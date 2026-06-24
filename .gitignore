@@ -1,0 +1,55 @@
+# Local proprietary game media and extracted content
+Burnout 2/
+data/local/*
+!data/local/.gitkeep
+
+# Disc images and dumps
+*.iso
+*.xiso
+*.xiso.iso
+*.xbe
+*.bin
+*.img
+*.cue
+*.ccd
+*.sub
+*.mdf
+*.mds
+
+# Reverse-engineering and analysis databases
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.ghidra
+*.bndb
+*.map
+*.sym
+*.pdb
+
+# Generated outputs
+build/
+dist/
+out/
+generated/
+reports/local/
+logs/
+tmp/
+temp/
+
+# Tool caches
+.cache/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# Editor and OS clutter
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
