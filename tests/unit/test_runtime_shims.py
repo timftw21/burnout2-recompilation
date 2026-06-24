@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ from runtime.xbox.shims import (
     ControllerState,
     XboxPathError,
     XboxRuntimeConfig,
+    XboxRuntimeError,
     XboxRuntimeShims,
     XboxStatus,
 )
@@ -22,7 +24,7 @@ class RuntimeShimTests(unittest.TestCase):
         resolver = ImportResolver()
         runtime = XboxRuntimeShims()
 
-        runtime.register_kernel_imports(resolver, imported_ordinals=[0x42, 0x08])
+        runtime.register_kernel_imports(resolver, imported_ordinals=[0x41, 0x08])
         loaded = load_xbe_bytes(blob, resolver=resolver)
 
         self.assertEqual(
@@ -39,18 +41,12 @@ class RuntimeShimTests(unittest.TestCase):
         self.assertTrue(all(resolution.resolved for resolution in kernel_resolutions))
         self.assertEqual(runtime.summary()["registered_kernel_shim_count"], 2)
 
-    def test_registers_placeholder_shims_for_unknown_imported_ordinals(self) -> None:
+    def test_rejects_unmodeled_kernel_imports(self) -> None:
         resolver = ImportResolver()
         runtime = XboxRuntimeShims()
 
-        shims = runtime.register_kernel_imports(
-            resolver, imported_ordinals=[8, 400], include_placeholders=True
-        )
-
-        by_ordinal = {shim.ordinal: shim for shim in shims}
-        self.assertEqual(by_ordinal[8].behavior, "implemented")
-        self.assertEqual(by_ordinal[400].behavior, "stub")
-        self.assertEqual(by_ordinal[400].name, "ordinal_0400")
+        with self.assertRaisesRegex(XboxRuntimeError, "no behavior model"):
+            runtime.register_kernel_imports(resolver, imported_ordinals=[8, 400])
 
     def test_runtime_smoke_summary_uses_registered_shims(self) -> None:
         blob, _ = _synthetic_xbe()
@@ -64,6 +60,7 @@ class RuntimeShimTests(unittest.TestCase):
         self.assertEqual(summary["source"]["kernel_import_count"], 2)
         self.assertEqual(summary["registered_kernel_shim_count"], 2)
         self.assertEqual(summary["unresolved_import_count"], 2)
+        self.assertNotIn("stub", summary["registered_behavior_counts"])
 
     def test_filesystem_resolves_guest_paths_inside_extracted_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -144,6 +141,120 @@ class RuntimeShimTests(unittest.TestCase):
         summary = runtime.summary()
         self.assertTrue(summary["audio_initialized"])
         self.assertGreaterEqual(len(summary["trace"]), 4)
+
+    def test_crypto_shims_model_stateful_rc4_and_xbox_hmac(self) -> None:
+        runtime = XboxRuntimeShims()
+
+        rc4_key = runtime.xc_rc4_key(b"Key")
+        self.assertEqual(
+            runtime.xc_rc4_crypt(rc4_key, b"Plain") + runtime.xc_rc4_crypt(rc4_key, b"text"),
+            bytes.fromhex("BBF316E8D940AF0AD3"),
+        )
+
+        key = bytes(range(80))
+        left = b"burn"
+        right = b"out"
+        pad1 = bytearray(64)
+        pad2 = bytearray(64)
+        pad1[:] = key[:64]
+        pad2[:] = key[:64]
+        for index in range(64):
+            pad1[index] ^= 0x36
+            pad2[index] ^= 0x5C
+        inner = hashlib.sha1(pad1 + left + right, usedforsecurity=False).digest()
+        expected = hashlib.sha1(pad2 + inner, usedforsecurity=False).digest()
+
+        self.assertEqual(runtime.xc_hmac(key, left, right), expected)
+
+    def test_crypto_shims_model_des_and_3des_cbc(self) -> None:
+        runtime = XboxRuntimeShims()
+        key = bytes.fromhex("133457799BBCDFF1")
+        plaintext = bytes.fromhex("0123456789ABCDEF")
+        expected_des = bytes.fromhex("85E813540F0AB405")
+
+        des_table = runtime.xc_key_table(0, key)
+        self.assertEqual(
+            runtime.xc_block_crypt_cbc(des_table, b"\x00" * 8, plaintext, 1),
+            expected_des,
+        )
+        self.assertEqual(
+            runtime.xc_block_crypt_cbc(des_table, b"\x00" * 8, expected_des, 0),
+            plaintext,
+        )
+
+        degenerate_3des = runtime.xc_key_table(1, key + key)
+        self.assertEqual(
+            runtime.xc_block_crypt_cbc(degenerate_3des, b"\x00" * 8, plaintext, 1),
+            expected_des,
+        )
+
+        triple_table = runtime.xc_key_table(
+            1, bytes.fromhex("0123456789ABCDEFFEDCBA9876543210")
+        )
+        message = b"Burnout2Burnout2"
+        encrypted = runtime.xc_block_crypt_cbc(triple_table, b"\x12" * 8, message, 1)
+        self.assertNotEqual(encrypted, message)
+        self.assertEqual(
+            runtime.xc_block_crypt_cbc(triple_table, b"\x12" * 8, encrypted, 0),
+            message,
+        )
+
+    def test_crypto_shims_verify_pkcs1_sha1_signatures(self) -> None:
+        runtime = XboxRuntimeShims()
+        digest = hashlib.sha1(b"burnout2", usedforsecurity=False).digest()
+        der_prefix = bytes.fromhex("3021300906052B0E03021A05000414")
+        size = 64
+        encoded = (
+            b"\x00\x01"
+            + b"\xFF" * (size - len(der_prefix) - len(digest) - 3)
+            + b"\x00"
+            + der_prefix
+            + digest
+        )
+        public_key = {"modulus": (1 << (size * 8)) - 1, "exponent": 1, "size": size}
+
+        self.assertTrue(runtime.xc_verify_pkcs1_signature(encoded, public_key, digest))
+        self.assertFalse(runtime.xc_verify_pkcs1_signature(encoded, public_key, b"\x00" * 20))
+
+    def test_crypto_shims_verify_xbox_rsa1_sha1_signatures(self) -> None:
+        runtime = XboxRuntimeShims()
+        digest = hashlib.sha1(b"burnout2-xbox", usedforsecurity=False).digest()
+        prefix = bytes.fromhex("140400051A02030E2B050609302130")
+        decrypted = bytearray(256)
+        decrypted[:20] = digest[::-1]
+        decrypted[20 : 20 + len(prefix)] = prefix
+        zero_position = 20 + len(prefix)
+        decrypted[zero_position] = 0
+        decrypted[zero_position + 1 : 254] = b"\xFF" * (253 - zero_position)
+        decrypted[254] = 1
+        decrypted[255] = 0
+        public_key = (
+            b"RSA1"
+            + (264).to_bytes(4, "little")
+            + (2048).to_bytes(4, "little")
+            + (255).to_bytes(4, "little")
+            + (1).to_bytes(4, "little")
+            + (b"\xFF" * 256)
+            + (b"\x00" * 8)
+        )
+
+        self.assertTrue(runtime.xc_verify_pkcs1_signature(bytes(decrypted), public_key, digest))
+        self.assertFalse(
+            runtime.xc_verify_pkcs1_signature(bytes(decrypted), public_key, b"\x01" * 20)
+        )
+
+    def test_crypto_shims_model_little_endian_mod_exp(self) -> None:
+        runtime = XboxRuntimeShims()
+
+        self.assertEqual(
+            runtime.xc_mod_exp(
+                (5).to_bytes(4, "little"),
+                (3).to_bytes(4, "little"),
+                (13).to_bytes(4, "little"),
+                4,
+            ),
+            (8).to_bytes(4, "little"),
+        )
 
 
 if __name__ == "__main__":

@@ -48,7 +48,7 @@ class AnalysisDatabaseTests(unittest.TestCase):
         self.assertEqual(records_by_name["lib_xapilib"]["subsystem"], "runtime")
         self.assertEqual(records_by_name["feature_d3d8"]["subsystem"], "rendering")
         self.assertEqual(
-            records_by_name["imp_kernel_0066_iocreatedevice"]["subsystem"],
+            records_by_name["imp_kernel_0065_iocreatedevice"]["subsystem"],
             "filesystem",
         )
         self.assertEqual(

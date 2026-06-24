@@ -10,7 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools.xbe.xbe_info import XbeFormatError, parse_xbe_bytes
+from tools.xbe.xbe_info import KERNEL_EXPORT_NAMES, XbeFormatError, parse_xbe_bytes
 
 
 def _put_u16(data: bytearray, offset: int, value: int) -> None:
@@ -166,7 +166,7 @@ def _synthetic_xbe(*, corrupt_digest: bool = False) -> tuple[bytes, dict[str, in
     _put_ascii(data, debug_filename_addr - base, "burnout2.exe")
     _put_wide_string(data, debug_unicode_filename_addr - base, "burnout2.exe")
 
-    _put_u32(data, text_raw + 0x100, 0x80000042)
+    _put_u32(data, text_raw + 0x100, 0x80000041)
     _put_u32(data, text_raw + 0x104, 0x80000008)
     _put_u32(data, text_raw + 0x108, 0)
 
@@ -226,6 +226,12 @@ def _synthetic_xbe(*, corrupt_digest: bool = False) -> tuple[bytes, dict[str, in
 
 
 class XbeInfoTests(unittest.TestCase):
+    def test_kernel_export_names_use_actual_xbox_ordinals(self) -> None:
+        self.assertEqual(KERNEL_EXPORT_NAMES[65], "IoCreateDevice")
+        self.assertEqual(KERNEL_EXPORT_NAMES[66], "IoCreateFile")
+        self.assertEqual(KERNEL_EXPORT_NAMES[84], "IoSynchronousDeviceIoControlRequest")
+        self.assertEqual(KERNEL_EXPORT_NAMES[335], "XcSHAInit")
+
     def test_parses_header_certificate_sections_memory_and_digests(self) -> None:
         blob, layout = _synthetic_xbe()
         info = parse_xbe_bytes(blob)
@@ -264,7 +270,7 @@ class XbeInfoTests(unittest.TestCase):
         self.assertEqual(info["libraries"]["xapi"]["name"], "XAPILIB")
         self.assertEqual(info["library_features"][0]["name"], "D3D8")
         self.assertEqual(info["kernel_imports"]["count"], 2)
-        self.assertEqual(info["kernel_imports"]["imports"][0]["ordinal"], 0x42)
+        self.assertEqual(info["kernel_imports"]["imports"][0]["ordinal"], 0x41)
         self.assertEqual(info["kernel_imports"]["imports"][0]["name"], "IoCreateDevice")
         self.assertEqual(info["kernel_imports"]["imports"][1]["ordinal"], 0x08)
         self.assertEqual(info["kernel_imports"]["imports"][1]["name"], "DbgPrint")

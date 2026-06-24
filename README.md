@@ -245,6 +245,13 @@ python .\tools\runtime\runtime_smoke.py `
 > threading, memory, input, rendering, audio, diagnostics, hardware, loader, and
 > crypto boundaries with structured traces and deterministic import registration.
 
+> [!IMPORTANT]
+> **Pre-Milestone 5 Runtime Hardening - June 24, 2026:** The Xbox kernel export
+> ordinal table has been corrected against xboxdevwiki, and every current
+> `default.xbe` kernel import now resolves to either a modeled handler or a
+> modeled data export. Current runtime smoke output reports no placeholder stub
+> registrations for the local executable.
+
 Last local extraction: June 24, 2026.
 
 - Extracted `667` files across `109` directories.
@@ -277,8 +284,9 @@ Last local extraction: June 24, 2026.
 - `default.xbe` runtime shim smoke summary:
   - Imported kernel ordinals: `142`
   - Registered host shims: `142`
-  - Implemented handler models: `86`
-  - Deterministic placeholder stubs: `56`
+  - Implemented handler models: `126`
+  - Modeled data exports: `16`
+  - Deterministic placeholder stubs: `0`
   - Unresolved loader imports with runtime resolver: `0`
 - `default.xbe` analysis database summary:
   - Records: `198`
@@ -423,9 +431,8 @@ Remaining:
 > [!IMPORTANT]
 > **Milestone 4 Update - June 24, 2026:** Runtime shims are implemented and
 > covered by synthetic tests. The local smoke check registers every current
-> `default.xbe` kernel import through the runtime resolver; unsupported or
-> unknown ordinals use deterministic placeholder stubs until execution reaches
-> those paths.
+> `default.xbe` kernel import through the runtime resolver with no placeholder
+> stub registrations.
 
 Completed:
 
@@ -450,17 +457,27 @@ Completed:
 - Added `XboxRuntimeShims.register_kernel_imports()` to bind imported kernel
   ordinals into the loader `ImportResolver` with deterministic host target
   addresses.
-- Added deterministic placeholder registration for unsupported or unknown
-  ordinals so the loader can patch all current kernel import thunks without
-  unresolved imports.
+- Added fail-fast runtime registration for unsupported or unknown ordinals so
+  missing behavior models cannot silently become placeholder shims.
 - Added synthetic unit tests covering shim registration, filesystem access,
   memory, timing, synchronization, input, graphics, and audio behavior.
+- Corrected the Xbox kernel export ordinal table using the xboxdevwiki kernel
+  export list.
+- Replaced the current `default.xbe` placeholder shim registrations with
+  modeled filesystem, device, object-manager, memory, scheduler, HAL, PHY,
+  runtime helper, crypto, and data-export behavior.
+- Added regression coverage for corrected kernel ordinals, zero-stub runtime
+  smoke registration, stateful RC4, Xbox-style two-buffer HMAC behavior, DES
+  known-answer encryption/decryption, 2-key 3DES CBC behavior, little-endian
+  modular exponentiation, and PKCS#1/SHA1 verification for generic and Xbox
+  `RSA1` public-key layouts.
 
 Remaining:
 
-- No remaining Milestone 4 tasks. Placeholder shims should be replaced by
-  behavior-accurate implementations as Milestone 5 and boot execution expose
-  concrete call sites and ABI details.
+- No remaining Milestone 4 tasks. Pre-Milestone 5 behavior-accuracy hardening is
+  complete for the current `default.xbe` import set: placeholder registrations
+  are gone, imported data exports are modeled explicitly, and crypto helpers are
+  covered by known-vector or format-specific regression tests.
 
 ### Milestone 5: Recompilation Prototype
 
@@ -525,5 +542,6 @@ analysis records, subsystem tags, confidence levels, and compiler/runtime
 patterns.
 
 The runtime shim layer can register all current `default.xbe` kernel imports
-through the loader resolver with deterministic host target addresses. A
-recompilation or execution pipeline has not been implemented yet.
+through the loader resolver with deterministic host target addresses and no
+placeholder stubs for the local executable. A recompilation or execution
+pipeline has not been implemented yet.

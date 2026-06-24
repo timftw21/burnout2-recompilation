@@ -10,8 +10,8 @@ subsystem methods.
 from __future__ import annotations
 
 import hashlib
-import hmac
 import itertools
+import datetime as dt
 from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -103,6 +103,8 @@ def _json_safe(value: Any) -> Any:
         return {key: _json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
+    if isinstance(value, bytes):
+        return {"bytes": len(value), "hex": value.hex().upper()}
     if isinstance(value, Path):
         return str(value)
     if hasattr(value, "to_dict"):
@@ -133,8 +135,8 @@ class RuntimeShim:
 @dataclass(frozen=True)
 class XboxRuntimeConfig:
     extracted_disc_root: Path | None = None
-    host_stub_base: int = 0xE0000000
-    host_stub_stride: int = 0x10
+    host_target_base: int = 0xE0000000
+    host_target_stride: int = 0x10
     allocation_base: int = 0x10000000
     contiguous_allocation_base: int = 0x20000000
     performance_frequency: int = 10_000_000
@@ -154,6 +156,52 @@ class GuestFile:
             "host_path": str(self.host_path),
             "mode": self.mode,
             "position": self.position,
+        }
+
+
+@dataclass
+class KernelVariable:
+    name: str
+    value: Any
+    type_name: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "type_name": self.type_name,
+            "value": self.value,
+        }
+
+
+@dataclass
+class DeviceObject:
+    name: str | None
+    device_type: int = 0
+    deleted: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "device_type": self.device_type,
+            "deleted": self.deleted,
+        }
+
+
+@dataclass
+class IoRequest:
+    major_function: str
+    target: Any = None
+    status: int = XboxStatus.SUCCESS
+    information: int = 0
+    must_complete: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "major_function": self.major_function,
+            "status": self.status,
+            "status_hex": _hex32(self.status),
+            "information": self.information,
+            "must_complete": self.must_complete,
         }
 
 
@@ -278,7 +326,7 @@ class XboxFileSystemShim:
         return info
 
     def open_file(self, guest_path: str, mode: str = "rb") -> dict[str, Any]:
-        if mode not in {"r", "rb"}:
+        if mode not in {"r", "rb", "w", "wb", "a", "ab"}:
             self._trace.add(
                 "filesystem", "open_file", "error", guest_path=guest_path, mode=mode
             )
@@ -338,6 +386,84 @@ class XboxFileSystemShim:
             status_hex=_hex32(status),
         )
         return {"status": status, "data": chunk, "bytes_read": len(chunk)}
+
+    def write_file(
+        self, handle: int, payload: bytes, *, offset: int | None = None
+    ) -> dict[str, Any]:
+        try:
+            file = self._handles.get(handle, "file")
+        except XboxRuntimeError as exc:
+            return {"status": XboxStatus.INVALID_HANDLE, "bytes_written": 0, "error": str(exc)}
+        if "w" not in file.mode and "a" not in file.mode:
+            self._trace.add(
+                "filesystem", "write_file", "error", handle=handle, mode=file.mode
+            )
+            return {"status": XboxStatus.ACCESS_DENIED, "bytes_written": 0}
+        if offset is not None:
+            if offset < 0:
+                return {"status": XboxStatus.INVALID_PARAMETER, "bytes_written": 0}
+            file.position = offset
+        start = file.position
+        current = bytearray(file.host_path.read_bytes() if file.host_path.exists() else b"")
+        if start > len(current):
+            current.extend(b"\x00" * (start - len(current)))
+        end = start + len(payload)
+        current[start:end] = payload
+        file.host_path.write_bytes(bytes(current))
+        file.position = end
+        self._trace.add(
+            "filesystem",
+            "write_file",
+            handle=handle,
+            guest_path=file.guest_path,
+            offset=start,
+            bytes_written=len(payload),
+        )
+        return {"status": XboxStatus.SUCCESS, "bytes_written": len(payload)}
+
+    def delete_file(self, guest_path: str) -> int:
+        try:
+            host_path = self.resolve_guest_path(guest_path)
+        except XboxPathError as exc:
+            self._trace.add(
+                "filesystem", "delete_file", "error", guest_path=guest_path, error=str(exc)
+            )
+            return XboxStatus.OBJECT_NAME_NOT_FOUND
+        if not host_path.exists():
+            return XboxStatus.OBJECT_NAME_NOT_FOUND
+        try:
+            if host_path.is_dir():
+                host_path.rmdir()
+            else:
+                host_path.unlink()
+        except OSError:
+            self._trace.add("filesystem", "delete_file", "error", guest_path=guest_path)
+            return XboxStatus.ACCESS_DENIED
+        self._trace.add("filesystem", "delete_file", guest_path=guest_path, host_path=host_path)
+        return XboxStatus.SUCCESS
+
+    def query_volume_information(self, guest_path: str = "D:\\") -> dict[str, Any]:
+        try:
+            host_path = self.resolve_guest_path(guest_path)
+        except XboxPathError as exc:
+            return {"status": XboxStatus.OBJECT_NAME_NOT_FOUND, "error": str(exc)}
+        root = host_path if host_path.is_dir() else host_path.parent
+        total_bytes = 0
+        file_count = 0
+        if root.exists():
+            for child in root.rglob("*"):
+                if child.is_file():
+                    file_count += 1
+                    total_bytes += child.stat().st_size
+        result = {
+            "status": XboxStatus.SUCCESS,
+            "label": "BURNOUT2",
+            "serial_number": 0x41430019,
+            "file_count": file_count,
+            "used_bytes": total_bytes,
+        }
+        self._trace.add("filesystem", "query_volume", guest_path=guest_path, result=result)
+        return result
 
     def list_directory(self, guest_path: str = "D:\\") -> dict[str, Any]:
         try:
@@ -412,6 +538,7 @@ class XboxMemoryShim:
         self._next_pool = config.allocation_base
         self._next_contiguous = config.contiguous_allocation_base
         self._allocations: dict[int, Allocation] = {}
+        self._locked_ranges: set[tuple[int, int]] = set()
 
     @property
     def allocations(self) -> tuple[Allocation, ...]:
@@ -516,6 +643,79 @@ class XboxMemoryShim:
         )
         return {"status": XboxStatus.SUCCESS, "old_protection": old}
 
+    def query_protection(self, address: int) -> dict[str, Any]:
+        allocation = self._find_allocation(address, 1)
+        result = {
+            "status": XboxStatus.SUCCESS,
+            "protection": allocation.protection,
+            "address": allocation.address,
+            "size": allocation.size,
+        }
+        self._trace.add("allocator", "query_protection", query_address=address, result=result)
+        return result
+
+    def query_allocation_size(self, address: int) -> dict[str, Any]:
+        allocation = self._find_allocation(address, 1)
+        result = {"status": XboxStatus.SUCCESS, "size": allocation.size}
+        self._trace.add("allocator", "query_allocation_size", address=address, result=result)
+        return result
+
+    def query_statistics(self) -> dict[str, Any]:
+        by_kind = Counter(allocation.kind for allocation in self._allocations.values())
+        committed = sum(allocation.size for allocation in self._allocations.values())
+        result = {
+            "status": XboxStatus.SUCCESS,
+            "allocation_count": len(self._allocations),
+            "committed_bytes": committed,
+            "allocation_kinds": dict(sorted(by_kind.items())),
+            "locked_range_count": len(self._locked_ranges),
+        }
+        self._trace.add("allocator", "query_statistics", result=result)
+        return result
+
+    def map_io_space(self, physical_address: int, size: int, protection: str = "rw") -> int:
+        address = self.allocate_contiguous_memory(size, kind="io", protection=protection)
+        self._trace.add(
+            "allocator",
+            "map_io_space",
+            physical_address=physical_address,
+            address=address,
+            size=size,
+            protection=protection,
+        )
+        return address
+
+    def unmap_io_space(self, address: int, size: int | None = None) -> int:
+        self._trace.add("allocator", "unmap_io_space", address=address, size=size)
+        return self.free(address)
+
+    def lock_unlock_buffer_pages(self, address: int, size: int, lock: bool = True) -> int:
+        self._find_allocation(address, size)
+        item = (address, size)
+        if lock:
+            self._locked_ranges.add(item)
+        else:
+            self._locked_ranges.discard(item)
+        self._trace.add(
+            "allocator",
+            "lock_unlock_buffer_pages",
+            address=address,
+            size=size,
+            lock=lock,
+        )
+        return XboxStatus.SUCCESS
+
+    def persist_contiguous_memory(self, address: int, size: int, persist: bool = True) -> int:
+        self._find_allocation(address, size)
+        self._trace.add(
+            "allocator",
+            "persist_contiguous_memory",
+            address=address,
+            size=size,
+            persist=persist,
+        )
+        return XboxStatus.SUCCESS
+
     def query(self, address: int) -> dict[str, Any]:
         for allocation in self._allocations.values():
             if allocation.contains(address, 1):
@@ -580,6 +780,14 @@ class XboxClockShim:
         self._trace.add("threading", "query_system_time", filetime=self._filetime)
         return self._filetime
 
+    def set_system_time(self, filetime: int) -> int:
+        previous = self._filetime
+        self._filetime = filetime
+        self._trace.add(
+            "threading", "set_system_time", previous_filetime=previous, filetime=filetime
+        )
+        return previous
+
     def query_interrupt_time(self) -> int:
         interrupt_time = self._counter * 10_000_000 // self._frequency
         self._trace.add(
@@ -638,10 +846,26 @@ class ThreadObject:
     parameter: int | None = None
     suspended: bool = False
     priority: int = 8
+    base_priority: int = 8
+    disable_boost: bool = False
+
+
+@dataclass
+class DpcObject:
+    routine: int | None = None
+    context: int | None = None
+    queued: bool = False
+
+
+@dataclass
+class InterruptObject:
+    vector: int
+    service_routine: int | None = None
+    connected: bool = False
 
 
 class XboxSynchronizationShim:
-    """Kernel event, semaphore, timer, and thread placeholders."""
+    """Kernel event, semaphore, timer, DPC, interrupt, and thread models."""
 
     def __init__(
         self, trace: ShimTraceLog, handles: GuestHandleTable, clock: XboxClockShim
@@ -651,6 +875,9 @@ class XboxSynchronizationShim:
         self._clock = clock
         self._critical_sections: set[int] = set()
         self._current_thread = self._handles.allocate("thread", ThreadObject())
+        self._dpcs: dict[int, DpcObject] = {}
+        self._interrupts: dict[int, InterruptObject] = {}
+        self._bugcheck: dict[str, Any] | None = None
 
     @property
     def current_thread(self) -> int:
@@ -666,6 +893,18 @@ class XboxSynchronizationShim:
             initial_state=initial_state,
         )
         return handle
+
+    def initialize_event(
+        self, manual_reset: bool = True, initial_state: bool = False
+    ) -> EventObject:
+        event = EventObject(manual_reset, initial_state)
+        self._trace.add(
+            "threading",
+            "initialize_event",
+            manual_reset=manual_reset,
+            initial_state=initial_state,
+        )
+        return event
 
     def set_event(self, handle: int) -> int:
         event = self._handles.get(handle, "event")
@@ -693,6 +932,18 @@ class XboxSynchronizationShim:
         )
         return handle
 
+    def initialize_semaphore(self, initial_count: int, limit: int) -> SemaphoreObject:
+        if initial_count < 0 or limit <= 0 or initial_count > limit:
+            raise XboxRuntimeError("invalid semaphore counts")
+        semaphore = SemaphoreObject(initial_count, limit)
+        self._trace.add(
+            "threading",
+            "initialize_semaphore",
+            initial_count=initial_count,
+            limit=limit,
+        )
+        return semaphore
+
     def release_semaphore(self, handle: int, release_count: int = 1) -> dict[str, Any]:
         semaphore = self._handles.get(handle, "semaphore")
         previous = semaphore.count
@@ -711,6 +962,11 @@ class XboxSynchronizationShim:
         self._trace.add("threading", "create_timer", handle=handle)
         return handle
 
+    def initialize_timer(self) -> TimerObject:
+        timer = TimerObject()
+        self._trace.add("threading", "initialize_timer")
+        return timer
+
     def set_timer(self, handle: int, due_time_100ns: int, period_ms: int = 0) -> int:
         timer = self._handles.get(handle, "timer")
         timer.due_time_100ns = due_time_100ns
@@ -723,6 +979,12 @@ class XboxSynchronizationShim:
             due_time_100ns=due_time_100ns,
             period_ms=period_ms,
         )
+        return XboxStatus.SUCCESS
+
+    def cancel_timer(self, handle: int) -> int:
+        timer = self._handles.get(handle, "timer")
+        timer.signaled = False
+        self._trace.add("threading", "cancel_timer", handle=handle)
         return XboxStatus.SUCCESS
 
     def wait_for_single_object(
@@ -785,6 +1047,16 @@ class XboxSynchronizationShim:
         )
         return handle
 
+    def terminate_thread(self, handle: int | None = None, status: int = XboxStatus.SUCCESS) -> int:
+        target = handle or self._current_thread
+        try:
+            thread = self._handles.get(target, "thread")
+            thread.suspended = True
+        except XboxRuntimeError:
+            return XboxStatus.INVALID_HANDLE
+        self._trace.add("threading", "terminate_thread", handle=target, status_hex=_hex32(status))
+        return status
+
     def suspend_thread(self, handle: int) -> int:
         thread = self._handles.get(handle, "thread")
         thread.suspended = True
@@ -796,6 +1068,95 @@ class XboxSynchronizationShim:
         thread.suspended = False
         self._trace.add("threading", "resume_thread", handle=handle)
         return XboxStatus.SUCCESS
+
+    def set_thread_priority(self, handle: int, priority: int, *, base: bool = False) -> int:
+        thread = self._handles.get(handle, "thread")
+        previous = thread.base_priority if base else thread.priority
+        if base:
+            thread.base_priority = priority
+        else:
+            thread.priority = priority
+        self._trace.add(
+            "threading",
+            "set_thread_priority",
+            handle=handle,
+            previous=previous,
+            priority=priority,
+            base=base,
+        )
+        return previous
+
+    def set_thread_disable_boost(self, handle: int, disable: bool) -> int:
+        thread = self._handles.get(handle, "thread")
+        previous = thread.disable_boost
+        thread.disable_boost = disable
+        self._trace.add(
+            "threading",
+            "set_thread_disable_boost",
+            handle=handle,
+            previous=previous,
+            disable=disable,
+        )
+        return int(previous)
+
+    def initialize_dpc(self, dpc_id: int, routine: int | None = None, context: int | None = None) -> DpcObject:
+        dpc = DpcObject(routine, context, False)
+        self._dpcs[dpc_id] = dpc
+        self._trace.add("threading", "initialize_dpc", dpc_id=dpc_id, routine=routine)
+        return dpc
+
+    def insert_queue_dpc(self, dpc_id: int) -> bool:
+        dpc = self._dpcs.setdefault(dpc_id, DpcObject())
+        previous = dpc.queued
+        dpc.queued = True
+        self._trace.add("threading", "insert_queue_dpc", dpc_id=dpc_id, previous=previous)
+        return not previous
+
+    def remove_queue_dpc(self, dpc_id: int) -> bool:
+        dpc = self._dpcs.setdefault(dpc_id, DpcObject())
+        previous = dpc.queued
+        dpc.queued = False
+        self._trace.add("threading", "remove_queue_dpc", dpc_id=dpc_id, previous=previous)
+        return previous
+
+    def initialize_interrupt(
+        self, interrupt_id: int, vector: int, service_routine: int | None = None
+    ) -> InterruptObject:
+        interrupt = InterruptObject(vector, service_routine, False)
+        self._interrupts[interrupt_id] = interrupt
+        self._trace.add(
+            "threading",
+            "initialize_interrupt",
+            interrupt_id=interrupt_id,
+            vector=vector,
+            service_routine=service_routine,
+        )
+        return interrupt
+
+    def connect_interrupt(self, interrupt_id: int) -> bool:
+        interrupt = self._interrupts.setdefault(interrupt_id, InterruptObject(interrupt_id))
+        previous = interrupt.connected
+        interrupt.connected = True
+        self._trace.add("threading", "connect_interrupt", interrupt_id=interrupt_id)
+        return not previous
+
+    def disconnect_interrupt(self, interrupt_id: int) -> bool:
+        interrupt = self._interrupts.setdefault(interrupt_id, InterruptObject(interrupt_id))
+        previous = interrupt.connected
+        interrupt.connected = False
+        self._trace.add("threading", "disconnect_interrupt", interrupt_id=interrupt_id)
+        return previous
+
+    def synchronize_execution(self, interrupt_id: int, routine: Callable[..., Any] | None = None) -> Any:
+        self._trace.add("threading", "synchronize_execution", interrupt_id=interrupt_id)
+        if routine is None:
+            return True
+        return routine()
+
+    def bugcheck(self, code: int, *parameters: int) -> int:
+        self._bugcheck = {"code": code, "parameters": list(parameters)}
+        self._trace.add("threading", "bugcheck", "fatal", code=code, parameters=list(parameters))
+        return code
 
     def enter_critical_section(self, address: int) -> int:
         self._critical_sections.add(address)
@@ -950,36 +1311,526 @@ class XboxAudioShim:
         return XboxStatus.SUCCESS
 
 
-class XboxCryptoShim:
-    def __init__(self, trace: ShimTraceLog) -> None:
-        self._trace = trace
+@dataclass
+class ShaContext:
+    hasher: Any = field(default_factory=lambda: hashlib.sha1(usedforsecurity=False))
 
-    def sha1(self, payload: bytes) -> bytes:
-        digest = hashlib.sha1(payload, usedforsecurity=False).digest()
-        self._trace.add("crypto", "sha1", bytes=len(payload))
-        return digest
 
-    def hmac_sha1(self, key: bytes, payload: bytes) -> bytes:
-        digest = hmac.new(key, payload, hashlib.sha1).digest()
-        self._trace.add("crypto", "hmac_sha1", key_bytes=len(key), bytes=len(payload))
-        return digest
+@dataclass
+class Rc4Key:
+    state: list[int]
+    i: int = 0
+    j: int = 0
 
-    def rc4_crypt(self, key: bytes, payload: bytes) -> bytes:
+    @classmethod
+    def from_key(cls, key: bytes) -> "Rc4Key":
         state = list(range(256))
         j = 0
         key_bytes = key or b"\x00"
         for i in range(256):
             j = (j + state[i] + key_bytes[i % len(key_bytes)]) & 0xFF
             state[i], state[j] = state[j], state[i]
+        return cls(state)
+
+
+_DES_IP = (
+    58, 50, 42, 34, 26, 18, 10, 2,
+    60, 52, 44, 36, 28, 20, 12, 4,
+    62, 54, 46, 38, 30, 22, 14, 6,
+    64, 56, 48, 40, 32, 24, 16, 8,
+    57, 49, 41, 33, 25, 17, 9, 1,
+    59, 51, 43, 35, 27, 19, 11, 3,
+    61, 53, 45, 37, 29, 21, 13, 5,
+    63, 55, 47, 39, 31, 23, 15, 7,
+)
+
+_DES_FP = (
+    40, 8, 48, 16, 56, 24, 64, 32,
+    39, 7, 47, 15, 55, 23, 63, 31,
+    38, 6, 46, 14, 54, 22, 62, 30,
+    37, 5, 45, 13, 53, 21, 61, 29,
+    36, 4, 44, 12, 52, 20, 60, 28,
+    35, 3, 43, 11, 51, 19, 59, 27,
+    34, 2, 42, 10, 50, 18, 58, 26,
+    33, 1, 41, 9, 49, 17, 57, 25,
+)
+
+_DES_E = (
+    32, 1, 2, 3, 4, 5,
+    4, 5, 6, 7, 8, 9,
+    8, 9, 10, 11, 12, 13,
+    12, 13, 14, 15, 16, 17,
+    16, 17, 18, 19, 20, 21,
+    20, 21, 22, 23, 24, 25,
+    24, 25, 26, 27, 28, 29,
+    28, 29, 30, 31, 32, 1,
+)
+
+_DES_P = (
+    16, 7, 20, 21,
+    29, 12, 28, 17,
+    1, 15, 23, 26,
+    5, 18, 31, 10,
+    2, 8, 24, 14,
+    32, 27, 3, 9,
+    19, 13, 30, 6,
+    22, 11, 4, 25,
+)
+
+_DES_PC1 = (
+    57, 49, 41, 33, 25, 17, 9,
+    1, 58, 50, 42, 34, 26, 18,
+    10, 2, 59, 51, 43, 35, 27,
+    19, 11, 3, 60, 52, 44, 36,
+    63, 55, 47, 39, 31, 23, 15,
+    7, 62, 54, 46, 38, 30, 22,
+    14, 6, 61, 53, 45, 37, 29,
+    21, 13, 5, 28, 20, 12, 4,
+)
+
+_DES_PC2 = (
+    14, 17, 11, 24, 1, 5,
+    3, 28, 15, 6, 21, 10,
+    23, 19, 12, 4, 26, 8,
+    16, 7, 27, 20, 13, 2,
+    41, 52, 31, 37, 47, 55,
+    30, 40, 51, 45, 33, 48,
+    44, 49, 39, 56, 34, 53,
+    46, 42, 50, 36, 29, 32,
+)
+
+_DES_SHIFTS = (1, 1, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1)
+
+_DES_SBOXES = (
+    (
+        (14, 4, 13, 1, 2, 15, 11, 8, 3, 10, 6, 12, 5, 9, 0, 7),
+        (0, 15, 7, 4, 14, 2, 13, 1, 10, 6, 12, 11, 9, 5, 3, 8),
+        (4, 1, 14, 8, 13, 6, 2, 11, 15, 12, 9, 7, 3, 10, 5, 0),
+        (15, 12, 8, 2, 4, 9, 1, 7, 5, 11, 3, 14, 10, 0, 6, 13),
+    ),
+    (
+        (15, 1, 8, 14, 6, 11, 3, 4, 9, 7, 2, 13, 12, 0, 5, 10),
+        (3, 13, 4, 7, 15, 2, 8, 14, 12, 0, 1, 10, 6, 9, 11, 5),
+        (0, 14, 7, 11, 10, 4, 13, 1, 5, 8, 12, 6, 9, 3, 2, 15),
+        (13, 8, 10, 1, 3, 15, 4, 2, 11, 6, 7, 12, 0, 5, 14, 9),
+    ),
+    (
+        (10, 0, 9, 14, 6, 3, 15, 5, 1, 13, 12, 7, 11, 4, 2, 8),
+        (13, 7, 0, 9, 3, 4, 6, 10, 2, 8, 5, 14, 12, 11, 15, 1),
+        (13, 6, 4, 9, 8, 15, 3, 0, 11, 1, 2, 12, 5, 10, 14, 7),
+        (1, 10, 13, 0, 6, 9, 8, 7, 4, 15, 14, 3, 11, 5, 2, 12),
+    ),
+    (
+        (7, 13, 14, 3, 0, 6, 9, 10, 1, 2, 8, 5, 11, 12, 4, 15),
+        (13, 8, 11, 5, 6, 15, 0, 3, 4, 7, 2, 12, 1, 10, 14, 9),
+        (10, 6, 9, 0, 12, 11, 7, 13, 15, 1, 3, 14, 5, 2, 8, 4),
+        (3, 15, 0, 6, 10, 1, 13, 8, 9, 4, 5, 11, 12, 7, 2, 14),
+    ),
+    (
+        (2, 12, 4, 1, 7, 10, 11, 6, 8, 5, 3, 15, 13, 0, 14, 9),
+        (14, 11, 2, 12, 4, 7, 13, 1, 5, 0, 15, 10, 3, 9, 8, 6),
+        (4, 2, 1, 11, 10, 13, 7, 8, 15, 9, 12, 5, 6, 3, 0, 14),
+        (11, 8, 12, 7, 1, 14, 2, 13, 6, 15, 0, 9, 10, 4, 5, 3),
+    ),
+    (
+        (12, 1, 10, 15, 9, 2, 6, 8, 0, 13, 3, 4, 14, 7, 5, 11),
+        (10, 15, 4, 2, 7, 12, 9, 5, 6, 1, 13, 14, 0, 11, 3, 8),
+        (9, 14, 15, 5, 2, 8, 12, 3, 7, 0, 4, 10, 1, 13, 11, 6),
+        (4, 3, 2, 12, 9, 5, 15, 10, 11, 14, 1, 7, 6, 0, 8, 13),
+    ),
+    (
+        (4, 11, 2, 14, 15, 0, 8, 13, 3, 12, 9, 7, 5, 10, 6, 1),
+        (13, 0, 11, 7, 4, 9, 1, 10, 14, 3, 5, 12, 2, 15, 8, 6),
+        (1, 4, 11, 13, 12, 3, 7, 14, 10, 15, 6, 8, 0, 5, 9, 2),
+        (6, 11, 13, 8, 1, 4, 10, 7, 9, 5, 0, 15, 14, 2, 3, 12),
+    ),
+    (
+        (13, 2, 8, 4, 6, 15, 11, 1, 10, 9, 3, 14, 5, 0, 12, 7),
+        (1, 15, 13, 8, 10, 3, 7, 4, 12, 5, 6, 11, 0, 14, 9, 2),
+        (7, 11, 4, 1, 9, 12, 14, 2, 0, 6, 10, 13, 15, 3, 5, 8),
+        (2, 1, 14, 7, 4, 10, 8, 13, 15, 12, 9, 0, 3, 5, 6, 11),
+    ),
+)
+
+_SHA1_DIGEST_INFO_PREFIX = bytes.fromhex("3021300906052B0E03021A05000414")
+_XBOX_SHA1_DIGEST_INFO_PREFIXES = (
+    bytes.fromhex("140400051A02030E2B050609302130"),
+    bytes.fromhex("14041A02030E2B050607301F30"),
+)
+
+
+def _des_permute(value: int, table: tuple[int, ...], input_bits: int) -> int:
+    result = 0
+    for position in table:
+        result = (result << 1) | ((value >> (input_bits - position)) & 1)
+    return result
+
+
+def _des_rotate_left28(value: int, count: int) -> int:
+    return ((value << count) | (value >> (28 - count))) & 0x0FFFFFFF
+
+
+def _des_subkeys(key: bytes) -> tuple[int, ...]:
+    if len(key) < 8:
+        raise XboxRuntimeError("DES key must be at least 8 bytes")
+    key_bits = int.from_bytes(key[:8], "big")
+    permuted = _des_permute(key_bits, _DES_PC1, 64)
+    left = (permuted >> 28) & 0x0FFFFFFF
+    right = permuted & 0x0FFFFFFF
+    subkeys = []
+    for shift in _DES_SHIFTS:
+        left = _des_rotate_left28(left, shift)
+        right = _des_rotate_left28(right, shift)
+        subkeys.append(_des_permute((left << 28) | right, _DES_PC2, 56))
+    return tuple(subkeys)
+
+
+def _des_round_function(right: int, subkey: int) -> int:
+    expanded = _des_permute(right, _DES_E, 32) ^ subkey
+    substituted = 0
+    for index, sbox in enumerate(_DES_SBOXES):
+        chunk = (expanded >> (42 - (index * 6))) & 0x3F
+        row = ((chunk & 0x20) >> 4) | (chunk & 0x01)
+        column = (chunk >> 1) & 0x0F
+        substituted = (substituted << 4) | sbox[row][column]
+    return _des_permute(substituted, _DES_P, 32)
+
+
+def _des_crypt_block(key: bytes, block: bytes, *, decrypt: bool = False) -> bytes:
+    if len(block) != 8:
+        raise XboxRuntimeError("DES block must be exactly 8 bytes")
+    value = int.from_bytes(block, "big")
+    permuted = _des_permute(value, _DES_IP, 64)
+    left = (permuted >> 32) & 0xFFFFFFFF
+    right = permuted & 0xFFFFFFFF
+    subkeys = _des_subkeys(key)
+    if decrypt:
+        subkeys = tuple(reversed(subkeys))
+    for subkey in subkeys:
+        left, right = right, left ^ _des_round_function(right, subkey)
+    final = _des_permute((right << 32) | left, _DES_FP, 64)
+    return final.to_bytes(8, "big")
+
+
+def _triple_des_crypt_block(keys: tuple[bytes, bytes, bytes], block: bytes, *, decrypt: bool = False) -> bytes:
+    first, second, third = keys
+    if decrypt:
+        step1 = _des_crypt_block(third, block, decrypt=True)
+        step2 = _des_crypt_block(second, step1, decrypt=False)
+        return _des_crypt_block(first, step2, decrypt=True)
+    return _des_crypt_block(
+        third,
+        _des_crypt_block(
+            second,
+            _des_crypt_block(first, block, decrypt=False),
+            decrypt=True,
+        ),
+        decrypt=False,
+    )
+
+
+def _des_cbc_crypt(
+    payload: bytes,
+    keys: tuple[bytes, ...],
+    iv: bytes,
+    *,
+    decrypt: bool = False,
+) -> tuple[bytes, bytes, bool]:
+    feedback = (iv or b"\x00" * 8)[:8].ljust(8, b"\x00")
+    invalid_length = len(payload) % 8 != 0
+    output = bytearray()
+    block_count = (len(payload) + 7) // 8
+    for index in range(block_count):
+        source = payload[index * 8 : index * 8 + 8]
+        original_size = len(source)
+        block = source.ljust(8, b"\x00")
+        if decrypt:
+            crypted = _des_crypt_block(keys[0], block, decrypt=True) if len(keys) == 1 else _triple_des_crypt_block(keys, block, decrypt=True)
+            plain = bytes(left ^ right for left, right in zip(crypted, feedback))
+            feedback = block
+            output.extend(plain[:original_size])
+        else:
+            mixed = bytes(left ^ right for left, right in zip(block, feedback))
+            crypted = _des_crypt_block(keys[0], mixed, decrypt=False) if len(keys) == 1 else _triple_des_crypt_block(keys, mixed, decrypt=False)
+            feedback = crypted
+            output.extend(crypted[:original_size])
+    return bytes(output), feedback, invalid_length
+
+
+def _parse_xbox_rsa_public_key(public_key: bytes) -> dict[str, Any]:
+    if len(public_key) < 284 or public_key[:4] != b"RSA1":
+        raise XboxRuntimeError("not an Xbox RSA1 public key blob")
+    blob_length = int.from_bytes(public_key[4:8], "little")
+    bit_length = int.from_bytes(public_key[8:12], "little")
+    modulus_size = int.from_bytes(public_key[12:16], "little")
+    exponent = int.from_bytes(public_key[16:20], "little")
+    modulus = int.from_bytes(public_key[20:276], "little")
+    if exponent <= 0 or modulus <= 0:
+        raise XboxRuntimeError("invalid Xbox RSA public key")
+    return {
+        "format": "xbox-rsa1",
+        "blob_length": blob_length,
+        "bit_length": bit_length,
+        "modulus_size": modulus_size,
+        "exponent": exponent,
+        "modulus": modulus,
+        "size": 256,
+    }
+
+
+def _parse_rsa_public_key(public_key: Any, signature_size: int) -> dict[str, Any]:
+    if isinstance(public_key, dict):
+        modulus = int(public_key["modulus"])
+        exponent = int(public_key.get("exponent", 65537))
+        size = int(public_key.get("size", max(signature_size, (modulus.bit_length() + 7) // 8)))
+        return {
+            "format": "generic",
+            "modulus": modulus,
+            "exponent": exponent,
+            "size": size,
+            "modulus_size": size - 1,
+        }
+    if isinstance(public_key, tuple) and len(public_key) >= 2:
+        modulus, exponent = int(public_key[0]), int(public_key[1])
+        size = max(signature_size, (modulus.bit_length() + 7) // 8)
+        return {
+            "format": "generic",
+            "modulus": modulus,
+            "exponent": exponent,
+            "size": size,
+            "modulus_size": size - 1,
+        }
+    if isinstance(public_key, bytes):
+        if public_key.startswith(b"RSA1"):
+            return _parse_xbox_rsa_public_key(public_key)
+        if len(public_key) >= 8:
+            exponent = int.from_bytes(public_key[:4], "big")
+            modulus = int.from_bytes(public_key[4:], "big")
+            size = max(signature_size, len(public_key) - 4)
+            return {
+                "format": "raw-exponent-modulus",
+                "modulus": modulus,
+                "exponent": exponent,
+                "size": size,
+                "modulus_size": size - 1,
+            }
+    raise XboxRuntimeError("unsupported RSA public key format")
+
+
+def _verify_xbox_pkcs1_sha1(decrypted_little: bytes, digest: bytes, modulus_size: int) -> bool:
+    if len(digest) != 20 or len(decrypted_little) <= modulus_size:
+        return False
+    if decrypted_little[:20] != digest[::-1]:
+        return False
+    zero_position = 20
+    for prefix in _XBOX_SHA1_DIGEST_INFO_PREFIXES:
+        if decrypted_little[20 : 20 + len(prefix)] == prefix:
+            zero_position = 20 + len(prefix)
+            break
+    else:
+        return False
+    if decrypted_little[zero_position] != 0:
+        return False
+    if decrypted_little[modulus_size] != 0:
+        return False
+    if decrypted_little[modulus_size - 1] != 1:
+        return False
+    return all(
+        value == 0xFF
+        for value in decrypted_little[zero_position + 1 : modulus_size - 1]
+    )
+
+
+def _verify_pkcs1_v15_sha1(decrypted_big: bytes, digest: bytes) -> bool:
+    expected_tail = _SHA1_DIGEST_INFO_PREFIX + digest
+    if len(digest) != 20 or len(decrypted_big) < len(expected_tail) + 11:
+        return False
+    if not decrypted_big.startswith(b"\x00\x01"):
+        return False
+    separator = decrypted_big.find(b"\x00", 2)
+    if separator < 10:
+        return False
+    if any(value != 0xFF for value in decrypted_big[2:separator]):
+        return False
+    return decrypted_big[separator + 1 :] == expected_tail
+
+
+class XboxCryptoShim:
+    def __init__(self, trace: ShimTraceLog) -> None:
+        self._trace = trace
+
+    def sha_init(self) -> ShaContext:
+        self._trace.add("crypto", "sha_init")
+        return ShaContext()
+
+    def sha_update(self, context: ShaContext, payload: bytes) -> int:
+        context.hasher.update(payload)
+        self._trace.add("crypto", "sha_update", bytes=len(payload))
+        return XboxStatus.SUCCESS
+
+    def sha_final(self, context: ShaContext) -> bytes:
+        digest = context.hasher.digest()
+        self._trace.add("crypto", "sha_final")
+        return digest
+
+    def sha1(self, payload: bytes) -> bytes:
+        digest = hashlib.sha1(payload, usedforsecurity=False).digest()
+        self._trace.add("crypto", "sha1", bytes=len(payload))
+        return digest
+
+    def hmac_sha1(self, key: bytes, payload: bytes, payload2: bytes = b"") -> bytes:
+        key_material = key[:64]
+        pad1 = bytearray(64)
+        pad2 = bytearray(64)
+        pad1[: len(key_material)] = key_material
+        pad2[: len(key_material)] = key_material
+        for index in range(64):
+            pad1[index] ^= 0x36
+            pad2[index] ^= 0x5C
+
+        inner = hashlib.sha1(usedforsecurity=False)
+        inner.update(pad1)
+        inner.update(payload)
+        inner.update(payload2)
+        inner_digest = inner.digest()
+
+        outer = hashlib.sha1(usedforsecurity=False)
+        outer.update(pad2)
+        outer.update(inner_digest)
+        digest = outer.digest()
+        self._trace.add(
+            "crypto",
+            "hmac_sha1",
+            key_bytes=len(key),
+            bytes=len(payload),
+            bytes2=len(payload2),
+        )
+        return digest
+
+    def rc4_key(self, key: bytes) -> Rc4Key:
+        self._trace.add("crypto", "rc4_key", key_bytes=len(key))
+        return Rc4Key.from_key(key)
+
+    def rc4_crypt(self, key: Rc4Key | bytes, payload: bytes) -> bytes:
+        if isinstance(key, Rc4Key):
+            context = key
+        else:
+            context = Rc4Key.from_key(key)
         output = bytearray()
-        i = j = 0
         for byte in payload:
-            i = (i + 1) & 0xFF
-            j = (j + state[i]) & 0xFF
-            state[i], state[j] = state[j], state[i]
-            output.append(byte ^ state[(state[i] + state[j]) & 0xFF])
-        self._trace.add("crypto", "rc4_crypt", key_bytes=len(key), bytes=len(payload))
+            context.i = (context.i + 1) & 0xFF
+            context.j = (context.j + context.state[context.i]) & 0xFF
+            context.state[context.i], context.state[context.j] = (
+                context.state[context.j],
+                context.state[context.i],
+            )
+            output.append(
+                byte ^ context.state[
+                    (context.state[context.i] + context.state[context.j]) & 0xFF
+                ]
+            )
+        self._trace.add("crypto", "rc4_crypt", bytes=len(payload))
         return bytes(output)
+
+    def des_key_parity(self, key: bytes) -> bytes:
+        adjusted = bytearray()
+        for byte in key:
+            upper = byte & 0xFE
+            parity = 1 if bin(upper).count("1") % 2 == 0 else 0
+            adjusted.append(upper | parity)
+        self._trace.add("crypto", "des_key_parity", key_bytes=len(key))
+        return bytes(adjusted)
+
+    def mod_exp(
+        self,
+        base: int | bytes,
+        exponent: int | bytes,
+        modulus: int | bytes,
+        size: int | None = None,
+    ) -> int | bytes:
+        if isinstance(base, bytes) or isinstance(exponent, bytes) or isinstance(modulus, bytes):
+            base_bytes = base if isinstance(base, bytes) else int(base).to_bytes(size or 4, "little")
+            exponent_bytes = exponent if isinstance(exponent, bytes) else int(exponent).to_bytes(size or 4, "little")
+            modulus_bytes = modulus if isinstance(modulus, bytes) else int(modulus).to_bytes(size or 4, "little")
+            output_size = size or max(len(base_bytes), len(modulus_bytes))
+            result = pow(
+                int.from_bytes(base_bytes, "little"),
+                int.from_bytes(exponent_bytes, "little"),
+                int.from_bytes(modulus_bytes, "little"),
+            )
+            self._trace.add("crypto", "mod_exp", size=output_size, representation="little-endian")
+            return result.to_bytes(output_size, "little")
+        result = pow(base, exponent, modulus)
+        self._trace.add("crypto", "mod_exp", representation="integer")
+        return result
+
+    def verify_pkcs1_signature(
+        self, signature: bytes, public_key: Any, digest: bytes
+    ) -> bool:
+        key = _parse_rsa_public_key(public_key, len(signature))
+        if key["format"] == "xbox-rsa1":
+            signature_int = int.from_bytes(signature[: key["size"]], "little")
+            decrypted_int = pow(signature_int, key["exponent"], key["modulus"])
+            decrypted = decrypted_int.to_bytes(key["size"], "little")
+            result = _verify_xbox_pkcs1_sha1(decrypted, digest, key["modulus_size"])
+        else:
+            signature_int = int.from_bytes(signature, "big")
+            decrypted_int = pow(signature_int, key["exponent"], key["modulus"])
+            decrypted = decrypted_int.to_bytes(key["size"], "big")
+            result = _verify_pkcs1_v15_sha1(decrypted, digest)
+        self._trace.add(
+            "crypto",
+            "verify_pkcs1_signature",
+            digest_bytes=len(digest),
+            signature_bytes=len(signature),
+            public_key_format=key["format"],
+            result=result,
+        )
+        return result
+
+    def key_table(self, cipher: int, key: bytes) -> dict[str, Any]:
+        if cipher:
+            if len(key) < 16:
+                raise XboxRuntimeError("3DES key table needs at least 16 key bytes")
+            keys = (key[:8], key[8:16], key[:8])
+            algorithm = "3des-ede2"
+        else:
+            if len(key) < 8:
+                raise XboxRuntimeError("DES key table needs at least 8 key bytes")
+            keys = (key[:8],)
+            algorithm = "des"
+        table = {
+            "cipher": cipher,
+            "algorithm": algorithm,
+            "keys": keys,
+            "key_bytes": len(key),
+        }
+        self._trace.add(
+            "crypto", "key_table", cipher=cipher, algorithm=algorithm, key_bytes=len(key)
+        )
+        return table
+
+    def block_crypt_cbc(
+        self,
+        key_table: dict[str, Any],
+        iv: bytes,
+        payload: bytes,
+        operation: int = 1,
+    ) -> bytes:
+        keys = key_table["keys"]
+        output, feedback, invalid_length = _des_cbc_crypt(
+            payload, keys, iv, decrypt=operation == 0
+        )
+        key_table["feedback"] = feedback
+        self._trace.add(
+            "crypto",
+            "block_crypt_cbc",
+            bytes=len(payload),
+            algorithm=key_table.get("algorithm"),
+            crypto_operation=operation,
+            invalid_length=invalid_length,
+        )
+        return output
 
 
 class XboxRuntimeShims:
@@ -999,9 +1850,19 @@ class XboxRuntimeShims:
         self.graphics = XboxGraphicsShim(self.trace, self.memory)
         self.audio = XboxAudioShim(self.trace, self.handles)
         self.crypto = XboxCryptoShim(self.trace)
-        self._next_target = self.config.host_stub_base
+        self._next_target = self.config.host_target_base
         self._registered: dict[int, RuntimeShim] = {}
         self._irql = 0
+        self._devices: dict[str, DeviceObject] = {}
+        self._symbolic_links: dict[str, str] = {
+            "\\??\\D:": "\\Device\\Cdrom0",
+            "\\Device\\Cdrom0": str(self.config.extracted_disc_root or "D:\\"),
+        }
+        self._nonvolatile_settings: dict[int, Any] = {
+            0x00000001: 0,
+            0x00000002: 0,
+        }
+        self._kernel_variables = self._build_kernel_variables()
 
     @property
     def registered_shims(self) -> tuple[RuntimeShim, ...]:
@@ -1011,8 +1872,6 @@ class XboxRuntimeShims:
         self,
         resolver: ImportResolver,
         imported_ordinals: Iterable[int] | None = None,
-        *,
-        include_placeholders: bool = True,
     ) -> tuple[RuntimeShim, ...]:
         ordinals = (
             sorted(set(imported_ordinals))
@@ -1023,11 +1882,11 @@ class XboxRuntimeShims:
         for ordinal in ordinals:
             name = KERNEL_EXPORT_NAMES.get(ordinal, f"ordinal_{ordinal:04d}")
             handler_info = _IMPLEMENTED_KERNEL_HANDLERS.get(name)
-            if handler_info is None and not include_placeholders:
-                continue
-            handler_name, behavior = (
-                handler_info if handler_info is not None else ("unimplemented_kernel_call", "stub")
-            )
+            if handler_info is None:
+                raise XboxRuntimeError(
+                    f"no behavior model registered for kernel import {ordinal} ({name})"
+                )
+            handler_name, behavior = handler_info
             subsystem = _kernel_import_subsystem(name)
             handler = self._handler_for_registered_shim(name, handler_name, subsystem)
             target = self._allocate_host_target()
@@ -1062,26 +1921,47 @@ class XboxRuntimeShims:
             import_info["ordinal"] for import_info in info["kernel_imports"]["imports"]
         )
 
+    def _build_kernel_variables(self) -> dict[str, KernelVariable]:
+        return {
+            "ExEventObjectType": KernelVariable("ExEventObjectType", "Event", "OBJECT_TYPE"),
+            "IoFileObjectType": KernelVariable("IoFileObjectType", "File", "OBJECT_TYPE"),
+            "PsThreadObjectType": KernelVariable("PsThreadObjectType", "Thread", "OBJECT_TYPE"),
+            "HalDiskCachePartitionCount": KernelVariable("HalDiskCachePartitionCount", 0, "ULONG"),
+            "HalDiskModelNumber": KernelVariable("HalDiskModelNumber", "B2_RECOMP_DISC", "STRING"),
+            "HalDiskSerialNumber": KernelVariable("HalDiskSerialNumber", "B2RECOMP0001", "STRING"),
+            "HalBootSMCVideoMode": KernelVariable("HalBootSMCVideoMode", 0, "ULONG"),
+            "LaunchDataPage": KernelVariable("LaunchDataPage", {"launch_type": "cold"}, "PLAUNCH_DATA_PAGE"),
+            "IdexChannelObject": KernelVariable("IdexChannelObject", {"channel": "dvd"}, "IDE_CHANNEL_OBJECT"),
+            "XePublicKeyData": KernelVariable("XePublicKeyData", b"\x00" * 284, "UCHAR[]"),
+            "XboxHDKey": KernelVariable("XboxHDKey", b"\x00" * 16, "XBOX_KEY_DATA"),
+            "XboxLANKey": KernelVariable("XboxLANKey", b"\x00" * 16, "XBOX_KEY_DATA"),
+            "XboxSignatureKey": KernelVariable("XboxSignatureKey", b"\x00" * 16, "XBOX_KEY_DATA"),
+            "XboxAlternateSignatureKeys": KernelVariable(
+                "XboxAlternateSignatureKeys", [b"\x00" * 16 for _ in range(16)], "XBOX_KEY_DATA[]"
+            ),
+            "XboxHardwareInfo": KernelVariable(
+                "XboxHardwareInfo",
+                {"flags": 0, "gpu_revision": 0, "memory_megabytes": 64, "emulated": True},
+                "XBOX_HARDWARE_INFO",
+            ),
+            "XboxKrnlVersion": KernelVariable(
+                "XboxKrnlVersion", {"major": 1, "minor": 0, "build": 5838, "qfe": 0}, "XBOX_KRNL_VERSION"
+            ),
+        }
+
     def _handler_for_registered_shim(
         self, name: str, handler_name: str, subsystem: str
     ) -> Callable[..., Any]:
-        if handler_name == "generic_success":
-            return lambda *args, **kwargs: self.generic_success(
-                name, subsystem, *args, **kwargs
-            )
+        if handler_name == "kernel_variable":
+            return lambda *args, **kwargs: self.kernel_variable(name)
         return getattr(self, handler_name)
 
-    def generic_success(
-        self, name: str, subsystem: str, *args: Any, **kwargs: Any
-    ) -> int:
-        self.trace.add(
-            subsystem,
-            name,
-            "modeled",
-            arg_count=len(args),
-            kwarg_names=sorted(kwargs),
-        )
-        return XboxStatus.SUCCESS
+    def kernel_variable(self, name: str) -> Any:
+        variable = self._kernel_variables.get(name)
+        if variable is None:
+            raise XboxRuntimeError(f"unknown kernel variable export: {name}")
+        self.trace.add("loader", "kernel_variable", name=name, variable=variable)
+        return variable.value
 
     def dbg_print(self, message: str = "", *args: Any) -> int:
         formatted = message % args if args else message
@@ -1096,6 +1976,24 @@ class XboxRuntimeShims:
 
     def ex_free_pool(self, address: int) -> int:
         return self.memory.free(address)
+
+    def ex_query_pool_block_size(self, address: int) -> dict[str, Any]:
+        return self.memory.query_allocation_size(address)
+
+    def ex_query_nonvolatile_setting(self, setting_id: int) -> dict[str, Any]:
+        if setting_id not in self._nonvolatile_settings:
+            self.trace.add(
+                "hardware",
+                "query_nonvolatile_setting",
+                "not_found",
+                setting_id=setting_id,
+            )
+            return {"status": XboxStatus.OBJECT_NAME_NOT_FOUND, "value": None}
+        value = self._nonvolatile_settings[setting_id]
+        self.trace.add(
+            "hardware", "query_nonvolatile_setting", setting_id=setting_id, value=value
+        )
+        return {"status": XboxStatus.SUCCESS, "value": value}
 
     def mm_allocate_contiguous_memory(self, size: int) -> int:
         return self.memory.allocate_contiguous_memory(size)
@@ -1112,6 +2010,33 @@ class XboxRuntimeShims:
     def mm_claim_gpu_instance_memory(self, size: int = 0x100000) -> int:
         return self.graphics.claim_gpu_instance_memory(size)
 
+    def mm_query_allocation_size(self, address: int) -> dict[str, Any]:
+        return self.memory.query_allocation_size(address)
+
+    def mm_query_address_protect(self, address: int) -> dict[str, Any]:
+        return self.memory.query_protection(address)
+
+    def mm_query_statistics(self) -> dict[str, Any]:
+        return self.memory.query_statistics()
+
+    def mm_lock_unlock_buffer_pages(
+        self, address: int, size: int, lock: bool = True
+    ) -> int:
+        return self.memory.lock_unlock_buffer_pages(address, size, lock)
+
+    def mm_persist_contiguous_memory(
+        self, address: int, size: int, persist: bool = True
+    ) -> int:
+        return self.memory.persist_contiguous_memory(address, size, persist)
+
+    def mm_map_io_space(
+        self, physical_address: int, size: int, protection: str = "rw"
+    ) -> int:
+        return self.memory.map_io_space(physical_address, size, protection)
+
+    def mm_unmap_io_space(self, address: int, size: int | None = None) -> int:
+        return self.memory.unmap_io_space(address, size)
+
     def nt_allocate_virtual_memory(self, size: int, protection: str = "rw") -> int:
         return self.memory.allocate_system_memory(size, protection)
 
@@ -1125,6 +2050,116 @@ class XboxRuntimeShims:
         self, address: int, size: int, protection: str
     ) -> dict[str, Any]:
         return self.memory.protect(address, size, protection)
+
+    def io_create_device(
+        self, name: str | None = None, device_type: int = 0
+    ) -> dict[str, Any]:
+        device = DeviceObject(name, device_type)
+        handle = self.handles.allocate("device", device)
+        if name:
+            self._devices[name] = device
+        self.trace.add(
+            "filesystem",
+            "create_device",
+            handle=handle,
+            name=name,
+            device_type=device_type,
+        )
+        return {"status": XboxStatus.SUCCESS, "handle": handle}
+
+    def io_delete_device(self, handle_or_name: int | str) -> int:
+        device: DeviceObject | None = None
+        if isinstance(handle_or_name, int):
+            try:
+                device = self.handles.get(handle_or_name, "device")
+            except XboxRuntimeError:
+                return XboxStatus.INVALID_HANDLE
+        else:
+            device = self._devices.get(handle_or_name)
+        if device is None:
+            return XboxStatus.OBJECT_NAME_NOT_FOUND
+        device.deleted = True
+        self.trace.add("filesystem", "delete_device", device=device)
+        return XboxStatus.SUCCESS
+
+    def io_create_symbolic_link(self, link_name: str, target_name: str) -> int:
+        self._symbolic_links[link_name] = target_name
+        self.trace.add(
+            "filesystem",
+            "create_symbolic_link",
+            link_name=link_name,
+            target_name=target_name,
+        )
+        return XboxStatus.SUCCESS
+
+    def io_delete_symbolic_link(self, link_name: str) -> int:
+        existed = link_name in self._symbolic_links
+        self._symbolic_links.pop(link_name, None)
+        self.trace.add(
+            "filesystem", "delete_symbolic_link", link_name=link_name, existed=existed
+        )
+        return XboxStatus.SUCCESS if existed else XboxStatus.OBJECT_NAME_NOT_FOUND
+
+    def io_build_synchronous_fsd_request(
+        self, major_function: str, target: Any = None
+    ) -> IoRequest:
+        request = IoRequest(major_function, target)
+        self.trace.add("filesystem", "build_synchronous_fsd_request", request=request)
+        return request
+
+    def io_invalid_device_request(self, request: IoRequest | None = None) -> int:
+        if request:
+            request.status = XboxStatus.INVALID_PARAMETER
+        self.trace.add("filesystem", "invalid_device_request", request=request)
+        return XboxStatus.INVALID_PARAMETER
+
+    def io_start_packet(self, device: Any = None, request: IoRequest | None = None) -> int:
+        self.trace.add("filesystem", "start_packet", device=device, request=request)
+        return XboxStatus.SUCCESS
+
+    def io_start_next_packet(self, device: Any = None) -> int:
+        self.trace.add("filesystem", "start_next_packet", device=device)
+        return XboxStatus.SUCCESS
+
+    def io_synchronous_fsd_request(
+        self, major_function: str, target: Any = None
+    ) -> IoRequest:
+        request = self.io_build_synchronous_fsd_request(major_function, target)
+        request.status = XboxStatus.SUCCESS
+        self.trace.add("filesystem", "synchronous_fsd_request", request=request)
+        return request
+
+    def io_synchronous_device_io_control_request(self, *args: Any, **kwargs: Any) -> int:
+        self.trace.add(
+            "filesystem",
+            "synchronous_device_io_control",
+            arg_count=len(args),
+            kwarg_names=sorted(kwargs),
+        )
+        return XboxStatus.SUCCESS
+
+    def iof_call_driver(self, device: Any = None, request: IoRequest | None = None) -> int:
+        if request:
+            request.status = XboxStatus.SUCCESS
+        self.trace.add("filesystem", "call_driver", device=device, request=request)
+        return XboxStatus.SUCCESS
+
+    def iof_complete_request(self, request: IoRequest | None = None, priority_boost: int = 0) -> int:
+        if request:
+            request.status = XboxStatus.SUCCESS
+        self.trace.add(
+            "filesystem",
+            "complete_request",
+            request=request,
+            priority_boost=priority_boost,
+        )
+        return XboxStatus.SUCCESS
+
+    def io_mark_irp_must_complete(self, request: IoRequest | None = None) -> int:
+        if request:
+            request.must_complete = True
+        self.trace.add("filesystem", "mark_irp_must_complete", request=request)
+        return XboxStatus.SUCCESS
 
     def nt_create_file(self, guest_path: str, mode: str = "rb") -> dict[str, Any]:
         return self.filesystem.open_file(guest_path, mode)
@@ -1140,6 +2175,38 @@ class XboxRuntimeShims:
     def nt_query_information_file(self, guest_path: str) -> dict[str, Any]:
         return self.filesystem.query_file_information(guest_path)
 
+    def nt_query_volume_information_file(self, guest_path: str = "D:\\") -> dict[str, Any]:
+        return self.filesystem.query_volume_information(guest_path)
+
+    def nt_query_directory_file(self, guest_path: str = "D:\\") -> dict[str, Any]:
+        return self.filesystem.list_directory(guest_path)
+
+    def nt_set_information_file(self, handle: int, information: dict[str, Any] | None = None) -> int:
+        self.trace.add(
+            "filesystem",
+            "set_information_file",
+            handle=handle,
+            information=information or {},
+        )
+        return XboxStatus.SUCCESS
+
+    def nt_write_file(
+        self, handle: int, payload: bytes, offset: int | None = None
+    ) -> dict[str, Any]:
+        return self.filesystem.write_file(handle, payload, offset=offset)
+
+    def nt_delete_file(self, guest_path: str) -> int:
+        return self.filesystem.delete_file(guest_path)
+
+    def nt_fs_control_file(self, *args: Any, **kwargs: Any) -> int:
+        self.trace.add(
+            "filesystem",
+            "fs_control_file",
+            arg_count=len(args),
+            kwarg_names=sorted(kwargs),
+        )
+        return XboxStatus.SUCCESS
+
     def nt_flush_buffers_file(self, handle: int) -> int:
         self.trace.add("filesystem", "flush_buffers_file", handle=handle)
         return XboxStatus.SUCCESS
@@ -1148,14 +2215,33 @@ class XboxRuntimeShims:
         self.trace.add(
             "filesystem",
             "device_io_control_file",
-            "stub",
+            "modeled",
             arg_count=len(args),
             kwarg_names=sorted(kwargs),
         )
         return XboxStatus.SUCCESS
 
+    def nt_open_symbolic_link_object(self, name: str) -> dict[str, Any]:
+        if name not in self._symbolic_links:
+            self.trace.add("filesystem", "open_symbolic_link", "not_found", name=name)
+            return {"status": XboxStatus.OBJECT_NAME_NOT_FOUND, "handle": None}
+        handle = self.handles.allocate(
+            "symbolic_link", {"name": name, "target": self._symbolic_links[name]}
+        )
+        self.trace.add(
+            "filesystem",
+            "open_symbolic_link",
+            name=name,
+            target=self._symbolic_links[name],
+            handle=handle,
+        )
+        return {"status": XboxStatus.SUCCESS, "handle": handle}
+
     def nt_query_symbolic_link_object(self, name: str | None = None) -> dict[str, Any]:
-        target = "D:\\" if not name or "Cdrom" in name or "D:" in name else None
+        if name in self._symbolic_links:
+            target = self._symbolic_links[name]
+        else:
+            target = "D:\\" if not name or "Cdrom" in name or "D:" in name else None
         status = XboxStatus.SUCCESS if target else XboxStatus.OBJECT_NAME_NOT_FOUND
         self.trace.add(
             "filesystem",
@@ -1168,6 +2254,50 @@ class XboxRuntimeShims:
 
     def nt_close(self, handle: int) -> int:
         return self.handles.close(handle)
+
+    def nt_yield_execution(self) -> int:
+        self.clock.advance_100ns(0)
+        self.trace.add("threading", "yield_execution")
+        return XboxStatus.SUCCESS
+
+    def ob_reference_object_by_handle(self, handle: int) -> dict[str, Any]:
+        try:
+            obj = self.handles.get(handle)
+        except XboxRuntimeError as exc:
+            return {"status": XboxStatus.INVALID_HANDLE, "object": None, "error": str(exc)}
+        self.trace.add("object_manager", "reference_by_handle", handle=handle)
+        return {"status": XboxStatus.SUCCESS, "object": obj}
+
+    def ob_reference_object_by_name(self, name: str) -> dict[str, Any]:
+        if name in self._devices:
+            obj: Any = self._devices[name]
+        elif name in self._symbolic_links:
+            obj = {"name": name, "target": self._symbolic_links[name]}
+        else:
+            self.trace.add("object_manager", "reference_by_name", "not_found", name=name)
+            return {"status": XboxStatus.OBJECT_NAME_NOT_FOUND, "object": None}
+        self.trace.add("object_manager", "reference_by_name", name=name, object=obj)
+        return {"status": XboxStatus.SUCCESS, "object": obj}
+
+    def obf_reference_object(self, obj: Any) -> Any:
+        self.trace.add("object_manager", "reference_object", object=obj)
+        return obj
+
+    def obf_dereference_object(self, obj: Any) -> int:
+        self.trace.add("object_manager", "dereference_object", object=obj)
+        return XboxStatus.SUCCESS
+
+    def ob_open_object_by_name(self, name: str) -> dict[str, Any]:
+        referenced = self.ob_reference_object_by_name(name)
+        if referenced["status"] != XboxStatus.SUCCESS:
+            return {"status": referenced["status"], "handle": None}
+        handle = self.handles.allocate("object", referenced["object"])
+        self.trace.add("object_manager", "open_object_by_name", name=name, handle=handle)
+        return {"status": XboxStatus.SUCCESS, "handle": handle}
+
+    def ob_make_temporary_object(self, obj: Any) -> int:
+        self.trace.add("object_manager", "make_temporary_object", object=obj)
+        return XboxStatus.SUCCESS
 
     def ke_query_performance_counter(self) -> int:
         return self.clock.query_performance_counter()
@@ -1214,6 +2344,16 @@ class XboxRuntimeShims:
         self._irql = max(irql, 0)
         self.trace.add("threading", "lower_irql", previous=previous, irql=self._irql)
         return XboxStatus.SUCCESS
+
+    def kf_raise_irql(self, irql: int) -> int:
+        previous = self._irql
+        self._irql = max(irql, self._irql)
+        self.trace.add("threading", "raise_irql", previous=previous, irql=self._irql)
+        return previous
+
+    def ke_get_current_irql(self) -> int:
+        self.trace.add("threading", "get_current_irql", irql=self._irql)
+        return self._irql
 
     def nt_create_event(
         self, manual_reset: bool = True, initial_state: bool = False
@@ -1271,12 +2411,20 @@ class XboxRuntimeShims:
     def nt_create_timer(self) -> int:
         return self.sync.create_timer()
 
+    def ke_initialize_timer_ex(self) -> TimerObject:
+        return self.sync.initialize_timer()
+
     def nt_set_timer(self, handle: int, due_time_100ns: int, period_ms: int = 0) -> int:
         return self.sync.set_timer(handle, due_time_100ns, period_ms)
 
+    def ke_set_timer(self, handle: int, due_time_100ns: int) -> int:
+        return self.sync.set_timer(handle, due_time_100ns, 0)
+
     def nt_cancel_timer(self, handle: int) -> int:
-        self.trace.add("threading", "cancel_timer", handle=handle)
-        return XboxStatus.SUCCESS
+        return self.sync.cancel_timer(handle)
+
+    def ke_cancel_timer(self, handle: int) -> int:
+        return self.sync.cancel_timer(handle)
 
     def nt_query_event(self, handle: int) -> dict[str, Any]:
         self.trace.add("threading", "query_event", handle=handle)
@@ -1285,6 +2433,9 @@ class XboxRuntimeShims:
     def nt_query_timer(self, handle: int) -> dict[str, Any]:
         self.trace.add("threading", "query_timer", handle=handle)
         return {"status": XboxStatus.SUCCESS, "handle": handle}
+
+    def nt_set_system_time(self, filetime: int) -> int:
+        return self.clock.set_system_time(filetime)
 
     def ps_create_system_thread(
         self,
@@ -1304,6 +2455,61 @@ class XboxRuntimeShims:
 
     def nt_resume_thread(self, handle: int) -> int:
         return self.sync.resume_thread(handle)
+
+    def ps_terminate_system_thread(self, status: int = XboxStatus.SUCCESS) -> int:
+        return self.sync.terminate_thread(status=status)
+
+    def ke_set_base_priority_thread(self, handle: int, priority: int) -> int:
+        return self.sync.set_thread_priority(handle, priority, base=True)
+
+    def ke_set_priority_thread(self, handle: int, priority: int) -> int:
+        return self.sync.set_thread_priority(handle, priority, base=False)
+
+    def ke_set_disable_boost_thread(self, handle: int, disable: bool) -> int:
+        return self.sync.set_thread_disable_boost(handle, disable)
+
+    def ke_initialize_dpc(
+        self, dpc_id: int, routine: int | None = None, context: int | None = None
+    ) -> DpcObject:
+        return self.sync.initialize_dpc(dpc_id, routine, context)
+
+    def ke_insert_queue_dpc(self, dpc_id: int) -> bool:
+        return self.sync.insert_queue_dpc(dpc_id)
+
+    def ke_remove_queue_dpc(self, dpc_id: int) -> bool:
+        return self.sync.remove_queue_dpc(dpc_id)
+
+    def ke_initialize_interrupt(
+        self, interrupt_id: int, vector: int, service_routine: int | None = None
+    ) -> InterruptObject:
+        return self.sync.initialize_interrupt(interrupt_id, vector, service_routine)
+
+    def ke_connect_interrupt(self, interrupt_id: int) -> bool:
+        return self.sync.connect_interrupt(interrupt_id)
+
+    def ke_disconnect_interrupt(self, interrupt_id: int) -> bool:
+        return self.sync.disconnect_interrupt(interrupt_id)
+
+    def ke_synchronize_execution(
+        self, interrupt_id: int, routine: Callable[..., Any] | None = None
+    ) -> Any:
+        return self.sync.synchronize_execution(interrupt_id, routine)
+
+    def ke_bug_check(self, code: int = 0, *parameters: int) -> int:
+        return self.sync.bugcheck(code, *parameters)
+
+    def ke_restore_floating_point_state(self, state: dict[str, Any] | None = None) -> int:
+        self.trace.add("threading", "restore_floating_point_state", state=state or {})
+        return XboxStatus.SUCCESS
+
+    def ke_save_floating_point_state(self) -> dict[str, Any]:
+        state = {"control_word": 0x037F, "status_word": 0}
+        self.trace.add("threading", "save_floating_point_state", state=state)
+        return state
+
+    def ke_test_alert_thread(self, mode: int = 0) -> bool:
+        self.trace.add("threading", "test_alert_thread", mode=mode, alert=False)
+        return False
 
     def ps_query_statistics(self) -> dict[str, Any]:
         snapshot = self.handles.snapshot()
@@ -1351,6 +2557,71 @@ class XboxRuntimeShims:
         )
         return encoded
 
+    def rtl_ansi_string_to_unicode_string(self, data: bytes | str) -> str:
+        if isinstance(data, bytes):
+            text = data.decode("ascii", errors="replace")
+        else:
+            text = data
+        self.trace.add("runtime", "ansi_to_unicode", input_length=len(data), text=text)
+        return text
+
+    def rtl_compare_memory_ulong(self, payload: bytes, pattern: int) -> int:
+        pattern_bytes = (pattern & 0xFFFFFFFF).to_bytes(4, "little")
+        matched = 0
+        for offset in range(0, len(payload) - 3, 4):
+            if payload[offset : offset + 4] != pattern_bytes:
+                break
+            matched += 4
+        self.trace.add(
+            "runtime",
+            "compare_memory_ulong",
+            bytes=len(payload),
+            pattern=pattern,
+            matched=matched,
+        )
+        return matched
+
+    def rtl_time_fields_to_time(
+        self,
+        year: int,
+        month: int,
+        day: int,
+        hour: int = 0,
+        minute: int = 0,
+        second: int = 0,
+        milliseconds: int = 0,
+    ) -> int:
+        value = dt.datetime(
+            year, month, day, hour, minute, second, milliseconds * 1000, tzinfo=dt.UTC
+        )
+        unix_100ns = int(value.timestamp() * 10_000_000)
+        filetime = unix_100ns + 116444736000000000
+        self.trace.add("runtime", "time_fields_to_time", filetime=filetime)
+        return filetime
+
+    def rtl_time_to_time_fields(self, filetime: int) -> dict[str, int]:
+        timestamp = (filetime - 116444736000000000) / 10_000_000
+        value = dt.datetime.fromtimestamp(timestamp, tz=dt.UTC)
+        fields = {
+            "year": value.year,
+            "month": value.month,
+            "day": value.day,
+            "hour": value.hour,
+            "minute": value.minute,
+            "second": value.second,
+            "milliseconds": value.microsecond // 1000,
+        }
+        self.trace.add("runtime", "time_to_time_fields", filetime=filetime, fields=fields)
+        return fields
+
+    def rtl_raise_exception(self, exception: Any = None) -> int:
+        self.trace.add("runtime", "raise_exception", "exception", exception=exception)
+        return XboxStatus.SUCCESS
+
+    def rtl_unwind(self, target_frame: int | None = None, target_ip: int | None = None) -> int:
+        self.trace.add("runtime", "unwind", target_frame=target_frame, target_ip=target_ip)
+        return XboxStatus.SUCCESS
+
     def av_set_display_mode(
         self,
         width: int = 640,
@@ -1388,6 +2659,117 @@ class XboxRuntimeShims:
     def xbox_zero_key(self) -> bytes:
         self.trace.add("hardware", "xbox_zero_key")
         return b"\x00" * 16
+
+    def xc_sha_init(self) -> ShaContext:
+        return self.crypto.sha_init()
+
+    def xc_sha_update(self, context: ShaContext, payload: bytes) -> int:
+        return self.crypto.sha_update(context, payload)
+
+    def xc_sha_final(self, context: ShaContext) -> bytes:
+        return self.crypto.sha_final(context)
+
+    def xc_rc4_key(self, key: bytes) -> Rc4Key:
+        return self.crypto.rc4_key(key)
+
+    def xc_rc4_crypt(self, key: Rc4Key | bytes, payload: bytes) -> bytes:
+        return self.crypto.rc4_crypt(key, payload)
+
+    def xc_hmac(self, key: bytes, payload: bytes, payload2: bytes = b"") -> bytes:
+        return self.crypto.hmac_sha1(key, payload, payload2)
+
+    def xc_des_key_parity(self, key: bytes) -> bytes:
+        return self.crypto.des_key_parity(key)
+
+    def xc_key_table(
+        self, cipher: int | bytes, key: bytes | None = None
+    ) -> dict[str, Any]:
+        if isinstance(cipher, bytes) and key is None:
+            return self.crypto.key_table(0, cipher)
+        if not isinstance(cipher, int) or key is None:
+            raise XboxRuntimeError("XcKeyTable requires a cipher id and key bytes")
+        return self.crypto.key_table(cipher, key)
+
+    def xc_block_crypt_cbc(
+        self,
+        key_table: dict[str, Any],
+        iv: bytes,
+        payload: bytes,
+        operation: int = 1,
+    ) -> bytes:
+        return self.crypto.block_crypt_cbc(key_table, iv, payload, operation)
+
+    def xc_mod_exp(
+        self,
+        base: int | bytes,
+        exponent: int | bytes,
+        modulus: int | bytes,
+        size: int | None = None,
+    ) -> int | bytes:
+        return self.crypto.mod_exp(base, exponent, modulus, size)
+
+    def xc_verify_pkcs1_signature(
+        self, signature: bytes, public_key: Any, digest: bytes
+    ) -> bool:
+        return self.crypto.verify_pkcs1_signature(signature, public_key, digest)
+
+    def hal_disk_cache_partition_count(self) -> int:
+        value = self._kernel_variables["HalDiskCachePartitionCount"].value
+        self.trace.add("hardware", "disk_cache_partition_count", value=value)
+        return value
+
+    def hal_disk_model_number(self) -> str:
+        value = self._kernel_variables["HalDiskModelNumber"].value
+        self.trace.add("hardware", "disk_model_number", value=value)
+        return value
+
+    def hal_disk_serial_number(self) -> str:
+        value = self._kernel_variables["HalDiskSerialNumber"].value
+        self.trace.add("hardware", "disk_serial_number", value=value)
+        return value
+
+    def hal_get_interrupt_vector(self, bus_interrupt_level: int = 0, bus_interrupt_vector: int = 0) -> int:
+        vector = 0x20 + ((bus_interrupt_level or bus_interrupt_vector) & 0x1F)
+        self.trace.add(
+            "hardware",
+            "get_interrupt_vector",
+            bus_interrupt_level=bus_interrupt_level,
+            bus_interrupt_vector=bus_interrupt_vector,
+            vector=vector,
+        )
+        return vector
+
+    def hal_read_write_pci_space(
+        self, bus: int, slot: int, offset: int, payload: bytes | None = None
+    ) -> bytes:
+        result = payload if payload is not None else b"\x00" * 4
+        self.trace.add(
+            "hardware",
+            "read_write_pci_space",
+            bus=bus,
+            slot=slot,
+            offset=offset,
+            bytes=len(result),
+            write=payload is not None,
+        )
+        return result
+
+    def hal_register_shutdown_notification(self, callback: int | None = None) -> int:
+        self.trace.add("hardware", "register_shutdown_notification", callback=callback)
+        return XboxStatus.SUCCESS
+
+    def hal_return_to_firmware(self, routine: int = 0) -> int:
+        self.trace.add("hardware", "return_to_firmware", routine=routine)
+        return XboxStatus.SUCCESS
+
+    def phy_get_link_state(self) -> dict[str, Any]:
+        state = {"status": XboxStatus.SUCCESS, "link_up": False, "speed_mbps": 0}
+        self.trace.add("hardware", "phy_get_link_state", state=state)
+        return state
+
+    def phy_initialize(self) -> int:
+        self.trace.add("hardware", "phy_initialize")
+        return XboxStatus.SUCCESS
 
     def rtl_fill_memory(self, address: int, size: int, value: int) -> int:
         self.memory.fill(address, value, size)
@@ -1435,16 +2817,6 @@ class XboxRuntimeShims:
         self.trace.add("hardware", "initiate_shutdown")
         return XboxStatus.SUCCESS
 
-    def unimplemented_kernel_call(self, *args: Any, **kwargs: Any) -> int:
-        self.trace.add(
-            "loader",
-            "unimplemented_kernel_call",
-            "stub",
-            arg_count=len(args),
-            kwarg_names=sorted(kwargs),
-        )
-        return XboxStatus.NOT_IMPLEMENTED
-
     def summary(self) -> dict[str, Any]:
         behavior_counts = Counter(shim.behavior for shim in self._registered.values())
         subsystem_counts = Counter(shim.subsystem for shim in self._registered.values())
@@ -1465,7 +2837,7 @@ class XboxRuntimeShims:
 
     def _allocate_host_target(self) -> int:
         target = self._next_target
-        self._next_target += self.config.host_stub_stride
+        self._next_target += self.config.host_target_stride
         if target > 0xFFFFFFFF:
             raise XboxRuntimeError("host shim target address space exhausted")
         return target
@@ -1481,119 +2853,160 @@ _IMPLEMENTED_KERNEL_HANDLERS: dict[str, tuple[str, str]] = {
     "AvSetDisplayMode": _handler("av_set_display_mode"),
     "AvSetSavedDataAddress": _handler("av_set_saved_data_address"),
     "DbgPrint": _handler("dbg_print"),
-    "ExAllocatePool": _handler("ex_allocate_pool"),
     "ExAllocatePoolWithTag": _handler("ex_allocate_pool_with_tag"),
+    "ExEventObjectType": _handler("kernel_variable", "data"),
     "ExFreePool": _handler("ex_free_pool"),
-    "ExQueryNonVolatileSetting": _handler("generic_success"),
-    "IoCreateFile": _handler("nt_create_file"),
-    "IoDeleteDevice": _handler("generic_success"),
-    "IoSynchronousDeviceIoControlRequest": _handler("nt_device_io_control_file", "stub"),
+    "ExQueryNonVolatileSetting": _handler("ex_query_nonvolatile_setting"),
+    "ExQueryPoolBlockSize": _handler("ex_query_pool_block_size"),
+    "HalBootSMCVideoMode": _handler("kernel_variable", "data"),
+    "HalDiskCachePartitionCount": _handler("kernel_variable", "data"),
+    "HalDiskModelNumber": _handler("kernel_variable", "data"),
+    "HalDiskSerialNumber": _handler("kernel_variable", "data"),
+    "HalGetInterruptVector": _handler("hal_get_interrupt_vector"),
+    "HalInitiateShutdown": _handler("hal_initiate_shutdown"),
+    "HalIsResetOrShutdownPending": _handler("hal_is_reset_or_shutdown_pending"),
+    "HalReadWritePCISpace": _handler("hal_read_write_pci_space"),
+    "HalRegisterShutdownNotification": _handler("hal_register_shutdown_notification"),
+    "HalReturnToFirmware": _handler("hal_return_to_firmware"),
+    "IdexChannelObject": _handler("kernel_variable", "data"),
+    "IoBuildSynchronousFsdRequest": _handler("io_build_synchronous_fsd_request"),
+    "IoCreateDevice": _handler("io_create_device"),
+    "IoCreateSymbolicLink": _handler("io_create_symbolic_link"),
+    "IoDeleteSymbolicLink": _handler("io_delete_symbolic_link"),
+    "IoFileObjectType": _handler("kernel_variable", "data"),
+    "IoInvalidDeviceRequest": _handler("io_invalid_device_request"),
+    "IoMarkIrpMustComplete": _handler("io_mark_irp_must_complete"),
+    "IoStartNextPacket": _handler("io_start_next_packet"),
+    "IoStartPacket": _handler("io_start_packet"),
+    "IoSynchronousDeviceIoControlRequest": _handler("io_synchronous_device_io_control_request"),
+    "IoSynchronousFsdRequest": _handler("io_synchronous_fsd_request"),
+    "IofCallDriver": _handler("iof_call_driver"),
+    "IofCompleteRequest": _handler("iof_complete_request"),
+    "KeBugCheck": _handler("ke_bug_check"),
+    "KeCancelTimer": _handler("ke_cancel_timer"),
+    "KeConnectInterrupt": _handler("ke_connect_interrupt"),
     "KeDelayExecutionThread": _handler("ke_delay_execution_thread"),
-    "KeGetCurrentThread": _handler("ke_get_current_thread"),
-    "KeInitializeApc": _handler("generic_success"),
-    "KeInitializeDpc": _handler("generic_success"),
-    "KeInitializeSemaphore": _handler("generic_success"),
-    "KeLeaveCriticalRegion": _handler("generic_success"),
-    "KeQueryInterruptTime": _handler("ke_query_interrupt_time"),
+    "KeDisconnectInterrupt": _handler("ke_disconnect_interrupt"),
+    "KeInitializeDpc": _handler("ke_initialize_dpc"),
+    "KeInitializeInterrupt": _handler("ke_initialize_interrupt"),
+    "KeInitializeTimerEx": _handler("ke_initialize_timer_ex"),
+    "KeInsertQueueDpc": _handler("ke_insert_queue_dpc"),
     "KeQueryPerformanceCounter": _handler("ke_query_performance_counter"),
     "KeQueryPerformanceFrequency": _handler("ke_query_performance_frequency"),
     "KeQuerySystemTime": _handler("ke_query_system_time"),
     "KeRaiseIrqlToDpcLevel": _handler("ke_raise_irql_to_dpc_level"),
-    "KeRaiseIrqlToSynchLevel": _handler("ke_raise_irql_to_synch_level"),
-    "KeReleaseMutant": _handler("generic_success"),
-    "KeReleaseSemaphore": _handler("nt_release_semaphore"),
-    "KeResetEvent": _handler("ke_reset_event"),
+    "KeRemoveQueueDpc": _handler("ke_remove_queue_dpc"),
+    "KeRestoreFloatingPointState": _handler("ke_restore_floating_point_state"),
+    "KeSaveFloatingPointState": _handler("ke_save_floating_point_state"),
+    "KeSetBasePriorityThread": _handler("ke_set_base_priority_thread"),
     "KeSetEvent": _handler("ke_set_event"),
-    "KeSetDisableBoostThread": _handler("generic_success"),
-    "KeSetPriorityProcess": _handler("generic_success"),
-    "KeSetPriorityThread": _handler("generic_success"),
+    "KeSetTimer": _handler("ke_set_timer"),
     "KeSetTimerEx": _handler("nt_set_timer"),
-    "KeSaveFloatingPointState": _handler("generic_success"),
     "KeStallExecutionProcessor": _handler("ke_stall_execution_processor"),
-    "KeSystemTime": _handler("ke_system_time"),
-    "KeTestAlertThread": _handler("generic_success"),
+    "KeSynchronizeExecution": _handler("ke_synchronize_execution"),
     "KeTickCount": _handler("ke_tick_count"),
     "KeWaitForMultipleObjects": _handler("ke_wait_for_multiple_objects"),
     "KeWaitForSingleObject": _handler("nt_wait_for_single_object"),
     "KfLowerIrql": _handler("kf_lower_irql"),
-    "KiUnlockDispatcherDatabase": _handler("generic_success"),
+    "KfRaiseIrql": _handler("kf_raise_irql"),
+    "LaunchDataPage": _handler("kernel_variable", "data"),
     "MmAllocateContiguousMemory": _handler("mm_allocate_contiguous_memory"),
     "MmAllocateContiguousMemoryEx": _handler("mm_allocate_contiguous_memory"),
-    "MmAllocateSystemMemory": _handler("mm_allocate_system_memory"),
     "MmClaimGpuInstanceMemory": _handler("mm_claim_gpu_instance_memory"),
     "MmFreeContiguousMemory": _handler("ex_free_pool"),
-    "MmFreeSystemMemory": _handler("mm_free_system_memory"),
     "MmGetPhysicalAddress": _handler("mm_get_physical_address"),
-    "MmQueryAllocationSize": _handler("nt_query_virtual_memory"),
+    "MmLockUnlockBufferPages": _handler("mm_lock_unlock_buffer_pages"),
+    "MmLockUnlockPhysicalPage": _handler("mm_lock_unlock_buffer_pages"),
+    "MmPersistContiguousMemory": _handler("mm_persist_contiguous_memory"),
+    "MmQueryAddressProtect": _handler("mm_query_address_protect"),
+    "MmQueryAllocationSize": _handler("mm_query_allocation_size"),
+    "MmQueryStatistics": _handler("mm_query_statistics"),
     "MmSetAddressProtect": _handler("nt_protect_virtual_memory"),
-    "MmUnmapIoSpace": _handler("generic_success"),
     "NtAllocateVirtualMemory": _handler("nt_allocate_virtual_memory"),
-    "NtCancelTimer": _handler("nt_cancel_timer"),
     "NtClose": _handler("nt_close"),
-    "NtCreateDirectoryObject": _handler("generic_success"),
     "NtCreateEvent": _handler("nt_create_event"),
     "NtCreateFile": _handler("nt_create_file"),
     "NtCreateSemaphore": _handler("nt_create_semaphore"),
-    "NtCreateTimer": _handler("nt_create_timer"),
-    "NtDeviceIoControlFile": _handler("nt_device_io_control_file", "stub"),
+    "NtDeleteFile": _handler("nt_delete_file"),
+    "NtDeviceIoControlFile": _handler("nt_device_io_control_file"),
     "NtFlushBuffersFile": _handler("nt_flush_buffers_file"),
     "NtFreeVirtualMemory": _handler("nt_free_virtual_memory"),
+    "NtFsControlFile": _handler("nt_fs_control_file"),
     "NtOpenFile": _handler("nt_open_file"),
-    "NtProtectVirtualMemory": _handler("nt_protect_virtual_memory"),
-    "NtQueryFullAttributesFile": _handler("nt_query_information_file"),
-    "NtQueryEvent": _handler("nt_query_event"),
+    "NtOpenSymbolicLinkObject": _handler("nt_open_symbolic_link_object"),
+    "NtQueryDirectoryFile": _handler("nt_query_directory_file"),
     "NtQueryInformationFile": _handler("nt_query_information_file"),
     "NtQuerySymbolicLinkObject": _handler("nt_query_symbolic_link_object"),
-    "NtQueryTimer": _handler("nt_query_timer"),
     "NtQueryVirtualMemory": _handler("nt_query_virtual_memory"),
-    "NtQueueApcThread": _handler("generic_success"),
+    "NtQueryVolumeInformationFile": _handler("nt_query_volume_information_file"),
     "NtReadFile": _handler("nt_read_file"),
     "NtReleaseSemaphore": _handler("nt_release_semaphore"),
-    "NtRemoveIoCompletion": _handler("generic_success"),
     "NtSetEvent": _handler("ke_set_event"),
+    "NtSetInformationFile": _handler("nt_set_information_file"),
+    "NtSetSystemTime": _handler("nt_set_system_time"),
     "NtSetTimerEx": _handler("nt_set_timer"),
-    "NtSuspendThread": _handler("nt_suspend_thread"),
     "NtWaitForSingleObject": _handler("nt_wait_for_single_object"),
     "NtWaitForSingleObjectEx": _handler("nt_wait_for_single_object"),
-    "NtWaitForMultipleObjectsEx": _handler("ke_wait_for_multiple_objects"),
-    "ObMakeTemporaryObject": _handler("generic_success"),
-    "ObOpenObjectByName": _handler("generic_success"),
-    "ObReferenceObjectByHandle": _handler("generic_success"),
-    "ObReferenceObjectByPointer": _handler("generic_success"),
-    "ObSymbolicLinkObjectType": _handler("generic_success"),
-    "ObfReferenceObject": _handler("generic_success"),
-    "PsCreateSystemThread": _handler("ps_create_system_thread"),
+    "NtWriteFile": _handler("nt_write_file"),
+    "NtYieldExecution": _handler("nt_yield_execution"),
+    "ObReferenceObjectByHandle": _handler("ob_reference_object_by_handle"),
+    "ObReferenceObjectByName": _handler("ob_reference_object_by_name"),
+    "ObfDereferenceObject": _handler("obf_dereference_object"),
+    "PhyGetLinkState": _handler("phy_get_link_state"),
+    "PhyInitialize": _handler("phy_initialize"),
     "PsCreateSystemThreadEx": _handler("ps_create_system_thread"),
-    "PsQueryStatistics": _handler("ps_query_statistics"),
+    "PsTerminateSystemThread": _handler("ps_terminate_system_thread"),
+    "PsThreadObjectType": _handler("kernel_variable", "data"),
+    "RtlAnsiStringToUnicodeString": _handler("rtl_ansi_string_to_unicode_string"),
+    "RtlCompareMemoryUlong": _handler("rtl_compare_memory_ulong"),
     "RtlEnterCriticalSection": _handler("rtl_enter_critical_section"),
     "RtlEqualString": _handler("rtl_equal_string"),
-    "RtlFillMemory": _handler("rtl_fill_memory"),
     "RtlInitAnsiString": _handler("rtl_init_ansi_string"),
     "RtlInitializeCriticalSection": _handler("rtl_initialize_critical_section"),
     "RtlLeaveCriticalSection": _handler("rtl_leave_critical_section"),
-    "RtlMoveMemory": _handler("rtl_move_memory"),
     "RtlNtStatusToDosError": _handler("rtl_nt_status_to_dos_error"),
+    "RtlRaiseException": _handler("rtl_raise_exception"),
+    "RtlTimeFieldsToTime": _handler("rtl_time_fields_to_time"),
+    "RtlTimeToTimeFields": _handler("rtl_time_to_time_fields"),
     "RtlUnicodeStringToAnsiString": _handler("rtl_unicode_string_to_ansi_string"),
-    "RtlUnwind": _handler("generic_success", "stub"),
-    "RtlZeroMemory": _handler("rtl_zero_memory"),
-    "XboxHDKey": _handler("xbox_zero_key"),
-    "XboxHardwareInfo": _handler("xbox_hardware_info"),
-    "XboxKrnlVersion": _handler("xbox_kernel_version"),
-    "XboxLANKey": _handler("xbox_zero_key"),
-    "XboxSignatureKey": _handler("xbox_zero_key"),
-    "XboxAlternateSignatureKeys": _handler("xbox_zero_key"),
+    "RtlUnwind": _handler("rtl_unwind"),
+    "XboxAlternateSignatureKeys": _handler("kernel_variable", "data"),
+    "XboxHDKey": _handler("kernel_variable", "data"),
+    "XboxHardwareInfo": _handler("kernel_variable", "data"),
+    "XboxKrnlVersion": _handler("kernel_variable", "data"),
+    "XboxLANKey": _handler("kernel_variable", "data"),
+    "XboxSignatureKey": _handler("kernel_variable", "data"),
+    "XcBlockCryptCBC": _handler("xc_block_crypt_cbc"),
+    "XcDESKeyParity": _handler("xc_des_key_parity"),
+    "XcHMAC": _handler("xc_hmac"),
+    "XcKeyTable": _handler("xc_key_table"),
+    "XcModExp": _handler("xc_mod_exp"),
+    "XcRC4Crypt": _handler("xc_rc4_crypt"),
+    "XcRC4Key": _handler("xc_rc4_key"),
+    "XcSHAFinal": _handler("xc_sha_final"),
+    "XcSHAInit": _handler("xc_sha_init"),
+    "XcSHAUpdate": _handler("xc_sha_update"),
+    "XcVerifyPKCS1Signature": _handler("xc_verify_pkcs1_signature"),
     "XeImageFileName": _handler("xe_image_file_name"),
     "XeLoadSection": _handler("xe_load_section"),
-    "XePublicKeyData": _handler("xbox_zero_key"),
+    "XePublicKeyData": _handler("kernel_variable", "data"),
     "XeUnloadSection": _handler("xe_unload_section"),
-    "HalIsResetOrShutdownPending": _handler("hal_is_reset_or_shutdown_pending"),
-    "HalInitiateShutdown": _handler("hal_initiate_shutdown"),
 }
 
 
 def _kernel_import_subsystem(name: str) -> str:
-    if name.startswith(("ExAllocate", "ExFree", "MmAllocate", "MmFree")):
+    if name in {"LaunchDataPage", "XeImageFileName"}:
+        return "loader"
+    if name in {"IdexChannelObject", "HalDiskCachePartitionCount", "HalDiskModelNumber", "HalDiskSerialNumber"}:
+        return "hardware"
+    if name.startswith("Phy"):
+        return "hardware"
+    if name.startswith(("ExAllocate", "ExFree", "ExQueryPool", "MmAllocate", "MmFree")):
         return "allocator"
+    if name.startswith("Ex") and "ObjectType" in name:
+        return "object_manager"
+    if name.startswith("ExQueryNonVolatile"):
+        return "hardware"
     if name.startswith("Nt") and any(
         token in name
         for token in (
@@ -1604,6 +3017,8 @@ def _kernel_import_subsystem(name: str) -> str:
         )
     ):
         return "allocator"
+    if name in {"NtClose"}:
+        return "object_manager"
     if name.startswith(("Io", "Iof")) or (
         name.startswith("Nt")
         and any(
@@ -1632,6 +3047,8 @@ def _kernel_import_subsystem(name: str) -> str:
                 "Mutant",
                 "Wait",
                 "Apc",
+                "Yield",
+                "SystemTime",
             )
         )
     ):
