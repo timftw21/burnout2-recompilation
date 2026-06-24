@@ -204,6 +204,16 @@ Generated local reports are marked `public_safe: false` because they contain
 local filesystem metadata, file hashes, executable metadata, and analysis state.
 Keep them ignored.
 
+Smoke-test runtime shim registration against the local executable without
+dumping executable bytes:
+
+```powershell
+python .\tools\runtime\runtime_smoke.py `
+  .\data\local\extracted\burnout_2_poi_usa\default.xbe `
+  --extracted-root .\data\local\extracted\burnout_2_poi_usa `
+  --pretty
+```
+
 ## Current Local Extraction Summary
 
 > [!NOTE]
@@ -228,6 +238,12 @@ Keep them ignored.
 > complete. It records project-owned names, confidence levels, subsystem tags,
 > compiler/runtime patterns, and roadmap focus areas from sanitized XBE metadata
 > and loader summaries.
+
+> [!IMPORTANT]
+> **Milestone 4 Update - June 24, 2026:** The first runtime shim layer is
+> complete. It provides host-side filesystem, timing, synchronization,
+> threading, memory, input, rendering, audio, diagnostics, hardware, loader, and
+> crypto boundaries with structured traces and deterministic import registration.
 
 Last local extraction: June 24, 2026.
 
@@ -258,6 +274,12 @@ Last local extraction: June 24, 2026.
   - Registered host shims: `0`
   - Synthetic unresolved stubs: `142`
   - First load phases: `parse`, `digest`, `arena`, `map_headers`, `map_section`
+- `default.xbe` runtime shim smoke summary:
+  - Imported kernel ordinals: `142`
+  - Registered host shims: `142`
+  - Implemented handler models: `86`
+  - Deterministic placeholder stubs: `56`
+  - Unresolved loader imports with runtime resolver: `0`
 - `default.xbe` analysis database summary:
   - Records: `198`
   - Record kinds: `7` focus areas, `18` memory regions, `17` sections,
@@ -396,12 +418,49 @@ Remaining:
 
 ### Milestone 4: Runtime Shims
 
-> **Status:** `Pending`
+> **Status:** `Done`
 
-- Implement filesystem access against extracted local files.
-- Implement timing, threading, synchronization, and memory APIs.
-- Add controller input abstraction.
-- Stub graphics/audio enough to boot through initialization.
+> [!IMPORTANT]
+> **Milestone 4 Update - June 24, 2026:** Runtime shims are implemented and
+> covered by synthetic tests. The local smoke check registers every current
+> `default.xbe` kernel import through the runtime resolver; unsupported or
+> unknown ordinals use deterministic placeholder stubs until execution reaches
+> those paths.
+
+Completed:
+
+- Added `runtime/xbox/shims.py` as the host runtime shim boundary.
+- Added structured runtime traces for filesystem, allocator, threading,
+  synchronization, timing, input, rendering, audio, diagnostics, hardware,
+  loader, crypto, and object-handle behavior.
+- Implemented read-only filesystem access rooted at the ignored extracted disc
+  tree, including Xbox device path normalization, case-insensitive lookup, safe
+  traversal rejection, file open/read/query, and directory listing.
+- Implemented deterministic memory APIs for pool, system, contiguous, and GPU
+  allocations with bounds-checked reads/writes, protection changes, query,
+  free, zero/fill/move helpers, and physical-address placeholders.
+- Implemented deterministic timing, thread, event, semaphore, timer, wait,
+  critical-section, and system-thread models.
+- Added a controller input abstraction with four pollable controller ports.
+- Stubbed rendering initialization through `Av*` display/saved-data calls and
+  GPU instance memory claiming.
+- Stubbed audio initialization, audio stream handles, and buffer submission.
+- Added diagnostics, hardware/version, loader section, and crypto helper
+  boundaries for imported kernel APIs that appear during early boot.
+- Added `XboxRuntimeShims.register_kernel_imports()` to bind imported kernel
+  ordinals into the loader `ImportResolver` with deterministic host target
+  addresses.
+- Added deterministic placeholder registration for unsupported or unknown
+  ordinals so the loader can patch all current kernel import thunks without
+  unresolved imports.
+- Added synthetic unit tests covering shim registration, filesystem access,
+  memory, timing, synchronization, input, graphics, and audio behavior.
+
+Remaining:
+
+- No remaining Milestone 4 tasks. Placeholder shims should be replaced by
+  behavior-accurate implementations as Milestone 5 and boot execution expose
+  concrete call sites and ABI details.
 
 ### Milestone 5: Recompilation Prototype
 
@@ -433,17 +492,14 @@ Remaining:
 
 ## Immediate Next Steps
 
-1. Start Milestone 4 by defining the host runtime shim boundary for Xbox kernel
-   calls, filesystem access, timing, threading, synchronization, memory, input,
-   graphics, and audio.
-2. Register the first real `ImportResolver` hooks for low-risk kernel calls
-   surfaced by the analysis database, beginning with diagnostics, memory, and
-   filesystem stubs.
-3. Build a local filesystem shim that resolves game paths against the ignored
-   extracted disc tree without committing filenames, assets, or executable
-   bytes.
-4. Add deterministic shim tests and trace assertions before using the shims in
-   a boot attempt.
+1. Start Milestone 5 by selecting a small, well-understood function range near
+   startup, a TLS callback, or a low-risk runtime helper.
+2. Define the first execution adapter that can call runtime shim handlers from
+   guest ABI state rather than direct Python test calls.
+3. Generate or interpret a narrow x86 instruction subset with explicit flag,
+   stack, memory, and call-target accounting.
+4. Add comparison tests around synthetic traces before attempting real boot
+   execution.
 5. Keep all extracted game content and local reports ignored.
 
 ## Open Questions
@@ -459,13 +515,15 @@ Remaining:
 
 ## Status
 
-Project foundation, disc/executable extraction tooling, XBE introspection, and
-the loader skeleton are in place. The first analysis database generator is also
-in place and seeded from sanitized XBE metadata plus loader summaries. The local
-Burnout 2 XISO has been extracted into ignored storage, `default.xbe` has been
-identified as the main executable, and local JSON reports now record the disc
-layout, executable hashes, loader memory maps, TLS metadata, library metadata,
-imports, section digest verification, project-owned analysis records, subsystem
-tags, confidence levels, and compiler/runtime patterns.
+Project foundation, disc/executable extraction tooling, XBE introspection, the
+loader skeleton, the analysis database generator, and the first runtime shim
+layer are in place. The local Burnout 2 XISO has been extracted into ignored
+storage, `default.xbe` has been identified as the main executable, and local JSON
+reports now record the disc layout, executable hashes, loader memory maps, TLS
+metadata, library metadata, imports, section digest verification, project-owned
+analysis records, subsystem tags, confidence levels, and compiler/runtime
+patterns.
 
-No runtime shim or recompilation pipeline has been implemented yet.
+The runtime shim layer can register all current `default.xbe` kernel imports
+through the loader resolver with deterministic host target addresses. A
+recompilation or execution pipeline has not been implemented yet.
