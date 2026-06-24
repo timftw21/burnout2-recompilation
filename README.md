@@ -42,6 +42,13 @@ Redump source image:
 These files are local development inputs only. They should not become part of
 the public project history.
 
+The extraction workflow now writes proprietary generated output only to ignored
+local paths:
+
+- Extracted disc tree: `data/local/extracted/burnout_2_poi_usa/`
+- Local extraction report: `reports/local/disc-extraction.json`
+- Local third-party tools: `data/local/tools/`
+
 ## Recommended Direction
 
 The practical path is to build the project in layers:
@@ -57,6 +64,7 @@ The practical path is to build the project in layers:
    - Identify the main `.xbe`, media layout, filesystem case sensitivity, and
      title metadata.
    - Record hashes for every local input and extracted executable.
+   - Current status: implemented and locally executed.
 
 3. **XBE loader research**
    - Parse XBE headers, section tables, imports, entry point, TLS, certificate
@@ -125,6 +133,65 @@ b2_recomp/
 `data/local/` should be ignored by version control and used for developer-owned
 game inputs, extracted files, generated databases, and temporary artifacts.
 
+## Disc Extraction Workflow
+
+The project uses
+[`XboxDev/extract-xiso`](https://github.com/XboxDev/extract-xiso) as an external
+local tool. The helper installer pins the current tool release used by this
+project (`build-202505152050`), stores it under ignored `data/local/tools/`,
+and records a local install manifest with hashes.
+
+Install the extractor locally:
+
+```powershell
+.\tools\extract\install_extract_xiso.ps1
+```
+
+Extract the current local XISO and generate the ignored report:
+
+```powershell
+python .\tools\extract\extract_disc.py `
+  --iso ".\Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso"
+```
+
+Regenerate the report from an existing extraction without extracting again:
+
+```powershell
+python .\tools\extract\extract_disc.py `
+  --iso ".\Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso" `
+  --scan-only
+```
+
+Inspect a single XBE directly:
+
+```powershell
+python .\tools\xbe\xbe_info.py `
+  .\data\local\extracted\burnout_2_poi_usa\default.xbe `
+  --pretty
+```
+
+The report is marked `public_safe: false` because it contains local filesystem
+metadata, file hashes, and extracted executable metadata. Keep it ignored.
+
+## Current Local Extraction Summary
+
+Last local extraction: June 24, 2026.
+
+- Extracted `667` files across `109` directories.
+- Found three XBE files: `default.xbe`, `dashupdate.xbe`, and `update.xbe`.
+- Selected main executable: `default.xbe`.
+- `default.xbe` title metadata:
+  - Title name: `Burnout 2`
+  - Title ID: `41430019` (`AC-025`)
+  - Region: `NA`
+  - Allowed media: `DVD_X2`
+  - XBE timestamp: `2003-04-16T10:56:12Z`
+  - Certificate timestamp: `2003-04-18T19:32:44Z`
+  - Section count: `17`
+- No case-only path collisions were detected in the extracted layout.
+- Full local input hashes, extracted executable hashes, root layout, extension
+  counts, and XBE metadata are stored in `reports/local/disc-extraction.json`.
+
 ## Technical Milestones
 
 ### Milestone 0: Project Foundation
@@ -187,11 +254,14 @@ game inputs, extracted files, generated databases, and temporary artifacts.
 
 ## Immediate Next Steps
 
-1. Initialize Git and add ignore rules before extracting or generating anything.
-2. Move local proprietary inputs under an ignored `data/local/` convention.
-3. Create a small XBE metadata parser as the first real tool.
-4. Generate a sanitized metadata report from the local executable.
-5. Use that report to design the loader memory model and import shim boundary.
+1. Expand `tools/xbe/xbe_info.py` into a loader-grade XBE parser for imports,
+   TLS, library versions, and section memory mapping.
+2. Generate a dedicated memory-map report from `default.xbe`.
+3. Design the loader arena and import shim boundary from the extracted XBE
+   metadata.
+4. Add synthetic fixture coverage for import tables, TLS tables, and edge-case
+   address mapping.
+5. Start the loader skeleton without committing proprietary extracted data.
 
 ## Open Questions
 
@@ -206,5 +276,9 @@ game inputs, extracted files, generated databases, and temporary artifacts.
 
 ## Status
 
-Project documentation has started. No executable parsing, extraction pipeline,
-runtime shim, or recompilation tooling has been implemented yet.
+Project foundation and disc/executable extraction tooling are in place. The
+local Burnout 2 XISO has been extracted into ignored storage, `default.xbe` has
+been identified as the main executable, and a local JSON report now records the
+disc layout, executable hashes, and initial XBE metadata.
+
+No loader, runtime shim, or recompilation pipeline has been implemented yet.
