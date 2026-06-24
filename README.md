@@ -242,6 +242,20 @@ python .\tools\recomp\recompile_range.py `
   --pretty
 ```
 
+Build and run the first Windows/Vulkan interactive-frame smoke test:
+
+```powershell
+python .\tools\host\first_frame_smoke.py `
+  --max-frames 3 `
+  --pretty
+```
+
+The first-frame smoke command builds `runtime/host/vulkan_first_frame.cpp` into
+ignored local output, opens a Win32 Vulkan swapchain window, presents a bounded
+number of clear-color frames, injects one keyboard input event for deterministic
+smoke coverage, and writes JSONL debug events plus a summary under
+`reports/local/first-frame/`.
+
 ## Current Local Extraction Summary
 
 > [!NOTE]
@@ -286,6 +300,14 @@ python .\tools\recomp\recompile_range.py `
 > deterministic trace events, verifies flags/stack/memory/call behavior through
 > synthetic tests, and emits deterministic Windows-targeted C++17. The first
 > renderer backend decision for the host runtime is Vulkan.
+
+> [!IMPORTANT]
+> **Milestone 6 Update - June 24, 2026:** The first interactive host frame is
+> complete. A native Windows/Vulkan harness now creates a Win32 window, selects
+> a Vulkan presentation device, enters a bounded host main loop, presents visible
+> swapchain frames, accepts keyboard input through the window procedure, and
+> records repeatable JSONL diagnostics for startup, device selection, frame
+> presentation, input, and shutdown.
 
 Last local extraction: June 24, 2026.
 
@@ -332,6 +354,15 @@ Last local extraction: June 24, 2026.
     `reports/local/recomp/b2_default_zero_return.cpp`
   - Generated C++ SHA-256:
     `1821E7BB2A4DB42CC5B09F1F42C26F68C67CD331482F80CD237E061865CCA484`
+- First interactive frame smoke summary:
+  - Built executable: `build/local/first-frame/b2_first_frame.exe`
+  - Renderer backend: Vulkan through a Win32 swapchain
+  - Selected local device: `NVIDIA GeForce RTX 5060 Ti`
+  - Host main loop: entered and exited cleanly
+  - Presented frames: `3`
+  - Input events: `2` (`WM_KEYDOWN` and `WM_KEYUP` from injected space key)
+  - Debug event log: `reports/local/first-frame/events.jsonl`
+  - Smoke summary: `reports/local/first-frame/summary.json`
 - `default.xbe` analysis database summary:
   - Records: `198`
   - Record kinds: `7` focus areas, `18` memory regions, `17` sections,
@@ -561,13 +592,37 @@ Remaining:
 
 ### Milestone 6: First Interactive Frame
 
-> **Status:** `Pending`
+> **Status:** `Done`
 
-- Reach main loop execution.
-- Render a visible first frame or menu through the host graphics layer.
-- Accept input.
-- Establish a repeatable debugging workflow for crashes, mismatches, and missing
-  platform behavior.
+Completed:
+
+- Added `runtime/host/vulkan_first_frame.cpp` as the first native host
+  interactive-frame harness.
+- Added `tools/host/first_frame_smoke.py` as a repeatable build/run/debug
+  workflow for the Windows/Vulkan first-frame smoke.
+- Build output stays ignored under `build/local/first-frame/`.
+- Runtime diagnostics stay ignored under `reports/local/first-frame/`.
+- The native harness creates a Win32 window, initializes Vulkan instance,
+  Win32 surface, physical device, logical device, swapchain, image views, render
+  pass, framebuffers, command buffers, and synchronization objects.
+- The host main loop processes Win32 messages, records keyboard input events,
+  presents Vulkan swapchain frames, and exits deterministically after a bounded
+  frame count during smoke tests.
+- The first-frame smoke injects one space-key press/release pair so input
+  acceptance is tested without manual interaction.
+- JSONL diagnostics record startup, window creation, Vulkan device selection,
+  swapchain creation, command recording, main-loop entry/exit, frame
+  presentation, input, and shutdown events.
+- Added synthetic unit tests for first-frame build command generation, JSONL
+  event parsing, and smoke-summary evidence.
+- Verified locally with a 3-frame Vulkan presentation smoke on the installed
+  NVIDIA device.
+
+Remaining:
+
+- No remaining Milestone 6 tasks. Full original-game boot execution, recovered
+  control-flow-driven runtime calls, and renderer translation remain Milestone 7
+  and later work.
 
 ### Milestone 7: Playability Push
 
@@ -580,15 +635,15 @@ Remaining:
 
 ## Immediate Next Steps
 
-1. Start Milestone 6 by wiring the lifted execution adapter toward the runtime
-   shim ABI boundary.
+1. Start Milestone 7 by connecting recovered boot/control-flow execution to the
+   runtime shim ABI boundary.
 2. Expand IA-32 instruction coverage only from observed decode failures in real
    startup/control-flow recovery.
-3. Recover a small boot path CFG and route external calls through registered
-   kernel shim targets.
-4. Begin the Vulkan host graphics boundary needed for the first visible frame.
-5. Keep all extracted game content, local generated C++, and local reports
-   ignored.
+3. Route recovered external calls through registered kernel shim targets.
+4. Replace the first-frame clear pass with translated renderer work as Direct3D
+   8 behavior is recovered.
+5. Keep all extracted game content, local generated C++, build outputs, and
+   local reports ignored.
 
 ## Open Questions
 
@@ -615,5 +670,8 @@ through the loader resolver with deterministic host target addresses and no
 placeholder stubs for the local executable. The first recompilation prototype
 can lift a narrow IA-32 function range, execute it with deterministic CPU and
 memory traces, and emit deterministic Windows C++17 for ignored local or
-synthetic inputs. Full boot execution, runtime ABI bridging, and the Vulkan
-first-frame path remain future milestones.
+synthetic inputs. The first Windows/Vulkan host frame can now build, open a
+window, enter a bounded main loop, present visible frames, accept keyboard
+input, and write repeatable debug traces. Full original-game boot execution,
+runtime ABI bridging from recovered control flow, and renderer translation
+remain future milestones.
