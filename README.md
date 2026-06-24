@@ -112,6 +112,7 @@ b2_recomp/
   tools/
     extract/
     xbe/
+    loader/
     analysis/
     recomp/
   runtime/
@@ -179,6 +180,14 @@ python .\tools\xbe\xbe_info.py `
   --pretty
 ```
 
+Map the executable into the loader skeleton and emit a non-byte summary:
+
+```powershell
+python .\tools\loader\xbe_loader.py `
+  .\data\local\extracted\burnout_2_poi_usa\default.xbe `
+  --pretty
+```
+
 The report is marked `public_safe: false` because it contains local filesystem
 metadata, file hashes, and extracted executable metadata. Keep it ignored.
 
@@ -192,6 +201,11 @@ metadata, file hashes, and extracted executable metadata. Keep it ignored.
 > local report includes loader memory maps, TLS metadata, library versions,
 > library feature descriptors, kernel imports, non-kernel imports, and section
 > digest verification for each extracted XBE.
+
+> **Update (June 24, 2026):** Milestone 2 loader skeleton is now complete. The
+> loader maps XBE headers and sections into a bounded host-owned arena, keeps
+> image gaps unmapped, preserves section zero-fill, patches import thunk tables
+> through resolver hooks or synthetic stubs, and records structured load traces.
 
 Last local extraction: June 24, 2026.
 
@@ -215,6 +229,13 @@ Last local extraction: June 24, 2026.
   - Non-kernel imports: `0`
   - Section digest verification: `16/17` sections match; `.text` is recorded
     as mismatched in the local report.
+- `default.xbe` loader summary:
+  - Mapped regions: `18`
+  - Entry point: `0x000E2555`
+  - Patched imports: `142`
+  - Registered host shims: `0`
+  - Synthetic unresolved stubs: `142`
+  - First load phases: `parse`, `digest`, `arena`, `map_headers`, `map_section`
 - No case-only path collisions were detected in the extracted layout.
 - Full local input hashes, extracted executable hashes, root layout, extension
   counts, and XBE metadata are stored in `reports/local/disc-extraction.json`.
@@ -275,12 +296,34 @@ Remaining:
 
 ### Milestone 2: Loader Skeleton
 
-> **Status:** `Pending`
+> **Status:** `Done`
 
-- Map executable sections into a controlled host memory arena.
-- Model Xbox virtual memory assumptions.
-- Provide import resolution hooks for kernel and library calls.
-- Add trace logging for initialization order.
+Completed:
+
+- Added `tools/loader/xbe_loader.py` as the first executable loader skeleton.
+- Added a controlled `XbeMemoryArena` with a 32-bit Xbox virtual image range,
+  mapped-region tracking, bounds-checked reads/writes, and region permissions.
+- Map XBE headers and every section into host-owned memory from parsed XBE
+  metadata.
+- Preserve Xbox section virtual memory behavior by copying file-backed bytes,
+  zero-filling `virtual_size - raw_size`, and leaving image gaps unmapped.
+- Model section permissions from XBE flags: readable by default, writable when
+  `WRITABLE` is set, executable when `EXECUTABLE` is set.
+- Provide `ImportResolver` hooks for kernel imports by ordinal/name and
+  non-kernel library imports by image name and ordinal.
+- Patch import thunk tables during load with registered hook addresses or
+  deterministic synthetic unresolved stubs.
+- Support fail-fast unresolved import policy and optional strict section digest
+  validation.
+- Add structured trace logging for parse, digest validation, arena creation,
+  header mapping, section mapping, import resolution, and load completion.
+- Add a loader CLI that emits a safe summary without dumping executable bytes.
+- Added synthetic-only loader tests for mapping, zero-fill, permissions, bounds,
+  import patching, unresolved import policy, digest policy, and trace order.
+
+Remaining:
+
+- No remaining Milestone 2 tasks.
 
 ### Milestone 3: Analysis Database
 
@@ -331,12 +374,14 @@ Remaining:
 
 ## Immediate Next Steps
 
-1. Start Milestone 2 by designing the loader arena from the emitted memory map.
-2. Create a loader skeleton that maps headers and sections into host memory,
-   including `.data` zero-fill behavior.
-3. Build the first import shim boundary from the `default.xbe` kernel import
-   table.
-4. Add loader tests using synthetic XBE fixtures only.
+1. Start Milestone 3 by creating the first analysis database format for
+   project-owned names, notes, confidence levels, and subsystem tags.
+2. Seed the analysis database from sanitized XBE metadata: sections, libraries,
+   imports, entry point, TLS, and loader memory regions.
+3. Define naming conventions for functions, globals, vtables, thunks, assets,
+   and subsystem boundaries.
+4. Add tests that prove analysis records are generated from synthetic XBE
+   metadata without proprietary fixtures.
 5. Keep all extracted game content and local reports ignored.
 
 ## Open Questions
@@ -352,10 +397,11 @@ Remaining:
 
 ## Status
 
-Project foundation, disc/executable extraction tooling, and XBE introspection
-are in place. The local Burnout 2 XISO has been extracted into ignored storage,
-`default.xbe` has been identified as the main executable, and a local JSON
-report now records the disc layout, executable hashes, loader memory maps, TLS
-metadata, library metadata, imports, and section digest verification.
+Project foundation, disc/executable extraction tooling, XBE introspection, and
+the loader skeleton are in place. The local Burnout 2 XISO has been extracted
+into ignored storage, `default.xbe` has been identified as the main executable,
+and a local JSON report now records the disc layout, executable hashes, loader
+memory maps, TLS metadata, library metadata, imports, and section digest
+verification.
 
-No loader, runtime shim, or recompilation pipeline has been implemented yet.
+No runtime shim or recompilation pipeline has been implemented yet.
