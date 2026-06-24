@@ -95,6 +95,9 @@ The practical path is to build the project in layers:
    - Preserve flags, calling conventions, stack behavior, memory ordering, and
      self-referential code assumptions.
    - Build per-function tests from captured original behavior where practical.
+   - Current status: first narrow IA-32 lifter, trace executor, and deterministic
+     Windows C++17 emitter implemented and covered by synthetic comparison
+     tests.
 
 7. **Vertical slice**
    - Boot through process initialization.
@@ -214,6 +217,31 @@ python .\tools\runtime\runtime_smoke.py `
   --pretty
 ```
 
+Generate the first deterministic C++ recompilation prototype from a synthetic
+byte range:
+
+```powershell
+python .\tools\recomp\recompile_range.py `
+  --hex 33C0C3 `
+  --virtual-address 0x12594 `
+  --symbol zero_return `
+  --pretty
+```
+
+Generate an ignored local C++ artifact from the developer-owned `default.xbe`
+without dumping executable bytes into tracked files:
+
+```powershell
+python .\tools\recomp\recompile_range.py `
+  .\data\local\extracted\burnout_2_poi_usa\default.xbe `
+  --virtual-address 0x12594 `
+  --size 3 `
+  --symbol b2_default_zero_return `
+  --cpp-output .\reports\local\recomp\b2_default_zero_return.cpp `
+  --json-output .\reports\local\recomp\b2_default_zero_return.json `
+  --pretty
+```
+
 ## Current Local Extraction Summary
 
 > [!NOTE]
@@ -252,6 +280,13 @@ python .\tools\runtime\runtime_smoke.py `
 > modeled data export. Current runtime smoke output reports no placeholder stub
 > registrations for the local executable.
 
+> [!IMPORTANT]
+> **Milestone 5 Update - June 24, 2026:** The first recompilation prototype is
+> complete. It lifts a narrow IA-32 range, executes the lifted form with
+> deterministic trace events, verifies flags/stack/memory/call behavior through
+> synthetic tests, and emits deterministic Windows-targeted C++17. The first
+> renderer backend decision for the host runtime is Vulkan.
+
 Last local extraction: June 24, 2026.
 
 - Extracted `667` files across `109` directories.
@@ -288,6 +323,15 @@ Last local extraction: June 24, 2026.
   - Modeled data exports: `16`
   - Deterministic placeholder stubs: `0`
   - Unresolved loader imports with runtime resolver: `0`
+- `default.xbe` local recompilation prototype smoke summary:
+  - Lifted range: `0x00012594` through `0x00012596`
+  - Lifted instructions: `2`
+  - Generated target: Windows C++17
+  - First renderer backend decision: Vulkan
+  - Generated local artifact:
+    `reports/local/recomp/b2_default_zero_return.cpp`
+  - Generated C++ SHA-256:
+    `1821E7BB2A4DB42CC5B09F1F42C26F68C67CD331482F80CD237E061865CCA484`
 - `default.xbe` analysis database summary:
   - Records: `198`
   - Record kinds: `7` focus areas, `18` memory regions, `17` sections,
@@ -481,12 +525,39 @@ Remaining:
 
 ### Milestone 5: Recompilation Prototype
 
-> **Status:** `Pending`
+> **Status:** `Done`
 
-- Lift a small, well-understood function range.
-- Generate native code or C/C++ with a deterministic build step.
-- Verify CPU flags, stack behavior, memory reads/writes, and call targets.
-- Add automated comparison tests against captured traces where possible.
+Completed:
+
+- Added `tools/recomp/x86_lifter.py` as the first narrow IA-32 recompilation
+  prototype.
+- Added `tools/recomp/recompile_range.py` as a repeatable range-to-C++ command
+  for synthetic byte ranges and developer-owned local XBE ranges.
+- Implemented a small decoder/lifter for stack operations, frame setup/teardown,
+  register/memory moves, LEA, arithmetic/logical operations, CMP/TEST,
+  conditional branches, direct and indirect calls/jumps, and RET forms.
+- Added an execution adapter that runs lifted code from explicit guest CPU
+  state, sparse guest memory, and external call handlers.
+- Recorded deterministic trace events for instruction flow, CPU flags, stack
+  pushes/pops, memory reads/writes, branches, calls, and returns.
+- Added deterministic Windows-targeted C++17 emission with stable SHA-256
+  summaries. C++ is the first generated-code target because it is inspectable,
+  debuggable with normal Windows tooling, and compatible with later native
+  runtime integration.
+- Recorded Vulkan as the first host renderer backend decision for the upcoming
+  interactive-frame work.
+- Added synthetic comparison tests covering CPU flags, stack behavior, memory
+  reads/writes, branch decisions, external call targets, and deterministic C++
+  emission without committing proprietary executable bytes.
+- Ran a local ignored smoke lift of the developer-owned `default.xbe` range at
+  `0x00012594` (`xor eax, eax; ret`) and generated C++ under
+  `reports/local/recomp/`.
+
+Remaining:
+
+- No remaining Milestone 5 tasks. Future work belongs to Milestone 6 and later:
+  expand instruction coverage, connect lifted call sites to runtime shim ABI
+  adapters, and drive execution from recovered real control flow.
 
 ### Milestone 6: First Interactive Frame
 
@@ -509,23 +580,21 @@ Remaining:
 
 ## Immediate Next Steps
 
-1. Start Milestone 5 by selecting a small, well-understood function range near
-   startup, a TLS callback, or a low-risk runtime helper.
-2. Define the first execution adapter that can call runtime shim handlers from
-   guest ABI state rather than direct Python test calls.
-3. Generate or interpret a narrow x86 instruction subset with explicit flag,
-   stack, memory, and call-target accounting.
-4. Add comparison tests around synthetic traces before attempting real boot
-   execution.
-5. Keep all extracted game content and local reports ignored.
+1. Start Milestone 6 by wiring the lifted execution adapter toward the runtime
+   shim ABI boundary.
+2. Expand IA-32 instruction coverage only from observed decode failures in real
+   startup/control-flow recovery.
+3. Recover a small boot path CFG and route external calls through registered
+   kernel shim targets.
+4. Begin the Vulkan host graphics boundary needed for the first visible frame.
+5. Keep all extracted game content, local generated C++, and local reports
+   ignored.
 
 ## Open Questions
 
-- Which host platforms are first-class targets: Windows only, or Windows/Linux?
-- Should generated code target C++, LLVM IR, or a custom interpreter-assisted
-  hybrid while the recompilation strategy matures?
-- Which renderer backend should be used first: Direct3D 11/12, Vulkan, OpenGL,
-  or a higher-level abstraction?
+- Resolved June 24, 2026: Windows is the only first-class host platform for now.
+- Resolved June 24, 2026: generated code targets deterministic C++17 first.
+- Resolved June 24, 2026: the first renderer backend is Vulkan.
 - What level of determinism is required for testing and replay?
 - How much of the Xbox API surface should be emulated generally versus tailored
   specifically to this title?
@@ -543,5 +612,8 @@ patterns.
 
 The runtime shim layer can register all current `default.xbe` kernel imports
 through the loader resolver with deterministic host target addresses and no
-placeholder stubs for the local executable. A recompilation or execution
-pipeline has not been implemented yet.
+placeholder stubs for the local executable. The first recompilation prototype
+can lift a narrow IA-32 function range, execute it with deterministic CPU and
+memory traces, and emit deterministic Windows C++17 for ignored local or
+synthetic inputs. Full boot execution, runtime ABI bridging, and the Vulkan
+first-frame path remain future milestones.

@@ -1,0 +1,1 @@
+"""Static recompilation prototype helpers."""
