@@ -11,8 +11,10 @@ from tools.loader.xbe_loader import ImportResolver
 from tools.playability.playability_probe import (
     DynamicBlockCache,
     RuntimeAbiBridge,
+    XbeBackedSparseMemory,
     _asset_io_summary_from_invocations,
     _deterministic_service_validation_summary,
+    _heap_free_list_boundary_from_step_limit,
     _recovered_render_command_stream,
     _scheduler_boundary_from_step_limit,
     build_playability_probe_summary,
@@ -42,6 +44,27 @@ def _push_u32(value: int) -> bytes:
 
 
 class PlayabilityProbeTests(unittest.TestCase):
+    def test_xbe_backed_memory_clears_observed_nv2a_status_poll_bit(self) -> None:
+        class DummyArena:
+            def read(self, _address: int, _size: int) -> bytes:
+                raise AssertionError("fallback arena should not be read")
+
+        class DummyLoaded:
+            arena = DummyArena()
+
+        observed_writes: list[tuple[int, bytes]] = []
+        memory = XbeBackedSparseMemory(
+            DummyLoaded(),  # type: ignore[arg-type]
+            write_observer=lambda address, payload: observed_writes.append(
+                (address, payload)
+            ),
+        )
+
+        memory.write_u32(0xFD100410, 0x00010000)
+
+        self.assertEqual(observed_writes, [(0xFD100410, b"\x00\x00\x01\x00")])
+        self.assertEqual(memory.read_u32(0xFD100410), 0)
+
     def test_runtime_abi_bridge_invokes_registered_kernel_import_target(self) -> None:
         resolver = ImportResolver()
         runtime = XboxRuntimeShims()
@@ -69,6 +92,98 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(len(bridge.invocations), 1)
         self.assertEqual(bridge.invocations[0].shim_name, "KeQueryPerformanceFrequency")
         self.assertIn("runtime_abi_call", trace_operations)
+
+    def test_runtime_abi_bridge_cleans_observed_tv_encoder_guest_arguments(self) -> None:
+        resolver = ImportResolver()
+        runtime = XboxRuntimeShims()
+        runtime.register_kernel_imports(resolver, imported_ordinals=[2])
+        bridge = RuntimeAbiBridge(runtime)
+        target = runtime.registered_shims[0].target_address
+        function = lift_x86_function(
+            _push_u32(0x00225208)
+            + _push_u32(0)
+            + _push_u32(6)
+            + _push_u32(0)
+            + _call_indirect_bytes(0x3000),
+            base_address=0x1000,
+            symbol="send_tv_encoder_option_callsite",
+        )
+        state = CpuState.with_registers(esp=0x9000)
+        memory = SparseMemory({0x3000: target, 0x9000: 0xDEADC0DE})
+
+        result = execute_lifted_function(
+            function,
+            state=state,
+            memory=memory,
+            call_handlers=bridge.call_handlers(),
+        )
+
+        invocation = bridge.invocations[0]
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        self.assertEqual(result.state.get_register("esp"), 0x9004)
+        self.assertEqual(invocation.shim_name, "AvSendTVEncoderOption")
+        self.assertEqual(invocation.arguments, (0, 6, 0, 0x00225208))
+        self.assertEqual(invocation.handler_arguments, (0, 6))
+        self.assertEqual(invocation.stack_cleanup_bytes, 16)
+
+    def test_runtime_abi_bridge_marshals_pci_space_read_buffer(self) -> None:
+        resolver = ImportResolver()
+        runtime = XboxRuntimeShims()
+        runtime.register_kernel_imports(resolver, imported_ordinals=[46])
+        bridge = RuntimeAbiBridge(runtime)
+        target = runtime.registered_shims[0].target_address
+        state = CpuState.with_registers(esp=0x8000)
+        memory = SparseMemory(
+            {
+                0x7000: b"\xFF\xFF\xFF\xFF",
+                0x8000: 0xDEADC0DE,
+            }
+        )
+        arguments = (3, 0, 0x4C, 0x7000, 4, 0)
+        for index, argument in enumerate(arguments):
+            memory.write_u32(0x8004 + index * 4, argument)
+
+        bridge.invoke(state, memory, target, ExecutionTrace())
+
+        invocation = bridge.invocations[0]
+        self.assertEqual(invocation.shim_name, "HalReadWritePCISpace")
+        self.assertEqual(invocation.arguments, arguments)
+        self.assertEqual(invocation.handler_arguments, arguments)
+        self.assertEqual(invocation.stack_cleanup_bytes, 24)
+        self.assertEqual(invocation.eax, XboxStatus.SUCCESS)
+        self.assertEqual(memory.read(0x7000, 4), b"\x00\x00\x00\x00")
+        self.assertEqual(memory.read_u32(0x8000 + 24), 0xDEADC0DE)
+        self.assertEqual(
+            [write["label"] for write in invocation.memory_writes],
+            ["pci_read_buffer"],
+        )
+
+    def test_runtime_abi_bridge_marshals_pci_space_write_payload(self) -> None:
+        resolver = ImportResolver()
+        runtime = XboxRuntimeShims()
+        runtime.register_kernel_imports(resolver, imported_ordinals=[46])
+        bridge = RuntimeAbiBridge(runtime)
+        target = runtime.registered_shims[0].target_address
+        state = CpuState.with_registers(esp=0x8000)
+        memory = SparseMemory(
+            {
+                0x7000: b"\x12\x34\x56\x78",
+                0x8000: 0xDEADC0DE,
+            }
+        )
+        arguments = (3, 0, 0x4C, 0x7000, 4, 1)
+        for index, argument in enumerate(arguments):
+            memory.write_u32(0x8004 + index * 4, argument)
+
+        bridge.invoke(state, memory, target, ExecutionTrace())
+
+        invocation = bridge.invocations[0]
+        self.assertEqual(invocation.shim_name, "HalReadWritePCISpace")
+        self.assertEqual(invocation.stack_cleanup_bytes, 24)
+        self.assertEqual(invocation.result["bytes_read"], 4)
+        self.assertTrue(invocation.result["data_elided"])
+        self.assertEqual(memory.read(0x7000, 4), b"\x12\x34\x56\x78")
+        self.assertEqual(invocation.memory_writes, ())
 
     def test_runtime_abi_bridge_maps_ps_create_system_thread_ex_arguments(self) -> None:
         resolver = ImportResolver()
@@ -184,6 +299,121 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(invocation.return_kind, "int")
         self.assertEqual(state.get_register("eax"), 0x20000000)
         self.assertEqual(memory.read_u32(0x8000 + 20), 0xDEADC0DE)
+
+    def test_runtime_abi_bridge_maps_virtual_memory_out_parameters(self) -> None:
+        resolver = ImportResolver()
+        runtime = XboxRuntimeShims()
+        runtime.register_kernel_imports(resolver, imported_ordinals=[184])
+        bridge = RuntimeAbiBridge(runtime)
+        target = runtime.registered_shims[0].target_address
+        base_pointer = 0x6000
+        size_pointer = 0x6004
+        arguments = (base_pointer, 0, size_pointer, 0x2000, 0x04)
+        state = CpuState.with_registers(esp=0x8000)
+        memory = SparseMemory({0x8000: 0xDEADC0DE})
+        memory.write_u32(base_pointer, 0)
+        memory.write_u32(size_pointer, 0x3000)
+        for index, argument in enumerate(arguments):
+            memory.write_u32(0x8004 + index * 4, argument)
+
+        bridge.invoke(state, memory, target, ExecutionTrace())
+
+        invocation = bridge.invocations[0]
+        self.assertEqual(invocation.shim_name, "NtAllocateVirtualMemory")
+        self.assertEqual(invocation.arguments, arguments)
+        self.assertEqual(invocation.handler_arguments, arguments)
+        self.assertEqual(invocation.stack_cleanup_bytes, 20)
+        self.assertEqual(invocation.return_kind, "status_dict")
+        self.assertEqual(state.get_register("eax"), XboxStatus.SUCCESS)
+        self.assertEqual(state.get_register("esp"), 0x8000 + 20)
+        self.assertEqual(memory.read_u32(0x8000 + 20), 0xDEADC0DE)
+        self.assertEqual(memory.read_u32(base_pointer), 0x10000000)
+        self.assertEqual(memory.read_u32(size_pointer), 0x3000)
+        self.assertEqual(
+            [write["label"] for write in invocation.memory_writes],
+            ["base_address", "region_size"],
+        )
+
+    def test_runtime_abi_bridge_preserves_virtual_memory_commit_base(self) -> None:
+        resolver = ImportResolver()
+        runtime = XboxRuntimeShims()
+        runtime.register_kernel_imports(resolver, imported_ordinals=[184])
+        bridge = RuntimeAbiBridge(runtime)
+        target = runtime.registered_shims[0].target_address
+        reserve_base_pointer = 0x6000
+        reserve_size_pointer = 0x6004
+        commit_base_pointer = 0x6010
+        commit_size_pointer = 0x6014
+        memory = SparseMemory()
+        memory.write_u32(reserve_base_pointer, 0)
+        memory.write_u32(reserve_size_pointer, 0x4000)
+        reserve_arguments = (
+            reserve_base_pointer,
+            0,
+            reserve_size_pointer,
+            0x2000,
+            0x04,
+        )
+        reserve_state = CpuState.with_registers(esp=0x8000)
+        memory.write_u32(0x8000, 0xDEADC0DE)
+        for index, argument in enumerate(reserve_arguments):
+            memory.write_u32(0x8004 + index * 4, argument)
+
+        bridge.invoke(reserve_state, memory, target, ExecutionTrace())
+
+        reserved_base = memory.read_u32(reserve_base_pointer)
+        requested_commit_base = reserved_base + 0x1000
+        memory.write_u32(commit_base_pointer, requested_commit_base)
+        memory.write_u32(commit_size_pointer, 0x1000)
+        commit_arguments = (
+            commit_base_pointer,
+            0,
+            commit_size_pointer,
+            0x1000,
+            0x04,
+        )
+        commit_state = CpuState.with_registers(esp=0x9000)
+        memory.write_u32(0x9000, 0xFEEDC0DE)
+        for index, argument in enumerate(commit_arguments):
+            memory.write_u32(0x9004 + index * 4, argument)
+
+        bridge.invoke(commit_state, memory, target, ExecutionTrace())
+
+        invocation = bridge.invocations[-1]
+        self.assertEqual(invocation.shim_name, "NtAllocateVirtualMemory")
+        self.assertEqual(invocation.arguments, commit_arguments)
+        self.assertEqual(invocation.result["allocation_policy"], "commit_existing_reservation")
+        self.assertEqual(invocation.result["allocated_address"], requested_commit_base)
+        self.assertEqual(memory.read_u32(commit_base_pointer), requested_commit_base)
+        self.assertEqual(memory.read_u32(commit_size_pointer), 0x1000)
+        self.assertEqual(len(runtime.memory.allocations), 1)
+        self.assertEqual(commit_state.get_register("eax"), XboxStatus.SUCCESS)
+        self.assertEqual(commit_state.get_register("esp"), 0x9000 + 20)
+        self.assertEqual(memory.read_u32(0x9000 + 20), 0xFEEDC0DE)
+
+    def test_runtime_abi_bridge_reads_compare_memory_ulong_payload(self) -> None:
+        resolver = ImportResolver()
+        runtime = XboxRuntimeShims()
+        runtime.register_kernel_imports(resolver, imported_ordinals=[269])
+        bridge = RuntimeAbiBridge(runtime)
+        target = runtime.registered_shims[0].target_address
+        arguments = (0x6000, 12, 0xA5A5A5A5)
+        state = CpuState.with_registers(esp=0x8000)
+        memory = SparseMemory({0x8000: 0xDEADC0DE})
+        memory.write(0x6000, b"\xA5" * 8 + b"\x00" * 4)
+        for index, argument in enumerate(arguments):
+            memory.write_u32(0x8004 + index * 4, argument)
+
+        bridge.invoke(state, memory, target, ExecutionTrace())
+
+        invocation = bridge.invocations[0]
+        self.assertEqual(invocation.shim_name, "RtlCompareMemoryUlong")
+        self.assertEqual(invocation.arguments, arguments)
+        self.assertEqual(invocation.handler_arguments, arguments)
+        self.assertEqual(invocation.stack_cleanup_bytes, 12)
+        self.assertEqual(invocation.return_kind, "int")
+        self.assertEqual(state.get_register("eax"), 8)
+        self.assertEqual(memory.read_u32(0x8000 + 12), 0xDEADC0DE)
 
     def test_runtime_abi_bridge_preserves_stack_for_kf_lower_irql(self) -> None:
         resolver = ImportResolver()
@@ -466,6 +696,85 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(
             producer_trace["instruction_groups"][1]["semantic"],
             "work_item_next_link",
+        )
+
+    def test_heap_free_list_boundary_classifies_null_head_walk(self) -> None:
+        state = CpuState.with_registers(
+            ebx=0x10000000,
+            ecx=0,
+            edx=0xFFFFFFF8,
+            esi=0x10000180,
+            edi=0x4B9A,
+        )
+        trace_events = [
+            {
+                "sequence": 0,
+                "address": 0x000E46B1,
+                "address_hex": "0x000E46B1",
+                "operation": "memory_write",
+                "details": {
+                    "memory_address": 0x10000180,
+                    "value": 0x10000180,
+                    "size": 4,
+                },
+            },
+            {
+                "sequence": 1,
+                "address": 0x000E5080,
+                "address_hex": "0x000E5080",
+                "operation": "memory_read",
+                "details": {
+                    "memory_address": 0xFFFFFFF8,
+                    "value": 0,
+                },
+            },
+            {
+                "sequence": 2,
+                "address": 0x000E5085,
+                "address_hex": "0x000E5085",
+                "operation": "memory_read",
+                "details": {
+                    "memory_address": 0,
+                    "value": 0,
+                },
+            },
+            {
+                "sequence": 3,
+                "address": 0x000E5087,
+                "address_hex": "0x000E5087",
+                "operation": "jump",
+                "details": {
+                    "target": 0x000E506F,
+                    "target_hex": "0x000E506F",
+                },
+            },
+        ]
+
+        boundary = _heap_free_list_boundary_from_step_limit(
+            trace_events,
+            state,
+            65536,
+        )
+
+        self.assertIsNotNone(boundary)
+        assert boundary is not None
+        self.assertEqual(boundary["status"], "heap_free_list_boundary")
+        self.assertEqual(boundary["boundary_kind"], "title_heap_free_list_scan")
+        self.assertEqual(boundary["loop_entry_hex"], "0x000E506F")
+        scan = boundary["heap_free_list_scan"]
+        self.assertEqual(scan["diagnosis"], "free_list_head_resolved_to_null")
+        self.assertEqual(scan["heap_base_hex"], "0x10000000")
+        self.assertEqual(scan["list_head_address_hex"], "0x10000180")
+        self.assertEqual(scan["current_link_hex"], "0x00000000")
+        self.assertEqual(scan["candidate_header_hex"], "0xFFFFFFF8")
+        self.assertEqual(scan["free_chunk_units_hex"], "0x00004B9A")
+        self.assertTrue(scan["current_link_is_null"])
+        self.assertTrue(scan["candidate_header_underflow"])
+        self.assertEqual(scan["head_write_count"], 1)
+        self.assertEqual(scan["latest_head_writes"][0]["value_hex"], "0x10000180")
+        self.assertEqual(
+            [read["label"] for read in scan["reads"]],
+            ["candidate_header_size", "next_free_link"],
         )
 
     def test_dynamic_block_cache_round_trips_decoded_metadata(self) -> None:

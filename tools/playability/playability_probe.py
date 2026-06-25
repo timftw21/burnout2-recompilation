@@ -87,12 +87,12 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
 
 DEFAULT_ENTRY_BYTES = 0x200
 DEFAULT_MAX_INSTRUCTIONS = 128
-DEFAULT_MAX_BLOCK_INSTRUCTIONS = 224
+DEFAULT_MAX_BLOCK_INSTRUCTIONS = 512
 DEFAULT_MAX_STEPS = 256
-DEFAULT_MAX_THREAD_STEPS = 65536
+DEFAULT_MAX_THREAD_STEPS = 327680
 DEFAULT_INTERNAL_DEPTH = 15
 DEFAULT_MAX_RECOVERED_BLOCKS = 1024
-DEFAULT_MAX_DYNAMIC_BLOCKS = 512
+DEFAULT_MAX_DYNAMIC_BLOCKS = 1024
 DEFAULT_MAX_GUEST_ARGUMENTS = 16
 DEFAULT_MAX_GUEST_THREAD_EXECUTIONS = 8
 DEFAULT_STACK_BASE = 0x70000000
@@ -155,8 +155,16 @@ SCHEDULER_PRODUCER_ANCHORS = {
     },
 }
 
+TITLE_HEAP_FREE_LIST_LOOP_ENTRY = 0x000E506F
+TITLE_HEAP_FREE_LIST_LOOP_BRANCH = 0x000E5087
+NV2A_STATUS_POLL_ADDRESS = 0xFD100410
+NV2A_STATUS_POLL_BUSY_BIT = 0x00010000
+
 GUEST_ARGUMENT_COUNT_OVERRIDES = {
+    "AvSendTVEncoderOption": 4,
+    "HalReadWritePCISpace": 6,
     "KfLowerIrql": 0,
+    "NtAllocateVirtualMemory": 5,
     "NtCreateFile": 11,
     "NtOpenFile": 6,
     "NtOpenSymbolicLinkObject": 2,
@@ -166,6 +174,7 @@ GUEST_ARGUMENT_COUNT_OVERRIDES = {
     "NtSetInformationFile": 5,
     "NtWriteFile": 8,
     "PsCreateSystemThreadEx": 10,
+    "RtlCompareMemoryUlong": 3,
 }
 
 FILE_APPEND_DATA = 0x00000004
@@ -176,6 +185,7 @@ FILE_CREATE = 2
 FILE_OPEN_IF = 3
 FILE_OVERWRITE = 4
 FILE_OVERWRITE_IF = 5
+MEM_COMMIT = 0x00001000
 
 
 class RuntimeAbiBridgeError(RuntimeError):
@@ -381,6 +391,11 @@ class RuntimeAbiBridge:
         if shim.name in {"NtCreateFile", "NtOpenFile"}:
             handler_arguments = arguments
             returned_value = self._invoke_guest_file_api(shim, arguments, memory, trace)
+        elif shim.name == "NtAllocateVirtualMemory":
+            handler_arguments = arguments
+            returned_value = self._invoke_guest_allocate_virtual_memory_api(
+                arguments, memory, trace
+            )
         elif shim.name == "NtOpenSymbolicLinkObject":
             handler_arguments = arguments
             returned_value = self._invoke_guest_open_symbolic_link_api(
@@ -401,6 +416,16 @@ class RuntimeAbiBridge:
         elif shim.name == "NtWriteFile":
             handler_arguments = arguments
             returned_value = self._invoke_guest_write_file_api(arguments, memory, trace)
+        elif shim.name == "HalReadWritePCISpace":
+            handler_arguments = arguments
+            returned_value = self._invoke_guest_hal_read_write_pci_space_api(
+                arguments, memory, trace
+            )
+        elif shim.name == "RtlCompareMemoryUlong":
+            handler_arguments = arguments
+            returned_value = self._invoke_guest_compare_memory_ulong_api(
+                arguments, memory, trace
+            )
         else:
             handler_arguments = arguments[:handler_argument_count]
             try:
@@ -543,6 +568,84 @@ class RuntimeAbiBridge:
             file_handle_address_hex=_hex32(file_handle_address),
             object_attributes_address=object_attributes_address,
             object_attributes_address_hex=_hex32(object_attributes_address),
+        )
+        return result
+
+    def _invoke_guest_allocate_virtual_memory_api(
+        self,
+        arguments: tuple[int, ...],
+        memory: SparseMemory,
+        trace: ExecutionTrace,
+    ) -> dict[str, Any]:
+        (
+            base_address_address,
+            zero_bits,
+            region_size_address,
+            allocation_type,
+            protection,
+        ) = arguments[:5]
+        requested_base = (
+            memory.read_u32(base_address_address) if base_address_address else 0
+        )
+        requested_size = (
+            memory.read_u32(region_size_address) if region_size_address else 0
+        )
+        if requested_size <= 0:
+            result: dict[str, Any] = {
+                "status": XboxStatus.INVALID_PARAMETER,
+                "allocated_address": None,
+                "allocated_size": 0,
+            }
+        else:
+            allocation_policy = "fresh_allocation"
+            allocated_address = None
+            if requested_base and allocation_type & MEM_COMMIT:
+                existing = self.runtime.memory.query(requested_base)
+                if existing.get("status") == XboxStatus.SUCCESS:
+                    allocated_address = requested_base
+                    allocation_policy = "commit_existing_reservation"
+            if allocated_address is None:
+                allocated_address = self.runtime.memory.allocate_system_memory(
+                    requested_size,
+                    _guest_page_protection(protection),
+                )
+            result = {
+                "status": XboxStatus.SUCCESS,
+                "allocated_address": allocated_address,
+                "allocated_size": requested_size,
+                "allocation_policy": allocation_policy,
+            }
+        result.update(
+            {
+                "base_address_address": base_address_address,
+                "zero_bits": zero_bits,
+                "region_size_address": region_size_address,
+                "allocation_type": allocation_type,
+                "protection": protection,
+                "protection_model": _guest_page_protection(protection),
+                "requested_base": requested_base,
+                "requested_size": requested_size,
+            }
+        )
+        trace.add(
+            None,
+            "runtime_virtual_memory_api",
+            shim_name="NtAllocateVirtualMemory",
+            status=result["status"],
+            status_hex=_hex32(result["status"]),
+            base_address_address=base_address_address,
+            base_address_address_hex=_hex32(base_address_address),
+            region_size_address=region_size_address,
+            region_size_address_hex=_hex32(region_size_address),
+            requested_base=requested_base,
+            requested_base_hex=_hex32(requested_base),
+            requested_size=requested_size,
+            allocated_address=result.get("allocated_address"),
+            allocated_address_hex=_hex32(result["allocated_address"])
+            if isinstance(result.get("allocated_address"), int)
+            else None,
+            allocation_type=allocation_type,
+            protection=protection,
         )
         return result
 
@@ -809,6 +912,81 @@ class RuntimeAbiBridge:
         )
         return result
 
+    def _invoke_guest_compare_memory_ulong_api(
+        self,
+        arguments: tuple[int, ...],
+        memory: SparseMemory,
+        trace: ExecutionTrace,
+    ) -> int:
+        source_address, length, pattern = arguments[:3]
+        payload = memory.read(source_address, length) if source_address and length else b""
+        matched = self.runtime.rtl_compare_memory_ulong(payload, pattern)
+        trace.add(
+            None,
+            "runtime_memory_compare_api",
+            shim_name="RtlCompareMemoryUlong",
+            source_address=source_address,
+            source_address_hex=_hex32(source_address),
+            length=length,
+            pattern=pattern,
+            pattern_hex=_hex32(pattern),
+            matched=matched,
+        )
+        return matched
+
+    def _invoke_guest_hal_read_write_pci_space_api(
+        self,
+        arguments: tuple[int, ...],
+        memory: SparseMemory,
+        trace: ExecutionTrace,
+    ) -> dict[str, Any]:
+        (
+            bus,
+            slot,
+            offset,
+            buffer_address,
+            length,
+            write_flag,
+        ) = arguments[:6]
+        write = write_flag != 0
+        payload = (
+            memory.read(buffer_address, length)
+            if write and buffer_address and length
+            else None
+        )
+        data = self.runtime.hal_read_write_pci_space(
+            bus,
+            slot,
+            offset,
+            payload,
+        )
+        result: dict[str, Any] = {
+            "status": XboxStatus.SUCCESS,
+            "bus": bus,
+            "slot": slot,
+            "offset": offset,
+            "buffer_address": buffer_address,
+            "length": length,
+            "write": write,
+            "bytes_transferred": len(data),
+            "data": data,
+        }
+        trace.add(
+            None,
+            "runtime_pci_space_api",
+            shim_name="HalReadWritePCISpace",
+            bus=bus,
+            slot=slot,
+            offset=offset,
+            offset_hex=_hex32(offset),
+            buffer_address=buffer_address,
+            buffer_address_hex=_hex32(buffer_address),
+            length=length,
+            write=write,
+            bytes_transferred=len(data),
+        )
+        return result
+
     def _apply_guest_side_effects(
         self,
         shim: RuntimeShim,
@@ -937,6 +1115,79 @@ class RuntimeAbiBridge:
                     buffer_hex=_hex32(source_address),
                 )
                 writes.append(write)
+            return writes
+        if shim.name == "HalReadWritePCISpace" and len(arguments) >= 6:
+            status = returned_value.get("status")
+            data = returned_value.get("data")
+            buffer_address = arguments[3]
+            length = arguments[4]
+            write = returned_value.get("write") is True
+            if (
+                status == XboxStatus.SUCCESS
+                and not write
+                and isinstance(data, bytes)
+                and buffer_address
+                and length
+            ):
+                payload = data[:length]
+                memory.write(buffer_address, payload)
+                trace.add(
+                    None,
+                    "runtime_abi_memory_write",
+                    shim_name=shim.name,
+                    label="pci_read_buffer",
+                    memory_address=buffer_address,
+                    memory_address_hex=_hex32(buffer_address),
+                    size=len(payload),
+                )
+                writes.append(
+                    {
+                        "shim_name": shim.name,
+                        "label": "pci_read_buffer",
+                        "address": buffer_address,
+                        "address_hex": _hex32(buffer_address),
+                        "size": len(payload),
+                    }
+                )
+            return writes
+        if shim.name == "NtAllocateVirtualMemory":
+            status = returned_value.get("status")
+            allocated_address = returned_value.get("allocated_address")
+            allocated_size = returned_value.get("allocated_size")
+            base_address_address = returned_value.get("base_address_address")
+            region_size_address = returned_value.get("region_size_address")
+            if (
+                status == XboxStatus.SUCCESS
+                and isinstance(allocated_address, int)
+                and isinstance(base_address_address, int)
+                and base_address_address
+            ):
+                writes.append(
+                    _write_runtime_out_u32(
+                        memory,
+                        trace,
+                        shim.name,
+                        "base_address",
+                        base_address_address,
+                        allocated_address,
+                    )
+                )
+            if (
+                status == XboxStatus.SUCCESS
+                and isinstance(allocated_size, int)
+                and isinstance(region_size_address, int)
+                and region_size_address
+            ):
+                writes.append(
+                    _write_runtime_out_u32(
+                        memory,
+                        trace,
+                        shim.name,
+                        "region_size",
+                        region_size_address,
+                        allocated_size,
+                    )
+                )
             return writes
         if shim.name == "NtQueryInformationFile":
             status = returned_value.get("status")
@@ -1223,12 +1474,22 @@ class XbeBackedSparseMemory(SparseMemory):
         super().write(address, payload)
         if self._write_observer is not None:
             self._write_observer(address, payload)
+        self._apply_title_mmio_completion(address, payload)
 
     def write_u32(self, address: int, value: int) -> None:
         payload = struct.pack("<I", _u32(value))
         super().write(address, payload)
         if self._write_observer is not None:
             self._write_observer(address, payload)
+        self._apply_title_mmio_completion(address, payload)
+
+    def _apply_title_mmio_completion(self, address: int, payload: bytes) -> None:
+        if address != NV2A_STATUS_POLL_ADDRESS or len(payload) < 4:
+            return
+        value = struct.unpack("<I", payload[:4])[0]
+        if value & NV2A_STATUS_POLL_BUSY_BIT:
+            cleared = value & ~NV2A_STATUS_POLL_BUSY_BIT
+            super().write(address, struct.pack("<I", cleared))
 
 
 class DynamicBlockCache:
@@ -2140,15 +2401,18 @@ def _execute_guest_thread_start(
         }
     except (X86ExecutionError, RuntimeAbiBridgeError) as exc:
         trace_events = exc.trace.to_list() if isinstance(exc, X86ExecutionError) and exc.trace is not None else []
-        scheduler_boundary = (
+        step_limit_boundary = (
             _scheduler_boundary_from_step_limit(trace_events, exc.state, exc.steps)
+            or _heap_free_list_boundary_from_step_limit(
+                trace_events, exc.state, exc.steps
+            )
             if isinstance(exc, X86ExecutionError)
             else None
         )
-        if scheduler_boundary is not None:
+        if step_limit_boundary is not None:
             return {
                 **summary,
-                **scheduler_boundary,
+                **step_limit_boundary,
                 "trace_event_count": len(trace_events),
                 "trace_tail": _trace_tail(trace_events),
                 "render_command_stream": _recovered_render_command_stream(trace_events),
@@ -2298,6 +2562,169 @@ def _scheduler_boundary_from_step_limit(
             "scheduler_queue_scan": queue_scan,
         }
     return None
+
+
+def _heap_free_list_boundary_from_step_limit(
+    trace_events: list[dict[str, Any]],
+    state: CpuState | None,
+    steps: int | None,
+) -> dict[str, Any] | None:
+    if not trace_events or state is None or steps is None:
+        return None
+    for event in reversed(trace_events[-256:]):
+        if event.get("operation") != "jump":
+            continue
+        details = event.get("details", {})
+        target = details.get("target")
+        address = event.get("address")
+        if (
+            target != TITLE_HEAP_FREE_LIST_LOOP_ENTRY
+            or address != TITLE_HEAP_FREE_LIST_LOOP_BRANCH
+        ):
+            continue
+        return {
+            "status": "heap_free_list_boundary",
+            "boundary_kind": "title_heap_free_list_scan",
+            "owner": "guest_thread_title_heap",
+            "loop_entry": target,
+            "loop_entry_hex": _hex32(target),
+            "loop_branch": address,
+            "loop_branch_hex": _hex32(address),
+            "steps": steps,
+            "state": state.to_dict(),
+            "heap_free_list_scan": _heap_free_list_scan_summary(
+                trace_events,
+                state=state,
+            ),
+        }
+    return None
+
+
+def _heap_free_list_scan_summary(
+    trace_events: list[dict[str, Any]],
+    *,
+    state: CpuState,
+) -> dict[str, Any]:
+    heap_base = state.get_register("ebx")
+    list_head = state.get_register("esi")
+    current_link = state.get_register("ecx")
+    candidate_header = state.get_register("edx")
+    free_chunk_units = state.get_register("edi")
+    reads = _latest_instruction_reads(
+        trace_events,
+        {
+            0x000E506D: "list_head_next",
+            0x000E507C: "free_chunk_units",
+            0x000E5080: "candidate_header_size",
+            0x000E5085: "next_free_link",
+        },
+        limit=4,
+        search_window=None,
+    )
+    head_writes = _latest_memory_writes(
+        trace_events,
+        [list_head, _u32(list_head + 4)],
+        limit=8,
+    )
+    current_link_is_null = current_link == 0
+    candidate_header_underflow = candidate_header == _u32(current_link - 8)
+    return {
+        "semantic": "title_heap_free_insert_sorted_list_walk",
+        "heap_base": heap_base,
+        "heap_base_hex": _hex32(heap_base),
+        "list_head_address": list_head,
+        "list_head_address_hex": _hex32(list_head),
+        "list_head_offset_hex": _hex32(_u32(list_head - heap_base)),
+        "current_link": current_link,
+        "current_link_hex": _hex32(current_link),
+        "candidate_header": candidate_header,
+        "candidate_header_hex": _hex32(candidate_header),
+        "free_chunk_units": free_chunk_units,
+        "free_chunk_units_hex": _hex32(free_chunk_units),
+        "current_link_is_null": current_link_is_null,
+        "candidate_header_underflow": candidate_header_underflow,
+        "diagnosis": "free_list_head_resolved_to_null"
+        if current_link_is_null and candidate_header_underflow
+        else "free_list_walk_did_not_converge",
+        "expected_empty_list_head_value_hex": _hex32(list_head),
+        "head_write_count": len(head_writes),
+        "latest_head_writes": head_writes,
+        "reads": reads,
+    }
+
+
+def _latest_instruction_reads(
+    trace_events: list[dict[str, Any]],
+    labels: dict[int, str],
+    *,
+    limit: int,
+    search_window: int | None = 512,
+) -> list[dict[str, Any]]:
+    reads: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    events = trace_events if search_window is None else trace_events[-search_window:]
+    for event in reversed(events):
+        if event.get("operation") != "memory_read":
+            continue
+        instruction_address = event.get("address")
+        if instruction_address not in labels or instruction_address in seen:
+            continue
+        details = event.get("details", {})
+        value = details.get("value")
+        memory_address = details.get("memory_address")
+        reads.append(
+            {
+                "label": labels[instruction_address],
+                "sequence": event.get("sequence"),
+                "instruction_address": instruction_address,
+                "instruction_address_hex": _hex32(instruction_address),
+                "memory_address": memory_address,
+                "memory_address_hex": _hex32(memory_address)
+                if isinstance(memory_address, int)
+                else None,
+                "value": value,
+                "value_hex": _hex32(value) if isinstance(value, int) else None,
+            }
+        )
+        seen.add(instruction_address)
+        if len(reads) >= limit:
+            break
+    reads.reverse()
+    return reads
+
+
+def _latest_memory_writes(
+    trace_events: list[dict[str, Any]],
+    addresses: list[int],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    watched = set(addresses)
+    writes: list[dict[str, Any]] = []
+    for event in reversed(trace_events):
+        if event.get("operation") != "memory_write":
+            continue
+        details = event.get("details", {})
+        address = details.get("memory_address")
+        if address not in watched:
+            continue
+        value = details.get("value")
+        writes.append(
+            {
+                "sequence": event.get("sequence"),
+                "instruction_address": event.get("address"),
+                "instruction_address_hex": event.get("address_hex"),
+                "memory_address": address,
+                "memory_address_hex": _hex32(address),
+                "value": value,
+                "value_hex": _hex32(value) if isinstance(value, int) else None,
+                "size": details.get("size", 4),
+            }
+        )
+        if len(writes) >= limit:
+            break
+    writes.reverse()
+    return writes
 
 
 def _scheduler_queue_scan_summary(
@@ -3412,6 +3839,17 @@ def _playability_gaps(
                     "error": thread.get("error"),
                 }
             )
+        elif status in {"scheduler_boundary", "heap_free_list_boundary"}:
+            gaps.append(
+                {
+                    "area": "control_flow",
+                    "status": f"thread_{status}",
+                    "thread_index": thread.get("thread_index"),
+                    "start_address_hex": thread.get("start_address_hex"),
+                    "boundary_kind": thread.get("boundary_kind"),
+                    "loop_entry_hex": thread.get("loop_entry_hex"),
+                }
+            )
     for frontier in execution.get("dynamic_frontiers", []):
         status = frontier.get("status")
         if status == "decode_failed":
@@ -3476,6 +3914,16 @@ def _read_guest_byte_offset(memory: SparseMemory, address: int) -> int | None:
     if value < 0:
         return None
     return min(value, 0x7FFFFFFF)
+
+
+def _guest_page_protection(protection: int) -> str:
+    if protection & 0x40:
+        return "rwx"
+    if protection & 0x20:
+        return "rx"
+    if protection & 0x04:
+        return "rw"
+    return "r"
 
 
 def _guest_file_mode(desired_access: int, create_disposition: int | None) -> str:

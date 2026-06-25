@@ -39,6 +39,7 @@ GENERATED_LANGUAGE = "c++17"
 FIRST_RENDERER_BACKEND = "vulkan"
 BLOCK_TERMINATORS = frozenset({"ret", "jmp", "jcc", "int3", "int"})
 DETERMINISTIC_TSC_STEP = 733_000
+DEFAULT_MXCSR = 0x00001F80
 
 
 class RecompilationError(RuntimeError):
@@ -127,6 +128,7 @@ class CpuState:
     eip: int = 0
     fs_base: int = 0
     timestamp_counter: int = 0
+    mxcsr: int = DEFAULT_MXCSR
 
     @classmethod
     def with_registers(cls, **registers: int) -> "CpuState":
@@ -137,6 +139,8 @@ class CpuState:
                 state.fs_base = _u32(value)
             elif normalized == "timestamp_counter":
                 state.timestamp_counter = value & 0xFFFFFFFFFFFFFFFF
+            elif normalized == "mxcsr":
+                state.mxcsr = _u32(value)
             else:
                 state.set_register(name, value)
         return state
@@ -162,6 +166,8 @@ class CpuState:
             "eip_hex": _hex32(self.eip),
             "timestamp_counter": self.timestamp_counter,
             "timestamp_counter_hex": f"0x{self.timestamp_counter & 0xFFFFFFFFFFFFFFFF:016X}",
+            "mxcsr": self.mxcsr,
+            "mxcsr_hex": _hex32(self.mxcsr),
         }
 
 
@@ -581,6 +587,14 @@ class X86Decoder:
             vector = self._read_u8(code, offset)
             offset += 1
             return inst("int", (Operand.immediate_u32(vector),))
+        if opcode == 0xEE:
+            return inst(
+                "out",
+                (
+                    Operand.register("dx", size=16),
+                    Operand.register("al", size=8),
+                ),
+            )
         if opcode == 0xDB:
             extension = self._read_u8(code, offset)
             offset += 1
@@ -797,6 +811,8 @@ class X86Decoder:
         if opcode == 0x0F:
             second = self._read_u8(code, offset)
             offset += 1
+            if second == 0x09:
+                return inst("wbinvd")
             if second == 0x31:
                 return inst("rdtsc")
             if 0x80 <= second <= 0x8F:
@@ -890,6 +906,25 @@ class X86Decoder:
                     "setcc",
                     (rm_operand,),
                     condition=_condition_for_short_opcode(0x70 + (second - 0x90)),
+                )
+            if second == 0xAE:
+                reg_index, rm_operand, offset = self._decode_modrm(
+                    code,
+                    offset,
+                    operand_size=32,
+                )
+                if reg_index == 7 and rm_operand.kind == "reg":
+                    return inst("sfence")
+                if rm_operand.kind != "mem":
+                    raise X86DecodeError(
+                        f"unsupported 0F AE register form at {_hex32(address)}"
+                    )
+                if reg_index == 2:
+                    return inst("ldmxcsr", (rm_operand,))
+                if reg_index == 3:
+                    return inst("stmxcsr", (rm_operand,))
+                raise X86DecodeError(
+                    f"unsupported 0F AE /{reg_index} at {_hex32(address)}"
                 )
             raise X86DecodeError(f"unsupported two-byte opcode 0F {second:02X} at {_hex32(address)}")
 
@@ -1226,7 +1261,7 @@ class X86Decoder:
             if index_bits != 4:
                 index = REGISTER_BY_INDEX[index_bits]
             if base_bits == 5 and mod == 0:
-                absolute = _read_u32(code, offset)
+                displacement = _i32(_read_u32(code, offset))
                 offset += 4
             else:
                 base = REGISTER_BY_INDEX[base_bits]
@@ -1359,6 +1394,24 @@ def execute_lifted_function(
             trace.add(instruction.address, "fpu_clear_exceptions")
             active_state.eip = next_eip
             continue
+        if instruction.mnemonic == "wbinvd":
+            trace.add(instruction.address, "cache_writeback_invalidate")
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "sfence":
+            trace.add(instruction.address, "store_fence")
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "out":
+            trace.add(
+                instruction.address,
+                "port_write",
+                port=active_state.get_register("edx") & 0xFFFF,
+                value=active_state.get_register("eax") & 0xFF,
+                size=1,
+            )
+            active_state.eip = next_eip
+            continue
         if instruction.mnemonic == "fnstcw":
             _write_operand(
                 active_state,
@@ -1376,6 +1429,26 @@ def execute_lifted_function(
                 active_state, active_memory, trace, instruction, instruction.operands[0]
             )
             trace.add(instruction.address, "fpu_load_control_word", value=value)
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "stmxcsr":
+            _write_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[0],
+                active_state.mxcsr,
+            )
+            trace.add(instruction.address, "sse_store_mxcsr", value=active_state.mxcsr)
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "ldmxcsr":
+            value = _read_operand(
+                active_state, active_memory, trace, instruction, instruction.operands[0]
+            )
+            active_state.mxcsr = _u32(value)
+            trace.add(instruction.address, "sse_load_mxcsr", value=active_state.mxcsr)
             active_state.eip = next_eip
             continue
         if instruction.mnemonic == "mov":
@@ -2315,6 +2388,7 @@ class CppEmitter:
             "    uint32_t edi;",
             "    uint32_t fs_base;",
             "    uint64_t timestamp_counter;",
+            "    uint32_t mxcsr;",
             "    B2RFlags flags;",
             "    void* user;",
             "    uint32_t (*read_u32)(void*, uint32_t);",
@@ -2444,6 +2518,19 @@ class CppEmitter:
             return [f"eip = {next_eip};", "continue;"]
         if instruction.mnemonic == "fnclex":
             return [f"eip = {next_eip};", "continue;"]
+        if instruction.mnemonic == "wbinvd":
+            return [f"eip = {next_eip};", "continue;"]
+        if instruction.mnemonic == "sfence":
+            return [f"eip = {next_eip};", "continue;"]
+        if instruction.mnemonic == "out":
+            return [
+                "const uint32_t port = ctx->edx & 0xffffu;",
+                "const uint8_t value = static_cast<uint8_t>(ctx->eax & 0xffu);",
+                "(void)port;",
+                "(void)value;",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
         if instruction.mnemonic == "fnstcw":
             return self._emit_write(instruction.operands[0], "0x037fu") + [
                 f"eip = {next_eip};",
@@ -2452,6 +2539,17 @@ class CppEmitter:
         if instruction.mnemonic == "fldcw":
             return [
                 f"(void){self._operand_read(instruction.operands[0])};",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "stmxcsr":
+            return self._emit_write(instruction.operands[0], "ctx->mxcsr") + [
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "ldmxcsr":
+            return [
+                f"ctx->mxcsr = {self._operand_read(instruction.operands[0])};",
                 f"eip = {next_eip};",
                 "continue;",
             ]

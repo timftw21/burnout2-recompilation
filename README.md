@@ -46,7 +46,7 @@ Milestone status:
 | 4. Runtime shims | Done | Current `default.xbe` kernel imports register with modeled handlers/data exports and no placeholder stubs. |
 | 5. Recompilation prototype | Done | A narrow IA-32 lifter, executor, and deterministic Windows C++17 emitter are implemented and tested. |
 | 6. First interactive frame | Done | The Windows/Vulkan harness builds, opens a window, presents bounded frames, and records diagnostics. |
-| 7. Playability push | Partial | Boot/control-flow execution reaches the guest-thread scheduler boundary with asset, runtime, and render evidence. |
+| 7. Playability push | Partial | Boot/control-flow execution now clears the title heap corruption path and reaches a later startup scheduler/timer boundary after GPU/PCI setup. |
 
 ## Local Inputs and Outputs
 
@@ -204,8 +204,8 @@ python .\tools\playability\playability_probe.py `
 python .\tools\render\d3d8_stream.py `
   --input .\reports\local\playability\probe-summary.json `
   --stream-output .\reports\local\render\recovered-d3d-stream.json `
-  --decode-output .\reports\local\render\decoded-d3d-stream.json `
-  --replay-output .\reports\local\render\replay-summary.json `
+  --decode-output .\reports\local\render\recovered-d3d-decode.json `
+  --replay-output .\reports\local\render\recovered-d3d-replay.json `
   --pretty
 
 python .\tools\host\first_frame_smoke.py `
@@ -216,67 +216,53 @@ python .\tools\host\first_frame_smoke.py `
 
 ## Current Recovery Evidence
 
-The current local playability probe:
+Latest local probe:
 
-- Executes the real entry prefix at `0x000E2555`.
-- Decodes entry handoffs at `0x000E68C4`, `0x000E5D5D`, and `0x000E099C`.
-- Recovers `681` static basic blocks with no remaining static frontier.
-- Follows the created guest thread at `0x000E682C`.
-- Dynamically decodes `438` executed blocks and reaches `219` runtime ABI calls
-  from the guest thread.
-- Stops cleanly at the recovered guest-thread scheduler work-queue scan at
-  `0x000F2A10`.
+- Entry execution at `0x000E2555` returns after `72` steps and decodes the
+  current handoffs at `0x000E68C4`, `0x000E5D5D`, and `0x000E099C`.
+- The created guest thread at `0x000E682C` now executes through `639` dynamic
+  blocks and `294` thread-local runtime ABI calls before stopping at the
+  classified `startup_work_queue_scan` boundary at `0x0021AB10`.
+- The previous title heap free-list boundary is cleared. The root cause was a
+  no-base SIB decode bug for `lea ecx, [ecx*4 + 4]`, which had under-allocated
+  the scheduler array and corrupted adjacent heap metadata.
+- The newest control-flow gap is a scheduler/timer countdown loop at
+  `0x0021AB10`/`0x0021AB19`; it has no dynamic decode frontier and should be
+  traced as a timing or queued-work model gap rather than as missing IA-32
+  instruction coverage.
 
-Scheduler boundary evidence:
+Runtime/API stance:
 
-- Requested key: `0x0000040D`, loaded by `0x000F2A10` from stack offset `0x24`
-  at stack address `0x70FFFECC`.
-- Observed node base/key/next: `0x00000008`, `0x003445C0`, `0x00000008`.
-- The observed node self-loops and does not contain the awaited key.
-- Producer candidates preserve `8` bounded writes to watched scheduler slots.
-- Current producer keys observed through `0x000F2A5B` -> `0x000F2A63` are
-  `0x0000040F` and `0x00000401`, not `0x0000040D`.
-- Producer/consumer key arguments both use stack offset `0x24`; the current
-  missing-key hypothesis is that the producer path for `0x0000040D` has not
-  executed before this wait.
-- Recovered producer labels: `0x00127E9B` initial node key seed,
-  `0x00127ED2` initial pointer-byte seed, `0x000F2A63` work-item key writer,
-  `0x000F2AAB` next-pointer initializer, `0x000F2AF9` next-pointer linker, and
-  `0x000F29F6` watched queue-slot replacement.
+- Runtime work is title-directed. Implement Xbox APIs only when this XBE reaches
+  a concrete edge with observed arguments, side effects, and return contracts.
+- Current observed fixes include five-argument `NtAllocateVirtualMemory`,
+  reserve/commit base preservation for the title heap,
+  four-argument guest cleanup for `AvSendTVEncoderOption`,
+  six-argument guest-buffer marshaling for `HalReadWritePCISpace`, and
+  `RtlCompareMemoryUlong` guest-buffer marshaling.
+- Current IA-32 coverage added from the boot path includes no-base SIB
+  addressing, MXCSR load/store, `wbinvd`, `sfence`, and `out dx, al`.
 
-Asset and runtime evidence:
+Asset and deterministic service evidence:
 
-- Ordered asset I/O summary records `15` file/symbolic-link edges.
-- The `d:\dashupdate.xbe` open/read/query/set-position/read/close sequence is
-  complete and streamed `840` bytes into guest buffers.
-- The `\??\D:` symbolic-link open/query/close sequence resolves to
-  `\Device\Cdrom0`.
-- The next edge after those completed sequences is the dashboard XODash fallback
-  `\Device\Harddisk0\partition2\XODash\xonlinedash.xbe` at ABI invocation `38`,
-  followed by the disc XODash fallback at invocation `40`; both are clean
-  not-found probes.
-- Dashboard/cache assessment records `2` dashboard probes and `1` cache probe,
-  all clean not-found, with `requires_configured_roots_for_observed_edges:
-  false`.
-- Deterministic service validation currently covers `2` file-read events,
-  `840` bytes read, and `1,500` deterministic 100 ns latency ticks. Save-data,
-  audio, and input-latency sections remain zero until later gameplay paths
-  exercise them.
+- The corrected heap path currently records only `2` file probes before the
+  current scheduler boundary: `\Device\CdRom0` and
+  `\Device\Harddisk0\partition1\`, both clean not-found.
+- The older `d:\dashupdate.xbe` and `\??\D:` sequences remain useful recovered
+  evidence, but they are not reached by the latest corrected heap path.
+- Streaming, save-data, audio, and input-latency validation remain zero on this
+  path until execution advances past the current scheduler/timer boundary.
 
-Render evidence:
+Visual/render evidence:
 
-- Guest-thread trace captures `143` D3D command writes: `24` MMIO writes and
-  `119` push-buffer writes.
-- Offline D3D stream decode currently reassembles `33` push-buffer dwords,
-  preserves `3` zero-count command-shaped words, and finds `0` valid recovered
-  method packets in the boot artifact.
-- The dominant recovered surface payload dword is `0x808080FF`, selected from
-  `19` of `33` complete dword samples.
-- Offline replay and the Vulkan smoke emit one Vulkan-facing render-pass clear
-  work item from the recovered surface payload.
-- Synthetic regression coverage exercises method-specific D3D ARGB
-  `clear_color`, `clear_surface` mask selection, and `begin_end` primitive draw
-  translation.
+- The current guest-thread trace captures `144` D3D writes: `24` MMIO writes and
+  `120` push-buffer writes.
+- Offline decode reassembles `33` push-buffer dwords, preserves `3`
+  zero-count command-shaped words, and has `0` stable method packets in this
+  boot artifact.
+- The current render stream is still boot-diagnostic data, not title-screen
+  rendering; visual work should resume after execution reaches visible title
+  flow.
 
 ## Implementation Areas
 
@@ -339,25 +325,20 @@ generated C++, dynamic block caches, and recovered stream reports are ignored.
 
 ## Immediate Next Steps
 
-1. Continue from the recovered `guest_thread_scheduler` work-queue scan at
-   `0x000F2A10` by tracing the producer caller/key path for missing requested
-   key `0x0000040D`, starting from producer stack slot `0x24`, source load
-   `0x000F2A5B`, key writer `0x000F2A63`, and grouped producer anchor
-   `0x000F29F6`.
-2. Continue from the XODash dashboard/disc fallback probes and determine whether
-   later boot/gameplay paths require configured local dashboard/cache roots or
-   whether deterministic not-found remains correct title behavior.
+1. Trace the `0x0021AB10` startup countdown/scheduler loop and decide whether
+   it needs a timer tick, queued-work producer, or narrower hardware completion
+   model.
+2. Re-check asset I/O once execution advances; the latest corrected path still
+   does not reach the previous `dashupdate.xbe`, `\??\D:`, dashboard, or cache
+   probes before the current scheduler/timer boundary.
 3. Validate streaming, audio, save-data, input-latency, and deterministic
    summary models against the next recovered gameplay paths.
-4. Feed newly decoded Direct3D 8/NV2A method packets and recovered surface
-   payload samples into the Vulkan state/work translator.
-5. Broaden regression tests only as new real boot and gameplay paths are
-   recovered.
+4. Expand D3D8/NV2A method-specific Vulkan translation when recovered command
+   streams contain stable method packets rather than only diagnostic payloads.
+5. Keep adding regression tests only for observed title paths and ABI edges.
 
 ## Open Questions
 
 - What determinism level is required for long-run gameplay testing and replay?
-- How much of the Xbox API surface should be emulated generally versus tailored
-  specifically to this title?
 - Which recovered render packets should graduate from preserved artifacts to
   method-specific Vulkan work once gameplay command streams stabilize?

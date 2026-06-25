@@ -214,6 +214,32 @@ class X86RecompPrototypeTests(unittest.TestCase):
         self.assertEqual(result.state.get_register("eax"), 0xFFFFEDCB)
         self.assertEqual(result.return_address, 0xDEADC0DE)
 
+    def test_sib_no_base_lea_preserves_index_scale_and_displacement(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex("B9040000008D0C8D04000000C3"),
+            base_address=0x3210,
+            symbol="scheduler_array_size",
+        )
+        operand = function.instructions[1].operands[1]
+
+        self.assertEqual(function.instructions[1].text(), "lea ecx, [ecx*4 + 0x4]")
+        self.assertIsNone(operand.base)
+        self.assertEqual(operand.index, "ecx")
+        self.assertEqual(operand.scale, 4)
+        self.assertEqual(operand.displacement, 4)
+        self.assertIsNone(operand.absolute)
+
+        state = CpuState.with_registers(esp=0x9000)
+        memory = SparseMemory({0x9000: 0xDEADC0DE})
+
+        result = execute_lifted_function(function, state=state, memory=memory)
+        emitted = emit_cpp(function, exported_symbol="scheduler_array_size")
+
+        self.assertEqual(result.state.get_register("ecx"), 20)
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        self.assertIn("(ctx->ecx * 4u)", emitted)
+        self.assertIn("0x00000004u", emitted)
+
     def test_rep_stosd_models_stack_buffer_fill(self) -> None:
         function = lift_x86_function(
             bytes.fromhex("B8EFBEADDEB903000000BF00200000F3ABC3"),
@@ -451,6 +477,92 @@ class X86RecompPrototypeTests(unittest.TestCase):
         self.assertEqual(result.state.get_register("edx"), 0x00000001)
         self.assertEqual(result.state.timestamp_counter, 0x00000002_000B2F38)
         self.assertEqual(result.return_address, 0xDEADC0DE)
+
+    def test_observed_mxcsr_store_modify_and_load_decode_and_execute(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex(
+                "0FAE5C2408"  # stmxcsr [esp+8]
+                "8B442408"  # mov eax, [esp+8]
+                "0D00800000"  # or eax, 0x8000
+                "89442408"  # mov [esp+8], eax
+                "0FAE542408"  # ldmxcsr [esp+8]
+                "C3"
+            ),
+            base_address=0x3840,
+            symbol="mxcsr_mode_update",
+        )
+        state = CpuState.with_registers(esp=0x9000, mxcsr=0x00001F80)
+        memory = SparseMemory({0x9000: 0xDEADC0DE})
+
+        result = execute_lifted_function(function, state=state, memory=memory)
+        emitted = emit_cpp(function, exported_symbol="mxcsr_mode_update")
+        operations = [event["operation"] for event in result.trace.to_list()]
+
+        self.assertEqual(function.instructions[0].text(), "stmxcsr [esp + 0x8]")
+        self.assertEqual(function.instructions[4].text(), "ldmxcsr [esp + 0x8]")
+        self.assertEqual(result.state.mxcsr, 0x00009F80)
+        self.assertEqual(memory.read_u32(0x9008), 0x00009F80)
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        self.assertIn("sse_store_mxcsr", operations)
+        self.assertIn("sse_load_mxcsr", operations)
+        self.assertIn("ctx->mxcsr", emitted)
+
+    def test_observed_cache_writeback_invalidate_decodes_as_noop(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex("0F09C3"),
+            base_address=0x3860,
+            symbol="cache_writeback_invalidate",
+        )
+        state = CpuState.with_registers(esp=0x9000)
+        memory = SparseMemory({0x9000: 0xDEADC0DE})
+
+        result = execute_lifted_function(function, state=state, memory=memory)
+        emitted = emit_cpp(function, exported_symbol="cache_writeback_invalidate")
+        operations = [event["operation"] for event in result.trace.to_list()]
+
+        self.assertEqual(function.instructions[0].text(), "wbinvd")
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        self.assertIn("cache_writeback_invalidate", operations)
+        self.assertIn("case 0x00003860u", emitted)
+
+    def test_observed_store_fence_decodes_as_noop(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex("0FAEF8C3"),
+            base_address=0x3868,
+            symbol="store_fence",
+        )
+        state = CpuState.with_registers(esp=0x9000)
+        memory = SparseMemory({0x9000: 0xDEADC0DE})
+
+        result = execute_lifted_function(function, state=state, memory=memory)
+        operations = [event["operation"] for event in result.trace.to_list()]
+
+        self.assertEqual(function.instructions[0].text(), "sfence")
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        self.assertIn("store_fence", operations)
+
+    def test_observed_byte_port_write_decodes_as_traced_noop(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex("BAC0800000B05AEEC3"),
+            base_address=0x3870,
+            symbol="byte_port_write",
+        )
+        state = CpuState.with_registers(esp=0x9000)
+        memory = SparseMemory({0x9000: 0xDEADC0DE})
+
+        result = execute_lifted_function(function, state=state, memory=memory)
+        emitted = emit_cpp(function, exported_symbol="byte_port_write")
+        port_events = [
+            event
+            for event in result.trace.to_list()
+            if event["operation"] == "port_write"
+        ]
+
+        self.assertEqual(function.instructions[2].text(), "out dx, al")
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        self.assertEqual(port_events[0]["details"]["port"], 0x80C0)
+        self.assertEqual(port_events[0]["details"]["value"], 0x5A)
+        self.assertIn("ctx->edx & 0xffffu", emitted)
 
     def test_observed_byte_test_and_immediate_group_flags(self) -> None:
         byte_test = lift_x86_function(
