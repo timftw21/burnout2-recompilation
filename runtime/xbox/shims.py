@@ -58,6 +58,11 @@ def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) & ~(alignment - 1)
 
 
+def _i64_from_u32_parts(low: int, high: int) -> int:
+    value = ((high & 0xFFFFFFFF) << 32) | (low & 0xFFFFFFFF)
+    return value - 0x1_0000_0000_0000_0000 if value & 0x8000_0000_0000_0000 else value
+
+
 @dataclass(frozen=True)
 class ShimTraceEvent:
     sequence: int
@@ -135,6 +140,9 @@ class RuntimeShim:
 @dataclass(frozen=True)
 class XboxRuntimeConfig:
     extracted_disc_root: Path | None = None
+    save_data_root: Path | None = None
+    dashboard_data_root: Path | None = None
+    cache_data_root: Path | None = None
     host_target_base: int = 0xE0000000
     host_target_stride: int = 0x10
     allocation_base: int = 0x10000000
@@ -148,14 +156,30 @@ class GuestFile:
     guest_path: str
     host_path: Path
     mode: str
+    root_kind: str
     position: int = 0
+    size: int = 0
+    read_count: int = 0
+    bytes_read: int = 0
+    write_count: int = 0
+    bytes_written: int = 0
+    writable: bool = False
+    streaming: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "guest_path": self.guest_path,
             "host_path": str(self.host_path),
             "mode": self.mode,
+            "root_kind": self.root_kind,
             "position": self.position,
+            "size": self.size,
+            "read_count": self.read_count,
+            "bytes_read": self.bytes_read,
+            "write_count": self.write_count,
+            "bytes_written": self.bytes_written,
+            "writable": self.writable,
+            "streaming": self.streaming,
         }
 
 
@@ -251,16 +275,42 @@ class GuestHandleTable:
 
 
 class XboxFileSystemShim:
-    """Read-only guest filesystem view rooted at the extracted local disc tree."""
+    """Guest filesystem view rooted at local disc and save-data directories."""
 
-    _DEVICE_PREFIXES = (
+    _DISC_PREFIXES = (
         "\\Device\\Cdrom0\\",
         "\\Device\\CdRom0\\",
-        "\\Device\\Harddisk0\\Partition0\\",
-        "\\Device\\Harddisk0\\Partition1\\",
         "\\??\\D:\\",
         "D:\\",
         "Cdrom0:\\",
+    )
+    _SAVE_PREFIXES = (
+        "\\Device\\Harddisk0\\Partition0\\",
+        "\\Device\\Harddisk0\\Partition1\\",
+        "\\??\\E:\\",
+        "E:\\",
+    )
+    _DASHBOARD_PREFIXES = (
+        "\\Device\\Harddisk0\\Partition2\\",
+        "\\??\\C:\\",
+        "C:\\",
+    )
+    _CACHE_PREFIXES = (
+        "\\Device\\Harddisk0\\Partition3\\",
+        "\\Device\\Harddisk0\\Partition4\\",
+        "\\Device\\Harddisk0\\Partition5\\",
+        "\\??\\X:\\",
+        "\\??\\Y:\\",
+        "\\??\\Z:\\",
+        "X:\\",
+        "Y:\\",
+        "Z:\\",
+    )
+    _DEVICE_PREFIXES = (
+        _DISC_PREFIXES
+        + _SAVE_PREFIXES
+        + _DASHBOARD_PREFIXES
+        + _CACHE_PREFIXES
     )
 
     def __init__(
@@ -268,20 +318,44 @@ class XboxFileSystemShim:
         trace: ShimTraceLog,
         handles: GuestHandleTable,
         extracted_disc_root: Path | None,
+        save_data_root: Path | None = None,
+        dashboard_data_root: Path | None = None,
+        cache_data_root: Path | None = None,
+        clock: "XboxClockShim | None" = None,
     ) -> None:
         self._trace = trace
         self._handles = handles
         self._root = extracted_disc_root.resolve() if extracted_disc_root else None
+        self._save_root = save_data_root.resolve() if save_data_root else None
+        self._dashboard_root = (
+            dashboard_data_root.resolve() if dashboard_data_root else None
+        )
+        self._cache_root = cache_data_root.resolve() if cache_data_root else None
+        self._clock = clock
 
     @property
     def root(self) -> Path | None:
         return self._root
 
-    def resolve_guest_path(self, guest_path: str) -> Path:
-        if self._root is None:
-            raise XboxPathError("no extracted disc root is configured")
+    @property
+    def save_root(self) -> Path | None:
+        return self._save_root
+
+    @property
+    def dashboard_root(self) -> Path | None:
+        return self._dashboard_root
+
+    @property
+    def cache_root(self) -> Path | None:
+        return self._cache_root
+
+    def resolve_guest_path(self, guest_path: str, *, for_write: bool = False) -> Path:
+        root_kind = self._root_kind_for_guest_path(guest_path)
+        root = self._root_for_guest_path(guest_path, for_write=for_write)
+        if root is None:
+            raise XboxPathError(f"no host root configured for {root_kind} volume")
         parts = self._guest_path_parts(guest_path)
-        current = self._root
+        current = root
         for part in parts:
             if current.exists() and current.is_dir():
                 matches = {
@@ -293,7 +367,7 @@ class XboxFileSystemShim:
 
         resolved = current.resolve(strict=False)
         try:
-            resolved.relative_to(self._root)
+            resolved.relative_to(root)
         except ValueError as exc:
             raise XboxPathError(f"guest path escapes extracted root: {guest_path}") from exc
         self._trace.add(
@@ -301,23 +375,31 @@ class XboxFileSystemShim:
             "resolve_path",
             guest_path=guest_path,
             host_path=resolved,
+            root_kind=root_kind,
+            for_write=for_write,
         )
         return resolved
 
     def query_file_information(self, guest_path: str) -> dict[str, Any]:
+        root_kind = self._root_kind_for_guest_path(guest_path)
         try:
             host_path = self.resolve_guest_path(guest_path)
         except XboxPathError as exc:
             self._trace.add(
                 "filesystem", "query_file", "error", guest_path=guest_path, error=str(exc)
             )
-            return {"status": XboxStatus.OBJECT_NAME_NOT_FOUND, "error": str(exc)}
+            return {
+                "status": XboxStatus.NO_SUCH_FILE,
+                "root_kind": root_kind,
+                "error": str(exc),
+            }
 
         exists = host_path.exists()
         info = {
             "status": XboxStatus.SUCCESS if exists else XboxStatus.OBJECT_NAME_NOT_FOUND,
             "guest_path": guest_path,
             "host_path": str(host_path),
+            "root_kind": root_kind,
             "exists": exists,
             "is_directory": host_path.is_dir() if exists else False,
             "size": host_path.stat().st_size if exists and host_path.is_file() else 0,
@@ -325,16 +407,123 @@ class XboxFileSystemShim:
         self._trace.add("filesystem", "query_file", **info)
         return info
 
+    def query_file_handle_information(self, handle: int) -> dict[str, Any]:
+        try:
+            file = self._handles.get(handle, "file")
+        except XboxRuntimeError as exc:
+            return {"status": XboxStatus.INVALID_HANDLE, "error": str(exc)}
+        file.size = file.host_path.stat().st_size if file.host_path.exists() else 0
+        info = {
+            "status": XboxStatus.SUCCESS,
+            "handle": handle,
+            "guest_path": file.guest_path,
+            "host_path": str(file.host_path),
+            "exists": file.host_path.exists(),
+            "is_directory": False,
+            "size": file.size,
+            "position": file.position,
+            "writable": file.writable,
+            "save_data": self._is_save_path(file.guest_path),
+        }
+        self._trace.add("filesystem", "query_file_handle", **info)
+        return info
+
+    def set_file_handle_information(
+        self,
+        handle: int,
+        file_information_class: int,
+        payload: bytes = b"",
+    ) -> dict[str, Any]:
+        try:
+            file = self._handles.get(handle, "file")
+        except XboxRuntimeError as exc:
+            return {"status": XboxStatus.INVALID_HANDLE, "error": str(exc)}
+        result: dict[str, Any] = {
+            "status": XboxStatus.SUCCESS,
+            "handle": handle,
+            "guest_path": file.guest_path,
+            "file_information_class": file_information_class,
+            "bytes_consumed": 0,
+        }
+        if file_information_class == 14:
+            if len(payload) < 8:
+                result["status"] = XboxStatus.INVALID_PARAMETER
+            else:
+                offset = int.from_bytes(payload[:8], "little", signed=True)
+                if offset < 0:
+                    result["status"] = XboxStatus.INVALID_PARAMETER
+                else:
+                    file.position = offset
+                    result["position"] = file.position
+                    result["bytes_consumed"] = 8
+        elif file_information_class in {19, 20}:
+            result["ignored"] = True
+            result["bytes_consumed"] = min(len(payload), 8)
+        else:
+            result["ignored"] = True
+        self._trace.add(
+            "filesystem",
+            "set_file_handle_information",
+            handle=handle,
+            guest_path=file.guest_path,
+            file_information_class=file_information_class,
+            status_hex=_hex32(result["status"]),
+            position=file.position,
+            bytes_consumed=result["bytes_consumed"],
+            ignored=result.get("ignored", False),
+        )
+        return result
+
+    def query_volume_handle_information(self, handle: int) -> dict[str, Any]:
+        try:
+            file = self._handles.get(handle, "file")
+        except XboxRuntimeError as exc:
+            return {"status": XboxStatus.INVALID_HANDLE, "error": str(exc)}
+        return self.query_volume_information(file.guest_path)
+
     def open_file(self, guest_path: str, mode: str = "rb") -> dict[str, Any]:
         if mode not in {"r", "rb", "w", "wb", "a", "ab"}:
             self._trace.add(
                 "filesystem", "open_file", "error", guest_path=guest_path, mode=mode
             )
             return {"status": XboxStatus.ACCESS_DENIED, "handle": None}
+        writable = "w" in mode or "a" in mode
+        root_kind = self._root_kind_for_guest_path(guest_path)
+        if writable and root_kind not in {"save", "cache"}:
+            self._trace.add(
+                "filesystem",
+                "open_file",
+                "error",
+                guest_path=guest_path,
+                mode=mode,
+                root_kind=root_kind,
+                reason="root_is_read_only",
+            )
+            return {"status": XboxStatus.ACCESS_DENIED, "handle": None, "root_kind": root_kind}
         try:
-            host_path = self.resolve_guest_path(guest_path)
+            host_path = self.resolve_guest_path(guest_path, for_write=writable)
         except XboxPathError as exc:
-            return {"status": XboxStatus.OBJECT_NAME_NOT_FOUND, "handle": None, "error": str(exc)}
+            self._trace.add(
+                "filesystem",
+                "open_file",
+                "error",
+                guest_path=guest_path,
+                mode=mode,
+                root_kind=root_kind,
+                error=str(exc),
+            )
+            return {
+                "status": XboxStatus.NO_SUCH_FILE,
+                "handle": None,
+                "root_kind": root_kind,
+                "error": str(exc),
+            }
+        if writable:
+            host_path.parent.mkdir(parents=True, exist_ok=True)
+            if "w" in mode:
+                host_path.write_bytes(b"")
+            elif not host_path.exists():
+                host_path.write_bytes(b"")
         if not host_path.is_file():
             self._trace.add(
                 "filesystem",
@@ -342,10 +531,20 @@ class XboxFileSystemShim:
                 "error",
                 guest_path=guest_path,
                 host_path=host_path,
+                root_kind=root_kind,
             )
-            return {"status": XboxStatus.NO_SUCH_FILE, "handle": None}
+            return {"status": XboxStatus.NO_SUCH_FILE, "handle": None, "root_kind": root_kind}
 
-        file = GuestFile(guest_path, host_path, mode)
+        size = host_path.stat().st_size
+        file = GuestFile(
+            guest_path,
+            host_path,
+            mode,
+            root_kind,
+            size=size,
+            writable=writable,
+            streaming=not writable,
+        )
         handle = self._handles.allocate("file", file)
         self._trace.add(
             "filesystem",
@@ -353,9 +552,13 @@ class XboxFileSystemShim:
             guest_path=guest_path,
             host_path=host_path,
             handle=handle,
-            size=host_path.stat().st_size,
+            size=size,
+            root_kind=root_kind,
+            writable=writable,
+            save_data=self._is_save_path(guest_path),
+            cache_data=root_kind == "cache",
         )
-        return {"status": XboxStatus.SUCCESS, "handle": handle}
+        return {"status": XboxStatus.SUCCESS, "handle": handle, "root_kind": root_kind}
 
     def read_file(
         self, handle: int, size: int | None = None, *, offset: int | None = None
@@ -369,12 +572,20 @@ class XboxFileSystemShim:
                 return {"status": XboxStatus.INVALID_PARAMETER, "data": b""}
             file.position = offset
 
-        payload = file.host_path.read_bytes()
-        start = min(file.position, len(payload))
-        end = len(payload) if size is None else min(start + max(size, 0), len(payload))
-        chunk = payload[start:end]
+        file.size = file.host_path.stat().st_size if file.host_path.exists() else 0
+        start = min(file.position, file.size)
+        requested = file.size - start if size is None else max(size, 0)
+        with file.host_path.open("rb") as host_file:
+            host_file.seek(start)
+            chunk = host_file.read(requested)
+        end = start + len(chunk)
         file.position = end
-        status = XboxStatus.SUCCESS if chunk or start < len(payload) else XboxStatus.END_OF_FILE
+        file.read_count += 1
+        file.bytes_read += len(chunk)
+        latency_100ns = self._stream_latency_100ns(len(chunk), requested)
+        if self._clock is not None:
+            self._clock.advance_100ns(latency_100ns)
+        status = XboxStatus.SUCCESS if chunk or start < file.size else XboxStatus.END_OF_FILE
         self._trace.add(
             "filesystem",
             "read_file",
@@ -383,6 +594,11 @@ class XboxFileSystemShim:
             offset=start,
             requested_size=size,
             bytes_read=len(chunk),
+            next_offset=file.position,
+            file_size=file.size,
+            stream_read_index=file.read_count,
+            deterministic_latency_100ns=latency_100ns,
+            end_of_file=status == XboxStatus.END_OF_FILE,
             status_hex=_hex32(status),
         )
         return {"status": status, "data": chunk, "bytes_read": len(chunk)}
@@ -409,8 +625,12 @@ class XboxFileSystemShim:
             current.extend(b"\x00" * (start - len(current)))
         end = start + len(payload)
         current[start:end] = payload
+        file.host_path.parent.mkdir(parents=True, exist_ok=True)
         file.host_path.write_bytes(bytes(current))
         file.position = end
+        file.size = len(current)
+        file.write_count += 1
+        file.bytes_written += len(payload)
         self._trace.add(
             "filesystem",
             "write_file",
@@ -418,12 +638,26 @@ class XboxFileSystemShim:
             guest_path=file.guest_path,
             offset=start,
             bytes_written=len(payload),
+            file_size=file.size,
+            write_index=file.write_count,
+            save_data=self._is_save_path(file.guest_path),
         )
         return {"status": XboxStatus.SUCCESS, "bytes_written": len(payload)}
 
     def delete_file(self, guest_path: str) -> int:
+        root_kind = self._root_kind_for_guest_path(guest_path)
+        if root_kind not in {"save", "cache"}:
+            self._trace.add(
+                "filesystem",
+                "delete_file",
+                "error",
+                guest_path=guest_path,
+                root_kind=root_kind,
+                reason="root_is_read_only",
+            )
+            return XboxStatus.ACCESS_DENIED
         try:
-            host_path = self.resolve_guest_path(guest_path)
+            host_path = self.resolve_guest_path(guest_path, for_write=True)
         except XboxPathError as exc:
             self._trace.add(
                 "filesystem", "delete_file", "error", guest_path=guest_path, error=str(exc)
@@ -443,10 +677,15 @@ class XboxFileSystemShim:
         return XboxStatus.SUCCESS
 
     def query_volume_information(self, guest_path: str = "D:\\") -> dict[str, Any]:
+        root_kind = self._root_kind_for_guest_path(guest_path)
         try:
             host_path = self.resolve_guest_path(guest_path)
         except XboxPathError as exc:
-            return {"status": XboxStatus.OBJECT_NAME_NOT_FOUND, "error": str(exc)}
+            return {
+                "status": XboxStatus.NO_SUCH_FILE,
+                "root_kind": root_kind,
+                "error": str(exc),
+            }
         root = host_path if host_path.is_dir() else host_path.parent
         total_bytes = 0
         file_count = 0
@@ -461,22 +700,33 @@ class XboxFileSystemShim:
             "serial_number": 0x41430019,
             "file_count": file_count,
             "used_bytes": total_bytes,
+            "root_kind": root_kind,
         }
         self._trace.add("filesystem", "query_volume", guest_path=guest_path, result=result)
         return result
 
     def list_directory(self, guest_path: str = "D:\\") -> dict[str, Any]:
+        root_kind = self._root_kind_for_guest_path(guest_path)
         try:
             host_path = self.resolve_guest_path(guest_path)
         except XboxPathError as exc:
-            return {"status": XboxStatus.OBJECT_NAME_NOT_FOUND, "entries": [], "error": str(exc)}
+            return {
+                "status": XboxStatus.NO_SUCH_FILE,
+                "entries": [],
+                "root_kind": root_kind,
+                "error": str(exc),
+            }
         if not host_path.is_dir():
-            return {"status": XboxStatus.NO_SUCH_FILE, "entries": []}
+            return {"status": XboxStatus.NO_SUCH_FILE, "entries": [], "root_kind": root_kind}
         entries = sorted(child.name for child in host_path.iterdir())
         self._trace.add(
-            "filesystem", "list_directory", guest_path=guest_path, entry_count=len(entries)
+            "filesystem",
+            "list_directory",
+            guest_path=guest_path,
+            root_kind=root_kind,
+            entry_count=len(entries),
         )
-        return {"status": XboxStatus.SUCCESS, "entries": entries}
+        return {"status": XboxStatus.SUCCESS, "entries": entries, "root_kind": root_kind}
 
     def _guest_path_parts(self, guest_path: str) -> tuple[str, ...]:
         if not guest_path:
@@ -500,6 +750,72 @@ class XboxFileSystemShim:
                 raise XboxPathError(f"invalid guest path segment: {part}")
             parts.append(part)
         return tuple(parts)
+
+    def _root_for_guest_path(self, guest_path: str, *, for_write: bool = False) -> Path | None:
+        root_kind = self._root_kind_for_guest_path(guest_path)
+        if root_kind == "save":
+            return self._save_root
+        if root_kind == "dashboard":
+            return self._dashboard_root
+        if root_kind == "cache":
+            return self._cache_root
+        return self._root
+
+    def _root_kind_for_guest_path(self, guest_path: str) -> str:
+        normalized = guest_path.replace("/", "\\").strip()
+        folded = normalized.casefold()
+        if any(folded.startswith(prefix.casefold()) for prefix in self._DISC_PREFIXES):
+            return "disc"
+        if any(folded.startswith(prefix.casefold()) for prefix in self._SAVE_PREFIXES):
+            return "save"
+        if any(folded.startswith(prefix.casefold()) for prefix in self._DASHBOARD_PREFIXES):
+            return "dashboard"
+        if any(folded.startswith(prefix.casefold()) for prefix in self._CACHE_PREFIXES):
+            return "cache"
+        if len(normalized) >= 2 and normalized[1] == ":":
+            drive = normalized[0].casefold()
+            if drive == "d":
+                return "disc"
+            if drive == "e":
+                return "save"
+            if drive == "c":
+                return "dashboard"
+            if drive in {"x", "y", "z"}:
+                return "cache"
+        return "save" if self._is_save_path(guest_path) else "disc"
+
+    def _is_save_path(self, guest_path: str) -> bool:
+        normalized = guest_path.replace("/", "\\").strip()
+        folded = normalized.casefold()
+        if any(folded.startswith(prefix.casefold()) for prefix in self._SAVE_PREFIXES):
+            return True
+        stripped = normalized
+        for prefix in self._DISC_PREFIXES:
+            if stripped.casefold().startswith(prefix.casefold()):
+                stripped = stripped[len(prefix) :]
+                break
+        stripped = stripped.lstrip("\\")
+        first = stripped.split("\\", 1)[0].casefold()
+        return first in {"udata", "tdata", "saves"}
+
+    @staticmethod
+    def _stream_latency_100ns(bytes_read: int, requested: int) -> int:
+        transfer = max(bytes_read, min(requested, 4096))
+        return 500 + ((transfer + 4095) // 4096) * 250
+
+    def open_file_snapshot(self) -> list[dict[str, Any]]:
+        files: list[dict[str, Any]] = []
+        for handle, (kind, file) in sorted(self._handles._objects.items()):
+            if kind != "file":
+                continue
+            data = file.to_dict()
+            data["handle"] = handle
+            data["handle_hex"] = _hex32(handle)
+            data["save_data"] = self._is_save_path(file.guest_path)
+            data["cache_data"] = file.root_kind == "cache"
+            data["dashboard_data"] = file.root_kind == "dashboard"
+            files.append(data)
+        return files
 
 
 @dataclass
@@ -820,6 +1136,14 @@ class XboxClockShim:
         )
         return XboxStatus.SUCCESS
 
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "performance_frequency": self._frequency,
+            "performance_counter": self._counter,
+            "system_time_filetime": self._filetime,
+            "interrupt_time_100ns": self._counter * 10_000_000 // self._frequency,
+        }
+
 
 @dataclass
 class EventObject:
@@ -835,6 +1159,8 @@ class SemaphoreObject:
 
 @dataclass
 class TimerObject:
+    address: int | None = None
+    timer_type: int = 0
     due_time_100ns: int | None = None
     period_ms: int = 0
     signaled: bool = False
@@ -845,9 +1171,53 @@ class ThreadObject:
     start_address: int | None = None
     parameter: int | None = None
     suspended: bool = False
+    start_context1: int | None = None
+    start_context2: int | None = None
+    thread_extra_size: int = 0
+    kernel_stack_size: int = 0
+    tls_data_size: int = 0
+    thread_handle_address: int | None = None
+    thread_id_address: int | None = None
+    debug_stack: bool = False
     priority: int = 8
     base_priority: int = 8
     disable_boost: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "start_address": self.start_address,
+            "start_address_hex": _hex32(self.start_address)
+            if self.start_address is not None
+            else None,
+            "parameter": self.parameter,
+            "parameter_hex": _hex32(self.parameter)
+            if self.parameter is not None
+            else None,
+            "suspended": self.suspended,
+            "start_context1": self.start_context1,
+            "start_context1_hex": _hex32(self.start_context1)
+            if self.start_context1 is not None
+            else None,
+            "start_context2": self.start_context2,
+            "start_context2_hex": _hex32(self.start_context2)
+            if self.start_context2 is not None
+            else None,
+            "thread_extra_size": self.thread_extra_size,
+            "kernel_stack_size": self.kernel_stack_size,
+            "tls_data_size": self.tls_data_size,
+            "thread_handle_address": self.thread_handle_address,
+            "thread_handle_address_hex": _hex32(self.thread_handle_address)
+            if self.thread_handle_address is not None
+            else None,
+            "thread_id_address": self.thread_id_address,
+            "thread_id_address_hex": _hex32(self.thread_id_address)
+            if self.thread_id_address is not None
+            else None,
+            "debug_stack": self.debug_stack,
+            "priority": self.priority,
+            "base_priority": self.base_priority,
+            "disable_boost": self.disable_boost,
+        }
 
 
 @dataclass
@@ -876,6 +1246,7 @@ class XboxSynchronizationShim:
         self._critical_sections: set[int] = set()
         self._current_thread = self._handles.allocate("thread", ThreadObject())
         self._dpcs: dict[int, DpcObject] = {}
+        self._kernel_timers: dict[int, TimerObject] = {}
         self._interrupts: dict[int, InterruptObject] = {}
         self._bugcheck: dict[str, Any] | None = None
 
@@ -962,12 +1333,23 @@ class XboxSynchronizationShim:
         self._trace.add("threading", "create_timer", handle=handle)
         return handle
 
-    def initialize_timer(self) -> TimerObject:
-        timer = TimerObject()
-        self._trace.add("threading", "initialize_timer")
+    def initialize_timer(
+        self, timer_address: int | None = None, timer_type: int = 0
+    ) -> TimerObject:
+        timer = TimerObject(address=timer_address, timer_type=timer_type)
+        if timer_address is not None:
+            self._kernel_timers[timer_address] = timer
+        self._trace.add(
+            "threading",
+            "initialize_timer",
+            timer_address=timer_address,
+            timer_type=timer_type,
+        )
         return timer
 
-    def set_timer(self, handle: int, due_time_100ns: int, period_ms: int = 0) -> int:
+    def set_timer_handle(
+        self, handle: int, due_time_100ns: int, period_ms: int = 0
+    ) -> int:
         timer = self._handles.get(handle, "timer")
         timer.due_time_100ns = due_time_100ns
         timer.period_ms = period_ms
@@ -980,6 +1362,34 @@ class XboxSynchronizationShim:
             period_ms=period_ms,
         )
         return XboxStatus.SUCCESS
+
+    def set_kernel_timer(
+        self,
+        timer_address: int,
+        due_time_low: int,
+        due_time_high: int = 0,
+        dpc_address: int | None = None,
+        *,
+        period_ms: int = 0,
+    ) -> bool:
+        timer = self._kernel_timers.setdefault(
+            timer_address, TimerObject(address=timer_address)
+        )
+        previous = timer.signaled
+        due_time_100ns = _i64_from_u32_parts(due_time_low, due_time_high)
+        timer.due_time_100ns = due_time_100ns
+        timer.period_ms = period_ms
+        timer.signaled = False
+        self._trace.add(
+            "threading",
+            "set_kernel_timer",
+            timer_address=timer_address,
+            due_time_100ns=due_time_100ns,
+            period_ms=period_ms,
+            dpc_address=dpc_address,
+            previous_signaled=previous,
+        )
+        return previous
 
     def cancel_timer(self, handle: int) -> int:
         timer = self._handles.get(handle, "timer")
@@ -1033,9 +1443,30 @@ class XboxSynchronizationShim:
         start_address: int | None = None,
         parameter: int | None = None,
         suspended: bool = False,
+        start_context1: int | None = None,
+        start_context2: int | None = None,
+        thread_extra_size: int = 0,
+        kernel_stack_size: int = 0,
+        tls_data_size: int = 0,
+        thread_handle_address: int | None = None,
+        thread_id_address: int | None = None,
+        debug_stack: bool = False,
     ) -> int:
         handle = self._handles.allocate(
-            "thread", ThreadObject(start_address, parameter, suspended)
+            "thread",
+            ThreadObject(
+                start_address=start_address,
+                parameter=parameter,
+                suspended=suspended,
+                start_context1=start_context1,
+                start_context2=start_context2,
+                thread_extra_size=thread_extra_size,
+                kernel_stack_size=kernel_stack_size,
+                tls_data_size=tls_data_size,
+                thread_handle_address=thread_handle_address,
+                thread_id_address=thread_id_address,
+                debug_stack=debug_stack,
+            ),
         )
         self._trace.add(
             "threading",
@@ -1044,8 +1475,28 @@ class XboxSynchronizationShim:
             start_address=start_address,
             parameter=parameter,
             suspended=suspended,
+            start_context1=start_context1,
+            start_context2=start_context2,
+            thread_extra_size=thread_extra_size,
+            kernel_stack_size=kernel_stack_size,
+            tls_data_size=tls_data_size,
+            thread_handle_address=thread_handle_address,
+            thread_id_address=thread_id_address,
+            debug_stack=debug_stack,
         )
         return handle
+
+    def thread_snapshot(self) -> list[dict[str, Any]]:
+        threads: list[dict[str, Any]] = []
+        for handle, (kind, thread) in sorted(self._handles._objects.items()):
+            if kind != "thread":
+                continue
+            data = thread.to_dict()
+            data["handle"] = handle
+            data["handle_hex"] = _hex32(handle)
+            data["current"] = handle == self._current_thread
+            threads.append(data)
+        return threads
 
     def terminate_thread(self, handle: int | None = None, status: int = XboxStatus.SUCCESS) -> int:
         target = handle or self._current_thread
@@ -1193,25 +1644,77 @@ class ControllerState:
         }
 
 
+@dataclass
+class ControllerSlot:
+    state: ControllerState = field(default_factory=ControllerState)
+    update_sequence: int = 0
+    poll_count: int = 0
+    last_latency_samples: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "state": self.state.to_dict(),
+            "update_sequence": self.update_sequence,
+            "poll_count": self.poll_count,
+            "last_latency_samples": self.last_latency_samples,
+        }
+
+
 class XboxInputShim:
     def __init__(self, trace: ShimTraceLog) -> None:
         self._trace = trace
-        self._controllers = {port: ControllerState() for port in range(4)}
+        self._controllers = {port: ControllerSlot() for port in range(4)}
+        self._sequence = 0
 
     def set_controller_state(self, port: int, state: ControllerState) -> None:
         self._validate_port(port)
-        self._controllers[port] = state
-        self._trace.add("input", "set_controller_state", port=port, state=state)
+        self._sequence += 1
+        slot = self._controllers[port]
+        slot.state = state
+        slot.update_sequence = self._sequence
+        slot.last_latency_samples = 0
+        self._trace.add(
+            "input",
+            "set_controller_state",
+            port=port,
+            state=state,
+            update_sequence=slot.update_sequence,
+        )
 
     def poll_controller(self, port: int) -> ControllerState:
         self._validate_port(port)
-        state = self._controllers[port]
-        self._trace.add("input", "poll_controller", port=port, state=state)
-        return state
+        self._sequence += 1
+        slot = self._controllers[port]
+        slot.poll_count += 1
+        latency_samples = max(0, self._sequence - slot.update_sequence)
+        slot.last_latency_samples = latency_samples
+        self._trace.add(
+            "input",
+            "poll_controller",
+            port=port,
+            state=slot.state,
+            poll_sequence=self._sequence,
+            update_sequence=slot.update_sequence,
+            latency_samples=latency_samples,
+        )
+        return slot.state
 
     def poll_all(self) -> dict[int, ControllerState]:
-        self._trace.add("input", "poll_all")
-        return dict(self._controllers)
+        self._sequence += 1
+        for slot in self._controllers.values():
+            slot.poll_count += 1
+            slot.last_latency_samples = max(0, self._sequence - slot.update_sequence)
+        self._trace.add("input", "poll_all", poll_sequence=self._sequence)
+        return {port: slot.state for port, slot in self._controllers.items()}
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "sequence": self._sequence,
+            "ports": {
+                str(port): slot.to_dict()
+                for port, slot in sorted(self._controllers.items())
+            },
+        }
 
     @staticmethod
     def _validate_port(port: int) -> None:
@@ -1283,12 +1786,38 @@ class XboxGraphicsShim:
 class AudioStream:
     format_tag: str
     queued_bytes: int = 0
+    submitted_buffer_count: int = 0
+    played_bytes: int = 0
+    sample_rate: int = 48000
+    channels: int = 2
+    bits_per_sample: int = 16
+
+    @property
+    def bytes_per_second(self) -> int:
+        return self.sample_rate * self.channels * max(1, self.bits_per_sample // 8)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "format_tag": self.format_tag,
+            "queued_bytes": self.queued_bytes,
+            "submitted_buffer_count": self.submitted_buffer_count,
+            "played_bytes": self.played_bytes,
+            "sample_rate": self.sample_rate,
+            "channels": self.channels,
+            "bits_per_sample": self.bits_per_sample,
+        }
 
 
 class XboxAudioShim:
-    def __init__(self, trace: ShimTraceLog, handles: GuestHandleTable) -> None:
+    def __init__(
+        self,
+        trace: ShimTraceLog,
+        handles: GuestHandleTable,
+        clock: XboxClockShim,
+    ) -> None:
         self._trace = trace
         self._handles = handles
+        self._clock = clock
         self.initialized = False
 
     def initialize(self) -> int:
@@ -1296,19 +1825,81 @@ class XboxAudioShim:
         self._trace.add("audio", "initialize")
         return XboxStatus.SUCCESS
 
-    def create_stream(self, format_tag: str = "pcm") -> int:
+    def create_stream(
+        self,
+        format_tag: str = "pcm",
+        *,
+        sample_rate: int = 48000,
+        channels: int = 2,
+        bits_per_sample: int = 16,
+    ) -> int:
         self.initialized = True
-        handle = self._handles.allocate("audio_stream", AudioStream(format_tag))
-        self._trace.add("audio", "create_stream", handle=handle, format_tag=format_tag)
+        stream = AudioStream(
+            format_tag,
+            sample_rate=sample_rate,
+            channels=channels,
+            bits_per_sample=bits_per_sample,
+        )
+        handle = self._handles.allocate("audio_stream", stream)
+        self._trace.add(
+            "audio",
+            "create_stream",
+            handle=handle,
+            format_tag=format_tag,
+            sample_rate=sample_rate,
+            channels=channels,
+            bits_per_sample=bits_per_sample,
+        )
         return handle
 
     def submit_buffer(self, handle: int, payload: bytes) -> int:
         stream = self._handles.get(handle, "audio_stream")
         stream.queued_bytes += len(payload)
+        stream.submitted_buffer_count += 1
         self._trace.add(
-            "audio", "submit_buffer", handle=handle, bytes=len(payload)
+            "audio",
+            "submit_buffer",
+            handle=handle,
+            bytes=len(payload),
+            queued_bytes=stream.queued_bytes,
+            submitted_buffer_count=stream.submitted_buffer_count,
         )
         return XboxStatus.SUCCESS
+
+    def advance_playback(self, handle: int, milliseconds: int) -> dict[str, Any]:
+        stream = self._handles.get(handle, "audio_stream")
+        duration_ms = max(milliseconds, 0)
+        playable_bytes = stream.bytes_per_second * duration_ms // 1000
+        consumed = min(stream.queued_bytes, playable_bytes)
+        stream.queued_bytes -= consumed
+        stream.played_bytes += consumed
+        self._clock.advance_100ns(duration_ms * 10_000)
+        self._trace.add(
+            "audio",
+            "advance_playback",
+            handle=handle,
+            milliseconds=duration_ms,
+            consumed_bytes=consumed,
+            queued_bytes=stream.queued_bytes,
+            played_bytes=stream.played_bytes,
+        )
+        return {
+            "status": XboxStatus.SUCCESS,
+            "consumed_bytes": consumed,
+            "queued_bytes": stream.queued_bytes,
+            "played_bytes": stream.played_bytes,
+        }
+
+    def stream_snapshot(self) -> list[dict[str, Any]]:
+        streams: list[dict[str, Any]] = []
+        for handle, (kind, stream) in sorted(self._handles._objects.items()):
+            if kind != "audio_stream":
+                continue
+            data = stream.to_dict()
+            data["handle"] = handle
+            data["handle_hex"] = _hex32(handle)
+            streams.append(data)
+        return streams
 
 
 @dataclass
@@ -1844,11 +2435,17 @@ class XboxRuntimeShims:
         self.clock = XboxClockShim(self.trace, self.config)
         self.sync = XboxSynchronizationShim(self.trace, self.handles, self.clock)
         self.filesystem = XboxFileSystemShim(
-            self.trace, self.handles, self.config.extracted_disc_root
+            self.trace,
+            self.handles,
+            self.config.extracted_disc_root,
+            self.config.save_data_root,
+            self.config.dashboard_data_root,
+            self.config.cache_data_root,
+            self.clock,
         )
         self.input = XboxInputShim(self.trace)
         self.graphics = XboxGraphicsShim(self.trace, self.memory)
-        self.audio = XboxAudioShim(self.trace, self.handles)
+        self.audio = XboxAudioShim(self.trace, self.handles, self.clock)
         self.crypto = XboxCryptoShim(self.trace)
         self._next_target = self.config.host_target_base
         self._registered: dict[int, RuntimeShim] = {}
@@ -1980,23 +2577,79 @@ class XboxRuntimeShims:
     def ex_query_pool_block_size(self, address: int) -> dict[str, Any]:
         return self.memory.query_allocation_size(address)
 
-    def ex_query_nonvolatile_setting(self, setting_id: int) -> dict[str, Any]:
+    def ex_query_nonvolatile_setting(
+        self,
+        setting_id: int,
+        type_address: int = 0,
+        value_address: int = 0,
+        value_length: int = 0,
+        result_length_address: int = 0,
+    ) -> dict[str, Any]:
         if setting_id not in self._nonvolatile_settings:
             self.trace.add(
                 "hardware",
                 "query_nonvolatile_setting",
                 "not_found",
                 setting_id=setting_id,
+                type_address=type_address,
+                value_address=value_address,
+                value_length=value_length,
+                result_length_address=result_length_address,
             )
-            return {"status": XboxStatus.OBJECT_NAME_NOT_FOUND, "value": None}
+            return {
+                "status": XboxStatus.OBJECT_NAME_NOT_FOUND,
+                "value": None,
+                "required_length": 0,
+                "setting_type": None,
+            }
         value = self._nonvolatile_settings[setting_id]
+        required_length = 4 if isinstance(value, int) else len(bytes(value))
         self.trace.add(
-            "hardware", "query_nonvolatile_setting", setting_id=setting_id, value=value
+            "hardware",
+            "query_nonvolatile_setting",
+            setting_id=setting_id,
+            type_address=type_address,
+            value_address=value_address,
+            value_length=value_length,
+            result_length_address=result_length_address,
+            value=value,
+            required_length=required_length,
         )
-        return {"status": XboxStatus.SUCCESS, "value": value}
+        return {
+            "status": XboxStatus.SUCCESS,
+            "value": value,
+            "required_length": required_length,
+            "setting_type": 4 if isinstance(value, int) else 3,
+        }
 
     def mm_allocate_contiguous_memory(self, size: int) -> int:
         return self.memory.allocate_contiguous_memory(size)
+
+    def mm_allocate_contiguous_memory_ex(
+        self,
+        size: int,
+        lowest_acceptable_address: int = 0,
+        highest_acceptable_address: int = 0xFFFFFFFF,
+        boundary_address_multiple: int = 0,
+        protect: int = 0,
+    ) -> int:
+        alignment = boundary_address_multiple if boundary_address_multiple else 0x1000
+        address = self.memory.allocate_contiguous_memory(
+            size,
+            alignment=alignment,
+            protection="rw",
+        )
+        self.trace.add(
+            "allocator",
+            "allocate_contiguous_ex",
+            address=address,
+            size=size,
+            lowest_acceptable_address=lowest_acceptable_address,
+            highest_acceptable_address=highest_acceptable_address,
+            boundary_address_multiple=boundary_address_multiple,
+            protect=protect,
+        )
+        return address
 
     def mm_allocate_system_memory(self, size: int) -> int:
         return self.memory.allocate_system_memory(size)
@@ -2172,8 +2825,10 @@ class XboxRuntimeShims:
     ) -> dict[str, Any]:
         return self.filesystem.read_file(handle, size, offset=offset)
 
-    def nt_query_information_file(self, guest_path: str) -> dict[str, Any]:
-        return self.filesystem.query_file_information(guest_path)
+    def nt_query_information_file(self, guest_path_or_handle: str | int) -> dict[str, Any]:
+        if isinstance(guest_path_or_handle, int):
+            return self.filesystem.query_file_handle_information(guest_path_or_handle)
+        return self.filesystem.query_file_information(guest_path_or_handle)
 
     def nt_query_volume_information_file(self, guest_path: str = "D:\\") -> dict[str, Any]:
         return self.filesystem.query_volume_information(guest_path)
@@ -2182,6 +2837,13 @@ class XboxRuntimeShims:
         return self.filesystem.list_directory(guest_path)
 
     def nt_set_information_file(self, handle: int, information: dict[str, Any] | None = None) -> int:
+        if information and "file_information_class" in information:
+            result = self.filesystem.set_file_handle_information(
+                handle,
+                int(information.get("file_information_class", 0)),
+                bytes(information.get("payload", b"")),
+            )
+            return result["status"]
         self.trace.add(
             "filesystem",
             "set_information_file",
@@ -2235,12 +2897,27 @@ class XboxRuntimeShims:
             target=self._symbolic_links[name],
             handle=handle,
         )
-        return {"status": XboxStatus.SUCCESS, "handle": handle}
+        return {
+            "status": XboxStatus.SUCCESS,
+            "handle": handle,
+            "name": name,
+            "target": self._symbolic_links[name],
+        }
 
-    def nt_query_symbolic_link_object(self, name: str | None = None) -> dict[str, Any]:
-        if name in self._symbolic_links:
+    def nt_query_symbolic_link_object(self, name_or_handle: str | int | None = None) -> dict[str, Any]:
+        name: str | None
+        if isinstance(name_or_handle, int):
+            try:
+                link = self.handles.get(name_or_handle, "symbolic_link")
+            except XboxRuntimeError as exc:
+                return {"status": XboxStatus.INVALID_HANDLE, "target": None, "error": str(exc)}
+            name = str(link.get("name", ""))
+            target = str(link.get("target", ""))
+        elif name_or_handle in self._symbolic_links:
+            name = str(name_or_handle)
             target = self._symbolic_links[name]
         else:
+            name = name_or_handle
             target = "D:\\" if not name or "Cdrom" in name or "D:" in name else None
         status = XboxStatus.SUCCESS if target else XboxStatus.OBJECT_NAME_NOT_FOUND
         self.trace.add(
@@ -2250,7 +2927,7 @@ class XboxRuntimeShims:
             target=target,
             status_hex=_hex32(status),
         )
-        return {"status": status, "target": target}
+        return {"status": status, "name": name, "target": target}
 
     def nt_close(self, handle: int) -> int:
         return self.handles.close(handle)
@@ -2411,14 +3088,42 @@ class XboxRuntimeShims:
     def nt_create_timer(self) -> int:
         return self.sync.create_timer()
 
-    def ke_initialize_timer_ex(self) -> TimerObject:
-        return self.sync.initialize_timer()
+    def ke_initialize_timer_ex(self, timer_address: int, timer_type: int = 0) -> None:
+        self.sync.initialize_timer(timer_address, timer_type)
+        return None
 
     def nt_set_timer(self, handle: int, due_time_100ns: int, period_ms: int = 0) -> int:
-        return self.sync.set_timer(handle, due_time_100ns, period_ms)
+        return self.sync.set_timer_handle(handle, due_time_100ns, period_ms)
 
-    def ke_set_timer(self, handle: int, due_time_100ns: int) -> int:
-        return self.sync.set_timer(handle, due_time_100ns, 0)
+    def ke_set_timer(
+        self,
+        timer_address: int,
+        due_time_low: int,
+        due_time_high: int = 0,
+        dpc_address: int = 0,
+    ) -> bool:
+        return self.sync.set_kernel_timer(
+            timer_address,
+            due_time_low,
+            due_time_high,
+            dpc_address or None,
+        )
+
+    def ke_set_timer_ex(
+        self,
+        timer_address: int,
+        due_time_low: int,
+        due_time_high: int = 0,
+        period_ms: int = 0,
+        dpc_address: int = 0,
+    ) -> bool:
+        return self.sync.set_kernel_timer(
+            timer_address,
+            due_time_low,
+            due_time_high,
+            dpc_address or None,
+            period_ms=period_ms,
+        )
 
     def nt_cancel_timer(self, handle: int) -> int:
         return self.sync.cancel_timer(handle)
@@ -2446,6 +3151,46 @@ class XboxRuntimeShims:
         return self.sync.create_system_thread(
             start_address=start_address, parameter=parameter, suspended=suspended
         )
+
+    def ps_create_system_thread_ex(
+        self,
+        thread_handle_address: int,
+        thread_extra_size: int,
+        kernel_stack_size: int,
+        tls_data_size: int,
+        thread_id_address: int,
+        start_context1: int,
+        start_context2: int,
+        create_suspended: int,
+        debug_stack: int,
+        start_routine: int,
+    ) -> dict[str, Any]:
+        suspended = bool(create_suspended)
+        handle = self.sync.create_system_thread(
+            start_address=start_routine or None,
+            parameter=start_context1,
+            suspended=suspended,
+            start_context1=start_context1,
+            start_context2=start_context2,
+            thread_extra_size=thread_extra_size,
+            kernel_stack_size=kernel_stack_size,
+            tls_data_size=tls_data_size,
+            thread_handle_address=thread_handle_address or None,
+            thread_id_address=thread_id_address or None,
+            debug_stack=bool(debug_stack),
+        )
+        return {
+            "status": XboxStatus.SUCCESS,
+            "handle": handle,
+            "thread_id": handle,
+            "thread_handle_address": thread_handle_address,
+            "thread_id_address": thread_id_address,
+            "start_address": start_routine,
+            "start_context1": start_context1,
+            "start_context2": start_context2,
+            "suspended": suspended,
+            "debug_stack": bool(debug_stack),
+        }
 
     def ke_get_current_thread(self) -> int:
         return self.sync.current_thread
@@ -2526,9 +3271,13 @@ class XboxRuntimeShims:
         self.trace.add("runtime", "initialize_critical_section", address=address)
         return XboxStatus.SUCCESS
 
-    def rtl_init_ansi_string(self, text: str = "") -> dict[str, Any]:
-        encoded = text.encode("ascii", errors="replace")
-        result = {"length": len(encoded), "maximum_length": len(encoded) + 1, "text": text}
+    def rtl_init_ansi_string(
+        self, destination_address: int = 0, source_address: int = 0
+    ) -> dict[str, Any]:
+        result = {
+            "destination_address": destination_address,
+            "source_address": source_address,
+        }
         self.trace.add("runtime", "init_ansi_string", result=result)
         return result
 
@@ -2828,10 +3577,22 @@ class XboxRuntimeShims:
             "registered_behavior_counts": dict(sorted(behavior_counts.items())),
             "registered_subsystem_counts": dict(sorted(subsystem_counts.items())),
             "open_handles": self.handles.snapshot(),
+            "open_files": self.filesystem.open_file_snapshot(),
+            "threads": self.sync.thread_snapshot(),
             "allocation_count": len(self.memory.allocations),
             "allocations": [allocation.to_dict() for allocation in self.memory.allocations],
             "display_mode": self.graphics.display_mode.to_dict(),
+            "input": self.input.snapshot(),
             "audio_initialized": self.audio.initialized,
+            "audio_streams": self.audio.stream_snapshot(),
+            "clock": self.clock.snapshot(),
+            "determinism": {
+                "clock": "manual_100ns_counter",
+                "handles": "monotonic_4_byte_stride",
+                "filesystem_reads": "seeked_stream_reads_with_fixed_latency",
+                "input": "sequenced_snapshots",
+                "audio": "queued_pcm_byte_budget",
+            },
             "trace": self.trace.to_list(),
         }
 
@@ -2901,7 +3662,7 @@ _IMPLEMENTED_KERNEL_HANDLERS: dict[str, tuple[str, str]] = {
     "KeSetBasePriorityThread": _handler("ke_set_base_priority_thread"),
     "KeSetEvent": _handler("ke_set_event"),
     "KeSetTimer": _handler("ke_set_timer"),
-    "KeSetTimerEx": _handler("nt_set_timer"),
+    "KeSetTimerEx": _handler("ke_set_timer_ex"),
     "KeStallExecutionProcessor": _handler("ke_stall_execution_processor"),
     "KeSynchronizeExecution": _handler("ke_synchronize_execution"),
     "KeTickCount": _handler("ke_tick_count"),
@@ -2911,7 +3672,7 @@ _IMPLEMENTED_KERNEL_HANDLERS: dict[str, tuple[str, str]] = {
     "KfRaiseIrql": _handler("kf_raise_irql"),
     "LaunchDataPage": _handler("kernel_variable", "data"),
     "MmAllocateContiguousMemory": _handler("mm_allocate_contiguous_memory"),
-    "MmAllocateContiguousMemoryEx": _handler("mm_allocate_contiguous_memory"),
+    "MmAllocateContiguousMemoryEx": _handler("mm_allocate_contiguous_memory_ex"),
     "MmClaimGpuInstanceMemory": _handler("mm_claim_gpu_instance_memory"),
     "MmFreeContiguousMemory": _handler("ex_free_pool"),
     "MmGetPhysicalAddress": _handler("mm_get_physical_address"),
@@ -2954,7 +3715,7 @@ _IMPLEMENTED_KERNEL_HANDLERS: dict[str, tuple[str, str]] = {
     "ObfDereferenceObject": _handler("obf_dereference_object"),
     "PhyGetLinkState": _handler("phy_get_link_state"),
     "PhyInitialize": _handler("phy_initialize"),
-    "PsCreateSystemThreadEx": _handler("ps_create_system_thread"),
+    "PsCreateSystemThreadEx": _handler("ps_create_system_thread_ex"),
     "PsTerminateSystemThread": _handler("ps_terminate_system_thread"),
     "PsThreadObjectType": _handler("kernel_variable", "data"),
     "RtlAnsiStringToUnicodeString": _handler("rtl_ansi_string_to_unicode_string"),

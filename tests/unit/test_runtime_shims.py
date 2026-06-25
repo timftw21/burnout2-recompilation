@@ -65,20 +65,113 @@ class RuntimeShimTests(unittest.TestCase):
     def test_filesystem_resolves_guest_paths_inside_extracted_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            save_root = root / "save"
+            dashboard_root = root / "dashboard"
+            cache_root = root / "cache"
             media = root / "MEDIA"
             media.mkdir()
-            (media / "Intro.BIN").write_bytes(b"burnout")
-            runtime = XboxRuntimeShims(XboxRuntimeConfig(extracted_disc_root=root))
+            (dashboard_root / "XODash").mkdir(parents=True)
+            (dashboard_root / "XODash" / "xonlinedash.xbe").write_bytes(b"dash")
+            (media / "Intro.BIN").write_bytes(b"burnout" * 1024)
+            runtime = XboxRuntimeShims(
+                XboxRuntimeConfig(
+                    extracted_disc_root=root,
+                    save_data_root=save_root,
+                    dashboard_data_root=dashboard_root,
+                    cache_data_root=cache_root,
+                )
+            )
+
+            link = runtime.nt_open_symbolic_link_object("\\??\\D:")
+            self.assertEqual(link["status"], XboxStatus.SUCCESS)
+            self.assertEqual(link["target"], "\\Device\\Cdrom0")
+            queried_link = runtime.nt_query_symbolic_link_object(link["handle"])
+            self.assertEqual(queried_link["status"], XboxStatus.SUCCESS)
+            self.assertEqual(queried_link["target"], "\\Device\\Cdrom0")
 
             resolved = runtime.filesystem.resolve_guest_path("D:\\media\\intro.bin")
             self.assertEqual(resolved, media / "Intro.BIN")
+            resolved_dash = runtime.filesystem.resolve_guest_path(
+                "\\Device\\Harddisk0\\partition2\\XODash\\xonlinedash.xbe"
+            )
+            self.assertEqual(
+                resolved_dash,
+                dashboard_root / "XODash" / "xonlinedash.xbe",
+            )
+            missing_cache = runtime.filesystem.open_file("Y:\\xboxdash.xbe", "rb")
+            self.assertEqual(missing_cache["status"], XboxStatus.NO_SUCH_FILE)
+            self.assertEqual(missing_cache["root_kind"], "cache")
             opened = runtime.filesystem.open_file("\\Device\\Cdrom0\\MEDIA\\Intro.BIN")
             self.assertEqual(opened["status"], XboxStatus.SUCCESS)
+            self.assertEqual(opened["root_kind"], "disc")
             read = runtime.filesystem.read_file(opened["handle"], 4)
             self.assertEqual(read["data"], b"burn")
+            next_read = runtime.filesystem.read_file(opened["handle"], 3)
+            self.assertEqual(next_read["data"], b"out")
+            handle_info = runtime.filesystem.query_file_handle_information(opened["handle"])
+            self.assertEqual(handle_info["status"], XboxStatus.SUCCESS)
+            self.assertEqual(handle_info["size"], len(b"burnout" * 1024))
+            self.assertEqual(handle_info["position"], 7)
+            nt_handle_info = runtime.nt_query_information_file(opened["handle"])
+            self.assertEqual(nt_handle_info["status"], XboxStatus.SUCCESS)
+            self.assertEqual(nt_handle_info["size"], len(b"burnout" * 1024))
+            set_position = runtime.nt_set_information_file(
+                opened["handle"],
+                {
+                    "file_information_class": 14,
+                    "payload": (2).to_bytes(8, "little"),
+                },
+            )
+            self.assertEqual(set_position, XboxStatus.SUCCESS)
+            positioned_read = runtime.filesystem.read_file(opened["handle"], 4)
+            self.assertEqual(positioned_read["data"], b"rnou")
+            file_summary = runtime.summary()["open_files"][0]
+            self.assertTrue(file_summary["streaming"])
+            self.assertEqual(file_summary["read_count"], 3)
+            self.assertEqual(file_summary["bytes_read"], 11)
+
+            denied = runtime.filesystem.open_file("D:\\MEDIA\\new.bin", "wb")
+            self.assertEqual(denied["status"], XboxStatus.ACCESS_DENIED)
+            save = runtime.filesystem.open_file(
+                "\\Device\\Harddisk0\\Partition1\\UDATA\\41430019\\save.dat",
+                "wb",
+            )
+            self.assertEqual(save["status"], XboxStatus.SUCCESS)
+            written = runtime.filesystem.write_file(save["handle"], b"save")
+            self.assertEqual(written["bytes_written"], 4)
+            cache = runtime.filesystem.open_file("Y:\\temp\\cache.bin", "wb")
+            self.assertEqual(cache["status"], XboxStatus.SUCCESS)
+            self.assertEqual(cache["root_kind"], "cache")
+            cache_written = runtime.filesystem.write_file(cache["handle"], b"cache")
+            self.assertEqual(cache_written["bytes_written"], 5)
+            save_summary = [
+                item
+                for item in runtime.summary()["open_files"]
+                if item["guest_path"].endswith("save.dat")
+            ][0]
+            self.assertTrue(save_summary["save_data"])
+            self.assertTrue((save_root / "UDATA" / "41430019" / "save.dat").is_file())
+            cache_summary = [
+                item
+                for item in runtime.summary()["open_files"]
+                if item["guest_path"].endswith("cache.bin")
+            ][0]
+            self.assertTrue(cache_summary["cache_data"])
+            self.assertTrue((cache_root / "temp" / "cache.bin").is_file())
 
             with self.assertRaises(XboxPathError):
                 runtime.filesystem.resolve_guest_path("D:\\..\\secret.bin")
+
+    def test_unconfigured_cache_drive_is_not_mapped_to_disc_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "xboxdash.xbe").write_bytes(b"disc-dashboard")
+            runtime = XboxRuntimeShims(XboxRuntimeConfig(extracted_disc_root=root))
+
+            missing = runtime.filesystem.open_file("Y:\\xboxdash.xbe", "rb")
+
+            self.assertEqual(missing["status"], XboxStatus.NO_SUCH_FILE)
+            self.assertEqual(missing["root_kind"], "cache")
 
     def test_memory_allocations_are_deterministic_and_bounds_checked(self) -> None:
         runtime = XboxRuntimeShims()
@@ -123,6 +216,25 @@ class RuntimeShimTests(unittest.TestCase):
             runtime.nt_release_semaphore(semaphore, 2)["previous_count"],
             0,
         )
+        self.assertIsNone(runtime.ke_initialize_timer_ex(0x5000, 1))
+        timer_event = runtime.summary()["trace"][-1]
+        self.assertEqual(timer_event["operation"], "initialize_timer")
+        self.assertEqual(timer_event["details"]["timer_address"], 0x5000)
+        self.assertEqual(timer_event["details"]["timer_type"], 1)
+        self.assertFalse(runtime.ke_set_timer(0x5000, 0xB5659000, 0xFFFFFFCD, 0x5010))
+        set_timer_event = runtime.summary()["trace"][-1]
+        self.assertEqual(set_timer_event["operation"], "set_kernel_timer")
+        self.assertEqual(set_timer_event["details"]["timer_address"], 0x5000)
+        self.assertEqual(set_timer_event["details"]["dpc_address"], 0x5010)
+
+        missing = runtime.ex_query_nonvolatile_setting(0x11, 0x6000, 0x6004, 4, 0x6008)
+        self.assertEqual(missing["status"], XboxStatus.OBJECT_NAME_NOT_FOUND)
+        present = runtime.ex_query_nonvolatile_setting(0x01, 0x6000, 0x6004, 4, 0x6008)
+        self.assertEqual(present["status"], XboxStatus.SUCCESS)
+        self.assertEqual(present["required_length"], 4)
+        setting_event = runtime.summary()["trace"][-1]
+        self.assertEqual(setting_event["operation"], "query_nonvolatile_setting")
+        self.assertEqual(setting_event["details"]["value_address"], 0x6004)
 
     def test_input_graphics_and_audio_shims_record_state(self) -> None:
         runtime = XboxRuntimeShims()
@@ -137,9 +249,16 @@ class RuntimeShimTests(unittest.TestCase):
         self.assertEqual(runtime.memory.query(gpu_address)["kind"], "gpu")
 
         stream = runtime.audio.create_stream("pcm16")
-        self.assertEqual(runtime.audio.submit_buffer(stream, b"\x00\x01"), XboxStatus.SUCCESS)
+        self.assertEqual(runtime.audio.submit_buffer(stream, b"\x00\x01" * 480), XboxStatus.SUCCESS)
+        playback = runtime.audio.advance_playback(stream, 5)
+        self.assertGreater(playback["consumed_bytes"], 0)
         summary = runtime.summary()
         self.assertTrue(summary["audio_initialized"])
+        self.assertEqual(summary["input"]["ports"]["0"]["poll_count"], 1)
+        self.assertEqual(summary["input"]["ports"]["0"]["last_latency_samples"], 1)
+        self.assertEqual(summary["audio_streams"][0]["submitted_buffer_count"], 1)
+        self.assertGreater(summary["audio_streams"][0]["played_bytes"], 0)
+        self.assertEqual(summary["determinism"]["input"], "sequenced_snapshots")
         self.assertGreaterEqual(len(summary["trace"]), 4)
 
     def test_crypto_shims_model_stateful_rc4_and_xbox_hmac(self) -> None:

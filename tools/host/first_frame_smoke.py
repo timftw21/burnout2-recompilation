@@ -20,6 +20,7 @@ DEFAULT_BUILD_DIR = REPO_ROOT / "build" / "local" / "first-frame"
 DEFAULT_EXE = DEFAULT_BUILD_DIR / "b2_first_frame.exe"
 DEFAULT_DEBUG_JSON = REPO_ROOT / "reports" / "local" / "first-frame" / "events.jsonl"
 DEFAULT_SUMMARY_JSON = REPO_ROOT / "reports" / "local" / "first-frame" / "summary.json"
+DEFAULT_RENDER_STREAM_JSON = REPO_ROOT / "reports" / "local" / "render" / "recovered-d3d-stream.json"
 DEFAULT_VULKAN_SDK = Path("C:/VulkanSDK/1.4.341.1")
 DEFAULT_LLVM_BIN = Path("C:/Program Files/LLVM/bin")
 
@@ -126,6 +127,7 @@ def run_first_frame(
     max_frames: int = 3,
     inject_input: bool = True,
     timeout_seconds: int = 30,
+    render_stream_json: Path | None = None,
 ) -> dict[str, Any]:
     if not executable.exists():
         raise FirstFrameSmokeError(f"first-frame executable is missing: {executable}")
@@ -145,6 +147,8 @@ def run_first_frame(
     ]
     if inject_input:
         command.append("--inject-input")
+    if render_stream_json is not None:
+        command.extend(["--render-stream-json", str(render_stream_json)])
 
     env = os.environ.copy()
     llvm_bin = str(DEFAULT_LLVM_BIN)
@@ -201,6 +205,38 @@ def summarize_smoke(
     input_events = [
         event for event in events if event.get("event") == "input_event"
     ]
+    input_processed_events = [
+        event for event in events if event.get("event") == "input_injection_processed"
+    ]
+    translated_work_events = [
+        event for event in events if event.get("event") == "translated_render_work_recorded"
+    ]
+    recovered_d3d_events = [
+        event for event in events if event.get("event") == "recovered_d3d_command_stream_loaded"
+    ]
+    interpreted_d3d_events = [
+        event for event in events if event.get("event") == "d3d8_stream_interpreted"
+    ]
+    translated_command_counts = [
+        int(event.get("translated_commands", 0))
+        for event in frame_events
+        if str(event.get("translated_commands", "")).isdigit()
+    ]
+    source_d3d_command_counts = [
+        int(event.get("source_d3d_commands", 0))
+        for event in frame_events
+        if str(event.get("source_d3d_commands", "")).isdigit()
+    ]
+    target_frame_ms = [
+        int(event.get("target_frame_ms", 0))
+        for event in frame_events
+        if str(event.get("target_frame_ms", "")).isdigit()
+    ]
+    pacing_sleep_ms = [
+        int(event.get("pacing_sleep_ms", 0))
+        for event in frame_events
+        if str(event.get("pacing_sleep_ms", "")).isdigit()
+    ]
     selected_device = next(
         (event for event in events if event.get("event") == "physical_device_selected"),
         None,
@@ -223,7 +259,133 @@ def summarize_smoke(
             "main_loop_exited": counts.get("main_loop_exit", 0) == 1,
             "frames_presented": len(frame_events),
             "input_events": len(input_events),
+            "input_keydown_events": sum(
+                1 for event in input_events if event.get("message") == "keydown"
+            ),
+            "input_keyup_events": sum(
+                1 for event in input_events if event.get("message") == "keyup"
+            ),
+            "injected_input_processed_before_first_frame": any(
+                str(event.get("before_frame")) == "1"
+                and str(event.get("input_events", "")).isdigit()
+                and int(event.get("input_events", 0)) >= 2
+                for event in input_processed_events
+            ),
+            "injected_input_processed_messages": max(
+                (
+                    int(event.get("messages", 0))
+                    for event in input_processed_events
+                    if str(event.get("messages", "")).isdigit()
+                ),
+                default=0,
+            ),
             "visible_frame_presented": len(frame_events) > 0,
+            "translated_renderer_work": len(translated_work_events) > 0,
+            "translated_command_count": max(translated_command_counts, default=0),
+            "recovered_d3d_command_stream": len(recovered_d3d_events) > 0,
+            "recovered_d3d_command_count": max(source_d3d_command_counts, default=0),
+            "recovered_d3d_stream_source": next(
+                (
+                    event.get("source")
+                    for event in recovered_d3d_events
+                    if event.get("source") is not None
+                ),
+                None,
+            ),
+            "recovered_d3d_mmio_writes": max(
+                (
+                    int(event.get("mmio_writes", 0))
+                    for event in recovered_d3d_events
+                    if str(event.get("mmio_writes", "")).isdigit()
+                ),
+                default=0,
+            ),
+            "recovered_d3d_push_buffer_writes": max(
+                (
+                    int(event.get("push_buffer_writes", 0))
+                    for event in recovered_d3d_events
+                    if str(event.get("push_buffer_writes", "")).isdigit()
+                ),
+                default=0,
+            ),
+            "d3d8_method_interpretation": len(interpreted_d3d_events) > 0,
+            "d3d8_translation_semantics": next(
+                (
+                    event.get("translation_semantics")
+                    for event in interpreted_d3d_events
+                    if event.get("translation_semantics") is not None
+                ),
+                None,
+            ),
+            "d3d8_push_buffer_words": max(
+                (
+                    int(event.get("push_buffer_words", 0))
+                    for event in interpreted_d3d_events
+                    if str(event.get("push_buffer_words", "")).isdigit()
+                ),
+                default=0,
+            ),
+            "d3d8_method_packets": max(
+                (
+                    int(event.get("method_packets", 0))
+                    for event in interpreted_d3d_events
+                    if str(event.get("method_packets", "")).isdigit()
+                ),
+                default=0,
+            ),
+            "d3d8_interpreted_methods": max(
+                (
+                    int(event.get("interpreted_methods", 0))
+                    for event in interpreted_d3d_events
+                    if str(event.get("interpreted_methods", "")).isdigit()
+                ),
+                default=0,
+            ),
+            "d3d8_zero_count_method_words": max(
+                (
+                    int(event.get("zero_count_method_words", 0))
+                    for event in interpreted_d3d_events
+                    if str(event.get("zero_count_method_words", "")).isdigit()
+                ),
+                default=0,
+            ),
+            "d3d8_surface_payload_samples": max(
+                (
+                    int(event.get("surface_payload_samples", 0))
+                    for event in interpreted_d3d_events
+                    if str(event.get("surface_payload_samples", "")).isdigit()
+                ),
+                default=0,
+            ),
+            "d3d8_surface_payload_dominant_count": max(
+                (
+                    int(event.get("surface_payload_dominant_count", 0))
+                    for event in interpreted_d3d_events
+                    if str(event.get("surface_payload_dominant_count", "")).isdigit()
+                ),
+                default=0,
+            ),
+            "d3d8_surface_payload_color_valid": any(
+                str(event.get("surface_payload_color_valid", "")).casefold() == "true"
+                for event in interpreted_d3d_events
+            ),
+            "d3d8_diagnostic_clear_source": next(
+                (
+                    event.get("diagnostic_clear_source")
+                    for event in interpreted_d3d_events
+                    if event.get("diagnostic_clear_source") is not None
+                ),
+                None,
+            ),
+            "d3d8_clear_color_valid": any(
+                str(event.get("clear_color_valid", "")).casefold() == "true"
+                for event in interpreted_d3d_events
+            ),
+            "frame_pacing": {
+                "target_frame_ms": max(target_frame_ms, default=None),
+                "events_with_pacing": len(pacing_sleep_ms),
+                "max_sleep_ms": max(pacing_sleep_ms, default=None),
+            },
             "selected_device": selected_device,
         },
     }
@@ -276,6 +438,11 @@ def main() -> int:
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--max-frames", type=int, default=3)
     parser.add_argument("--timeout-seconds", type=int, default=30)
+    parser.add_argument(
+        "--render-stream-json",
+        type=Path,
+        help="Optional normalized recovered D3D stream JSON to replay.",
+    )
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--no-inject-input", action="store_true")
     parser.add_argument("--pretty", action="store_true")
@@ -301,6 +468,7 @@ def main() -> int:
         max_frames=args.max_frames,
         inject_input=not args.no_inject_input,
         timeout_seconds=args.timeout_seconds,
+        render_stream_json=args.render_stream_json,
     )
     summary = summarize_smoke(
         compile_result=compile_result,
