@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import struct
+from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +26,10 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
 
 REGISTER_NAMES = ("eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi")
 REGISTER_BY_INDEX = {index: name for index, name in enumerate(REGISTER_NAMES)}
+XMM_REGISTER_NAMES = tuple(f"xmm{index}" for index in range(8))
+XMM_REGISTER_BY_INDEX = {index: name for index, name in enumerate(XMM_REGISTER_NAMES)}
+MMX_REGISTER_NAMES = tuple(f"mm{index}" for index in range(8))
+MMX_REGISTER_BY_INDEX = {index: name for index, name in enumerate(MMX_REGISTER_NAMES)}
 BYTE_REGISTER_BY_INDEX = {
     0: "al",
     1: "cl",
@@ -40,6 +46,11 @@ FIRST_RENDERER_BACKEND = "vulkan"
 BLOCK_TERMINATORS = frozenset({"ret", "jmp", "jcc", "int3", "int"})
 DETERMINISTIC_TSC_STEP = 733_000
 DEFAULT_MXCSR = 0x00001F80
+X87_STATUS_C0 = 0x0100
+X87_STATUS_C1 = 0x0200
+X87_STATUS_C2 = 0x0400
+X87_STATUS_C3 = 0x4000
+X87_STATUS_CONDITION_MASK = X87_STATUS_C0 | X87_STATUS_C1 | X87_STATUS_C2 | X87_STATUS_C3
 
 
 class RecompilationError(RuntimeError):
@@ -91,8 +102,18 @@ def _read_u32(data: bytes, offset: int) -> int:
     return struct.unpack_from("<I", data, offset)[0]
 
 
+def _x87_stack_register_index(operand: Operand) -> int:
+    if operand.kind != "reg" or operand.reg not in REGISTER_NAMES:
+        raise X86DecodeError("invalid x87 stack register encoding")
+    return REGISTER_NAMES.index(operand.reg)
+
+
 def _hex32(value: int) -> str:
     return f"0x{value & 0xFFFFFFFF:08X}"
+
+
+def _hex64(value: int) -> str:
+    return f"0x{value & 0xFFFFFFFFFFFFFFFF:016X}"
 
 
 def _parity8(value: int) -> bool:
@@ -129,6 +150,16 @@ class CpuState:
     fs_base: int = 0
     timestamp_counter: int = 0
     mxcsr: int = DEFAULT_MXCSR
+    fpu_status_word: int = 0
+    fpu_stack: list[float] = field(default_factory=list)
+    xmm_registers: dict[str, tuple[float, float, float, float]] = field(
+        default_factory=lambda: {
+            name: (0.0, 0.0, 0.0, 0.0) for name in XMM_REGISTER_NAMES
+        }
+    )
+    mmx_registers: dict[str, int] = field(
+        default_factory=lambda: {name: 0 for name in MMX_REGISTER_NAMES}
+    )
 
     @classmethod
     def with_registers(cls, **registers: int) -> "CpuState":
@@ -141,6 +172,8 @@ class CpuState:
                 state.timestamp_counter = value & 0xFFFFFFFFFFFFFFFF
             elif normalized == "mxcsr":
                 state.mxcsr = _u32(value)
+            elif normalized == "fpu_status_word":
+                state.fpu_status_word = value & 0xFFFF
             else:
                 state.set_register(name, value)
         return state
@@ -157,6 +190,33 @@ class CpuState:
             raise X86ExecutionError(f"unknown register: {name}")
         self.registers[normalized] = _u32(value)
 
+    def get_xmm_register(self, name: str) -> tuple[float, float, float, float]:
+        normalized = name.casefold()
+        if normalized not in XMM_REGISTER_NAMES:
+            raise X86ExecutionError(f"unknown XMM register: {name}")
+        return self.xmm_registers[normalized]
+
+    def set_xmm_register(self, name: str, value: Iterable[float]) -> None:
+        normalized = name.casefold()
+        if normalized not in XMM_REGISTER_NAMES:
+            raise X86ExecutionError(f"unknown XMM register: {name}")
+        lanes = tuple(float(lane) for lane in value)
+        if len(lanes) != 4:
+            raise X86ExecutionError("XMM register writes require four lanes")
+        self.xmm_registers[normalized] = (lanes[0], lanes[1], lanes[2], lanes[3])
+
+    def get_mmx_register(self, name: str) -> int:
+        normalized = name.casefold()
+        if normalized not in MMX_REGISTER_NAMES:
+            raise X86ExecutionError(f"unknown MMX register: {name}")
+        return self.mmx_registers[normalized]
+
+    def set_mmx_register(self, name: str, value: int) -> None:
+        normalized = name.casefold()
+        if normalized not in MMX_REGISTER_NAMES:
+            raise X86ExecutionError(f"unknown MMX register: {name}")
+        self.mmx_registers[normalized] = value & 0xFFFFFFFFFFFFFFFF
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "registers": {name: _hex32(self.registers[name]) for name in REGISTER_NAMES},
@@ -168,6 +228,15 @@ class CpuState:
             "timestamp_counter_hex": f"0x{self.timestamp_counter & 0xFFFFFFFFFFFFFFFF:016X}",
             "mxcsr": self.mxcsr,
             "mxcsr_hex": _hex32(self.mxcsr),
+            "fpu_status_word": self.fpu_status_word,
+            "fpu_status_word_hex": f"0x{self.fpu_status_word & 0xFFFF:04X}",
+            "fpu_stack_depth": len(self.fpu_stack),
+            "xmm_registers": {
+                name: list(self.xmm_registers[name]) for name in XMM_REGISTER_NAMES
+            },
+            "mmx_registers": {
+                name: _hex64(self.mmx_registers[name]) for name in MMX_REGISTER_NAMES
+            },
         }
 
 
@@ -371,21 +440,32 @@ class ExecutionEvent:
 
 
 class ExecutionTrace:
-    def __init__(self) -> None:
-        self._events: list[ExecutionEvent] = []
+    def __init__(self, *, enabled: bool = True, max_events: int | None = None) -> None:
+        self._events: deque[ExecutionEvent] = deque()
+        self._enabled = enabled
+        self._max_events = max_events if max_events is None else max(1, max_events)
+        self._event_count = 0
 
     def add(self, address: int | None, operation: str, **details: Any) -> None:
+        if not self._enabled:
+            return
+        if self._max_events is not None and len(self._events) >= self._max_events:
+            self._events.popleft()
         self._events.append(
             ExecutionEvent(
-                len(self._events),
+                self._event_count,
                 address,
                 operation,
                 _json_safe(details),
             )
         )
+        self._event_count += 1
 
     def to_list(self) -> list[dict[str, Any]]:
         return [event.to_dict() for event in self._events]
+
+    def last_event(self) -> ExecutionEvent | None:
+        return self._events[-1] if self._events else None
 
     def __iter__(self):
         return iter(self._events)
@@ -410,8 +490,14 @@ def _json_safe(value: Any) -> Any:
 class SparseMemory:
     """Little-endian sparse u32 memory used by the trace executor."""
 
+    _PAGE_BITS = 12
+    _PAGE_SIZE = 1 << _PAGE_BITS
+    _PAGE_MASK = _PAGE_SIZE - 1
+
     def __init__(self, initial: dict[int, bytes | int] | None = None) -> None:
-        self._data: dict[int, int] = {}
+        self._pages: dict[int, bytearray] = {}
+        self._written_pages: dict[int, bytearray] = {}
+        self._page_generations: dict[int, int] = {}
         for address, value in (initial or {}).items():
             if isinstance(value, int):
                 self.write_u32(address, value)
@@ -421,20 +507,78 @@ class SparseMemory:
     def read(self, address: int, size: int) -> bytes:
         if size < 0:
             raise X86ExecutionError("cannot read a negative size")
-        return bytes(self._data.get(_u32(address + offset), 0) for offset in range(size))
+        payload = bytearray(size)
+        cursor = 0
+        while cursor < size:
+            current = _u32(address + cursor)
+            page_number = current >> self._PAGE_BITS
+            page_offset = current & self._PAGE_MASK
+            chunk_size = min(size - cursor, self._PAGE_SIZE - page_offset)
+            page = self._pages.get(page_number)
+            if page is not None:
+                payload[cursor : cursor + chunk_size] = page[
+                    page_offset : page_offset + chunk_size
+                ]
+            cursor += chunk_size
+        return bytes(payload)
 
     def read_u32(self, address: int) -> int:
         return struct.unpack("<I", self.read(address, 4))[0]
 
     def write(self, address: int, payload: bytes) -> None:
-        for offset, byte in enumerate(payload):
-            self._data[_u32(address + offset)] = byte
+        cursor = 0
+        while cursor < len(payload):
+            current = _u32(address + cursor)
+            page_number = current >> self._PAGE_BITS
+            page_offset = current & self._PAGE_MASK
+            chunk_size = min(len(payload) - cursor, self._PAGE_SIZE - page_offset)
+            page = self._pages.setdefault(page_number, bytearray(self._PAGE_SIZE))
+            written = self._written_pages.setdefault(
+                page_number, bytearray(self._PAGE_SIZE)
+            )
+            page[page_offset : page_offset + chunk_size] = payload[
+                cursor : cursor + chunk_size
+            ]
+            written[page_offset : page_offset + chunk_size] = b"\x01" * chunk_size
+            self._page_generations[page_number] = (
+                self._page_generations.get(page_number, 0) + 1
+            )
+            cursor += chunk_size
+
+    def _has_byte(self, address: int) -> bool:
+        current = _u32(address)
+        written = self._written_pages.get(current >> self._PAGE_BITS)
+        return bool(written and written[current & self._PAGE_MASK])
+
+    def _read_byte(self, address: int, default: int = 0) -> int:
+        current = _u32(address)
+        page = self._pages.get(current >> self._PAGE_BITS)
+        if page is None or not self._has_byte(current):
+            return default
+        return page[current & self._PAGE_MASK]
 
     def write_u32(self, address: int, value: int) -> None:
         self.write(address, struct.pack("<I", _u32(value)))
 
     def snapshot_u32(self, addresses: Iterable[int]) -> dict[int, int]:
         return {address: self.read_u32(address) for address in addresses}
+
+    def storage_summary(self) -> dict[str, int]:
+        return {
+            "page_count": len(self._pages),
+            "written_byte_count": sum(mask.count(1) for mask in self._written_pages.values()),
+            "allocated_page_bytes": len(self._pages) * self._PAGE_SIZE * 2,
+        }
+
+    @property
+    def allocated_page_count(self) -> int:
+        return len(self._pages)
+
+    def has_allocated_page(self, address: int) -> bool:
+        return (_u32(address) >> self._PAGE_BITS) in self._pages
+
+    def page_generation(self, address: int) -> int:
+        return self._page_generations.get(_u32(address) >> self._PAGE_BITS, 0)
 
 
 @dataclass
@@ -459,6 +603,7 @@ class ExecutionResult:
 
 CallHandler = Callable[[CpuState, SparseMemory, int, ExecutionTrace], None]
 BlockLoader = Callable[[int], LiftedFunction | None]
+StepObserver = Callable[[CpuState, SparseMemory, ExecutionTrace, int], None]
 
 
 class X86Decoder:
@@ -521,6 +666,7 @@ class X86Decoder:
         start = offset
         address = base_address + offset
         repeat_prefix = False
+        repeat_not_equal_prefix = False
         operand_size = 32
         segment_override: str | None = None
         while True:
@@ -531,6 +677,9 @@ class X86Decoder:
                 continue
             if opcode == 0x66:
                 operand_size = 16
+                continue
+            if opcode == 0xF2:
+                repeat_not_equal_prefix = True
                 continue
             if opcode == 0xF3:
                 repeat_prefix = True
@@ -561,6 +710,39 @@ class X86Decoder:
                 offset,
             )
 
+        def scalar_float_operand(operand: Operand) -> Operand:
+            if operand.kind != "mem":
+                return operand
+            return Operand.memory(
+                base=operand.base,
+                index=operand.index,
+                scale=operand.scale,
+                displacement=operand.displacement,
+                absolute=operand.absolute,
+                size=32,
+                segment=operand.segment,
+            )
+
+        def mmx_operand(operand: Operand) -> Operand:
+            if operand.kind == "reg":
+                if operand.reg not in REGISTER_NAMES:
+                    raise X86DecodeError("invalid MMX register encoding")
+                return Operand.register(
+                    MMX_REGISTER_BY_INDEX[REGISTER_NAMES.index(operand.reg)],
+                    size=64,
+                )
+            if operand.kind == "mem":
+                return Operand.memory(
+                    base=operand.base,
+                    index=operand.index,
+                    scale=operand.scale,
+                    displacement=operand.displacement,
+                    absolute=operand.absolute,
+                    size=64,
+                    segment=operand.segment,
+                )
+            return operand
+
         if opcode == 0x90:
             return inst("nop")
         if opcode == 0x9B:
@@ -573,6 +755,10 @@ class X86Decoder:
             return inst("rep_movsb")
         if repeat_prefix and opcode == 0xA5:
             return inst("rep_movsd")
+        if repeat_prefix and opcode == 0xA6:
+            return inst("rep_cmpsb")
+        if repeat_not_equal_prefix and opcode == 0xAE:
+            return inst("repne_scasb")
         if opcode == 0xAA:
             return inst("stosb")
         if opcode == 0xAB:
@@ -581,6 +767,10 @@ class X86Decoder:
             return inst("movsb")
         if opcode == 0xA5:
             return inst("movsd")
+        if opcode == 0xA6:
+            return inst("cmpsb")
+        if opcode == 0xAE:
+            return inst("scasb")
         if opcode == 0xCC:
             return inst("int3")
         if opcode == 0xCD:
@@ -597,24 +787,202 @@ class X86Decoder:
             )
         if opcode == 0xDB:
             extension = self._read_u8(code, offset)
-            offset += 1
             if extension == 0xE2:
+                offset += 1
                 return inst("fnclex")
+            reg_index, rm_operand, offset = self._decode_modrm(
+                code,
+                offset,
+                operand_size=32,
+            )
+            if reg_index == 0:
+                return inst("fild", (rm_operand,))
             raise X86DecodeError(
                 f"unsupported x87 DB {extension:02X} at {_hex32(address)}"
+            )
+        if opcode == 0xDF:
+            reg_index, rm_operand, offset = self._decode_modrm(
+                code,
+                offset,
+                operand_size=64,
+            )
+            if (
+                rm_operand.kind == "reg"
+                and rm_operand.reg == "eax"
+                and reg_index == 4
+            ):
+                return inst("fnstsw", (Operand.register("eax", size=16),))
+            if reg_index == 5:
+                return inst("fild", (rm_operand,))
+            if reg_index == 7:
+                return inst("fistp", (rm_operand,))
+            raise X86DecodeError(
+                f"unsupported x87 DF /{reg_index} at {_hex32(address)}"
+            )
+        if opcode == 0xD8:
+            reg_index, rm_operand, offset = self._decode_modrm(
+                code,
+                offset,
+                operand_size=32,
+            )
+            if rm_operand.kind == "reg":
+                st_index = _x87_stack_register_index(rm_operand)
+                st_operand = Operand.immediate_u32(st_index)
+                if reg_index == 0:
+                    return inst("fadd", (st_operand,))
+                if reg_index == 1:
+                    return inst("fmul", (st_operand,))
+                if reg_index == 2:
+                    return inst("fcom", (st_operand,))
+                if reg_index == 3:
+                    return inst("fcomp", (st_operand,))
+                if reg_index == 4:
+                    return inst("fsub", (st_operand,))
+                if reg_index == 5:
+                    return inst("fsubr", (st_operand,))
+                if reg_index == 6:
+                    return inst("fdiv", (st_operand,))
+                if reg_index == 7:
+                    return inst("fdivr", (st_operand,))
+            if reg_index == 0:
+                return inst("fadd", (rm_operand,))
+            if reg_index == 1:
+                return inst("fmul", (rm_operand,))
+            if reg_index == 2:
+                return inst("fcom", (rm_operand,))
+            if reg_index == 3:
+                return inst("fcomp", (rm_operand,))
+            if reg_index == 4:
+                return inst("fsub", (rm_operand,))
+            if reg_index == 5:
+                return inst("fsubr", (rm_operand,))
+            if reg_index == 6:
+                return inst("fdiv", (rm_operand,))
+            if reg_index == 7:
+                return inst("fdivr", (rm_operand,))
+            raise X86DecodeError(
+                f"unsupported x87 D8 /{reg_index} at {_hex32(address)}"
+            )
+        if opcode == 0xDA:
+            reg_index, rm_operand, offset = self._decode_modrm(
+                code,
+                offset,
+                operand_size=32,
+            )
+            if rm_operand.kind != "reg" and reg_index == 4:
+                return inst("fisub", (rm_operand,))
+            raise X86DecodeError(
+                f"unsupported x87 DA /{reg_index} at {_hex32(address)}"
             )
         if opcode == 0xD9:
             reg_index, rm_operand, offset = self._decode_modrm(
                 code,
                 offset,
-                operand_size=16,
+                operand_size=32,
             )
+            if rm_operand.kind == "reg":
+                st_index = _x87_stack_register_index(rm_operand)
+                if reg_index == 0:
+                    return inst("fld", (Operand.immediate_u32(st_index),))
+                if reg_index == 1:
+                    return inst("fxch", (Operand.immediate_u32(st_index),))
+                if reg_index == 4 and st_index == 0:
+                    return inst("fchs")
+                if reg_index == 5 and st_index == 4:
+                    return inst("fldlg2")
+                if reg_index == 6 and st_index == 1:
+                    return inst("fyl2x")
+                if reg_index == 6 and st_index == 2:
+                    return inst("fptan")
+            if reg_index == 0:
+                return inst("fld", (rm_operand,))
+            if reg_index == 2:
+                return inst("fst", (rm_operand,))
+            if reg_index == 3:
+                return inst("fstp", (rm_operand,))
             if reg_index == 5:
+                rm_operand = Operand.memory(
+                    base=rm_operand.base,
+                    index=rm_operand.index,
+                    scale=rm_operand.scale,
+                    displacement=rm_operand.displacement,
+                    absolute=rm_operand.absolute,
+                    size=16,
+                    segment=rm_operand.segment,
+                )
                 return inst("fldcw", (rm_operand,))
             if reg_index == 7:
+                rm_operand = Operand.memory(
+                    base=rm_operand.base,
+                    index=rm_operand.index,
+                    scale=rm_operand.scale,
+                    displacement=rm_operand.displacement,
+                    absolute=rm_operand.absolute,
+                    size=16,
+                    segment=rm_operand.segment,
+                )
                 return inst("fnstcw", (rm_operand,))
             raise X86DecodeError(
                 f"unsupported x87 D9 /{reg_index} at {_hex32(address)}"
+            )
+        if opcode == 0xDC:
+            reg_index, rm_operand, offset = self._decode_modrm(
+                code,
+                offset,
+                operand_size=64,
+            )
+            if rm_operand.kind == "reg":
+                st_index = _x87_stack_register_index(rm_operand)
+                if reg_index == 0 and st_index == 0:
+                    return inst("fadd", (Operand.immediate_u32(st_index),))
+            else:
+                memory_operations = {
+                    0: "fadd",
+                    1: "fmul",
+                    2: "fcom",
+                    3: "fcomp",
+                    4: "fsub",
+                    5: "fsubr",
+                    6: "fdiv",
+                    7: "fdivr",
+                }
+                return inst(memory_operations[reg_index], (rm_operand,))
+            raise X86DecodeError(
+                f"unsupported x87 DC /{reg_index} at {_hex32(address)}"
+            )
+        if opcode == 0xDD:
+            reg_index, rm_operand, offset = self._decode_modrm(
+                code,
+                offset,
+                operand_size=32,
+            )
+            if rm_operand.kind == "reg":
+                st_index = _x87_stack_register_index(rm_operand)
+                if reg_index == 2:
+                    return inst("fst", (Operand.immediate_u32(st_index),))
+                if reg_index == 3:
+                    return inst("fstp", (Operand.immediate_u32(st_index),))
+            raise X86DecodeError(
+                f"unsupported x87 DD /{reg_index} at {_hex32(address)}"
+            )
+        if opcode == 0xDE:
+            reg_index, rm_operand, offset = self._decode_modrm(
+                code,
+                offset,
+                operand_size=32,
+            )
+            if rm_operand.kind == "reg":
+                st_index = _x87_stack_register_index(rm_operand)
+                if reg_index == 0:
+                    return inst("faddp", (Operand.immediate_u32(st_index),))
+                if reg_index == 1:
+                    return inst("fmulp", (Operand.immediate_u32(st_index),))
+                if reg_index == 5:
+                    return inst("fsubp", (Operand.immediate_u32(st_index),))
+                if reg_index == 7:
+                    return inst("fdivp", (Operand.immediate_u32(st_index),))
+            raise X86DecodeError(
+                f"unsupported x87 DE /{reg_index} at {_hex32(address)}"
             )
         if 0x50 <= opcode <= 0x57:
             return inst("push", (Operand.register(REGISTER_BY_INDEX[opcode - 0x50]),))
@@ -680,6 +1048,22 @@ class X86Decoder:
                     ),
                     rm_operand,
                     Operand.immediate_u32(value),
+                ),
+            )
+        if opcode == 0x87:
+            reg_index, rm_operand, offset = self._decode_modrm(
+                code,
+                offset,
+                operand_size=operand_size,
+            )
+            return inst(
+                "xchg",
+                (
+                    rm_operand,
+                    Operand.register(
+                        REGISTER_BY_INDEX[reg_index],
+                        size=operand_size,
+                    ),
                 ),
             )
         if opcode == 0xA1:
@@ -756,6 +1140,20 @@ class X86Decoder:
                 "and",
                 (Operand.register("al", size=8), Operand.immediate_u32(value)),
             )
+        if opcode == 0x04:
+            value = self._read_u8(code, offset)
+            offset += 1
+            return inst(
+                "add",
+                (Operand.register("al", size=8), Operand.immediate_u32(value)),
+            )
+        if opcode == 0x0C:
+            value = self._read_u8(code, offset)
+            offset += 1
+            return inst(
+                "or",
+                (Operand.register("al", size=8), Operand.immediate_u32(value)),
+            )
         if opcode == 0x2C:
             value = self._read_u8(code, offset)
             offset += 1
@@ -799,6 +1197,14 @@ class X86Decoder:
             rel = _i8(self._read_u8(code, offset))
             offset += 1
             return inst("jmp", target=_u32(base_address + offset + rel))
+        if opcode == 0xE3:
+            rel = _i8(self._read_u8(code, offset))
+            offset += 1
+            return inst(
+                "jcc",
+                target=_u32(base_address + offset + rel),
+                condition="ecx_zero",
+            )
         if 0x70 <= opcode <= 0x7F:
             rel = _i8(self._read_u8(code, offset))
             offset += 1
@@ -815,6 +1221,142 @@ class X86Decoder:
                 return inst("wbinvd")
             if second == 0x31:
                 return inst("rdtsc")
+            if second == 0x77:
+                return inst("emms")
+            if second == 0x18:
+                reg_index, rm_operand, offset = self._decode_modrm(
+                    code,
+                    offset,
+                    operand_size=8,
+                )
+                mnemonic = {
+                    0: "prefetchnta",
+                    1: "prefetcht0",
+                    2: "prefetcht1",
+                    3: "prefetcht2",
+                }.get(reg_index, "prefetch")
+                return inst(mnemonic, (rm_operand,))
+            if second in {0x6F, 0xE7}:
+                reg_index, rm_operand, offset = self._decode_modrm(
+                    code,
+                    offset,
+                    operand_size=32,
+                )
+                reg_operand = Operand.register(
+                    MMX_REGISTER_BY_INDEX[reg_index],
+                    size=64,
+                )
+                rm_operand = mmx_operand(rm_operand)
+                if second == 0x6F:
+                    return inst("movq", (reg_operand, rm_operand))
+                return inst("movntq", (rm_operand, reg_operand))
+            if repeat_prefix and second == 0x2C:
+                reg_index, rm_operand, offset = self._decode_modrm(
+                    code,
+                    offset,
+                    operand_size=32,
+                )
+                if rm_operand.kind != "mem":
+                    raise X86DecodeError(
+                        f"unsupported cvttss2si register source at {_hex32(address)}"
+                    )
+                return inst(
+                    "cvttss2si",
+                    (
+                        Operand.register(REGISTER_BY_INDEX[reg_index]),
+                        rm_operand,
+                    ),
+                )
+            if repeat_prefix and second in {0x10, 0x11, 0x52}:
+                reg_index, rm_operand, offset = self._decode_modrm(
+                    code,
+                    offset,
+                    operand_size=128,
+                )
+                reg_operand = Operand.register(
+                    XMM_REGISTER_BY_INDEX[reg_index],
+                    size=128,
+                )
+                rm_operand = scalar_float_operand(rm_operand)
+                if second == 0x10:
+                    return inst("movss", (reg_operand, rm_operand))
+                if second == 0x11:
+                    return inst("movss", (rm_operand, reg_operand))
+                return inst("rsqrtss", (reg_operand, rm_operand))
+            if second in {0x13, 0x17}:
+                reg_index, rm_operand, offset = self._decode_modrm(
+                    code,
+                    offset,
+                    operand_size=64,
+                )
+                if rm_operand.kind != "mem":
+                    raise X86DecodeError(
+                        f"unsupported packed-half register destination at {_hex32(address)}"
+                    )
+                return inst(
+                    "movlps_store" if second == 0x13 else "movhps_store",
+                    (
+                        rm_operand,
+                        Operand.register(XMM_REGISTER_BY_INDEX[reg_index], size=128),
+                    ),
+                )
+            if second in {0x12, 0x14, 0x15, 0x16}:
+                reg_index, rm_operand, offset = self._decode_modrm(
+                    code,
+                    offset,
+                    operand_size=128,
+                )
+                reg_operand = Operand.register(
+                    XMM_REGISTER_BY_INDEX[reg_index],
+                    size=128,
+                )
+                if second in {0x12, 0x16} and rm_operand.kind != "reg":
+                    raise X86DecodeError(
+                        f"unsupported packed-half memory source at {_hex32(address)}"
+                    )
+                mnemonic = {
+                    0x12: "movhlps",
+                    0x14: "unpcklps",
+                    0x15: "unpckhps",
+                    0x16: "movlhps",
+                }[second]
+                return inst(mnemonic, (reg_operand, rm_operand))
+            if second in {0x28, 0x29, 0x58, 0x59}:
+                reg_index, rm_operand, offset = self._decode_modrm(
+                    code,
+                    offset,
+                    operand_size=128,
+                )
+                reg_operand = Operand.register(
+                    XMM_REGISTER_BY_INDEX[reg_index],
+                    size=128,
+                )
+                if second == 0x28:
+                    return inst("movaps", (reg_operand, rm_operand))
+                if second == 0x29:
+                    return inst("movaps", (rm_operand, reg_operand))
+                if rm_operand.kind == "reg" or rm_operand.kind == "mem":
+                    mnemonic = "addps" if second == 0x58 else "mulps"
+                    return inst(mnemonic, (reg_operand, rm_operand))
+            if second == 0xC6:
+                reg_index, rm_operand, offset = self._decode_modrm(
+                    code,
+                    offset,
+                    operand_size=128,
+                )
+                immediate = self._read_u8(code, offset)
+                offset += 1
+                return inst(
+                    "shufps",
+                    (
+                        Operand.register(
+                            XMM_REGISTER_BY_INDEX[reg_index],
+                            size=128,
+                        ),
+                        rm_operand,
+                        Operand.immediate_u32(immediate),
+                    ),
+                )
             if 0x80 <= second <= 0x8F:
                 rel = _i32(_read_u32(code, offset))
                 offset += 4
@@ -866,6 +1408,20 @@ class X86Decoder:
                         rm_operand,
                     ),
                 )
+            if second == 0xBF:
+                reg_index, rm_operand, offset = self._decode_modrm(
+                    code, offset, operand_size=16
+                )
+                return inst(
+                    "movsx",
+                    (
+                        Operand.register(
+                            REGISTER_BY_INDEX[reg_index],
+                            size=operand_size,
+                        ),
+                        rm_operand,
+                    ),
+                )
             if second == 0xBC:
                 reg_index, rm_operand, offset = self._decode_modrm(
                     code,
@@ -896,6 +1452,29 @@ class X86Decoder:
                             size=operand_size,
                         ),
                         rm_operand,
+                    ),
+                )
+            if second in {0xA4, 0xAC}:
+                if operand_size != 32:
+                    raise X86DecodeError(
+                        f"unsupported 0F {second:02X} operand size at {_hex32(address)}"
+                    )
+                reg_index, rm_operand, offset = self._decode_modrm(
+                    code,
+                    offset,
+                    operand_size=operand_size,
+                )
+                count = self._read_u8(code, offset)
+                offset += 1
+                return inst(
+                    "shld" if second == 0xA4 else "shrd",
+                    (
+                        rm_operand,
+                        Operand.register(
+                            REGISTER_BY_INDEX[reg_index],
+                            size=operand_size,
+                        ),
+                        Operand.immediate_u32(count),
                     ),
                 )
             if 0x90 <= second <= 0x9F:
@@ -1175,6 +1754,10 @@ class X86Decoder:
                 return inst("not", (rm_operand,))
             if reg_index == 3:
                 return inst("neg", (rm_operand,))
+            if reg_index == 4:
+                return inst("mul", (rm_operand,))
+            if reg_index == 5:
+                return inst("imul", (rm_operand,))
             if reg_index == 6:
                 return inst("div", (rm_operand,))
             if reg_index == 7:
@@ -1195,6 +1778,8 @@ class X86Decoder:
                 return inst("not", (rm_operand,))
             if reg_index == 3:
                 return inst("neg", (rm_operand,))
+            if reg_index == 5:
+                return inst("imul", (rm_operand,))
             raise X86DecodeError(f"unsupported F6 /{reg_index} at {_hex32(address)}")
 
         if opcode == 0xFE:
@@ -1239,11 +1824,12 @@ class X86Decoder:
         rm = modrm & 0b111
 
         if mod == 0b11:
-            register = (
-                BYTE_REGISTER_BY_INDEX[rm]
-                if operand_size == 8
-                else REGISTER_BY_INDEX[rm]
-            )
+            if operand_size == 8:
+                register = BYTE_REGISTER_BY_INDEX[rm]
+            elif operand_size == 128:
+                register = XMM_REGISTER_BY_INDEX[rm]
+            else:
+                register = REGISTER_BY_INDEX[rm]
             return reg, Operand.register(register, size=operand_size), offset
 
         base: str | None = None
@@ -1351,13 +1937,17 @@ def execute_lifted_function(
     call_handlers: dict[int, CallHandler] | None = None,
     unhandled_call_handler: CallHandler | None = None,
     block_loader: BlockLoader | None = None,
+    step_observer: StepObserver | None = None,
     max_steps: int = 1024,
+    record_instruction_trace: bool = True,
+    record_trace: bool = True,
+    trace_max_events: int | None = None,
 ) -> ExecutionResult:
     active_state = state or CpuState()
     active_memory = memory or SparseMemory()
     active_state.eip = function.base_address
     handlers = call_handlers or {}
-    trace = ExecutionTrace()
+    trace = ExecutionTrace(enabled=record_trace, max_events=trace_max_events)
     instructions = {instruction.address: instruction for instruction in function.instructions}
     valid_addresses = set(instructions)
     steps = 0
@@ -1373,17 +1963,76 @@ def execute_lifted_function(
             valid_addresses.add(loaded_instruction.address)
         return target in valid_addresses
 
-    while steps < max_steps:
+    while max_steps == 0 or steps < max_steps:
+        if step_observer is not None:
+            step_observer(active_state, active_memory, trace, steps)
         instruction = instructions.get(active_state.eip)
         if instruction is None and install_block(active_state.eip):
             instruction = instructions.get(active_state.eip)
         if instruction is None:
-            raise X86ExecutionError(f"no lifted instruction at {_hex32(active_state.eip)}")
-        trace.add(instruction.address, "instruction", text=instruction.text())
+            trace.add(
+                active_state.eip,
+                "missing_instruction",
+                eip=active_state.eip,
+                eip_hex=_hex32(active_state.eip),
+            )
+            raise X86ExecutionError(
+                f"no lifted instruction at {_hex32(active_state.eip)}",
+                state=active_state,
+                trace=trace,
+                steps=steps,
+            )
+        if record_instruction_trace:
+            trace.add(instruction.address, "instruction", text=instruction.text())
         steps += 1
         next_eip = instruction.next_address
 
         if instruction.mnemonic == "nop":
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic in {
+            "prefetch",
+            "prefetchnta",
+            "prefetcht0",
+            "prefetcht1",
+            "prefetcht2",
+        }:
+            operand = instruction.operands[0] if instruction.operands else None
+            address = (
+                _effective_address(active_state, operand)
+                if operand is not None and operand.kind == "mem"
+                else None
+            )
+            trace.add(
+                instruction.address,
+                "cache_prefetch",
+                hint=instruction.mnemonic,
+                memory_address=address,
+                memory_address_hex=_hex32(address) if address is not None else None,
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "emms":
+            trace.add(instruction.address, "mmx_empty_state")
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic in {"movq", "movntq"}:
+            value = _read_mmx_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[1],
+            )
+            _write_mmx_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[0],
+                value,
+                non_temporal=instruction.mnemonic == "movntq",
+            )
             active_state.eip = next_eip
             continue
         if instruction.mnemonic == "fwait":
@@ -1392,6 +2041,19 @@ def execute_lifted_function(
             continue
         if instruction.mnemonic == "fnclex":
             trace.add(instruction.address, "fpu_clear_exceptions")
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "fnstsw":
+            value = active_state.fpu_status_word & 0xFFFF
+            _write_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[0],
+                value,
+            )
+            trace.add(instruction.address, "fpu_store_status_word", value=value)
             active_state.eip = next_eip
             continue
         if instruction.mnemonic == "wbinvd":
@@ -1431,6 +2093,401 @@ def execute_lifted_function(
             trace.add(instruction.address, "fpu_load_control_word", value=value)
             active_state.eip = next_eip
             continue
+        if instruction.mnemonic == "fild":
+            value = _read_x87_integer_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[0],
+            )
+            active_state.fpu_stack.insert(0, float(value))
+            trace.add(
+                instruction.address,
+                "fpu_integer_load",
+                value=value,
+                stack_depth=len(active_state.fpu_stack),
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "fistp":
+            if not active_state.fpu_stack:
+                raise X86ExecutionError(f"x87 stack underflow at {_hex32(instruction.address)}")
+            operand = instruction.operands[0]
+            value = active_state.fpu_stack.pop(0)
+            integer = _x87_float_to_int(value, operand.size)
+            _write_x87_integer_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                operand,
+                integer,
+            )
+            trace.add(
+                instruction.address,
+                "fpu_integer_store_pop",
+                value=value,
+                integer=integer,
+                integer_hex=_hex64(integer) if operand.size == 64 else _hex32(integer),
+                stack_depth=len(active_state.fpu_stack),
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "fld":
+            value = _read_x87_float_operand(
+                active_state, active_memory, trace, instruction, instruction.operands[0]
+            )
+            active_state.fpu_stack.insert(0, value)
+            trace.add(
+                instruction.address,
+                "fpu_load",
+                value=value,
+                stack_depth=len(active_state.fpu_stack),
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "fldlg2":
+            value = math.log10(2.0)
+            active_state.fpu_stack.insert(0, value)
+            trace.add(
+                instruction.address,
+                "fpu_load_constant",
+                constant="lg2",
+                value=value,
+                stack_depth=len(active_state.fpu_stack),
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "fyl2x":
+            if len(active_state.fpu_stack) < 2:
+                raise X86ExecutionError(f"x87 stack underflow at {_hex32(instruction.address)}")
+            x = active_state.fpu_stack.pop(0)
+            y = active_state.fpu_stack[0]
+            result = y * math.log2(x) if x > 0.0 else float("nan")
+            active_state.fpu_stack[0] = result
+            trace.add(
+                instruction.address,
+                "fpu_y_log2_x",
+                x=x,
+                y=y,
+                result=result,
+                stack_depth=len(active_state.fpu_stack),
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "fptan":
+            if not active_state.fpu_stack:
+                raise X86ExecutionError(f"x87 stack underflow at {_hex32(instruction.address)}")
+            argument = active_state.fpu_stack[0]
+            result = math.tan(argument)
+            active_state.fpu_stack[0] = result
+            active_state.fpu_stack.insert(0, 1.0)
+            trace.add(
+                instruction.address,
+                "fpu_partial_tangent",
+                argument=argument,
+                result=result,
+                stack_depth=len(active_state.fpu_stack),
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic in {"fcom", "fcomp"}:
+            if not active_state.fpu_stack:
+                raise X86ExecutionError(f"x87 stack underflow at {_hex32(instruction.address)}")
+            value = _read_x87_float_operand(
+                active_state, active_memory, trace, instruction, instruction.operands[0]
+            )
+            top = active_state.fpu_stack[0]
+            comparison = _x87_compare(top, value)
+            active_state.fpu_status_word = _x87_compare_status_word(
+                active_state.fpu_status_word,
+                comparison,
+            )
+            if instruction.mnemonic == "fcomp":
+                active_state.fpu_stack.pop(0)
+            trace.add(
+                instruction.address,
+                "fpu_compare_pop" if instruction.mnemonic == "fcomp" else "fpu_compare",
+                value=value,
+                top=top,
+                comparison=comparison,
+                status_word=active_state.fpu_status_word,
+                status_word_hex=f"0x{active_state.fpu_status_word:04X}",
+                stack_depth=len(active_state.fpu_stack),
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "fadd":
+            if not active_state.fpu_stack:
+                raise X86ExecutionError(f"x87 stack underflow at {_hex32(instruction.address)}")
+            value = _read_x87_float_operand(
+                active_state, active_memory, trace, instruction, instruction.operands[0]
+            )
+            active_state.fpu_stack[0] += value
+            trace.add(
+                instruction.address,
+                "fpu_add",
+                value=value,
+                result=active_state.fpu_stack[0],
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "fmul":
+            if not active_state.fpu_stack:
+                raise X86ExecutionError(f"x87 stack underflow at {_hex32(instruction.address)}")
+            value = _read_x87_float_operand(
+                active_state, active_memory, trace, instruction, instruction.operands[0]
+            )
+            active_state.fpu_stack[0] *= value
+            trace.add(
+                instruction.address,
+                "fpu_multiply",
+                value=value,
+                result=active_state.fpu_stack[0],
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "fsub":
+            if not active_state.fpu_stack:
+                raise X86ExecutionError(f"x87 stack underflow at {_hex32(instruction.address)}")
+            value = _read_x87_float_operand(
+                active_state, active_memory, trace, instruction, instruction.operands[0]
+            )
+            active_state.fpu_stack[0] -= value
+            trace.add(
+                instruction.address,
+                "fpu_subtract",
+                value=value,
+                result=active_state.fpu_stack[0],
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "fisub":
+            if not active_state.fpu_stack:
+                raise X86ExecutionError(f"x87 stack underflow at {_hex32(instruction.address)}")
+            value = _read_x87_integer_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[0],
+            )
+            active_state.fpu_stack[0] -= float(value)
+            trace.add(
+                instruction.address,
+                "fpu_integer_subtract",
+                value=value,
+                result=active_state.fpu_stack[0],
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "fsubr":
+            if not active_state.fpu_stack:
+                raise X86ExecutionError(f"x87 stack underflow at {_hex32(instruction.address)}")
+            value = _read_x87_float_operand(
+                active_state, active_memory, trace, instruction, instruction.operands[0]
+            )
+            active_state.fpu_stack[0] = value - active_state.fpu_stack[0]
+            trace.add(
+                instruction.address,
+                "fpu_reverse_subtract",
+                value=value,
+                result=active_state.fpu_stack[0],
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "fdiv":
+            if not active_state.fpu_stack:
+                raise X86ExecutionError(f"x87 stack underflow at {_hex32(instruction.address)}")
+            value = _read_x87_float_operand(
+                active_state, active_memory, trace, instruction, instruction.operands[0]
+            )
+            active_state.fpu_stack[0] = _x87_divide(active_state.fpu_stack[0], value)
+            trace.add(
+                instruction.address,
+                "fpu_divide",
+                value=value,
+                result=active_state.fpu_stack[0],
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "fdivr":
+            if not active_state.fpu_stack:
+                raise X86ExecutionError(f"x87 stack underflow at {_hex32(instruction.address)}")
+            value = _read_x87_float_operand(
+                active_state, active_memory, trace, instruction, instruction.operands[0]
+            )
+            active_state.fpu_stack[0] = _x87_divide(value, active_state.fpu_stack[0])
+            trace.add(
+                instruction.address,
+                "fpu_reverse_divide",
+                value=value,
+                result=active_state.fpu_stack[0],
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "fchs":
+            if not active_state.fpu_stack:
+                raise X86ExecutionError(f"x87 stack underflow at {_hex32(instruction.address)}")
+            active_state.fpu_stack[0] = -active_state.fpu_stack[0]
+            trace.add(
+                instruction.address,
+                "fpu_change_sign",
+                result=active_state.fpu_stack[0],
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "fxch":
+            index = _x87_stack_operand_index(
+                active_state, instruction, instruction.operands[0]
+            )
+            active_state.fpu_stack[0], active_state.fpu_stack[index] = (
+                active_state.fpu_stack[index],
+                active_state.fpu_stack[0],
+            )
+            trace.add(
+                instruction.address,
+                "fpu_exchange",
+                stack_index=index,
+                top=active_state.fpu_stack[0],
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "faddp":
+            index = _x87_stack_operand_index(
+                active_state, instruction, instruction.operands[0]
+            )
+            value = active_state.fpu_stack[0]
+            active_state.fpu_stack[index] += value
+            result = active_state.fpu_stack[index]
+            active_state.fpu_stack.pop(0)
+            trace.add(
+                instruction.address,
+                "fpu_add_pop",
+                stack_index=index,
+                value=value,
+                result=result,
+                stack_depth=len(active_state.fpu_stack),
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "fmulp":
+            index = _x87_stack_operand_index(
+                active_state, instruction, instruction.operands[0]
+            )
+            value = active_state.fpu_stack[0]
+            active_state.fpu_stack[index] *= value
+            result = active_state.fpu_stack[index]
+            active_state.fpu_stack.pop(0)
+            trace.add(
+                instruction.address,
+                "fpu_multiply_pop",
+                stack_index=index,
+                value=value,
+                result=result,
+                stack_depth=len(active_state.fpu_stack),
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "fsubp":
+            index = _x87_stack_operand_index(
+                active_state, instruction, instruction.operands[0]
+            )
+            value = active_state.fpu_stack[0]
+            active_state.fpu_stack[index] -= value
+            result = active_state.fpu_stack[index]
+            active_state.fpu_stack.pop(0)
+            trace.add(
+                instruction.address,
+                "fpu_subtract_pop",
+                stack_index=index,
+                value=value,
+                result=result,
+                stack_depth=len(active_state.fpu_stack),
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "fdivp":
+            index = _x87_stack_operand_index(
+                active_state, instruction, instruction.operands[0]
+            )
+            value = active_state.fpu_stack[0]
+            active_state.fpu_stack[index] = _x87_divide(
+                active_state.fpu_stack[index],
+                value,
+            )
+            result = active_state.fpu_stack[index]
+            active_state.fpu_stack.pop(0)
+            trace.add(
+                instruction.address,
+                "fpu_divide_pop",
+                stack_index=index,
+                value=value,
+                result=result,
+                stack_depth=len(active_state.fpu_stack),
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "fst":
+            if not active_state.fpu_stack:
+                raise X86ExecutionError(f"x87 stack underflow at {_hex32(instruction.address)}")
+            value = active_state.fpu_stack[0]
+            operand = instruction.operands[0]
+            if operand.kind == "imm":
+                index = _x87_stack_operand_index(active_state, instruction, operand)
+                active_state.fpu_stack[index] = value
+                trace.add(
+                    instruction.address,
+                    "fpu_store_stack",
+                    stack_index=index,
+                    value=value,
+                    stack_depth=len(active_state.fpu_stack),
+                )
+            else:
+                _write_float32_operand(
+                    active_state,
+                    active_memory,
+                    trace,
+                    instruction,
+                    operand,
+                    value,
+                )
+                trace.add(
+                    instruction.address,
+                    "fpu_store",
+                    value=value,
+                    stack_depth=len(active_state.fpu_stack),
+                )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "fstp":
+            if not active_state.fpu_stack:
+                raise X86ExecutionError(f"x87 stack underflow at {_hex32(instruction.address)}")
+            operand = instruction.operands[0]
+            value = active_state.fpu_stack[0]
+            if operand.kind == "imm":
+                index = _x87_stack_operand_index(active_state, instruction, operand)
+                active_state.fpu_stack[index] = value
+                active_state.fpu_stack.pop(0)
+            else:
+                active_state.fpu_stack.pop(0)
+                _write_float32_operand(
+                    active_state,
+                    active_memory,
+                    trace,
+                    instruction,
+                    operand,
+                    value,
+                )
+            trace.add(
+                instruction.address,
+                "fpu_store_pop",
+                value=value,
+                stack_depth=len(active_state.fpu_stack),
+            )
+            active_state.eip = next_eip
+            continue
         if instruction.mnemonic == "stmxcsr":
             _write_operand(
                 active_state,
@@ -1451,9 +2508,271 @@ def execute_lifted_function(
             trace.add(instruction.address, "sse_load_mxcsr", value=active_state.mxcsr)
             active_state.eip = next_eip
             continue
+        if instruction.mnemonic == "cvttss2si":
+            value = _read_float32_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[1],
+            )
+            integer = _sse_truncate_float32_to_i32(value)
+            _write_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[0],
+                integer,
+            )
+            trace.add(
+                instruction.address,
+                "sse_truncate_scalar_float_to_i32",
+                value=value,
+                integer=integer,
+                integer_hex=_hex32(integer),
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "movaps":
+            value = _read_xmm_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[1],
+            )
+            _write_xmm_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[0],
+                value,
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "movss":
+            destination = instruction.operands[0]
+            source = instruction.operands[1]
+            value = _read_xmm_scalar_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                source,
+            )
+            if destination.kind == "reg":
+                current = active_state.get_xmm_register(destination.reg or "")
+                vector = (
+                    (value, 0.0, 0.0, 0.0)
+                    if source.kind == "mem"
+                    else (value, current[1], current[2], current[3])
+                )
+                _write_xmm_operand(
+                    active_state,
+                    active_memory,
+                    trace,
+                    instruction,
+                    destination,
+                    vector,
+                )
+            else:
+                _write_float32_operand(
+                    active_state,
+                    active_memory,
+                    trace,
+                    instruction,
+                    destination,
+                    value,
+                )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "rsqrtss":
+            destination = instruction.operands[0]
+            value = _read_xmm_scalar_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[1],
+            )
+            current = active_state.get_xmm_register(destination.reg or "")
+            result = 1.0 / math.sqrt(value) if value > 0.0 else float("nan")
+            _write_xmm_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                destination,
+                (result, current[1], current[2], current[3]),
+            )
+            trace.add(
+                instruction.address,
+                "xmm_reciprocal_sqrt_scalar",
+                value=value,
+                result=result,
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic in {"addps", "mulps"}:
+            destination = _read_xmm_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[0],
+            )
+            source = _read_xmm_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[1],
+            )
+            if instruction.mnemonic == "addps":
+                result = tuple(left + right for left, right in zip(destination, source))
+                operation = "xmm_add_packed_float"
+            else:
+                result = tuple(left * right for left, right in zip(destination, source))
+                operation = "xmm_multiply_packed_float"
+            _write_xmm_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[0],
+                result,
+            )
+            trace.add(instruction.address, operation, result=list(result))
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "shufps":
+            destination = _read_xmm_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[0],
+            )
+            source = _read_xmm_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[1],
+            )
+            immediate = instruction.operands[2].immediate or 0
+            result = _xmm_shuffle(destination, source, immediate)
+            _write_xmm_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[0],
+                result,
+            )
+            trace.add(
+                instruction.address,
+                "xmm_shuffle_packed_float",
+                immediate=immediate,
+                immediate_hex=_hex32(immediate),
+                result=list(result),
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic in {"unpcklps", "unpckhps", "movlhps", "movhlps"}:
+            destination = _read_xmm_operand(
+                active_state, active_memory, trace, instruction, instruction.operands[0]
+            )
+            source = _read_xmm_operand(
+                active_state, active_memory, trace, instruction, instruction.operands[1]
+            )
+            if instruction.mnemonic == "unpcklps":
+                result = (destination[0], source[0], destination[1], source[1])
+            elif instruction.mnemonic == "unpckhps":
+                result = (destination[2], source[2], destination[3], source[3])
+            elif instruction.mnemonic == "movlhps":
+                result = (destination[0], destination[1], source[0], source[1])
+            else:
+                result = (source[2], source[3], destination[2], destination[3])
+            _write_xmm_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[0],
+                result,
+            )
+            trace.add(
+                instruction.address,
+                f"xmm_{instruction.mnemonic}",
+                result=list(result),
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic in {"movlps_store", "movhps_store"}:
+            source = _read_xmm_operand(
+                active_state, active_memory, trace, instruction, instruction.operands[1]
+            )
+            lanes = source[:2] if instruction.mnemonic == "movlps_store" else source[2:]
+            address = _effective_address(active_state, instruction.operands[0])
+            active_memory.write(address, struct.pack("<2f", *lanes))
+            trace.add(
+                instruction.address,
+                "xmm_store_low_packed_float" if instruction.mnemonic == "movlps_store"
+                else "xmm_store_high_packed_float",
+                memory_address=address,
+                memory_address_hex=_hex32(address),
+                value=list(lanes),
+                size=8,
+            )
+            active_state.eip = next_eip
+            continue
         if instruction.mnemonic == "mov":
             value = _read_operand(active_state, active_memory, trace, instruction, instruction.operands[1])
             _write_operand(active_state, active_memory, trace, instruction, instruction.operands[0], value)
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic == "xchg":
+            left = _read_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[0],
+            )
+            right = _read_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[1],
+            )
+            _write_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[0],
+                right,
+            )
+            _write_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[1],
+                left,
+            )
+            trace.add(
+                instruction.address,
+                "exchange",
+                left=left,
+                left_hex=_hex32(left),
+                right=right,
+                right_hex=_hex32(right),
+            )
             active_state.eip = next_eip
             continue
         if instruction.mnemonic == "movzx":
@@ -1529,6 +2848,73 @@ def execute_lifted_function(
             active_state.eip = next_eip
             continue
         if instruction.mnemonic == "imul":
+            if len(instruction.operands) == 1:
+                operand = instruction.operands[0]
+                if operand.size == 32:
+                    lhs = _signed_int(active_state.get_register("eax"), 32)
+                    rhs = _signed_int(
+                        _read_operand(
+                            active_state, active_memory, trace, instruction, operand
+                        ),
+                        32,
+                    )
+                    product = lhs * rhs
+                    result = product & 0xFFFFFFFFFFFFFFFF
+                    low = result & 0xFFFFFFFF
+                    high = (result >> 32) & 0xFFFFFFFF
+                    active_state.set_register("eax", low)
+                    active_state.set_register("edx", high)
+                    active_state.flags.cf = active_state.flags.of = (
+                        product != _signed_int(low, 32)
+                    )
+                    trace.add(
+                        instruction.address,
+                        "signed_multiply",
+                        lhs=lhs,
+                        rhs=rhs,
+                        product=product,
+                        low=low,
+                        low_hex=_hex32(low),
+                        high=high,
+                        high_hex=_hex32(high),
+                    )
+                    trace.add(
+                        instruction.address, "flags", **active_state.flags.to_dict()
+                    )
+                    active_state.eip = next_eip
+                    continue
+                if operand.size != 8:
+                    raise X86ExecutionError("unsupported one-operand imul size")
+                lhs = _signed_int(active_state.get_register("eax") & 0xFF, 8)
+                rhs = _signed_int(
+                    _read_operand(
+                        active_state, active_memory, trace, instruction, operand
+                    ),
+                    8,
+                )
+                product = lhs * rhs
+                result = product & 0xFFFF
+                active_state.set_register(
+                    "eax",
+                    (active_state.get_register("eax") & 0xFFFF0000) | result,
+                )
+                active_state.flags.cf = active_state.flags.of = (
+                    product != _signed_int(result & 0xFF, 8)
+                )
+                trace.add(
+                    instruction.address,
+                    "signed_multiply",
+                    lhs=lhs,
+                    rhs=rhs,
+                    product=product,
+                    result=result,
+                    result_hex=_hex32(result),
+                )
+                trace.add(
+                    instruction.address, "flags", **active_state.flags.to_dict()
+                )
+                active_state.eip = next_eip
+                continue
             destination = instruction.operands[0]
             size = destination.size
             lhs_operand = (
@@ -1646,6 +3032,40 @@ def execute_lifted_function(
                 count,
                 result,
                 size=instruction.operands[0].size,
+            )
+            trace.add(instruction.address, "flags", **active_state.flags.to_dict())
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic in {"shld", "shrd"}:
+            destination = _read_operand(
+                active_state, active_memory, trace, instruction, instruction.operands[0]
+            )
+            source = _read_operand(
+                active_state, active_memory, trace, instruction, instruction.operands[1]
+            )
+            count = _read_operand(
+                active_state, active_memory, trace, instruction, instruction.operands[2]
+            ) & 0x1F
+            result = _double_shift_result(
+                instruction.mnemonic,
+                destination,
+                source,
+                count,
+            )
+            _write_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[0],
+                result,
+            )
+            _update_double_shift_flags(
+                active_state.flags,
+                instruction.mnemonic,
+                destination,
+                count,
+                result,
             )
             trace.add(instruction.address, "flags", **active_state.flags.to_dict())
             active_state.eip = next_eip
@@ -1768,6 +3188,35 @@ def execute_lifted_function(
             )
             active_state.eip = next_eip
             continue
+        if instruction.mnemonic == "mul":
+            multiplier = _read_operand(
+                active_state,
+                active_memory,
+                trace,
+                instruction,
+                instruction.operands[0],
+            )
+            multiplicand = active_state.get_register("eax")
+            product = multiplicand * multiplier
+            low = product & 0xFFFFFFFF
+            high = (product >> 32) & 0xFFFFFFFF
+            active_state.set_register("eax", low)
+            active_state.set_register("edx", high)
+            active_state.flags.cf = active_state.flags.of = high != 0
+            trace.add(
+                instruction.address,
+                "unsigned_multiply",
+                multiplicand=multiplicand,
+                multiplier=multiplier,
+                product=product,
+                product_hex=_hex64(product),
+                low=low,
+                low_hex=_hex32(low),
+                high=high,
+                high_hex=_hex32(high),
+            )
+            active_state.eip = next_eip
+            continue
         if instruction.mnemonic in {"stosb", "rep_stosb"}:
             count = (
                 active_state.get_register("ecx")
@@ -1872,6 +3321,101 @@ def execute_lifted_function(
             )
             active_state.eip = next_eip
             continue
+        if instruction.mnemonic in {"cmpsb", "rep_cmpsb"}:
+            requested_count = (
+                active_state.get_register("ecx")
+                if instruction.mnemonic == "rep_cmpsb"
+                else 1
+            )
+            source = active_state.get_register("esi")
+            destination = active_state.get_register("edi")
+            remaining = requested_count
+            compared = 0
+            last_lhs = 0
+            last_rhs = 0
+            while remaining:
+                last_lhs = active_memory.read(_u32(source + compared), 1)[0]
+                last_rhs = active_memory.read(_u32(destination + compared), 1)[0]
+                result = _u32(last_lhs - last_rhs) & 0xFF
+                _update_flags(
+                    active_state.flags,
+                    "sub",
+                    last_lhs,
+                    last_rhs,
+                    result,
+                    size=8,
+                )
+                compared += 1
+                remaining -= 1
+                if instruction.mnemonic != "rep_cmpsb" or not active_state.flags.zf:
+                    break
+            active_state.set_register("esi", source + compared)
+            active_state.set_register("edi", destination + compared)
+            if instruction.mnemonic == "rep_cmpsb":
+                active_state.set_register("ecx", remaining)
+            trace.add(
+                instruction.address,
+                "string_compare",
+                element_size=1,
+                requested_count=requested_count,
+                compared_count=compared,
+                source=source,
+                source_hex=_hex32(source),
+                destination=destination,
+                destination_hex=_hex32(destination),
+                last_lhs=last_lhs,
+                last_lhs_hex=_hex32(last_lhs),
+                last_rhs=last_rhs,
+                last_rhs_hex=_hex32(last_rhs),
+                equal=active_state.flags.zf,
+            )
+            active_state.eip = next_eip
+            continue
+        if instruction.mnemonic in {"scasb", "repne_scasb"}:
+            requested_count = (
+                active_state.get_register("ecx")
+                if instruction.mnemonic == "repne_scasb"
+                else 1
+            )
+            source = active_state.get_register("edi")
+            needle = active_state.get_register("eax") & 0xFF
+            remaining = requested_count
+            scanned = 0
+            last_value = 0
+            while remaining:
+                last_value = active_memory.read(_u32(source + scanned), 1)[0]
+                result = _u32(needle - last_value) & 0xFF
+                _update_flags(
+                    active_state.flags,
+                    "sub",
+                    needle,
+                    last_value,
+                    result,
+                    size=8,
+                )
+                scanned += 1
+                remaining -= 1
+                if instruction.mnemonic != "repne_scasb" or active_state.flags.zf:
+                    break
+            active_state.set_register("edi", source + scanned)
+            if instruction.mnemonic == "repne_scasb":
+                active_state.set_register("ecx", remaining)
+            trace.add(
+                instruction.address,
+                "string_scan",
+                element_size=1,
+                requested_count=requested_count,
+                scanned_count=scanned,
+                source=source,
+                source_hex=_hex32(source),
+                needle=needle,
+                needle_hex=_hex32(needle),
+                last_value=last_value,
+                last_value_hex=_hex32(last_value),
+                remaining=remaining,
+            )
+            active_state.eip = next_eip
+            continue
         if instruction.mnemonic == "int3":
             raise X86ExecutionError(f"debug trap at {_hex32(instruction.address)}")
         if instruction.mnemonic == "int":
@@ -1939,7 +3483,11 @@ def execute_lifted_function(
         if instruction.mnemonic == "jcc":
             if instruction.target is None or instruction.condition is None:
                 raise X86ExecutionError("conditional branch missing target or condition")
-            taken = _evaluate_condition(active_state.flags, instruction.condition)
+            taken = (
+                active_state.get_register("ecx") == 0
+                if instruction.condition == "ecx_zero"
+                else _evaluate_condition(active_state.flags, instruction.condition)
+            )
             trace.add(
                 instruction.address,
                 "branch",
@@ -2018,6 +3566,364 @@ def _read_operand(
         )
         return value
     raise X86ExecutionError(f"cannot read operand kind {operand.kind}")
+
+
+def _read_float32_operand(
+    state: CpuState,
+    memory: SparseMemory,
+    trace: ExecutionTrace,
+    instruction: X86Instruction,
+    operand: Operand,
+) -> float:
+    if operand.kind != "mem":
+        raise X86ExecutionError("x87 float operand must be memory-backed")
+    address = _effective_address(state, operand)
+    payload = memory.read(address, 4)
+    raw = struct.unpack("<I", payload)[0]
+    trace.add(
+        instruction.address,
+        "memory_read",
+        memory_address=address,
+        memory_address_hex=_hex32(address),
+        value=raw,
+        value_hex=_hex32(raw),
+    )
+    return struct.unpack("<f", payload)[0]
+
+
+def _read_xmm_operand(
+    state: CpuState,
+    memory: SparseMemory,
+    trace: ExecutionTrace,
+    instruction: X86Instruction,
+    operand: Operand,
+) -> tuple[float, float, float, float]:
+    if operand.kind == "reg":
+        if operand.reg not in XMM_REGISTER_NAMES:
+            raise X86ExecutionError(f"unsupported XMM register read: {operand.reg}")
+        value = state.get_xmm_register(operand.reg)
+        trace.add(
+            instruction.address,
+            "xmm_register_read",
+            register=operand.reg,
+            value=list(value),
+        )
+        return value
+    if operand.kind == "mem":
+        address = _effective_address(state, operand)
+        payload = memory.read(address, 16)
+        value = struct.unpack("<4f", payload)
+        trace.add(
+            instruction.address,
+            "xmm_memory_read",
+            memory_address=address,
+            memory_address_hex=_hex32(address),
+            value=list(value),
+            size=16,
+        )
+        return value
+    raise X86ExecutionError(f"cannot read XMM operand kind {operand.kind}")
+
+
+def _write_xmm_operand(
+    state: CpuState,
+    memory: SparseMemory,
+    trace: ExecutionTrace,
+    instruction: X86Instruction,
+    operand: Operand,
+    value: Iterable[float],
+) -> None:
+    lanes = tuple(float(lane) for lane in value)
+    if len(lanes) != 4:
+        raise X86ExecutionError("XMM operand writes require four lanes")
+    vector = (lanes[0], lanes[1], lanes[2], lanes[3])
+    if operand.kind == "reg":
+        if operand.reg not in XMM_REGISTER_NAMES:
+            raise X86ExecutionError(f"unsupported XMM register write: {operand.reg}")
+        state.set_xmm_register(operand.reg, vector)
+        trace.add(
+            instruction.address,
+            "xmm_register_write",
+            register=operand.reg,
+            value=list(vector),
+        )
+        return
+    if operand.kind == "mem":
+        address = _effective_address(state, operand)
+        memory.write(address, struct.pack("<4f", *vector))
+        trace.add(
+            instruction.address,
+            "xmm_memory_write",
+            memory_address=address,
+            memory_address_hex=_hex32(address),
+            value=list(vector),
+            size=16,
+        )
+        return
+    raise X86ExecutionError(f"cannot write XMM operand kind {operand.kind}")
+
+
+def _read_mmx_operand(
+    state: CpuState,
+    memory: SparseMemory,
+    trace: ExecutionTrace,
+    instruction: X86Instruction,
+    operand: Operand,
+) -> int:
+    if operand.kind == "reg":
+        if operand.reg not in MMX_REGISTER_NAMES:
+            raise X86ExecutionError(f"unsupported MMX register read: {operand.reg}")
+        value = state.get_mmx_register(operand.reg)
+        trace.add(
+            instruction.address,
+            "mmx_register_read",
+            register=operand.reg,
+            value=value,
+            value_hex=_hex64(value),
+        )
+        return value
+    if operand.kind == "mem":
+        address = _effective_address(state, operand)
+        payload = memory.read(address, 8)
+        value = struct.unpack("<Q", payload)[0]
+        trace.add(
+            instruction.address,
+            "memory_read",
+            memory_address=address,
+            memory_address_hex=_hex32(address),
+            value=value,
+            value_hex=_hex64(value),
+            size=8,
+        )
+        return value
+    raise X86ExecutionError(f"cannot read MMX operand kind {operand.kind}")
+
+
+def _write_mmx_operand(
+    state: CpuState,
+    memory: SparseMemory,
+    trace: ExecutionTrace,
+    instruction: X86Instruction,
+    operand: Operand,
+    value: int,
+    *,
+    non_temporal: bool = False,
+) -> None:
+    value &= 0xFFFFFFFFFFFFFFFF
+    if operand.kind == "reg":
+        if operand.reg not in MMX_REGISTER_NAMES:
+            raise X86ExecutionError(f"unsupported MMX register write: {operand.reg}")
+        state.set_mmx_register(operand.reg, value)
+        trace.add(
+            instruction.address,
+            "mmx_register_write",
+            register=operand.reg,
+            value=value,
+            value_hex=_hex64(value),
+        )
+        return
+    if operand.kind == "mem":
+        address = _effective_address(state, operand)
+        memory.write(address, struct.pack("<Q", value))
+        trace.add(
+            instruction.address,
+            "memory_write",
+            memory_address=address,
+            memory_address_hex=_hex32(address),
+            value=value,
+            value_hex=_hex64(value),
+            size=8,
+            non_temporal=non_temporal,
+        )
+        return
+    raise X86ExecutionError(f"cannot write MMX operand kind {operand.kind}")
+
+
+def _read_xmm_scalar_operand(
+    state: CpuState,
+    memory: SparseMemory,
+    trace: ExecutionTrace,
+    instruction: X86Instruction,
+    operand: Operand,
+) -> float:
+    if operand.kind == "reg":
+        if operand.reg not in XMM_REGISTER_NAMES:
+            raise X86ExecutionError(f"unsupported XMM scalar read: {operand.reg}")
+        value = state.get_xmm_register(operand.reg)[0]
+        trace.add(
+            instruction.address,
+            "xmm_scalar_register_read",
+            register=operand.reg,
+            value=value,
+        )
+        return value
+    return _read_float32_operand(state, memory, trace, instruction, operand)
+
+
+def _xmm_shuffle(
+    destination: tuple[float, float, float, float],
+    source: tuple[float, float, float, float],
+    immediate: int,
+) -> tuple[float, float, float, float]:
+    return (
+        destination[immediate & 0x03],
+        destination[(immediate >> 2) & 0x03],
+        source[(immediate >> 4) & 0x03],
+        source[(immediate >> 6) & 0x03],
+    )
+
+
+def _read_x87_integer_operand(
+    state: CpuState,
+    memory: SparseMemory,
+    trace: ExecutionTrace,
+    instruction: X86Instruction,
+    operand: Operand,
+) -> int:
+    if operand.kind != "mem":
+        raise X86ExecutionError("x87 integer operand must be memory-backed")
+    if operand.size == 32:
+        return _i32(_read_operand(state, memory, trace, instruction, operand))
+    if operand.size != 64:
+        raise X86ExecutionError(f"unsupported x87 integer size {operand.size}")
+    address = _effective_address(state, operand)
+    payload = memory.read(address, 8)
+    raw = struct.unpack("<Q", payload)[0]
+    value = struct.unpack("<q", payload)[0]
+    trace.add(
+        instruction.address,
+        "memory_read",
+        memory_address=address,
+        memory_address_hex=_hex32(address),
+        value=raw,
+        value_hex=_hex64(raw),
+        size=8,
+    )
+    return value
+
+
+def _write_x87_integer_operand(
+    state: CpuState,
+    memory: SparseMemory,
+    trace: ExecutionTrace,
+    instruction: X86Instruction,
+    operand: Operand,
+    value: int,
+) -> None:
+    if operand.kind != "mem":
+        raise X86ExecutionError("x87 integer operand must be memory-backed")
+    if operand.size != 64:
+        _write_operand(state, memory, trace, instruction, operand, value)
+        return
+    address = _effective_address(state, operand)
+    payload = struct.pack("<q", int(value))
+    raw = struct.unpack("<Q", payload)[0]
+    memory.write(address, payload)
+    trace.add(
+        instruction.address,
+        "memory_write",
+        memory_address=address,
+        memory_address_hex=_hex32(address),
+        value=raw,
+        value_hex=_hex64(raw),
+        size=8,
+    )
+
+
+def _x87_float_to_int(value: float, bits: int) -> int:
+    minimum = -(1 << (bits - 1))
+    maximum = (1 << (bits - 1)) - 1
+    if not math.isfinite(value):
+        return minimum
+    rounded = int(round(value))
+    if rounded < minimum or rounded > maximum:
+        return minimum
+    return rounded
+
+
+def _sse_truncate_float32_to_i32(value: float) -> int:
+    if not math.isfinite(value) or value < -2147483648.0 or value > 2147483647.0:
+        return 0x80000000
+    return _u32(int(value))
+
+
+def _x87_stack_operand_index(
+    state: CpuState,
+    instruction: X86Instruction,
+    operand: Operand,
+) -> int:
+    if operand.kind != "imm":
+        raise X86ExecutionError("x87 stack operand must be an encoded ST index")
+    index = operand.immediate or 0
+    if index >= len(state.fpu_stack):
+        raise X86ExecutionError(
+            f"x87 stack underflow reading st({index}) at {_hex32(instruction.address)}"
+        )
+    return index
+
+
+def _read_x87_float_operand(
+    state: CpuState,
+    memory: SparseMemory,
+    trace: ExecutionTrace,
+    instruction: X86Instruction,
+    operand: Operand,
+) -> float:
+    if operand.kind == "imm":
+        index = _x87_stack_operand_index(state, instruction, operand)
+        value = state.fpu_stack[index]
+        trace.add(
+            instruction.address,
+            "fpu_stack_read",
+            stack_index=index,
+            value=value,
+        )
+        return value
+    if operand.size != 64:
+        return _read_float32_operand(state, memory, trace, instruction, operand)
+    address = _effective_address(state, operand)
+    payload = memory.read(address, 8)
+    raw = struct.unpack("<Q", payload)[0]
+    trace.add(
+        instruction.address,
+        "memory_read",
+        memory_address=address,
+        memory_address_hex=_hex32(address),
+        value=raw,
+        value_hex=_hex64(raw),
+        size=8,
+    )
+    return struct.unpack("<d", payload)[0]
+
+
+def _x87_compare(left: float, right: float) -> str:
+    if math.isnan(left) or math.isnan(right):
+        return "unordered"
+    if left < right:
+        return "less"
+    if left > right:
+        return "greater"
+    return "equal"
+
+
+def _x87_compare_status_word(status_word: int, comparison: str) -> int:
+    status_word &= ~X87_STATUS_CONDITION_MASK
+    if comparison == "less":
+        status_word |= X87_STATUS_C0
+    elif comparison == "equal":
+        status_word |= X87_STATUS_C3
+    elif comparison == "unordered":
+        status_word |= X87_STATUS_C0 | X87_STATUS_C2 | X87_STATUS_C3
+    return status_word & 0xFFFF
+
+
+def _x87_divide(numerator: float, denominator: float) -> float:
+    if denominator == 0.0:
+        if numerator == 0.0:
+            return float("nan")
+        negative = math.copysign(1.0, numerator) != math.copysign(1.0, denominator)
+        return float("-inf") if negative else float("inf")
+    return numerator / denominator
 
 
 def _read_low_u8_register(state: CpuState, name: str) -> int:
@@ -2131,6 +4037,31 @@ def _write_operand(
     raise X86ExecutionError(f"cannot write operand kind {operand.kind}")
 
 
+def _write_float32_operand(
+    state: CpuState,
+    memory: SparseMemory,
+    trace: ExecutionTrace,
+    instruction: X86Instruction,
+    operand: Operand,
+    value: float,
+) -> None:
+    if operand.kind != "mem":
+        raise X86ExecutionError("x87 float operand must be memory-backed")
+    address = _effective_address(state, operand)
+    payload = struct.pack("<f", float(value))
+    raw = struct.unpack("<I", payload)[0]
+    memory.write(address, payload)
+    trace.add(
+        instruction.address,
+        "memory_write",
+        memory_address=address,
+        memory_address_hex=_hex32(address),
+        value=raw,
+        value_hex=_hex32(raw),
+        size=4,
+    )
+
+
 def _effective_address(state: CpuState, operand: Operand) -> int:
     if operand.kind != "mem":
         raise X86ExecutionError("effective address requested for non-memory operand")
@@ -2231,6 +4162,24 @@ def _shift_result(operation: str, value: int, count: int, *, size: int = 32) -> 
     raise X86ExecutionError(f"unsupported shift operation {operation}")
 
 
+def _double_shift_result(
+    operation: str,
+    destination: int,
+    source: int,
+    count: int,
+) -> int:
+    destination = _u32(destination)
+    source = _u32(source)
+    count &= 0x1F
+    if count == 0:
+        return destination
+    if operation == "shld":
+        return _u32((destination << count) | (source >> (32 - count)))
+    if operation == "shrd":
+        return _u32((destination >> count) | (source << (32 - count)))
+    raise X86ExecutionError(f"unsupported double shift operation {operation}")
+
+
 def _update_flags(
     flags: CpuFlags,
     operation: str,
@@ -2297,6 +4246,32 @@ def _update_shift_flags(
     flags.af = False
 
 
+def _update_double_shift_flags(
+    flags: CpuFlags,
+    operation: str,
+    destination: int,
+    count: int,
+    result: int,
+) -> None:
+    count &= 0x1F
+    if count == 0:
+        return
+    destination = _u32(destination)
+    result = _u32(result)
+    if operation == "shld":
+        flags.cf = bool(destination & (1 << (32 - count)))
+        flags.of = bool(((result >> 31) & 1) ^ int(flags.cf)) if count == 1 else False
+    elif operation == "shrd":
+        flags.cf = bool(destination & (1 << (count - 1)))
+        flags.of = bool(((destination ^ result) >> 31) & 1) if count == 1 else False
+    else:
+        raise X86ExecutionError(f"cannot update double shift flags for {operation}")
+    flags.zf = result == 0
+    flags.sf = bool(result & 0x80000000)
+    flags.pf = _parity8(result)
+    flags.af = False
+
+
 def _condition_for_short_opcode(opcode: int) -> str:
     return {
         0x70: "o",
@@ -2357,12 +4332,26 @@ def _evaluate_condition(flags: CpuFlags, condition: str) -> bool:
 class CppEmitter:
     """Emit deterministic C++17 for the lifted subset."""
 
-    def emit(self, function: LiftedFunction, *, exported_symbol: str | None = None) -> str:
+    def emit(
+        self,
+        function: LiftedFunction,
+        *,
+        exported_symbol: str | None = None,
+        resumable: bool = False,
+        observer_addresses: Iterable[int] = (),
+        callback_addresses: Iterable[int] = (),
+    ) -> str:
+        self._resumable = resumable
+        self._observer_addresses = {_u32(address) for address in observer_addresses}
+        self._callback_addresses = {_u32(address) for address in callback_addresses}
         symbol = _cpp_identifier(exported_symbol or function.symbol)
         lines = [
             "// Generated by b2_recomp Milestone 5 prototype.",
             "// Target: Windows x86 guest semantics, C++17 host translation unit.",
+            "#include <cmath>",
             "#include <cstdint>",
+            "#include <cstring>",
+            "#include <limits>",
             "",
             "#ifndef _WIN32",
             '#error "b2_recomp Milestone 5 generated code currently targets Windows hosts only"',
@@ -2377,6 +4366,10 @@ class CppEmitter:
             "    bool of;",
             "};",
             "",
+            "struct B2RXmm {",
+            "    float lane[4];",
+            "};",
+            "",
             "struct B2RContext {",
             "    uint32_t eax;",
             "    uint32_t ecx;",
@@ -2389,13 +4382,26 @@ class CppEmitter:
             "    uint32_t fs_base;",
             "    uint64_t timestamp_counter;",
             "    uint32_t mxcsr;",
+            "    uint32_t fpu_status_word;",
+            "    float fpu_stack[8];",
+            "    uint32_t fpu_depth;",
+            "    B2RXmm xmm[8];",
+            "    uint64_t mmx[8];",
             "    B2RFlags flags;",
+            "    uint32_t eip;",
+            "    uint64_t steps;",
+            "    uint64_t step_budget;",
+            "    bool yield_requested;",
             "    void* user;",
             "    uint32_t (*read_u32)(void*, uint32_t);",
             "    void (*write_u32)(void*, uint32_t, uint32_t);",
             "    uint8_t (*read_u8)(void*, uint32_t);",
             "    void (*write_u8)(void*, uint32_t, uint8_t);",
             "    void (*call)(void*, uint32_t, B2RContext*);",
+            "    void (*observe)(void*, B2RContext*);",
+            "    uint8_t** read_pages;",
+            "    uint8_t* callback_pages;",
+            "    uint8_t* dirty_pages;",
             "};",
             "",
             "static inline bool b2r_parity8(uint32_t value) {",
@@ -2424,6 +4430,54 @@ class CppEmitter:
             "    return static_cast<int64_t>(static_cast<int32_t>(b2r_sign_extend(value, bits)));",
             "}",
             "",
+            "static inline uint8_t b2r_read_u8(B2RContext* ctx, uint32_t address) {",
+            "    const uint32_t page = address >> 12u;",
+            "    if (address < 0x80000000u && ctx->read_pages != nullptr &&",
+            "        (ctx->callback_pages == nullptr || ctx->callback_pages[page] == 0u) &&",
+            "        ctx->read_pages[page] != nullptr) {",
+            "        return ctx->read_pages[page][address & 0xfffu];",
+            "    }",
+            "    return (ctx->read_u8)(ctx->user, address);",
+            "}",
+            "",
+            "static inline uint32_t b2r_read_u32(B2RContext* ctx, uint32_t address) {",
+            "    const uint32_t page = address >> 12u;",
+            "    if (address < 0x80000000u && (address & 0xfffu) <= 0xffcu &&",
+            "        ctx->read_pages != nullptr &&",
+            "        (ctx->callback_pages == nullptr || ctx->callback_pages[page] == 0u) &&",
+            "        ctx->read_pages[page] != nullptr) {",
+            "        uint32_t value;",
+            "        std::memcpy(&value, ctx->read_pages[page] + (address & 0xfffu), sizeof(value));",
+            "        return value;",
+            "    }",
+            "    return (ctx->read_u32)(ctx->user, address);",
+            "}",
+            "",
+            "static inline void b2r_write_u8(B2RContext* ctx, uint32_t address, uint8_t value) {",
+            "    const uint32_t page = address >> 12u;",
+            "    if (address < 0x80000000u && ctx->read_pages != nullptr &&",
+            "        (ctx->callback_pages == nullptr || ctx->callback_pages[page] == 0u) &&",
+            "        ctx->read_pages[page] != nullptr) {",
+            "        ctx->read_pages[page][address & 0xfffu] = value;",
+            "        if (ctx->dirty_pages != nullptr) { ctx->dirty_pages[page] = 1u; }",
+            "        return;",
+            "    }",
+            "    (ctx->write_u8)(ctx->user, address, value);",
+            "}",
+            "",
+            "static inline void b2r_write_u32(B2RContext* ctx, uint32_t address, uint32_t value) {",
+            "    const uint32_t page = address >> 12u;",
+            "    if (address < 0x80000000u && (address & 0xfffu) <= 0xffcu &&",
+            "        ctx->read_pages != nullptr &&",
+            "        (ctx->callback_pages == nullptr || ctx->callback_pages[page] == 0u) &&",
+            "        ctx->read_pages[page] != nullptr) {",
+            "        std::memcpy(ctx->read_pages[page] + (address & 0xfffu), &value, sizeof(value));",
+            "        if (ctx->dirty_pages != nullptr) { ctx->dirty_pages[page] = 1u; }",
+            "        return;",
+            "    }",
+            "    (ctx->write_u32)(ctx->user, address, value);",
+            "}",
+            "",
             "static inline uint16_t b2r_read_u16(B2RContext* ctx, uint32_t address) {",
             "    return static_cast<uint16_t>(",
             "        static_cast<uint16_t>(ctx->read_u8(ctx->user, address)) |",
@@ -2433,6 +4487,41 @@ class CppEmitter:
             "static inline void b2r_write_u16(B2RContext* ctx, uint32_t address, uint16_t value) {",
             "    ctx->write_u8(ctx->user, address, static_cast<uint8_t>(value & 0xffu));",
             "    ctx->write_u8(ctx->user, address + 1u, static_cast<uint8_t>((value >> 8) & 0xffu));",
+            "}",
+            "",
+            "static inline int64_t b2r_read_i64(B2RContext* ctx, uint32_t address) {",
+            "    const uint64_t low = static_cast<uint64_t>(ctx->read_u32(ctx->user, address));",
+            "    const uint64_t high = static_cast<uint64_t>(ctx->read_u32(ctx->user, address + 4u));",
+            "    return static_cast<int64_t>((high << 32) | low);",
+            "}",
+            "",
+            "static inline uint64_t b2r_read_u64(B2RContext* ctx, uint32_t address) {",
+            "    const uint64_t low = static_cast<uint64_t>(ctx->read_u32(ctx->user, address));",
+            "    const uint64_t high = static_cast<uint64_t>(ctx->read_u32(ctx->user, address + 4u));",
+            "    return (high << 32) | low;",
+            "}",
+            "",
+            "static inline void b2r_write_i64(B2RContext* ctx, uint32_t address, int64_t value) {",
+            "    const uint64_t bits = static_cast<uint64_t>(value);",
+            "    ctx->write_u32(ctx->user, address, static_cast<uint32_t>(bits & 0xffffffffu));",
+            "    ctx->write_u32(ctx->user, address + 4u, static_cast<uint32_t>(bits >> 32));",
+            "}",
+            "",
+            "static inline void b2r_write_u64(B2RContext* ctx, uint32_t address, uint64_t value) {",
+            "    ctx->write_u32(ctx->user, address, static_cast<uint32_t>(value & 0xffffffffu));",
+            "    ctx->write_u32(ctx->user, address + 4u, static_cast<uint32_t>(value >> 32));",
+            "}",
+            "",
+            "static inline int64_t b2r_fistp_i64(float value) {",
+            "    if (!std::isfinite(value)) {",
+            "        return std::numeric_limits<int64_t>::min();",
+            "    }",
+            "    const double rounded = std::nearbyint(static_cast<double>(value));",
+            "    if (rounded < static_cast<double>(std::numeric_limits<int64_t>::min()) ||",
+            "        rounded > static_cast<double>(std::numeric_limits<int64_t>::max())) {",
+            "        return std::numeric_limits<int64_t>::min();",
+            "    }",
+            "    return static_cast<int64_t>(rounded);",
             "}",
             "",
             "static inline void b2r_logic_flags(B2RContext* ctx, uint32_t result, uint32_t bits) {",
@@ -2488,19 +4577,180 @@ class CppEmitter:
             "    return value;",
             "}",
             "",
+            "static inline float b2r_read_f32(B2RContext* ctx, uint32_t address) {",
+            "    const uint32_t bits = ctx->read_u32(ctx->user, address);",
+            "    float value;",
+            "    std::memcpy(&value, &bits, sizeof(value));",
+            "    return value;",
+            "}",
+            "",
+            "static inline float b2r_read_f64(B2RContext* ctx, uint32_t address) {",
+            "    const uint64_t bits = b2r_read_u64(ctx, address);",
+            "    double value;",
+            "    std::memcpy(&value, &bits, sizeof(value));",
+            "    return static_cast<float>(value);",
+            "}",
+            "",
+            "static inline void b2r_write_f32(B2RContext* ctx, uint32_t address, float value) {",
+            "    uint32_t bits;",
+            "    std::memcpy(&bits, &value, sizeof(bits));",
+            "    ctx->write_u32(ctx->user, address, bits);",
+            "}",
+            "",
+            "static inline B2RXmm b2r_read_xmm(B2RContext* ctx, uint32_t address) {",
+            "    B2RXmm value{};",
+            "    for (uint32_t lane = 0u; lane < 4u; ++lane) {",
+            "        const uint32_t bits = ctx->read_u32(ctx->user, address + lane * 4u);",
+            "        std::memcpy(&value.lane[lane], &bits, sizeof(bits));",
+            "    }",
+            "    return value;",
+            "}",
+            "",
+            "static inline void b2r_write_xmm(B2RContext* ctx, uint32_t address, B2RXmm value) {",
+            "    for (uint32_t lane = 0u; lane < 4u; ++lane) {",
+            "        uint32_t bits;",
+            "        std::memcpy(&bits, &value.lane[lane], sizeof(bits));",
+            "        ctx->write_u32(ctx->user, address + lane * 4u, bits);",
+            "    }",
+            "}",
+            "",
+            "static inline B2RXmm b2r_xmm_shuffle(B2RXmm destination, B2RXmm source, uint32_t immediate) {",
+            "    B2RXmm result{};",
+            "    result.lane[0] = destination.lane[immediate & 0x03u];",
+            "    result.lane[1] = destination.lane[(immediate >> 2u) & 0x03u];",
+            "    result.lane[2] = source.lane[(immediate >> 4u) & 0x03u];",
+            "    result.lane[3] = source.lane[(immediate >> 6u) & 0x03u];",
+            "    return result;",
+            "}",
+            "",
+            "static inline B2RXmm b2r_xmm_unpack_low(B2RXmm destination, B2RXmm source) {",
+            "    return B2RXmm{{destination.lane[0], source.lane[0], destination.lane[1], source.lane[1]}};",
+            "}",
+            "",
+            "static inline B2RXmm b2r_xmm_unpack_high(B2RXmm destination, B2RXmm source) {",
+            "    return B2RXmm{{destination.lane[2], source.lane[2], destination.lane[3], source.lane[3]}};",
+            "}",
+            "",
+            "static inline B2RXmm b2r_xmm_move_low_to_high(B2RXmm destination, B2RXmm source) {",
+            "    return B2RXmm{{destination.lane[0], destination.lane[1], source.lane[0], source.lane[1]}};",
+            "}",
+            "",
+            "static inline B2RXmm b2r_xmm_move_high_to_low(B2RXmm destination, B2RXmm source) {",
+            "    return B2RXmm{{source.lane[2], source.lane[3], destination.lane[2], destination.lane[3]}};",
+            "}",
+            "",
+            "static inline B2RXmm b2r_xmm_add(B2RXmm left, B2RXmm right) {",
+            "    B2RXmm result{};",
+            "    for (uint32_t lane = 0u; lane < 4u; ++lane) {",
+            "        result.lane[lane] = left.lane[lane] + right.lane[lane];",
+            "    }",
+            "    return result;",
+            "}",
+            "",
+            "static inline B2RXmm b2r_xmm_multiply(B2RXmm left, B2RXmm right) {",
+            "    B2RXmm result{};",
+            "    for (uint32_t lane = 0u; lane < 4u; ++lane) {",
+            "        result.lane[lane] = left.lane[lane] * right.lane[lane];",
+            "    }",
+            "    return result;",
+            "}",
+            "",
+            "static inline uint32_t b2r_cvttss2si(float value) {",
+            "    if (!std::isfinite(value) || value < -2147483648.0f || value > 2147483647.0f) {",
+            "        return 0x80000000u;",
+            "    }",
+            "    return static_cast<uint32_t>(static_cast<int32_t>(value));",
+            "}",
+            "",
+            "static inline float b2r_rsqrtss(float value) {",
+            "    if (value <= 0.0f) {",
+            "        return std::numeric_limits<float>::quiet_NaN();",
+            "    }",
+            "    return 1.0f / std::sqrt(value);",
+            "}",
+            "",
+            "static inline void b2r_fpu_push(B2RContext* ctx, float value) {",
+            "    for (uint32_t index = 7u; index > 0u; --index) {",
+            "        ctx->fpu_stack[index] = ctx->fpu_stack[index - 1u];",
+            "    }",
+            "    ctx->fpu_stack[0] = value;",
+            "    if (ctx->fpu_depth < 8u) {",
+            "        ++ctx->fpu_depth;",
+            "    }",
+            "}",
+            "",
+            "static inline float b2r_fpu_pop(B2RContext* ctx) {",
+            "    const float value = ctx->fpu_stack[0];",
+            "    for (uint32_t index = 0u; index < 7u; ++index) {",
+            "        ctx->fpu_stack[index] = ctx->fpu_stack[index + 1u];",
+            "    }",
+            "    if (ctx->fpu_depth > 0u) {",
+            "        --ctx->fpu_depth;",
+            "    }",
+            "    return value;",
+            "}",
+            "",
+            "static inline uint32_t b2r_fpu_compare_status(float left, float right, uint32_t status_word) {",
+            "    status_word &= ~0x4700u;",
+            "    if (std::isnan(left) || std::isnan(right)) {",
+            "        return status_word | 0x4500u;",
+            "    }",
+            "    if (left < right) {",
+            "        return status_word | 0x0100u;",
+            "    }",
+            "    if (left > right) {",
+            "        return status_word;",
+            "    }",
+            "    return status_word | 0x4000u;",
+            "}",
+            "",
             f'extern "C" __declspec(dllexport) uint32_t {symbol}(B2RContext* ctx) {{',
-            f"    uint32_t eip = {_cpp_u32(function.base_address)};",
+            (
+                f"    uint32_t eip = ctx->eip != 0u ? ctx->eip : {_cpp_u32(function.base_address)};"
+                if resumable
+                else f"    uint32_t eip = {_cpp_u32(function.base_address)};"
+            ),
             "    for (;;) {",
-            "        switch (eip) {",
         ]
+        if resumable:
+            if self._callback_addresses:
+                callback_condition = " || ".join(
+                    f"eip == {_cpp_u32(address)}"
+                    for address in sorted(self._callback_addresses)
+                )
+                lines.extend(
+                    [
+                        f"        if ({callback_condition}) {{",
+                        "            ctx->eip = eip;",
+                        "            return eip;",
+                        "        }",
+                    ]
+                )
+            lines.extend(
+                [
+                    "        if (ctx->yield_requested || (ctx->step_budget != 0u && ctx->steps >= ctx->step_budget)) {",
+                    "            ctx->eip = eip;",
+                    "            return eip;",
+                    "        }",
+                    "        ++ctx->steps;",
+                ]
+            )
+        lines.extend(
+            [
+            "        switch (eip) {",
+            ]
+        )
         for instruction in function.instructions:
             lines.append(f"        case {_cpp_u32(instruction.address)}: {{")
             lines.append(f"            // {instruction.text()}")
+            if instruction.address in self._observer_addresses:
+                lines.append("            if (ctx->observe != nullptr) { ctx->eip = eip; ctx->observe(ctx->user, ctx); }")
             lines.extend(f"            {line}" for line in self._emit_instruction(instruction))
             lines.append("        }")
         lines.extend(
             [
                 "        default:",
+                *( ["            ctx->eip = eip;"] if resumable else [] ),
                 "            return eip;",
                 "        }",
                 "    }",
@@ -2508,16 +4758,45 @@ class CppEmitter:
                 "",
             ]
         )
-        return "\n".join(lines)
+        source = "\n".join(lines)
+        return (
+            source.replace("ctx->read_u32(ctx->user,", "b2r_read_u32(ctx,")
+            .replace("ctx->write_u32(ctx->user,", "b2r_write_u32(ctx,")
+            .replace("ctx->read_u8(ctx->user,", "b2r_read_u8(ctx,")
+            .replace("ctx->write_u8(ctx->user,", "b2r_write_u8(ctx,")
+        )
 
     def _emit_instruction(self, instruction: X86Instruction) -> list[str]:
         next_eip = _cpp_u32(instruction.next_address)
         if instruction.mnemonic == "nop":
             return [f"eip = {next_eip};", "continue;"]
+        if instruction.mnemonic in {
+            "prefetch",
+            "prefetchnta",
+            "prefetcht0",
+            "prefetcht1",
+            "prefetcht2",
+        }:
+            return [f"eip = {next_eip};", "continue;"]
+        if instruction.mnemonic == "emms":
+            return [f"eip = {next_eip};", "continue;"]
+        if instruction.mnemonic in {"movq", "movntq"}:
+            return self._emit_mmx_write(
+                instruction.operands[0],
+                self._mmx_operand_read(instruction.operands[1]),
+            ) + [f"eip = {next_eip};", "continue;"]
         if instruction.mnemonic == "fwait":
             return [f"eip = {next_eip};", "continue;"]
         if instruction.mnemonic == "fnclex":
             return [f"eip = {next_eip};", "continue;"]
+        if instruction.mnemonic == "fnstsw":
+            return self._emit_write(
+                instruction.operands[0],
+                "ctx->fpu_status_word",
+            ) + [
+                f"eip = {next_eip};",
+                "continue;",
+            ]
         if instruction.mnemonic == "wbinvd":
             return [f"eip = {next_eip};", "continue;"]
         if instruction.mnemonic == "sfence":
@@ -2542,6 +4821,199 @@ class CppEmitter:
                 f"eip = {next_eip};",
                 "continue;",
             ]
+        if instruction.mnemonic == "fild":
+            operand = instruction.operands[0]
+            if operand.size == 64:
+                value = f"static_cast<float>(b2r_read_i64(ctx, {self._effective_address_expr(operand)}))"
+            else:
+                value = (
+                    "static_cast<float>(static_cast<int32_t>("
+                    f"{self._operand_read(operand)}))"
+                )
+            return [
+                f"b2r_fpu_push(ctx, {value});",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fistp":
+            operand = instruction.operands[0]
+            if operand.size != 64:
+                raise X86DecodeError("cannot emit non-qword fistp")
+            return [
+                f"b2r_write_i64(ctx, {self._effective_address_expr(operand)}, b2r_fistp_i64(b2r_fpu_pop(ctx)));",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fld":
+            operand = instruction.operands[0]
+            return [
+                f"b2r_fpu_push(ctx, {self._x87_float_operand_read(operand)});",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fldlg2":
+            return [
+                "b2r_fpu_push(ctx, std::log10(2.0f));",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fyl2x":
+            return [
+                "const float x = b2r_fpu_pop(ctx);",
+                "ctx->fpu_stack[0] = x > 0.0f ? ctx->fpu_stack[0] * std::log2(x) : std::numeric_limits<float>::quiet_NaN();",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fptan":
+            return [
+                "ctx->fpu_stack[0] = std::tan(ctx->fpu_stack[0]);",
+                "b2r_fpu_push(ctx, 1.0f);",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fcom":
+            operand = instruction.operands[0]
+            return [
+                f"const float compare_value = {self._x87_float_operand_read(operand)};",
+                "ctx->fpu_status_word = b2r_fpu_compare_status(ctx->fpu_stack[0], compare_value, ctx->fpu_status_word);",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fcomp":
+            operand = instruction.operands[0]
+            return [
+                f"const float compare_value = {self._x87_float_operand_read(operand)};",
+                "ctx->fpu_status_word = b2r_fpu_compare_status(ctx->fpu_stack[0], compare_value, ctx->fpu_status_word);",
+                "(void)b2r_fpu_pop(ctx);",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fadd":
+            operand = instruction.operands[0]
+            return [
+                f"ctx->fpu_stack[0] += {self._x87_float_operand_read(operand)};",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fmul":
+            operand = instruction.operands[0]
+            return [
+                f"ctx->fpu_stack[0] *= {self._x87_float_operand_read(operand)};",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fsub":
+            operand = instruction.operands[0]
+            return [
+                f"ctx->fpu_stack[0] -= {self._x87_float_operand_read(operand)};",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fisub":
+            operand = instruction.operands[0]
+            return [
+                "ctx->fpu_stack[0] -= static_cast<float>(static_cast<int32_t>("
+                f"{self._operand_read(operand)}));",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fsubr":
+            operand = instruction.operands[0]
+            return [
+                f"ctx->fpu_stack[0] = {self._x87_float_operand_read(operand)} - ctx->fpu_stack[0];",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fdiv":
+            operand = instruction.operands[0]
+            return [
+                f"ctx->fpu_stack[0] /= {self._x87_float_operand_read(operand)};",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fdivr":
+            operand = instruction.operands[0]
+            return [
+                f"ctx->fpu_stack[0] = {self._x87_float_operand_read(operand)} / ctx->fpu_stack[0];",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fchs":
+            return [
+                "ctx->fpu_stack[0] = -ctx->fpu_stack[0];",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fxch":
+            index = self._x87_stack_index(instruction.operands[0])
+            return [
+                f"const float value = ctx->fpu_stack[0];",
+                f"ctx->fpu_stack[0] = ctx->fpu_stack[{index}u];",
+                f"ctx->fpu_stack[{index}u] = value;",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "faddp":
+            index = self._x87_stack_index(instruction.operands[0])
+            return [
+                f"ctx->fpu_stack[{index}u] += ctx->fpu_stack[0];",
+                "(void)b2r_fpu_pop(ctx);",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fmulp":
+            index = self._x87_stack_index(instruction.operands[0])
+            return [
+                f"ctx->fpu_stack[{index}u] *= ctx->fpu_stack[0];",
+                "(void)b2r_fpu_pop(ctx);",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fsubp":
+            index = self._x87_stack_index(instruction.operands[0])
+            return [
+                f"ctx->fpu_stack[{index}u] -= ctx->fpu_stack[0];",
+                "(void)b2r_fpu_pop(ctx);",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fdivp":
+            index = self._x87_stack_index(instruction.operands[0])
+            return [
+                f"ctx->fpu_stack[{index}u] /= ctx->fpu_stack[0];",
+                "(void)b2r_fpu_pop(ctx);",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fst":
+            operand = instruction.operands[0]
+            if operand.kind == "imm":
+                index = self._x87_stack_index(operand)
+                return [
+                    f"ctx->fpu_stack[{index}u] = ctx->fpu_stack[0];",
+                    f"eip = {next_eip};",
+                    "continue;",
+                ]
+            return [
+                f"b2r_write_f32(ctx, {self._effective_address_expr(operand)}, ctx->fpu_stack[0]);",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "fstp":
+            operand = instruction.operands[0]
+            if operand.kind == "imm":
+                index = self._x87_stack_index(operand)
+                return [
+                    f"ctx->fpu_stack[{index}u] = ctx->fpu_stack[0];",
+                    "(void)b2r_fpu_pop(ctx);",
+                    f"eip = {next_eip};",
+                    "continue;",
+                ]
+            return [
+                f"b2r_write_f32(ctx, {self._effective_address_expr(operand)}, b2r_fpu_pop(ctx));",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
         if instruction.mnemonic == "stmxcsr":
             return self._emit_write(instruction.operands[0], "ctx->mxcsr") + [
                 f"eip = {next_eip};",
@@ -2553,11 +5025,105 @@ class CppEmitter:
                 f"eip = {next_eip};",
                 "continue;",
             ]
+        if instruction.mnemonic == "cvttss2si":
+            return self._emit_write(
+                instruction.operands[0],
+                f"b2r_cvttss2si({self._x87_float_operand_read(instruction.operands[1])})",
+            ) + [f"eip = {next_eip};", "continue;"]
+        if instruction.mnemonic == "movss":
+            destination = instruction.operands[0]
+            source = instruction.operands[1]
+            value = self._xmm_scalar_operand_read(source)
+            if destination.kind == "reg":
+                index = self._xmm_register_index(destination)
+                lines = [f"ctx->xmm[{index}u].lane[0] = {value};"]
+                if source.kind == "mem":
+                    lines.extend(
+                        [
+                            f"ctx->xmm[{index}u].lane[1] = 0.0f;",
+                            f"ctx->xmm[{index}u].lane[2] = 0.0f;",
+                            f"ctx->xmm[{index}u].lane[3] = 0.0f;",
+                        ]
+                    )
+                return lines + [f"eip = {next_eip};", "continue;"]
+            return [
+                f"b2r_write_f32(ctx, {self._effective_address_expr(destination)}, {value});",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "rsqrtss":
+            destination = instruction.operands[0]
+            return [
+                f"ctx->xmm[{self._xmm_register_index(destination)}u].lane[0] = b2r_rsqrtss({self._xmm_scalar_operand_read(instruction.operands[1])});",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
+        if instruction.mnemonic == "movaps":
+            return self._emit_xmm_write(
+                instruction.operands[0],
+                self._xmm_operand_read(instruction.operands[1]),
+            ) + [f"eip = {next_eip};", "continue;"]
+        if instruction.mnemonic in {"addps", "mulps"}:
+            helper = (
+                "b2r_xmm_add"
+                if instruction.mnemonic == "addps"
+                else "b2r_xmm_multiply"
+            )
+            destination = instruction.operands[0]
+            return self._emit_xmm_write(
+                destination,
+                f"{helper}({self._xmm_operand_read(destination)}, {self._xmm_operand_read(instruction.operands[1])})",
+            ) + [f"eip = {next_eip};", "continue;"]
+        if instruction.mnemonic == "shufps":
+            immediate = instruction.operands[2].immediate or 0
+            destination = instruction.operands[0]
+            return self._emit_xmm_write(
+                destination,
+                (
+                    "b2r_xmm_shuffle("
+                    f"{self._xmm_operand_read(destination)}, "
+                    f"{self._xmm_operand_read(instruction.operands[1])}, "
+                    f"{_cpp_u32(immediate)})"
+                ),
+            ) + [f"eip = {next_eip};", "continue;"]
+        if instruction.mnemonic in {"unpcklps", "unpckhps", "movlhps", "movhlps"}:
+            helper = {
+                "unpcklps": "b2r_xmm_unpack_low",
+                "unpckhps": "b2r_xmm_unpack_high",
+                "movlhps": "b2r_xmm_move_low_to_high",
+                "movhlps": "b2r_xmm_move_high_to_low",
+            }[instruction.mnemonic]
+            destination = instruction.operands[0]
+            return self._emit_xmm_write(
+                destination,
+                f"{helper}({self._xmm_operand_read(destination)}, {self._xmm_operand_read(instruction.operands[1])})",
+            ) + [f"eip = {next_eip};", "continue;"]
+        if instruction.mnemonic in {"movlps_store", "movhps_store"}:
+            source = self._xmm_operand_read(instruction.operands[1])
+            lane = 0 if instruction.mnemonic == "movlps_store" else 2
+            address = self._effective_address_expr(instruction.operands[0])
+            return [
+                f"b2r_write_f32(ctx, {address}, {source}.lane[{lane}u]);",
+                f"b2r_write_f32(ctx, {address} + 4u, {source}.lane[{lane + 1}u]);",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
         if instruction.mnemonic == "mov":
             return self._emit_write(
                 instruction.operands[0],
                 self._operand_read(instruction.operands[1]),
             ) + [f"eip = {next_eip};", "continue;"]
+        if instruction.mnemonic == "xchg":
+            left = instruction.operands[0]
+            right = instruction.operands[1]
+            lines = [
+                f"const uint32_t left = {self._operand_read(left)};",
+                f"const uint32_t right = {self._operand_read(right)};",
+            ]
+            lines.extend(self._emit_write(left, "right"))
+            lines.extend(self._emit_write(right, "left"))
+            lines.extend([f"eip = {next_eip};", "continue;"])
+            return lines
         if instruction.mnemonic == "movzx":
             return self._emit_write(
                 instruction.operands[0],
@@ -2653,6 +5219,36 @@ class CppEmitter:
             lines.extend([f"eip = {next_eip};", "continue;"])
             return lines
         if instruction.mnemonic == "imul":
+            if len(instruction.operands) == 1:
+                operand = instruction.operands[0]
+                if operand.size == 32:
+                    return [
+                        "const int64_t lhs = static_cast<int32_t>(ctx->eax);",
+                        f"const int64_t rhs = static_cast<int32_t>({self._operand_read(operand)});",
+                        "const int64_t product = lhs * rhs;",
+                        "const uint64_t result = static_cast<uint64_t>(product);",
+                        "ctx->eax = static_cast<uint32_t>(result);",
+                        "ctx->edx = static_cast<uint32_t>(result >> 32);",
+                        "const bool overflow = product != static_cast<int64_t>(static_cast<int32_t>(ctx->eax));",
+                        "ctx->flags.cf = overflow;",
+                        "ctx->flags.of = overflow;",
+                        f"eip = {next_eip};",
+                        "continue;",
+                    ]
+                if operand.size != 8:
+                    raise X86DecodeError("unsupported one-operand imul size")
+                return [
+                    "const int32_t lhs = static_cast<int8_t>(ctx->eax & 0xffu);",
+                    f"const int32_t rhs = static_cast<int8_t>({self._operand_read(operand)} & 0xffu);",
+                    "const int32_t product = lhs * rhs;",
+                    "const uint32_t result = static_cast<uint32_t>(product) & 0xffffu;",
+                    "ctx->eax = (ctx->eax & 0xffff0000u) | result;",
+                    "const bool overflow = product != static_cast<int8_t>(result & 0xffu);",
+                    "ctx->flags.cf = overflow;",
+                    "ctx->flags.of = overflow;",
+                    f"eip = {next_eip};",
+                    "continue;",
+                ]
             bits = f"{instruction.operands[0].size}u"
             lhs_operand = (
                 instruction.operands[1]
@@ -2761,6 +5357,37 @@ class CppEmitter:
                 ]
             )
             return lines
+        if instruction.mnemonic in {"shld", "shrd"}:
+            destination_expr = self._operand_read(instruction.operands[0])
+            source_expr = self._operand_read(instruction.operands[1])
+            count_expr = self._operand_read(instruction.operands[2])
+            if instruction.mnemonic == "shld":
+                result_expr = "(lhs << count) | (source >> (32u - count))"
+                carry_expr = "(lhs & (1u << (32u - count))) != 0u"
+                overflow_expr = "(((result >> 31u) & 1u) != static_cast<uint32_t>(ctx->flags.cf))"
+            else:
+                result_expr = "(lhs >> count) | (source << (32u - count))"
+                carry_expr = "(lhs & (1u << (count - 1u))) != 0u"
+                overflow_expr = "(((lhs ^ result) & 0x80000000u) != 0u)"
+            lines = [
+                f"const uint32_t lhs = {destination_expr};",
+                f"const uint32_t source = {source_expr};",
+                f"const uint32_t count = ({count_expr}) & 0x1fu;",
+                f"const uint32_t result = count == 0u ? lhs : ({result_expr});",
+            ]
+            lines.extend(self._emit_write(instruction.operands[0], "result"))
+            lines.extend(
+                [
+                    "if (count != 0u) {",
+                    "    b2r_logic_flags(ctx, result, 32u);",
+                    f"    ctx->flags.cf = {carry_expr};",
+                    f"    ctx->flags.of = count == 1u ? {overflow_expr} : false;",
+                    "}",
+                    f"eip = {next_eip};",
+                    "continue;",
+                ]
+            )
+            return lines
         if instruction.mnemonic == "push":
             return [
                 f"b2r_push(ctx, {self._operand_read(instruction.operands[0])});",
@@ -2797,64 +5424,121 @@ class CppEmitter:
         if instruction.mnemonic in {"stosb", "rep_stosb"}:
             count_expr = "ctx->ecx" if instruction.mnemonic == "rep_stosb" else "1u"
             lines = [
-                f"const uint32_t count = {count_expr};",
-                "const uint32_t destination = ctx->edi;",
+                f"uint32_t remaining = {count_expr};",
                 "const uint8_t value = static_cast<uint8_t>(ctx->eax & 0xffu);",
-                "for (uint32_t index = 0; index < count; ++index) {",
-                "    ctx->write_u8(ctx->user, destination + index, value);",
+                "while (remaining != 0u) {",
+                "    ctx->write_u8(ctx->user, ctx->edi, value);",
+                "    ++ctx->edi;",
+                "    --remaining;",
                 "}",
-                "ctx->edi = destination + count;",
             ]
             if instruction.mnemonic == "rep_stosb":
-                lines.append("ctx->ecx = 0u;")
+                lines.insert(-1, "    --ctx->ecx;")
             lines.extend([f"eip = {next_eip};", "continue;"])
             return lines
         if instruction.mnemonic in {"stosd", "rep_stosd"}:
             count_expr = "ctx->ecx" if instruction.mnemonic == "rep_stosd" else "1u"
             lines = [
-                f"const uint32_t count = {count_expr};",
-                "const uint32_t destination = ctx->edi;",
-                "for (uint32_t index = 0; index < count; ++index) {",
-                "    ctx->write_u32(ctx->user, destination + index * 4u, ctx->eax);",
+                f"uint32_t remaining = {count_expr};",
+                "while (remaining != 0u) {",
+                "    ctx->write_u32(ctx->user, ctx->edi, ctx->eax);",
+                "    ctx->edi += 4u;",
+                "    --remaining;",
                 "}",
-                "ctx->edi = destination + count * 4u;",
             ]
             if instruction.mnemonic == "rep_stosd":
-                lines.append("ctx->ecx = 0u;")
+                lines.insert(-1, "    --ctx->ecx;")
             lines.extend([f"eip = {next_eip};", "continue;"])
             return lines
         if instruction.mnemonic in {"movsb", "rep_movsb"}:
             count_expr = "ctx->ecx" if instruction.mnemonic == "rep_movsb" else "1u"
             lines = [
-                f"const uint32_t count = {count_expr};",
-                "const uint32_t source = ctx->esi;",
-                "const uint32_t destination = ctx->edi;",
-                "for (uint32_t index = 0; index < count; ++index) {",
-                "    const uint8_t value = ctx->read_u8(ctx->user, source + index);",
-                "    ctx->write_u8(ctx->user, destination + index, value);",
+                f"uint32_t remaining = {count_expr};",
+                "while (remaining != 0u) {",
+                "    const uint8_t value = ctx->read_u8(ctx->user, ctx->esi);",
+                "    ctx->write_u8(ctx->user, ctx->edi, value);",
+                "    ++ctx->esi;",
+                "    ++ctx->edi;",
+                "    --remaining;",
                 "}",
-                "ctx->esi = source + count;",
-                "ctx->edi = destination + count;",
             ]
             if instruction.mnemonic == "rep_movsb":
-                lines.append("ctx->ecx = 0u;")
+                lines.insert(-1, "    --ctx->ecx;")
             lines.extend([f"eip = {next_eip};", "continue;"])
             return lines
         if instruction.mnemonic in {"movsd", "rep_movsd"}:
             count_expr = "ctx->ecx" if instruction.mnemonic == "rep_movsd" else "1u"
             lines = [
-                f"const uint32_t count = {count_expr};",
-                "const uint32_t source = ctx->esi;",
-                "const uint32_t destination = ctx->edi;",
-                "for (uint32_t index = 0; index < count; ++index) {",
-                "    const uint32_t value = ctx->read_u32(ctx->user, source + index * 4u);",
-                "    ctx->write_u32(ctx->user, destination + index * 4u, value);",
+                f"uint32_t remaining = {count_expr};",
+                "while (remaining != 0u) {",
+                "    const uint32_t value = ctx->read_u32(ctx->user, ctx->esi);",
+                "    ctx->write_u32(ctx->user, ctx->edi, value);",
+                "    ctx->esi += 4u;",
+                "    ctx->edi += 4u;",
+                "    --remaining;",
                 "}",
-                "ctx->esi = source + count * 4u;",
-                "ctx->edi = destination + count * 4u;",
             ]
             if instruction.mnemonic == "rep_movsd":
-                lines.append("ctx->ecx = 0u;")
+                lines.insert(-1, "    --ctx->ecx;")
+            lines.extend([f"eip = {next_eip};", "continue;"])
+            return lines
+        if instruction.mnemonic in {"cmpsb", "rep_cmpsb"}:
+            count_expr = "ctx->ecx" if instruction.mnemonic == "rep_cmpsb" else "1u"
+            lines = [
+                f"const uint32_t requested_count = {count_expr};",
+                "uint32_t remaining = requested_count;",
+                "while (remaining != 0u) {",
+                "    const uint32_t lhs = ctx->read_u8(ctx->user, ctx->esi);",
+                "    const uint32_t rhs = ctx->read_u8(ctx->user, ctx->edi);",
+                "    const uint32_t result = (lhs - rhs) & 0xffu;",
+                "    b2r_sub_flags(ctx, lhs, rhs, result, 8u);",
+                "    ++ctx->esi;",
+                "    ++ctx->edi;",
+                "    --remaining;",
+            ]
+            if instruction.mnemonic == "rep_cmpsb":
+                lines.append("    --ctx->ecx;")
+                lines.extend(
+                    [
+                        "    if (!ctx->flags.zf) {",
+                        "        break;",
+                        "    }",
+                    ]
+                )
+            else:
+                lines.append("    break;")
+            lines.extend(
+                [
+                    "}",
+                ]
+            )
+            lines.extend([f"eip = {next_eip};", "continue;"])
+            return lines
+        if instruction.mnemonic in {"scasb", "repne_scasb"}:
+            count_expr = "ctx->ecx" if instruction.mnemonic == "repne_scasb" else "1u"
+            lines = [
+                f"const uint32_t requested_count = {count_expr};",
+                "const uint32_t needle = ctx->eax & 0xffu;",
+                "uint32_t remaining = requested_count;",
+                "while (remaining != 0u) {",
+                "    const uint32_t value = ctx->read_u8(ctx->user, ctx->edi);",
+                "    const uint32_t result = (needle - value) & 0xffu;",
+                "    b2r_sub_flags(ctx, needle, value, result, 8u);",
+                "    ++ctx->edi;",
+                "    --remaining;",
+            ]
+            if instruction.mnemonic == "repne_scasb":
+                lines.append("    --ctx->ecx;")
+                lines.extend(
+                    [
+                        "    if (ctx->flags.zf) {",
+                        "        break;",
+                        "    }",
+                    ]
+                )
+            else:
+                lines.append("    break;")
+            lines.extend(["}"])
             lines.extend([f"eip = {next_eip};", "continue;"])
             return lines
         if instruction.mnemonic == "int3":
@@ -2884,15 +5568,38 @@ class CppEmitter:
                 f"eip = {next_eip};",
                 "continue;",
             ]
+        if instruction.mnemonic == "mul":
+            return [
+                f"const uint64_t product = static_cast<uint64_t>(ctx->eax) * static_cast<uint64_t>({self._operand_read(instruction.operands[0])});",
+                "ctx->eax = static_cast<uint32_t>(product & 0xffffffffu);",
+                "ctx->edx = static_cast<uint32_t>(product >> 32);",
+                "ctx->flags.cf = ctx->flags.of = ctx->edx != 0u;",
+                f"eip = {next_eip};",
+                "continue;",
+            ]
         if instruction.mnemonic == "call":
             target = (
                 _cpp_u32(instruction.target)
                 if instruction.target is not None
                 else self._operand_read(instruction.operands[0])
             )
+            target_setup = (
+                []
+                if instruction.target is not None
+                else [f"const uint32_t call_target = {target};"]
+            )
+            target_expr = target if instruction.target is not None else "call_target"
+            if self._resumable:
+                return [
+                    *target_setup,
+                    f"b2r_push(ctx, {next_eip});",
+                    f"eip = {target_expr};",
+                    "continue;",
+                ]
             return [
+                *target_setup,
                 f"b2r_push(ctx, {next_eip});",
-                f"ctx->call(ctx->user, {target}, ctx);",
+                f"ctx->call(ctx->user, {target_expr}, ctx);",
                 "const uint32_t return_eip = b2r_pop(ctx);",
                 "eip = return_eip;",
                 "continue;",
@@ -2916,6 +5623,8 @@ class CppEmitter:
             lines = ["const uint32_t return_address = b2r_pop(ctx);"]
             if instruction.ret_stack_adjust:
                 lines.append(f"ctx->esp += {_cpp_u32(instruction.ret_stack_adjust)};")
+            if self._resumable:
+                lines.append("ctx->eip = return_address;")
             lines.append("return return_address;")
             return lines
         raise X86DecodeError(f"cannot emit C++ for {instruction.mnemonic}")
@@ -2970,6 +5679,71 @@ class CppEmitter:
             value = f"ctx->read_u32(ctx->user, {self._effective_address_expr(operand)})"
             return value
         raise X86DecodeError(f"cannot emit read for {operand.kind}")
+
+    def _x87_float_operand_read(self, operand: Operand) -> str:
+        if operand.kind == "imm":
+            return f"ctx->fpu_stack[{self._x87_stack_index(operand)}u]"
+        if operand.kind == "mem":
+            helper = "b2r_read_f64" if operand.size == 64 else "b2r_read_f32"
+            return f"{helper}(ctx, {self._effective_address_expr(operand)})"
+        raise X86DecodeError(f"cannot emit x87 float read for {operand.kind}")
+
+    def _xmm_operand_read(self, operand: Operand) -> str:
+        if operand.kind == "reg":
+            return f"ctx->xmm[{self._xmm_register_index(operand)}u]"
+        if operand.kind == "mem":
+            return f"b2r_read_xmm(ctx, {self._effective_address_expr(operand)})"
+        raise X86DecodeError(f"cannot emit XMM read for {operand.kind}")
+
+    def _xmm_scalar_operand_read(self, operand: Operand) -> str:
+        if operand.kind == "reg":
+            return f"ctx->xmm[{self._xmm_register_index(operand)}u].lane[0]"
+        if operand.kind == "mem":
+            return f"b2r_read_f32(ctx, {self._effective_address_expr(operand)})"
+        raise X86DecodeError(f"cannot emit XMM scalar read for {operand.kind}")
+
+    def _emit_xmm_write(self, operand: Operand, value_expr: str) -> list[str]:
+        if operand.kind == "reg":
+            return [f"ctx->xmm[{self._xmm_register_index(operand)}u] = {value_expr};"]
+        if operand.kind == "mem":
+            return [
+                f"b2r_write_xmm(ctx, {self._effective_address_expr(operand)}, {value_expr});"
+            ]
+        raise X86DecodeError(f"cannot emit XMM write for {operand.kind}")
+
+    def _mmx_operand_read(self, operand: Operand) -> str:
+        if operand.kind == "reg":
+            return f"ctx->mmx[{self._mmx_register_index(operand)}u]"
+        if operand.kind == "mem":
+            return f"b2r_read_u64(ctx, {self._effective_address_expr(operand)})"
+        raise X86DecodeError(f"cannot emit MMX read for {operand.kind}")
+
+    def _emit_mmx_write(self, operand: Operand, value_expr: str) -> list[str]:
+        if operand.kind == "reg":
+            return [f"ctx->mmx[{self._mmx_register_index(operand)}u] = {value_expr};"]
+        if operand.kind == "mem":
+            return [
+                f"b2r_write_u64(ctx, {self._effective_address_expr(operand)}, {value_expr});"
+            ]
+        raise X86DecodeError(f"cannot emit MMX write for {operand.kind}")
+
+    @staticmethod
+    def _x87_stack_index(operand: Operand) -> int:
+        if operand.kind != "imm" or operand.immediate is None or operand.immediate > 7:
+            raise X86DecodeError("cannot emit x87 stack operand")
+        return operand.immediate
+
+    @staticmethod
+    def _xmm_register_index(operand: Operand) -> int:
+        if operand.kind != "reg" or operand.reg not in XMM_REGISTER_NAMES:
+            raise X86DecodeError("cannot emit XMM register operand")
+        return XMM_REGISTER_NAMES.index(operand.reg)
+
+    @staticmethod
+    def _mmx_register_index(operand: Operand) -> int:
+        if operand.kind != "reg" or operand.reg not in MMX_REGISTER_NAMES:
+            raise X86DecodeError("cannot emit MMX register operand")
+        return MMX_REGISTER_NAMES.index(operand.reg)
 
     @staticmethod
     def _byte_register_parent(register: str) -> tuple[str, int]:
@@ -3034,11 +5808,25 @@ class CppEmitter:
             "ge": "(ctx->flags.sf == ctx->flags.of)",
             "le": "(ctx->flags.zf || (ctx->flags.sf != ctx->flags.of))",
             "g": "(!ctx->flags.zf && (ctx->flags.sf == ctx->flags.of))",
+            "ecx_zero": "(ctx->ecx == 0u)",
         }[condition]
 
 
-def emit_cpp(function: LiftedFunction, *, exported_symbol: str | None = None) -> str:
-    return CppEmitter().emit(function, exported_symbol=exported_symbol)
+def emit_cpp(
+    function: LiftedFunction,
+    *,
+    exported_symbol: str | None = None,
+    resumable: bool = False,
+    observer_addresses: Iterable[int] = (),
+    callback_addresses: Iterable[int] = (),
+) -> str:
+    return CppEmitter().emit(
+        function,
+        exported_symbol=exported_symbol,
+        resumable=resumable,
+        observer_addresses=observer_addresses,
+        callback_addresses=callback_addresses,
+    )
 
 
 def cpp_sha256(source: str) -> str:

@@ -1,0 +1,26 @@
+{
+  "format": "b2-recomp-preflight-replay-suite",
+  "stages": [
+    {
+      "name": "publisher_splash",
+      "render_stream": "reports/local/live/render-real-init.json",
+      "min_native_textures": 1,
+      "min_presented_draws": 1,
+      "min_unique_colors": 32,
+      "max_dominant_fraction": 0.98,
+      "required_texture_formats": ["DXT1"],
+      "sequence_group": "boot"
+    },
+    {
+      "name": "title",
+      "render_stream": "reports/local/live/render.json",
+      "min_native_textures": 8,
+      "min_presented_draws": 1,
+      "min_unique_colors": 1000,
+      "max_dominant_fraction": 0.95,
+      "required_texture_formats": ["DXT1", "DXT5"],
+      "sequence_group": "boot",
+      "require_sequence_change": true
+    }
+  ]
+}

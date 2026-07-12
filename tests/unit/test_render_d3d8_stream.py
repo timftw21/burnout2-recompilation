@@ -5,17 +5,67 @@ import unittest
 from tools.render.d3d8_stream import (
     decode_render_stream,
     extract_render_streams_from_probe_summary,
+    merge_render_streams,
     normalize_render_stream,
     replay_render_stream,
 )
 
 
 class RenderD3D8StreamTests(unittest.TestCase):
+    def test_reassembles_locally_out_of_order_push_buffer_payload(self) -> None:
+        decoded = decode_render_stream(
+            {
+                "format": "b2-recomp-render-command-stream",
+                "writes": [
+                    {"kind": "d3d_push_buffer", "address": 0x80000080, "value": 0x00081D90},
+                    {"kind": "d3d_push_buffer", "address": 0x80000088, "value": 0x000000F0},
+                    {"kind": "d3d_push_buffer", "address": 0x80000084, "value": 0x804020FF},
+                ],
+            }
+        )
+
+        packet = next(
+            command for command in decoded["commands"]
+            if command.get("method") == "nv2a_increasing_methods"
+        )
+        self.assertEqual(
+            [(method["name"], method["data_hex"]) for method in packet["methods"]],
+            [("clear_color", "0x804020FF"), ("clear_surface", "0x000000F0")],
+        )
+
+    def test_merges_sequential_windows_for_persistent_nv2a_state(self) -> None:
+        first = {
+            "format": "b2-recomp-render-command-stream",
+            "write_count": 1,
+            "writes": [
+                {"sequence": 7, "kind": "d3d_push_buffer", "address": 0x8000, "value": 1}
+            ],
+        }
+        second = {
+            "format": "b2-recomp-render-command-stream",
+            "write_count": 1,
+            "writes": [
+                {"sequence": 99, "kind": "d3d_push_buffer", "address": 0x8004, "value": 2}
+            ],
+        }
+
+        merged = merge_render_streams(first, second)
+
+        self.assertEqual(merged["write_count"], 2)
+        self.assertEqual([write["sequence"] for write in merged["writes"]], [0, 1])
+        self.assertEqual(
+            [write["source_sequence"] for write in merged["writes"]], [7, 99]
+        )
+        self.assertEqual([write["source_window"] for write in merged["writes"]], [0, 1])
+
     def test_extracts_first_class_stream_from_probe_summary(self) -> None:
         summary = {
             "format": "b2-recomp-playability-probe",
             "entry_recovery": {
                 "execution": {
+                    "title_text_draw_fast_path": {
+                        "sampled_strings": [{"bytes_hex": "48656C6C6F"}]
+                    },
                     "guest_thread_executions": [
                         {
                             "status": "scheduler_boundary",
@@ -52,7 +102,57 @@ class RenderD3D8StreamTests(unittest.TestCase):
         self.assertEqual(streams[0]["format"], "b2-recomp-render-command-stream")
         self.assertFalse(streams[0]["public_safe"])
         self.assertEqual(streams[0]["source"]["thread_status"], "scheduler_boundary")
+        self.assertEqual(streams[0]["source"]["frontend_text"], "Hello")
         self.assertEqual(streams[0]["captured_write_count"], 2)
+
+    def test_extract_prefers_render_observer_stream_when_present(self) -> None:
+        summary = {
+            "format": "b2-recomp-playability-probe",
+            "entry_recovery": {
+                "execution": {
+                    "status": "returned",
+                    "render_watchpoint_stream": {
+                        "write_count": 1,
+                        "mmio_write_count": 0,
+                        "push_buffer_write_count": 1,
+                        "writes": [
+                            {
+                                "sequence": 1,
+                                "kind": "d3d_push_buffer",
+                                "address": 0x80000080,
+                                        "value": 0x00041D90,
+                            }
+                        ],
+                    },
+                    "guest_thread_executions": [
+                        {
+                            "status": "returned_to_guest",
+                            "start_address_hex": "0x000E682C",
+                            "render_command_stream": {
+                                "write_count": 1,
+                                "mmio_write_count": 1,
+                                "push_buffer_write_count": 0,
+                                "writes": [
+                                    {
+                                        "sequence": 2,
+                                        "kind": "d3d_mmio",
+                                        "address": 0xFED00048,
+                                        "value": 0x1200,
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                }
+            },
+        }
+
+        streams = extract_render_streams_from_probe_summary(summary)
+
+        self.assertEqual(len(streams), 2)
+        self.assertEqual(streams[0]["source"]["kind"], "playability_probe_render_observer")
+        self.assertEqual(streams[0]["push_buffer_write_count"], 1)
+        self.assertEqual(streams[1]["source"]["kind"], "playability_probe_guest_thread")
 
     def test_decodes_known_mmio_and_interprets_push_buffer_method_packet(self) -> None:
         stream = normalize_render_stream(
@@ -70,13 +170,13 @@ class RenderD3D8StreamTests(unittest.TestCase):
                     {
                         "kind": "d3d_push_buffer",
                         "address": 0x80000080,
-                        "value": 0x10,
+                        "value": 0x90,
                         "size": 1,
                     },
                     {
                         "kind": "d3d_push_buffer",
                         "address": 0x80000081,
-                        "value": 0x18,
+                        "value": 0x1D,
                         "size": 1,
                     },
                     {
@@ -125,15 +225,46 @@ class RenderD3D8StreamTests(unittest.TestCase):
         self.assertEqual(decoded["decoded_command_count"], 3)
         self.assertEqual(decoded["commands"][0]["method"], "push_buffer_pitch_or_limit")
         self.assertEqual(decoded["commands"][1]["method"], "push_buffer_contiguous_bytes")
-        self.assertEqual(decoded["commands"][1]["bytes_hex"], "10180400FF204080")
+        self.assertEqual(decoded["commands"][1]["bytes_hex"], "901D0400FF204080")
         self.assertEqual(decoded["commands"][2]["method"], "nv2a_increasing_methods")
-        self.assertEqual(decoded["commands"][2]["first_method_hex"], "0x00001810")
+        self.assertEqual(decoded["commands"][2]["first_method_hex"], "0x00001D90")
         self.assertEqual(decoded["commands"][2]["methods"][0]["name"], "clear_color")
         self.assertEqual(decoded["commands"][2]["methods"][0]["data_hex"], "0x804020FF")
+        self.assertEqual(decoded["method_counts"], {"clear_color": 1})
+        self.assertEqual(decoded["unnamed_method_counts"], {})
+        self.assertEqual(decoded["visual_gap_inventory"]["unnamed_method_writes"], 0)
+        self.assertEqual(decoded["visual_gap_inventory"]["inline_vertex_words"], 0)
         self.assertEqual(decoded["frame_state"]["clear_color"]["r8"], 0x40)
         self.assertEqual(decoded["frame_state"]["clear_color"]["g8"], 0x20)
         self.assertEqual(decoded["frame_state"]["clear_color"]["b8"], 0xFF)
         self.assertEqual(decoded["state_update_count"], 1)
+
+    def test_decodes_eight_byte_push_buffer_write_payload(self) -> None:
+        stream = normalize_render_stream(
+            {
+                "format": "b2-recomp-render-command-stream",
+                "write_count": 1,
+                "push_buffer_write_count": 1,
+                "writes": [
+                    {
+                        "kind": "d3d_push_buffer",
+                        "address": 0x80000080,
+                        "value": 0x00041D90,
+                        "size": 8,
+                        "bytes_hex": "901D0400FF204080",
+                    },
+                ],
+            }
+        )
+
+        decoded = decode_render_stream(stream)
+
+        self.assertEqual(stream["writes"][0]["bytes_hex"], "901D0400FF204080")
+        self.assertEqual(decoded["commands"][0]["byte_count"], 8)
+        self.assertEqual(decoded["commands"][0]["dword_count"], 2)
+        self.assertEqual(decoded["commands"][1]["method"], "nv2a_increasing_methods")
+        self.assertEqual(decoded["commands"][1]["methods"][0]["name"], "clear_color")
+        self.assertEqual(decoded["commands"][1]["methods"][0]["data_hex"], "0x804020FF")
 
     def test_zero_count_method_words_do_not_count_as_method_packets(self) -> None:
         stream = {
@@ -159,7 +290,7 @@ class RenderD3D8StreamTests(unittest.TestCase):
             "write_count": 4,
             "writes": [
                 {"kind": "d3d_mmio", "address": 0xFED00008, "value": 1},
-                {"kind": "d3d_push_buffer", "address": 0x80000080, "value": 0x00041810},
+                {"kind": "d3d_push_buffer", "address": 0x80000080, "value": 0x00041D90},
                 {"kind": "d3d_push_buffer", "address": 0x80000084, "value": 0x804020FF},
                 {"kind": "d3d_mmio", "address": 0xFED00048, "value": 0x1200},
             ],
@@ -231,13 +362,13 @@ class RenderD3D8StreamTests(unittest.TestCase):
             "format": "b2-recomp-render-command-stream",
             "write_count": 8,
             "writes": [
-                {"kind": "d3d_push_buffer", "address": 0x80000080, "value": 0x00041810},
+                {"kind": "d3d_push_buffer", "address": 0x80000080, "value": 0x00041D90},
                 {"kind": "d3d_push_buffer", "address": 0x80000084, "value": 0x804020FF},
-                {"kind": "d3d_push_buffer", "address": 0x80000088, "value": 0x00040300},
+                {"kind": "d3d_push_buffer", "address": 0x80000088, "value": 0x00041D94},
                 {"kind": "d3d_push_buffer", "address": 0x8000008C, "value": 0x000000F0},
-                {"kind": "d3d_push_buffer", "address": 0x80000090, "value": 0x000406B0},
-                {"kind": "d3d_push_buffer", "address": 0x80000094, "value": 0x00000004},
-                {"kind": "d3d_push_buffer", "address": 0x80000098, "value": 0x000401D8},
+                {"kind": "d3d_push_buffer", "address": 0x80000090, "value": 0x000417FC},
+                {"kind": "d3d_push_buffer", "address": 0x80000094, "value": 0x00000005},
+                {"kind": "d3d_push_buffer", "address": 0x80000098, "value": 0x00040200},
                 {"kind": "d3d_push_buffer", "address": 0x8000009C, "value": 0x02800010},
             ],
         }
@@ -272,6 +403,53 @@ class RenderD3D8StreamTests(unittest.TestCase):
         self.assertEqual(draw["primitive"], "triangle_list")
         self.assertEqual(replay["vulkan_state"]["render_area"]["x"], 0x10)
         self.assertEqual(replay["vulkan_state"]["render_area"]["width"], 0x280)
+
+    def test_replay_translates_observed_inline_vertex_methods_to_draw_work(self) -> None:
+        formats = [0x42, 2, 2, 0x40, 2, 2, 2, 2, 2, 0x22, 2, 2, 2, 2, 2, 2]
+        inline_words = [
+            0x00000000, 0x00000000, 0, 0, 0xFFFF0000, 0, 0,
+            0x3F800000, 0x00000000, 0, 0, 0xFF00FF00, 0x3F800000, 0,
+            0x00000000, 0x3F800000, 0, 0, 0xFF0000FF, 0, 0x3F800000,
+        ]
+        values = [
+            0x00401760,
+            *formats,
+            0x000417FC,
+            5,
+            0x40541818,
+            *inline_words,
+            0x000417FC,
+            0,
+        ]
+        stream = {
+            "format": "b2-recomp-render-command-stream",
+            "write_count": len(values),
+            "writes": [
+                {
+                    "kind": "d3d_push_buffer",
+                    "address": 0x80000080 + index * 4,
+                    "value": value,
+                }
+                for index, value in enumerate(values)
+            ],
+        }
+
+        replay = replay_render_stream(stream)
+
+        self.assertEqual(replay["vulkan_draw_work_count"], 1)
+        self.assertEqual(
+            replay["frame_state"]["inline_vertex_stream"]["method_count"],
+            21,
+        )
+        draw = next(
+            item
+            for item in replay["vulkan_work"]
+            if item["translated_kind"] == "vulkan_cmd_draw"
+        )
+        self.assertEqual(draw["vertex_source"], "inline_array")
+        self.assertEqual(draw["primitive"], "triangle_list")
+        self.assertEqual(draw["vertex_count"], 3)
+        self.assertEqual(draw["vertices"][1]["color"]["g8"], 0xFF)
 
 
 if __name__ == "__main__":

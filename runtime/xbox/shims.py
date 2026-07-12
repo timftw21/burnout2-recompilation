@@ -12,11 +12,11 @@ from __future__ import annotations
 import hashlib
 import itertools
 import datetime as dt
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
-from typing import Any
+from typing import Any, Protocol
 
 from tools.loader.xbe_loader import ImportResolver
 from tools.xbe.xbe_info import KERNEL_EXPORT_NAMES
@@ -84,15 +84,17 @@ class ShimTraceEvent:
 class ShimTraceLog:
     """Structured runtime trace shared by every shim subsystem."""
 
-    def __init__(self) -> None:
-        self._events: list[ShimTraceEvent] = []
+    def __init__(self, *, max_events: int = 4096) -> None:
+        self._events: deque[ShimTraceEvent] = deque(maxlen=max_events)
+        self._sequence = 0
 
     def add(
         self, subsystem: str, operation: str, status: str = "ok", **details: Any
     ) -> ShimTraceEvent:
         event = ShimTraceEvent(
-            len(self._events), subsystem, operation, status, _json_safe(details)
+            self._sequence, subsystem, operation, status, _json_safe(details)
         )
+        self._sequence += 1
         self._events.append(event)
         return event
 
@@ -165,6 +167,7 @@ class GuestFile:
     bytes_written: int = 0
     writable: bool = False
     streaming: bool = False
+    is_directory: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -180,6 +183,7 @@ class GuestFile:
             "bytes_written": self.bytes_written,
             "writable": self.writable,
             "streaming": self.streaming,
+            "is_directory": self.is_directory,
         }
 
 
@@ -412,14 +416,20 @@ class XboxFileSystemShim:
             file = self._handles.get(handle, "file")
         except XboxRuntimeError as exc:
             return {"status": XboxStatus.INVALID_HANDLE, "error": str(exc)}
-        file.size = file.host_path.stat().st_size if file.host_path.exists() else 0
+        exists = file.host_path.exists()
+        is_directory = file.is_directory or (file.host_path.is_dir() if exists else False)
+        file.size = (
+            file.host_path.stat().st_size
+            if exists and not is_directory
+            else 0
+        )
         info = {
             "status": XboxStatus.SUCCESS,
             "handle": handle,
             "guest_path": file.guest_path,
             "host_path": str(file.host_path),
-            "exists": file.host_path.exists(),
-            "is_directory": False,
+            "exists": exists,
+            "is_directory": is_directory,
             "size": file.size,
             "position": file.position,
             "writable": file.writable,
@@ -519,12 +529,29 @@ class XboxFileSystemShim:
                 "error": str(exc),
             }
         if writable:
+            if host_path.is_dir():
+                self._trace.add(
+                    "filesystem",
+                    "open_file",
+                    "error",
+                    guest_path=guest_path,
+                    host_path=host_path,
+                    root_kind=root_kind,
+                    reason="directory_is_not_writable_stream",
+                )
+                return {
+                    "status": XboxStatus.ACCESS_DENIED,
+                    "handle": None,
+                    "root_kind": root_kind,
+                }
             host_path.parent.mkdir(parents=True, exist_ok=True)
             if "w" in mode:
                 host_path.write_bytes(b"")
             elif not host_path.exists():
                 host_path.write_bytes(b"")
-        if not host_path.is_file():
+        is_file = host_path.is_file()
+        is_directory = host_path.is_dir()
+        if not is_file and not is_directory:
             self._trace.add(
                 "filesystem",
                 "open_file",
@@ -535,7 +562,7 @@ class XboxFileSystemShim:
             )
             return {"status": XboxStatus.NO_SUCH_FILE, "handle": None, "root_kind": root_kind}
 
-        size = host_path.stat().st_size
+        size = host_path.stat().st_size if is_file else 0
         file = GuestFile(
             guest_path,
             host_path,
@@ -543,7 +570,8 @@ class XboxFileSystemShim:
             root_kind,
             size=size,
             writable=writable,
-            streaming=not writable,
+            streaming=not writable and not is_directory,
+            is_directory=is_directory,
         )
         handle = self._handles.allocate("file", file)
         self._trace.add(
@@ -555,10 +583,16 @@ class XboxFileSystemShim:
             size=size,
             root_kind=root_kind,
             writable=writable,
+            is_directory=is_directory,
             save_data=self._is_save_path(guest_path),
             cache_data=root_kind == "cache",
         )
-        return {"status": XboxStatus.SUCCESS, "handle": handle, "root_kind": root_kind}
+        return {
+            "status": XboxStatus.SUCCESS,
+            "handle": handle,
+            "root_kind": root_kind,
+            "is_directory": is_directory,
+        }
 
     def read_file(
         self, handle: int, size: int | None = None, *, offset: int | None = None
@@ -567,6 +601,20 @@ class XboxFileSystemShim:
             file = self._handles.get(handle, "file")
         except XboxRuntimeError as exc:
             return {"status": XboxStatus.INVALID_HANDLE, "data": b"", "error": str(exc)}
+        if file.is_directory or file.host_path.is_dir():
+            self._trace.add(
+                "filesystem",
+                "read_file",
+                "error",
+                handle=handle,
+                guest_path=file.guest_path,
+                reason="directory_handle",
+            )
+            return {
+                "status": XboxStatus.ACCESS_DENIED,
+                "data": b"",
+                "bytes_read": 0,
+            }
         if offset is not None:
             if offset < 0:
                 return {"status": XboxStatus.INVALID_PARAMETER, "data": b""}
@@ -610,6 +658,16 @@ class XboxFileSystemShim:
             file = self._handles.get(handle, "file")
         except XboxRuntimeError as exc:
             return {"status": XboxStatus.INVALID_HANDLE, "bytes_written": 0, "error": str(exc)}
+        if file.is_directory or file.host_path.is_dir():
+            self._trace.add(
+                "filesystem",
+                "write_file",
+                "error",
+                handle=handle,
+                guest_path=file.guest_path,
+                reason="directory_handle",
+            )
+            return {"status": XboxStatus.ACCESS_DENIED, "bytes_written": 0}
         if "w" not in file.mode and "a" not in file.mode:
             self._trace.add(
                 "filesystem", "write_file", "error", handle=handle, mode=file.mode
@@ -733,8 +791,9 @@ class XboxFileSystemShim:
             return ()
         normalized = guest_path.replace("/", "\\").strip()
         for prefix in self._DEVICE_PREFIXES:
-            if normalized.casefold().startswith(prefix.casefold()):
-                normalized = normalized[len(prefix) :]
+            stripped = self._strip_guest_path_prefix(normalized, prefix)
+            if stripped is not None:
+                normalized = stripped
                 break
         if len(normalized) >= 2 and normalized[1] == ":":
             normalized = normalized[2:]
@@ -751,6 +810,24 @@ class XboxFileSystemShim:
             parts.append(part)
         return tuple(parts)
 
+    @staticmethod
+    def _strip_guest_path_prefix(normalized: str, prefix: str) -> str | None:
+        folded = normalized.casefold()
+        folded_prefix = prefix.casefold()
+        if folded.startswith(folded_prefix):
+            return normalized[len(prefix) :]
+        trimmed = prefix.rstrip("\\")
+        if trimmed != prefix and folded == trimmed.casefold():
+            return ""
+        return None
+
+    @classmethod
+    def _guest_path_matches_any_prefix(cls, normalized: str, prefixes: tuple[str, ...]) -> bool:
+        return any(
+            cls._strip_guest_path_prefix(normalized, prefix) is not None
+            for prefix in prefixes
+        )
+
     def _root_for_guest_path(self, guest_path: str, *, for_write: bool = False) -> Path | None:
         root_kind = self._root_kind_for_guest_path(guest_path)
         if root_kind == "save":
@@ -763,14 +840,13 @@ class XboxFileSystemShim:
 
     def _root_kind_for_guest_path(self, guest_path: str) -> str:
         normalized = guest_path.replace("/", "\\").strip()
-        folded = normalized.casefold()
-        if any(folded.startswith(prefix.casefold()) for prefix in self._DISC_PREFIXES):
+        if self._guest_path_matches_any_prefix(normalized, self._DISC_PREFIXES):
             return "disc"
-        if any(folded.startswith(prefix.casefold()) for prefix in self._SAVE_PREFIXES):
+        if self._guest_path_matches_any_prefix(normalized, self._SAVE_PREFIXES):
             return "save"
-        if any(folded.startswith(prefix.casefold()) for prefix in self._DASHBOARD_PREFIXES):
+        if self._guest_path_matches_any_prefix(normalized, self._DASHBOARD_PREFIXES):
             return "dashboard"
-        if any(folded.startswith(prefix.casefold()) for prefix in self._CACHE_PREFIXES):
+        if self._guest_path_matches_any_prefix(normalized, self._CACHE_PREFIXES):
             return "cache"
         if len(normalized) >= 2 and normalized[1] == ":":
             drive = normalized[0].casefold()
@@ -786,13 +862,13 @@ class XboxFileSystemShim:
 
     def _is_save_path(self, guest_path: str) -> bool:
         normalized = guest_path.replace("/", "\\").strip()
-        folded = normalized.casefold()
-        if any(folded.startswith(prefix.casefold()) for prefix in self._SAVE_PREFIXES):
+        if self._guest_path_matches_any_prefix(normalized, self._SAVE_PREFIXES):
             return True
         stripped = normalized
         for prefix in self._DISC_PREFIXES:
-            if stripped.casefold().startswith(prefix.casefold()):
-                stripped = stripped[len(prefix) :]
+            remainder = self._strip_guest_path_prefix(stripped, prefix)
+            if remainder is not None:
+                stripped = remainder
                 break
         stripped = stripped.lstrip("\\")
         first = stripped.split("\\", 1)[0].casefold()
@@ -818,6 +894,39 @@ class XboxFileSystemShim:
         return files
 
 
+class SparseAllocationData:
+    """Zero-filled allocation storage that commits only pages actually written."""
+
+    PAGE_SIZE = 4096
+
+    def __init__(self, size: int) -> None:
+        self.size = size
+        self._pages: dict[int, bytearray] = {}
+
+    def read(self, offset: int, size: int) -> bytes:
+        payload = bytearray(size)
+        cursor = 0
+        while cursor < size:
+            current = offset + cursor
+            page_number, page_offset = divmod(current, self.PAGE_SIZE)
+            chunk = min(size - cursor, self.PAGE_SIZE - page_offset)
+            page = self._pages.get(page_number)
+            if page is not None:
+                payload[cursor : cursor + chunk] = page[page_offset : page_offset + chunk]
+            cursor += chunk
+        return bytes(payload)
+
+    def write(self, offset: int, payload: bytes) -> None:
+        cursor = 0
+        while cursor < len(payload):
+            current = offset + cursor
+            page_number, page_offset = divmod(current, self.PAGE_SIZE)
+            chunk = min(len(payload) - cursor, self.PAGE_SIZE - page_offset)
+            page = self._pages.setdefault(page_number, bytearray(self.PAGE_SIZE))
+            page[page_offset : page_offset + chunk] = payload[cursor : cursor + chunk]
+            cursor += chunk
+
+
 @dataclass
 class Allocation:
     address: int
@@ -825,7 +934,11 @@ class Allocation:
     kind: str
     tag: int | None = None
     protection: str = "rw"
-    data: bytearray = field(default_factory=bytearray)
+    data: SparseAllocationData | None = None
+
+    def __post_init__(self) -> None:
+        if self.data is None:
+            self.data = SparseAllocationData(self.size)
 
     @property
     def end_address(self) -> int:
@@ -885,7 +998,7 @@ class XboxMemoryShim:
         address = _align_up(self._next_contiguous, alignment)
         self._next_contiguous = _align_up(address + size, alignment)
         self._allocations[address] = Allocation(
-            address, size, kind, None, protection, bytearray(size)
+            address, size, kind, None, protection
         )
         self._trace.add(
             "allocator",
@@ -914,14 +1027,16 @@ class XboxMemoryShim:
     def read(self, address: int, size: int) -> bytes:
         allocation = self._find_allocation(address, size)
         offset = address - allocation.address
-        return bytes(allocation.data[offset : offset + size])
+        assert allocation.data is not None
+        return allocation.data.read(offset, size)
 
     def write(self, address: int, payload: bytes) -> None:
         allocation = self._find_allocation(address, len(payload))
         if "w" not in allocation.protection:
             raise XboxRuntimeError(f"allocation at {_hex32(address)} is not writable")
         offset = address - allocation.address
-        allocation.data[offset : offset + len(payload)] = payload
+        assert allocation.data is not None
+        allocation.data.write(offset, payload)
         self._trace.add(
             "allocator",
             "write",
@@ -1060,7 +1175,7 @@ class XboxMemoryShim:
         address = _align_up(self._next_pool, alignment)
         self._next_pool = _align_up(address + size, alignment)
         self._allocations[address] = Allocation(
-            address, size, kind, tag, protection, bytearray(size)
+            address, size, kind, tag, protection
         )
         return address
 
@@ -1791,6 +1906,7 @@ class AudioStream:
     sample_rate: int = 48000
     channels: int = 2
     bits_per_sample: int = 16
+    host_submitted_buffer_count: int = 0
 
     @property
     def bytes_per_second(self) -> int:
@@ -1805,7 +1921,19 @@ class AudioStream:
             "sample_rate": self.sample_rate,
             "channels": self.channels,
             "bits_per_sample": self.bits_per_sample,
+            "host_submitted_buffer_count": self.host_submitted_buffer_count,
         }
+
+
+class AudioOutputBackend(Protocol):
+    def submit_pcm(
+        self,
+        payload: bytes,
+        *,
+        sample_rate: int,
+        channels: int,
+        bits_per_sample: int,
+    ) -> bool: ...
 
 
 class XboxAudioShim:
@@ -1819,6 +1947,16 @@ class XboxAudioShim:
         self._handles = handles
         self._clock = clock
         self.initialized = False
+        self._output_backend: AudioOutputBackend | None = None
+
+    def set_output_backend(self, backend: AudioOutputBackend | None) -> None:
+        self._output_backend = backend
+        self._trace.add(
+            "audio",
+            "set_output_backend",
+            enabled=backend is not None,
+            backend=type(backend).__name__ if backend is not None else None,
+        )
 
     def initialize(self) -> int:
         self.initialized = True
@@ -1856,6 +1994,19 @@ class XboxAudioShim:
         stream = self._handles.get(handle, "audio_stream")
         stream.queued_bytes += len(payload)
         stream.submitted_buffer_count += 1
+        host_submitted = False
+        if self._output_backend is not None and stream.format_tag.casefold().startswith("pcm"):
+            try:
+                host_submitted = self._output_backend.submit_pcm(
+                    payload,
+                    sample_rate=stream.sample_rate,
+                    channels=stream.channels,
+                    bits_per_sample=stream.bits_per_sample,
+                )
+            except (OSError, RuntimeError, ValueError):
+                host_submitted = False
+        if host_submitted:
+            stream.host_submitted_buffer_count += 1
         self._trace.add(
             "audio",
             "submit_buffer",
@@ -1863,6 +2014,7 @@ class XboxAudioShim:
             bytes=len(payload),
             queued_bytes=stream.queued_bytes,
             submitted_buffer_count=stream.submitted_buffer_count,
+            host_submitted=host_submitted,
         )
         return XboxStatus.SUCCESS
 
@@ -2623,6 +2775,14 @@ class XboxRuntimeShims:
         }
 
     def mm_allocate_contiguous_memory(self, size: int) -> int:
+        if size <= 0:
+            self.trace.add(
+                "allocator",
+                "allocate_contiguous_failed",
+                size=size,
+                reason="non_positive_size",
+            )
+            return 0
         return self.memory.allocate_contiguous_memory(size)
 
     def mm_allocate_contiguous_memory_ex(
@@ -2633,6 +2793,18 @@ class XboxRuntimeShims:
         boundary_address_multiple: int = 0,
         protect: int = 0,
     ) -> int:
+        if size <= 0:
+            self.trace.add(
+                "allocator",
+                "allocate_contiguous_ex_failed",
+                size=size,
+                lowest_acceptable_address=lowest_acceptable_address,
+                highest_acceptable_address=highest_acceptable_address,
+                boundary_address_multiple=boundary_address_multiple,
+                protect=protect,
+                reason="non_positive_size",
+            )
+            return 0
         alignment = boundary_address_multiple if boundary_address_multiple else 0x1000
         address = self.memory.allocate_contiguous_memory(
             size,
@@ -2830,8 +3002,12 @@ class XboxRuntimeShims:
             return self.filesystem.query_file_handle_information(guest_path_or_handle)
         return self.filesystem.query_file_information(guest_path_or_handle)
 
-    def nt_query_volume_information_file(self, guest_path: str = "D:\\") -> dict[str, Any]:
-        return self.filesystem.query_volume_information(guest_path)
+    def nt_query_volume_information_file(
+        self, guest_path_or_handle: str | int = "D:\\"
+    ) -> dict[str, Any]:
+        if isinstance(guest_path_or_handle, int):
+            return self.filesystem.query_volume_handle_information(guest_path_or_handle)
+        return self.filesystem.query_volume_information(guest_path_or_handle)
 
     def nt_query_directory_file(self, guest_path: str = "D:\\") -> dict[str, Any]:
         return self.filesystem.list_directory(guest_path)
@@ -3083,7 +3259,22 @@ class XboxRuntimeShims:
         return self.sync.create_semaphore(initial_count, limit)
 
     def nt_release_semaphore(self, handle: int, release_count: int = 1) -> dict[str, Any]:
-        return self.sync.release_semaphore(handle, release_count)
+        try:
+            return self.sync.release_semaphore(handle, release_count)
+        except XboxRuntimeError as exc:
+            self.trace.add(
+                "threading",
+                "release_semaphore",
+                status="error",
+                handle=handle,
+                release_count=release_count,
+                error=str(exc),
+            )
+            return {
+                "status": XboxStatus.INVALID_HANDLE,
+                "previous_count": 0,
+                "error": str(exc),
+            }
 
     def nt_create_timer(self) -> int:
         return self.sync.create_timer()

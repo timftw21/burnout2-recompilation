@@ -91,6 +91,8 @@ class RuntimeShimTests(unittest.TestCase):
 
             resolved = runtime.filesystem.resolve_guest_path("D:\\media\\intro.bin")
             self.assertEqual(resolved, media / "Intro.BIN")
+            resolved_disc_root = runtime.filesystem.resolve_guest_path("\\Device\\CdRom0")
+            self.assertEqual(resolved_disc_root, root)
             resolved_dash = runtime.filesystem.resolve_guest_path(
                 "\\Device\\Harddisk0\\partition2\\XODash\\xonlinedash.xbe"
             )
@@ -129,6 +131,36 @@ class RuntimeShimTests(unittest.TestCase):
             self.assertTrue(file_summary["streaming"])
             self.assertEqual(file_summary["read_count"], 3)
             self.assertEqual(file_summary["bytes_read"], 11)
+
+            disc_root = runtime.filesystem.open_file("\\Device\\CdRom0", "rb")
+            self.assertEqual(disc_root["status"], XboxStatus.SUCCESS)
+            self.assertEqual(disc_root["root_kind"], "disc")
+            self.assertTrue(disc_root["is_directory"])
+            disc_root_info = runtime.filesystem.query_file_handle_information(
+                disc_root["handle"]
+            )
+            self.assertEqual(disc_root_info["status"], XboxStatus.SUCCESS)
+            self.assertTrue(disc_root_info["is_directory"])
+            self.assertEqual(disc_root_info["size"], 0)
+            disc_volume = runtime.filesystem.query_volume_handle_information(
+                disc_root["handle"]
+            )
+            self.assertEqual(disc_volume["status"], XboxStatus.SUCCESS)
+            self.assertEqual(disc_volume["root_kind"], "disc")
+            nt_disc_volume = runtime.nt_query_volume_information_file(
+                disc_root["handle"]
+            )
+            self.assertEqual(nt_disc_volume["status"], XboxStatus.SUCCESS)
+            self.assertEqual(nt_disc_volume["root_kind"], "disc")
+            directory_read = runtime.filesystem.read_file(disc_root["handle"], 4)
+            self.assertEqual(directory_read["status"], XboxStatus.ACCESS_DENIED)
+            disc_root_summary = [
+                item
+                for item in runtime.summary()["open_files"]
+                if item["guest_path"] == "\\Device\\CdRom0"
+            ][0]
+            self.assertTrue(disc_root_summary["is_directory"])
+            self.assertFalse(disc_root_summary["streaming"])
 
             denied = runtime.filesystem.open_file("D:\\MEDIA\\new.bin", "wb")
             self.assertEqual(denied["status"], XboxStatus.ACCESS_DENIED)
@@ -216,6 +248,9 @@ class RuntimeShimTests(unittest.TestCase):
             runtime.nt_release_semaphore(semaphore, 2)["previous_count"],
             0,
         )
+        invalid_release = runtime.nt_release_semaphore(0, 1)
+        self.assertEqual(invalid_release["status"], XboxStatus.INVALID_HANDLE)
+        self.assertEqual(invalid_release["previous_count"], 0)
         self.assertIsNone(runtime.ke_initialize_timer_ex(0x5000, 1))
         timer_event = runtime.summary()["trace"][-1]
         self.assertEqual(timer_event["operation"], "initialize_timer")
@@ -239,6 +274,17 @@ class RuntimeShimTests(unittest.TestCase):
     def test_input_graphics_and_audio_shims_record_state(self) -> None:
         runtime = XboxRuntimeShims()
 
+        class RecordingAudioOutput:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def submit_pcm(self, payload: bytes, **format_fields: object) -> bool:
+                self.calls.append({"payload": payload, **format_fields})
+                return True
+
+        output = RecordingAudioOutput()
+        runtime.audio.set_output_backend(output)
+
         state = ControllerState(connected=True, buttons=0x1000, left_trigger=64)
         runtime.input.set_controller_state(0, state)
         self.assertEqual(runtime.input.poll_controller(0), state)
@@ -257,6 +303,8 @@ class RuntimeShimTests(unittest.TestCase):
         self.assertEqual(summary["input"]["ports"]["0"]["poll_count"], 1)
         self.assertEqual(summary["input"]["ports"]["0"]["last_latency_samples"], 1)
         self.assertEqual(summary["audio_streams"][0]["submitted_buffer_count"], 1)
+        self.assertEqual(summary["audio_streams"][0]["host_submitted_buffer_count"], 1)
+        self.assertEqual(len(output.calls), 1)
         self.assertGreater(summary["audio_streams"][0]["played_bytes"], 0)
         self.assertEqual(summary["determinism"]["input"], "sequenced_snapshots")
         self.assertGreaterEqual(len(summary["trace"]), 4)

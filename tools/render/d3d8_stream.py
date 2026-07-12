@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import struct
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -65,26 +66,54 @@ PUSH_BUFFER_METHOD_NAMES = {
     0x0194: "dma_texture1",
     0x0198: "dma_vertex",
     0x01A0: "dma_state",
-    0x01D8: "surface_clip_horizontal",
-    0x01DC: "surface_clip_vertical",
-    0x01E0: "surface_format",
-    0x01E4: "surface_pitch",
-    0x01E8: "color_offset",
-    0x01EC: "zeta_offset",
-    0x0300: "clear_surface",
-    0x03B0: "viewport_scale",
-    0x03C0: "viewport_offset",
-    0x0400: "texture_offset",
-    0x0418: "texture_format",
-    0x041C: "texture_address",
-    0x0420: "texture_control0",
-    0x0428: "texture_filter",
-    0x042C: "texture_image_rect",
-    0x0430: "texture_palette",
-    0x06B0: "begin_end",
-    0x1810: "clear_color",
-    0x1814: "clear_depth",
+    0x0110: "wait_for_idle",
+    0x012C: "flip_increment_write",
+    0x0200: "surface_clip_horizontal",
+    0x0204: "surface_clip_vertical",
+    0x0208: "surface_format",
+    0x020C: "surface_pitch",
+    0x0210: "color_offset",
+    0x0214: "zeta_offset",
+    0x17FC: "begin_end",
+    0x1800: "array_element16",
+    0x1808: "array_element32",
+    0x1810: "draw_arrays",
+    0x1818: "inline_array",
+    0x1D8C: "clear_depth",
+    0x1D90: "clear_color",
+    0x1D94: "clear_surface",
+    0x1E60: "combiner_control",
+    0x1E70: "shader_stage_program",
+    0x1E94: "transform_execution_mode",
+    0x1E98: "transform_program_cxt_write_enable",
+    0x1E9C: "transform_program_load",
 }
+
+TEXTURE_METHOD_OFFSETS = {
+    0x00: "texture_offset",
+    0x04: "texture_format",
+    0x08: "texture_address",
+    0x0C: "texture_control0",
+    0x10: "texture_control1",
+    0x14: "texture_filter",
+    0x18: "texture_image_rect",
+    0x1C: "texture_palette",
+    0x20: "texture_border_color",
+}
+
+
+def _push_buffer_method_name(method: int) -> str:
+    if 0x1760 <= method <= 0x179C and (method - 0x1760) % 4 == 0:
+        return f"vertex_array_format_{(method - 0x1760) // 4}"
+    if 0x1720 <= method <= 0x175C and (method - 0x1720) % 4 == 0:
+        return f"vertex_array_offset_{(method - 0x1720) // 4}"
+    if 0x1B00 <= method < 0x1C00:
+        stage = (method - 0x1B00) // 0x40
+        register_offset = (method - 0x1B00) % 0x40
+        register_name = TEXTURE_METHOD_OFFSETS.get(register_offset)
+        if register_name is not None:
+            return f"{register_name}_{stage}"
+    return PUSH_BUFFER_METHOD_NAMES.get(method, f"method_{method:04X}")
 
 
 class RenderStreamError(RuntimeError):
@@ -109,9 +138,66 @@ def normalize_render_stream(data: dict[str, Any]) -> dict[str, Any]:
     return streams[0]
 
 
+def merge_render_streams(
+    prefix: dict[str, Any], continuation: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge sequential capture windows while preserving their NV2A state order."""
+
+    first = normalize_render_stream(prefix)
+    second = normalize_render_stream(continuation)
+    writes: list[dict[str, Any]] = []
+    for source_index, stream in enumerate((first, second)):
+        for write in stream["writes"]:
+            merged = dict(write)
+            merged["source_window"] = source_index
+            merged["source_sequence"] = write.get("sequence")
+            merged["sequence"] = len(writes)
+            writes.append(merged)
+    resources: dict[int, dict[str, Any]] = {}
+    for stream in (first, second):
+        for resource in stream.get("resource_snapshots", []):
+            if isinstance(resource, dict) and isinstance(resource.get("address"), int):
+                resources[int(resource["address"])] = dict(resource)
+    return {
+        "format": STREAM_FORMAT,
+        "public_safe": False,
+        "source": {
+            "kind": "sequential_capture_windows",
+            "window_count": 2,
+            "frontend_text": second.get("source", {}).get("frontend_text"),
+        },
+        "write_count": len(writes),
+        "captured_write_count": len(writes),
+        "mmio_write_count": sum(
+            1 for write in writes if write.get("kind") == "d3d_mmio"
+        ),
+        "push_buffer_write_count": sum(
+            1 for write in writes if write.get("kind") == "d3d_push_buffer"
+        ),
+        "truncated": bool(first.get("truncated") or second.get("truncated")),
+        "resource_snapshot_count": len(resources),
+        "resource_snapshots": list(resources.values()),
+        "writes": writes,
+    }
+
+
 def extract_render_streams_from_probe_summary(summary: dict[str, Any]) -> list[dict[str, Any]]:
     execution = summary.get("entry_recovery", {}).get("execution", {})
+    frontend_text = _recovered_frontend_text(execution)
     streams: list[dict[str, Any]] = []
+    observer_stream = execution.get("render_watchpoint_stream")
+    if isinstance(observer_stream, dict):
+        normalized = _normalize_embedded_stream(
+            observer_stream,
+            source={
+                "kind": "playability_probe_render_observer",
+                "execution_status": execution.get("status"),
+                "frontend_text": frontend_text,
+            },
+        )
+        if normalized["write_count"]:
+            streams.append(normalized)
+
     for index, thread in enumerate(execution.get("guest_thread_executions", [])):
         stream = thread.get("render_command_stream")
         if not isinstance(stream, dict):
@@ -123,6 +209,7 @@ def extract_render_streams_from_probe_summary(summary: dict[str, Any]) -> list[d
                 "thread_index": index,
                 "thread_start": thread.get("start_address_hex"),
                 "thread_status": thread.get("status"),
+                "frontend_text": frontend_text,
             },
         )
         if normalized["write_count"]:
@@ -135,11 +222,31 @@ def extract_render_streams_from_probe_summary(summary: dict[str, Any]) -> list[d
             source={
                 "kind": "playability_probe_entry_execution",
                 "execution_status": execution.get("status"),
+                "frontend_text": frontend_text,
             },
         )
         if normalized["write_count"]:
             streams.append(normalized)
     return streams
+
+
+def _recovered_frontend_text(execution: dict[str, Any]) -> str | None:
+    text_draw = execution.get("title_text_draw_fast_path")
+    if not isinstance(text_draw, dict):
+        return None
+    for sample in text_draw.get("sampled_strings", []):
+        if not isinstance(sample, dict):
+            continue
+        bytes_hex = sample.get("bytes_hex")
+        if not isinstance(bytes_hex, str):
+            continue
+        try:
+            text = bytes.fromhex(bytes_hex).decode("cp1252").strip("\0")
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if text:
+            return text
+    return None
 
 
 def _normalize_direct_stream(stream: dict[str, Any]) -> dict[str, Any]:
@@ -167,6 +274,14 @@ def _normalize_embedded_stream(
         ),
         "captured_write_count": len(writes),
         "truncated": bool(stream.get("truncated", stream.get("write_count", len(writes)) > len(writes))),
+        "capture_after_write_count": int(stream.get("capture_after_write_count", 0) or 0),
+        "skipped_write_count": int(stream.get("skipped_write_count", 0) or 0),
+        "resource_snapshot_count": len(stream.get("resource_snapshots", [])),
+        "resource_snapshots": [
+            dict(resource)
+            for resource in stream.get("resource_snapshots", [])
+            if isinstance(resource, dict)
+        ],
         "writes": writes,
     }
 
@@ -176,6 +291,8 @@ def _normalize_write(write: dict[str, Any], fallback_sequence: int) -> dict[str,
     address = _coerce_u32(write.get("address"), write.get("address_hex"))
     value = _coerce_u32(write.get("value"), write.get("value_hex"))
     offset = _coerce_u32(write.get("offset"), write.get("offset_hex"))
+    size = int(write.get("size", 4))
+    bytes_hex = _normalize_payload_hex(write, size)
     if offset is None and address is not None:
         if D3D_MMIO_BASE <= address <= D3D_MMIO_END:
             offset = address - D3D_MMIO_BASE
@@ -191,7 +308,8 @@ def _normalize_write(write: dict[str, Any], fallback_sequence: int) -> dict[str,
         "offset_hex": hex32(offset),
         "value": value,
         "value_hex": hex32(value),
-        "size": int(write.get("size", 4)),
+        "size": size,
+        "bytes_hex": bytes_hex,
     }
 
 
@@ -206,26 +324,67 @@ def _coerce_u32(*values: Any) -> int | None:
     return None
 
 
+def _coerce_int(*values: Any) -> int | None:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value:
+            return int(value, 0)
+    return None
+
+
+def _normalize_payload_hex(write: dict[str, Any], size: int) -> str | None:
+    bytes_hex = write.get("bytes_hex")
+    if isinstance(bytes_hex, str) and bytes_hex:
+        compact = "".join(bytes_hex.split()).upper()
+        try:
+            bytes.fromhex(compact)
+        except ValueError:
+            return None
+        return compact
+
+    if size <= 0:
+        return None
+    raw_value = _coerce_int(write.get("value"), write.get("value_hex"))
+    if raw_value is None:
+        return None
+    byte_count = max(1, min(size, 8))
+    if raw_value < 0 or raw_value >= (1 << (byte_count * 8)):
+        raw_value &= (1 << (byte_count * 8)) - 1
+    return raw_value.to_bytes(byte_count, "little").hex().upper()
+
+
 def decode_render_stream(stream: dict[str, Any]) -> dict[str, Any]:
     normalized = normalize_render_stream(stream)
     decoded: list[dict[str, Any]] = []
     pending_push_writes: list[dict[str, Any]] = []
+    pending_max_address: int | None = None
 
     def flush_pending_push_writes() -> None:
+        nonlocal pending_max_address
         if not pending_push_writes:
             return
-        decoded.extend(_decode_push_buffer_run(pending_push_writes))
+        latest_by_address = {int(write["address"]): write for write in pending_push_writes}
+        ordered = [latest_by_address[address] for address in sorted(latest_by_address)]
+        run: list[dict[str, Any]] = []
+        for write in ordered:
+            if run and write["address"] != _write_end_address(run[-1]):
+                decoded.extend(_decode_push_buffer_run(run))
+                run = []
+            run.append(write)
+        if run:
+            decoded.extend(_decode_push_buffer_run(run))
         pending_push_writes.clear()
+        pending_max_address = None
 
     for write in normalized["writes"]:
         if write["kind"] == "d3d_push_buffer":
-            if (
-                pending_push_writes
-                and write["address"]
-                != _write_end_address(pending_push_writes[-1])
-            ):
+            if pending_max_address is not None and write["address"] + 0x1000 < pending_max_address:
                 flush_pending_push_writes()
             pending_push_writes.append(write)
+            pending_max_address = max(pending_max_address or write["address"], write["address"])
             continue
         flush_pending_push_writes()
         if write["kind"] == "d3d_mmio":
@@ -247,6 +406,44 @@ def decode_render_stream(stream: dict[str, Any]) -> dict[str, Any]:
         for item in decoded
         if item.get("category") == "push-buffer-methods"
     )
+    methods = [
+        method
+        for item in decoded
+        if item.get("category") == "push-buffer-methods"
+        for method in item.get("methods", [])
+    ]
+    method_counts = Counter(str(method.get("name", "unknown")) for method in methods)
+    unnamed_method_counts = Counter(
+        str(method.get("name", "unknown"))
+        for method in methods
+        if str(method.get("name", "")).startswith("method_")
+    )
+    visual_gap_inventory = {
+        "unknown_mmio_commands": categories.get("mmio-unknown", 0),
+        "unknown_push_buffer_packets": categories.get("push-buffer-unknown-packet", 0),
+        "truncated_commands": counts.get("truncated_preserved", 0),
+        "unnamed_method_writes": sum(unnamed_method_counts.values()),
+        "unnamed_method_families": len(unnamed_method_counts),
+        "inline_vertex_words": method_counts.get("inline_array", 0),
+        "draw_control_writes": sum(
+            method_counts.get(name, 0)
+            for name in ("begin_end", "draw_arrays", "draw_end")
+        ),
+        "texture_state_writes": sum(
+            count for name, count in method_counts.items() if name.startswith("texture_")
+        ),
+        "surface_state_writes": sum(
+            method_counts.get(name, 0)
+            for name in (
+                "surface_clip_horizontal",
+                "surface_clip_vertical",
+                "surface_format",
+                "surface_pitch",
+                "color_offset",
+                "zeta_offset",
+            )
+        ),
+    }
     frame_state = _frame_state_from_decoded_commands(decoded)
     return {
         "format": DECODED_FORMAT,
@@ -259,6 +456,9 @@ def decode_render_stream(stream: dict[str, Any]) -> dict[str, Any]:
         "category_counts": dict(sorted(categories.items())),
         "push_buffer_method_packet_count": method_packet_count,
         "interpreted_method_count": interpreted_method_count,
+        "method_counts": dict(sorted(method_counts.items())),
+        "unnamed_method_counts": dict(sorted(unnamed_method_counts.items())),
+        "visual_gap_inventory": visual_gap_inventory,
         "zero_count_method_word_count": zero_count_method_word_count,
         "state_update_count": len(frame_state["state_updates"]),
         "frame_state": frame_state,
@@ -324,6 +524,13 @@ def _push_buffer_run_from_writes(writes: list[dict[str, Any]]) -> dict[str, Any]
     first_address = int(writes[0].get("address") or D3D_PUSH_BUFFER_BASE)
     payload = bytearray()
     for write in writes:
+        bytes_hex = write.get("bytes_hex")
+        if isinstance(bytes_hex, str) and bytes_hex:
+            try:
+                payload.extend(bytes.fromhex(bytes_hex))
+                continue
+            except ValueError:
+                pass
         value = int(write.get("value") or 0)
         size = max(1, min(int(write.get("size", 4)), 4))
         payload.extend(value.to_bytes(4, "little")[:size])
@@ -539,7 +746,7 @@ def _method_data_records(
             {
                 "method": method,
                 "method_hex": hex32(method),
-                "name": PUSH_BUFFER_METHOD_NAMES.get(method, f"method_{method:04X}"),
+                "name": _push_buffer_method_name(method),
                 "data": int(word["value"]),
                 "data_hex": word["value_hex"],
                 "word_address_hex": word["address_hex"],
@@ -633,9 +840,38 @@ def _frame_state_from_decoded_commands(commands: list[dict[str, Any]]) -> dict[s
         "surface_format": None,
         "surface_pitch": None,
         "texture_state": {},
+        "vertex_array_formats": {},
         "begin_end": None,
+        "draw_arrays": None,
+        "draw_end": None,
+        "draw_calls": [],
+        "inline_vertex_stream": {
+            "method_count": 0,
+            "sampled_values": [],
+        },
         "state_updates": [],
     }
+    active_draw: dict[str, Any] | None = None
+
+    def finish_active_draw() -> None:
+        nonlocal active_draw
+        if active_draw is None:
+            return
+        raw_words = active_draw.pop("raw_words")
+        decoded_vertices = _decode_inline_vertices(
+            raw_words,
+            state["vertex_array_formats"],
+        )
+        active_draw["inline_word_count"] = len(raw_words)
+        active_draw["vertex_count"] = len(decoded_vertices)
+        active_draw["vertices"] = decoded_vertices
+        active_draw["texture_state"] = {
+            stage: dict(registers)
+            for stage, registers in state["texture_state"].items()
+        }
+        state["draw_calls"].append(active_draw)
+        active_draw = None
+
     for command in commands:
         if command.get("category") != "push-buffer-methods":
             continue
@@ -660,10 +896,101 @@ def _frame_state_from_decoded_commands(commands: list[dict[str, Any]]) -> dict[s
             elif name == "surface_pitch":
                 state["surface_pitch"] = update["value"]
             elif name.startswith("texture_"):
-                state["texture_state"][name] = update["value"]
+                stage = str(update["value"]["stage"])
+                state["texture_state"].setdefault(stage, {})[
+                    update["value"]["register"]
+                ] = update["value"]
+            elif name.startswith("vertex_array_format_"):
+                state["vertex_array_formats"][str(update["value"]["slot"])] = (
+                    update["value"]
+                )
             elif name == "begin_end":
                 state["begin_end"] = update["value"]
+                if update["value"]["active"]:
+                    finish_active_draw()
+                    active_draw = {
+                        "primitive": update["value"]["primitive"],
+                        "primitive_raw": update["value"]["raw"],
+                        "source": "inline_array",
+                        "raw_words": [],
+                    }
+                else:
+                    finish_active_draw()
+            elif name == "draw_arrays":
+                state["draw_arrays"] = update["value"]
+                state["draw_calls"].append(
+                    {
+                        "primitive": (
+                            active_draw["primitive"]
+                            if active_draw is not None
+                            else "triangle_list"
+                        ),
+                        "source": "draw_arrays",
+                        **update["value"],
+                    }
+                )
+            elif name == "draw_end":
+                state["draw_end"] = update["value"]
+            elif name == "inline_array":
+                stream = state["inline_vertex_stream"]
+                stream["method_count"] += 1
+                if len(stream["sampled_values"]) < 16:
+                    stream["sampled_values"].append(update["value"])
+                if active_draw is not None:
+                    active_draw["raw_words"].append(update["value"]["raw"])
+    finish_active_draw()
     return state
+
+
+def _decode_inline_vertices(
+    words: list[int], formats: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    enabled = [
+        formats[key]
+        for key in sorted(formats, key=int)
+        if int(formats[key].get("components", 0)) > 0
+    ]
+    stride_words = sum(int(item.get("word_count", 0)) for item in enabled)
+    if stride_words <= 0:
+        return []
+    vertices: list[dict[str, Any]] = []
+    for base in range(0, len(words) - stride_words + 1, stride_words):
+        cursor = base
+        attributes: dict[str, Any] = {}
+        for item in enabled:
+            word_count = int(item["word_count"])
+            raw = words[cursor : cursor + word_count]
+            cursor += word_count
+            slot = int(item["slot"])
+            value_type = int(item["type"])
+            components = int(item["components"])
+            if value_type == 2:
+                values = [
+                    struct.unpack("<f", struct.pack("<I", value & 0xFFFFFFFF))[0]
+                    for value in raw[:components]
+                ]
+            elif value_type in {0, 4} and raw:
+                packed = raw[0]
+                values = [(packed >> (8 * index)) & 0xFF for index in range(components)]
+            else:
+                values = list(raw)
+            attributes[str(slot)] = {
+                "format": item["type_name"],
+                "values": values,
+                "raw_hex": [hex32(value) for value in raw],
+            }
+        vertex: dict[str, Any] = {"attributes": attributes}
+        position = attributes.get("0", {}).get("values", [])
+        if len(position) >= 2:
+            vertex["position"] = position
+        color_raw = attributes.get("3", {}).get("raw_hex", [])
+        if color_raw:
+            vertex["color"] = _argb_color(int(color_raw[0], 16))
+        texcoord = attributes.get("9", {}).get("values", [])
+        if len(texcoord) >= 2:
+            vertex["texcoord0"] = texcoord[:2]
+        vertices.append(vertex)
+    return vertices
 
 
 def _surface_payload_from_decoded_commands(commands: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -733,17 +1060,88 @@ def _state_update_from_method(method: dict[str, Any]) -> dict[str, Any] | None:
             "primitive": _primitive_from_begin_end(data),
             "active": data != 0,
         }
+    elif name == "draw_arrays":
+        value = {
+            "raw": data,
+            "raw_hex": hex32(data),
+            "start": data & 0x00FFFFFF,
+            "count": ((data >> 24) & 0xFF) + 1,
+        }
+    elif name in {"draw_end", "inline_array"}:
+        value = {"raw": data, "raw_hex": hex32(data)}
+    elif name.startswith("vertex_array_format_"):
+        slot = int(name.rsplit("_", 1)[1])
+        value_type = data & 0xF
+        components = (data >> 4) & 0xF
+        type_names = {
+            0: "ubyte_d3d",
+            1: "short_normalized",
+            2: "float",
+            4: "ubyte_ogl",
+            5: "short_32k",
+            6: "compressed",
+        }
+        if value_type == 2:
+            word_count = components
+        elif value_type in {0, 4, 6}:
+            word_count = 1 if components else 0
+        else:
+            word_count = (components + 1) // 2
+        value = {
+            "raw": data,
+            "raw_hex": hex32(data),
+            "slot": slot,
+            "type": value_type,
+            "type_name": type_names.get(value_type, f"type_{value_type}"),
+            "components": components,
+            "stride": (data >> 8) & 0xFFFFFF,
+            "word_count": word_count,
+        }
     elif name in {
         "surface_format",
-        "texture_offset",
-        "texture_format",
-        "texture_address",
-        "texture_control0",
-        "texture_filter",
-        "texture_image_rect",
-        "texture_palette",
     }:
         value = {"raw": data, "raw_hex": hex32(data)}
+    elif name.startswith("texture_"):
+        register, stage_text = name.rsplit("_", 1)
+        stage = int(stage_text)
+        value = {
+            "raw": data,
+            "raw_hex": hex32(data),
+            "stage": stage,
+            "register": register,
+        }
+        if register == "texture_format":
+            color_format = (data >> 8) & 0xFF
+            format_names = {
+                0x05: "R5G6B5",
+                0x06: "A8R8G8B8",
+                0x07: "X8R8G8B8",
+                0x0C: "DXT1",
+                0x0E: "DXT3",
+                0x0F: "DXT5",
+                0x12: "A8R8G8B8_LINEAR",
+                0x1E: "X8R8G8B8_LINEAR",
+            }
+            value.update(
+                {
+                    "dimensionality": (data >> 4) & 0xF,
+                    "color_format": color_format,
+                    "color_format_name": format_names.get(
+                        color_format, f"format_{color_format:02X}"
+                    ),
+                    "mipmap_levels": (data >> 16) & 0xF,
+                    "base_size_u": (data >> 20) & 0xF,
+                    "base_size_v": (data >> 24) & 0xF,
+                    "base_size_p": (data >> 28) & 0xF,
+                    "width": 1 << ((data >> 20) & 0xF),
+                    "height": 1 << ((data >> 24) & 0xF),
+                }
+            )
+        elif register == "texture_control0":
+            value["enabled"] = bool(data & (1 << 30))
+        elif register == "texture_image_rect":
+            value["width"] = (data >> 16) & 0xFFFF
+            value["height"] = data & 0xFFFF
     elif name in {"surface_clip_horizontal", "surface_clip_vertical"}:
         value = {
             "raw": data,
@@ -967,6 +1365,11 @@ def replay_render_stream(
             "surface_pitch": frame_state.get("surface_pitch"),
             "texture_state": frame_state.get("texture_state"),
             "begin_end": frame_state.get("begin_end"),
+            "draw_arrays": frame_state.get("draw_arrays"),
+            "draw_end": frame_state.get("draw_end"),
+            "inline_vertex_stream": frame_state.get("inline_vertex_stream"),
+            "vertex_array_formats": frame_state.get("vertex_array_formats"),
+            "draw_calls": frame_state.get("draw_calls"),
         },
         "vulkan_state": vulkan_state,
         "vulkan_work": vulkan_work,
@@ -1017,6 +1420,11 @@ def _vulkan_state_from_frame_state(
         "texture_state": frame_state.get("texture_state", {}),
         "clear_surface": frame_state.get("clear_surface"),
         "begin_end": frame_state.get("begin_end"),
+        "draw_arrays": frame_state.get("draw_arrays"),
+        "draw_end": frame_state.get("draw_end"),
+        "inline_vertex_stream": frame_state.get("inline_vertex_stream"),
+        "vertex_array_formats": frame_state.get("vertex_array_formats"),
+        "draw_calls": frame_state.get("draw_calls"),
     }
 
 
@@ -1058,14 +1466,47 @@ def _vulkan_work_from_frame_state(
             render_area=vulkan_state["render_area"],
         )
 
-    begin_end = frame_state.get("begin_end")
-    if isinstance(begin_end, dict) and bool(begin_end.get("active")):
-        add(
-            "vulkan_cmd_draw",
-            primitive=begin_end.get("primitive"),
-            begin_end=begin_end,
-            vertex_source="recovered_nv2a_push_buffer_state",
+    draw_calls = frame_state.get("draw_calls", [])
+    if isinstance(draw_calls, list) and draw_calls:
+        for draw_call in draw_calls:
+            if not isinstance(draw_call, dict):
+                continue
+            add(
+                "vulkan_cmd_draw",
+                primitive=draw_call.get("primitive"),
+                vertex_source=draw_call.get("source"),
+                vertex_count=draw_call.get("vertex_count", draw_call.get("count")),
+                vertices=draw_call.get("vertices", []),
+                texture_state=draw_call.get("texture_state", {}),
+            )
+    else:
+        begin_end = frame_state.get("begin_end")
+        draw_arrays = frame_state.get("draw_arrays")
+        inline_vertices = frame_state.get("inline_vertex_stream")
+        inline_count = (
+            int(inline_vertices.get("method_count") or 0)
+            if isinstance(inline_vertices, dict)
+            else 0
         )
+        if isinstance(begin_end, dict) and bool(begin_end.get("active")):
+            add(
+                "vulkan_cmd_draw",
+                primitive=begin_end.get("primitive"),
+                begin_end=begin_end,
+                vertex_source="recovered_nv2a_push_buffer_state",
+            )
+        elif isinstance(draw_arrays, dict) or inline_count >= 3:
+            add(
+                "vulkan_cmd_draw",
+                primitive="triangle_list",
+                draw_arrays=draw_arrays,
+                inline_vertex_stream=inline_vertices,
+                vertex_source=(
+                    "draw_arrays_method"
+                    if isinstance(draw_arrays, dict)
+                    else "inline_vertex_methods"
+                ),
+            )
     return work
 
 
@@ -1073,10 +1514,14 @@ def _primitive_from_begin_end(value: int) -> str:
     names = {
         1: "point_list",
         2: "line_list",
-        3: "line_strip",
-        4: "triangle_list",
-        5: "triangle_strip",
-        6: "triangle_fan",
+        3: "line_loop",
+        4: "line_strip",
+        5: "triangle_list",
+        6: "triangle_strip",
+        7: "triangle_fan",
+        8: "quad_list",
+        9: "quad_strip",
+        10: "polygon",
     }
     return names.get(value, f"primitive_{value}")
 
@@ -1121,6 +1566,11 @@ def main() -> int:
         description="Extract, decode, and replay recovered D3D8 render streams."
     )
     parser.add_argument("--input", type=Path, required=True, help="Probe summary or stream JSON.")
+    parser.add_argument(
+        "--prefix-input",
+        type=Path,
+        help="Optional earlier capture window whose persistent NV2A state prefixes --input.",
+    )
     parser.add_argument("--stream-output", type=Path, help="Optional normalized stream output.")
     parser.add_argument("--decode-output", type=Path, help="Optional decoded command output.")
     parser.add_argument("--replay-output", type=Path, help="Optional translated replay output.")
@@ -1131,6 +1581,9 @@ def main() -> int:
 
     data = json.loads(args.input.read_text(encoding="utf-8"))
     stream = normalize_render_stream(data)
+    if args.prefix_input is not None:
+        prefix = json.loads(args.prefix_input.read_text(encoding="utf-8"))
+        stream = merge_render_streams(prefix, stream)
     decoded = decode_render_stream(stream)
     replay = replay_render_stream(stream, width=args.width, height=args.height)
 

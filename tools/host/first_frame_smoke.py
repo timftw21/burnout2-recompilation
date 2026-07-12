@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
+import struct
 import subprocess
 from collections import Counter
 from dataclasses import dataclass
@@ -20,7 +22,13 @@ DEFAULT_BUILD_DIR = REPO_ROOT / "build" / "local" / "first-frame"
 DEFAULT_EXE = DEFAULT_BUILD_DIR / "b2_first_frame.exe"
 DEFAULT_DEBUG_JSON = REPO_ROOT / "reports" / "local" / "first-frame" / "events.jsonl"
 DEFAULT_SUMMARY_JSON = REPO_ROOT / "reports" / "local" / "first-frame" / "summary.json"
+DEFAULT_SCREENSHOT = REPO_ROOT / "reports" / "local" / "first-frame" / "frame.bmp"
+DEFAULT_HOTKEY_SCREENSHOT_DIR = REPO_ROOT / "reports" / "local" / "screenshots"
 DEFAULT_RENDER_STREAM_JSON = REPO_ROOT / "reports" / "local" / "render" / "recovered-d3d-stream.json"
+DEFAULT_VERTEX_SHADER = REPO_ROOT / "runtime" / "host" / "shaders" / "nv2a_inline.vert"
+DEFAULT_FRAGMENT_SHADER = REPO_ROOT / "runtime" / "host" / "shaders" / "nv2a_inline.frag"
+DEFAULT_VERTEX_SPV = DEFAULT_BUILD_DIR / "nv2a_inline.vert.spv"
+DEFAULT_FRAGMENT_SPV = DEFAULT_BUILD_DIR / "nv2a_inline.frag.spv"
 DEFAULT_VULKAN_SDK = Path("C:/VulkanSDK/1.4.341.1")
 DEFAULT_LLVM_BIN = Path("C:/Program Files/LLVM/bin")
 
@@ -118,6 +126,47 @@ def compile_first_frame(
     }
 
 
+def compile_shaders(
+    *,
+    toolchain: Toolchain,
+    vertex_source: Path = DEFAULT_VERTEX_SHADER,
+    fragment_source: Path = DEFAULT_FRAGMENT_SHADER,
+    vertex_output: Path = DEFAULT_VERTEX_SPV,
+    fragment_output: Path = DEFAULT_FRAGMENT_SPV,
+) -> dict[str, Any]:
+    glslc = toolchain.vulkan_sdk / "Bin" / "glslc.exe"
+    if not glslc.exists():
+        raise FirstFrameSmokeError(f"glslc not found: {glslc}")
+    commands: list[list[str]] = []
+    for source, output in (
+        (vertex_source, vertex_output),
+        (fragment_source, fragment_output),
+    ):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        command = [str(glslc), str(source), "-o", str(output)]
+        completed = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise FirstFrameSmokeError(
+                "shader compile failed\n"
+                f"command: {' '.join(command)}\n"
+                f"stdout:\n{completed.stdout}\n"
+                f"stderr:\n{completed.stderr}"
+            )
+        commands.append(command)
+    return {
+        "returncode": 0,
+        "commands": commands,
+        "vertex_output": str(vertex_output),
+        "fragment_output": str(fragment_output),
+    }
+
+
 def run_first_frame(
     *,
     executable: Path = DEFAULT_EXE,
@@ -128,6 +177,17 @@ def run_first_frame(
     inject_input: bool = True,
     timeout_seconds: int = 30,
     render_stream_json: Path | None = None,
+    screenshot: Path | None = None,
+    hotkey_screenshot_directory: Path | None = DEFAULT_HOTKEY_SCREENSHOT_DIR,
+    vertex_shader: Path = DEFAULT_VERTEX_SPV,
+    fragment_shader: Path = DEFAULT_FRAGMENT_SPV,
+    live_render_stream: bool = False,
+    controller_state_json: Path | None = None,
+    strict_render_validation: bool = False,
+    flip_audit_ack: Path | None = None,
+    flip_audit_frame_directory: Path | None = None,
+    flip_audit_max_flips: int = 0,
+    flip_audit_health_interval: int = 30,
 ) -> dict[str, Any]:
     if not executable.exists():
         raise FirstFrameSmokeError(f"first-frame executable is missing: {executable}")
@@ -148,7 +208,44 @@ def run_first_frame(
     if inject_input:
         command.append("--inject-input")
     if render_stream_json is not None:
-        command.extend(["--render-stream-json", str(render_stream_json)])
+        command.extend([
+            "--live-render-stream-json" if live_render_stream else "--render-stream-json",
+            str(render_stream_json),
+        ])
+    if controller_state_json is not None:
+        controller_state_json.parent.mkdir(parents=True, exist_ok=True)
+        command.extend(["--controller-state-json", str(controller_state_json)])
+    if strict_render_validation:
+        command.append("--strict-render-validation")
+    if (flip_audit_ack is None) != (flip_audit_frame_directory is None):
+        raise FirstFrameSmokeError(
+            "flip audit acknowledgement and frame directory must be used together"
+        )
+    if flip_audit_ack is not None and flip_audit_frame_directory is not None:
+        flip_audit_ack.parent.mkdir(parents=True, exist_ok=True)
+        flip_audit_frame_directory.mkdir(parents=True, exist_ok=True)
+        command.extend(["--flip-audit-ack", str(flip_audit_ack)])
+        command.extend(
+            ["--flip-audit-frame-directory", str(flip_audit_frame_directory)]
+        )
+        if flip_audit_max_flips > 0:
+            command.extend(["--flip-audit-max-flips", str(flip_audit_max_flips)])
+        command.extend(
+            ["--flip-audit-health-interval", str(flip_audit_health_interval)]
+        )
+    if screenshot is not None:
+        screenshot.parent.mkdir(parents=True, exist_ok=True)
+        if screenshot.exists():
+            screenshot.unlink()
+        command.extend(["--screenshot", str(screenshot)])
+    if hotkey_screenshot_directory is not None:
+        hotkey_screenshot_directory.mkdir(parents=True, exist_ok=True)
+        command.extend([
+            "--hotkey-screenshot-directory",
+            str(hotkey_screenshot_directory),
+        ])
+    command.extend(["--vertex-shader", str(vertex_shader)])
+    command.extend(["--fragment-shader", str(fragment_shader)])
 
     env = os.environ.copy()
     llvm_bin = str(DEFAULT_LLVM_BIN)
@@ -160,7 +257,7 @@ def run_first_frame(
         cwd=REPO_ROOT,
         text=True,
         capture_output=True,
-        timeout=timeout_seconds,
+        timeout=timeout_seconds if timeout_seconds > 0 else None,
         check=False,
         env=env,
     )
@@ -171,6 +268,12 @@ def run_first_frame(
         "stdout": completed.stdout,
         "stderr": completed.stderr,
         "debug_json": str(debug_json),
+        "screenshot": str(screenshot) if screenshot is not None else None,
+        "hotkey_screenshot_directory": (
+            str(hotkey_screenshot_directory)
+            if hotkey_screenshot_directory is not None
+            else None
+        ),
         "events": events,
     }
 
@@ -189,6 +292,29 @@ def read_debug_events(path: Path) -> list[dict[str, Any]]:
                 f"invalid JSONL event at {path}:{line_number}: {exc}"
             ) from exc
     return events
+
+
+def inspect_bmp(path: Path) -> dict[str, Any]:
+    data = path.read_bytes()
+    if len(data) < 54 or data[:2] != b"BM":
+        raise FirstFrameSmokeError(f"invalid BMP screenshot: {path}")
+    pixel_offset = struct.unpack_from("<I", data, 10)[0]
+    width, signed_height = struct.unpack_from("<ii", data, 18)
+    planes, bits_per_pixel = struct.unpack_from("<HH", data, 26)
+    if width <= 0 or signed_height == 0 or planes != 1 or bits_per_pixel != 32:
+        raise FirstFrameSmokeError(f"unsupported BMP screenshot layout: {path}")
+    height = abs(signed_height)
+    expected_bytes = width * height * 4
+    if pixel_offset + expected_bytes > len(data):
+        raise FirstFrameSmokeError(f"truncated BMP screenshot: {path}")
+    return {
+        "path": str(path),
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "width": width,
+        "height": height,
+        "bits_per_pixel": bits_per_pixel,
+    }
 
 
 def summarize_smoke(
@@ -217,6 +343,30 @@ def summarize_smoke(
     interpreted_d3d_events = [
         event for event in events if event.get("event") == "d3d8_stream_interpreted"
     ]
+    readback_events = [
+        event for event in events if event.get("event") == "frame_readback_captured"
+    ]
+    flip_audit_events = [
+        event
+        for event in events
+        if event.get("event") == "lossless_flip_audited"
+        and bool(event.get("readback_captured", False))
+    ]
+    frontend_text_events = [
+        event for event in events if event.get("event") == "frontend_text_draw_recorded"
+    ]
+    native_resource_events = [
+        event for event in events if event.get("event") == "nv2a_native_resources_created"
+    ]
+    render_validation_events = [
+        event for event in events if event.get("event") == "render_validation"
+    ]
+    screenshot_path = run_result.get("screenshot")
+    screenshot = (
+        inspect_bmp(Path(screenshot_path))
+        if screenshot_path is not None and Path(screenshot_path).exists()
+        else None
+    )
     translated_command_counts = [
         int(event.get("translated_commands", 0))
         for event in frame_events
@@ -253,6 +403,7 @@ def summarize_smoke(
         },
         "run": {
             "returncode": run_result["returncode"],
+            "stderr": run_result.get("stderr") or None,
             "debug_json": run_result["debug_json"],
             "event_counts": dict(sorted(counts.items())),
             "main_loop_entered": counts.get("main_loop_enter", 0) == 1,
@@ -280,6 +431,118 @@ def summarize_smoke(
                 default=0,
             ),
             "visible_frame_presented": len(frame_events) > 0,
+            "pixel_readback_captured": (
+                bool(readback_events) and screenshot is not None
+            )
+            or bool(flip_audit_events),
+            "lossless_flip_readback_count": len(flip_audit_events),
+            "hotkey_screenshot_count": sum(
+                1 for event in readback_events if event.get("trigger") == "f12"
+            ),
+            "hotkey_screenshot_outputs": [
+                event.get("output")
+                for event in readback_events
+                if event.get("trigger") == "f12" and event.get("output")
+            ],
+            "recovered_frontend_text_drawn": len(frontend_text_events) == 1,
+            "recovered_frontend_text": next(
+                (event.get("text") for event in frontend_text_events if event.get("text")),
+                None,
+            ),
+            "frontend_text_rectangles": max(
+                (
+                    int(event.get("rectangles", 0))
+                    for event in frontend_text_events
+                    if str(event.get("rectangles", "")).isdigit()
+                ),
+                default=0,
+            ),
+            "nv2a_native_vertices": max(
+                (int(event.get("vertices", 0)) for event in native_resource_events),
+                default=0,
+            ),
+            "nv2a_native_draws": max(
+                (int(event.get("draws", 0)) for event in native_resource_events),
+                default=0,
+            ),
+            "nv2a_presented_draws": max(
+                (int(event.get("presented_draws", 0)) for event in native_resource_events),
+                default=0,
+            ),
+            "nv2a_guest_flips": max(
+                (int(event.get("guest_flips", 0)) for event in native_resource_events),
+                default=0,
+            ),
+            "nv2a_native_textures": max(
+                (int(event.get("textures", 0)) for event in native_resource_events),
+                default=0,
+            ),
+            "render_validation_passed": bool(render_validation_events) and all(
+                event.get("passed") in (True, "true", 1, "1")
+                for event in render_validation_events
+            ),
+            "unsupported_texture_resource_count": max(
+                (
+                    int(event.get("unsupported_texture_resource_count", 0))
+                    for event in render_validation_events
+                ),
+                default=0,
+            ),
+            "unmatched_presented_texture_draw_count": max(
+                (
+                    int(event.get("unmatched_presented_texture_draw_count", 0))
+                    for event in render_validation_events
+                ),
+                default=0,
+            ),
+            "unsupported_presented_primitive_count": max(
+                (
+                    int(event.get("unsupported_presented_primitive_count", 0))
+                    for event in render_validation_events
+                ),
+                default=0,
+            ),
+            "unsupported_draw_arrays_count": max(
+                (
+                    int(event.get("unsupported_draw_arrays_count", 0))
+                    for event in render_validation_events
+                ),
+                default=0,
+            ),
+            "nv2a_presented_half_quad_recovered": any(
+                event.get("presented_half_quad_recovered") in (True, "true", 1, "1")
+                for event in native_resource_events
+            ),
+            "nv2a_presented_overscan_height_recovered": any(
+                event.get("presented_overscan_height_recovered")
+                in (True, "true", 1, "1")
+                for event in native_resource_events
+            ),
+            "screenshot": screenshot,
+            "readback_unique_colors": max(
+                (
+                    int(event.get("unique_colors", 0))
+                    for event in readback_events
+                    if str(event.get("unique_colors", "")).isdigit()
+                ),
+                default=0,
+            ),
+            "readback_dominant_rgba": next(
+                (
+                    int(event["dominant_rgba"])
+                    for event in readback_events
+                    if str(event.get("dominant_rgba", "")).isdigit()
+                ),
+                None,
+            ),
+            "readback_dominant_count": max(
+                (
+                    int(event.get("dominant_count", 0))
+                    for event in readback_events
+                    if str(event.get("dominant_count", "")).isdigit()
+                ),
+                default=0,
+            ),
             "translated_renderer_work": len(translated_work_events) > 0,
             "translated_command_count": max(translated_command_counts, default=0),
             "recovered_d3d_command_stream": len(recovered_d3d_events) > 0,
@@ -432,23 +695,83 @@ def main() -> int:
     parser.add_argument("--exe", type=Path, default=DEFAULT_EXE)
     parser.add_argument("--debug-json", type=Path, default=DEFAULT_DEBUG_JSON)
     parser.add_argument("--summary-output", type=Path, default=DEFAULT_SUMMARY_JSON)
+    parser.add_argument("--screenshot-output", type=Path, default=DEFAULT_SCREENSHOT)
+    parser.add_argument(
+        "--no-automatic-screenshot",
+        action="store_true",
+        help="Disable the automatic first-frame BMP; F12 captures remain enabled.",
+    )
+    parser.add_argument(
+        "--hotkey-screenshot-directory",
+        type=Path,
+        default=DEFAULT_HOTKEY_SCREENSHOT_DIR,
+        help="Directory for timestamped BMP captures created with F12.",
+    )
     parser.add_argument("--clangxx", type=Path)
     parser.add_argument("--vulkan-sdk", type=Path)
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
-    parser.add_argument("--max-frames", type=int, default=3)
-    parser.add_argument("--timeout-seconds", type=int, default=30)
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=3,
+        help="Frames to present; 0 runs until the window is closed or Escape is pressed.",
+    )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=30,
+        help="Host-process timeout; 0 disables the timeout for manual runs.",
+    )
     parser.add_argument(
         "--render-stream-json",
         type=Path,
         help="Optional normalized recovered D3D stream JSON to replay.",
     )
+    parser.add_argument(
+        "--live-render-stream",
+        action="store_true",
+        help="Hot-reload --render-stream-json snapshots published by the resumable runner.",
+    )
+    parser.add_argument(
+        "--controller-state-json",
+        type=Path,
+        help="Publish keyboard-mapped Xbox controller state for the resumable runner.",
+    )
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--no-inject-input", action="store_true")
+    parser.add_argument(
+        "--strict-render-validation",
+        action="store_true",
+        help="Fail when a presented textured draw lacks a supported matching resource.",
+    )
+    parser.add_argument("--flip-audit-ack", type=Path)
+    parser.add_argument("--flip-audit-frame-directory", type=Path)
+    parser.add_argument("--flip-audit-max-flips", type=int, default=0)
+    parser.add_argument(
+        "--flip-audit-health-interval",
+        type=int,
+        default=30,
+        help=(
+            "Read back and analyze every Nth audited flip in addition to "
+            "candidate-triggered checks; 0 uses candidates only."
+        ),
+    )
     parser.add_argument("--pretty", action="store_true")
     args = parser.parse_args()
+    if args.live_render_stream and args.render_stream_json is None:
+        parser.error("--live-render-stream requires --render-stream-json")
+    if (args.flip_audit_ack is None) != (args.flip_audit_frame_directory is None):
+        parser.error(
+            "--flip-audit-ack and --flip-audit-frame-directory must be used together"
+        )
+    if args.flip_audit_max_flips < 0:
+        parser.error("--flip-audit-max-flips must not be negative")
+    if args.flip_audit_health_interval < 0:
+        parser.error("--flip-audit-health-interval must not be negative")
 
     compile_result = None
+    shader_result = None
     if not args.skip_build:
         toolchain = discover_toolchain(
             clangxx=args.clangxx,
@@ -459,6 +782,8 @@ def main() -> int:
             output=args.exe,
             toolchain=toolchain,
         )
+        shader_result = compile_shaders(toolchain=toolchain)
+        compile_result["shaders"] = shader_result
 
     run_result = run_first_frame(
         executable=args.exe,
@@ -469,6 +794,15 @@ def main() -> int:
         inject_input=not args.no_inject_input,
         timeout_seconds=args.timeout_seconds,
         render_stream_json=args.render_stream_json,
+        live_render_stream=args.live_render_stream,
+        controller_state_json=args.controller_state_json,
+        strict_render_validation=args.strict_render_validation,
+        flip_audit_ack=args.flip_audit_ack,
+        flip_audit_frame_directory=args.flip_audit_frame_directory,
+        flip_audit_max_flips=args.flip_audit_max_flips,
+        flip_audit_health_interval=args.flip_audit_health_interval,
+        screenshot=None if args.no_automatic_screenshot else args.screenshot_output,
+        hotkey_screenshot_directory=args.hotkey_screenshot_directory,
     )
     summary = summarize_smoke(
         compile_result=compile_result,
