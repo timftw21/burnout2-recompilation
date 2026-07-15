@@ -220,8 +220,62 @@ def _load_live_binary_stream(manifest_path: Path, manifest: dict[str, Any]) -> d
                 "bytes_hex": data.hex().upper(),
             }
         )
-    resource_payload = json.loads(resource_path.read_text(encoding="utf-8"))
-    resources = resource_payload.get("resource_snapshots", [])
+    resource_bytes = resource_path.read_bytes()
+    if resource_bytes[:8] == b"B2TEX001":
+        if len(resource_bytes) < 12:
+            raise PreflightError(f"truncated live texture stream: {resource_path}")
+        resource_count = struct.unpack_from("<I", resource_bytes, 8)[0]
+        resources: list[dict[str, Any]] = []
+        offset = 12
+        for resource_index in range(resource_count):
+            if offset + 56 > len(resource_bytes):
+                raise PreflightError(
+                    f"truncated live texture header {resource_index}: {resource_path}"
+                )
+            (
+                stage,
+                address,
+                width,
+                height,
+                format_size,
+                payload_size,
+                content_hash,
+            ) = struct.unpack_from("<IIIIII32s", resource_bytes, offset)
+            offset += 56
+            resource_end = offset + format_size + payload_size
+            if format_size <= 0 or format_size > 32 or resource_end > len(resource_bytes):
+                raise PreflightError(
+                    f"invalid live texture record {resource_index}: {resource_path}"
+                )
+            try:
+                format_name = resource_bytes[offset : offset + format_size].decode(
+                    "ascii"
+                )
+            except UnicodeDecodeError as exc:
+                raise PreflightError(
+                    f"invalid live texture format {resource_index}: {resource_path}"
+                ) from exc
+            offset += format_size
+            texture_bytes = resource_bytes[offset : offset + payload_size]
+            offset += payload_size
+            resources.append(
+                {
+                    "stage": stage,
+                    "address": address,
+                    "address_hex": f"0x{address:08X}",
+                    "format": format_name,
+                    "width": width,
+                    "height": height,
+                    "byte_count": payload_size,
+                    "sha256": content_hash.hex().upper(),
+                    "bytes_hex": texture_bytes.hex().upper(),
+                }
+            )
+        if offset != len(resource_bytes):
+            raise PreflightError(f"trailing live texture data: {resource_path}")
+    else:
+        resource_payload = json.loads(resource_bytes.decode("utf-8"))
+        resources = resource_payload.get("resource_snapshots", [])
     return normalize_render_stream(
         {
             "format": STREAM_FORMAT,

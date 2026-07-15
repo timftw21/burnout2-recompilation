@@ -62,12 +62,29 @@ class RuntimeShimTests(unittest.TestCase):
         self.assertEqual(summary["unresolved_import_count"], 2)
         self.assertNotIn("stub", summary["registered_behavior_counts"])
 
+    def test_page_lock_accepts_committed_tail_of_small_contiguous_allocation(self) -> None:
+        runtime = XboxRuntimeShims()
+        address = runtime.mm_allocate_contiguous_memory_ex(
+            0x98,
+            boundary_address_multiple=0x4000,
+        )
+
+        status = runtime.mm_lock_unlock_buffer_pages(address, 0x1000, True)
+
+        self.assertEqual(status, XboxStatus.SUCCESS)
+        self.assertEqual(runtime.memory.query_statistics()["locked_range_count"], 1)
+        with self.assertRaisesRegex(XboxRuntimeError, "page range"):
+            runtime.mm_lock_unlock_buffer_pages(address + 0x1000, 0x1000, True)
+
     def test_filesystem_resolves_guest_paths_inside_extracted_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             save_root = root / "save"
             dashboard_root = root / "dashboard"
             cache_root = root / "cache"
+            profile_root = save_root / "UDATA" / "41430019" / "Profile1"
+            profile_root.mkdir(parents=True)
+            (profile_root / "progress.bin").write_bytes(b"progress")
             media = root / "MEDIA"
             media.mkdir()
             (dashboard_root / "XODash").mkdir(parents=True)
@@ -79,6 +96,7 @@ class RuntimeShimTests(unittest.TestCase):
                     save_data_root=save_root,
                     dashboard_data_root=dashboard_root,
                     cache_data_root=cache_root,
+                    title_id=0x41430019,
                 )
             )
 
@@ -100,6 +118,31 @@ class RuntimeShimTests(unittest.TestCase):
                 resolved_dash,
                 dashboard_root / "XODash" / "xonlinedash.xbe",
             )
+            self.assertEqual(
+                runtime.filesystem.resolve_guest_path("U:\\"),
+                save_root / "UDATA" / "41430019",
+            )
+            self.assertEqual(
+                runtime.filesystem.resolve_guest_path("T:\\settings.bin"),
+                save_root / "TDATA" / "41430019" / "settings.bin",
+            )
+            user_root = runtime.filesystem.open_file("U:\\", "rb")
+            self.assertEqual(user_root["status"], XboxStatus.SUCCESS)
+            self.assertEqual(user_root["root_kind"], "save")
+            directory_entry = runtime.filesystem.query_directory_entry(
+                user_root["handle"], pattern="*.*"
+            )
+            self.assertEqual(directory_entry["status"], XboxStatus.SUCCESS)
+            self.assertEqual(directory_entry["name"], "Profile1")
+            self.assertTrue(directory_entry["is_directory"])
+            self.assertEqual(
+                runtime.filesystem.query_directory_entry(user_root["handle"])["status"],
+                XboxStatus.NO_MORE_FILES,
+            )
+            restarted_entry = runtime.filesystem.query_directory_entry(
+                user_root["handle"], restart_scan=True
+            )
+            self.assertEqual(restarted_entry["name"], "Profile1")
             missing_cache = runtime.filesystem.open_file("Y:\\xboxdash.xbe", "rb")
             self.assertEqual(missing_cache["status"], XboxStatus.NO_SUCH_FILE)
             self.assertEqual(missing_cache["root_kind"], "cache")
@@ -127,7 +170,11 @@ class RuntimeShimTests(unittest.TestCase):
             self.assertEqual(set_position, XboxStatus.SUCCESS)
             positioned_read = runtime.filesystem.read_file(opened["handle"], 4)
             self.assertEqual(positioned_read["data"], b"rnou")
-            file_summary = runtime.summary()["open_files"][0]
+            file_summary = next(
+                item
+                for item in runtime.summary()["open_files"]
+                if item["guest_path"].endswith("Intro.BIN")
+            )
             self.assertTrue(file_summary["streaming"])
             self.assertEqual(file_summary["read_count"], 3)
             self.assertEqual(file_summary["bytes_read"], 11)
@@ -152,6 +199,15 @@ class RuntimeShimTests(unittest.TestCase):
             )
             self.assertEqual(nt_disc_volume["status"], XboxStatus.SUCCESS)
             self.assertEqual(nt_disc_volume["root_kind"], "disc")
+            nt_disc_directory = runtime.nt_query_directory_file(
+                disc_root["handle"]
+            )
+            self.assertEqual(nt_disc_directory["status"], XboxStatus.SUCCESS)
+            self.assertIn("MEDIA", nt_disc_directory["entries"])
+            self.assertEqual(
+                runtime.nt_query_directory_file(0xDEADBEEF)["status"],
+                XboxStatus.INVALID_HANDLE,
+            )
             directory_read = runtime.filesystem.read_file(disc_root["handle"], 4)
             self.assertEqual(directory_read["status"], XboxStatus.ACCESS_DENIED)
             disc_root_summary = [

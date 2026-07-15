@@ -15,6 +15,7 @@ import datetime as dt
 from collections import Counter, deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from pathlib import Path, PureWindowsPath
 from typing import Any, Protocol
 
@@ -41,10 +42,14 @@ class XboxStatus:
     INVALID_HANDLE = 0xC0000008
     INVALID_PARAMETER = 0xC000000D
     NO_SUCH_FILE = 0xC000000F
+    NO_MORE_FILES = 0x80000006
     ACCESS_DENIED = 0xC0000022
+    BUFFER_TOO_SMALL = 0xC0000023
     OBJECT_NAME_COLLISION = 0xC0000035
     OBJECT_NAME_NOT_FOUND = 0xC0000034
     END_OF_FILE = 0xC0000011
+    INVALID_INFO_CLASS = 0xC0000003
+    INFO_LENGTH_MISMATCH = 0xC0000004
     TIMEOUT = 0x00000102
 
 
@@ -145,6 +150,7 @@ class XboxRuntimeConfig:
     save_data_root: Path | None = None
     dashboard_data_root: Path | None = None
     cache_data_root: Path | None = None
+    title_id: int | None = None
     host_target_base: int = 0xE0000000
     host_target_stride: int = 0x10
     allocation_base: int = 0x10000000
@@ -168,6 +174,10 @@ class GuestFile:
     writable: bool = False
     streaming: bool = False
     is_directory: bool = False
+    directory_entries: tuple[str, ...] = ()
+    directory_pattern: str = "*"
+    directory_index: int = 0
+    directory_initialized: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -184,6 +194,9 @@ class GuestFile:
             "writable": self.writable,
             "streaming": self.streaming,
             "is_directory": self.is_directory,
+            "directory_entry_count": len(self.directory_entries),
+            "directory_index": self.directory_index,
+            "directory_pattern": self.directory_pattern,
         }
 
 
@@ -288,12 +301,20 @@ class XboxFileSystemShim:
         "D:\\",
         "Cdrom0:\\",
     )
+    _USER_DATA_PREFIXES = (
+        "\\??\\U:\\",
+        "U:\\",
+    )
+    _TITLE_DATA_PREFIXES = (
+        "\\??\\T:\\",
+        "T:\\",
+    )
     _SAVE_PREFIXES = (
         "\\Device\\Harddisk0\\Partition0\\",
         "\\Device\\Harddisk0\\Partition1\\",
         "\\??\\E:\\",
         "E:\\",
-    )
+    ) + _USER_DATA_PREFIXES + _TITLE_DATA_PREFIXES
     _DASHBOARD_PREFIXES = (
         "\\Device\\Harddisk0\\Partition2\\",
         "\\??\\C:\\",
@@ -325,6 +346,7 @@ class XboxFileSystemShim:
         save_data_root: Path | None = None,
         dashboard_data_root: Path | None = None,
         cache_data_root: Path | None = None,
+        title_id: int | None = None,
         clock: "XboxClockShim | None" = None,
     ) -> None:
         self._trace = trace
@@ -335,7 +357,14 @@ class XboxFileSystemShim:
             dashboard_data_root.resolve() if dashboard_data_root else None
         )
         self._cache_root = cache_data_root.resolve() if cache_data_root else None
+        self._title_id = title_id
         self._clock = clock
+        if self._save_root is not None:
+            for data_kind in ("UDATA", "TDATA"):
+                alias_root = self._save_root / data_kind
+                if self._title_id is not None:
+                    alias_root /= f"{self._title_id & 0xFFFFFFFF:08X}"
+                alias_root.mkdir(parents=True, exist_ok=True)
 
     @property
     def root(self) -> Path | None:
@@ -752,13 +781,38 @@ class XboxFileSystemShim:
                 if child.is_file():
                     file_count += 1
                     total_bytes += child.stat().st_size
+        if root_kind == "disc":
+            bytes_per_sector = 2048
+            sectors_per_allocation_unit = 1
+            total_allocation_units = 3_820_880
+            available_allocation_units = 0
+            label = "BURNOUT2"
+        else:
+            # Match the stock Xbox data-partition geometry used by Cxbx:
+            # 0x9896b0 sectors with 32 sectors per FATX allocation unit.
+            bytes_per_sector = 512
+            sectors_per_allocation_unit = 32
+            total_allocation_units = 0x9896B0 // sectors_per_allocation_unit
+            used_allocation_units = (
+                total_bytes
+                + bytes_per_sector * sectors_per_allocation_unit
+                - 1
+            ) // (bytes_per_sector * sectors_per_allocation_unit)
+            available_allocation_units = max(
+                0, total_allocation_units - used_allocation_units
+            )
+            label = "XBOX DATA"
         result = {
             "status": XboxStatus.SUCCESS,
-            "label": "BURNOUT2",
-            "serial_number": 0x41430019,
+            "label": label,
+            "serial_number": self._title_id or 0x41430019,
             "file_count": file_count,
             "used_bytes": total_bytes,
             "root_kind": root_kind,
+            "bytes_per_sector": bytes_per_sector,
+            "sectors_per_allocation_unit": sectors_per_allocation_unit,
+            "total_allocation_units": total_allocation_units,
+            "available_allocation_units": available_allocation_units,
         }
         self._trace.add("filesystem", "query_volume", guest_path=guest_path, result=result)
         return result
@@ -785,6 +839,100 @@ class XboxFileSystemShim:
             entry_count=len(entries),
         )
         return {"status": XboxStatus.SUCCESS, "entries": entries, "root_kind": root_kind}
+
+    def query_directory_entry(
+        self,
+        handle: int,
+        *,
+        pattern: str | None = None,
+        restart_scan: bool = False,
+        max_record_length: int | None = None,
+    ) -> dict[str, Any]:
+        try:
+            file = self._handles.get(handle, "file")
+        except XboxRuntimeError as exc:
+            return {"status": XboxStatus.INVALID_HANDLE, "error": str(exc)}
+        if not file.is_directory or not file.host_path.is_dir():
+            return {"status": XboxStatus.INVALID_PARAMETER, "handle": handle}
+
+        requested_pattern = pattern or file.directory_pattern or "*"
+        if requested_pattern == "*.*":
+            requested_pattern = "*"
+        normalized_pattern = requested_pattern.casefold()
+        needs_restart = (
+            restart_scan
+            or not file.directory_initialized
+            or normalized_pattern != file.directory_pattern.casefold()
+        )
+        if needs_restart:
+            file.directory_entries = tuple(
+                child.name
+                for child in sorted(
+                    file.host_path.iterdir(), key=lambda item: item.name.casefold()
+                )
+                if fnmatchcase(child.name.casefold(), normalized_pattern)
+            )
+            file.directory_pattern = requested_pattern
+            file.directory_index = 0
+            file.directory_initialized = True
+
+        if file.directory_index >= len(file.directory_entries):
+            return {
+                "status": XboxStatus.NO_MORE_FILES,
+                "handle": handle,
+                "root_kind": file.root_kind,
+                "pattern": file.directory_pattern,
+            }
+
+        file_index = file.directory_index
+        name = file.directory_entries[file_index]
+        name_bytes = name.encode("ascii", errors="replace")
+        required_length = 0x40 + len(name_bytes)
+        if max_record_length is not None and max_record_length < required_length:
+            return {
+                "status": XboxStatus.BUFFER_TOO_SMALL,
+                "handle": handle,
+                "root_kind": file.root_kind,
+                "required_length": required_length,
+            }
+
+        child = file.host_path / name
+        stat = child.stat()
+        file.directory_index += 1
+        filetime_epoch = 116444736000000000
+
+        def filetime(seconds: float) -> int:
+            return max(0, int(seconds * 10_000_000) + filetime_epoch)
+
+        is_directory = child.is_dir()
+        size = stat.st_size if not is_directory else 0
+        result = {
+            "status": XboxStatus.SUCCESS,
+            "handle": handle,
+            "root_kind": file.root_kind,
+            "name": name,
+            "file_index": file_index,
+            "creation_time": filetime(stat.st_ctime),
+            "last_access_time": filetime(stat.st_atime),
+            "last_write_time": filetime(stat.st_mtime),
+            "change_time": filetime(stat.st_mtime),
+            "size": size,
+            "allocation_size": _align_up(size, 4096) if size else 0,
+            "file_attributes": 0x10 if is_directory else 0x80,
+            "is_directory": is_directory,
+            "required_length": required_length,
+            "pattern": file.directory_pattern,
+        }
+        self._trace.add(
+            "filesystem",
+            "query_directory_entry",
+            handle=handle,
+            guest_path=file.guest_path,
+            root_kind=file.root_kind,
+            name=name,
+            file_index=file_index,
+        )
+        return result
 
     def _guest_path_parts(self, guest_path: str) -> tuple[str, ...]:
         if not guest_path:
@@ -831,6 +979,17 @@ class XboxFileSystemShim:
     def _root_for_guest_path(self, guest_path: str, *, for_write: bool = False) -> Path | None:
         root_kind = self._root_kind_for_guest_path(guest_path)
         if root_kind == "save":
+            normalized = guest_path.replace("/", "\\").strip()
+            data_kind = None
+            if self._guest_path_matches_any_prefix(normalized, self._USER_DATA_PREFIXES):
+                data_kind = "UDATA"
+            elif self._guest_path_matches_any_prefix(normalized, self._TITLE_DATA_PREFIXES):
+                data_kind = "TDATA"
+            if data_kind is not None and self._save_root is not None:
+                alias_root = self._save_root / data_kind
+                if self._title_id is not None:
+                    alias_root /= f"{self._title_id & 0xFFFFFFFF:08X}"
+                return alias_root.resolve(strict=False)
             return self._save_root
         if root_kind == "dashboard":
             return self._dashboard_root
@@ -853,6 +1012,8 @@ class XboxFileSystemShim:
             if drive == "d":
                 return "disc"
             if drive == "e":
+                return "save"
+            if drive in {"t", "u"}:
                 return "save"
             if drive == "c":
                 return "dashboard"
@@ -1121,7 +1282,7 @@ class XboxMemoryShim:
         return self.free(address)
 
     def lock_unlock_buffer_pages(self, address: int, size: int, lock: bool = True) -> int:
-        self._find_allocation(address, size)
+        self._find_page_backed_allocation(address, size)
         item = (address, size)
         if lock:
             self._locked_ranges.add(item)
@@ -1137,7 +1298,7 @@ class XboxMemoryShim:
         return XboxStatus.SUCCESS
 
     def persist_contiguous_memory(self, address: int, size: int, persist: bool = True) -> int:
-        self._find_allocation(address, size)
+        self._find_page_backed_allocation(address, size)
         self._trace.add(
             "allocator",
             "persist_contiguous_memory",
@@ -1187,6 +1348,24 @@ class XboxMemoryShim:
                 return allocation
         raise XboxRuntimeError(
             f"address range {_hex32(address)}..{_hex32(address + size)} is not allocated"
+        )
+
+    def _find_page_backed_allocation(self, address: int, size: int) -> Allocation:
+        """Find an allocation whose committed guest pages cover the range."""
+        if size < 0:
+            raise XboxRuntimeError("negative memory access size")
+        page_start = address & ~0xFFF
+        page_end = _align_up(address + max(size, 1), 0x1000)
+        for allocation in self._allocations.values():
+            allocation_page_start = allocation.address & ~0xFFF
+            allocation_page_end = _align_up(allocation.end_address, 0x1000)
+            if (
+                allocation_page_start <= page_start
+                and page_end <= allocation_page_end
+            ):
+                return allocation
+        raise XboxRuntimeError(
+            f"page range {_hex32(page_start)}..{_hex32(page_end)} is not allocated"
         )
 
 
@@ -2593,6 +2772,7 @@ class XboxRuntimeShims:
             self.config.save_data_root,
             self.config.dashboard_data_root,
             self.config.cache_data_root,
+            self.config.title_id,
             self.clock,
         )
         self.input = XboxInputShim(self.trace)
@@ -2607,6 +2787,21 @@ class XboxRuntimeShims:
             "\\??\\D:": "\\Device\\Cdrom0",
             "\\Device\\Cdrom0": str(self.config.extracted_disc_root or "D:\\"),
         }
+        title_suffix = (
+            f"\\{self.config.title_id & 0xFFFFFFFF:08X}"
+            if self.config.title_id is not None
+            else ""
+        )
+        self._symbolic_links.update(
+            {
+                "\\??\\T:": (
+                    "\\Device\\Harddisk0\\Partition1\\TDATA" + title_suffix
+                ),
+                "\\??\\U:": (
+                    "\\Device\\Harddisk0\\Partition1\\UDATA" + title_suffix
+                ),
+            }
+        )
         self._nonvolatile_settings: dict[int, Any] = {
             0x00000001: 0,
             0x00000002: 0,
@@ -3009,8 +3204,18 @@ class XboxRuntimeShims:
             return self.filesystem.query_volume_handle_information(guest_path_or_handle)
         return self.filesystem.query_volume_information(guest_path_or_handle)
 
-    def nt_query_directory_file(self, guest_path: str = "D:\\") -> dict[str, Any]:
-        return self.filesystem.list_directory(guest_path)
+    def nt_query_directory_file(
+        self, guest_path_or_handle: str | int = "D:\\"
+    ) -> dict[str, Any]:
+        if isinstance(guest_path_or_handle, int):
+            info = self.filesystem.query_file_handle_information(guest_path_or_handle)
+            guest_path = info.get("guest_path")
+            if info.get("status") != XboxStatus.SUCCESS or not isinstance(
+                guest_path, str
+            ):
+                return info
+            return self.filesystem.list_directory(guest_path)
+        return self.filesystem.list_directory(guest_path_or_handle)
 
     def nt_set_information_file(self, handle: int, information: dict[str, Any] | None = None) -> int:
         if information and "file_information_class" in information:
@@ -3416,9 +3621,30 @@ class XboxRuntimeShims:
         return self.sync.remove_queue_dpc(dpc_id)
 
     def ke_initialize_interrupt(
-        self, interrupt_id: int, vector: int, service_routine: int | None = None
+        self,
+        interrupt_id: int,
+        service_routine: int | None = None,
+        service_context: int | None = None,
+        vector: int = 0,
+        irql: int = 0,
+        interrupt_mode: int = 0,
+        share_vector: int | bool = False,
     ) -> InterruptObject:
-        return self.sync.initialize_interrupt(interrupt_id, vector, service_routine)
+        interrupt = self.sync.initialize_interrupt(
+            interrupt_id,
+            vector,
+            service_routine,
+        )
+        self.trace.add(
+            "threading",
+            "initialize_interrupt_abi",
+            interrupt_id=interrupt_id,
+            service_context=service_context,
+            irql=irql,
+            interrupt_mode=interrupt_mode,
+            share_vector=bool(share_vector),
+        )
+        return interrupt
 
     def ke_connect_interrupt(self, interrupt_id: int) -> bool:
         return self.sync.connect_interrupt(interrupt_id)
@@ -3694,8 +3920,17 @@ class XboxRuntimeShims:
         )
         return result
 
-    def hal_register_shutdown_notification(self, callback: int | None = None) -> int:
-        self.trace.add("hardware", "register_shutdown_notification", callback=callback)
+    def hal_register_shutdown_notification(
+        self,
+        registration: int | None = None,
+        register: int | bool = True,
+    ) -> int:
+        self.trace.add(
+            "hardware",
+            "register_shutdown_notification",
+            registration=registration,
+            register=bool(register),
+        )
         return XboxStatus.SUCCESS
 
     def hal_return_to_firmware(self, routine: int = 0) -> int:
@@ -3856,7 +4091,10 @@ _IMPLEMENTED_KERNEL_HANDLERS: dict[str, tuple[str, str]] = {
     "KeSetTimerEx": _handler("ke_set_timer_ex"),
     "KeStallExecutionProcessor": _handler("ke_stall_execution_processor"),
     "KeSynchronizeExecution": _handler("ke_synchronize_execution"),
-    "KeTickCount": _handler("ke_tick_count"),
+    # KeTickCount is exported by the Xbox kernel as volatile ULONG data. Guest
+    # code loads the thunk and then dereferences the exported address; it does
+    # not call that address as a function.
+    "KeTickCount": _handler("ke_tick_count", "data"),
     "KeWaitForMultipleObjects": _handler("ke_wait_for_multiple_objects"),
     "KeWaitForSingleObject": _handler("nt_wait_for_single_object"),
     "KfLowerIrql": _handler("kf_lower_irql"),

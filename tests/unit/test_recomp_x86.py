@@ -8,6 +8,7 @@ from pathlib import Path
 
 from tools.recomp.x86_lifter import (
     CpuState,
+    DETERMINISTIC_TSC_STEP,
     SparseMemory,
     X86ExecutionError,
     X86Decoder,
@@ -38,6 +39,41 @@ def _sum_helper_bytes() -> bytes:
 
 
 class X86RecompPrototypeTests(unittest.TestCase):
+    def test_sparse_memory_reports_only_pages_changed_since_last_boundary(self) -> None:
+        memory = SparseMemory({0x3000: 1, 0x8000: 2})
+
+        self.assertEqual(memory.consume_changed_pages(), {0x3, 0x8})
+        self.assertEqual(memory.consume_changed_pages(), set())
+
+        memory.write(0x4FFF, b"\xAA\xBB")
+        self.assertEqual(memory.consume_changed_pages(), {0x4, 0x5})
+
+    def test_absolute_byte_accumulator_moves_decode_execute_and_emit(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex(
+                "A000300000"  # mov al, byte ptr [0x3000]
+                "A201300000"  # mov byte ptr [0x3001], al
+                "C3"
+            ),
+            base_address=0x1000,
+            symbol="absolute_byte_moves",
+        )
+        state = CpuState.with_registers(eax=0xAABBCCDD, esp=0x8000)
+        memory = SparseMemory({0x3000: 0x7B, 0x8000: 0xDEADC0DE})
+
+        result = execute_lifted_function(function, state=state, memory=memory)
+
+        self.assertEqual(function.instructions[0].text(), "mov al, [0x00003000]")
+        self.assertEqual(function.instructions[1].text(), "mov [0x00003001], al")
+        self.assertEqual(result.state.get_register("eax"), 0xAABBCC7B)
+        self.assertEqual(memory.read(0x3001, 1), b"{")
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        generated = emit_cpp(function)
+        self.assertIn("ctx->read_u8", generated)
+        self.assertIn("ctx->write_u8", generated)
+        self.assertIn("dirty_page_indices", generated)
+        self.assertIn("b2r_mark_dirty_page(ctx, page", generated)
+
     def test_zero_max_steps_runs_without_a_step_limit(self) -> None:
         function = lift_x86_function(
             bytes.fromhex("9090C3"),
@@ -707,6 +743,47 @@ class X86RecompPrototypeTests(unittest.TestCase):
         self.assertFalse(result.state.flags.cf)
         self.assertEqual(result.return_address, 0xDEADC0DE)
 
+    def test_observed_repe_cmpsd_compares_dwords_and_stops_on_mismatch(self) -> None:
+        dword_compare = lift_x86_function(
+            bytes.fromhex("F3A7C3"),
+            base_address=0x3758,
+            symbol="repe_cmpsd_mismatch",
+        )
+        state = CpuState.with_registers(
+            esp=0x9000,
+            ecx=3,
+            esi=0x1000,
+            edi=0x2000,
+        )
+        memory = SparseMemory(
+            {
+                0x1000: struct.pack("<III", 1, 2, 3),
+                0x2000: struct.pack("<III", 1, 5, 3),
+                0x9000: 0xDEADC0DE,
+            }
+        )
+
+        result = execute_lifted_function(dword_compare, state=state, memory=memory)
+        emitted = emit_cpp(dword_compare, exported_symbol="repe_cmpsd_mismatch")
+
+        self.assertEqual(dword_compare.instructions[0].mnemonic, "rep_cmpsd")
+        self.assertEqual(result.state.get_register("esi"), 0x1008)
+        self.assertEqual(result.state.get_register("edi"), 0x2008)
+        self.assertEqual(result.state.get_register("ecx"), 1)
+        self.assertFalse(result.state.flags.zf)
+        self.assertTrue(result.state.flags.cf)
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        self.assertIn("ctx->read_u32", emitted)
+        self.assertIn("ctx->esi += 4u", emitted)
+        self.assertIn("result, 32u", emitted)
+
+        one_dword = lift_x86_function(
+            bytes.fromhex("A7C3"),
+            base_address=0x375B,
+            symbol="cmpsd_once",
+        )
+        self.assertEqual(one_dword.instructions[0].mnemonic, "cmpsd")
+
     def test_observed_repne_scasb_scans_until_match_or_count_exhaustion(self) -> None:
         scan = lift_x86_function(
             bytes.fromhex(
@@ -854,7 +931,7 @@ class X86RecompPrototypeTests(unittest.TestCase):
         self.assertEqual(result.return_address, 0xDEADC0DE)
         self.assertIn("fpu_load_constant", operations)
         self.assertIn("fpu_y_log2_x", operations)
-        self.assertIn("std::log10", emitted)
+        self.assertIn("0.30102999566f", emitted)
         self.assertIn("std::log2", emitted)
 
         fpu_tangent = lift_x86_function(
@@ -1346,8 +1423,93 @@ class X86RecompPrototypeTests(unittest.TestCase):
 
         self.assertEqual(result.state.get_register("eax"), 0xFFFFFFF0)
         self.assertEqual(result.state.get_register("edx"), 0x00000001)
-        self.assertEqual(result.state.timestamp_counter, 0x00000002_000B2F38)
+        self.assertEqual(
+            result.state.timestamp_counter,
+            0x00000001_FFFFFFF0 + DETERMINISTIC_TSC_STEP,
+        )
         self.assertEqual(result.return_address, 0xDEADC0DE)
+
+    def test_x87_double_memory_load_and_store_pop(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex(
+                "DD0500200000"  # fld qword [0x2000]
+                "DD1D08200000"  # fstp qword [0x2008]
+                "C3"
+            ),
+            base_address=0x3A80,
+            symbol="x87_double_round_trip",
+        )
+        state = CpuState.with_registers(esp=0x9000)
+        memory = SparseMemory(
+            {
+                0x9000: 0xDEADC0DE,
+                0x2000: struct.pack("<d", 123.25),
+            }
+        )
+
+        result = execute_lifted_function(function, state=state, memory=memory)
+        emitted = emit_cpp(function, exported_symbol="x87_double_round_trip")
+
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        self.assertEqual(struct.unpack("<d", memory.read(0x2008, 8))[0], 123.25)
+        self.assertIn("b2r_read_f64", emitted)
+        self.assertIn("b2r_write_f64", emitted)
+
+    def test_observed_x87_exponential_sequence_operations(self) -> None:
+        cases = (
+            ("D9E8C3", [], [1.0]),
+            ("D9EEC3", [], [0.0]),
+            ("D9FCC3", [2.6], [3.0]),
+            ("D9FDC3", [1.5, 2.0], [6.0, 2.0]),
+            ("D9F0C3", [0.5], [math.sqrt(2.0) - 1.0]),
+            ("D9FAC3", [4.0], [2.0]),
+            ("D9FFC3", [0.0], [1.0]),
+        )
+        for index, (code, initial_stack, expected_stack) in enumerate(cases):
+            with self.subTest(code=code):
+                function = lift_x86_function(
+                    bytes.fromhex(code),
+                    base_address=0x3AA0 + index * 0x10,
+                    symbol=f"x87_exponential_{index}",
+                )
+                state = CpuState.with_registers(esp=0x9000)
+                state.fpu_stack = list(initial_stack)
+                memory = SparseMemory({0x9000: 0xDEADC0DE})
+
+                result = execute_lifted_function(
+                    function,
+                    state=state,
+                    memory=memory,
+                )
+
+                self.assertEqual(result.return_address, 0xDEADC0DE)
+                self.assertEqual(len(result.state.fpu_stack), len(expected_stack))
+                for actual, expected in zip(result.state.fpu_stack, expected_stack):
+                    self.assertAlmostEqual(actual, expected)
+
+        sequence = lift_x86_function(
+            bytes.fromhex("D9E8D9FCD9FDD9F0C3"),
+            base_address=0x3AF0,
+            symbol="x87_exponential_sequence",
+        )
+        emitted = emit_cpp(sequence, exported_symbol="x87_exponential_sequence")
+        self.assertEqual(
+            [instruction.mnemonic for instruction in sequence.instructions[:4]],
+            ["fld1", "frndint", "fscale", "f2xm1"],
+        )
+        self.assertIn("std::nearbyint", emitted)
+        self.assertIn("std::ldexp", emitted)
+        self.assertIn("std::exp2", emitted)
+
+        constants = lift_x86_function(
+            bytes.fromhex("D9E8D9E9D9EAD9EBD9ECD9EDD9EEC3"),
+            base_address=0x3B00,
+            symbol="x87_constant_family",
+        )
+        self.assertEqual(
+            [instruction.mnemonic for instruction in constants.instructions[:7]],
+            ["fld1", "fldl2t", "fldl2e", "fldpi", "fldlg2", "fldln2", "fldz"],
+        )
 
     def test_observed_x87_stack_register_arithmetic_and_pop_forms(self) -> None:
         function = lift_x86_function(
@@ -1539,6 +1701,27 @@ class X86RecompPrototypeTests(unittest.TestCase):
         self.assertIn("xmm_add_packed_float", operations)
         self.assertIn("b2r_xmm_shuffle", emitted)
         self.assertIn("b2r_write_xmm", emitted)
+
+    def test_sqrtps_decodes_and_computes_all_packed_lanes(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex("0F510500200000C3"),
+            base_address=0x3950,
+            symbol="sse_packed_sqrt",
+        )
+        state = CpuState.with_registers(esp=0x9000)
+        memory = SparseMemory(
+            {
+                0x9000: 0xDEADC0DE,
+                0x2000: struct.pack("<4f", 1.0, 4.0, 9.0, 16.0),
+            }
+        )
+
+        result = execute_lifted_function(function, state=state, memory=memory)
+        emitted = emit_cpp(function, exported_symbol="sse_packed_sqrt")
+
+        self.assertEqual(function.instructions[0].mnemonic, "sqrtps")
+        self.assertEqual(result.state.get_xmm_register("xmm0"), (1.0, 2.0, 3.0, 4.0))
+        self.assertIn("b2r_xmm_sqrt", emitted)
 
     def test_observed_sse_packed_half_interleave_and_move_forms(self) -> None:
         function = lift_x86_function(

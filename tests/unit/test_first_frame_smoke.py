@@ -24,6 +24,87 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("controller_state_published", host_source)
         self.assertIn('"--live-render-stream-json" if live_render_stream', runner_source)
 
+    def test_live_reload_waits_only_for_in_flight_frame_and_reuses_pipelines(self) -> None:
+        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+
+        self.assertIn('"vkWaitForFences(live reload)"', source)
+        self.assertNotIn('"vkDeviceWaitIdle(live reload)"', source)
+        self.assertIn("nv2a_graphics_pipeline_cache_hit", source)
+        self.assertIn("graphics_pipelines_.begin(), graphics_pipelines_.end()", source)
+
+    def test_live_reload_cost_does_not_scale_with_complete_command_history(self) -> None:
+        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+
+        self.assertIn("interpret_recovered_d3d_append", source)
+        self.assertIn("last_interpreted_command_delta_", source)
+        self.assertIn("presentable_command_record_count", source)
+        self.assertNotIn("tail_context_commands = 65536", source)
+        self.assertIn("record_count > commands.capacity()", source)
+        self.assertIn("commands.size() / 4u", source)
+        self.assertIn("std::array<uint8_t, 8> payload{}", source)
+        self.assertIn("uint8_t payload_size = 0", source)
+        command_struct = source.split("struct RecoveredD3DCommand", 1)[1].split("};", 1)[0]
+        self.assertNotIn("std::vector<uint8_t> payload;", command_struct)
+        # The one-shot loader still reserves its known final size; the live
+        # append path must not reserve the exact growing count on each reload.
+        self.assertEqual(source.count("commands.reserve(record_count);"), 1)
+
+    def test_live_reload_batches_reads_reuses_texture_content_and_paces_at_60_hz(self) -> None:
+        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+
+        self.assertIn("std::vector<uint8_t> appended_bytes", source)
+        self.assertIn("read_live_render_manifest", source)
+        self.assertIn("read_text_handle_shared(live_manifest_file_)", source)
+        self.assertIn('"B2PRS001"', source)
+        self.assertIn("acknowledge_current_presentation();", source)
+        self.assertIn("OpenEventW", source)
+        self.assertIn("SetEvent(presentation_ack_event_)", source)
+        self.assertIn("WaitForMultipleObjects", source)
+        self.assertIn("publication_event_", source)
+        self.assertIn('"B2TEX001"', source)
+        self.assertIn("texture_content_identity", source)
+        self.assertIn("retain_matching", source)
+        self.assertIn('"nv2a_texture_resources_refreshed"', source)
+        self.assertIn("std::chrono::nanoseconds(16666667)", source)
+        self.assertIn("CreateWaitableTimerExW", source)
+        self.assertIn("kHighResolutionWaitableTimerFlag", source)
+        self.assertIn("wait_for_frame_deadline(next_frame_time)", source)
+        self.assertIn("constexpr auto poll_interval = std::chrono::milliseconds(1)", source)
+        self.assertIn('"target_frame_us"', source)
+
+    def test_live_reload_retries_incomplete_shared_manifest(self) -> None:
+        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+
+        self.assertIn("load_initial_recovered_render_work", source)
+        self.assertIn("live_render_startup_manifest_retried", source)
+        self.assertIn("std::chrono::seconds(2)", source)
+        self.assertIn("The validated manifest is the publication boundary", source)
+        self.assertIn("FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE", source)
+        self.assertIn("manifest_text[final_non_space] != '}'", source)
+        self.assertIn("write_time == live_render_write_time_", source)
+        self.assertNotIn("command-sidecar-only fast path", source)
+
+    def test_live_reload_samples_expensive_presented_geometry_diagnostics(self) -> None:
+        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+
+        self.assertIn("const bool emit_presented_details", source)
+        self.assertIn("live_render_reload_count_ % 120u == 0u", source)
+        self.assertIn("if (emit_presented_details)", source)
+        self.assertIn('"nv2a_presented_geometry_anomalies"', source)
+        self.assertIn("exact_center_origin_draw_count", source)
+        self.assertIn("manifest_guest_flip_count", source)
+        self.assertIn("presented_vertex_count", source)
+        self.assertIn("fullscreen_draw_count", source)
+        self.assertIn("presented_texture_addresses", source)
+
+    def test_frame_readback_reports_low_information_coverage(self) -> None:
+        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+
+        self.assertIn("bright_count", source)
+        self.assertIn("dark_count", source)
+        self.assertIn("near_solid", source)
+        self.assertIn("low_information", source)
+
     def test_keyboard_controller_pulses_survive_guest_polling_interval(self) -> None:
         source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
 

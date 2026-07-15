@@ -133,6 +133,54 @@ class PreflightValidationTests(unittest.TestCase):
         self.assertEqual(stream["write_count"], 1)
         self.assertEqual(stream["captured_write_count"], 1)
 
+    def test_live_manifest_replay_loads_binary_texture_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            commands = root / "commands.bin"
+            record = struct.pack("<BBHI8s", 0, 4, 0, 0xFED00000, bytes(8))
+            commands.write_bytes(b"B2APPND1" + record)
+            texture_payload = bytes.fromhex("1122334455667788")
+            texture_format = b"DXT1"
+            texture_hash = bytes(range(32))
+            resources = root / "resources.bin"
+            resources.write_bytes(
+                b"B2TEX001"
+                + struct.pack("<I", 1)
+                + struct.pack(
+                    "<IIIIII32s",
+                    0,
+                    0x22001000,
+                    4,
+                    4,
+                    len(texture_format),
+                    len(texture_payload),
+                    texture_hash,
+                )
+                + texture_format
+                + texture_payload
+            )
+            manifest = root / "render.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "format": "b2-recomp-live-render-manifest",
+                        "write_count": 1,
+                        "command_snapshot_path": str(commands),
+                        "resource_snapshot_path": str(resources),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            stream = load_render_stream(manifest)
+
+        self.assertEqual(stream["resource_snapshot_count"], 1)
+        self.assertEqual(stream["resource_snapshots"][0]["format"], "DXT1")
+        self.assertEqual(
+            stream["resource_snapshots"][0]["bytes_hex"],
+            texture_payload.hex().upper(),
+        )
+
     def test_render_capability_gate_rejects_metadata_and_primitive_gaps(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "render.json"

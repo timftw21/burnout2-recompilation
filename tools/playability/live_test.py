@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import datetime as dt
 import json
 import subprocess
@@ -16,13 +17,26 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tools.host.first_frame_smoke import read_debug_events
+from tools.playability.render_debug_report import (
+    build_render_debug_report,
+    write_render_debug_report,
+)
 DEFAULT_XBE = REPO_ROOT / "data" / "local" / "extracted" / "burnout_2_poi_usa" / "default.xbe"
 DEFAULT_EXTRACTED_ROOT = DEFAULT_XBE.parent
+DEFAULT_SAVE_DATA_ROOT = REPO_ROOT / "data" / "local" / "save-data"
+DEFAULT_DASHBOARD_ROOT = REPO_ROOT / "data" / "local" / "dashboard-data"
+DEFAULT_CACHE_ROOT = REPO_ROOT / "data" / "local" / "cache-data"
 DEFAULT_BLOCK_CACHE = REPO_ROOT / "reports" / "local" / "playability" / "dynamic-block-cache.json"
 DEFAULT_RENDER_STREAM = REPO_ROOT / "reports" / "local" / "live" / "render.json"
 DEFAULT_CONTROLLER_STATE = REPO_ROOT / "reports" / "local" / "live" / "controller.json"
 DEFAULT_PROBE_SUMMARY = REPO_ROOT / "reports" / "local" / "playability" / "native-live.json"
 DEFAULT_RUNNER_LOG = REPO_ROOT / "reports" / "local" / "playability" / "native-live.log"
+DEFAULT_RENDER_DEBUG_EVENTS = (
+    REPO_ROOT / "reports" / "local" / "playability" / "render-debug-events.jsonl"
+)
+DEFAULT_RENDER_DEBUG_REPORT = (
+    REPO_ROOT / "reports" / "local" / "playability" / "render-debug-report.json"
+)
 DEFAULT_AUDIT_ROOT = REPO_ROOT / "reports" / "local" / "flip-audit"
 
 
@@ -32,6 +46,9 @@ def build_guest_command(args: argparse.Namespace) -> list[str]:
         str(REPO_ROOT / "tools" / "playability" / "playability_probe.py"),
         str(args.xbe),
         "--extracted-root", str(args.extracted_root),
+        "--save-data-root", str(args.save_data_root),
+        "--dashboard-root", str(args.dashboard_root),
+        "--cache-root", str(args.cache_root),
         "--dynamic-block-cache", str(args.dynamic_block_cache),
         "--native-guest-loop",
         "--native-slice-steps", str(args.native_slice_steps),
@@ -85,6 +102,13 @@ def build_presenter_command(args: argparse.Namespace) -> list[str]:
             command.extend(
                 ["--flip-audit-max-flips", str(args.flip_audit_max_flips)]
             )
+    else:
+        command.extend(
+            [
+                "--debug-json",
+                str(getattr(args, "render_debug_events", DEFAULT_RENDER_DEBUG_EVENTS)),
+            ]
+        )
     return command
 
 
@@ -250,12 +274,122 @@ def build_lossless_flip_audit_report(
 def _stop_process(process: subprocess.Popen[bytes] | None) -> None:
     if process is None or process.poll() is not None:
         return
+    if sys.platform == "win32":
+        completed = subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if completed.returncode == 0:
+            process.wait()
+            return
     process.terminate()
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait()
+
+
+def _request_presenter_close(process: subprocess.Popen[bytes]) -> bool:
+    if sys.platform != "win32" or process.poll() is not None:
+        return False
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+    class ProcessEntry32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", ctypes.c_ulong),
+            ("cntUsage", ctypes.c_ulong),
+            ("th32ProcessID", ctypes.c_ulong),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", ctypes.c_ulong),
+            ("cntThreads", ctypes.c_ulong),
+            ("th32ParentProcessID", ctypes.c_ulong),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", ctypes.c_ulong),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    kernel32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_ulong, ctypes.c_ulong]
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.Process32FirstW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ProcessEntry32W),
+    ]
+    kernel32.Process32FirstW.restype = ctypes.c_bool
+    kernel32.Process32NextW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ProcessEntry32W),
+    ]
+    kernel32.Process32NextW.restype = ctypes.c_bool
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_bool
+
+    parent_process_ids: dict[int, int] = {}
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    if snapshot != ctypes.c_void_p(-1).value:
+        try:
+            entry = ProcessEntry32W()
+            entry.dwSize = ctypes.sizeof(ProcessEntry32W)
+            if kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+                while True:
+                    parent_process_ids[int(entry.th32ProcessID)] = int(
+                        entry.th32ParentProcessID
+                    )
+                    if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                        break
+        finally:
+            kernel32.CloseHandle(snapshot)
+    presenter_process_ids = {process.pid}
+    while True:
+        descendants = {
+            process_id
+            for process_id, parent_id in parent_process_ids.items()
+            if parent_id in presenter_process_ids
+        }
+        expanded = presenter_process_ids | descendants
+        if expanded == presenter_process_ids:
+            break
+        presenter_process_ids = expanded
+
+    window_handles: list[int] = []
+    callback_type = ctypes.WINFUNCTYPE(
+        ctypes.c_bool,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    )
+    user32.EnumWindows.argtypes = [callback_type, ctypes.c_void_p]
+    user32.EnumWindows.restype = ctypes.c_bool
+    user32.GetWindowThreadProcessId.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_ulong),
+    ]
+    user32.GetWindowThreadProcessId.restype = ctypes.c_ulong
+    user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+    user32.IsWindowVisible.restype = ctypes.c_bool
+    user32.PostMessageW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    user32.PostMessageW.restype = ctypes.c_bool
+
+    @callback_type
+    def find_window(hwnd: int, _parameter: int) -> bool:
+        process_id = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+        if process_id.value in presenter_process_ids and user32.IsWindowVisible(hwnd):
+            window_handles.append(int(hwnd or 0))
+            return False
+        return True
+
+    user32.EnumWindows(find_window, 0)
+    if not window_handles:
+        return False
+    return bool(user32.PostMessageW(window_handles[0], 0x0010, 0, 0))
 
 
 def _finalize_lossless_flip_audit(args: argparse.Namespace, result: int) -> int:
@@ -300,12 +434,38 @@ def _finalize_lossless_flip_audit(args: argparse.Namespace, result: int) -> int:
     return 1 if not audit_report["passed"] and result == 0 else result
 
 
+def _finalize_render_diagnostics(args: argparse.Namespace) -> None:
+    events_path = (
+        args.flip_audit_events
+        if getattr(args, "lossless_flip_audit", False)
+        else args.render_debug_events
+    )
+    try:
+        report = build_render_debug_report(
+            probe_summary_path=args.json_output,
+            presenter_events_path=events_path,
+            xbe_path=args.xbe,
+        )
+        write_render_debug_report(report, args.render_debug_report)
+        print(
+            "Render diagnostics: "
+            f"{report['status']}; report={args.render_debug_report}"
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(f"Could not finalize render diagnostics: {exc}")
+
+
 def run_live_test(args: argparse.Namespace) -> int:
     run_started = time.monotonic()
     args.runner_log.parent.mkdir(parents=True, exist_ok=True)
     args.live_render_stream.parent.mkdir(parents=True, exist_ok=True)
     args.live_controller_state.parent.mkdir(parents=True, exist_ok=True)
     args.json_output.parent.mkdir(parents=True, exist_ok=True)
+    args.render_debug_events.parent.mkdir(parents=True, exist_ok=True)
+    args.render_debug_report.parent.mkdir(parents=True, exist_ok=True)
+    args.save_data_root.mkdir(parents=True, exist_ok=True)
+    args.dashboard_root.mkdir(parents=True, exist_ok=True)
+    args.cache_root.mkdir(parents=True, exist_ok=True)
     if args.lossless_flip_audit:
         args.flip_audit_output_dir.mkdir(parents=True, exist_ok=True)
         args.flip_audit_frames.mkdir(parents=True, exist_ok=True)
@@ -324,6 +484,9 @@ def run_live_test(args: argparse.Namespace) -> int:
         args.live_render_stream.unlink()
     if args.live_controller_state.exists():
         args.live_controller_state.unlink()
+    for stale in (args.render_debug_events, args.render_debug_report):
+        if stale.exists():
+            stale.unlink()
     controller_consumed = args.live_controller_state.with_name(
         args.live_controller_state.name + ".consumed.json"
     )
@@ -357,18 +520,32 @@ def run_live_test(args: argparse.Namespace) -> int:
             print("Starting Vulkan presenter. Close the window or press Escape to stop.")
             presenter_started = time.monotonic()
             presenter = subprocess.Popen(build_presenter_command(args), cwd=REPO_ROOT)
-            presenter_returncode = presenter.wait()
-            args.live_controller_state.write_text(
-                json.dumps({"stop": True}, separators=(",", ":")) + "\n",
-                encoding="utf-8",
+            bounded_guest_run = args.max_steps > 0 or (
+                args.lossless_flip_audit and args.flip_audit_max_flips > 0
             )
-            try:
-                guest_returncode = guest.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                print("Guest did not stop after the presenter closed; terminating it.")
-                return presenter_returncode
+            if bounded_guest_run:
+                guest_returncode = guest.wait()
+                if presenter.poll() is None and not _request_presenter_close(presenter):
+                    print("Could not request a graceful presenter close.")
+                try:
+                    presenter_returncode = presenter.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    print("Presenter did not close after the bounded guest run.")
+                    presenter_returncode = 1
+            else:
+                presenter_returncode = presenter.wait()
+                args.live_controller_state.write_text(
+                    json.dumps({"stop": True}, separators=(",", ":")) + "\n",
+                    encoding="utf-8",
+                )
+                try:
+                    guest_returncode = guest.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    print("Guest did not stop after the presenter closed; terminating it.")
+                    return presenter_returncode
             if guest_returncode != 0:
                 print(f"Guest runner exited with code {guest_returncode}. See {args.runner_log}")
+                _finalize_render_diagnostics(args)
                 args.flip_audit_total_elapsed_seconds = time.monotonic() - run_started
                 if presenter_started is not None:
                     args.flip_audit_presenter_elapsed_seconds = (
@@ -380,6 +557,7 @@ def run_live_test(args: argparse.Namespace) -> int:
                 args.flip_audit_presenter_elapsed_seconds = (
                     time.monotonic() - presenter_started
                 )
+            _finalize_render_diagnostics(args)
             return _finalize_lossless_flip_audit(args, presenter_returncode)
         except KeyboardInterrupt:
             print("Stopping live test...")
@@ -397,11 +575,26 @@ def main() -> int:
     )
     parser.add_argument("--xbe", type=Path, default=DEFAULT_XBE)
     parser.add_argument("--extracted-root", type=Path, default=DEFAULT_EXTRACTED_ROOT)
+    parser.add_argument("--save-data-root", type=Path, default=DEFAULT_SAVE_DATA_ROOT)
+    parser.add_argument("--dashboard-root", type=Path, default=DEFAULT_DASHBOARD_ROOT)
+    parser.add_argument("--cache-root", type=Path, default=DEFAULT_CACHE_ROOT)
     parser.add_argument("--dynamic-block-cache", type=Path, default=DEFAULT_BLOCK_CACHE)
     parser.add_argument("--live-render-stream", type=Path, default=DEFAULT_RENDER_STREAM)
     parser.add_argument("--live-controller-state", type=Path, default=DEFAULT_CONTROLLER_STATE)
     parser.add_argument("--json-output", type=Path, default=DEFAULT_PROBE_SUMMARY)
     parser.add_argument("--runner-log", type=Path, default=DEFAULT_RUNNER_LOG)
+    parser.add_argument(
+        "--render-debug-events",
+        type=Path,
+        default=DEFAULT_RENDER_DEBUG_EVENTS,
+        help="Presenter JSONL used for cross-layer geometry diagnostics.",
+    )
+    parser.add_argument(
+        "--render-debug-report",
+        type=Path,
+        default=DEFAULT_RENDER_DEBUG_REPORT,
+        help="Post-run guest/host geometry provenance report.",
+    )
     parser.add_argument("--native-slice-steps", type=int, default=2500)
     parser.add_argument(
         "--max-steps",

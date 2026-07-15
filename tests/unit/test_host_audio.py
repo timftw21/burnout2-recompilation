@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import struct
 import queue
+import ctypes
 import unittest
 
 from tools.playability.host_audio import (
     PcmClip,
     RWS_PCM16_CODEC_UUID,
     WindowsPcmOutput,
+    _WaveFormatEx,
+    _prepare_queued_playback,
     parse_rws_pcm,
     parse_rws_xbox_adpcm,
     pcm_wave_bytes,
@@ -38,6 +41,9 @@ def _rws_pcm_fixture(pcm: bytes, *, sample_rate: int = 22050) -> bytes:
 
 
 class HostAudioTests(unittest.TestCase):
+    def test_waveout_pcm_format_matches_native_windows_layout(self) -> None:
+        self.assertEqual(ctypes.sizeof(_WaveFormatEx), 18)
+
     def test_master_volume_scales_pcm_without_changing_system_volume(self) -> None:
         pcm = struct.pack("<hhhh", -32768, -1000, 1000, 32767)
 
@@ -101,7 +107,11 @@ class HostAudioTests(unittest.TestCase):
         self.assertTrue(submitted)
         request = output._queue.get_nowait()
         self.assertTrue(request.loop)
-        self.assertTrue(request.wave_payload.startswith(b"RIFF"))
+        self.assertEqual(
+            struct.unpack("<hhhh", _prepare_queued_playback(request)),
+            (0, 0, 0, 0),
+        )
+        self.assertEqual(output.summary()["backend"], "winmm_waveout")
 
 
 if __name__ == "__main__":

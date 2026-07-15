@@ -18,6 +18,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <regex>
@@ -29,12 +30,16 @@
 #include <utility>
 #include <vector>
 
+#include "nv2a_vertex_program.h"
+
 namespace {
 
 constexpr uint32_t kDefaultWidth = 640;
 constexpr uint32_t kDefaultHeight = 480;
 constexpr uint32_t kDefaultFrames = 120;
-constexpr int64_t kTargetFrameMs = 16;
+constexpr int64_t kTargetFrameUs = 16667;
+constexpr auto kTargetFrameInterval = std::chrono::nanoseconds(16666667);
+constexpr DWORD kHighResolutionWaitableTimerFlag = 0x00000002u;
 constexpr int64_t kControllerMinimumPulseMs = 150;
 
 std::string narrow(const std::wstring& value) {
@@ -63,6 +68,50 @@ std::wstring widen(const std::string& value) {
     std::wstring result(static_cast<size_t>(size), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size);
     return result;
+}
+
+std::optional<std::string> read_text_handle_shared(HANDLE file) {
+    LARGE_INTEGER start{};
+    if (file == INVALID_HANDLE_VALUE
+        || !SetFilePointerEx(file, start, nullptr, FILE_BEGIN)) {
+        return std::nullopt;
+    }
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart < 0
+        || static_cast<uint64_t>(size.QuadPart) > std::numeric_limits<DWORD>::max()) {
+        return std::nullopt;
+    }
+    std::string payload(static_cast<size_t>(size.QuadPart), '\0');
+    DWORD bytes_read = 0;
+    const BOOL read_ok = payload.empty()
+        || ReadFile(
+            file,
+            payload.data(),
+            static_cast<DWORD>(payload.size()),
+            &bytes_read,
+            nullptr);
+    if (!read_ok || bytes_read != payload.size()) {
+        return std::nullopt;
+    }
+    return payload;
+}
+
+std::optional<std::string> read_text_file_shared(
+    const std::filesystem::path& path) {
+    const HANDLE file = CreateFileW(
+        path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return std::nullopt;
+    }
+    const auto payload = read_text_handle_shared(file);
+    CloseHandle(file);
+    return payload;
 }
 
 std::string escape_json(const std::string& value) {
@@ -165,7 +214,8 @@ struct RecoveredD3DCommand {
     uint32_t address = 0;
     uint32_t value = 0;
     uint32_t size = 4;
-    std::vector<uint8_t> payload;
+    std::array<uint8_t, 8> payload{};
+    uint8_t payload_size = 0;
 };
 
 struct PushBufferWord {
@@ -212,6 +262,7 @@ struct NativeDraw {
     uint32_t transform_execution_mode = 0;
     uint32_t transform_program_start = 0;
     std::array<std::array<uint32_t, 4>, 136> transform_program{};
+    std::array<std::array<uint32_t, 4>, 192> transform_constants{};
 };
 
 struct FrameReadback {
@@ -237,17 +288,93 @@ struct RecoveredTextureResource {
     uint32_t width = 0;
     uint32_t height = 0;
     std::string format;
+    std::string content_hash;
     std::vector<uint8_t> payload;
 };
 
 struct HostTexture {
     uint32_t guest_address = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::string format;
+    std::string content_hash;
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkSampler sampler = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
 };
+
+struct NativePipelineState {
+    uint32_t blend_enable = 0;
+    uint32_t color_mask = 0x01010101;
+    bool operator==(const NativePipelineState& other) const {
+        return blend_enable == other.blend_enable
+            && color_mask == other.color_mask;
+    }
+};
+
+struct HostPipeline {
+    NativePipelineState state{};
+    VkPipeline pipeline = VK_NULL_HANDLE;
+};
+
+NativePipelineState pipeline_state_for_draw(const NativeDraw& draw) {
+    return {draw.blend_enable, draw.color_mask};
+}
+
+VkColorComponentFlags nv2a_color_write_mask(uint32_t mask) {
+    VkColorComponentFlags result = 0;
+    if (mask & 0x00000001u) result |= VK_COLOR_COMPONENT_B_BIT;
+    if (mask & 0x00000100u) result |= VK_COLOR_COMPONENT_G_BIT;
+    if (mask & 0x00010000u) result |= VK_COLOR_COMPONENT_R_BIT;
+    if (mask & 0x01000000u) result |= VK_COLOR_COMPONENT_A_BIT;
+    return result;
+}
+
+uint32_t execute_presented_vertex_program(
+    std::vector<NativeVertex>& vertices,
+    const NativeDraw& draw) {
+    if (draw.transform_execution_mode != 6u
+        || draw.first_vertex + draw.vertex_count > vertices.size()) {
+        return 0;
+    }
+    uint32_t transformed = 0;
+    for (uint32_t index = 0; index < draw.vertex_count; ++index) {
+        NativeVertex& vertex = vertices[draw.first_vertex + index];
+        std::array<std::array<float, 4>, 16> inputs{};
+        for (auto& input : inputs) input[3] = 1.0f;
+        inputs[0] = {vertex.x, vertex.y, 0.0f, 1.0f};
+        inputs[3] = {vertex.r, vertex.g, vertex.b, vertex.a};
+        inputs[9] = {vertex.u, vertex.v, 0.0f, 1.0f};
+        const Nv2aVertexProgramResult result = execute_nv2a_vertex_program(
+            draw.transform_program,
+            draw.transform_constants,
+            draw.transform_program_start,
+            inputs);
+        if (!result.valid) continue;
+        const auto& position = result.outputs[0];
+        if ((result.output_masks[0] & 12u) == 12u
+            && std::isfinite(position[0]) && std::isfinite(position[1])) {
+            vertex.x = position[0];
+            vertex.y = position[1];
+        }
+        if (result.output_masks[3]) {
+            const auto& diffuse = result.outputs[3];
+            if (result.output_masks[3] & 8u) vertex.r = diffuse[0];
+            if (result.output_masks[3] & 4u) vertex.g = diffuse[1];
+            if (result.output_masks[3] & 2u) vertex.b = diffuse[2];
+            if (result.output_masks[3] & 1u) vertex.a = diffuse[3];
+        }
+        if (result.output_masks[9]) {
+            const auto& texture = result.outputs[9];
+            if (result.output_masks[9] & 8u) vertex.u = texture[0];
+            if (result.output_masks[9] & 4u) vertex.v = texture[1];
+        }
+        ++transformed;
+    }
+    return transformed;
+}
 
 struct InterpretedD3DStream {
     VkClearValue diagnostic_clear_color{};
@@ -370,6 +497,15 @@ uint32_t parse_json_u32_text(const std::string& value, const char* label) {
     return static_cast<uint32_t>(parsed);
 }
 
+uint64_t parse_json_u64_text(const std::string& value, const char* label) {
+    size_t consumed = 0;
+    const unsigned long long parsed = std::stoull(value, &consumed, 0);
+    if (consumed != value.size()) {
+        throw std::runtime_error(std::string("invalid render stream ") + label + ": " + value);
+    }
+    return static_cast<uint64_t>(parsed);
+}
+
 uint32_t parse_json_u32_wrapping_text(const std::string& value, const char* label) {
     size_t consumed = 0;
     const unsigned long long parsed = std::stoull(value, &consumed, 0);
@@ -423,6 +559,24 @@ std::vector<uint8_t> payload_from_value(uint32_t value, uint32_t size) {
         payload.push_back(static_cast<uint8_t>((value >> (byte_index * 8u)) & 0xFFu));
     }
     return payload;
+}
+
+RecoveredD3DCommand make_recovered_d3d_command(
+    RecoveredD3DCommandKind kind,
+    uint32_t address,
+    uint32_t value,
+    uint32_t size,
+    const uint8_t* payload,
+    size_t payload_size) {
+    RecoveredD3DCommand command{kind, address, value, size};
+    if (payload_size > command.payload.size()) {
+        throw std::runtime_error("render command payload exceeds the 8-byte stream record");
+    }
+    if (payload_size != 0u) {
+        std::memcpy(command.payload.data(), payload, payload_size);
+        command.payload_size = static_cast<uint8_t>(payload_size);
+    }
+    return command;
 }
 
 std::optional<std::string> json_object_field_text(
@@ -518,8 +672,8 @@ std::vector<RecoveredD3DCommand> load_recovered_d3d_command_stream(
         const std::optional<std::string> bytes_hex_text = json_object_field_text(object, "bytes_hex");
         std::vector<uint8_t> payload =
             bytes_hex_text.has_value() ? parse_json_bytes_hex(*bytes_hex_text) : payload_from_value(value, size);
-        commands.push_back(
-            {kind, address, value, size, std::move(payload)});
+        commands.push_back(make_recovered_d3d_command(
+            kind, address, value, size, payload.data(), payload.size()));
     }
     if (commands.empty()) {
         throw std::runtime_error("render stream JSON contained no D3D MMIO or push-buffer writes: " + path.string());
@@ -570,17 +724,16 @@ std::vector<RecoveredD3DCommand> load_recovered_d3d_binary_stream(
         if (!file || size == 0 || size > bytes.size() || kind_raw > 1u) {
             throw std::runtime_error("invalid live command snapshot record");
         }
-        std::vector<uint8_t> payload(bytes.begin(), bytes.begin() + size);
         uint32_t value = 0;
-        std::memcpy(&value, payload.data(), std::min<size_t>(payload.size(), sizeof(value)));
-        commands.push_back({
+        std::memcpy(&value, bytes.data(), std::min<size_t>(size, sizeof(value)));
+        commands.push_back(make_recovered_d3d_command(
             kind_raw == 0u ? RecoveredD3DCommandKind::MmioWrite
                            : RecoveredD3DCommandKind::PushBufferWrite,
             address,
             value,
             size,
-            std::move(payload),
-        });
+            bytes.data(),
+            size));
     }
     if (magic_text == "B2RING01") {
         std::array<uint8_t, 0x10000> valid{};
@@ -597,16 +750,15 @@ std::vector<RecoveredD3DCommand> load_recovered_d3d_binary_stream(
             const size_t start = offset;
             while (offset < valid.size() && valid[offset] != 0u && offset - start < 8u) ++offset;
             const uint8_t size = static_cast<uint8_t>(offset - start);
-            std::vector<uint8_t> payload(ring.begin() + start, ring.begin() + offset);
             uint32_t value = 0;
-            std::memcpy(&value, payload.data(), std::min<size_t>(payload.size(), sizeof(value)));
-            commands.push_back({
+            std::memcpy(&value, ring.data() + start, std::min<size_t>(size, sizeof(value)));
+            commands.push_back(make_recovered_d3d_command(
                 RecoveredD3DCommandKind::PushBufferWrite,
                 static_cast<uint32_t>(0x80000000u + start),
                 value,
                 size,
-                std::move(payload),
-            });
+                ring.data() + start,
+                size));
         }
     }
     return commands;
@@ -654,27 +806,80 @@ bool append_recovered_d3d_binary_stream(
         if (!file || size == 0 || size > bytes.size() || kind_raw > 1u) {
             return false;
         }
-        std::vector<uint8_t> payload(bytes.begin(), bytes.begin() + size);
         uint32_t value = 0;
-        std::memcpy(&value, payload.data(), std::min<size_t>(payload.size(), sizeof(value)));
-        commands.push_back({
+        std::memcpy(&value, bytes.data(), std::min<size_t>(size, sizeof(value)));
+        commands.push_back(make_recovered_d3d_command(
             kind_raw == 0u ? RecoveredD3DCommandKind::MmioWrite
                            : RecoveredD3DCommandKind::PushBufferWrite,
             address,
             value,
             size,
-            std::move(payload),
-        });
+            bytes.data(),
+            size));
     }
     return true;
 }
 
 std::vector<RecoveredTextureResource> load_recovered_texture_resources(
     const std::filesystem::path& path) {
-    std::ifstream file(path);
+    std::ifstream file(path, std::ios::binary);
     if (!file) {
         return {};
     }
+    std::array<char, 8> magic{};
+    file.read(magic.data(), static_cast<std::streamsize>(magic.size()));
+    if (file && std::string(magic.data(), magic.size()) == "B2TEX001") {
+        uint32_t resource_count = 0;
+        file.read(reinterpret_cast<char*>(&resource_count), sizeof(resource_count));
+        std::vector<RecoveredTextureResource> resources;
+        resources.reserve(resource_count);
+        for (uint32_t index = 0; index < resource_count; ++index) {
+            uint32_t stage = 0;
+            uint32_t address = 0;
+            uint32_t width = 0;
+            uint32_t height = 0;
+            uint32_t format_size = 0;
+            uint32_t payload_size = 0;
+            std::array<uint8_t, 32> content_hash{};
+            file.read(reinterpret_cast<char*>(&stage), sizeof(stage));
+            file.read(reinterpret_cast<char*>(&address), sizeof(address));
+            file.read(reinterpret_cast<char*>(&width), sizeof(width));
+            file.read(reinterpret_cast<char*>(&height), sizeof(height));
+            file.read(reinterpret_cast<char*>(&format_size), sizeof(format_size));
+            file.read(reinterpret_cast<char*>(&payload_size), sizeof(payload_size));
+            file.read(
+                reinterpret_cast<char*>(content_hash.data()),
+                static_cast<std::streamsize>(content_hash.size()));
+            if (!file || format_size == 0u || format_size > 32u
+                || payload_size > 256u * 1024u * 1024u) {
+                throw std::runtime_error("invalid binary live texture resource header");
+            }
+            RecoveredTextureResource resource{};
+            resource.address = address;
+            resource.width = width;
+            resource.height = height;
+            resource.format.resize(format_size);
+            resource.payload.resize(payload_size);
+            file.read(resource.format.data(), static_cast<std::streamsize>(format_size));
+            file.read(
+                reinterpret_cast<char*>(resource.payload.data()),
+                static_cast<std::streamsize>(payload_size));
+            if (!file) {
+                throw std::runtime_error("truncated binary live texture resource");
+            }
+            std::ostringstream hash;
+            hash << std::hex << std::uppercase << std::setfill('0');
+            for (const uint8_t byte : content_hash) {
+                hash << std::setw(2) << static_cast<uint32_t>(byte);
+            }
+            resource.content_hash = hash.str();
+            resources.push_back(std::move(resource));
+            (void)stage;
+        }
+        return resources;
+    }
+    file.clear();
+    file.seekg(0, std::ios::beg);
     std::ostringstream buffer;
     buffer << file.rdbuf();
     const std::string text = buffer.str();
@@ -686,6 +891,7 @@ std::vector<RecoveredTextureResource> load_recovered_texture_resources(
         const auto width = json_object_field_text(object, "width");
         const auto height = json_object_field_text(object, "height");
         const auto format = json_object_field_text(object, "format");
+        const auto content_hash = json_object_field_text(object, "sha256");
         const auto bytes_hex = json_object_field_text(object, "bytes_hex");
         if (!address || !width || !height || !format || !bytes_hex) {
             continue;
@@ -695,6 +901,7 @@ std::vector<RecoveredTextureResource> load_recovered_texture_resources(
         resource.width = parse_json_u32_text(*width, "texture width");
         resource.height = parse_json_u32_text(*height, "texture height");
         resource.format = *format;
+        resource.content_hash = content_hash.value_or(std::string{});
         resource.payload = parse_json_bytes_hex(*bytes_hex);
         resources.push_back(std::move(resource));
     }
@@ -711,39 +918,32 @@ struct RecoveredD3DStreamSource {
 };
 
 std::string load_recovered_frontend_text(const std::filesystem::path& path) {
-    std::ifstream file(path);
-    if (!file) {
+    const auto text = read_text_file_shared(path);
+    if (!text.has_value()) {
         return {};
     }
-    std::ostringstream buffer;
-    buffer << file.rdbuf();
-    const std::string text = buffer.str();
     const std::regex field_regex("\"frontend_text\"\\s*:\\s*\"([^\"]*)\"");
     std::smatch match;
-    return std::regex_search(text, match, field_regex) ? match[1].str() : std::string{};
+    return std::regex_search(*text, match, field_regex) ? match[1].str() : std::string{};
 }
 
 std::filesystem::path load_recovered_resource_snapshot_path(
     const std::filesystem::path& stream_path) {
-    std::ifstream file(stream_path);
-    if (!file) {
+    const auto text = read_text_file_shared(stream_path);
+    if (!text.has_value()) {
         return stream_path;
     }
-    std::ostringstream buffer;
-    buffer << file.rdbuf();
-    const auto field = json_object_field_text(buffer.str(), "resource_snapshot_path");
+    const auto field = json_object_field_text(*text, "resource_snapshot_path");
     return field.has_value() ? std::filesystem::path(*field) : stream_path;
 }
 
 std::filesystem::path load_recovered_command_snapshot_path(
     const std::filesystem::path& stream_path) {
-    std::ifstream file(stream_path);
-    if (!file) {
+    const auto text = read_text_file_shared(stream_path);
+    if (!text.has_value()) {
         return {};
     }
-    std::ostringstream buffer;
-    buffer << file.rdbuf();
-    const auto field = json_object_field_text(buffer.str(), "command_snapshot_path");
+    const auto field = json_object_field_text(*text, "command_snapshot_path");
     return field.has_value() ? std::filesystem::path(*field) : std::filesystem::path{};
 }
 
@@ -755,10 +955,8 @@ RecoveredD3DStreamSource load_or_build_recovered_d3d_command_stream(
     if (!render_stream_json.empty()) {
         std::string owned_manifest_text;
         if (supplied_manifest_text == nullptr) {
-            std::ifstream marker_file(render_stream_json);
-            std::ostringstream marker_buffer;
-            marker_buffer << marker_file.rdbuf();
-            owned_manifest_text = marker_buffer.str();
+            owned_manifest_text = read_text_file_shared(render_stream_json).value_or(
+                std::string{});
             supplied_manifest_text = &owned_manifest_text;
         }
         const std::string& manifest_text = *supplied_manifest_text;
@@ -831,8 +1029,8 @@ VkClearValue color_from_d3d_argb(uint32_t argb) {
 
 std::vector<PushBufferWord> push_buffer_words_from_recovered_stream(
     const std::vector<RecoveredD3DCommand>& stream,
-    size_t prefix_end,
-    size_t tail_begin) {
+    size_t begin,
+    size_t end) {
     std::vector<PushBufferWord> words;
     std::array<uint8_t, 0x10000> pending_bytes{};
     std::array<uint8_t, 0x10000> pending_valid{};
@@ -881,8 +1079,8 @@ std::vector<PushBufferWord> push_buffer_words_from_recovered_stream(
         }
         std::array<uint8_t, 8> fallback_payload{};
         const uint8_t* payload_data = command.payload.data();
-        size_t payload_size = command.payload.size();
-        if (command.payload.empty()) {
+        size_t payload_size = command.payload_size;
+        if (command.payload_size == 0u) {
             payload_size = std::min<size_t>(command.size, fallback_payload.size());
             std::memcpy(fallback_payload.data(), &command.value, payload_size);
             payload_data = fallback_payload.data();
@@ -907,11 +1105,7 @@ std::vector<PushBufferWord> push_buffer_words_from_recovered_stream(
             command.address + static_cast<uint32_t>(payload_size));
     }
     };
-    consume_range(0, prefix_end);
-    if (tail_begin > prefix_end && tail_begin < stream.size()) {
-        flush_pending();
-        consume_range(tail_begin, stream.size());
-    }
+    consume_range(std::min(begin, stream.size()), std::min(end, stream.size()));
     flush_pending();
     return words;
 }
@@ -995,6 +1189,7 @@ void finish_inline_draw(InterpretedD3DStream& interpreted) {
     draw.transform_execution_mode = interpreted.transform_execution_mode;
     draw.transform_program_start = interpreted.transform_program_start;
     draw.transform_program = interpreted.transform_program;
+    draw.transform_constants = interpreted.transform_constants;
     for (uint32_t stage = 0; stage < interpreted.texture_controls.size(); ++stage) {
         if ((interpreted.texture_controls[stage] & (1u << 30u)) == 0u) {
             continue;
@@ -1203,14 +1398,20 @@ void interpret_long_non_increasing_packet(
     }
 }
 
-InterpretedD3DStream interpret_recovered_d3d_stream(
+void interpret_recovered_d3d_append(
     const std::vector<RecoveredD3DCommand>& stream,
-    size_t prefix_end,
-    size_t tail_begin) {
-    InterpretedD3DStream interpreted{};
-    interpreted.state_seed = 0xB200D3D8u;
-    auto consume_command_state = [&](size_t begin, size_t end) {
-    for (size_t command_index = begin; command_index < end; ++command_index) {
+    size_t begin,
+    size_t end,
+    InterpretedD3DStream& interpreted) {
+    const size_t bounded_begin = std::min(begin, stream.size());
+    const size_t bounded_end = std::min(std::max(end, bounded_begin), stream.size());
+    if (interpreted.state_seed == 0u) {
+        interpreted.state_seed = 0xB200D3D8u;
+    }
+    const uint32_t starting_flip_count = interpreted.flip_count;
+    for (size_t command_index = bounded_begin;
+         command_index < bounded_end;
+         ++command_index) {
         const RecoveredD3DCommand& command = stream[command_index];
         interpreted.state_seed = mix_d3d_state_seed(interpreted.state_seed, command.address);
         interpreted.state_seed = mix_d3d_state_seed(interpreted.state_seed, command.value);
@@ -1223,19 +1424,16 @@ InterpretedD3DStream interpret_recovered_d3d_stream(
             }
         }
     }
-    };
-    consume_command_state(0, prefix_end);
-    if (tail_begin > prefix_end && tail_begin < stream.size()) {
-        consume_command_state(tail_begin, stream.size());
-    }
     const std::vector<PushBufferWord> words = push_buffer_words_from_recovered_stream(
-        stream, prefix_end, tail_begin);
-    interpreted.push_buffer_word_count = static_cast<uint32_t>(words.size());
+        stream, bounded_begin, bounded_end);
+    interpreted.push_buffer_word_count += static_cast<uint32_t>(words.size());
     const SurfacePayloadCandidate surface_payload = dominant_surface_payload_from_words(words);
-    interpreted.surface_payload_color_valid = surface_payload.valid;
-    interpreted.surface_payload_argb = surface_payload.argb;
-    interpreted.surface_payload_sample_count = surface_payload.sample_count;
-    interpreted.surface_payload_dominant_count = surface_payload.dominant_count;
+    if (surface_payload.valid) {
+        interpreted.surface_payload_color_valid = true;
+        interpreted.surface_payload_argb = surface_payload.argb;
+        interpreted.surface_payload_sample_count = surface_payload.sample_count;
+        interpreted.surface_payload_dominant_count = surface_payload.dominant_count;
+    }
     size_t index = 0;
     while (index < words.size()) {
         const uint32_t word = words[index].value;
@@ -1256,10 +1454,42 @@ InterpretedD3DStream interpret_recovered_d3d_stream(
             ++index;
         }
     }
-    finish_inline_draw(interpreted);
-    if (interpreted.flip_count == 0u) {
+    if (interpreted.flip_count != starting_flip_count) {
+        std::vector<NativeVertex> retained_vertices;
+        std::vector<NativeDraw> retained_draws;
+        auto retain_draw_range = [&](size_t first, size_t count) {
+            const size_t draw_end = std::min(first + count, interpreted.draws.size());
+            for (size_t draw_index = std::min(first, interpreted.draws.size());
+                 draw_index < draw_end;
+                 ++draw_index) {
+                NativeDraw draw = interpreted.draws[draw_index];
+                const size_t vertex_begin = std::min<size_t>(
+                    draw.first_vertex, interpreted.vertices.size());
+                const size_t vertex_end = std::min<size_t>(
+                    vertex_begin + draw.vertex_count, interpreted.vertices.size());
+                draw.first_vertex = static_cast<uint32_t>(retained_vertices.size());
+                draw.vertex_count = static_cast<uint32_t>(vertex_end - vertex_begin);
+                retained_vertices.insert(
+                    retained_vertices.end(),
+                    interpreted.vertices.begin() + vertex_begin,
+                    interpreted.vertices.begin() + vertex_end);
+                retained_draws.push_back(std::move(draw));
+            }
+        };
+        retain_draw_range(
+            interpreted.presented_draw_begin,
+            interpreted.presented_draw_count);
+        const uint32_t retained_presented_count =
+            static_cast<uint32_t>(retained_draws.size());
+        retain_draw_range(
+            interpreted.frame_draw_begin,
+            interpreted.draws.size() - std::min<size_t>(
+                interpreted.frame_draw_begin, interpreted.draws.size()));
+        interpreted.vertices = std::move(retained_vertices);
+        interpreted.draws = std::move(retained_draws);
         interpreted.presented_draw_begin = 0u;
-        interpreted.presented_draw_count = static_cast<uint32_t>(interpreted.draws.size());
+        interpreted.presented_draw_count = retained_presented_count;
+        interpreted.frame_draw_begin = retained_presented_count;
     }
     if (interpreted.clear_color_valid) {
         interpreted.diagnostic_clear_color = color_from_d3d_argb(interpreted.clear_color_argb);
@@ -1268,45 +1498,19 @@ InterpretedD3DStream interpret_recovered_d3d_stream(
     } else {
         interpreted.diagnostic_clear_color = color_from_interpreted_d3d_state(interpreted.state_seed);
     }
-    return interpreted;
 }
 
 InterpretedD3DStream interpret_recovered_d3d_stream(
     const std::vector<RecoveredD3DCommand>& stream) {
-    return interpret_recovered_d3d_stream(stream, stream.size(), stream.size());
-}
-
-std::pair<size_t, size_t> live_interpretation_ranges(
-    const std::vector<RecoveredD3DCommand>& stream) {
-    constexpr size_t prefix_commands = 4096;
-    constexpr size_t tail_commands = 32768;
-    constexpr size_t bounded_threshold = 49152;
-    if (stream.size() <= bounded_threshold) {
-        return {stream.size(), stream.size()};
+    InterpretedD3DStream interpreted{};
+    interpreted.state_seed = 0xB200D3D8u;
+    interpret_recovered_d3d_append(stream, 0u, stream.size(), interpreted);
+    finish_inline_draw(interpreted);
+    if (interpreted.flip_count == 0u) {
+        interpreted.presented_draw_begin = 0u;
+        interpreted.presented_draw_count = static_cast<uint32_t>(interpreted.draws.size());
     }
-    const size_t prefix_end = std::min(prefix_commands, stream.size());
-    const size_t desired_tail = stream.size() - tail_commands;
-    size_t tail_begin = desired_tail;
-    uint32_t pending_max_address = 0;
-    for (size_t index = prefix_end; index < stream.size(); ++index) {
-        const RecoveredD3DCommand& command = stream[index];
-        if (command.kind != RecoveredD3DCommandKind::PushBufferWrite) {
-            pending_max_address = 0;
-            continue;
-        }
-        if (pending_max_address != 0
-            && command.address + 0x1000u < pending_max_address) {
-            if (index >= desired_tail) {
-                tail_begin = index;
-                break;
-            }
-            pending_max_address = 0;
-        }
-        pending_max_address = std::max(
-            pending_max_address,
-            command.address + std::max<uint32_t>(1u, command.size));
-    }
-    return {prefix_end, tail_begin};
+    return interpreted;
 }
 
 class DebugLog {
@@ -1396,11 +1600,17 @@ public:
         create_render_pass();
         create_framebuffers();
         create_command_pool();
-        load_recovered_render_work();
+        if (!load_initial_recovered_render_work()) {
+            throw std::runtime_error("live render manifest was incomplete at startup");
+        }
         create_native_graphics_pipeline();
         create_native_render_resources();
         create_readback_buffer();
         create_command_buffers();
+        if (publication_event_) {
+            ResetEvent(publication_event_);
+        }
+        acknowledge_current_presentation();
         create_sync_objects();
         main_loop();
         vkDeviceWaitIdle(device_);
@@ -1410,6 +1620,45 @@ public:
     }
 
 private:
+    std::optional<std::string> read_live_render_manifest() {
+        if (!options_.flip_audit_ack.empty()) {
+            // Audit publications are atomic replacements, so every read must
+            // open the newest file identity.
+            return read_text_file_shared(options_.render_stream_json);
+        }
+        if (live_manifest_file_ == INVALID_HANDLE_VALUE) {
+            live_manifest_file_ = CreateFileW(
+                options_.render_stream_json.c_str(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+        }
+        return read_text_handle_shared(live_manifest_file_);
+    }
+
+    bool load_initial_recovered_render_work() {
+        const auto deadline = std::chrono::steady_clock::now()
+            + std::chrono::seconds(2);
+        uint32_t retry_count = 0;
+        while (!load_recovered_render_work()) {
+            if (!options_.live_render_stream
+                || std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            ++retry_count;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (retry_count != 0) {
+            log_.emit(
+                "live_render_startup_manifest_retried",
+                {{"retries", std::to_string(retry_count)}});
+        }
+        return true;
+    }
+
     bool update_flip_audit_manifest_state(const std::string& manifest_text) {
         if (options_.flip_audit_ack.empty() || manifest_text.empty()) {
             return options_.flip_audit_ack.empty();
@@ -1475,6 +1724,7 @@ private:
 
     bool append_live_command_stream(
         const std::filesystem::path& path,
+        size_t required_record_count,
         std::vector<RecoveredD3DCommand>& commands) {
         if (path != live_command_file_path_ || !live_command_file_.is_open()) {
             live_command_file_.close();
@@ -1492,51 +1742,56 @@ private:
             }
             live_command_file_path_ = path;
         }
-        std::error_code size_error;
-        const uintmax_t byte_size = std::filesystem::file_size(path, size_error);
         constexpr uintmax_t header_size = 8;
         constexpr uintmax_t record_size = 16;
-        if (size_error || byte_size < header_size
-            || (byte_size - header_size) % record_size != 0) {
-            return false;
-        }
-        const size_t record_count = static_cast<size_t>(
-            (byte_size - header_size) / record_size);
-        if (record_count < commands.size()) {
-            return false;
+        // The manifest is the validated publication boundary and is written
+        // only after the producer flushes this many records. Avoid a separate
+        // filesystem metadata query and do not parse commands from a newer,
+        // in-progress guest frame merely because they already exist on disk.
+        const size_t record_count = required_record_count;
+        if (record_count <= commands.size()) {
+            return true;
         }
         live_command_file_.clear();
         live_command_file_.seekg(
             static_cast<std::streamoff>(header_size + commands.size() * record_size),
             std::ios::beg);
-        commands.reserve(record_count);
-        while (commands.size() < record_count) {
-            uint8_t kind_raw = 0;
-            uint8_t size = 0;
-            uint16_t reserved = 0;
+        if (record_count > commands.capacity()) {
+            // The sidecar is append-only. Leave geometric slack so a live
+            // reload does not relocate the complete command history for every
+            // small producer append.
+            const size_t growth = std::max<size_t>(
+                65536u,
+                commands.size() / 4u);
+            commands.reserve(std::max(record_count, commands.size() + growth));
+        }
+        const size_t appended_count = record_count - commands.size();
+        std::vector<uint8_t> appended_bytes(appended_count * record_size);
+        live_command_file_.read(
+            reinterpret_cast<char*>(appended_bytes.data()),
+            static_cast<std::streamsize>(appended_bytes.size()));
+        if (!live_command_file_) {
+            return false;
+        }
+        for (size_t record_index = 0; record_index < appended_count; ++record_index) {
+            const uint8_t* record = appended_bytes.data() + record_index * record_size;
+            const uint8_t kind_raw = record[0];
+            const uint8_t size = record[1];
             uint32_t address = 0;
-            std::array<uint8_t, 8> bytes{};
-            live_command_file_.read(reinterpret_cast<char*>(&kind_raw), sizeof(kind_raw));
-            live_command_file_.read(reinterpret_cast<char*>(&size), sizeof(size));
-            live_command_file_.read(reinterpret_cast<char*>(&reserved), sizeof(reserved));
-            live_command_file_.read(reinterpret_cast<char*>(&address), sizeof(address));
-            live_command_file_.read(
-                reinterpret_cast<char*>(bytes.data()),
-                static_cast<std::streamsize>(bytes.size()));
-            if (!live_command_file_ || size == 0 || size > bytes.size() || kind_raw > 1u) {
+            std::memcpy(&address, record + 4u, sizeof(address));
+            if (size == 0 || size > 8u || kind_raw > 1u) {
                 return false;
             }
-            std::vector<uint8_t> payload(bytes.begin(), bytes.begin() + size);
             uint32_t value = 0;
-            std::memcpy(&value, payload.data(), std::min<size_t>(payload.size(), sizeof(value)));
-            commands.push_back({
+            std::memcpy(&value, record + 8u, std::min<size_t>(size, sizeof(value)));
+            commands.push_back(make_recovered_d3d_command(
                 kind_raw == 0u ? RecoveredD3DCommandKind::MmioWrite
                                : RecoveredD3DCommandKind::PushBufferWrite,
                 address,
                 value,
                 size,
-                std::move(payload),
-            });
+                record + 8u,
+                size));
         }
         return true;
     }
@@ -1983,39 +2238,22 @@ private:
             });
     }
 
-    void load_recovered_render_work(bool command_growth_only = false) {
+    bool load_recovered_render_work() {
         const auto command_load_begin = std::chrono::steady_clock::now();
-        if (command_growth_only) {
-            if (!append_live_command_stream(
-                    live_command_file_path_, recovered_source_.commands)) {
-                return;
-            }
-            recovered_source_.resources_unchanged = true;
-            const auto before_interpret = std::chrono::steady_clock::now();
-            const auto [interpret_prefix_end, interpret_tail_begin] =
-                live_interpretation_ranges(recovered_source_.commands);
-            interpreted_stream_ = interpret_recovered_d3d_stream(
-                recovered_source_.commands,
-                interpret_prefix_end,
-                interpret_tail_begin);
-            interpreted_source_command_count_ =
-                interpret_prefix_end + recovered_source_.commands.size() - interpret_tail_begin;
-            const auto after_interpret = std::chrono::steady_clock::now();
-            last_command_load_us_ = std::chrono::duration_cast<std::chrono::microseconds>(
-                before_interpret - command_load_begin).count();
-            last_interpret_us_ = std::chrono::duration_cast<std::chrono::microseconds>(
-                after_interpret - before_interpret).count();
-            return;
-        }
+        auto after_manifest_read = command_load_begin;
         bool resources_unchanged = false;
         std::filesystem::path resource_source;
         std::filesystem::file_time_type resource_write_time{};
         std::string manifest_text;
         if (options_.live_render_stream && !options_.render_stream_json.empty()) {
-            std::ifstream manifest_file(options_.render_stream_json);
-            std::ostringstream manifest_buffer;
-            manifest_buffer << manifest_file.rdbuf();
-            manifest_text = manifest_buffer.str();
+            manifest_text = read_live_render_manifest().value_or(
+                std::string{});
+            after_manifest_read = std::chrono::steady_clock::now();
+            const size_t final_non_space = manifest_text.find_last_not_of(" \t\r\n");
+            if (final_non_space == std::string::npos
+                || manifest_text[final_non_space] != '}') {
+                return false;
+            }
             if (!options_.flip_audit_ack.empty()) {
                 const auto deadline = std::chrono::steady_clock::now()
                     + std::chrono::seconds(2);
@@ -2025,11 +2263,32 @@ private:
                             "lossless flip audit manifest is missing required fields");
                     }
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                    std::ifstream retry_file(options_.render_stream_json);
-                    std::ostringstream retry_buffer;
-                    retry_buffer << retry_file.rdbuf();
-                    manifest_text = retry_buffer.str();
+                    manifest_text = read_live_render_manifest().value_or(
+                        std::string{});
                 }
+            }
+            const auto guest_flip_field = json_object_field_text(
+                manifest_text, "guest_flip_count");
+            const auto guest_steps_field = json_object_field_text(
+                manifest_text, "guest_steps");
+            const auto presentable_command_field = json_object_field_text(
+                manifest_text, "presentable_command_record_count");
+            const auto published_command_field = json_object_field_text(
+                manifest_text, "published_command_record_count");
+            if (guest_flip_field.has_value()) {
+                current_manifest_guest_flip_count_ = parse_json_u64_text(
+                    *guest_flip_field, "guest flip count");
+            }
+            if (guest_steps_field.has_value()) {
+                current_manifest_guest_steps_ = parse_json_u64_text(
+                    *guest_steps_field, "guest steps");
+            }
+            if (presentable_command_field.has_value()) {
+                current_manifest_presentable_command_count_ = parse_json_u64_text(
+                    *presentable_command_field, "presentable command record count");
+            } else if (published_command_field.has_value()) {
+                current_manifest_presentable_command_count_ = parse_json_u64_text(
+                    *published_command_field, "published command record count");
             }
             const auto resource_field = json_object_field_text(
                 manifest_text, "resource_snapshot_path");
@@ -2063,6 +2322,49 @@ private:
         const auto generation_field = manifest_text.empty()
             ? std::optional<std::string>{}
             : json_object_field_text(manifest_text, "command_stream_generation");
+        const auto presentation_ack_field = manifest_text.empty()
+            ? std::optional<std::string>{}
+            : json_object_field_text(manifest_text, "presentation_ack_path");
+        const auto presentation_event_field = manifest_text.empty()
+            ? std::optional<std::string>{}
+            : json_object_field_text(manifest_text, "presentation_event_name");
+        const auto publication_event_field = manifest_text.empty()
+            ? std::optional<std::string>{}
+            : json_object_field_text(manifest_text, "publication_event_name");
+        if (presentation_ack_field.has_value()) {
+            const std::filesystem::path next_ack_path(*presentation_ack_field);
+            if (next_ack_path != presentation_ack_path_) {
+                if (presentation_ack_file_ != INVALID_HANDLE_VALUE) {
+                    CloseHandle(presentation_ack_file_);
+                    presentation_ack_file_ = INVALID_HANDLE_VALUE;
+                }
+                presentation_ack_path_ = next_ack_path;
+                acknowledged_presentation_flip_ = 0u;
+            }
+        }
+        if (presentation_event_field.has_value()
+            && *presentation_event_field != presentation_event_name_) {
+            if (presentation_ack_event_) {
+                CloseHandle(presentation_ack_event_);
+                presentation_ack_event_ = nullptr;
+            }
+            presentation_event_name_ = *presentation_event_field;
+        }
+        if (publication_event_field.has_value()
+            && *publication_event_field != publication_event_name_) {
+            if (publication_event_) {
+                CloseHandle(publication_event_);
+                publication_event_ = nullptr;
+            }
+            publication_event_name_ = *publication_event_field;
+            publication_event_ = OpenEventW(
+                SYNCHRONIZE,
+                FALSE,
+                widen(publication_event_name_).c_str());
+        }
+        const bool command_generation_changed = options_.live_render_stream
+            && generation_field.has_value()
+            && *generation_field != live_command_generation_;
         const bool incremental_commands = options_.live_render_stream
             && command_field.has_value()
             && generation_field.has_value()
@@ -2071,20 +2373,28 @@ private:
         if (incremental_commands) {
             retained_commands = std::move(recovered_source_.commands);
         }
+        const auto before_source_load = std::chrono::steady_clock::now();
         RecoveredD3DStreamSource next_source = load_or_build_recovered_d3d_command_stream(
             options_.render_stream_json,
             !resources_unchanged,
             manifest_text.empty() ? nullptr : &manifest_text,
             !incremental_commands);
         if (incremental_commands) {
+            const size_t required_record_count = static_cast<size_t>(
+                std::min<uint64_t>(
+                    current_manifest_presentable_command_count_,
+                    std::numeric_limits<size_t>::max()));
             if (append_live_command_stream(
-                    std::filesystem::path(*command_field), retained_commands)) {
+                    std::filesystem::path(*command_field),
+                    required_record_count,
+                    retained_commands)) {
                 next_source.commands = std::move(retained_commands);
             } else {
                 next_source.commands = load_recovered_d3d_binary_stream(
                     std::filesystem::path(*command_field));
             }
         }
+        const auto after_source_load = std::chrono::steady_clock::now();
         if (options_.live_render_stream) {
             if (generation_field.has_value()
                 && *generation_field != live_command_generation_
@@ -2111,21 +2421,47 @@ private:
             recovered_source_.commands.resize(current_audit_command_count_);
         }
         const auto before_interpret = std::chrono::steady_clock::now();
-        const auto [interpret_prefix_end, interpret_tail_begin] =
-            options_.live_render_stream
-                ? live_interpretation_ranges(recovered_source_.commands)
-                : std::pair<size_t, size_t>{
-                    recovered_source_.commands.size(),
-                    recovered_source_.commands.size()};
-        interpreted_stream_ = interpret_recovered_d3d_stream(
-            recovered_source_.commands,
-            interpret_prefix_end,
-            interpret_tail_begin);
-        interpreted_source_command_count_ =
-            interpret_prefix_end + recovered_source_.commands.size() - interpret_tail_begin;
+        if (options_.live_render_stream) {
+            const size_t presentable_command_count = static_cast<size_t>(
+                std::min<uint64_t>(
+                    current_manifest_presentable_command_count_,
+                    std::numeric_limits<size_t>::max()));
+            if (presentable_command_count > recovered_source_.commands.size()) {
+                std::ostringstream message;
+                message << "live render manifest requires "
+                        << presentable_command_count << " commands but sidecar has "
+                        << recovered_source_.commands.size();
+                throw std::runtime_error(message.str());
+            }
+            if (command_generation_changed
+                || interpreted_source_command_count_ > presentable_command_count) {
+                interpreted_stream_ = InterpretedD3DStream{};
+                interpreted_stream_.state_seed = 0xB200D3D8u;
+                interpreted_source_command_count_ = 0u;
+            }
+            last_interpreted_command_delta_ =
+                presentable_command_count - interpreted_source_command_count_;
+            interpret_recovered_d3d_append(
+                recovered_source_.commands,
+                interpreted_source_command_count_,
+                presentable_command_count,
+                interpreted_stream_);
+            interpreted_source_command_count_ = presentable_command_count;
+        } else {
+            interpreted_stream_ = interpret_recovered_d3d_stream(
+                recovered_source_.commands);
+            interpreted_source_command_count_ = recovered_source_.commands.size();
+            last_interpreted_command_delta_ = interpreted_source_command_count_;
+        }
         const auto after_interpret = std::chrono::steady_clock::now();
         last_command_load_us_ = std::chrono::duration_cast<std::chrono::microseconds>(
             before_interpret - command_load_begin).count();
+        last_manifest_read_us_ = std::chrono::duration_cast<std::chrono::microseconds>(
+            after_manifest_read - command_load_begin).count();
+        last_manifest_parse_us_ = std::chrono::duration_cast<std::chrono::microseconds>(
+            before_source_load - after_manifest_read).count();
+        last_source_load_us_ = std::chrono::duration_cast<std::chrono::microseconds>(
+            after_source_load - before_source_load).count();
         last_interpret_us_ = std::chrono::duration_cast<std::chrono::microseconds>(
             after_interpret - before_interpret).count();
         recovered_frontend_text_ = recovered_source_.frontend_text;
@@ -2134,6 +2470,7 @@ private:
             live_render_write_time_ = std::filesystem::last_write_time(
                 options_.render_stream_json, error);
         }
+        return true;
     }
 
     void destroy_native_render_resources(
@@ -2171,78 +2508,52 @@ private:
         }
         presented_half_quad_recovered_ = false;
         presented_overscan_height_recovered_ = false;
+        presented_vertex_program_transformed_count_ = 0;
         frontend_text_rectangle_count_ = 0;
     }
 
-    void reload_live_render_work() {
+    void reload_live_render_work(bool publication_signaled = false) {
         if (!options_.live_render_stream) {
             return;
         }
         std::error_code error;
         const auto write_time = std::filesystem::last_write_time(
             options_.render_stream_json, error);
-        bool command_growth = false;
-        if (!live_command_file_path_.empty()) {
-            std::error_code size_error;
-            const uintmax_t command_bytes = std::filesystem::file_size(
-                live_command_file_path_, size_error);
-            const uintmax_t consumed_bytes = 8u
-                + static_cast<uintmax_t>(recovered_source_.commands.size()) * 16u;
-            command_growth = !size_error && command_bytes > consumed_bytes;
-        }
-        // Audit manifests carry the exact flip boundary. Never take the
-        // command-sidecar-only fast path because it could consume writes from
-        // the following frame without advancing the audited flip identity.
-        if (!options_.flip_audit_ack.empty()) {
-            command_growth = false;
-        }
-        bool resource_changed = false;
-        if (!recovered_source_.resource_source.empty()) {
-            std::error_code resource_error;
-            const auto resource_time = std::filesystem::last_write_time(
-                recovered_source_.resource_source, resource_error);
-            resource_changed = !resource_error
-                && resource_time != live_resource_write_time_;
-        }
-        if (command_growth && resource_changed) {
-            command_growth = false;
-        }
-        if (!command_growth && !resource_changed
-            && (error || write_time == live_render_write_time_)) {
+        // The validated manifest is the publication boundary. Command/resource
+        // sidecars are written first and may grow while a guest frame is still
+        // under construction; consuming them directly would replay partial
+        // work under a stale flip identity.
+        if (error || (!publication_signaled && write_time == live_render_write_time_)) {
             return;
         }
         const auto reload_begin = std::chrono::steady_clock::now();
-        vk_check(vkDeviceWaitIdle(device_), "vkDeviceWaitIdle(live reload)");
+        // Only one frame can be in flight. Waiting for its fence is sufficient
+        // before replacing command buffers/resources and avoids draining the
+        // entire device on every guest publication.
+        vk_check(
+            vkWaitForFences(device_, 1, &in_flight_, VK_TRUE, UINT64_MAX),
+            "vkWaitForFences(live reload)");
         const auto after_wait = std::chrono::steady_clock::now();
-        load_recovered_render_work(command_growth);
-        if (command_growth) {
-            std::error_code latest_manifest_error;
-            const auto latest_manifest_time = std::filesystem::last_write_time(
-                options_.render_stream_json, latest_manifest_error);
-            if (!latest_manifest_error) {
-                live_render_write_time_ = latest_manifest_time;
-            }
-        } else {
-            std::error_code latest_resource_error;
-            const auto latest_resource_time = std::filesystem::last_write_time(
-                recovered_source_.resource_source, latest_resource_error);
-            if (!latest_resource_error) {
-                live_resource_write_time_ = latest_resource_time;
-            }
+        if (!load_recovered_render_work()) {
+            return;
         }
         const auto after_load = std::chrono::steady_clock::now();
-        const bool preserve_textures = recovered_source_.resources_unchanged
-            && !host_textures_.empty();
+        // Keep existing images alive across a resource generation change so
+        // refresh_host_textures can retain payload-identical textures and
+        // upload only additions/replacements.
+        const bool preserve_textures = !host_textures_.empty();
         const VkDeviceSize required_vertex_bytes =
             interpreted_stream_.vertices.size() * sizeof(NativeVertex);
         const bool preserve_vertex_buffer = vertex_buffer_ != VK_NULL_HANDLE
             && required_vertex_bytes != 0
             && required_vertex_bytes <= vertex_buffer_size_;
         destroy_native_render_resources(preserve_textures, preserve_vertex_buffer);
-        create_native_render_resources(!preserve_textures);
+        create_native_render_resources(!recovered_source_.resources_unchanged);
+        create_native_graphics_pipeline();
         const auto after_resources = std::chrono::steady_clock::now();
         create_command_buffers();
         const auto after_commands = std::chrono::steady_clock::now();
+        acknowledge_current_presentation();
         ++live_render_reload_count_;
         log_.emit(
             "live_render_stream_reloaded",
@@ -2250,11 +2561,23 @@ private:
                 {"reload", std::to_string(live_render_reload_count_)},
                 {"writes", std::to_string(recovered_source_.commands.size())},
                 {"guest_flips", std::to_string(interpreted_stream_.flip_count)},
+                {"manifest_guest_flip_count", std::to_string(current_manifest_guest_flip_count_)},
+                {"manifest_guest_steps", std::to_string(current_manifest_guest_steps_)},
+                {"presentable_command_record_count", std::to_string(current_manifest_presentable_command_count_)},
                 {"interpreted_source_commands", std::to_string(interpreted_source_command_count_)},
+                {"interpreted_command_delta", std::to_string(last_interpreted_command_delta_)},
+                {"exact_completed_flip", json_bool(
+                    interpreted_source_command_count_
+                        == current_manifest_presentable_command_count_
+                    && interpreted_stream_.flip_count
+                        == current_manifest_guest_flip_count_)},
                 {"resources_unchanged", json_bool(recovered_source_.resources_unchanged)},
                 {"wait_us", std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(after_wait - reload_begin).count())},
                 {"load_interpret_us", std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(after_load - after_wait).count())},
                 {"command_load_us", std::to_string(last_command_load_us_)},
+                {"manifest_read_us", std::to_string(last_manifest_read_us_)},
+                {"manifest_parse_us", std::to_string(last_manifest_parse_us_)},
+                {"source_load_us", std::to_string(last_source_load_us_)},
                 {"interpret_us", std::to_string(last_interpret_us_)},
                 {"resource_update_us", std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(after_resources - after_load).count())},
                 {"command_record_us", std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(after_commands - after_resources).count())},
@@ -2289,24 +2612,52 @@ private:
     }
 
     void create_native_graphics_pipeline() {
-        VkDescriptorSetLayoutBinding sampler_binding{};
-        sampler_binding.binding = 0;
-        sampler_binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        sampler_binding.descriptorCount = 1;
-        sampler_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-        VkDescriptorSetLayoutCreateInfo descriptor_info{};
-        descriptor_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        descriptor_info.bindingCount = 1;
-        descriptor_info.pBindings = &sampler_binding;
-        vk_check(
-            vkCreateDescriptorSetLayout(device_, &descriptor_info, nullptr, &texture_descriptor_layout_),
-            "vkCreateDescriptorSetLayout");
+        if (!texture_descriptor_layout_) {
+            VkDescriptorSetLayoutBinding sampler_binding{};
+            sampler_binding.binding = 0;
+            sampler_binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            sampler_binding.descriptorCount = 1;
+            sampler_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            VkDescriptorSetLayoutCreateInfo descriptor_info{};
+            descriptor_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            descriptor_info.bindingCount = 1;
+            descriptor_info.pBindings = &sampler_binding;
+            vk_check(
+                vkCreateDescriptorSetLayout(device_, &descriptor_info, nullptr, &texture_descriptor_layout_),
+                "vkCreateDescriptorSetLayout");
 
-        VkPipelineLayoutCreateInfo layout_info{};
-        layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        layout_info.setLayoutCount = 1;
-        layout_info.pSetLayouts = &texture_descriptor_layout_;
-        vk_check(vkCreatePipelineLayout(device_, &layout_info, nullptr, &pipeline_layout_), "vkCreatePipelineLayout");
+            VkPipelineLayoutCreateInfo layout_info{};
+            layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+            layout_info.setLayoutCount = 1;
+            layout_info.pSetLayouts = &texture_descriptor_layout_;
+            vk_check(vkCreatePipelineLayout(device_, &layout_info, nullptr, &pipeline_layout_), "vkCreatePipelineLayout");
+        }
+
+        std::vector<NativePipelineState> states;
+        const size_t first_draw = std::min<size_t>(interpreted_stream_.presented_draw_begin, interpreted_stream_.draws.size());
+        const size_t end_draw = std::min<size_t>(first_draw + interpreted_stream_.presented_draw_count, interpreted_stream_.draws.size());
+        for (size_t draw_index = first_draw; draw_index < end_draw; ++draw_index) {
+            const NativePipelineState state = pipeline_state_for_draw(interpreted_stream_.draws[draw_index]);
+            if (std::find(states.begin(), states.end(), state) == states.end()) states.push_back(state);
+        }
+        if (states.empty()) states.push_back({});
+        states.erase(
+            std::remove_if(
+                states.begin(), states.end(),
+                [this](const NativePipelineState& state) {
+                    return std::find_if(
+                        graphics_pipelines_.begin(), graphics_pipelines_.end(),
+                        [&state](const HostPipeline& pipeline) {
+                            return pipeline.state == state;
+                        }) != graphics_pipelines_.end();
+                }),
+            states.end());
+        if (states.empty()) {
+            log_.emit(
+                "nv2a_graphics_pipeline_cache_hit",
+                {{"pipeline_count", std::to_string(graphics_pipelines_.size())}});
+            return;
+        }
 
         const VkShaderModule vertex_shader = create_shader_module(options_.vertex_shader);
         const VkShaderModule fragment_shader = create_shader_module(options_.fragment_shader);
@@ -2356,15 +2707,6 @@ private:
         multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
         multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
         VkPipelineColorBlendAttachmentState blend_attachment{};
-        blend_attachment.blendEnable = VK_TRUE;
-        blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-        blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-        blend_attachment.colorBlendOp = VK_BLEND_OP_ADD;
-        blend_attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-        blend_attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-        blend_attachment.alphaBlendOp = VK_BLEND_OP_ADD;
-        blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
         VkPipelineColorBlendStateCreateInfo blend{};
         blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
         blend.attachmentCount = 1;
@@ -2382,10 +2724,27 @@ private:
         pipeline_info.layout = pipeline_layout_;
         pipeline_info.renderPass = render_pass_;
         pipeline_info.subpass = 0;
-        vk_check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &graphics_pipeline_), "vkCreateGraphicsPipelines");
+        for (const NativePipelineState& state : states) {
+            blend_attachment.blendEnable = state.blend_enable ? VK_TRUE : VK_FALSE;
+            blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+            blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            blend_attachment.colorBlendOp = VK_BLEND_OP_ADD;
+            blend_attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            blend_attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            blend_attachment.alphaBlendOp = VK_BLEND_OP_ADD;
+            blend_attachment.colorWriteMask = nv2a_color_write_mask(state.color_mask);
+            VkPipeline pipeline = VK_NULL_HANDLE;
+            vk_check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline), "vkCreateGraphicsPipelines");
+            graphics_pipelines_.push_back({state, pipeline});
+        }
         vkDestroyShaderModule(device_, fragment_shader, nullptr);
         vkDestroyShaderModule(device_, vertex_shader, nullptr);
-        log_.emit("nv2a_graphics_pipeline_created");
+        log_.emit(
+            "nv2a_graphics_pipeline_created",
+            {
+                {"created_count", std::to_string(states.size())},
+                {"pipeline_count", std::to_string(graphics_pipelines_.size())},
+            });
     }
 
     void create_buffer(
@@ -2579,9 +2938,15 @@ private:
         uint32_t guest_address,
         uint32_t width,
         uint32_t height,
+        std::string format,
+        std::string content_hash,
         const std::vector<uint8_t>& rgba) {
         HostTexture texture{};
         texture.guest_address = guest_address;
+        texture.width = width;
+        texture.height = height;
+        texture.format = std::move(format);
+        texture.content_hash = std::move(content_hash);
         VkBuffer staging = VK_NULL_HANDLE;
         VkDeviceMemory staging_memory = VK_NULL_HANDLE;
         create_buffer(
@@ -2673,6 +3038,177 @@ private:
         return texture;
     }
 
+    static void clear_moved_texture_handles(HostTexture& texture) {
+        texture.image = VK_NULL_HANDLE;
+        texture.memory = VK_NULL_HANDLE;
+        texture.view = VK_NULL_HANDLE;
+        texture.sampler = VK_NULL_HANDLE;
+        texture.descriptor_set = VK_NULL_HANDLE;
+    }
+
+    void destroy_host_texture(HostTexture& texture) {
+        if (texture.sampler) vkDestroySampler(device_, texture.sampler, nullptr);
+        if (texture.view) vkDestroyImageView(device_, texture.view, nullptr);
+        if (texture.image) vkDestroyImage(device_, texture.image, nullptr);
+        if (texture.memory) vkFreeMemory(device_, texture.memory, nullptr);
+        clear_moved_texture_handles(texture);
+    }
+
+    static std::string texture_content_identity(
+        const RecoveredTextureResource& resource) {
+        if (!resource.content_hash.empty()) {
+            return resource.content_hash;
+        }
+        uint64_t fingerprint = 14695981039346656037ull;
+        for (const uint8_t byte : resource.payload) {
+            fingerprint ^= byte;
+            fingerprint *= 1099511628211ull;
+        }
+        std::ostringstream value;
+        value << "fnv64:" << std::hex << std::uppercase << std::setfill('0')
+              << std::setw(16) << fingerprint;
+        return value.str();
+    }
+
+    void refresh_host_textures() {
+        if (texture_descriptor_pool_) {
+            vkDestroyDescriptorPool(device_, texture_descriptor_pool_, nullptr);
+            texture_descriptor_pool_ = VK_NULL_HANDLE;
+        }
+        std::vector<HostTexture> previous = std::move(host_textures_);
+        host_textures_.clear();
+        host_textures_.reserve(recovered_source_.textures.size() + 1u);
+        uint32_t reused_texture_count = 0;
+        uint32_t uploaded_texture_count = 0;
+
+        auto retain_matching = [&](uint32_t address,
+                                   uint32_t width,
+                                   uint32_t height,
+                                   const std::string& format,
+                                   const std::string& content_hash) -> bool {
+            const auto match = std::find_if(
+                previous.begin(),
+                previous.end(),
+                [&](const HostTexture& texture) {
+                    return texture.image != VK_NULL_HANDLE
+                        && texture.guest_address == address
+                        && texture.width == width
+                        && texture.height == height
+                        && texture.format == format
+                        && texture.content_hash == content_hash;
+                });
+            if (match == previous.end()) {
+                return false;
+            }
+            host_textures_.push_back(std::move(*match));
+            clear_moved_texture_handles(*match);
+            ++reused_texture_count;
+            return true;
+        };
+
+        if (!retain_matching(0u, 1u, 1u, "fallback", "white")) {
+            host_textures_.push_back(create_host_texture(
+                0u, 1u, 1u, "fallback", "white", {255, 255, 255, 255}));
+            ++uploaded_texture_count;
+        }
+        for (const RecoveredTextureResource& resource : recovered_source_.textures) {
+            const std::string content_identity = texture_content_identity(resource);
+            const size_t rgba_size = static_cast<size_t>(resource.width)
+                * resource.height * 4u;
+            const bool supported = resource.format == "DXT1"
+                || resource.format == "DXT5"
+                || resource.payload.size() >= rgba_size;
+            if (!supported) {
+                ++unsupported_texture_resource_count_;
+                log_.emit(
+                    "unsupported_texture_resource",
+                    {
+                        {"address", std::to_string(resource.address)},
+                        {"format", json_string(resource.format)},
+                        {"width", std::to_string(resource.width)},
+                        {"height", std::to_string(resource.height)},
+                        {"payload_bytes", std::to_string(resource.payload.size())},
+                    });
+                continue;
+            }
+            if (retain_matching(
+                    resource.address,
+                    resource.width,
+                    resource.height,
+                    resource.format,
+                    content_identity)) {
+                continue;
+            }
+            std::vector<uint8_t> rgba;
+            if (resource.format == "DXT1") {
+                rgba = decompress_dxt1(resource);
+            } else if (resource.format == "DXT5") {
+                rgba = decompress_dxt5(resource);
+            } else {
+                rgba.assign(resource.payload.begin(), resource.payload.begin() + rgba_size);
+            }
+            host_textures_.push_back(create_host_texture(
+                resource.address,
+                resource.width,
+                resource.height,
+                resource.format,
+                content_identity,
+                rgba));
+            ++uploaded_texture_count;
+        }
+        for (HostTexture& texture : previous) {
+            destroy_host_texture(texture);
+        }
+
+        const uint32_t descriptor_count = static_cast<uint32_t>(host_textures_.size());
+        VkDescriptorPoolSize pool_size{
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            descriptor_count};
+        VkDescriptorPoolCreateInfo pool_info{};
+        pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pool_info.maxSets = descriptor_count;
+        pool_info.poolSizeCount = 1;
+        pool_info.pPoolSizes = &pool_size;
+        vk_check(vkCreateDescriptorPool(
+            device_, &pool_info, nullptr, &texture_descriptor_pool_),
+            "vkCreateDescriptorPool");
+
+        std::vector<VkDescriptorSetLayout> layouts(
+            host_textures_.size(), texture_descriptor_layout_);
+        std::vector<VkDescriptorSet> descriptor_sets(host_textures_.size());
+        VkDescriptorSetAllocateInfo descriptor_allocation{};
+        descriptor_allocation.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        descriptor_allocation.descriptorPool = texture_descriptor_pool_;
+        descriptor_allocation.descriptorSetCount = static_cast<uint32_t>(layouts.size());
+        descriptor_allocation.pSetLayouts = layouts.data();
+        vk_check(vkAllocateDescriptorSets(
+            device_, &descriptor_allocation, descriptor_sets.data()),
+            "vkAllocateDescriptorSets");
+        for (size_t index = 0; index < host_textures_.size(); ++index) {
+            HostTexture& texture = host_textures_[index];
+            texture.descriptor_set = descriptor_sets[index];
+            VkDescriptorImageInfo image_info{
+                texture.sampler,
+                texture.view,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = texture.descriptor_set;
+            write.dstBinding = 0;
+            write.descriptorCount = 1;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            write.pImageInfo = &image_info;
+            vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+        }
+        log_.emit(
+            "nv2a_texture_resources_refreshed",
+            {
+                {"textures", std::to_string(host_textures_.size() - 1u)},
+                {"reused", std::to_string(reused_texture_count)},
+                {"uploaded", std::to_string(uploaded_texture_count)},
+            });
+    }
+
     void create_native_render_resources(bool create_textures = true) {
         unsupported_texture_resource_count_ = 0;
         if (!interpreted_stream_.vertices.empty()) {
@@ -2684,6 +3220,9 @@ private:
                 first_draw + interpreted_stream_.presented_draw_count,
                 interpreted_stream_.draws.size());
             for (size_t draw_index = first_draw; draw_index < end_draw; ++draw_index) {
+                presented_vertex_program_transformed_count_ += execute_presented_vertex_program(
+                    vertices,
+                    interpreted_stream_.draws[draw_index]);
                 presented_half_quad_recovered_ |= recover_presented_half_surface_quad(
                     vertices,
                     interpreted_stream_.draws[draw_index],
@@ -2717,60 +3256,7 @@ private:
         }
 
         if (create_textures) {
-        const uint32_t descriptor_count = static_cast<uint32_t>(recovered_source_.textures.size() + 1u);
-        VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, descriptor_count};
-        VkDescriptorPoolCreateInfo pool_info{};
-        pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        pool_info.maxSets = descriptor_count;
-        pool_info.poolSizeCount = 1;
-        pool_info.pPoolSizes = &pool_size;
-        vk_check(vkCreateDescriptorPool(device_, &pool_info, nullptr, &texture_descriptor_pool_), "vkCreateDescriptorPool");
-
-        host_textures_.push_back(create_host_texture(0, 1, 1, {255, 255, 255, 255}));
-        for (const RecoveredTextureResource& resource : recovered_source_.textures) {
-            std::vector<uint8_t> rgba;
-            if (resource.format == "DXT1") {
-                rgba = decompress_dxt1(resource);
-            } else if (resource.format == "DXT5") {
-                rgba = decompress_dxt5(resource);
-            } else if (resource.payload.size() >= static_cast<size_t>(resource.width) * resource.height * 4u) {
-                rgba.assign(resource.payload.begin(), resource.payload.begin() + static_cast<size_t>(resource.width) * resource.height * 4u);
-            } else {
-                ++unsupported_texture_resource_count_;
-                log_.emit(
-                    "unsupported_texture_resource",
-                    {
-                        {"address", std::to_string(resource.address)},
-                        {"format", json_string(resource.format)},
-                        {"width", std::to_string(resource.width)},
-                        {"height", std::to_string(resource.height)},
-                        {"payload_bytes", std::to_string(resource.payload.size())},
-                    });
-                continue;
-            }
-            host_textures_.push_back(create_host_texture(resource.address, resource.width, resource.height, rgba));
-        }
-        std::vector<VkDescriptorSetLayout> layouts(host_textures_.size(), texture_descriptor_layout_);
-        std::vector<VkDescriptorSet> descriptor_sets(host_textures_.size());
-        VkDescriptorSetAllocateInfo descriptor_allocation{};
-        descriptor_allocation.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        descriptor_allocation.descriptorPool = texture_descriptor_pool_;
-        descriptor_allocation.descriptorSetCount = static_cast<uint32_t>(layouts.size());
-        descriptor_allocation.pSetLayouts = layouts.data();
-        vk_check(vkAllocateDescriptorSets(device_, &descriptor_allocation, descriptor_sets.data()), "vkAllocateDescriptorSets");
-        for (size_t index = 0; index < host_textures_.size(); ++index) {
-            HostTexture& texture = host_textures_[index];
-            texture.descriptor_set = descriptor_sets[index];
-            VkDescriptorImageInfo image_info{texture.sampler, texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-            VkWriteDescriptorSet write{};
-            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            write.dstSet = texture.descriptor_set;
-            write.dstBinding = 0;
-            write.descriptorCount = 1;
-            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            write.pImageInfo = &image_info;
-            vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
-        }
+            refresh_host_textures();
         }
         log_.emit(
             "nv2a_native_resources_created",
@@ -2779,9 +3265,12 @@ private:
                 {"draws", std::to_string(interpreted_stream_.draws.size())},
                 {"presented_draws", std::to_string(interpreted_stream_.presented_draw_count)},
                 {"guest_flips", std::to_string(interpreted_stream_.flip_count)},
+                {"manifest_guest_flip_count", std::to_string(current_manifest_guest_flip_count_)},
+                {"manifest_guest_steps", std::to_string(current_manifest_guest_steps_)},
                 {"textures", std::to_string(host_textures_.size() - 1u)},
                 {"presented_half_quad_recovered", json_bool(presented_half_quad_recovered_)},
                 {"presented_overscan_height_recovered", json_bool(presented_overscan_height_recovered_)},
+                {"presented_vertex_program_transformed_count", std::to_string(presented_vertex_program_transformed_count_)},
             });
         const size_t diagnostic_first_draw = std::min<size_t>(
             interpreted_stream_.presented_draw_begin,
@@ -2792,17 +3281,161 @@ private:
         uint32_t textured_presented_draw_count = 0;
         uint32_t unmatched_presented_texture_draw_count = 0;
         uint32_t unsupported_presented_primitive_count = 0;
+        uint32_t valid_geometry_draw_count = 0;
+        uint32_t invalid_geometry_range_count = 0;
+        uint32_t non_finite_position_draw_count = 0;
+        uint32_t collapsed_x_draw_count = 0;
+        uint32_t collapsed_y_draw_count = 0;
+        uint32_t zero_area_draw_count = 0;
+        uint32_t exact_center_origin_draw_count = 0;
+        uint32_t fully_offscreen_draw_count = 0;
+        uint32_t outside_viewport_draw_count = 0;
+        uint64_t presented_vertex_count = 0;
+        uint32_t fullscreen_draw_count = 0;
+        uint32_t textured_fullscreen_draw_count = 0;
+        uint32_t untextured_presented_draw_count = 0;
+        uint32_t alpha_only_presented_draw_count = 0;
+        uint32_t zero_alpha_presented_draw_count = 0;
+        std::vector<uint32_t> presented_texture_addresses;
+        int64_t first_zero_area_presented_index = -1;
+        int64_t first_center_origin_presented_index = -1;
+        bool overall_bounds_valid = false;
+        float overall_min_x = 0.0f;
+        float overall_max_x = 0.0f;
+        float overall_min_y = 0.0f;
+        float overall_max_y = 0.0f;
+        const bool emit_presented_details = !options_.live_render_stream
+            || create_textures
+            || live_render_reload_count_ == 0u
+            || live_render_reload_count_ % 120u == 0u;
         for (size_t draw_index = diagnostic_first_draw;
              draw_index < diagnostic_end_draw;
              ++draw_index) {
             const NativeDraw& draw = interpreted_stream_.draws[draw_index];
+            const bool draw_textured = draw.texture_enabled
+                && draw.texture_address != 0u;
+            if (!draw_textured) {
+                ++untextured_presented_draw_count;
+            }
+            const VkColorComponentFlags write_mask = nv2a_color_write_mask(
+                draw.color_mask);
+            if ((write_mask & VK_COLOR_COMPONENT_A_BIT) != 0u
+                && (write_mask & (VK_COLOR_COMPONENT_R_BIT
+                    | VK_COLOR_COMPONENT_G_BIT
+                    | VK_COLOR_COMPONENT_B_BIT)) == 0u) {
+                ++alpha_only_presented_draw_count;
+            }
             if (draw.primitive != 6u) {
                 ++unsupported_presented_primitive_count;
             }
-            if (!draw.texture_enabled || draw.texture_address == 0u) {
+            if (draw.vertex_count == 0u ||
+                draw.first_vertex + draw.vertex_count > interpreted_stream_.vertices.size()) {
+                ++invalid_geometry_range_count;
+            } else {
+                ++valid_geometry_draw_count;
+                presented_vertex_count += draw.vertex_count;
+                bool draw_bounds_valid = false;
+                bool non_finite = false;
+                bool exact_center_origin = true;
+                float max_a = 0.0f;
+                float min_x = 0.0f;
+                float max_x = 0.0f;
+                float min_y = 0.0f;
+                float max_y = 0.0f;
+                for (uint32_t vertex_index = 0; vertex_index < draw.vertex_count; ++vertex_index) {
+                    const NativeVertex& vertex =
+                        interpreted_stream_.vertices[draw.first_vertex + vertex_index];
+                    if (!std::isfinite(vertex.x) || !std::isfinite(vertex.y)) {
+                        non_finite = true;
+                        exact_center_origin = false;
+                        continue;
+                    }
+                    exact_center_origin = exact_center_origin
+                        && vertex.raw_x_bits == 0x43A00000u
+                        && (vertex.raw_y_bits & 0x7FFFFFFFu) == 0u;
+                    max_a = std::max(max_a, vertex.a);
+                    if (!draw_bounds_valid) {
+                        min_x = max_x = vertex.x;
+                        min_y = max_y = vertex.y;
+                        draw_bounds_valid = true;
+                    } else {
+                        min_x = std::min(min_x, vertex.x);
+                        max_x = std::max(max_x, vertex.x);
+                        min_y = std::min(min_y, vertex.y);
+                        max_y = std::max(max_y, vertex.y);
+                    }
+                }
+                if (non_finite) {
+                    ++non_finite_position_draw_count;
+                }
+                if (draw_bounds_valid) {
+                    if (max_a <= 0.0001f) {
+                        ++zero_alpha_presented_draw_count;
+                    }
+                    if (!overall_bounds_valid) {
+                        overall_min_x = min_x;
+                        overall_max_x = max_x;
+                        overall_min_y = min_y;
+                        overall_max_y = max_y;
+                        overall_bounds_valid = true;
+                    } else {
+                        overall_min_x = std::min(overall_min_x, min_x);
+                        overall_max_x = std::max(overall_max_x, max_x);
+                        overall_min_y = std::min(overall_min_y, min_y);
+                        overall_max_y = std::max(overall_max_y, max_y);
+                    }
+                    const bool collapsed_x = std::abs(max_x - min_x) <= 0.0001f;
+                    const bool collapsed_y = std::abs(max_y - min_y) <= 0.0001f;
+                    if (collapsed_x) {
+                        ++collapsed_x_draw_count;
+                    }
+                    if (collapsed_y) {
+                        ++collapsed_y_draw_count;
+                    }
+                    if (collapsed_x && collapsed_y) {
+                        ++zero_area_draw_count;
+                        if (first_zero_area_presented_index < 0) {
+                            first_zero_area_presented_index = static_cast<int64_t>(
+                                draw_index - diagnostic_first_draw);
+                        }
+                    }
+                    if (exact_center_origin) {
+                        ++exact_center_origin_draw_count;
+                        if (first_center_origin_presented_index < 0) {
+                            first_center_origin_presented_index = static_cast<int64_t>(
+                                draw_index - diagnostic_first_draw);
+                        }
+                    }
+                    if (max_x < 0.0f || min_x > static_cast<float>(options_.width)
+                        || max_y < 0.0f || min_y > static_cast<float>(options_.height)) {
+                        ++fully_offscreen_draw_count;
+                    }
+                    if (min_x < 0.0f || max_x > static_cast<float>(options_.width)
+                        || min_y < 0.0f || max_y > static_cast<float>(options_.height)) {
+                        ++outside_viewport_draw_count;
+                    }
+                    const bool fullscreen = min_x <= 0.5f
+                        && max_x >= static_cast<float>(options_.width) - 0.5f
+                        && min_y <= 0.5f
+                        && max_y >= static_cast<float>(options_.height) - 0.5f;
+                    if (fullscreen) {
+                        ++fullscreen_draw_count;
+                        if (draw_textured) {
+                            ++textured_fullscreen_draw_count;
+                        }
+                    }
+                }
+            }
+            if (!draw_textured) {
                 continue;
             }
             ++textured_presented_draw_count;
+            if (std::find(
+                    presented_texture_addresses.begin(),
+                    presented_texture_addresses.end(),
+                    draw.texture_address) == presented_texture_addresses.end()) {
+                presented_texture_addresses.push_back(draw.texture_address);
+            }
             const bool texture_matched = std::any_of(
                 host_textures_.begin() + 1,
                 host_textures_.end(),
@@ -2813,10 +3446,58 @@ private:
                 ++unmatched_presented_texture_draw_count;
             }
         }
+        std::ostringstream presented_texture_addresses_json;
+        presented_texture_addresses_json << '[';
+        for (size_t index = 0; index < presented_texture_addresses.size(); ++index) {
+            if (index != 0u) {
+                presented_texture_addresses_json << ',';
+            }
+            presented_texture_addresses_json << presented_texture_addresses[index];
+        }
+        presented_texture_addresses_json << ']';
+        log_.emit(
+            "nv2a_presented_geometry_anomalies",
+            {
+                {"reload", std::to_string(options_.live_render_stream ? live_render_reload_count_ + 1u : 0u)},
+                {"source_commands", std::to_string(recovered_source_.commands.size())},
+                {"guest_flips", std::to_string(interpreted_stream_.flip_count)},
+                {"manifest_guest_flip_count", std::to_string(current_manifest_guest_flip_count_)},
+                {"manifest_guest_steps", std::to_string(current_manifest_guest_steps_)},
+                {"presented_draw_count", std::to_string(diagnostic_end_draw - diagnostic_first_draw)},
+                {"presented_vertex_count", std::to_string(presented_vertex_count)},
+                {"fullscreen_draw_count", std::to_string(fullscreen_draw_count)},
+                {"textured_fullscreen_draw_count", std::to_string(textured_fullscreen_draw_count)},
+                {"untextured_presented_draw_count", std::to_string(untextured_presented_draw_count)},
+                {"alpha_only_presented_draw_count", std::to_string(alpha_only_presented_draw_count)},
+                {"zero_alpha_presented_draw_count", std::to_string(zero_alpha_presented_draw_count)},
+                {"presented_texture_addresses", presented_texture_addresses_json.str()},
+                {"valid_geometry_draw_count", std::to_string(valid_geometry_draw_count)},
+                {"invalid_geometry_range_count", std::to_string(invalid_geometry_range_count)},
+                {"non_finite_position_draw_count", std::to_string(non_finite_position_draw_count)},
+                {"collapsed_x_draw_count", std::to_string(collapsed_x_draw_count)},
+                {"collapsed_y_draw_count", std::to_string(collapsed_y_draw_count)},
+                {"zero_area_draw_count", std::to_string(zero_area_draw_count)},
+                {"exact_center_origin_draw_count", std::to_string(exact_center_origin_draw_count)},
+                {"fully_offscreen_draw_count", std::to_string(fully_offscreen_draw_count)},
+                {"outside_viewport_draw_count", std::to_string(outside_viewport_draw_count)},
+                {"first_zero_area_presented_index", std::to_string(first_zero_area_presented_index)},
+                {"first_center_origin_presented_index", std::to_string(first_center_origin_presented_index)},
+                {"overall_min_x", overall_bounds_valid ? json_float(overall_min_x) : "null"},
+                {"overall_max_x", overall_bounds_valid ? json_float(overall_max_x) : "null"},
+                {"overall_min_y", overall_bounds_valid ? json_float(overall_min_y) : "null"},
+                {"overall_max_y", overall_bounds_valid ? json_float(overall_max_y) : "null"},
+                {"anomalous", json_bool(
+                    invalid_geometry_range_count != 0u
+                    || non_finite_position_draw_count != 0u
+                    || zero_area_draw_count != 0u
+                    || exact_center_origin_draw_count != 0u)},
+            });
         log_.emit(
             "render_validation",
             {
                 {"strict", json_bool(options_.strict_render_validation)},
+                {"manifest_guest_flip_count", std::to_string(current_manifest_guest_flip_count_)},
+                {"manifest_guest_steps", std::to_string(current_manifest_guest_steps_)},
                 {"texture_resource_count", std::to_string(recovered_source_.textures.size())},
                 {"unsupported_texture_resource_count", std::to_string(unsupported_texture_resource_count_)},
                 {"textured_presented_draw_count", std::to_string(textured_presented_draw_count)},
@@ -2842,6 +3523,7 @@ private:
                     << interpreted_stream_.unsupported_draw_arrays_count << " unsupported DRAW_ARRAYS methods";
             throw std::runtime_error(message.str());
         }
+        if (emit_presented_details) {
         for (size_t draw_index = diagnostic_first_draw;
              draw_index < diagnostic_end_draw;
              ++draw_index) {
@@ -2933,6 +3615,8 @@ private:
                     {"vertex_format_9", std::to_string(draw.vertex_formats[9])},
                     {"transform_execution_mode", std::to_string(draw.transform_execution_mode)},
                     {"transform_program_start", std::to_string(draw.transform_program_start)},
+                    {"transform_constant_0_x", std::to_string(draw.transform_constants[0][0])},
+                    {"transform_constant_96_x", std::to_string(draw.transform_constants[96][0])},
                     {"min_x", json_float(min_x)},
                     {"max_x", json_float(max_x)},
                     {"min_y", json_float(min_y)},
@@ -2998,6 +3682,7 @@ private:
                     });
             }
         }
+        }
         if (interpreted_stream_.presented_draw_count != 0u &&
             interpreted_stream_.presented_draw_begin < interpreted_stream_.draws.size()) {
             const NativeDraw& draw = interpreted_stream_.draws[interpreted_stream_.presented_draw_begin];
@@ -3033,7 +3718,6 @@ private:
         if (interpreted_stream_.draws.empty() || vertex_buffer_ == VK_NULL_HANDLE) {
             return;
         }
-        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics_pipeline_);
         const VkDeviceSize offset = 0;
         vkCmdBindVertexBuffers(command_buffer, 0, 1, &vertex_buffer_, &offset);
         const size_t first_draw = std::min<size_t>(
@@ -3044,6 +3728,12 @@ private:
             interpreted_stream_.draws.size());
         for (size_t draw_index = first_draw; draw_index < end_draw; ++draw_index) {
             const NativeDraw& draw = interpreted_stream_.draws[draw_index];
+            const NativePipelineState state = pipeline_state_for_draw(draw);
+            const auto pipeline = std::find_if(
+                graphics_pipelines_.begin(), graphics_pipelines_.end(),
+                [&](const HostPipeline& candidate) { return candidate.state == state; });
+            if (pipeline == graphics_pipelines_.end()) continue;
+            vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
             const VkDescriptorSet descriptor = descriptor_for_texture(
                 draw.texture_enabled ? draw.texture_address : 0u);
             vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &descriptor, 0, nullptr);
@@ -3167,14 +3857,18 @@ private:
         const std::vector<RecoveredD3DCommand>& recovered_d3d_stream =
             recovered_source_.commands;
         const InterpretedD3DStream& interpreted_stream = interpreted_stream_;
+        if (counted_recovered_command_count_ > recovered_d3d_stream.size()) {
+            counted_recovered_command_count_ = 0u;
+            recovered_d3d_mmio_count_ = 0u;
+        }
+        for (size_t index = counted_recovered_command_count_;
+             index < recovered_d3d_stream.size();
+             ++index) {
+            recovered_d3d_mmio_count_ += static_cast<uint32_t>(
+                recovered_d3d_stream[index].kind == RecoveredD3DCommandKind::MmioWrite);
+        }
+        counted_recovered_command_count_ = recovered_d3d_stream.size();
         recovered_d3d_command_count_ = static_cast<uint32_t>(recovered_d3d_stream.size());
-        recovered_d3d_mmio_count_ = static_cast<uint32_t>(
-            std::count_if(
-                recovered_d3d_stream.begin(),
-                recovered_d3d_stream.end(),
-                [](const RecoveredD3DCommand& command) {
-                    return command.kind == RecoveredD3DCommandKind::MmioWrite;
-                }));
         recovered_d3d_push_buffer_count_ =
             recovered_d3d_command_count_ - recovered_d3d_mmio_count_;
         interpreted_push_buffer_word_count_ = interpreted_stream.push_buffer_word_count;
@@ -3417,6 +4111,65 @@ private:
         return options_.flip_audit_frame_directory / name.str();
     }
 
+    void acknowledge_current_presentation() {
+        if (presentation_ack_path_.empty()
+            || current_manifest_guest_flip_count_ == 0u
+            || current_manifest_guest_flip_count_ <= acknowledged_presentation_flip_) {
+            return;
+        }
+        if (presentation_ack_path_.has_parent_path()) {
+            std::filesystem::create_directories(
+                presentation_ack_path_.parent_path());
+        }
+        if (presentation_ack_file_ == INVALID_HANDLE_VALUE) {
+            presentation_ack_file_ = CreateFileW(
+                presentation_ack_path_.c_str(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr,
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+        }
+        if (presentation_ack_file_ == INVALID_HANDLE_VALUE) {
+            throw std::runtime_error(
+                "cannot open live presentation acknowledgement");
+        }
+        std::array<uint8_t, 24> ack{};
+        std::memcpy(ack.data(), "B2PRS001", 8);
+        const uint64_t generation = std::stoull(live_command_generation_);
+        std::memcpy(ack.data() + 8, &generation, sizeof(generation));
+        std::memcpy(
+            ack.data() + 16,
+            &current_manifest_guest_flip_count_,
+            sizeof(current_manifest_guest_flip_count_));
+        LARGE_INTEGER start{};
+        DWORD written = 0;
+        const BOOL write_ok = SetFilePointerEx(
+                presentation_ack_file_, start, nullptr, FILE_BEGIN)
+            && WriteFile(
+                presentation_ack_file_,
+                ack.data(),
+                static_cast<DWORD>(ack.size()),
+                &written,
+                nullptr)
+            && SetEndOfFile(presentation_ack_file_);
+        if (!write_ok || written != ack.size()) {
+            throw std::runtime_error(
+                "cannot publish live presentation acknowledgement");
+        }
+        acknowledged_presentation_flip_ = current_manifest_guest_flip_count_;
+        if (!presentation_ack_event_ && !presentation_event_name_.empty()) {
+            presentation_ack_event_ = OpenEventW(
+                EVENT_MODIFY_STATE,
+                FALSE,
+                widen(presentation_event_name_).c_str());
+        }
+        if (presentation_ack_event_) {
+            SetEvent(presentation_ack_event_);
+        }
+    }
+
     void acknowledge_current_flip_audit(
         const FrameReadback* readback,
         const std::filesystem::path& frame_path,
@@ -3510,7 +4263,7 @@ private:
         log_.emit("main_loop_enter");
         write_controller_state();
         auto last_frame = std::chrono::steady_clock::now();
-        auto next_frame_time = last_frame + std::chrono::milliseconds(kTargetFrameMs);
+        auto next_frame_time = last_frame + kTargetFrameInterval;
         while (running_ && (options_.max_frames == 0u || frame_count_ < options_.max_frames)) {
             const auto frame_start = std::chrono::steady_clock::now();
             pump_window_messages();
@@ -3539,30 +4292,34 @@ private:
             draw_frame();
             ++frame_count_;
             const auto after_draw = std::chrono::steady_clock::now();
-            const auto draw_ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(after_draw - frame_start).count();
-            const auto sleep_ms = std::max<int64_t>(
+            const auto draw_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(after_draw - frame_start).count();
+            const auto sleep_us = std::max<int64_t>(
                 0,
-                std::chrono::duration_cast<std::chrono::milliseconds>(next_frame_time - after_draw).count());
-            if (sleep_ms > 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+                std::chrono::duration_cast<std::chrono::microseconds>(next_frame_time - after_draw).count());
+            if (sleep_us > 0) {
+                wait_for_frame_deadline(next_frame_time);
             }
             const auto now = std::chrono::steady_clock::now();
-            const auto elapsed_ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(now - last_frame).count();
+            const auto elapsed_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(now - last_frame).count();
             last_frame = now;
-            next_frame_time += std::chrono::milliseconds(kTargetFrameMs);
-            if (next_frame_time < now) {
-                next_frame_time = now + std::chrono::milliseconds(kTargetFrameMs);
+            next_frame_time += kTargetFrameInterval;
+            if (next_frame_time <= now) {
+                next_frame_time = now + kTargetFrameInterval;
             }
             log_.emit(
                 "frame_presented",
                 {
                     {"frame", std::to_string(frame_count_)},
-                    {"elapsed_ms", std::to_string(elapsed_ms)},
-                    {"draw_ms", std::to_string(draw_ms)},
-                    {"target_frame_ms", std::to_string(kTargetFrameMs)},
-                    {"pacing_sleep_ms", std::to_string(sleep_ms)},
+                    {"elapsed_us", std::to_string(elapsed_us)},
+                    {"draw_us", std::to_string(draw_us)},
+                    {"target_frame_us", std::to_string(kTargetFrameUs)},
+                    {"pacing_sleep_us", std::to_string(sleep_us)},
+                    {"elapsed_ms", std::to_string(elapsed_us / 1000)},
+                    {"draw_ms", std::to_string(draw_us / 1000)},
+                    {"target_frame_ms", "16.666667"},
+                    {"pacing_sleep_ms", std::to_string(sleep_us / 1000)},
                     {"translated_commands", std::to_string(translated_command_count_)},
                     {"source_d3d_commands", std::to_string(recovered_d3d_command_count_)},
                     {"push_buffer_words", std::to_string(interpreted_push_buffer_word_count_)},
@@ -3578,6 +4335,105 @@ private:
                 {"input_events", std::to_string(input_events_)},
                 {"closed_by_user", json_bool(closed_by_user_)},
             });
+    }
+
+    void sleep_until_frame_deadline(
+        std::chrono::steady_clock::time_point deadline) {
+        const auto now = std::chrono::steady_clock::now();
+        if (deadline <= now) {
+            return;
+        }
+        if (!frame_pacing_timer_) {
+            frame_pacing_timer_ = CreateWaitableTimerExW(
+                nullptr,
+                nullptr,
+                kHighResolutionWaitableTimerFlag,
+                TIMER_ALL_ACCESS);
+        }
+        if (frame_pacing_timer_) {
+            const int64_t remaining_ns = std::chrono::duration_cast<
+                std::chrono::nanoseconds>(deadline - now).count();
+            LARGE_INTEGER due_time{};
+            due_time.QuadPart = -std::max<int64_t>(
+                1,
+                (remaining_ns + 99) / 100);
+            if (SetWaitableTimerEx(
+                    frame_pacing_timer_,
+                    &due_time,
+                    0,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    0)) {
+                WaitForSingleObject(frame_pacing_timer_, INFINITE);
+                return;
+            }
+        }
+        std::this_thread::sleep_until(deadline);
+    }
+
+    void wait_for_frame_deadline(
+        std::chrono::steady_clock::time_point deadline) {
+        if (!options_.live_render_stream || presentation_ack_path_.empty()) {
+            sleep_until_frame_deadline(deadline);
+            return;
+        }
+        if (publication_event_) {
+            const auto now = std::chrono::steady_clock::now();
+            if (deadline <= now) {
+                return;
+            }
+            if (!frame_pacing_timer_) {
+                frame_pacing_timer_ = CreateWaitableTimerExW(
+                    nullptr,
+                    nullptr,
+                    kHighResolutionWaitableTimerFlag,
+                    TIMER_ALL_ACCESS);
+            }
+            if (frame_pacing_timer_) {
+                const int64_t remaining_ns = std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(deadline - now).count();
+                LARGE_INTEGER due_time{};
+                due_time.QuadPart = -std::max<int64_t>(
+                    1,
+                    (remaining_ns + 99) / 100);
+                if (SetWaitableTimerEx(
+                        frame_pacing_timer_,
+                        &due_time,
+                        0,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        0)) {
+                    const HANDLE waits[] = {
+                        frame_pacing_timer_,
+                        publication_event_,
+                    };
+                    const DWORD result = WaitForMultipleObjects(
+                        2, waits, FALSE, INFINITE);
+                    if (result == WAIT_OBJECT_0 + 1u) {
+                        reload_live_render_work(true);
+                        sleep_until_frame_deadline(deadline);
+                    }
+                    if (result == WAIT_OBJECT_0 || result == WAIT_OBJECT_0 + 1u) {
+                        return;
+                    }
+                }
+            }
+        }
+        // A normal live guest waits for acknowledgement of every exact flip.
+        // Poll the tiny manifest while this frame is otherwise idle so command
+        // ingestion overlaps presentation rather than serializing an entire
+        // 16.7 ms host interval ahead of the guest's next frame computation.
+        constexpr auto poll_interval = std::chrono::milliseconds(1);
+        while (running_) {
+            reload_live_render_work();
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                return;
+            }
+            sleep_until_frame_deadline(std::min(deadline, now + poll_interval));
+        }
     }
 
     uint32_t pump_window_messages() {
@@ -3812,10 +4668,17 @@ private:
                 {"trigger", json_string(trigger)},
                 {"width", std::to_string(swapchain_extent_.width)},
                 {"height", std::to_string(swapchain_extent_.height)},
+                {"manifest_guest_flip_count", std::to_string(current_manifest_guest_flip_count_)},
+                {"manifest_guest_steps", std::to_string(current_manifest_guest_steps_)},
                 {"pixel_count", std::to_string(readback.pixel_count)},
                 {"unique_colors", std::to_string(readback.unique_colors)},
                 {"dominant_rgba", std::to_string(readback.dominant_rgba)},
                 {"dominant_count", std::to_string(readback.dominant_count)},
+                {"bright_count", std::to_string(readback.bright_count)},
+                {"dark_count", std::to_string(readback.dark_count)},
+                {"near_solid", json_bool(readback.near_solid)},
+                {"whiteout", json_bool(readback.whiteout)},
+                {"low_information", json_bool(readback.low_information)},
             });
     }
 
@@ -3975,6 +4838,26 @@ private:
     }
 
     void cleanup() {
+        if (publication_event_) {
+            CloseHandle(publication_event_);
+            publication_event_ = nullptr;
+        }
+        if (presentation_ack_event_) {
+            CloseHandle(presentation_ack_event_);
+            presentation_ack_event_ = nullptr;
+        }
+        if (presentation_ack_file_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(presentation_ack_file_);
+            presentation_ack_file_ = INVALID_HANDLE_VALUE;
+        }
+        if (live_manifest_file_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(live_manifest_file_);
+            live_manifest_file_ = INVALID_HANDLE_VALUE;
+        }
+        if (frame_pacing_timer_) {
+            CloseHandle(frame_pacing_timer_);
+            frame_pacing_timer_ = nullptr;
+        }
         if (device_) {
             if (in_flight_) {
                 vkDestroyFence(device_, in_flight_, nullptr);
@@ -4004,9 +4887,10 @@ private:
                 if (texture.image) vkDestroyImage(device_, texture.image, nullptr);
                 if (texture.memory) vkFreeMemory(device_, texture.memory, nullptr);
             }
-            if (graphics_pipeline_) {
-                vkDestroyPipeline(device_, graphics_pipeline_, nullptr);
+            for (const HostPipeline& host_pipeline : graphics_pipelines_) {
+                if (host_pipeline.pipeline) vkDestroyPipeline(device_, host_pipeline.pipeline, nullptr);
             }
+            graphics_pipelines_.clear();
             if (pipeline_layout_) {
                 vkDestroyPipelineLayout(device_, pipeline_layout_, nullptr);
             }
@@ -4060,17 +4944,34 @@ private:
     uint16_t controller_buttons_ = 0;
     uint16_t controller_latched_buttons_ = 0;
     std::chrono::steady_clock::time_point controller_latch_deadline_{};
+    HANDLE frame_pacing_timer_ = nullptr;
     uint32_t controller_publish_count_ = 0;
     uint32_t live_render_reload_count_ = 0;
     int64_t last_command_load_us_ = 0;
+    int64_t last_manifest_read_us_ = 0;
+    int64_t last_manifest_parse_us_ = 0;
+    int64_t last_source_load_us_ = 0;
     int64_t last_interpret_us_ = 0;
+    size_t last_interpreted_command_delta_ = 0;
+    uint64_t current_manifest_guest_flip_count_ = 0;
+    uint64_t current_manifest_guest_steps_ = 0;
+    uint64_t current_manifest_presentable_command_count_ = 0;
     std::filesystem::file_time_type live_render_write_time_{};
     std::filesystem::file_time_type live_resource_write_time_{};
     std::string live_resource_generation_;
     std::string live_command_generation_;
     std::ifstream live_command_file_;
     std::filesystem::path live_command_file_path_;
+    HANDLE live_manifest_file_ = INVALID_HANDLE_VALUE;
+    std::filesystem::path presentation_ack_path_;
+    HANDLE presentation_ack_file_ = INVALID_HANDLE_VALUE;
+    std::string presentation_event_name_;
+    HANDLE presentation_ack_event_ = nullptr;
+    std::string publication_event_name_;
+    HANDLE publication_event_ = nullptr;
+    uint64_t acknowledged_presentation_flip_ = 0;
     uint32_t recovered_d3d_command_count_ = 0;
+    size_t counted_recovered_command_count_ = 0;
     size_t interpreted_source_command_count_ = 0;
     uint32_t recovered_d3d_mmio_count_ = 0;
     uint32_t recovered_d3d_push_buffer_count_ = 0;
@@ -4085,6 +4986,7 @@ private:
     InterpretedD3DStream interpreted_stream_;
     bool presented_half_quad_recovered_ = false;
     bool presented_overscan_height_recovered_ = false;
+    uint32_t presented_vertex_program_transformed_count_ = 0;
     bool screenshot_captured_ = false;
     bool hotkey_screenshot_pending_ = false;
     bool hotkey_screenshot_key_down_ = false;
@@ -4118,7 +5020,7 @@ private:
     VkDescriptorSetLayout texture_descriptor_layout_ = VK_NULL_HANDLE;
     VkDescriptorPool texture_descriptor_pool_ = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
-    VkPipeline graphics_pipeline_ = VK_NULL_HANDLE;
+    std::vector<HostPipeline> graphics_pipelines_;
     VkBuffer vertex_buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory vertex_memory_ = VK_NULL_HANDLE;
     VkDeviceSize vertex_buffer_size_ = 0;

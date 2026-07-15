@@ -5,7 +5,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
+from tools.playability import live_test
 from tools.playability.live_test import (
     build_guest_command,
     build_lossless_flip_audit_report,
@@ -18,12 +20,17 @@ class LiveTestTests(unittest.TestCase):
         return argparse.Namespace(
             xbe=Path("game/default.xbe"),
             extracted_root=Path("game"),
+            save_data_root=Path("save"),
+            dashboard_root=Path("dashboard"),
+            cache_root=Path("cache-data"),
             dynamic_block_cache=Path("cache.json"),
             native_slice_steps=2500,
             max_steps=0,
             live_render_stream=Path("render.json"),
             live_controller_state=Path("controller.json"),
             json_output=Path("summary.json"),
+            render_debug_events=Path("render-debug-events.jsonl"),
+            render_debug_report=Path("render-debug-report.json"),
             skip_host_build=True,
             lossless_flip_audit=False,
             flip_audit_health_interval=30,
@@ -34,6 +41,9 @@ class LiveTestTests(unittest.TestCase):
 
         self.assertEqual(command[command.index("--max-steps") + 1], "0")
         self.assertIn("--native-guest-loop", command)
+        self.assertEqual(command[command.index("--save-data-root") + 1], "save")
+        self.assertEqual(command[command.index("--dashboard-root") + 1], "dashboard")
+        self.assertEqual(command[command.index("--cache-root") + 1], "cache-data")
 
     def test_presenter_command_runs_until_window_closes(self) -> None:
         command = build_presenter_command(self._args())
@@ -42,6 +52,30 @@ class LiveTestTests(unittest.TestCase):
         self.assertEqual(command[command.index("--timeout-seconds") + 1], "0")
         self.assertIn("--live-render-stream", command)
         self.assertIn("--skip-build", command)
+        self.assertEqual(
+            command[command.index("--debug-json") + 1],
+            "render-debug-events.jsonl",
+        )
+
+    def test_windows_forced_cleanup_terminates_the_presenter_process_tree(self) -> None:
+        process = Mock()
+        process.pid = 1234
+        process.poll.return_value = None
+        completed = Mock(returncode=0)
+        with (
+            patch.object(live_test.sys, "platform", "win32"),
+            patch.object(live_test.subprocess, "run", return_value=completed) as run,
+        ):
+            live_test._stop_process(process)
+
+        run.assert_called_once_with(
+            ["taskkill", "/PID", "1234", "/T", "/F"],
+            stdout=live_test.subprocess.DEVNULL,
+            stderr=live_test.subprocess.DEVNULL,
+            check=False,
+        )
+        process.wait.assert_called_once_with()
+        process.terminate.assert_not_called()
 
     def test_lossless_mode_wires_guest_and_presenter_handshake(self) -> None:
         args = self._args()

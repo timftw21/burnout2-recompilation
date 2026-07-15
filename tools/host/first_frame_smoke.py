@@ -377,16 +377,25 @@ def summarize_smoke(
         for event in frame_events
         if str(event.get("source_d3d_commands", "")).isdigit()
     ]
-    target_frame_ms = [
-        int(event.get("target_frame_ms", 0))
-        for event in frame_events
-        if str(event.get("target_frame_ms", "")).isdigit()
-    ]
-    pacing_sleep_ms = [
-        int(event.get("pacing_sleep_ms", 0))
-        for event in frame_events
-        if str(event.get("pacing_sleep_ms", "")).isdigit()
-    ]
+    target_frame_us: list[int] = []
+    pacing_sleep_us: list[int] = []
+    for event in frame_events:
+        try:
+            target_frame_us.append(
+                int(event["target_frame_us"])
+                if event.get("target_frame_us") is not None
+                else int(float(event["target_frame_ms"]) * 1000)
+            )
+        except (KeyError, TypeError, ValueError):
+            pass
+        try:
+            pacing_sleep_us.append(
+                int(event["pacing_sleep_us"])
+                if event.get("pacing_sleep_us") is not None
+                else int(float(event["pacing_sleep_ms"]) * 1000)
+            )
+        except (KeyError, TypeError, ValueError):
+            pass
     selected_device = next(
         (event for event in events if event.get("event") == "physical_device_selected"),
         None,
@@ -645,9 +654,15 @@ def summarize_smoke(
                 for event in interpreted_d3d_events
             ),
             "frame_pacing": {
-                "target_frame_ms": max(target_frame_ms, default=None),
-                "events_with_pacing": len(pacing_sleep_ms),
-                "max_sleep_ms": max(pacing_sleep_ms, default=None),
+                "target_frame_us": max(target_frame_us, default=None),
+                "target_frame_ms": (
+                    max(target_frame_us) / 1000.0 if target_frame_us else None
+                ),
+                "events_with_pacing": len(pacing_sleep_us),
+                "max_sleep_us": max(pacing_sleep_us, default=None),
+                "max_sleep_ms": (
+                    max(pacing_sleep_us) / 1000.0 if pacing_sleep_us else None
+                ),
             },
             "selected_device": selected_device,
         },

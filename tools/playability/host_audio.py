@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import io
 import array
+import ctypes
 import queue
 import struct
 import sys
 import threading
+import time
 import wave
 from dataclasses import dataclass
-from typing import Callable
 
 
 RWS_FILE_ID = 0x809
@@ -47,8 +48,162 @@ class PcmClip:
 
 @dataclass(frozen=True)
 class _QueuedPlayback:
-    wave_payload: bytes
+    pcm_payload: bytes
     loop: bool
+    sample_rate: int = 48000
+    channels: int = 2
+    bits_per_sample: int = 16
+    gain: float = 1.0
+
+
+class _WaveFormatEx(ctypes.Structure):
+    _pack_ = 2
+    _fields_ = (
+        ("wFormatTag", ctypes.c_uint16),
+        ("nChannels", ctypes.c_uint16),
+        ("nSamplesPerSec", ctypes.c_uint32),
+        ("nAvgBytesPerSec", ctypes.c_uint32),
+        ("nBlockAlign", ctypes.c_uint16),
+        ("wBitsPerSample", ctypes.c_uint16),
+        ("cbSize", ctypes.c_uint16),
+    )
+
+
+class _WaveHeader(ctypes.Structure):
+    _fields_ = (
+        ("lpData", ctypes.c_void_p),
+        ("dwBufferLength", ctypes.c_uint32),
+        ("dwBytesRecorded", ctypes.c_uint32),
+        ("dwUser", ctypes.c_size_t),
+        ("dwFlags", ctypes.c_uint32),
+        ("dwLoops", ctypes.c_uint32),
+        ("lpNext", ctypes.c_void_p),
+        ("reserved", ctypes.c_size_t),
+    )
+
+
+class _WaveOutPcmSink:
+    """Keep several raw PCM buffers queued in WinMM to avoid boundary gaps."""
+
+    _WHDR_DONE = 0x00000001
+    _CALLBACK_NULL = 0
+    _WAVE_MAPPER = 0xFFFFFFFF
+
+    def __init__(self, *, buffer_count: int = 4) -> None:
+        self._winmm = ctypes.WinDLL("winmm")
+        self._handle = ctypes.c_void_p()
+        self._pending: list[tuple[ctypes.Array[ctypes.c_char], _WaveHeader]] = []
+        self._buffer_count = max(2, buffer_count)
+        self._configure_api()
+        format_info = _WaveFormatEx(
+            1,
+            2,
+            48000,
+            48000 * 2 * 2,
+            2 * 2,
+            16,
+            0,
+        )
+        self._check(
+            self._winmm.waveOutOpen(
+                ctypes.byref(self._handle),
+                self._WAVE_MAPPER,
+                ctypes.byref(format_info),
+                0,
+                0,
+                self._CALLBACK_NULL,
+            ),
+            "waveOutOpen",
+        )
+
+    def _configure_api(self) -> None:
+        header_pointer = ctypes.POINTER(_WaveHeader)
+        self._winmm.waveOutOpen.argtypes = (
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_uint,
+            ctypes.POINTER(_WaveFormatEx),
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_uint32,
+        )
+        self._winmm.waveOutOpen.restype = ctypes.c_uint
+        for name in ("waveOutPrepareHeader", "waveOutWrite", "waveOutUnprepareHeader"):
+            function = getattr(self._winmm, name)
+            function.argtypes = (ctypes.c_void_p, header_pointer, ctypes.c_uint)
+            function.restype = ctypes.c_uint
+        for name in ("waveOutReset", "waveOutClose"):
+            function = getattr(self._winmm, name)
+            function.argtypes = (ctypes.c_void_p,)
+            function.restype = ctypes.c_uint
+
+    @staticmethod
+    def _check(result: int, operation: str) -> None:
+        if result:
+            raise RuntimeError(f"{operation} failed with WinMM status {result}")
+
+    def _release_completed(self) -> None:
+        retained: list[tuple[ctypes.Array[ctypes.c_char], _WaveHeader]] = []
+        for buffer, header in self._pending:
+            if header.dwFlags & self._WHDR_DONE:
+                self._check(
+                    self._winmm.waveOutUnprepareHeader(
+                        self._handle, ctypes.byref(header), ctypes.sizeof(header)
+                    ),
+                    "waveOutUnprepareHeader",
+                )
+            else:
+                retained.append((buffer, header))
+        self._pending = retained
+
+    def write(self, payload: bytes) -> None:
+        while len(self._pending) >= self._buffer_count:
+            self._release_completed()
+            if len(self._pending) >= self._buffer_count:
+                time.sleep(0.001)
+        buffer = ctypes.create_string_buffer(payload)
+        header = _WaveHeader(
+            ctypes.cast(buffer, ctypes.c_void_p),
+            len(payload),
+            0,
+            0,
+            0,
+            0,
+            None,
+            0,
+        )
+        self._check(
+            self._winmm.waveOutPrepareHeader(
+                self._handle, ctypes.byref(header), ctypes.sizeof(header)
+            ),
+            "waveOutPrepareHeader",
+        )
+        try:
+            self._check(
+                self._winmm.waveOutWrite(
+                    self._handle, ctypes.byref(header), ctypes.sizeof(header)
+                ),
+                "waveOutWrite",
+            )
+        except RuntimeError:
+            self._winmm.waveOutUnprepareHeader(
+                self._handle, ctypes.byref(header), ctypes.sizeof(header)
+            )
+            raise
+        self._pending.append((buffer, header))
+
+    def close(self) -> None:
+        if not self._handle:
+            return
+        self.reset()
+        self._winmm.waveOutClose(self._handle)
+        self._handle = ctypes.c_void_p()
+
+    def reset(self) -> None:
+        if not self._handle:
+            return
+        self._winmm.waveOutReset(self._handle)
+        self._release_completed()
+        self._pending.clear()
 
 
 def parse_rws_pcm(payload: bytes) -> list[PcmClip]:
@@ -126,7 +281,10 @@ def parse_rws_xbox_adpcm(payload: bytes, *, channels: int = 2) -> PcmClip:
     if len(encoded) % block_align:
         raise ValueError("streamed Xbox ADPCM payload is not block-aligned")
 
-    output = bytearray()
+    block_count = len(encoded) // block_align
+    output = bytearray(block_count * 64 * channels * 2)
+    output_offset = 0
+    packed_block = struct.Struct(f"<{64 * channels}h")
     for block_offset in range(0, len(encoded), block_align):
         channel_samples = []
         for channel in range(channels):
@@ -139,9 +297,13 @@ def parse_rws_xbox_adpcm(payload: bytes, *, channels: int = 2) -> PcmClip:
                     encoded[group_offset + channel * 4:group_offset + channel * 4 + 4]
                 )
             channel_samples.append(_decode_xbox_adpcm_block(bytes(channel_block)))
-        for sample_index in range(64):
-            for channel in range(channels):
-                output.extend(struct.pack("<h", channel_samples[channel][sample_index]))
+        interleaved = [
+            channel_samples[channel][sample_index]
+            for sample_index in range(64)
+            for channel in range(channels)
+        ]
+        packed_block.pack_into(output, output_offset, *interleaved)
+        output_offset += packed_block.size
     return PcmClip(sample_rate, channels, 16, bytes(output))
 
 
@@ -245,13 +407,15 @@ class WindowsPcmOutput:
         self.error_count = 0
         self.looping = False
         self._queue: queue.Queue[_QueuedPlayback] = queue.Queue(maxsize=max(1, queue_depth))
-        self._play_sound: Callable[[bytes, int], None] | None = None
+        self._sink: _WaveOutPcmSink | None = None
         if not self.available:
             return
-        import winsound
-
-        self._play_sound = winsound.PlaySound
-        self._flags = winsound.SND_MEMORY | winsound.SND_NODEFAULT
+        try:
+            self._sink = _WaveOutPcmSink()
+        except (OSError, RuntimeError):
+            self.available = False
+            self.error_count += 1
+            return
         threading.Thread(
             target=self._worker,
             name="b2-recomp-audio",
@@ -269,23 +433,27 @@ class WindowsPcmOutput:
     ) -> bool:
         if not self.available:
             return False
-        scaled_payload = scale_pcm_volume(
-            payload,
-            bits_per_sample=bits_per_sample,
-            gain=getattr(self, "master_volume", 0.5),
-        )
-        wave_payload = pcm_wave_bytes(
-            PcmClip(sample_rate, channels, bits_per_sample, scaled_payload)
+        if bits_per_sample != 16 or channels not in {1, 2} or sample_rate <= 0:
+            raise ValueError(
+                "host mixer requires mono/stereo PCM16 with a valid sample rate"
+            )
+        request = _QueuedPlayback(
+            bytes(payload),
+            loop,
+            sample_rate,
+            channels,
+            bits_per_sample,
+            getattr(self, "master_volume", 0.5),
         )
         try:
-            self._queue.put_nowait(_QueuedPlayback(wave_payload, loop))
+            self._queue.put_nowait(request)
         except queue.Full:
             try:
                 self._queue.get_nowait()
             except queue.Empty:
                 pass
             self.dropped_buffer_count += 1
-            self._queue.put_nowait(_QueuedPlayback(wave_payload, loop))
+            self._queue.put_nowait(request)
         self.submitted_buffer_count += 1
         return True
 
@@ -302,27 +470,73 @@ class WindowsPcmOutput:
             self._queue.put_nowait(_QueuedPlayback(b"", False))
 
     def _worker(self) -> None:
+        loop_payload = b""
+        loop_cursor = 0
+        one_shots: list[tuple[bytes, int]] = []
+        chunk_samples = 2400 * 2  # 50 ms at 48 kHz stereo.
         while True:
-            request = self._queue.get()
-            while request.wave_payload:
-                self.looping = request.loop
-                try:
-                    assert self._play_sound is not None
-                    self._play_sound(request.wave_payload, self._flags)
-                except RuntimeError:
-                    self.error_count += 1
-                    break
-                if not request.loop:
-                    break
+            if not loop_payload and not one_shots:
+                request = self._queue.get()
+                prepared_payload = _prepare_queued_playback(request)
+                if request.loop:
+                    loop_payload = prepared_payload
+                    loop_cursor = 0
+                elif prepared_payload:
+                    one_shots.append((prepared_payload, 0))
+                else:
+                    self.looping = False
+                    if self._sink is not None:
+                        self._sink.reset()
+                    continue
+            while True:
                 try:
                     request = self._queue.get_nowait()
                 except queue.Empty:
-                    continue
-            self.looping = False
+                    break
+                if not request.pcm_payload:
+                    loop_payload = b""
+                    loop_cursor = 0
+                    one_shots.clear()
+                    if self._sink is not None:
+                        self._sink.reset()
+                elif request.loop:
+                    loop_payload = _prepare_queued_playback(request)
+                    loop_cursor = 0
+                else:
+                    one_shots.append((_prepare_queued_playback(request), 0))
+
+            mixed = [0] * chunk_samples
+            if loop_payload:
+                for index in range(chunk_samples):
+                    if loop_cursor >= len(loop_payload):
+                        loop_cursor = 0
+                    mixed[index] = struct.unpack_from("<h", loop_payload, loop_cursor)[0]
+                    loop_cursor += 2
+
+            remaining_shots: list[tuple[bytes, int]] = []
+            for payload, cursor in one_shots:
+                for index in range(chunk_samples):
+                    if cursor >= len(payload):
+                        break
+                    sample = struct.unpack_from("<h", payload, cursor)[0]
+                    mixed[index] = max(-32768, min(32767, mixed[index] + sample))
+                    cursor += 2
+                if cursor < len(payload):
+                    remaining_shots.append((payload, cursor))
+            one_shots = remaining_shots
+            self.looping = bool(loop_payload)
+
+            chunk_payload = struct.pack(f"<{chunk_samples}h", *mixed)
+            try:
+                assert self._sink is not None
+                self._sink.write(chunk_payload)
+            except RuntimeError:
+                self.error_count += 1
+                time.sleep(0.05)
 
     def summary(self) -> dict[str, int | float | bool | str]:
         return {
-            "backend": "winmm_winsound",
+            "backend": "winmm_waveout",
             "available": self.available,
             "master_volume": self.master_volume,
             "submitted_buffer_count": self.submitted_buffer_count,
@@ -330,3 +544,49 @@ class WindowsPcmOutput:
             "error_count": self.error_count,
             "looping": self.looping,
         }
+
+
+def _convert_pcm16_to_stereo_48k(
+    payload: bytes,
+    *,
+    sample_rate: int,
+    channels: int,
+    bits_per_sample: int,
+) -> bytes:
+    """Normalize host clips for low-latency music/SFX software mixing."""
+
+    if bits_per_sample != 16 or channels not in {1, 2} or sample_rate <= 0:
+        raise ValueError("host mixer requires mono/stereo PCM16 with a valid sample rate")
+    if sample_rate == 48000 and channels == 2 and len(payload) % 4 == 0:
+        return bytes(payload)
+    samples = array.array("h")
+    samples.frombytes(payload)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    frame_count = len(samples) // channels
+    output_frame_count = round(frame_count * 48000 / sample_rate)
+    output = array.array("h")
+    for output_frame in range(output_frame_count):
+        source_frame = min(frame_count - 1, output_frame * sample_rate // 48000)
+        left = samples[source_frame * channels]
+        right = samples[source_frame * channels + 1] if channels == 2 else left
+        output.extend((left, right))
+    if sys.byteorder != "little":
+        output.byteswap()
+    return output.tobytes()
+
+
+def _prepare_queued_playback(request: _QueuedPlayback) -> bytes:
+    if not request.pcm_payload:
+        return b""
+    scaled_payload = scale_pcm_volume(
+        request.pcm_payload,
+        bits_per_sample=request.bits_per_sample,
+        gain=request.gain,
+    )
+    return _convert_pcm16_to_stereo_48k(
+        scaled_payload,
+        sample_rate=request.sample_rate,
+        channels=request.channels,
+        bits_per_sample=request.bits_per_sample,
+    )
