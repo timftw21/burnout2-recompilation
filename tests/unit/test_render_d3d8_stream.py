@@ -12,6 +12,23 @@ from tools.render.d3d8_stream import (
 
 
 class RenderD3D8StreamTests(unittest.TestCase):
+    def test_normalizes_push_buffer_offsets_beyond_legacy_64k_window(self) -> None:
+        stream = normalize_render_stream(
+            {
+                "format": "b2-recomp-render-command-stream",
+                "writes": [
+                    {
+                        "kind": "d3d_push_buffer",
+                        "address": 0x80010020,
+                        "value": 1,
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(stream["writes"][0]["offset"], 0x10020)
+        self.assertEqual(stream["writes"][0]["offset_hex"], "0x00010020")
+
     def test_reassembles_locally_out_of_order_push_buffer_payload(self) -> None:
         decoded = decode_render_stream(
             {
@@ -57,6 +74,44 @@ class RenderD3D8StreamTests(unittest.TestCase):
             [write["source_sequence"] for write in merged["writes"]], [7, 99]
         )
         self.assertEqual([write["source_window"] for write in merged["writes"]], [0, 1])
+
+    def test_merge_preserves_distinct_texture_formats_at_reused_address(self) -> None:
+        address = 0x2272A080
+        first = {
+            "format": "b2-recomp-render-command-stream",
+            "writes": [],
+            "resource_snapshots": [
+                {
+                    "address": address,
+                    "format": "DXT1",
+                    "width": 512,
+                    "height": 512,
+                }
+            ],
+        }
+        second = {
+            "format": "b2-recomp-render-command-stream",
+            "writes": [],
+            "resource_snapshots": [
+                {
+                    "address": address,
+                    "format": "DXT5",
+                    "width": 256,
+                    "height": 256,
+                }
+            ],
+        }
+
+        merged = merge_render_streams(first, second)
+
+        self.assertEqual(merged["resource_snapshot_count"], 2)
+        self.assertEqual(
+            {
+                (resource["format"], resource["width"], resource["height"])
+                for resource in merged["resource_snapshots"]
+            },
+            {("DXT1", 512, 512), ("DXT5", 256, 256)},
+        )
 
     def test_extracts_first_class_stream_from_probe_summary(self) -> None:
         summary = {

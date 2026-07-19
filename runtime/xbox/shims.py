@@ -520,7 +520,13 @@ class XboxFileSystemShim:
             return {"status": XboxStatus.INVALID_HANDLE, "error": str(exc)}
         return self.query_volume_information(file.guest_path)
 
-    def open_file(self, guest_path: str, mode: str = "rb") -> dict[str, Any]:
+    def open_file(
+        self,
+        guest_path: str,
+        mode: str = "rb",
+        *,
+        create_disposition: int | None = None,
+    ) -> dict[str, Any]:
         if mode not in {"r", "rb", "w", "wb", "a", "ab"}:
             self._trace.add(
                 "filesystem", "open_file", "error", guest_path=guest_path, mode=mode
@@ -556,6 +562,19 @@ class XboxFileSystemShim:
                 "handle": None,
                 "root_kind": root_kind,
                 "error": str(exc),
+            }
+        existed = host_path.exists()
+        if create_disposition == 2 and existed:
+            return {
+                "status": XboxStatus.OBJECT_NAME_COLLISION,
+                "handle": None,
+                "root_kind": root_kind,
+            }
+        if create_disposition in {1, 4} and not existed:
+            return {
+                "status": XboxStatus.NO_SUCH_FILE,
+                "handle": None,
+                "root_kind": root_kind,
             }
         if writable:
             if host_path.is_dir():
@@ -603,6 +622,15 @@ class XboxFileSystemShim:
             is_directory=is_directory,
         )
         handle = self._handles.allocate("file", file)
+        created = not existed
+        if created:
+            io_information = 2
+        elif create_disposition == 0:
+            io_information = 0
+        elif create_disposition in {4, 5} or "w" in mode:
+            io_information = 3
+        else:
+            io_information = 1
         self._trace.add(
             "filesystem",
             "open_file",
@@ -615,12 +643,116 @@ class XboxFileSystemShim:
             is_directory=is_directory,
             save_data=self._is_save_path(guest_path),
             cache_data=root_kind == "cache",
+            created=created,
+            io_information=io_information,
         )
         return {
             "status": XboxStatus.SUCCESS,
             "handle": handle,
             "root_kind": root_kind,
             "is_directory": is_directory,
+            "created": created,
+            "io_information": io_information,
+        }
+
+    def open_directory(
+        self,
+        guest_path: str,
+        *,
+        create_disposition: int | None = None,
+    ) -> dict[str, Any]:
+        root_kind = self._root_kind_for_guest_path(guest_path)
+        create = create_disposition in {2, 3}
+        if create and root_kind not in {"save", "cache"}:
+            return {
+                "status": XboxStatus.ACCESS_DENIED,
+                "handle": None,
+                "root_kind": root_kind,
+            }
+        if create_disposition not in {None, 1, 2, 3}:
+            return {
+                "status": XboxStatus.INVALID_PARAMETER,
+                "handle": None,
+                "root_kind": root_kind,
+            }
+        try:
+            host_path = self.resolve_guest_path(guest_path, for_write=create)
+        except XboxPathError as exc:
+            return {
+                "status": XboxStatus.NO_SUCH_FILE,
+                "handle": None,
+                "root_kind": root_kind,
+                "error": str(exc),
+            }
+
+        existed = host_path.exists()
+        if existed and not host_path.is_dir():
+            return {
+                "status": XboxStatus.ACCESS_DENIED,
+                "handle": None,
+                "root_kind": root_kind,
+            }
+        if existed and create_disposition == 2:
+            return {
+                "status": XboxStatus.OBJECT_NAME_COLLISION,
+                "handle": None,
+                "root_kind": root_kind,
+            }
+        if not existed:
+            if not create:
+                return {
+                    "status": XboxStatus.NO_SUCH_FILE,
+                    "handle": None,
+                    "root_kind": root_kind,
+                }
+            try:
+                host_path.mkdir(parents=True)
+            except OSError as exc:
+                self._trace.add(
+                    "filesystem",
+                    "open_directory",
+                    "error",
+                    guest_path=guest_path,
+                    host_path=host_path,
+                    root_kind=root_kind,
+                    error=str(exc),
+                )
+                return {
+                    "status": XboxStatus.ACCESS_DENIED,
+                    "handle": None,
+                    "root_kind": root_kind,
+                }
+
+        file = GuestFile(
+            guest_path,
+            host_path,
+            "rb",
+            root_kind,
+            writable=create,
+            is_directory=True,
+        )
+        handle = self._handles.allocate("file", file)
+        created = not existed
+        io_information = 2 if created else 1
+        self._trace.add(
+            "filesystem",
+            "open_directory",
+            guest_path=guest_path,
+            host_path=host_path,
+            handle=handle,
+            root_kind=root_kind,
+            created=created,
+            io_information=io_information,
+            save_data=self._is_save_path(guest_path),
+            cache_data=root_kind == "cache",
+        )
+        return {
+            "status": XboxStatus.SUCCESS,
+            "handle": handle,
+            "root_kind": root_kind,
+            "is_directory": True,
+            "created": created,
+            "io_information": io_information,
         }
 
     def read_file(
@@ -1538,7 +1670,14 @@ class XboxSynchronizationShim:
         self._handles = handles
         self._clock = clock
         self._critical_sections: set[int] = set()
-        self._current_thread = self._handles.allocate("thread", ThreadObject())
+        current_thread = ThreadObject()
+        self._current_thread = self._handles.allocate("thread", current_thread)
+        # Closing a thread handle does not destroy the running kernel thread.
+        # Keep scheduler-visible objects independently of the guest handle
+        # table so closed handles cannot make live threads disappear.
+        self._threads: dict[int, ThreadObject] = {
+            self._current_thread: current_thread
+        }
         self._dpcs: dict[int, DpcObject] = {}
         self._kernel_timers: dict[int, TimerObject] = {}
         self._interrupts: dict[int, InterruptObject] = {}
@@ -1746,22 +1885,21 @@ class XboxSynchronizationShim:
         thread_id_address: int | None = None,
         debug_stack: bool = False,
     ) -> int:
-        handle = self._handles.allocate(
-            "thread",
-            ThreadObject(
-                start_address=start_address,
-                parameter=parameter,
-                suspended=suspended,
-                start_context1=start_context1,
-                start_context2=start_context2,
-                thread_extra_size=thread_extra_size,
-                kernel_stack_size=kernel_stack_size,
-                tls_data_size=tls_data_size,
-                thread_handle_address=thread_handle_address,
-                thread_id_address=thread_id_address,
-                debug_stack=debug_stack,
-            ),
+        thread = ThreadObject(
+            start_address=start_address,
+            parameter=parameter,
+            suspended=suspended,
+            start_context1=start_context1,
+            start_context2=start_context2,
+            thread_extra_size=thread_extra_size,
+            kernel_stack_size=kernel_stack_size,
+            tls_data_size=tls_data_size,
+            thread_handle_address=thread_handle_address,
+            thread_id_address=thread_id_address,
+            debug_stack=debug_stack,
         )
+        handle = self._handles.allocate("thread", thread)
+        self._threads[handle] = thread
         self._trace.add(
             "threading",
             "create_system_thread",
@@ -1782,9 +1920,7 @@ class XboxSynchronizationShim:
 
     def thread_snapshot(self) -> list[dict[str, Any]]:
         threads: list[dict[str, Any]] = []
-        for handle, (kind, thread) in sorted(self._handles._objects.items()):
-            if kind != "thread":
-                continue
+        for handle, thread in sorted(self._threads.items()):
             data = thread.to_dict()
             data["handle"] = handle
             data["handle_hex"] = _hex32(handle)
@@ -2035,6 +2171,10 @@ class DisplayMode:
 
 
 class XboxGraphicsShim:
+    # Standard A/V pack, NTSC-M, 60 Hz. D3D8 requires both the pack/standard
+    # selector and a matching refresh capability before exposing display modes.
+    DEFAULT_AV_CAPABILITIES = 0x00400101
+
     def __init__(self, trace: ShimTraceLog, memory: XboxMemoryShim) -> None:
         self._trace = trace
         self._memory = memory
@@ -2044,20 +2184,51 @@ class XboxGraphicsShim:
 
     def set_display_mode(
         self,
-        width: int = 640,
-        height: int = 480,
-        bpp: int = 32,
-        refresh_rate: int = 60,
-        flags: int = 0,
+        register_base: int,
+        step: int,
+        mode: int,
+        pixel_format: int,
+        pitch: int,
+        frame_buffer: int,
     ) -> int:
-        self.display_mode = DisplayMode(width, height, bpp, refresh_rate, flags)
-        self._trace.add("rendering", "set_display_mode", mode=self.display_mode)
+        # The observed linear 32-bit modes encode their visible width in the
+        # byte pitch. Keep the human-readable summary coherent while retaining
+        # every raw Xbox AV argument in the trace.
+        if pixel_format in {0x12, 0x1E} and pitch:
+            self.display_mode.width = pitch // 4
+            self.display_mode.bpp = 32
+        self._trace.add(
+            "rendering",
+            "set_display_mode",
+            register_base=register_base,
+            step=step,
+            mode=mode,
+            pixel_format=pixel_format,
+            pitch=pitch,
+            frame_buffer=frame_buffer,
+            display_mode=self.display_mode,
+        )
         return XboxStatus.SUCCESS
 
-    def send_tv_encoder_option(self, option: int, value: int = 0) -> int:
-        self.encoder_options.append({"option": option, "value": value})
-        self._trace.add("rendering", "send_tv_encoder_option", option=option, value=value)
-        return XboxStatus.SUCCESS
+    def send_tv_encoder_option(
+        self,
+        register_base: int,
+        option: int,
+        parameter: int = 0,
+        result_address: int = 0,
+    ) -> dict[str, int]:
+        result_value = self.DEFAULT_AV_CAPABILITIES if option == 6 else 0
+        result = {
+            "status": XboxStatus.SUCCESS,
+            "register_base": register_base,
+            "option": option,
+            "parameter": parameter,
+            "result_address": result_address,
+            "result_value": result_value,
+        }
+        self.encoder_options.append(dict(result))
+        self._trace.add("rendering", "send_tv_encoder_option", **result)
+        return result
 
     def set_saved_data_address(self, address: int) -> int:
         self.saved_data_address = address
@@ -3427,9 +3598,74 @@ class XboxRuntimeShims:
         return self.sync.reset_event(handle)
 
     def nt_wait_for_single_object(
-        self, handle: int, timeout_100ns: int | None = None
+        self,
+        handle: int,
+        alertable: int = 0,
+        timeout_100ns: int | None = None,
     ) -> int:
-        return self.sync.wait_for_single_object(handle, timeout_100ns=timeout_100ns)
+        status = self.sync.wait_for_single_object(
+            handle,
+            timeout_100ns=timeout_100ns,
+        )
+        self.trace.add(
+            "threading",
+            "wait_nt_single",
+            handle=handle,
+            alertable=bool(alertable),
+            timeout_100ns=timeout_100ns,
+            status_hex=_hex32(status),
+        )
+        return status
+
+    def nt_wait_for_single_object_ex(
+        self,
+        handle: int,
+        wait_mode: int = 0,
+        alertable: int = 0,
+        timeout_address: int = 0,
+    ) -> int:
+        # The ABI supplies a guest LARGE_INTEGER pointer, which the standalone
+        # runtime shim cannot dereference. A non-null pointer still denotes a
+        # bounded wait; model that as an immediate poll at this boundary.
+        status = self.sync.wait_for_single_object(
+            handle,
+            timeout_100ns=0 if timeout_address else None,
+        )
+        self.trace.add(
+            "threading",
+            "wait_nt_single_ex",
+            handle=handle,
+            wait_mode=wait_mode,
+            alertable=bool(alertable),
+            timeout_address=timeout_address,
+            status_hex=_hex32(status),
+        )
+        return status
+
+    def ke_wait_for_single_object(
+        self,
+        object_address: int,
+        wait_reason: int = 0,
+        wait_mode: int = 0,
+        alertable: int = 0,
+        timeout_address: int = 0,
+    ) -> int:
+        # KeWaitForSingleObject receives a pointer to an in-place dispatcher
+        # object, unlike NtWaitForSingleObject's runtime handle. The native
+        # guest runner is single-threaded and services the hardware completion
+        # paths synchronously, so an unmodeled dispatcher wait is complete at
+        # the bridge boundary.
+        self.trace.add(
+            "threading",
+            "wait_kernel_single",
+            object_address=object_address,
+            wait_reason=wait_reason,
+            wait_mode=wait_mode,
+            alertable=bool(alertable),
+            timeout_address=timeout_address,
+            status_hex=_hex32(XboxStatus.WAIT_0),
+        )
+        return XboxStatus.WAIT_0
 
     def ke_wait_for_multiple_objects(
         self,
@@ -3790,16 +4026,35 @@ class XboxRuntimeShims:
 
     def av_set_display_mode(
         self,
-        width: int = 640,
-        height: int = 480,
-        bpp: int = 32,
-        refresh_rate: int = 60,
-        flags: int = 0,
+        register_base: int,
+        step: int,
+        mode: int,
+        pixel_format: int,
+        pitch: int,
+        frame_buffer: int,
     ) -> int:
-        return self.graphics.set_display_mode(width, height, bpp, refresh_rate, flags)
+        return self.graphics.set_display_mode(
+            register_base,
+            step,
+            mode,
+            pixel_format,
+            pitch,
+            frame_buffer,
+        )
 
-    def av_send_tv_encoder_option(self, option: int, value: int = 0) -> int:
-        return self.graphics.send_tv_encoder_option(option, value)
+    def av_send_tv_encoder_option(
+        self,
+        register_base: int,
+        option: int,
+        parameter: int = 0,
+        result_address: int = 0,
+    ) -> dict[str, int]:
+        return self.graphics.send_tv_encoder_option(
+            register_base,
+            option,
+            parameter,
+            result_address,
+        )
 
     def av_set_saved_data_address(self, address: int) -> int:
         return self.graphics.set_saved_data_address(address)
@@ -4008,6 +4263,7 @@ class XboxRuntimeShims:
             "allocation_count": len(self.memory.allocations),
             "allocations": [allocation.to_dict() for allocation in self.memory.allocations],
             "display_mode": self.graphics.display_mode.to_dict(),
+            "encoder_options": list(self.graphics.encoder_options),
             "input": self.input.snapshot(),
             "audio_initialized": self.audio.initialized,
             "audio_streams": self.audio.stream_snapshot(),
@@ -4096,7 +4352,7 @@ _IMPLEMENTED_KERNEL_HANDLERS: dict[str, tuple[str, str]] = {
     # not call that address as a function.
     "KeTickCount": _handler("ke_tick_count", "data"),
     "KeWaitForMultipleObjects": _handler("ke_wait_for_multiple_objects"),
-    "KeWaitForSingleObject": _handler("nt_wait_for_single_object"),
+    "KeWaitForSingleObject": _handler("ke_wait_for_single_object"),
     "KfLowerIrql": _handler("kf_lower_irql"),
     "KfRaiseIrql": _handler("kf_raise_irql"),
     "LaunchDataPage": _handler("kernel_variable", "data"),
@@ -4136,7 +4392,7 @@ _IMPLEMENTED_KERNEL_HANDLERS: dict[str, tuple[str, str]] = {
     "NtSetSystemTime": _handler("nt_set_system_time"),
     "NtSetTimerEx": _handler("nt_set_timer"),
     "NtWaitForSingleObject": _handler("nt_wait_for_single_object"),
-    "NtWaitForSingleObjectEx": _handler("nt_wait_for_single_object"),
+    "NtWaitForSingleObjectEx": _handler("nt_wait_for_single_object_ex"),
     "NtWriteFile": _handler("nt_write_file"),
     "NtYieldExecution": _handler("nt_yield_execution"),
     "ObReferenceObjectByHandle": _handler("ob_reference_object_by_handle"),

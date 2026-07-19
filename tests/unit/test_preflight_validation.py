@@ -37,17 +37,34 @@ def _render_stream(
     resource_height: int = 4,
 ) -> dict[str, object]:
     address = 0x22001000
-    draw_format = (2 << 24) | (2 << 20) | (1 << 16) | (0x0C << 8) | (2 << 4)
-    words = (
+    linear = resource_format in {"A8R8G8B8_LINEAR", "X8R8G8B8_LINEAR"}
+    color_format = 0x12 if resource_format == "A8R8G8B8_LINEAR" else 0x1E
+    draw_format = (
+        ((color_format << 8) | (2 << 4) | 9)
+        if linear
+        else (2 << 24) | (2 << 20) | (1 << 16) | (0x0C << 8) | (2 << 4)
+    )
+    words = [
         (4 << 18) | 0x1B00,
         address,
         draw_format,
         0,
         1 << 30,
-        (1 << 18) | 0x17FC,
-        primitive,
-        (1 << 18) | 0x17FC,
-        0,
+    ]
+    if linear:
+        words.extend(
+            (
+                (1 << 18) | 0x1B18,
+                (resource_width << 16) | resource_height,
+            )
+        )
+    words.extend(
+        (
+            (1 << 18) | 0x17FC,
+            primitive,
+            (1 << 18) | 0x17FC,
+            0,
+        )
     )
     payload = struct.pack(f"<{len(words)}I", *words)
     resource_bytes = 8 if resource_format == "DXT1" else 16
@@ -105,6 +122,28 @@ class PreflightValidationTests(unittest.TestCase):
         self.assertTrue(report["passed"])
         self.assertEqual(report["textured_draw_count"], 1)
         self.assertEqual(report["matched_textured_draw_count"], 1)
+
+    def test_render_capability_gate_accepts_converted_quad_list(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "render.json"
+            path.write_text(
+                json.dumps(
+                    _render_stream(
+                        primitive=8,
+                        resource_format="A8R8G8B8_LINEAR",
+                        resource_width=640,
+                        resource_height=480,
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            report = analyze_render_capabilities(path)
+
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["primitive_counts"], {"quad_list": 1})
+        self.assertEqual(report["unsupported_primitives"], [])
+        self.assertEqual(report["draw_resource_consistency_failure_count"], 0)
 
     def test_audit_manifest_replay_honors_exact_command_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

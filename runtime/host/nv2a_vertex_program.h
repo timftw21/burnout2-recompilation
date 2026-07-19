@@ -138,7 +138,8 @@ inline Nv2aVertexProgramResult execute_nv2a_vertex_program(
     const std::array<std::array<uint32_t, 4>, 136>& program,
     const std::array<std::array<uint32_t, 4>, 192>& constant_bits,
     uint32_t start,
-    const std::array<std::array<float, 4>, 16>& inputs) {
+    const std::array<std::array<float, 4>, 16>& inputs,
+    std::array<std::array<uint32_t, 4>, 192>* context_output_bits = nullptr) {
     using namespace nv2a_vsh;
     Nv2aVertexProgramResult execution{};
     std::array<Vec4, 12> temporary{};
@@ -197,14 +198,26 @@ inline Nv2aVertexProgramResult execute_nv2a_vertex_program(
         const uint32_t temporary_index = field(token[3], 20, 4);
         const uint32_t mac_mask = field(token[3], 24, 4);
         const uint32_t ilu_mask = field(token[3], 16, 4);
+        const auto write_temporary = [&](uint32_t index, const Vec4& value,
+                                         uint32_t mask) {
+            if (index == 12u) {
+                write_mask(execution.outputs[0], value, mask);
+                execution.output_masks[0] |= mask;
+            } else if (index < temporary.size()) {
+                write_mask(temporary[index], value, mask);
+            }
+        };
         if (mac_opcode == 13u) {
             address = mac[0];
-        } else if (mac_mask && temporary_index < temporary.size()) {
-            write_mask(temporary[temporary_index], mac, mac_mask);
+        } else if (mac_mask
+                   && !(ilu_opcode != 0u && temporary_index == 1u)) {
+            // R12 mirrors oPos. In a paired instruction the MAC write to R1
+            // is discarded because the ILU owns that temporary register.
+            write_temporary(temporary_index, mac, mac_mask);
         }
         if (ilu_mask) {
             const uint32_t ilu_temporary = mac_opcode ? 1u : temporary_index;
-            if (ilu_temporary < temporary.size()) write_mask(temporary[ilu_temporary], ilu, ilu_mask);
+            write_temporary(ilu_temporary, ilu, ilu_mask);
         }
 
         const uint32_t output_mask = field(token[3], 12, 4);
@@ -221,6 +234,16 @@ inline Nv2aVertexProgramResult execute_nv2a_vertex_program(
             }
         }
         if (field(token[3], 0, 1)) {
+            if (context_output_bits != nullptr) {
+                for (uint32_t row = 0; row < constants.size(); ++row) {
+                    for (uint32_t lane = 0; lane < 4; ++lane) {
+                        std::memcpy(
+                            &(*context_output_bits)[row][lane],
+                            &constants[row][lane],
+                            sizeof(float));
+                    }
+                }
+            }
             execution.valid = true;
             return execution;
         }

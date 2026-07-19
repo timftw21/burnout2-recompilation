@@ -126,6 +126,29 @@ class RuntimeShimTests(unittest.TestCase):
                 runtime.filesystem.resolve_guest_path("T:\\settings.bin"),
                 save_root / "TDATA" / "41430019" / "settings.bin",
             )
+            created_profile = runtime.filesystem.open_directory(
+                "U:\\Profile2",
+                create_disposition=3,
+            )
+            self.assertEqual(created_profile["status"], XboxStatus.SUCCESS)
+            self.assertTrue(created_profile["created"])
+            self.assertEqual(created_profile["io_information"], 2)
+            self.assertTrue((save_root / "UDATA" / "41430019" / "Profile2").is_dir())
+            reopened_profile = runtime.filesystem.open_directory(
+                "U:\\Profile2",
+                create_disposition=3,
+            )
+            self.assertEqual(reopened_profile["status"], XboxStatus.SUCCESS)
+            self.assertFalse(reopened_profile["created"])
+            self.assertEqual(reopened_profile["io_information"], 1)
+            collision = runtime.filesystem.open_directory(
+                "U:\\Profile2",
+                create_disposition=2,
+            )
+            self.assertEqual(
+                collision["status"],
+                XboxStatus.OBJECT_NAME_COLLISION,
+            )
             user_root = runtime.filesystem.open_file("U:\\", "rb")
             self.assertEqual(user_root["status"], XboxStatus.SUCCESS)
             self.assertEqual(user_root["root_kind"], "save")
@@ -135,8 +158,15 @@ class RuntimeShimTests(unittest.TestCase):
             self.assertEqual(directory_entry["status"], XboxStatus.SUCCESS)
             self.assertEqual(directory_entry["name"], "Profile1")
             self.assertTrue(directory_entry["is_directory"])
+            second_entry = runtime.filesystem.query_directory_entry(
+                user_root["handle"]
+            )
+            self.assertEqual(second_entry["status"], XboxStatus.SUCCESS)
+            self.assertEqual(second_entry["name"], "Profile2")
             self.assertEqual(
-                runtime.filesystem.query_directory_entry(user_root["handle"])["status"],
+                runtime.filesystem.query_directory_entry(user_root["handle"])[
+                    "status"
+                ],
                 XboxStatus.NO_MORE_FILES,
             )
             restarted_entry = runtime.filesystem.query_directory_entry(
@@ -301,9 +331,33 @@ class RuntimeShimTests(unittest.TestCase):
             XboxStatus.WAIT_TIMEOUT,
         )
         self.assertEqual(
+            runtime.nt_wait_for_single_object_ex(semaphore, 1, 0, 0),
+            XboxStatus.WAIT_TIMEOUT,
+        )
+        self.assertEqual(
+            runtime.ke_wait_for_single_object(0x0022704C, 6, 1, 0, 0),
+            XboxStatus.WAIT_0,
+        )
+        kernel_wait_event = runtime.summary()["trace"][-1]
+        self.assertEqual(kernel_wait_event["operation"], "wait_kernel_single")
+        self.assertEqual(
+            kernel_wait_event["details"]["object_address"],
+            0x0022704C,
+        )
+        self.assertEqual(
             runtime.nt_release_semaphore(semaphore, 2)["previous_count"],
             0,
         )
+        worker = runtime.ps_create_system_thread(
+            start_address=0x00108D50,
+            parameter=0x1234,
+        )
+        self.assertEqual(runtime.nt_close(worker), XboxStatus.SUCCESS)
+        self.assertIn(
+            worker,
+            {thread["handle"] for thread in runtime.sync.thread_snapshot()},
+        )
+        self.assertNotIn(worker, runtime.handles._objects)
         invalid_release = runtime.nt_release_semaphore(0, 1)
         self.assertEqual(invalid_release["status"], XboxStatus.INVALID_HANDLE)
         self.assertEqual(invalid_release["previous_count"], 0)
@@ -345,7 +399,17 @@ class RuntimeShimTests(unittest.TestCase):
         runtime.input.set_controller_state(0, state)
         self.assertEqual(runtime.input.poll_controller(0), state)
 
-        self.assertEqual(runtime.av_set_display_mode(1280, 720, 32, 60, 0), XboxStatus.SUCCESS)
+        self.assertEqual(
+            runtime.av_set_display_mode(
+                0xFD000000,
+                0,
+                0x040F0D0F,
+                0x12,
+                1280 * 4,
+                0x21D8D000,
+            ),
+            XboxStatus.SUCCESS,
+        )
         self.assertEqual(runtime.graphics.display_mode.width, 1280)
         gpu_address = runtime.mm_claim_gpu_instance_memory(0x2000)
         self.assertEqual(runtime.memory.query(gpu_address)["kind"], "gpu")

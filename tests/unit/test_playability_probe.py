@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ctypes
 import json
+import math
 import struct
 import tempfile
 import threading
@@ -60,6 +62,8 @@ from tools.playability.playability_probe import (
     TITLE_D3D_PACKET_ALLOC_SIZE,
     TITLE_D3D_PRIMITIVE_DRAW_ADDRESS,
     TITLE_D3D_PRIMITIVE_DRAW_STACK_CLEANUP,
+    TITLE_D3D_INDEXED_DRAW_ADDRESS,
+    TITLE_D3D_INDEXED_DRAW_WRAPPER_RETURN_ADDRESS,
     TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS,
     TITLE_D3D_PUSH_BUFFER_END_ADDRESS,
     TITLE_D3D_PUSH_BUFFER_SIZE,
@@ -70,6 +74,18 @@ from tools.playability.playability_probe import (
     TITLE_D3D_STATE_DESCRIPTOR_STRIDE,
     TITLE_D3D_STATE_DESCRIPTOR_SWITCH_OFFSET,
     TITLE_D3D_STATE_DESCRIPTOR_SWITCH_VALUE,
+    TITLE_WORLD_MATRIX_BUILD_ADDRESS,
+    TITLE_WORLD_DRAW_CALLBACK_ADDRESS,
+    TITLE_CAMERA_UPDATE_ADDRESS,
+    TITLE_CAMERA_TARGET_FRAME_RETURN_ADDRESS,
+    TITLE_CAMERA_UPDATE_RETURN_ADDRESS,
+    TITLE_GENERIC_CAMERA_UPDATE_ADDRESS,
+    TITLE_GENERIC_CAMERA_TARGET_FRAME_RETURN_ADDRESS,
+    TITLE_GENERIC_CAMERA_UPDATE_RETURN_ADDRESSES,
+    TITLE_WORLD_MATRIX_ROTATE_ADDRESS,
+    TITLE_WORLD_MATRIX_ROTATE_RETURN_ADDRESSES,
+    TITLE_WORLD_MATRIX_ROTATION_BUILD_ADDRESS,
+    TITLE_WORLD_MATRIX_ROTATION_BUILD_RETURN_ADDRESS,
     TITLE_DIRECTSOUND_BUFFER_SYNC_ADDRESS,
     TITLE_GLOBAL_LIST_HEAD_ADDRESS,
     TITLE_GLOBAL_LIST_OWNER_FLAG,
@@ -150,6 +166,7 @@ from tools.playability.playability_probe import (
     TITLE_HEAP_FAST_PATH_ALIGNMENT,
     TITLE_HEAP_FAST_PATH_MIN_OBJECT_SIZE,
     TITLE_HEAP_FREE_TRAMPOLINE_ADDRESS,
+    TITLE_HEAP_LARGE_BIN_SENTINEL_OFFSET,
     TITLE_STATIC_DRIVE_ARRAY_ELEMENT_SIZE,
     TITLE_STATIC_DRIVE_ARRAY_REGISTRY_COUNT_ADDRESS,
     TITLE_STATIC_DRIVE_ARRAY_REGISTRY_DESCRIPTORS_ADDRESS,
@@ -186,6 +203,7 @@ from tools.playability.playability_probe import (
     TitleAllocationListCountFastPath,
     TitleAssetStreamOpenFastPath,
     TitleGuestHeapFastPath,
+    TitleHeapLargeBinIntegrityRepair,
     TitleFrontendAssetInitFastPath,
     TitleFrontendSpecialAudioFastPath,
     TitleMusicModeFastPath,
@@ -203,6 +221,10 @@ from tools.playability.playability_probe import (
     TitleD3DPrimitiveDrawFastPath,
     TitleD3DReserveFastPath,
     TitleImmediateDrawAudit,
+    TitleSceneRecordAudit,
+    TitleSceneRecordSourceLayout,
+    TitleSceneRecordTableLayout,
+    TitleWorldMatrixAudit,
     TitleDirectSoundBufferSyncFastPath,
     TitleGlobalListRegistrationFastPath,
     TitleStaticDriveArrayFastPath,
@@ -211,10 +233,13 @@ from tools.playability.playability_probe import (
     TitleVertexAppendFastPath,
     XbeBackedSparseMemory,
     _asset_io_summary_from_invocations,
+    _append_native_frontier_module_batch,
     _deterministic_service_validation_summary,
     _frontend_resource_boundary_from_step_limit,
     _gpu_idle_pump_boundary_from_step_limit,
     _guest_thread_requested_live_stop,
+    _load_title_scene_record_sources,
+    build_title_scene_record_audit_report,
     _heap_free_list_boundary_from_step_limit,
     _recover_missing_branch_targets,
     _playability_gaps,
@@ -236,6 +261,7 @@ from tools.recomp.x86_lifter import (
     lift_x86_block,
     lift_x86_function,
 )
+from tools.recomp.native_executor import NativeResumableExecutor
 
 
 def _call_indirect_bytes(pointer_address: int) -> bytes:
@@ -256,6 +282,92 @@ def _call_relative_bytes(base_address: int, target_address: int) -> bytes:
 
 
 class PlayabilityProbeTests(unittest.TestCase):
+    def test_native_frontier_batches_keep_prior_module_stable(self) -> None:
+        first = lift_x86_function(
+            bytes.fromhex("40C3"),
+            base_address=0x1000,
+            symbol="frontier_first",
+        )
+        second = lift_x86_function(
+            bytes.fromhex("48C3"),
+            base_address=0x2000,
+            symbol="frontier_second",
+        )
+        third = lift_x86_function(
+            bytes.fromhex("90C3"),
+            base_address=0x3000,
+            symbol="frontier_third",
+        )
+        frontier_functions: list[LiftedFunction] = []
+        frontier_modules: list[LiftedFunction] = []
+
+        _append_native_frontier_module_batch(
+            [first, second],
+            frontier_functions=frontier_functions,
+            frontier_modules=frontier_modules,
+            symbol_prefix="guest_thread_00_frontier",
+        )
+        original_module = frontier_modules[0]
+        original_addresses = [
+            instruction.address for instruction in original_module.instructions
+        ]
+        _append_native_frontier_module_batch(
+            [third],
+            frontier_functions=frontier_functions,
+            frontier_modules=frontier_modules,
+            symbol_prefix="guest_thread_00_frontier",
+        )
+
+        self.assertEqual(len(frontier_functions), 3)
+        self.assertEqual(len(frontier_modules), 2)
+        self.assertIs(frontier_modules[0], original_module)
+        self.assertEqual(
+            [
+                instruction.address
+                for instruction in frontier_modules[0].instructions
+            ],
+            original_addresses,
+        )
+        self.assertEqual(
+            [instruction.address for instruction in frontier_modules[1].instructions],
+            [0x3000, 0x3001],
+        )
+        self.assertEqual(
+            frontier_modules[1].symbol,
+            "guest_thread_00_frontier_batch_0001",
+        )
+
+    def test_live_stop_is_polled_between_native_frontier_recoveries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            controller_path = root / "controller.json"
+            controller_path.write_text('{"stop":true}', encoding="utf-8")
+            bridge = LiveHostBridge(
+                XboxRuntimeShims(),
+                RenderWriteWatchpoint(),
+                render_stream_path=root / "render.json",
+                controller_state_path=controller_path,
+            )
+
+            self.assertFalse(bridge.should_continue_native_recovery())
+            self.assertTrue(bridge.stop_requested)
+
+    def test_native_guest_loop_executes_recovered_vertex_append_directly(self) -> None:
+        source = Path("tools/playability/playability_probe.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("title_vertex_append_handlers = (", source)
+        self.assertIn("if native_guest_loop", source)
+        self.assertIn("else title_vertex_append_fast_path.call_handlers()", source)
+        self.assertIn("**title_vertex_append_handlers,", source)
+        self.assertNotIn(
+            "**title_vertex_append_fast_path.call_handlers(),",
+            source,
+        )
+        self.assertIn("default=100_000", source)
+        self.assertIn("completed flips still", source)
+
     def test_subsystem_initializer_audit_records_ordered_results(self) -> None:
         audit = TitleSubsystemInitializerAudit()
         state = CpuState.with_registers(esi=7, edi=0x3000)
@@ -395,6 +507,276 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(stream["writes"][0]["value"], 3)
         self.assertEqual(len(watchpoint.history_stream()["writes"]), 3)
 
+    def test_render_watchpoint_normalizes_dynamic_title_push_buffer(self) -> None:
+        watchpoint = RenderWriteWatchpoint()
+        watchpoint.set_push_buffer_range_provider(
+            lambda: (0x21B80000, 0x21BC0000)
+        )
+        flip_header = (1 << 18) | 0x012C
+
+        watchpoint.observe(0x21B90100, flip_header.to_bytes(4, "little"))
+        watchpoint.observe(0x21B90104, (7).to_bytes(4, "little"))
+        watchpoint.observe(0xFED00000, (1).to_bytes(4, "little"))
+
+        stream = watchpoint.to_stream()
+        self.assertEqual(stream["dynamic_push_buffer_range"]["base_hex"], "0x21B80000")
+        self.assertEqual(stream["writes"][0]["address_hex"], "0x80010100")
+        self.assertEqual(stream["writes"][0]["guest_address_hex"], "0x21B90100")
+        self.assertEqual(
+            watchpoint.consume_pending_flip_boundaries(),
+            [{"flip_index": 1, "write_count": 3, "flip_value": 7}],
+        )
+
+    def test_live_render_watchpoint_can_skip_expensive_diagnostic_records(self) -> None:
+        watchpoint = RenderWriteWatchpoint(retain_diagnostic_writes=False)
+        watchpoint.set_push_buffer_range_provider(
+            lambda: (0x21B80000, 0x21BC0000)
+        )
+        flip_header = (1 << 18) | 0x012C
+
+        watchpoint.observe(0x21B90100, flip_header.to_bytes(4, "little"))
+        watchpoint.observe(0x21B90104, (7).to_bytes(4, "little"))
+        watchpoint.observe(0xFED00000, (1).to_bytes(4, "little"))
+
+        stream = watchpoint.to_stream()
+        self.assertFalse(stream["diagnostic_write_retention"])
+        self.assertEqual(stream["write_count"], 3)
+        self.assertEqual(stream["captured_write_count"], 0)
+        self.assertEqual(stream["writes"], [])
+        self.assertEqual(len(watchpoint.live_command_records), 3)
+        self.assertEqual(
+            watchpoint.consume_pending_flip_boundaries(),
+            [{"flip_index": 1, "write_count": 3, "flip_value": 7}],
+        )
+
+    def test_live_render_watchpoint_batches_native_push_buffer_writes(self) -> None:
+        watchpoint = RenderWriteWatchpoint(retain_diagnostic_writes=False)
+        watchpoint.set_push_buffer_range_provider(
+            lambda: (0x21B80000, 0x21BC0000)
+        )
+        flip_header = (1 << 18) | 0x012C
+
+        addresses = (ctypes.c_uint32 * 2)(0x21B90100, 0x21B90104)
+        values = (ctypes.c_uint32 * 2)(flip_header, 7)
+        sizes = (ctypes.c_uint8 * 2)(4, 4)
+        eips = (ctypes.c_uint32 * 2)(0x1000, 0x1004)
+        sources = (ctypes.c_uint32 * 2)(0x2000, 0x2004)
+        steps = (ctypes.c_uint64 * 2)(10, 11)
+        packed = (ctypes.c_uint8 * 32).from_buffer_copy(
+            struct.pack(
+                "<BBHIII",
+                1,
+                4,
+                0,
+                0x80010100,
+                flip_header,
+                0,
+            )
+            + struct.pack(
+                "<BBHIII",
+                1,
+                4,
+                0,
+                0x80010104,
+                7,
+                0,
+            )
+        )
+        watchpoint.observe_native_write_batch(
+            packed,
+            addresses,
+            values,
+            sizes,
+            eips,
+            sources,
+            steps,
+            2,
+            0x21B80000,
+            True,
+        )
+        watchpoint.observe(0xFED00000, (1).to_bytes(4, "little"))
+
+        self.assertEqual(watchpoint.write_count, 3)
+        self.assertEqual(len(watchpoint.live_command_records), 3)
+        self.assertEqual(
+            [
+                struct.unpack("<BBHI8s", record)[3]
+                for record in watchpoint.live_command_records
+            ],
+            [0x80010100, 0x80010104, 0xFED00000],
+        )
+        self.assertEqual(
+            watchpoint.consume_pending_flip_boundaries(),
+            [{"flip_index": 1, "write_count": 3, "flip_value": 7}],
+        )
+        batch = watchpoint.live_epoch_stream()["native_write_batch"]
+        self.assertEqual(batch["batch_count"], 1)
+        self.assertEqual(batch["write_count"], 2)
+
+    def test_render_watchpoint_attributes_near_zero_position_matrix_upload(self) -> None:
+        watchpoint = RenderWriteWatchpoint(retain_diagnostic_writes=False)
+        range_start = 0x21B80000
+        watchpoint.set_push_buffer_range_provider(
+            lambda: (range_start, range_start + 0x40000)
+        )
+        matrix = (
+            0.0001,
+            0.0,
+            0.0,
+            -2.0,
+            0.0,
+            0.0002,
+            0.0,
+            3.0,
+            0.0,
+            0.0,
+            0.0003,
+            55.0,
+            0.0,
+            0.0,
+            0.0003,
+            56.0,
+        )
+        words = [
+            (1 << 18) | 0x1EA4,
+            96,
+            (16 << 18) | 0x0B80,
+            *struct.unpack("<16I", struct.pack("<16f", *matrix)),
+            (1 << 18) | 0x012C,
+            1,
+        ]
+        count = len(words)
+        guest_start = range_start + 0x100
+        addresses = (ctypes.c_uint32 * count)(
+            *(guest_start + index * 4 for index in range(count))
+        )
+        values = (ctypes.c_uint32 * count)(*words)
+        sizes = (ctypes.c_uint8 * count)(*([4] * count))
+        eips = (ctypes.c_uint32 * count)(
+            *(0x2222 if 3 <= index < 19 else 0x1111 for index in range(count))
+        )
+        sources = (ctypes.c_uint32 * count)(
+            *(0x5000 + index * 4 for index in range(count))
+        )
+        steps = (ctypes.c_uint64 * count)(*(100 + index for index in range(count)))
+        packed = bytearray(count * 16)
+        for index, word in enumerate(words):
+            struct.pack_into(
+                "<BBHIII",
+                packed,
+                index * 16,
+                1,
+                4,
+                0,
+                0x80000100 + index * 4,
+                word,
+                0,
+            )
+        packed_records = (ctypes.c_uint8 * len(packed)).from_buffer_copy(packed)
+
+        watchpoint.observe_native_write_batch(
+            packed_records,
+            addresses,
+            values,
+            sizes,
+            eips,
+            sources,
+            steps,
+            count,
+            range_start,
+            True,
+        )
+
+        provenance = watchpoint.to_stream()[
+            "transform_constant_upload_provenance"
+        ]
+        self.assertEqual(provenance["status"], "captured")
+        self.assertEqual(provenance["matrix_upload_count"], 1)
+        self.assertEqual(provenance["near_zero_basis_matrix_upload_count"], 1)
+        self.assertEqual(
+            provenance["near_zero_producer_instruction_counts"],
+            [{"instruction_address_hex": "0x00002222", "matrix_upload_count": 1}],
+        )
+        matrix_upload = provenance["near_zero_matrix_uploads"][0]
+        self.assertEqual(matrix_upload["next_guest_flip_count"], 1)
+        self.assertEqual(
+            matrix_upload["position_c96_c99_max_abs_basis"],
+            0.0003,
+        )
+
+    def test_render_watchpoint_preserves_full_dynamic_push_buffer_offsets(self) -> None:
+        watchpoint = RenderWriteWatchpoint()
+        watchpoint.set_push_buffer_range_provider(
+            lambda: (0x21B80000, 0x21D80000)
+        )
+
+        watchpoint.observe(0x21B80020, (1).to_bytes(4, "little"))
+        watchpoint.observe(0x21B90020, (2).to_bytes(4, "little"))
+
+        stream = watchpoint.to_stream()
+        self.assertEqual(
+            [write["address_hex"] for write in stream["writes"]],
+            ["0x80000020", "0x80010020"],
+        )
+        self.assertEqual(
+            [
+                struct.unpack("<BBHI8s", record)[3]
+                for record in watchpoint.live_command_records
+            ],
+            [0x80000020, 0x80010020],
+        )
+
+    def test_live_command_record_ring_retains_newest_records_in_order(self) -> None:
+        watchpoint = RenderWriteWatchpoint(max_writes=2)
+
+        watchpoint.observe(0x80000000, (1).to_bytes(4, "little"))
+        watchpoint.observe(0x80000004, (2).to_bytes(4, "little"))
+        watchpoint.observe(0x80000008, (3).to_bytes(4, "little"))
+
+        self.assertEqual(
+            [
+                struct.unpack("<BBHI8s", record)[3]
+                for record in watchpoint.live_command_records
+            ],
+            [0x80000004, 0x80000008],
+        )
+        self.assertEqual(
+            len(watchpoint.live_command_records.to_bytes()),
+            2 * 16,
+        )
+
+    def test_render_watchpoint_rejects_large_non_command_copy_before_chunking(self) -> None:
+        class CountingWatchpoint(RenderWriteWatchpoint):
+            normalization_count = 0
+
+            def _normalize_dynamic_push_buffer_address(self, address: int):
+                self.normalization_count += 1
+                return super()._normalize_dynamic_push_buffer_address(address)
+
+        watchpoint = CountingWatchpoint()
+        watchpoint.set_push_buffer_range_provider(
+            lambda: (0x21B80000, 0x21BC0000)
+        )
+
+        watchpoint.observe(0x10000000, bytes(1024 * 1024))
+
+        self.assertEqual(watchpoint.normalization_count, 0)
+        self.assertEqual(watchpoint.write_count, 0)
+
+    def test_render_watchpoint_retains_relevant_span_of_large_dynamic_copy(self) -> None:
+        watchpoint = RenderWriteWatchpoint()
+        watchpoint.set_push_buffer_range_provider(
+            lambda: (0x21B80000, 0x21BC0000)
+        )
+        payload = bytes(range(32))
+
+        watchpoint.observe(0x21B7FFF8, payload)
+
+        writes = watchpoint.to_stream()["writes"]
+        self.assertEqual(len(writes), 3)
+        self.assertEqual(writes[0]["guest_address_hex"], "0x21B80000")
+        self.assertEqual(writes[-1]["guest_address_hex"], "0x21B80010")
+
     def test_texture_snapshot_uses_lightweight_push_buffer_scan(self) -> None:
         watchpoint = RenderWriteWatchpoint()
         texture_address = 0x22001000
@@ -406,7 +788,7 @@ class PlayabilityProbeTests(unittest.TestCase):
             struct.pack("<II", (1 << 18) | 0x17FC, 6),
         )
         bindings = _scan_render_texture_bindings(watchpoint.history_stream()["writes"])
-        self.assertEqual(bindings, [(0, texture_address, texture_format)])
+        self.assertEqual(bindings, [(0, texture_address, texture_format, 0)])
 
         payload = bytes.fromhex("00F8E00700000000")
         memory = SparseMemory()
@@ -417,6 +799,125 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(stream["resource_snapshot_count"], 1)
         self.assertEqual(stream["resource_snapshots"][0]["format"], "DXT1")
         self.assertEqual(stream["resource_snapshots"][0]["bytes_hex"], payload.hex().upper())
+
+    def test_texture_snapshot_retains_declared_compressed_mip_chain(self) -> None:
+        texture_address = 0x22001000
+        texture_format = (
+            (3 << 24) | (3 << 20) | (3 << 16) | (0x0F << 8) | (2 << 4)
+        )
+        payload = bytes(range(96))
+        memory = SparseMemory({texture_address: payload})
+
+        stream = _snapshot_render_texture_resources(
+            {},
+            {
+                "texture_bindings": [
+                    [0, texture_address, texture_format, 0],
+                ]
+            },
+            memory,
+        )
+
+        resource = stream["resource_snapshots"][0]
+        self.assertEqual(resource["format"], "DXT5")
+        self.assertEqual(resource["mipmap_levels"], 3)
+        self.assertEqual(resource["byte_count"], 64 + 16 + 16)
+        self.assertEqual(resource["bytes_hex"], payload.hex().upper())
+
+    def test_indexed_draw_snapshot_retains_vertex_buffer_bytes(self) -> None:
+        watchpoint = RenderWriteWatchpoint()
+        vertex_address = 0x22010000
+        vertex_format = (12 << 8) | (3 << 4) | 2
+        words = (
+            (1 << 18) | 0x1720,
+            vertex_address,
+            (1 << 18) | 0x1760,
+            vertex_format,
+            (1 << 18) | 0x17FC,
+            6,
+            (1 << 18) | 0x1800,
+            (2 << 16) | 0,
+            (1 << 18) | 0x17FC,
+            0,
+        )
+        watchpoint.observe(0x80000000, struct.pack(f"<{len(words)}I", *words))
+        payload = bytes(range(36))
+        memory = SparseMemory({vertex_address: payload})
+
+        history = watchpoint.resource_binding_stream()
+        stream = _snapshot_render_texture_resources(
+            watchpoint.to_stream(),
+            history,
+            memory,
+        )
+
+        self.assertEqual(
+            history["vertex_buffer_ranges"],
+            [[vertex_address, vertex_address + len(payload)]],
+        )
+        self.assertEqual(stream["resource_snapshot_count"], 1)
+        resource = stream["resource_snapshots"][0]
+        self.assertEqual(resource["format"], "VERTEX_BUFFER")
+        self.assertEqual(resource["bytes_hex"], payload.hex().upper())
+
+    def test_vertex_snapshot_resolves_xbox_cpu_direct_map(self) -> None:
+        watchpoint = RenderWriteWatchpoint()
+        vertex_address = 0x03380000
+        cpu_direct_address = vertex_address | 0x80000000
+        vertex_format = (12 << 8) | (3 << 4) | 2
+        words = (
+            (1 << 18) | 0x1720,
+            vertex_address,
+            (1 << 18) | 0x1760,
+            vertex_format,
+            (1 << 18) | 0x17FC,
+            6,
+            (1 << 18) | 0x1800,
+            (2 << 16) | 0,
+            (1 << 18) | 0x17FC,
+            0,
+        )
+        watchpoint.observe(0x80000000, struct.pack(f"<{len(words)}I", *words))
+        payload = bytes(range(36))
+        memory = SparseMemory({cpu_direct_address: payload})
+
+        stream = _snapshot_render_texture_resources(
+            watchpoint.to_stream(),
+            watchpoint.resource_binding_stream(),
+            memory,
+        )
+
+        resource = stream["resource_snapshots"][0]
+        self.assertEqual(resource["address"], vertex_address)
+        self.assertEqual(resource["source_address"], cpu_direct_address)
+        self.assertEqual(resource["bytes_hex"], payload.hex().upper())
+
+    def test_texture_snapshot_preserves_distinct_formats_at_reused_address(self) -> None:
+        texture_address = 0x2272A080
+        dxt1_format = (9 << 24) | (9 << 20) | (1 << 16) | (0x0C << 8) | (2 << 4)
+        dxt5_format = (8 << 24) | (8 << 20) | (1 << 16) | (0x0F << 8) | (2 << 4)
+        memory = SparseMemory()
+        memory.write(texture_address, bytes(range(256)) * 512)
+
+        stream = _snapshot_render_texture_resources(
+            {},
+            {
+                "texture_bindings": [
+                    [0, texture_address, dxt1_format, 0],
+                    [0, texture_address, dxt5_format, 0],
+                ]
+            },
+            memory,
+        )
+
+        self.assertEqual(stream["resource_snapshot_count"], 2)
+        self.assertEqual(
+            {
+                (resource["format"], resource["width"], resource["height"])
+                for resource in stream["resource_snapshots"]
+            },
+            {("DXT1", 512, 512), ("DXT5", 256, 256)},
+        )
 
     def test_texture_snapshot_cache_reuses_unchanged_pages_and_invalidates_writes(self) -> None:
         class CountingMemory(SparseMemory):
@@ -496,8 +997,8 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(
             _scan_render_texture_bindings(watchpoint.history_stream()["writes"]),
             [
-                (0, background_address, background_format),
-                (0, logo_address, logo_format),
+                (0, background_address, background_format, 0),
+                (0, logo_address, logo_format, 0),
             ],
         )
 
@@ -523,9 +1024,46 @@ class PlayabilityProbeTests(unittest.TestCase):
         stream = _snapshot_render_texture_resources(watchpoint.to_stream(), history, memory)
 
         self.assertTrue(history["truncated"])
-        self.assertEqual(history["texture_bindings"], [[0, texture_address, texture_format]])
+        self.assertEqual(
+            history["texture_bindings"],
+            [[0, texture_address, texture_format, 0]],
+        )
         self.assertEqual(stream["resource_snapshot_count"], 1)
         self.assertEqual(stream["resource_snapshots"][0]["format"], "DXT1")
+
+    def test_linear_texture_snapshot_uses_image_rect_extent(self) -> None:
+        watchpoint = RenderWriteWatchpoint()
+        texture_address = 0x01D94000
+        texture_format = 0x00011229
+        image_rect = (640 << 16) | 480
+        words = (
+            (2 << 18) | 0x1B00,
+            texture_address,
+            texture_format,
+            (1 << 18) | 0x1B18,
+            image_rect,
+            (1 << 18) | 0x17FC,
+            8,
+        )
+        watchpoint.observe(0x80000000, struct.pack(f"<{len(words)}I", *words))
+
+        history = watchpoint.resource_binding_stream()
+        stream = _snapshot_render_texture_resources(
+            watchpoint.to_stream(),
+            history,
+            SparseMemory(),
+        )
+
+        self.assertEqual(
+            history["texture_bindings"],
+            [[0, texture_address, texture_format, image_rect]],
+        )
+        self.assertEqual(stream["resource_snapshot_count"], 1)
+        resource = stream["resource_snapshots"][0]
+        self.assertEqual(resource["format"], "A8R8G8B8_LINEAR")
+        self.assertEqual((resource["width"], resource["height"]), (640, 480))
+        self.assertEqual(resource["byte_count"], 640 * 480 * 4)
+        self.assertEqual(resource["nonzero_byte_count"], 0)
 
     def test_xbe_memory_aliases_cpu_gpu_physical_surface_addresses(self) -> None:
         loaded = load_xbe_bytes(_synthetic_xbe()[0])
@@ -541,6 +1079,72 @@ class PlayabilityProbeTests(unittest.TestCase):
 
         memory.write_u32(physical_address + 8, 0xAABBCCDD)
         self.assertEqual(memory.read_u32(cpu_alias + 8), 0xAABBCCDD)
+        self.assertTrue(memory.native_cache_physical_aliases)
+        self.assertEqual(memory.native_cache_address(cpu_alias), physical_address)
+        self.assertTrue(memory.native_cacheable_address(0x83380000))
+        self.assertFalse(memory.native_cacheable_address(0x80000000))
+        self.assertFalse(memory.native_cacheable_address(0x84000000))
+
+        function = lift_x86_function(
+            b"\xA1" + struct.pack("<I", cpu_alias) + b"\xC3",
+            base_address=0x1000,
+            symbol="native_physical_alias_read",
+        )
+        memory.write_u32(0x8000, 0)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            executor = NativeResumableExecutor(
+                function,
+                build_dir=Path(temp_dir),
+            )
+            first_state = CpuState.with_registers(esp=0x8000)
+            self.assertEqual(executor.run(first_state, memory, max_steps=10), 0)
+            second_state = CpuState.with_registers(esp=0x8000)
+            self.assertEqual(executor.run(second_state, memory, max_steps=10), 0)
+
+        self.assertEqual(first_state.get_register("eax"), 0x55667788)
+        self.assertEqual(second_state.get_register("eax"), 0x55667788)
+        self.assertEqual(
+            executor.last_run_summary["performance"]["page_cache_fill_count"],
+            0,
+        )
+
+    def test_xbe_memory_declares_exact_callback_dependencies(self) -> None:
+        memory = XbeBackedSparseMemory(load_xbe_bytes(_synthetic_xbe()[0]))
+
+        self.assertEqual(
+            memory.native_memory_callback_dependency_addresses(
+                TITLE_D3D_CONTEXT_GET_POINTER_ADDRESS,
+                4,
+                is_write=False,
+            ),
+            (TITLE_D3D_CONTEXT_SYNTHETIC_ADDRESS + 0x2C,),
+        )
+        self.assertEqual(
+            memory.native_memory_callback_dependency_addresses(
+                TITLE_GPU_COMMAND_KICK_ADDRESS,
+                4,
+                is_write=True,
+            ),
+            (
+                TITLE_GPU_SUBMISSION_BASE_ADDRESS
+                + TITLE_GPU_COMPLETION_DMA_POINTER_OFFSET,
+            ),
+        )
+        self.assertEqual(
+            memory.native_memory_callback_dependency_addresses(
+                TITLE_AUDIO_DSP_STATUS_ADDRESS,
+                4,
+                is_write=False,
+            ),
+            (),
+        )
+        self.assertIsNone(
+            memory.native_memory_callback_dependency_addresses(
+                0x00123450,
+                4,
+                is_write=False,
+            )
+        )
 
     def test_native_page_writeback_commits_exact_range_without_host_invalidation(self) -> None:
         loaded = load_xbe_bytes(_synthetic_xbe()[0])
@@ -795,9 +1399,38 @@ class PlayabilityProbeTests(unittest.TestCase):
             memory.read_u32(TITLE_ASSET_STREAM_SYNTHETIC_OBJECT_ADDRESS + 0x10),
             len(b"recovered-asset"),
         )
+        self.assertEqual(
+            memory.read_u32(TITLE_ASSET_STREAM_SYNTHETIC_OBJECT_ADDRESS + 0x14),
+            0,
+        )
+        self.assertEqual(
+            memory.read_u32(TITLE_ASSET_STREAM_SYNTHETIC_OBJECT_ADDRESS + 0x18),
+            0,
+        )
+        self.assertEqual(
+            memory.read_u32(TITLE_ASSET_STREAM_SYNTHETIC_OBJECT_ADDRESS + 0x2C),
+            2,
+        )
         summary = fast_path.summary()
         self.assertEqual(summary["successful_open_count"], 1)
         self.assertEqual(summary["recent_invocations"][0]["guest_path"], "D:\\audio\\special.rws")
+        status_stack = 0x8080
+        memory.write_u32(status_stack, 0xFEEDFACE)
+        status_state = CpuState.with_registers(
+            ecx=TITLE_ASSET_STREAM_SYNTHETIC_OBJECT_ADDRESS,
+            esp=status_stack,
+        )
+        fast_path.status_handler(
+            status_state,
+            memory,
+            fast_path.status_target,
+            ExecutionTrace(),
+        )
+        self.assertEqual(status_state.get_register("eax"), 1)
+        self.assertEqual(
+            memory.read_u32(TITLE_ASSET_STREAM_SYNTHETIC_OBJECT_ADDRESS + 0x2C),
+            1,
+        )
         read_stack = 0x8100
         read_destination = 0x9300
         memory.write_u32(read_stack + 4, read_destination)
@@ -814,7 +1447,293 @@ class PlayabilityProbeTests(unittest.TestCase):
         )
         self.assertEqual(read_state.get_register("eax"), 9)
         self.assertEqual(memory.read(read_destination, 9), b"recovered")
+        self.assertEqual(
+            memory.read_u32(TITLE_ASSET_STREAM_SYNTHETIC_OBJECT_ADDRESS + 0x18),
+            9,
+        )
+        self.assertEqual(
+            memory.read_u32(TITLE_ASSET_STREAM_SYNTHETIC_OBJECT_ADDRESS + 0x1C),
+            0,
+        )
+        seek_stack = 0x8200
+        memory.write_u32(seek_stack + 4, 0)
+        memory.write_u32(seek_stack + 8, 0)
+        memory.write_u32(seek_stack + 0xC, 2)
+        seek_state = CpuState.with_registers(
+            ecx=TITLE_ASSET_STREAM_SYNTHETIC_OBJECT_ADDRESS,
+            esp=seek_stack,
+        )
+        fast_path.seek_handler(
+            seek_state,
+            memory,
+            fast_path.seek_target,
+            ExecutionTrace(),
+        )
+        self.assertEqual(seek_state.get_register("eax"), len(b"recovered-asset"))
+        self.assertEqual(
+            memory.read_u32(TITLE_ASSET_STREAM_SYNTHETIC_OBJECT_ADDRESS + 0x18),
+            len(b"recovered-asset"),
+        )
+        self.assertTrue(fast_path.summary()["stream_states"][0]["complete"])
         self.assertEqual(fast_path.summary()["read_count"], 1)
+        self.assertEqual(fast_path.summary()["ready_transition_count"], 1)
+
+    def test_title_asset_stream_publishes_track_pss_prelinked_image(self) -> None:
+        runtime = XboxRuntimeShims()
+        fast_path = TitleAssetStreamOpenFastPath(runtime)
+        object_address = TITLE_ASSET_STREAM_SYNTHETIC_OBJECT_ADDRESS
+        image_base = 0x8381C000
+        table_a_address = image_base + 0x200
+        table_b_address = image_base + 0x220
+        scene_record_address = image_base + 0x240
+        scene_index_address = image_base + 0x2F0
+        descriptors = (
+            (0x00000000, 0x0003C000),
+            (0x0003C000, 0x0003C000),
+            (0x00078000, 0x00012345),
+        )
+        descriptor_payload = b"".join(
+            struct.pack("<II", stream_offset, stream_length)
+            for stream_offset, stream_length in descriptors
+        )
+        payload = bytearray(0x300)
+        struct.pack_into("<I", payload, 0x14, image_base + 0x1C0)
+        struct.pack_into("<II", payload, 0x18, 1, scene_record_address)
+        struct.pack_into("<I", payload, 0x5C, len(descriptors))
+        struct.pack_into("<I", payload, 0x60, table_a_address)
+        struct.pack_into("<I", payload, 0x64, table_b_address)
+        payload[0x200 : 0x200 + len(descriptor_payload)] = descriptor_payload
+        payload[0x220 : 0x220 + len(descriptor_payload)] = descriptor_payload
+        struct.pack_into("<II", payload, 0x24C, scene_index_address, 42)
+        fast_path._states[object_address] = {
+            "payload": bytes(payload),
+            "position": 0,
+            "title_path": "trackpss/forward/fwyl.pss",
+            "status": 2,
+            "terminal": False,
+        }
+        stack = 0x8100
+        destination = 0x9300
+        memory = SparseMemory(
+            {
+                object_address + 0x2C: 2,
+                stack + 4: destination,
+                stack + 8: len(payload),
+                # One table is already present. Publication should repair only
+                # the missing prelinked target while retaining exact bytes.
+                table_b_address: descriptor_payload,
+            }
+        )
+        state = CpuState.with_registers(ecx=object_address, esp=stack)
+        trace = ExecutionTrace()
+
+        fast_path.read_handler(
+            state,
+            memory,
+            TITLE_ASSET_STREAM_SYNTHETIC_READ_TARGET_ADDRESS,
+            trace,
+        )
+
+        self.assertEqual(state.get_register("eax"), len(payload))
+        self.assertEqual(memory.read(destination, len(payload)), bytes(payload))
+        self.assertEqual(
+            memory.read(table_a_address, len(descriptor_payload)),
+            descriptor_payload,
+        )
+        self.assertEqual(
+            memory.read(table_b_address, len(descriptor_payload)),
+            descriptor_payload,
+        )
+        self.assertEqual(memory.read(image_base, len(payload)), bytes(payload))
+        self.assertEqual(
+            memory.read(scene_record_address + 0x0C, 8),
+            struct.pack("<II", scene_index_address, 42),
+        )
+        summary = fast_path.summary()
+        self.assertEqual(summary["track_descriptor_publication_count"], 1)
+        self.assertEqual(summary["track_descriptor_table_count"], 2)
+        self.assertEqual(summary["track_descriptor_table_repair_count"], 1)
+        self.assertEqual(summary["track_descriptor_entry_count"], 6)
+        self.assertEqual(summary["track_descriptor_validation_failure_count"], 0)
+        self.assertEqual(summary["track_prelinked_image_publication_count"], 1)
+        self.assertEqual(summary["track_prelinked_image_repair_count"], 1)
+        self.assertEqual(summary["track_prelinked_image_bytes"], len(payload))
+        self.assertEqual(summary["track_scene_record_table_count"], 1)
+        self.assertEqual(summary["track_scene_record_table_repair_count"], 1)
+        self.assertEqual(summary["track_scene_record_entry_count"], 1)
+        stream = summary["stream_states"][0]
+        self.assertTrue(stream["track_descriptor_publication_attempted"])
+        self.assertTrue(stream["track_descriptor_tables_published"])
+        self.assertTrue(stream["track_prelinked_image_published"])
+        self.assertEqual(
+            stream["track_descriptor_publication"]["descriptor_count"],
+            len(descriptors),
+        )
+        self.assertTrue(
+            stream["track_descriptor_publication"]["prelinked_image_repaired"]
+        )
+        self.assertEqual(
+            stream["track_descriptor_publication"]["scene_record_count"], 1
+        )
+        self.assertIn(
+            "title_track_descriptor_publication",
+            {event["operation"] for event in trace.to_list()},
+        )
+
+    def test_title_asset_stream_rejects_invalid_track_pss_descriptor_table(self) -> None:
+        runtime = XboxRuntimeShims()
+        fast_path = TitleAssetStreamOpenFastPath(runtime)
+        object_address = TITLE_ASSET_STREAM_SYNTHETIC_OBJECT_ADDRESS
+        image_base = 0x8381C000
+        invalid_table_address = image_base + 0x400
+        payload = bytearray(0x68)
+        struct.pack_into("<I", payload, 0x14, image_base + 0x1C0)
+        struct.pack_into("<I", payload, 0x5C, 1)
+        struct.pack_into("<I", payload, 0x60, invalid_table_address)
+        struct.pack_into("<I", payload, 0x64, invalid_table_address)
+        fast_path._states[object_address] = {
+            "payload": bytes(payload),
+            "position": 0,
+            "title_path": "trackpss/reverse/fwyl.pss",
+            "status": 2,
+            "terminal": False,
+        }
+        stack = 0x8100
+        memory = SparseMemory(
+            {
+                object_address + 0x2C: 2,
+                stack + 4: 0x9300,
+                stack + 8: len(payload),
+            }
+        )
+        state = CpuState.with_registers(ecx=object_address, esp=stack)
+        trace = ExecutionTrace()
+
+        fast_path.read_handler(
+            state,
+            memory,
+            TITLE_ASSET_STREAM_SYNTHETIC_READ_TARGET_ADDRESS,
+            trace,
+        )
+
+        summary = fast_path.summary()
+        self.assertEqual(summary["track_descriptor_publication_count"], 0)
+        self.assertEqual(summary["track_descriptor_table_repair_count"], 0)
+        self.assertEqual(summary["track_descriptor_validation_failure_count"], 1)
+        stream = summary["stream_states"][0]
+        self.assertTrue(stream["track_descriptor_publication_attempted"])
+        self.assertFalse(stream["track_descriptor_tables_published"])
+        self.assertIn("outside its payload", stream["track_descriptor_validation_error"])
+        self.assertEqual(memory.read(invalid_table_address, 8), b"\x00" * 8)
+        self.assertIn(
+            "title_track_descriptor_publication_rejected",
+            {event["operation"] for event in trace.to_list()},
+        )
+
+    def test_title_asset_stream_records_terminal_and_repeated_eof_reads(self) -> None:
+        runtime = XboxRuntimeShims()
+        fast_path = TitleAssetStreamOpenFastPath(runtime)
+        object_address = TITLE_ASSET_STREAM_SYNTHETIC_OBJECT_ADDRESS
+        fast_path._states[object_address] = {
+            "payload": b"abc",
+            "position": 0,
+            "title_path": "racecars/driveed/driveede.rws",
+            "status": 2,
+            "read_count": 0,
+            "requested_bytes": 0,
+            "bytes_read": 0,
+            "short_read_count": 0,
+            "eof_read_count": 0,
+            "terminal_read_count": 0,
+            "terminal": False,
+        }
+        memory = SparseMemory(
+            {
+                object_address + 0x2C: 2,
+                0x8104: 0x9300,
+                0x8108: 5,
+                0x8204: 0x9400,
+                0x8208: 5,
+            }
+        )
+
+        first = CpuState.with_registers(ecx=object_address, esp=0x8100)
+        fast_path.read_handler(
+            first,
+            memory,
+            TITLE_ASSET_STREAM_SYNTHETIC_READ_TARGET_ADDRESS,
+            ExecutionTrace(),
+        )
+        second = CpuState.with_registers(ecx=object_address, esp=0x8200)
+        fast_path.read_handler(
+            second,
+            memory,
+            TITLE_ASSET_STREAM_SYNTHETIC_READ_TARGET_ADDRESS,
+            ExecutionTrace(),
+        )
+
+        self.assertEqual(first.get_register("eax"), 3)
+        self.assertEqual(second.get_register("eax"), 0)
+        self.assertEqual(memory.read(0x9300, 3), b"abc")
+        self.assertEqual(memory.read_u32(object_address + 0x2C), 1)
+        summary = fast_path.summary()
+        self.assertEqual(summary["short_read_count"], 2)
+        self.assertEqual(summary["eof_read_count"], 1)
+        self.assertEqual(summary["terminal_read_count"], 2)
+        self.assertEqual(summary["ready_transition_count"], 1)
+        stream = summary["stream_states"][0]
+        self.assertEqual(stream["status"], 1)
+        self.assertEqual(stream["read_count"], 2)
+        self.assertEqual(stream["requested_bytes"], 10)
+        self.assertEqual(stream["bytes_read"], 3)
+        self.assertEqual(stream["short_read_count"], 2)
+        self.assertEqual(stream["eof_read_count"], 1)
+        self.assertEqual(stream["terminal_read_count"], 2)
+        self.assertEqual(
+            stream["terminal_transition_read_count"],
+            1,
+        )
+        self.assertEqual(
+            [
+                (read["requested"], read["bytes_read"], read["eof_read"])
+                for read in summary["recent_reads"]
+            ],
+            [(5, 3, False), (5, 0, True)],
+        )
+
+    def test_title_asset_stream_seek_publishes_ready_mode(self) -> None:
+        runtime = XboxRuntimeShims()
+        fast_path = TitleAssetStreamOpenFastPath(runtime)
+        object_address = TITLE_ASSET_STREAM_SYNTHETIC_OBJECT_ADDRESS
+        fast_path._states[object_address] = {
+            "payload": b"abc",
+            "position": 0,
+            "status": 2,
+            "terminal": False,
+        }
+        stack = 0x8100
+        memory = SparseMemory(
+            {
+                object_address + 0x2C: 2,
+                stack + 4: 3,
+                stack + 8: 0,
+                stack + 0xC: 0,
+            }
+        )
+        state = CpuState.with_registers(ecx=object_address, esp=stack)
+
+        fast_path.seek_handler(
+            state,
+            memory,
+            fast_path.seek_target,
+            ExecutionTrace(),
+        )
+
+        self.assertEqual(state.get_register("eax"), 3)
+        self.assertEqual(memory.read_u32(object_address + 0x18), 3)
+        self.assertEqual(memory.read_u32(object_address + 0x2C), 1)
+        self.assertEqual(fast_path.summary()["ready_transition_count"], 1)
+        self.assertTrue(fast_path.summary()["stream_states"][0]["terminal"])
 
     def test_xbe_backed_memory_clears_observed_nv2a_status_poll_bit(self) -> None:
         class DummyArena:
@@ -1601,7 +2520,7 @@ class PlayabilityProbeTests(unittest.TestCase):
     ) -> None:
         base_address = 0x2100
         function = lift_x86_function(
-            _push_u32(0)
+            _push_u32(2)
             + _call_relative_bytes(base_address + 5, TITLE_D3D_PACKET_ALLOC_ADDRESS)
             + b"\xC3",
             base_address=base_address,
@@ -1642,6 +2561,52 @@ class PlayabilityProbeTests(unittest.TestCase):
         )
         self.assertEqual(memory.read_u32(context_address + 0x2C), 0x22)
         self.assertEqual(fast_path.summary()["invocation_count"], 1)
+
+    def test_title_d3d_packet_alloc_flush_advances_get_completion(
+        self,
+    ) -> None:
+        base_address = 0x2180
+        function = lift_x86_function(
+            _push_u32(0)
+            + _call_relative_bytes(base_address + 5, TITLE_D3D_PACKET_ALLOC_ADDRESS)
+            + b"\xC3",
+            base_address=base_address,
+            symbol="title_d3d_packet_alloc_flush_call",
+        )
+        context_address = 0x3000
+        dma_state_address = 0x5000
+        get_pointer_address = 0x6000
+        packet_address = 0x80000080
+        fast_path = TitleD3DPacketAllocFastPath()
+        state = CpuState.with_registers(esp=0x8000)
+        memory = SparseMemory(
+            {
+                0x8000: 0xFEEDFACE,
+                TITLE_D3D_CONTEXT_GLOBAL_ADDRESS: context_address,
+                context_address: packet_address,
+                context_address + 0x04: 0x80010000,
+                context_address + 0x24: TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS,
+                context_address + 0x2C: 9,
+                context_address + 0x30: get_pointer_address,
+                context_address + 0x17F4: dma_state_address,
+                get_pointer_address: 3,
+            }
+        )
+
+        result = execute_lifted_function(
+            function,
+            state=state,
+            memory=memory,
+            call_handlers=fast_path.call_handlers(),
+            max_steps=4,
+        )
+
+        self.assertEqual(result.return_address, 0xFEEDFACE)
+        self.assertEqual(result.state.get_register("eax"), 9)
+        self.assertEqual(memory.read_u32(context_address + 0x2C), 11)
+        self.assertEqual(memory.read_u32(get_pointer_address), 9)
+        self.assertEqual(memory.read_u32(dma_state_address + 0x40), 9)
+        self.assertEqual(fast_path.summary()["flush_requested_count"], 1)
 
     def test_title_d3d_reserve_fast_path_sets_limit_and_marker_packet(
         self,
@@ -1910,7 +2875,15 @@ class PlayabilityProbeTests(unittest.TestCase):
         watchpoint.flip_count = 7
         fast_path = TitleTextDrawFastPath(render_watchpoint=watchpoint)
         state = CpuState.with_registers(ecx=0x00318A9C, esp=0x8000)
-        memory = SparseMemory({0x8000: 0xFEEDFACE, string_address: b"PLAY\x00"})
+        memory = SparseMemory(
+            {
+                0x8000: 0xFEEDFACE,
+                string_address: b"PLAY\x00",
+                descriptor_address: struct.pack(
+                    "<4f", 255.0, 255.0, 255.0, 128.0
+                ),
+            }
+        )
 
         result = execute_lifted_function(
             function,
@@ -1944,6 +2917,20 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(summary["sampled_strings"][0]["bytes_hex"], "504C4159")
         self.assertEqual(summary["sampled_strings"][0]["render_write_count"], 1)
         self.assertEqual(summary["sampled_strings"][0]["guest_flip_count"], 7)
+        self.assertEqual(summary["sampled_strings"][0]["color_argb"], 0x80FFFFFF)
+        self.assertEqual(fast_path.text_for_completed_flip(8), "PLAY")
+        self.assertIsNone(fast_path.text_for_completed_flip(7))
+        self.assertIsNone(fast_path.text_for_completed_flip(9))
+        self.assertEqual(
+            fast_path.manifest_for_completed_flip(8),
+            {
+                "frontend_text": "PLAY",
+                "frontend_text_x_bits": 0x43A00000,
+                "frontend_text_y_bits": 0x43AA0000,
+                "frontend_text_size_bits": 0x3F800000,
+                "frontend_text_color_argb": 0x80FFFFFF,
+            },
+        )
         self.assertEqual(
             summary["sampled_strings"][0]["caller_return_address_hex"],
             f"0x{base_address + len(code) - 1:08X}",
@@ -1952,6 +2939,22 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertIn(
             "title_text_draw_fast_path",
             {event["operation"] for event in result.trace.to_list()},
+        )
+
+    def test_guest_thread_receives_title_text_fast_path_for_live_publishing(
+        self,
+    ) -> None:
+        source = Path("tools/playability/playability_probe.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "title_text_draw_fast_path=title_text_draw_fast_path,",
+            source,
+        )
+        self.assertIn(
+            "title_text_draw_fast_path: TitleTextDrawFastPath,",
+            source,
         )
 
     def test_title_d3d_primitive_draw_fast_path_preserves_call_contract(self) -> None:
@@ -2114,6 +3117,534 @@ class PlayabilityProbeTests(unittest.TestCase):
             (geometry["min_y"], geometry["max_y"]), (0.0, 480.0)
         )
 
+    def test_title_world_matrix_audit_captures_singular_input_read_only(self) -> None:
+        def f32(value: float) -> int:
+            return struct.unpack("<I", struct.pack("<f", value))[0]
+
+        source_address = 0x9000
+        matrix_values = (
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            30.0,
+            0.0,
+        )
+        memory_values = {
+            0x8000: 0x000860C6,
+            0x8004: source_address,
+        }
+        memory_values.update(
+            {
+                source_address + index * 4: f32(value)
+                for index, value in enumerate(matrix_values)
+            }
+        )
+        memory = SparseMemory(memory_values)
+        state = CpuState.with_registers(
+            eax=source_address,
+            ebx=0x1234,
+            ecx=0x00521B28,
+            esp=0x8000,
+        )
+        state.eip = TITLE_WORLD_MATRIX_BUILD_ADDRESS
+        watchpoint = RenderWriteWatchpoint()
+        watchpoint.flip_count = 42
+        audit = TitleWorldMatrixAudit(
+            enabled=True,
+            render_watchpoint=watchpoint,
+        )
+        before_state = state.to_dict()
+        before_stack_and_matrix = memory.read(0x8000, 8) + memory.read(
+            source_address, 0x40
+        )
+
+        audit.observer(state, memory, ExecutionTrace(enabled=False), 123)
+
+        self.assertEqual(state.to_dict(), before_state)
+        self.assertEqual(
+            memory.read(0x8000, 8) + memory.read(source_address, 0x40),
+            before_stack_and_matrix,
+        )
+        summary = audit.summary()
+        self.assertEqual(
+            audit.observer_addresses,
+            {
+                TITLE_WORLD_MATRIX_BUILD_ADDRESS,
+                TITLE_WORLD_DRAW_CALLBACK_ADDRESS,
+                TITLE_D3D_INDEXED_DRAW_ADDRESS,
+                TITLE_CAMERA_UPDATE_ADDRESS,
+                TITLE_CAMERA_TARGET_FRAME_RETURN_ADDRESS,
+                TITLE_CAMERA_UPDATE_RETURN_ADDRESS,
+                TITLE_GENERIC_CAMERA_UPDATE_ADDRESS,
+                TITLE_GENERIC_CAMERA_TARGET_FRAME_RETURN_ADDRESS,
+                *TITLE_GENERIC_CAMERA_UPDATE_RETURN_ADDRESSES,
+            },
+        )
+        self.assertEqual(summary["invocation_count"], 1)
+        self.assertEqual(summary["singular_matrix_count"], 1)
+        self.assertEqual(summary["source_records"][0]["source_address_hex"], "0x00009000")
+        self.assertEqual(
+            summary["source_records"][0]["matrix_owner_candidate_hex"],
+            "0x00008300",
+        )
+        self.assertEqual(summary["singular_samples"][0]["guest_flip_count"], 42)
+        self.assertIn(
+            "degenerate_basis_axis",
+            summary["singular_samples"][0]["reasons"],
+        )
+
+    def test_title_world_matrix_audit_attributes_zero_index_world_draws(self) -> None:
+        def f32(value: float) -> int:
+            return struct.unpack("<I", struct.pack("<f", value))[0]
+
+        mesh_entry_address = 0x9000
+        owner_address = 0xA000
+        index_data_address = 0xB000
+        matrix_stack = 0x7F00
+        callback_stack = 0x8000
+        indexed_stack = 0x8100
+        object_address = 0xC000
+        mesh_root_address = 0xD000
+        matrix_address = 0xE000
+        matrix_values = (
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            10.0,
+            20.0,
+            30.0,
+            1.0,
+        )
+        memory_values = {
+            matrix_stack: 0x000860C6,
+            matrix_stack + 4: matrix_address,
+            callback_stack: 0x000860DC,
+            callback_stack + 4: mesh_entry_address,
+            mesh_entry_address + 0x0C: index_data_address,
+            mesh_entry_address + 0x10: 0,
+            owner_address + 0x14: 0,
+            object_address + 0xCEC: mesh_root_address,
+            mesh_root_address + 0x28: 1,
+            mesh_root_address + 0x38: mesh_entry_address,
+            indexed_stack: TITLE_D3D_INDEXED_DRAW_WRAPPER_RETURN_ADDRESS,
+            indexed_stack + 4: 6,
+            indexed_stack + 8: 0,
+            indexed_stack + 12: index_data_address,
+            indexed_stack + 0x10: 0x000C4AA3,
+        }
+        memory_values.update(
+            {
+                matrix_address + index * 4: f32(value)
+                for index, value in enumerate(matrix_values)
+            }
+        )
+        memory = SparseMemory(
+            memory_values
+        )
+        watchpoint = RenderWriteWatchpoint()
+        watchpoint.flip_count = 44
+        audit = TitleWorldMatrixAudit(
+            enabled=True,
+            render_watchpoint=watchpoint,
+        )
+        state = CpuState.with_registers(
+            ebx=object_address,
+            ecx=owner_address,
+            esi=0x34,
+            edi=1,
+            esp=callback_stack,
+        )
+        state.set_register("esp", matrix_stack)
+        state.eip = TITLE_WORLD_MATRIX_BUILD_ADDRESS
+        audit.observer(state, memory, ExecutionTrace(enabled=False), 90)
+        state.set_register("esp", callback_stack)
+        state.eip = TITLE_WORLD_DRAW_CALLBACK_ADDRESS
+        before_memory = memory.read(callback_stack, 0x1200)
+
+        audit.observer(state, memory, ExecutionTrace(enabled=False), 100)
+        state.set_register("esp", indexed_stack)
+        state.eip = TITLE_D3D_INDEXED_DRAW_ADDRESS
+        audit.observer(state, memory, ExecutionTrace(enabled=False), 110)
+
+        self.assertEqual(memory.read(callback_stack, 0x1200), before_memory)
+        indexed = audit.summary()["indexed_draw_audit"]
+        self.assertEqual(indexed["world_draw_callback_count"], 1)
+        self.assertEqual(indexed["world_draw_callback_zero_index_count"], 1)
+        self.assertEqual(indexed["indexed_draw_count"], 1)
+        self.assertEqual(indexed["zero_index_draw_count"], 1)
+        self.assertEqual(
+            indexed["indexed_draw_caller_counts"][0],
+            {
+                "caller_return_address_hex": "0x000C4AA3",
+                "invocation_count": 1,
+                "zero_index_count": 1,
+            },
+        )
+        self.assertEqual(
+            indexed["world_draw_callback_samples"][0]["mesh_entry_address_hex"],
+            "0x00009000",
+        )
+        caller_sample = indexed["world_draw_callback_caller_samples"][0]
+        self.assertEqual(
+            caller_sample["caller_return_address_hex"], "0x000860DC"
+        )
+        self.assertEqual(caller_sample["mesh_root_address_hex"], "0x0000D000")
+        self.assertEqual(
+            caller_sample["mesh_entry_index_count_address_hex"], "0x00009010"
+        )
+        self.assertEqual(caller_sample["registers_hex"]["ebx"], "0x0000C000")
+        self.assertEqual(caller_sample["active_matrix_step_delta"], 10)
+        self.assertEqual(
+            caller_sample["active_matrix"]["source_address_hex"], "0x0000E000"
+        )
+        self.assertEqual(caller_sample["active_matrix"]["position"], [10.0, 20.0, 30.0])
+        self.assertEqual(
+            indexed["indexed_draw_samples"][0]["guest_flip_count"], 44
+        )
+
+    def test_scene_record_source_loader_reads_prelinked_track_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            extracted_root = Path(temporary)
+            path = extracted_root / "trackpss" / "forward" / "test.pss"
+            path.parent.mkdir(parents=True)
+            image_base = 0x8381C000
+            record_address = image_base + 0x100
+            payload = bytearray(0x200)
+            struct.pack_into("<I", payload, 0x14, image_base + 0x1C0)
+            struct.pack_into("<II", payload, 0x18, 1, record_address)
+            struct.pack_into(
+                "<II", payload, 0x10C, image_base + 0x180, 42
+            )
+            path.write_bytes(payload)
+
+            sources, errors = _load_title_scene_record_sources(extracted_root)
+
+        self.assertEqual(errors, ())
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0].title_path, "trackpss/forward/test.pss")
+        primary = sources[0].tables[0]
+        self.assertEqual(primary.record_address, record_address)
+        self.assertEqual(primary.record_count, 1)
+        self.assertEqual(struct.unpack_from("<II", primary.records[0], 0x0C), (
+            image_base + 0x180,
+            42,
+        ))
+
+    def test_scene_record_audit_distinguishes_native_reads_from_ram(self) -> None:
+        image_base = 0x9000
+        root_address = 0xB000
+        record_address = 0x9100
+        expected_pointer = 0xA000
+        header = bytearray(0x68)
+        struct.pack_into("<II", header, 0x18, 1, record_address)
+        source_record = bytearray(0x78)
+        struct.pack_into("<II", source_record, 0x0C, expected_pointer, 42)
+        source = TitleSceneRecordSourceLayout(
+            "trackpss/forward/test.pss",
+            image_base,
+            bytes(header),
+            (
+                TitleSceneRecordTableLayout(
+                    "primary", 1, record_address, (bytes(source_record),)
+                ),
+            ),
+        )
+        memory = SparseMemory()
+        memory.write_u32(0x004B85B8, root_address)
+        memory.write(root_address, header)
+        memory.write(record_address, source_record)
+        stack = 0x8000
+        memory.write_u32(stack, TITLE_D3D_INDEXED_DRAW_WRAPPER_RETURN_ADDRESS)
+        memory.write_u32(stack + 0x08, 0)
+        memory.write_u32(stack + 0x0C, 0)
+        memory.write_u32(stack + 0x10, 0x000C3C4A)
+        memory.write_u32(stack + 0x20, 0x00091158)
+        memory.write_u32(stack + 0x24, record_address)
+        watchpoint = RenderWriteWatchpoint()
+        watchpoint.flip_count = 50
+        audit = TitleSceneRecordAudit(
+            enabled=True,
+            source_layouts=(source,),
+            render_watchpoint=watchpoint,
+        )
+        state = CpuState.with_registers(esp=stack)
+        state.eip = TITLE_D3D_INDEXED_DRAW_ADDRESS
+
+        audit.observer(state, memory, ExecutionTrace(enabled=False), 123)
+
+        summary = audit.summary()
+        self.assertEqual(summary["status"], "native_read_divergence")
+        self.assertEqual(summary["argument_memory_divergence_count"], 1)
+        self.assertEqual(summary["runtime_source_divergence_count"], 0)
+        self.assertTrue(summary["complete"])
+        sample = summary["record_samples"][0]
+        self.assertEqual(sample["passed_index_count"], 0)
+        self.assertEqual(sample["authoritative_index_count"], 42)
+        self.assertEqual(sample["expected_pairs"][0]["index_count"], 42)
+
+        report = build_title_scene_record_audit_report(
+            {
+                "entry_recovery": {
+                    "execution": {
+                        "guest_thread_executions": [
+                            {"title_scene_record_audit": summary}
+                        ]
+                    }
+                }
+            }
+        )
+        self.assertEqual(report["status"], "native_read_divergence")
+        self.assertEqual(report["scene_draw_count"], 1)
+
+    def test_scene_record_audit_tracks_runtime_source_corruption_and_writes(self) -> None:
+        image_base = 0x9000
+        root_address = 0xB000
+        record_address = 0x9100
+        header = bytearray(0x68)
+        struct.pack_into("<II", header, 0x18, 1, record_address)
+        source_record = bytearray(0x78)
+        struct.pack_into("<II", source_record, 0x0C, 0xA000, 42)
+        source = TitleSceneRecordSourceLayout(
+            "trackpss/forward/test.pss",
+            image_base,
+            bytes(header),
+            (
+                TitleSceneRecordTableLayout(
+                    "primary", 1, record_address, (bytes(source_record),)
+                ),
+            ),
+        )
+        memory = SparseMemory()
+        memory.write_u32(0x004B85B8, root_address)
+        memory.write(root_address, header)
+        memory.write(record_address, bytes(0x78))
+        stack = 0x8000
+        memory.write_u32(stack, TITLE_D3D_INDEXED_DRAW_WRAPPER_RETURN_ADDRESS)
+        memory.write_u32(stack + 0x10, 0x000C3C4A)
+        memory.write_u32(stack + 0x20, 0x00091BED)
+        memory.write_u32(stack + 0x24, record_address)
+        audit = TitleSceneRecordAudit(enabled=True, source_layouts=(source,))
+        state = CpuState.with_registers(esp=stack)
+        state.eip = TITLE_D3D_INDEXED_DRAW_ADDRESS
+
+        audit.observer(state, memory, ExecutionTrace(enabled=False), 200)
+        audit.observe_memory_write(
+            memory,
+            source="host_model",
+            instruction_address=None,
+            write_address=record_address + 0x0C,
+            payload=struct.pack("<II", 0xA000, 42),
+            steps=None,
+        )
+        memory.write(record_address + 0x0C, struct.pack("<II", 0xA000, 42))
+        audit.observe_memory_write(
+            memory,
+            source="native_page_writeback",
+            instruction_address=None,
+            write_address=record_address + 0x0C,
+            payload=bytes(8),
+            steps=None,
+        )
+
+        summary = audit.summary()
+        self.assertEqual(summary["status"], "runtime_record_corruption")
+        self.assertEqual(summary["runtime_source_divergence_count"], 1)
+        self.assertEqual(summary["write_audit"]["transition_counts"], {
+            "initialized": 2,
+            "cleared": 2,
+        })
+        self.assertEqual(
+            summary["write_audit"]["first_clearing_write"]["source"],
+            "native_page_writeback",
+        )
+
+    def test_title_world_matrix_audit_captures_exact_singularity_writes(self) -> None:
+        source_address = 0x9000
+        matrix = struct.pack(
+            "<16f",
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            10.0,
+            20.0,
+            30.0,
+            0.0,
+        )
+        memory = SparseMemory({source_address: matrix})
+        watchpoint = RenderWriteWatchpoint()
+        watchpoint.flip_count = 43
+        audit = TitleWorldMatrixAudit(
+            render_watchpoint=watchpoint,
+            write_watch_address=source_address,
+        )
+
+        audit.observe_memory_write(
+            memory,
+            instruction_address=0x00081234,
+            write_address=source_address,
+            size=4,
+            value=0,
+            steps=456,
+        )
+
+        self.assertEqual(memory.read(source_address, 0x40), matrix)
+        self.assertEqual(
+            audit.memory_callback_addresses,
+            set(range(source_address, source_address + 0x40, 4)),
+        )
+        summary = audit.summary()["write_audit"]
+        self.assertTrue(summary["enabled"])
+        self.assertEqual(summary["address_hex"], "0x00009000")
+        self.assertEqual(summary["write_count"], 1)
+        self.assertEqual(summary["singularizing_write_count"], 1)
+        self.assertEqual(
+            summary["instruction_counts"][0]["instruction_address_hex"],
+            "0x00081234",
+        )
+        sample = summary["transition_samples"][0]
+        self.assertEqual(sample["guest_flip_count"], 43)
+        self.assertEqual(sample["transition"], "became_singular")
+        self.assertFalse(sample["before"]["singular"])
+        self.assertTrue(sample["after"]["singular"])
+
+    def test_title_world_matrix_audit_pairs_rotation_input_and_output(self) -> None:
+        source_address = 0x9000
+        axis_address = 0xA000
+        stack_address = 0x8000
+        return_address = min(TITLE_WORLD_MATRIX_ROTATE_RETURN_ADDRESSES)
+        healthy_matrix = struct.pack(
+            "<16f",
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            10.0,
+            20.0,
+            30.0,
+            0.0,
+        )
+        singular_matrix = struct.pack(
+            "<16f",
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            30.0,
+            0.0,
+        )
+        angle_raw = struct.unpack("<I", struct.pack("<f", 12.5))[0]
+        memory = SparseMemory(
+            {
+                source_address: healthy_matrix,
+                axis_address: struct.pack("<3f", 0.0, 0.0, 1.0),
+                stack_address: struct.pack(
+                    "<5I",
+                    return_address,
+                    source_address,
+                    axis_address,
+                    angle_raw,
+                    1,
+                ),
+            }
+        )
+        state = CpuState.with_registers(esp=stack_address)
+        state.eip = TITLE_WORLD_MATRIX_ROTATE_ADDRESS
+        state.fpu_stack = [3.0, 2.0]
+        audit = TitleWorldMatrixAudit(write_watch_address=source_address)
+        trace = ExecutionTrace(enabled=False)
+
+        audit.observer(state, memory, trace, 500)
+        builder_stack_address = 0x8100
+        one_minus_cosine_raw = struct.unpack(
+            "<I", struct.pack("<f", 1.0 - math.cos(math.radians(30.0)))
+        )[0]
+        sine_raw = struct.unpack(
+            "<I", struct.pack("<f", math.sin(math.radians(30.0)))
+        )[0]
+        memory.write(
+            builder_stack_address,
+            struct.pack(
+                "<6I",
+                TITLE_WORLD_MATRIX_ROTATION_BUILD_RETURN_ADDRESS,
+                source_address,
+                axis_address,
+                one_minus_cosine_raw,
+                sine_raw,
+                1,
+            ),
+        )
+        state.set_register("esp", builder_stack_address)
+        state.eip = TITLE_WORLD_MATRIX_ROTATION_BUILD_ADDRESS
+        audit.observer(state, memory, trace, 550)
+        memory.write(source_address, singular_matrix)
+        state.eip = return_address
+        audit.observer(state, memory, trace, 600)
+
+        summary = audit.summary()["rotation_audit"]
+        self.assertTrue(summary["enabled"])
+        self.assertEqual(summary["entry_count"], 1)
+        self.assertEqual(summary["completion_count"], 1)
+        self.assertEqual(summary["pending_count"], 0)
+        self.assertEqual(summary["singular_input_count"], 0)
+        self.assertEqual(summary["singular_output_count"], 1)
+        sample = summary["samples"][0]
+        self.assertEqual(sample["axis"], [0.0, 0.0, 1.0])
+        self.assertEqual(sample["angle_degrees"], 12.5)
+        self.assertEqual(sample["combine_mode"], 1)
+        self.assertEqual(sample["entry_fpu"]["stack_depth"], 2)
+        self.assertEqual(sample["builder"]["normalized_axis"], [0.0, 0.0, 1.0])
+        self.assertAlmostEqual(sample["builder"]["sine"], 0.5)
+        self.assertLess(sample["builder"]["unit_circle_error"], 1.0e-6)
+        self.assertFalse(sample["input"]["singular"])
+        self.assertTrue(sample["output"]["singular"])
+
     def test_legacy_title_frontend_asset_seed_is_not_registered_over_real_init(self) -> None:
         object_address = 0x00400000
         fast_path = TitleFrontendAssetInitFastPath()
@@ -2122,6 +3653,18 @@ class PlayabilityProbeTests(unittest.TestCase):
         trace = ExecutionTrace()
 
         self.assertNotIn(TITLE_FRONTEND_ASSET_INIT_ADDRESS, fast_path.call_handlers())
+        self.assertNotIn(
+            TITLE_FRONTEND_ASSET_METHOD_TRAMPOLINE_ADDRESS,
+            fast_path.call_handlers(),
+        )
+        self.assertNotIn(
+            TITLE_FRONTEND_ASSET_SECOND_METHOD_TRAMPOLINE_ADDRESS,
+            fast_path.call_handlers(),
+        )
+        self.assertIn(
+            TITLE_FRONTEND_SYNTHETIC_ASSET_METHOD_TARGET_ADDRESS,
+            fast_path.call_handlers(),
+        )
         fast_path.init_handler(
             state,
             memory,
@@ -2186,7 +3729,7 @@ class PlayabilityProbeTests(unittest.TestCase):
         fast_path.method_handler(
             method_state,
             memory,
-            TITLE_FRONTEND_ASSET_METHOD_TRAMPOLINE_ADDRESS,
+            TITLE_FRONTEND_SYNTHETIC_ASSET_METHOD_TARGET_ADDRESS,
             ExecutionTrace(),
         )
         self.assertEqual(method_state.get_register("eax"), 1)
@@ -2194,7 +3737,7 @@ class PlayabilityProbeTests(unittest.TestCase):
         fast_path.method_handler(
             method_state,
             memory,
-            TITLE_FRONTEND_ASSET_SECOND_METHOD_TRAMPOLINE_ADDRESS,
+            TITLE_FRONTEND_SYNTHETIC_ASSET_METHOD_TARGET_ADDRESS,
             ExecutionTrace(),
         )
         self.assertEqual(fast_path.summary()["method_invocation_count"], 2)
@@ -2772,6 +4315,182 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(memory.read_u32(sentinel + 4), sentinel)
         self.assertEqual(repair.summary()["repair_count"], 1)
 
+    def test_title_heap_large_bin_integrity_repair_leaves_healthy_list_untouched(
+        self,
+    ) -> None:
+        repair = TitleHeapLargeBinIntegrityRepair()
+        heap_base = 0x10000000
+        sentinel = heap_base + TITLE_HEAP_LARGE_BIN_SENTINEL_OFFSET
+        node = 0x828A2458
+        watched = (sentinel, sentinel + 4, node - 8, node, node + 4)
+        memory = SparseMemory(
+            {
+                sentinel: node,
+                sentinel + 4: node,
+                node - 8: 0x100,
+                node: sentinel,
+                node + 4: sentinel,
+            }
+        )
+        before = memory.snapshot_u32(watched)
+        state = CpuState.with_registers(ebx=heap_base, ecx=node)
+        state.eip = 0x000E497D
+
+        self.assertFalse(repair.service_native_slice(state, memory, 20_000))
+
+        self.assertEqual(memory.snapshot_u32(watched), before)
+        self.assertEqual(state.eip, 0x000E497D)
+        summary = repair.summary()
+        self.assertEqual(summary["observation_count"], 1)
+        self.assertEqual(summary["healthy_count"], 1)
+        self.assertEqual(summary["repair_count"], 0)
+
+    def test_title_heap_large_bin_integrity_repair_removes_observed_zero_size_link(
+        self,
+    ) -> None:
+        repair = TitleHeapLargeBinIntegrityRepair()
+        heap_base = 0x10000000
+        sentinel = heap_base + TITLE_HEAP_LARGE_BIN_SENTINEL_OFFSET
+        node = 0x828A2458
+        memory = SparseMemory(
+            {
+                sentinel: node,
+                sentinel + 4: node,
+                node - 8: 0,
+                node: node,
+                node + 4: node,
+            }
+        )
+        state = CpuState.with_registers(ebx=heap_base, ecx=node)
+        state.eip = 0x000E497D
+
+        self.assertTrue(repair.service_native_slice(state, memory, 130_680_000))
+
+        self.assertEqual(memory.read_u32(sentinel), sentinel)
+        self.assertEqual(memory.read_u32(sentinel + 4), sentinel)
+        self.assertEqual(state.eip, 0x000E4978)
+        self.assertEqual(state.get_register("ecx"), sentinel)
+        summary = repair.summary()
+        self.assertEqual(summary["repair_count"], 1)
+        self.assertEqual(summary["termination_counts"], {"invalid_chunk_size": 1})
+        self.assertEqual(summary["repairs"][0]["invalid_chunk_size"], 0)
+        self.assertEqual(summary["repairs"][0]["preserved_node_count"], 0)
+        self.assertTrue(summary["repairs"][0]["rerouted_to_loop_head"])
+
+    def test_title_heap_large_bin_integrity_repair_batches_all_scan_loops(
+        self,
+    ) -> None:
+        heap_base = 0x10000000
+        sentinel = heap_base + TITLE_HEAP_LARGE_BIN_SENTINEL_OFFSET
+        node = 0x828A2458
+        cases = (
+            ("allocation", 0x000E499D, 0x000E4978, "ecx"),
+            ("coalesce_insert_a", 0x000E4AE4, 0x000E4ACA, "eax"),
+            ("coalesce_insert_b", 0x000E4BC5, 0x000E4BAB, "eax"),
+            ("coalesce_insert_c", 0x000E4D17, 0x000E4CFD, "eax"),
+            ("free_insert", 0x000E5087, 0x000E506F, "ecx"),
+        )
+        for scan_kind, instruction, loop_entry, cursor_register in cases:
+            with self.subTest(scan_kind=scan_kind):
+                repair = TitleHeapLargeBinIntegrityRepair()
+                memory = SparseMemory(
+                    {
+                        sentinel: node,
+                        sentinel + 4: node,
+                        node - 8: 0x100,
+                        node: node,
+                        node + 4: node,
+                    }
+                )
+                state = CpuState.with_registers(
+                    ebx=heap_base,
+                    eax=node,
+                    ecx=node,
+                    esi=sentinel,
+                )
+                state.eip = instruction
+
+                self.assertTrue(
+                    repair.service_native_slice(state, memory, 40_000)
+                )
+
+                self.assertEqual(memory.read_u32(sentinel), node)
+                self.assertEqual(memory.read_u32(sentinel + 4), node)
+                self.assertEqual(memory.read_u32(node), sentinel)
+                self.assertEqual(memory.read_u32(node + 4), sentinel)
+                self.assertEqual(state.eip, loop_entry)
+                self.assertEqual(state.get_register(cursor_register), sentinel)
+                summary = repair.summary()
+                self.assertEqual(summary["termination_counts"], {"cycle": 1})
+                self.assertEqual(summary["repair_counts_by_scan"], {scan_kind: 1})
+                self.assertEqual(summary["repairs"][0]["preserved_node_count"], 1)
+
+    def test_title_heap_large_bin_integrity_repair_restores_backlinks_without_reroute(
+        self,
+    ) -> None:
+        repair = TitleHeapLargeBinIntegrityRepair()
+        heap_base = 0x10000000
+        sentinel = heap_base + TITLE_HEAP_LARGE_BIN_SENTINEL_OFFSET
+        node = 0x828A2458
+        memory = SparseMemory(
+            {
+                sentinel: node,
+                sentinel + 4: 0,
+                node - 8: 0x100,
+                node: sentinel,
+                node + 4: node,
+            }
+        )
+        state = CpuState.with_registers(
+            ebx=heap_base,
+            ecx=node,
+            esi=sentinel,
+        )
+        state.eip = 0x000E506F
+
+        self.assertTrue(repair.service_native_slice(state, memory, 60_000))
+
+        self.assertEqual(memory.read_u32(sentinel + 4), node)
+        self.assertEqual(memory.read_u32(node + 4), sentinel)
+        self.assertEqual(state.eip, 0x000E506F)
+        self.assertEqual(state.get_register("ecx"), node)
+        summary = repair.summary()
+        self.assertEqual(summary["termination_counts"], {"backlink_mismatch": 1})
+        self.assertFalse(summary["repairs"][0]["rerouted_to_loop_head"])
+
+    def test_title_heap_large_bin_integrity_repair_does_not_mutate_at_scan_limit(
+        self,
+    ) -> None:
+        repair = TitleHeapLargeBinIntegrityRepair(max_nodes=1)
+        heap_base = 0x10000000
+        sentinel = heap_base + TITLE_HEAP_LARGE_BIN_SENTINEL_OFFSET
+        first = 0x828A2458
+        second = 0x828A3458
+        watched = (sentinel, sentinel + 4, first, first + 4, second, second + 4)
+        memory = SparseMemory(
+            {
+                sentinel: first,
+                sentinel + 4: second,
+                first - 8: 0x100,
+                first: second,
+                first + 4: sentinel,
+                second - 8: 0x100,
+                second: sentinel,
+                second + 4: first,
+            }
+        )
+        before = memory.snapshot_u32(watched)
+        state = CpuState.with_registers(ebx=heap_base, ecx=first)
+        state.eip = 0x000E497D
+
+        self.assertFalse(repair.service_native_slice(state, memory, 80_000))
+
+        self.assertEqual(memory.snapshot_u32(watched), before)
+        self.assertEqual(state.eip, 0x000E497D)
+        summary = repair.summary()
+        self.assertEqual(summary["scan_limit_count"], 1)
+        self.assertEqual(summary["repair_count"], 0)
+
     def test_title_spin_delay_fast_path_preserves_call_contract(self) -> None:
         base_address = 0x1000
         function = lift_x86_function(
@@ -2986,44 +4705,19 @@ class PlayabilityProbeTests(unittest.TestCase):
             "title_global_list_register",
         )
 
-    def test_title_global_list_fast_path_cleanup_resets_sentinel(self) -> None:
-        node_address = 0x18000E68
-        state = CpuState.with_registers(esp=0x8000)
-        memory = SparseMemory(
-            {
-                0x8000: 0xDEADC0DE,
-                TITLE_GLOBAL_LIST_HEAD_ADDRESS: node_address,
-                TITLE_GLOBAL_LIST_TAIL_ADDRESS: node_address,
-                node_address: TITLE_GLOBAL_LIST_HEAD_ADDRESS,
-                node_address + 4: TITLE_GLOBAL_LIST_HEAD_ADDRESS,
-            }
-        )
-        trace = ExecutionTrace()
+    def test_title_global_list_fast_path_leaves_cleanup_to_guest_code(self) -> None:
         fast_path = TitleGlobalListRegistrationFastPath()
 
-        fast_path.cleanup_handler(
-            state,
-            memory,
+        self.assertNotIn(
             TITLE_GLOBAL_LIST_CLEANUP_ADDRESS,
-            trace,
+            fast_path.call_handlers(),
         )
-
-        self.assertEqual(
-            memory.read_u32(TITLE_GLOBAL_LIST_HEAD_ADDRESS),
-            TITLE_GLOBAL_LIST_HEAD_ADDRESS,
+        self.assertIn(
+            TITLE_GLOBAL_LIST_REGISTER_ADDRESS,
+            fast_path.call_handlers(),
         )
-        self.assertEqual(
-            memory.read_u32(TITLE_GLOBAL_LIST_TAIL_ADDRESS),
-            TITLE_GLOBAL_LIST_HEAD_ADDRESS,
-        )
-        self.assertEqual(state.get_register("eax"), 1)
         summary = fast_path.summary()
-        self.assertEqual(summary["cleanup_count"], 1)
-        self.assertEqual(summary["cleanup_node_count"], 1)
-        self.assertEqual(
-            trace.to_list()[0]["operation"],
-            "title_global_list_cleanup",
-        )
+        self.assertFalse(summary["cleanup_fast_path_enabled"])
 
     def test_title_static_drive_array_fast_path_seeds_element_descriptors(self) -> None:
         object_address = 0x3000
@@ -3495,8 +5189,131 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(result.state.get_register("esp"), 0x9004)
         self.assertEqual(invocation.shim_name, "AvSendTVEncoderOption")
         self.assertEqual(invocation.arguments, (0, 6, 0, 0x00225208))
-        self.assertEqual(invocation.handler_arguments, (0, 6))
+        self.assertEqual(invocation.handler_arguments, invocation.arguments)
         self.assertEqual(invocation.stack_cleanup_bytes, 16)
+        self.assertEqual(memory.read_u32(0x00225208), 0x00400101)
+        self.assertEqual(
+            invocation.memory_writes[0]["label"],
+            "encoder_option_result",
+        )
+
+    def test_runtime_abi_bridge_cleans_ke_wait_dispatcher_arguments(self) -> None:
+        resolver = ImportResolver()
+        runtime = XboxRuntimeShims()
+        runtime.register_kernel_imports(resolver, imported_ordinals=[159])
+        bridge = RuntimeAbiBridge(runtime)
+        target = runtime.registered_shims[0].target_address
+        function = lift_x86_function(
+            _push_u32(0)
+            + _push_u32(0)
+            + _push_u32(1)
+            + _push_u32(6)
+            + _push_u32(0x0022704C)
+            + _call_indirect_bytes(0x3000)
+            + b"\xC3",
+            base_address=0x1000,
+            symbol="ke_wait_for_single_object_callsite",
+        )
+        state = CpuState.with_registers(esp=0x9000)
+        memory = SparseMemory({0x3000: target, 0x9000: 0xDEADC0DE})
+
+        result = execute_lifted_function(
+            function,
+            state=state,
+            memory=memory,
+            call_handlers=bridge.call_handlers(),
+        )
+
+        invocation = bridge.invocations[0]
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        self.assertEqual(result.state.get_register("esp"), 0x9004)
+        self.assertEqual(invocation.shim_name, "KeWaitForSingleObject")
+        self.assertEqual(
+            invocation.arguments,
+            (0x0022704C, 6, 1, 0, 0),
+        )
+        self.assertEqual(invocation.handler_arguments, invocation.arguments)
+        self.assertEqual(invocation.stack_cleanup_bytes, 20)
+        self.assertEqual(invocation.eax, XboxStatus.WAIT_0)
+
+    def test_runtime_abi_bridge_cleans_av_set_display_mode_arguments(self) -> None:
+        resolver = ImportResolver()
+        runtime = XboxRuntimeShims()
+        runtime.register_kernel_imports(resolver, imported_ordinals=[3])
+        bridge = RuntimeAbiBridge(runtime)
+        target = runtime.registered_shims[0].target_address
+        arguments = (
+            0xFD000000,
+            0,
+            0x040F0D0F,
+            0x12,
+            0xA00,
+            0x21D8D000,
+        )
+        function = lift_x86_function(
+            b"".join(_push_u32(argument) for argument in reversed(arguments))
+            + _call_indirect_bytes(0x3000)
+            + b"\xC3",
+            base_address=0x1000,
+            symbol="av_set_display_mode_callsite",
+        )
+        state = CpuState.with_registers(esp=0x9000)
+        memory = SparseMemory({0x3000: target, 0x9000: 0xDEADC0DE})
+
+        result = execute_lifted_function(
+            function,
+            state=state,
+            memory=memory,
+            call_handlers=bridge.call_handlers(),
+        )
+
+        invocation = bridge.invocations[0]
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        self.assertEqual(result.state.get_register("esp"), 0x9004)
+        self.assertEqual(invocation.shim_name, "AvSetDisplayMode")
+        self.assertEqual(invocation.arguments, arguments)
+        self.assertEqual(invocation.handler_arguments, arguments)
+        self.assertEqual(invocation.stack_cleanup_bytes, 24)
+        self.assertEqual(invocation.eax, XboxStatus.SUCCESS)
+        self.assertEqual(runtime.graphics.display_mode.width, 640)
+
+    def test_runtime_abi_bridge_cleans_nt_wait_ex_arguments(self) -> None:
+        resolver = ImportResolver()
+        runtime = XboxRuntimeShims()
+        runtime.register_kernel_imports(resolver, imported_ordinals=[193, 234])
+        bridge = RuntimeAbiBridge(runtime)
+        semaphore = runtime.nt_create_semaphore(initial_count=1, limit=1)
+        target = next(
+            shim.target_address
+            for shim in runtime.registered_shims
+            if shim.name == "NtWaitForSingleObjectEx"
+        )
+        arguments = (semaphore, 1, 0, 0)
+        function = lift_x86_function(
+            b"".join(_push_u32(argument) for argument in reversed(arguments))
+            + _call_indirect_bytes(0x3000)
+            + b"\xC3",
+            base_address=0x1000,
+            symbol="nt_wait_for_single_object_ex_callsite",
+        )
+        state = CpuState.with_registers(esp=0x9000)
+        memory = SparseMemory({0x3000: target, 0x9000: 0xDEADC0DE})
+
+        result = execute_lifted_function(
+            function,
+            state=state,
+            memory=memory,
+            call_handlers=bridge.call_handlers(),
+        )
+
+        invocation = bridge.invocations[0]
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        self.assertEqual(result.state.get_register("esp"), 0x9004)
+        self.assertEqual(invocation.shim_name, "NtWaitForSingleObjectEx")
+        self.assertEqual(invocation.arguments, arguments)
+        self.assertEqual(invocation.handler_arguments, arguments)
+        self.assertEqual(invocation.stack_cleanup_bytes, 16)
+        self.assertEqual(invocation.eax, XboxStatus.WAIT_0)
 
     def test_runtime_abi_bridge_marshals_pci_space_read_buffer(self) -> None:
         resolver = ImportResolver()
@@ -3910,6 +5727,53 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(state.get_register("eax"), 0)
         self.assertEqual(state.get_register("esp"), 0x8000)
         self.assertEqual(memory.read_u32(0x8000), 0xDEADC0DE)
+
+    def test_runtime_abi_bridge_cleans_phy_initialize_arguments(self) -> None:
+        resolver = ImportResolver()
+        runtime = XboxRuntimeShims()
+        runtime.register_kernel_imports(resolver, imported_ordinals=[253])
+        bridge = RuntimeAbiBridge(runtime)
+        target = runtime.registered_shims[0].target_address
+        return_address = 0x000E7294
+        arguments = (0, 0)
+        state = CpuState.with_registers(esp=0x8000)
+        memory = SparseMemory({0x8000: return_address})
+        for index, argument in enumerate(arguments):
+            memory.write_u32(0x8004 + index * 4, argument)
+
+        bridge.invoke(state, memory, target, ExecutionTrace())
+
+        invocation = bridge.invocations[0]
+        self.assertEqual(invocation.shim_name, "PhyInitialize")
+        self.assertEqual(invocation.arguments, arguments)
+        self.assertEqual(invocation.handler_arguments, ())
+        self.assertEqual(invocation.stack_cleanup_bytes, 8)
+        self.assertEqual(state.get_register("eax"), XboxStatus.SUCCESS)
+        self.assertEqual(state.get_register("esp"), 0x8008)
+        self.assertEqual(memory.read_u32(0x8008), return_address)
+
+    def test_runtime_abi_bridge_cleans_phy_get_link_state_argument(self) -> None:
+        resolver = ImportResolver()
+        runtime = XboxRuntimeShims()
+        runtime.register_kernel_imports(resolver, imported_ordinals=[252])
+        bridge = RuntimeAbiBridge(runtime)
+        target = runtime.registered_shims[0].target_address
+        return_address = 0x000E729B
+        arguments = (0,)
+        state = CpuState.with_registers(esp=0x8000)
+        memory = SparseMemory({0x8000: return_address})
+        memory.write_u32(0x8004, arguments[0])
+
+        bridge.invoke(state, memory, target, ExecutionTrace())
+
+        invocation = bridge.invocations[0]
+        self.assertEqual(invocation.shim_name, "PhyGetLinkState")
+        self.assertEqual(invocation.arguments, arguments)
+        self.assertEqual(invocation.handler_arguments, ())
+        self.assertEqual(invocation.stack_cleanup_bytes, 4)
+        self.assertEqual(state.get_register("eax"), XboxStatus.SUCCESS)
+        self.assertEqual(state.get_register("esp"), 0x8004)
+        self.assertEqual(memory.read_u32(0x8004), return_address)
 
     def test_runtime_abi_bridge_cleans_ob_reference_object_by_handle_stack(self) -> None:
         resolver = ImportResolver()
@@ -4393,6 +6257,88 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(cached.instructions[0].mnemonic, "mov")
         self.assertEqual(cached.instructions[0].operands[1].immediate, 7)
 
+    def test_dynamic_block_cache_refreshes_legacy_decoder_semantics(self) -> None:
+        legacy_function = LiftedFunction(
+            symbol="dynamic_block_00001000",
+            base_address=0x1000,
+            code_size=5,
+            instructions=(
+                X86Instruction(
+                    address=0x1000,
+                    size=2,
+                    mnemonic="fnstcw",
+                    operands=(Operand.memory(size=16),),
+                ),
+                X86Instruction(
+                    address=0x1002,
+                    size=2,
+                    mnemonic="fnstcw",
+                    operands=(Operand.memory(size=16),),
+                ),
+                X86Instruction(address=0x1004, size=1, mnemonic="ret"),
+            ),
+        )
+        legacy_key = "1:ABCDEF:0x00001000:512:224"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "dynamic-block-cache.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "format": "b2-recomp-dynamic-block-cache",
+                        "public_safe": False,
+                        "version": 1,
+                        "records": {
+                            legacy_key: legacy_function.to_dict(
+                                include_bytes=False
+                            )
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = type(
+                "Loaded",
+                (),
+                {"arena": SparseMemory({0x1000: bytes.fromhex("D9FED9FFC3")})},
+            )()
+            cache = DynamicBlockCache(path)
+
+            cache.prepare_for_image(loaded, image_sha256="ABCDEF")
+            current_key = cache.key(
+                image_sha256="ABCDEF",
+                target=0x1000,
+                entry_bytes=0x200,
+                max_block_instructions=224,
+            )
+            refreshed = cache.get(current_key)
+            cache.save()
+            saved = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertIsNotNone(refreshed)
+        assert refreshed is not None
+        self.assertEqual(
+            [instruction.mnemonic for instruction in refreshed.instructions],
+            ["fsin", "fcos", "ret"],
+        )
+        summary = cache.summary()
+        self.assertTrue(summary["migration_performed"])
+        self.assertEqual(summary["migration_validated_record_count"], 1)
+        self.assertEqual(summary["migration_decode_count"], 1)
+        self.assertEqual(summary["migration_refreshed_record_count"], 1)
+        self.assertEqual(summary["migration_rejected_record_count"], 0)
+        self.assertEqual(
+            [
+                change["refreshed_mnemonic"]
+                for change in summary["migration_samples"][0][
+                    "instruction_changes"
+                ]
+            ],
+            ["fsin", "fcos"],
+        )
+        self.assertEqual(saved["version"], DynamicBlockCache.VERSION)
+        self.assertIn(current_key, saved["records"])
+        self.assertNotIn(legacy_key, saved["records"])
+
     def test_recovered_render_command_stream_captures_d3d_writes(self) -> None:
         trace_events = [
             {
@@ -4658,6 +6604,44 @@ class PlayabilityProbeTests(unittest.TestCase):
             [write["label"] for write in invocation.memory_writes],
             ["ansi_string"],
         )
+
+    def test_runtime_abi_bridge_compares_guest_ansi_strings(self) -> None:
+        resolver = ImportResolver()
+        runtime = XboxRuntimeShims()
+        runtime.register_kernel_imports(resolver, imported_ordinals=[279])
+        bridge = RuntimeAbiBridge(runtime)
+        target = runtime.registered_shims[0].target_address
+        state = CpuState.with_registers(esp=0x8000)
+        left = b"TDATA"
+        right = b"tdata"
+        memory = SparseMemory(
+            {
+                0x6000: (
+                    len(left).to_bytes(2, "little")
+                    + len(left).to_bytes(2, "little")
+                    + (0x7000).to_bytes(4, "little")
+                ),
+                0x6010: (
+                    len(right).to_bytes(2, "little")
+                    + len(right).to_bytes(2, "little")
+                    + (0x7100).to_bytes(4, "little")
+                ),
+                0x7000: left,
+                0x7100: right,
+                0x8000: 0xDEADC0DE,
+                0x8004: 0x6000,
+                0x8008: 0x6010,
+                0x800C: 1,
+            }
+        )
+
+        bridge.invoke(state, memory, target, ExecutionTrace())
+
+        invocation = bridge.invocations[0]
+        self.assertEqual(invocation.shim_name, "RtlEqualString")
+        self.assertEqual(invocation.stack_cleanup_bytes, 12)
+        self.assertTrue(invocation.result)
+        self.assertEqual(state.get_register("eax"), 1)
 
     def test_runtime_abi_bridge_decodes_nt_open_file_object_attributes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5152,6 +7136,60 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(invocation.result["mode"], "ab")
         self.assertEqual(memory.read_u32(0x6200), invocation.result["handle"])
         self.assertEqual(memory.read_u32(0x6210), XboxStatus.SUCCESS)
+        self.assertEqual(memory.read_u32(0x6214), 2)
+
+    def test_runtime_abi_bridge_opens_or_creates_save_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            save_root = root / "save"
+            resolver = ImportResolver()
+            runtime = XboxRuntimeShims(
+                XboxRuntimeConfig(extracted_disc_root=root, save_data_root=save_root)
+            )
+            runtime.register_kernel_imports(resolver, imported_ordinals=[190])
+            bridge = RuntimeAbiBridge(runtime)
+            target = runtime.registered_shims[0].target_address
+            path = b"\\Device\\Harddisk0\\Partition1\\TDATA"
+            ansi_string = (
+                len(path).to_bytes(2, "little")
+                + (len(path) + 1).to_bytes(2, "little")
+                + (0x7000).to_bytes(4, "little")
+            )
+            object_attributes = bytearray(24)
+            struct.pack_into("<I", object_attributes, 8, 0x6000)
+            state = CpuState.with_registers(esp=0x8000)
+            memory = SparseMemory(
+                {
+                    0x6000: ansi_string,
+                    0x6100: bytes(object_attributes),
+                    0x7000: path + b"\x00",
+                    0x8000: 0xDEADC0DE,
+                    0x8004: 0x6200,
+                    0x8008: 0x00100001,
+                    0x800C: 0x6100,
+                    0x8010: 0x6210,
+                    0x8014: 0,
+                    0x8018: 0,
+                    0x801C: 3,
+                    0x8020: 3,
+                    0x8024: 0x00004021,
+                    0x8028: 0,
+                    0x802C: 0,
+                }
+            )
+
+            bridge.invoke(state, memory, target, ExecutionTrace())
+
+            self.assertTrue((save_root / "TDATA").is_dir())
+
+        invocation = bridge.invocations[0]
+        self.assertEqual(invocation.shim_name, "NtCreateFile")
+        self.assertEqual(invocation.eax, XboxStatus.SUCCESS)
+        self.assertTrue(invocation.result["is_directory"])
+        self.assertFalse(invocation.result["created"])
+        self.assertEqual(memory.read_u32(0x6200), invocation.result["handle"])
+        self.assertEqual(memory.read_u32(0x6210), XboxStatus.SUCCESS)
+        self.assertEqual(memory.read_u32(0x6214), 1)
 
     def test_playability_probe_executes_synthetic_entry_import_call(self) -> None:
         blob, layout = _synthetic_xbe()
@@ -5554,6 +7592,14 @@ class PlayabilityProbeTests(unittest.TestCase):
         }
 
         self.assertTrue(_guest_thread_requested_live_stop(thread_execution))
+        self.assertTrue(
+            _guest_thread_requested_live_stop(
+                {
+                    "status": "live_stop",
+                    "native_run": {"reason": "unhandled_target"},
+                }
+            )
+        )
         self.assertFalse(
             _guest_thread_requested_live_stop(
                 {"native_run": {"reason": "step_budget"}}
@@ -5886,6 +7932,17 @@ class PlayabilityProbeTests(unittest.TestCase):
                 render_stream_path=render_path,
                 controller_state_path=root / "controller.json",
                 render_publish_interval_seconds=0.0,
+                frontend_text_provider=lambda flip: (
+                    {
+                        "frontend_text": "Loading - please wait",
+                        "frontend_text_x_bits": 0x43A00000,
+                        "frontend_text_y_bits": 0x43AA0000,
+                        "frontend_text_size_bits": 0x41C80000,
+                        "frontend_text_color_argb": 0x80FFFFFF,
+                    }
+                    if flip == 1
+                    else None
+                ),
             )
 
             watchpoint.observe(0x80000000, flip_header.to_bytes(4, "little"))
@@ -5896,6 +7953,11 @@ class PlayabilityProbeTests(unittest.TestCase):
             first = json.loads(render_path.read_text(encoding="utf-8"))
             self.assertEqual(first["guest_flip_count"], 1)
             self.assertEqual(first["presentable_command_record_count"], 3)
+            self.assertEqual(first["frontend_text"], "Loading - please wait")
+            self.assertEqual(first["frontend_text_x_bits"], 0x43A00000)
+            self.assertEqual(first["frontend_text_y_bits"], 0x43AA0000)
+            self.assertEqual(first["frontend_text_size_bits"], 0x41C80000)
+            self.assertEqual(first["frontend_text_color_argb"], 0x80FFFFFF)
             self.assertEqual(bridge.summary()["render_publish_count"], 1)
 
             watchpoint.observe(0x80000008, (0xDEADBEEF).to_bytes(4, "little"))
@@ -5914,7 +7976,96 @@ class PlayabilityProbeTests(unittest.TestCase):
             self.assertEqual(second["guest_flip_count"], 2)
             self.assertEqual(second["presentable_command_record_count"], 7)
             self.assertEqual(second["published_command_record_count"], 7)
+            self.assertNotIn("frontend_text", second)
             self.assertEqual(bridge.summary()["render_publish_count"], 2)
+
+    def test_live_host_bridge_detects_cached_resource_page_changes(self) -> None:
+        runtime = XboxRuntimeShims()
+        watchpoint = RenderWriteWatchpoint()
+        memory = SparseMemory({0x80004000: b"TEXTURE"})
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bridge = LiveHostBridge(
+                runtime,
+                watchpoint,
+                render_stream_path=root / "render.json",
+                controller_state_path=root / "controller.json",
+            )
+            source_address = 0x80004000
+            generations = (
+                memory.page_generation(source_address & ~memory._PAGE_MASK),
+            )
+            bridge._resource_snapshot_cache[
+                (0, 0x00004000, 0x00000600, 0)
+            ] = (
+                generations,
+                {
+                    "address": 0x00004000,
+                    "source_address": source_address,
+                    "byte_count": 7,
+                },
+            )
+
+            self.assertFalse(bridge._cached_audit_resource_changed(memory))
+            memory.write(source_address, b"texture")
+            self.assertTrue(bridge._cached_audit_resource_changed(memory))
+
+    def test_live_host_bridge_rotates_acknowledged_command_epochs(self) -> None:
+        runtime = XboxRuntimeShims()
+        watchpoint = RenderWriteWatchpoint()
+        memory = SparseMemory()
+        flip_header = (1 << 18) | 0x012C
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            render_path = root / "render.json"
+            bridge = LiveHostBridge(
+                runtime,
+                watchpoint,
+                render_stream_path=render_path,
+                controller_state_path=root / "controller.json",
+                presentation_ack_path=root / "presented.bin",
+                render_publish_interval_seconds=0.0,
+            )
+
+            with patch.object(
+                bridge,
+                "_wait_for_presentation_ack",
+                return_value=True,
+            ):
+                watchpoint.observe(0x80000000, flip_header.to_bytes(4, "little"))
+                watchpoint.observe(0x80000004, (1).to_bytes(4, "little"))
+                watchpoint.observe(0xFED00000, (1).to_bytes(4, "little"))
+                # Native batching may cross a completed flip before yielding.
+                # This next-frame write must seed, not invalidate, the next epoch.
+                watchpoint.observe(0x80000008, (0xDEADBEEF).to_bytes(4, "little"))
+                bridge.on_slice(CpuState(), memory, 100)
+
+                first = json.loads(render_path.read_text(encoding="utf-8"))
+                first_path = Path(first["command_snapshot_path"])
+                self.assertEqual(first["command_snapshot_base_record_count"], 0)
+                self.assertEqual(first["command_snapshot_record_count"], 4)
+                self.assertEqual(first["presentable_command_record_count"], 3)
+                self.assertEqual((first_path.stat().st_size - 8) // 16, 4)
+
+                watchpoint.observe(0x8000000C, flip_header.to_bytes(4, "little"))
+                watchpoint.observe(0x80000010, (2).to_bytes(4, "little"))
+                watchpoint.observe(0xFED00004, (1).to_bytes(4, "little"))
+                bridge.on_slice(CpuState(), memory, 200)
+
+                second = json.loads(render_path.read_text(encoding="utf-8"))
+                second_path = Path(second["command_snapshot_path"])
+                self.assertEqual(second["command_stream_generation"], first["command_stream_generation"])
+                self.assertEqual(second["command_snapshot_base_record_count"], 3)
+                self.assertEqual(second["command_snapshot_record_count"], 4)
+                self.assertEqual(second["presentable_command_record_count"], 7)
+                self.assertEqual((second_path.stat().st_size - 8) // 16, 4)
+                self.assertFalse(first_path.exists())
+
+            summary = bridge.summary()
+            self.assertEqual(summary["command_epoch_rotation_count"], 2)
+            self.assertEqual(summary["retired_snapshot_delete_count"], 1)
 
     def test_live_host_bridge_paces_completed_flips_without_catch_up_bursts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

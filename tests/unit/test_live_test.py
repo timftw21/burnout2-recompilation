@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 from tools.playability import live_test
 from tools.playability.live_test import (
+    _wait_for_guest_shutdown,
     build_guest_command,
     build_lossless_flip_audit_report,
     build_presenter_command,
@@ -24,7 +25,7 @@ class LiveTestTests(unittest.TestCase):
             dashboard_root=Path("dashboard"),
             cache_root=Path("cache-data"),
             dynamic_block_cache=Path("cache.json"),
-            native_slice_steps=2500,
+            native_slice_steps=20_000,
             max_steps=0,
             live_render_stream=Path("render.json"),
             live_controller_state=Path("controller.json"),
@@ -32,6 +33,10 @@ class LiveTestTests(unittest.TestCase):
             render_debug_events=Path("render-debug-events.jsonl"),
             render_debug_report=Path("render-debug-report.json"),
             skip_host_build=True,
+            audit_world_matrices=False,
+            audit_world_matrix_address=None,
+            audit_scene_records=False,
+            scene_record_audit_output=Path("scene-record-audit.json"),
             lossless_flip_audit=False,
             flip_audit_health_interval=30,
         )
@@ -39,11 +44,50 @@ class LiveTestTests(unittest.TestCase):
     def test_guest_command_uses_unlimited_steps(self) -> None:
         command = build_guest_command(self._args())
 
+        self.assertEqual(command[1], "-u")
         self.assertEqual(command[command.index("--max-steps") + 1], "0")
         self.assertIn("--native-guest-loop", command)
+        self.assertIn("--quiet", command)
         self.assertEqual(command[command.index("--save-data-root") + 1], "save")
         self.assertEqual(command[command.index("--dashboard-root") + 1], "dashboard")
         self.assertEqual(command[command.index("--cache-root") + 1], "cache-data")
+        self.assertEqual(
+            command[command.index("--native-slice-steps") + 1],
+            "20000",
+        )
+
+    def test_default_native_slice_cadence_targets_frame_rate(self) -> None:
+        self.assertEqual(live_test.DEFAULT_NATIVE_SLICE_STEPS, 100_000)
+
+    def test_world_matrix_audit_is_forwarded_to_guest(self) -> None:
+        args = self._args()
+        args.audit_world_matrices = True
+
+        self.assertIn("--audit-world-matrices", build_guest_command(args))
+
+    def test_world_matrix_write_address_is_forwarded_to_guest(self) -> None:
+        args = self._args()
+        args.audit_world_matrix_address = 0x20D74D00
+
+        command = build_guest_command(args)
+
+        self.assertIn("--audit-world-matrices", command)
+        self.assertEqual(
+            command[command.index("--audit-world-matrix-address") + 1],
+            "0x20D74D00",
+        )
+
+    def test_scene_record_audit_uses_compact_dedicated_output(self) -> None:
+        args = self._args()
+        args.audit_scene_records = True
+
+        command = build_guest_command(args)
+
+        self.assertIn("--audit-scene-records", command)
+        self.assertEqual(
+            command[command.index("--scene-record-audit-output") + 1],
+            "scene-record-audit.json",
+        )
 
     def test_presenter_command_runs_until_window_closes(self) -> None:
         command = build_presenter_command(self._args())
@@ -76,6 +120,21 @@ class LiveTestTests(unittest.TestCase):
         )
         process.wait.assert_called_once_with()
         process.terminate.assert_not_called()
+
+    def test_guest_shutdown_timeout_forces_cleanup_and_reports_failure(self) -> None:
+        process = Mock()
+        process.wait.side_effect = live_test.subprocess.TimeoutExpired(
+            cmd="guest",
+            timeout=30.0,
+        )
+        process.poll.return_value = None
+
+        with patch.object(live_test, "_stop_process") as stop_process:
+            returncode, forced = _wait_for_guest_shutdown(process)
+
+        self.assertTrue(forced)
+        self.assertEqual(returncode, 1)
+        stop_process.assert_called_once_with(process)
 
     def test_lossless_mode_wires_guest_and_presenter_handshake(self) -> None:
         args = self._args()

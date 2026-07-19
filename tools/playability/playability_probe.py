@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import ctypes
 import hashlib
 import inspect
@@ -14,7 +15,7 @@ import os
 import struct
 import time
 from collections import Counter, deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -197,6 +198,19 @@ SCHEDULER_PRODUCER_ANCHORS = {
 
 TITLE_HEAP_FREE_LIST_LOOP_ENTRY = 0x000E506F
 TITLE_HEAP_FREE_LIST_LOOP_BRANCH = 0x000E5087
+TITLE_HEAP_LARGE_BIN_SENTINEL_OFFSET = 0x00000180
+TITLE_HEAP_LARGE_BIN_MAX_NODES = 4096
+# The title's allocator uses one size-ordered large-bin list from both its
+# allocation and free/coalescing paths. Each range ends immediately before the
+# normal loop-exit block; the cursor register is the link compared to the
+# sentinel at the loop head.
+TITLE_HEAP_LARGE_BIN_SCAN_SPECS = (
+    ("allocation", 0x000E4978, 0x000E499F, "ecx"),
+    ("coalesce_insert_a", 0x000E4ACA, 0x000E4AE6, "eax"),
+    ("coalesce_insert_b", 0x000E4BAB, 0x000E4BC7, "eax"),
+    ("coalesce_insert_c", 0x000E4CFD, 0x000E4D19, "eax"),
+    ("free_insert", 0x000E506F, 0x000E5089, "ecx"),
+)
 TITLE_GPU_IDLE_PUMP_LOOP_ENTRY = 0x0021DD80
 TITLE_GPU_IDLE_PUMP_LOOP_BRANCH = 0x0021DDBC
 TITLE_FRONTEND_RESOURCE_LIST_FIND_LOOP_ENTRY = 0x000EB4E5
@@ -225,6 +239,14 @@ TITLE_ASSET_STREAM_SYNTHETIC_STATUS_TARGET_ADDRESS = 0x31F10300
 TITLE_ASSET_STREAM_SYNTHETIC_READ_TARGET_ADDRESS = 0x31F10700
 TITLE_ASSET_STREAM_SYNTHETIC_SEEK_TARGET_ADDRESS = 0x31F10800
 TITLE_ASSET_STREAM_SYNTHETIC_OBJECT_STRIDE = 0x1000
+TITLE_TRACK_PSS_HEADER_SIZE = 0x68
+TITLE_TRACK_PSS_IMAGE_ANCHOR_POINTER_OFFSET = 0x14
+TITLE_TRACK_PSS_IMAGE_ANCHOR_OFFSET = 0x1C0
+TITLE_TRACK_PSS_DESCRIPTOR_COUNT_OFFSET = 0x5C
+TITLE_TRACK_PSS_DESCRIPTOR_POINTER_OFFSETS = (0x60, 0x64)
+TITLE_TRACK_PSS_DESCRIPTOR_SIZE = 8
+TITLE_TRACK_PSS_MAX_DESCRIPTOR_COUNT = 4096
+TITLE_TRACK_STREAM_CHUNK_SIZE = 0x3C000
 TITLE_FRONTEND_SPECIAL_AUDIO_CREATE_ADDRESS = 0x000CB690
 TITLE_MUSIC_MODE_SET_ADDRESS = 0x000CC2F0
 TITLE_MUSIC_SYNTHETIC_MANAGER_ADDRESS = 0x31FE0000
@@ -509,6 +531,18 @@ TITLE_FRONTEND_CRT_VTABLE_INITIALIZER_ADDRESS = 0x001392B0
 TITLE_FRONTEND_CRT_VTABLE_INITIALIZER_TABLE_ENTRY_ADDRESS = 0x002CF664
 TITLE_RUNTIME_OBJECT_TABLE_USE_ADDRESS = 0x0003F660
 TITLE_RUNTIME_CALLBACK_DISPATCH_ADDRESSES = (0x00109AD0, 0x00109B40)
+TITLE_RUNTIME_CALLBACK_CALL_SITES = {
+    0x00109AEB: ("owner_2c", "eax", "esi"),
+    0x00109B20: ("list_2c", "edx", "ecx"),
+    0x00109B5B: ("owner_30", "eax", "esi"),
+    0x00109B90: ("list_30", "edx", "ecx"),
+}
+TITLE_RUNTIME_CALLBACK_RETURN_SITES = {
+    0x00109AED: "owner_2c",
+    0x00109B25: "list_2c",
+    0x00109B5D: "owner_30",
+    0x00109B95: "list_30",
+}
 TITLE_RUNTIME_CALLBACK_GLOBAL_OBJECT_ADDRESS = 0x005A6EEC
 TITLE_RUNTIME_CALLBACK_LIST_OFFSET = 0x0C
 TITLE_RUNTIME_CALLBACK_SYNTHETIC_OBJECT_ADDRESS = 0x31F10900
@@ -573,6 +607,14 @@ TITLE_AUDIO_DSP_RESET_READY_BIT = 0x00000100
 TITLE_AUDIO_DSP_VOICE_COMMAND_ADDRESSES = (0xFEC0011B, 0xFEC0017B)
 TITLE_AUDIO_DSP_VOICE_COMMAND_PENDING_BIT = 0x02
 TITLE_D3D_CONTEXT_GLOBAL_ADDRESS = 0x002256B8
+TITLE_D3D_PRESENT_OBSERVER_ADDRESSES = {
+    0x002224A0,  # public Present entry
+    0x00222506,  # immediate flip path
+    0x00222546,  # queued flip path
+    0x00222271,  # immediate flip method header write
+    0x00222290,  # immediate flip method header write, short path
+    0x002223F4,  # queued flip method header write
+}
 TITLE_D3D_CONTEXT_SYNTHETIC_ADDRESS = 0x21B70000
 TITLE_D3D_CONTEXT_DMA_STATE_ADDRESS = TITLE_D3D_CONTEXT_SYNTHETIC_ADDRESS + 0x2000
 TITLE_D3D_CONTEXT_GET_POINTER_ADDRESS = TITLE_D3D_CONTEXT_SYNTHETIC_ADDRESS + 0x3000
@@ -609,6 +651,11 @@ TITLE_D3D_PUSH_BUFFER_SIZE = 0x00010000
 TITLE_D3D_PUSH_BUFFER_END_ADDRESS = (
     TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS + TITLE_D3D_PUSH_BUFFER_SIZE
 )
+TITLE_XBOX_PHYSICAL_RAM_SIZE = 0x04000000
+RENDER_PUSH_BUFFER_APERTURE_SIZE = 0x01000000
+RENDER_PUSH_BUFFER_APERTURE_END_ADDRESS = (
+    TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS + RENDER_PUSH_BUFFER_APERTURE_SIZE
+)
 TITLE_D3D_FLUSH_ADDRESS = 0x0021AE80
 TITLE_D3D_PACKET_ALLOC_ADDRESS = 0x0021AFD0
 TITLE_D3D_PACKET_ALLOC_SIZE = 0x18
@@ -620,10 +667,81 @@ TITLE_D3D_PRIMITIVE_DRAW_ADDRESS = 0x0021CA20
 TITLE_D3D_PRIMITIVE_DRAW_STACK_CLEANUP = 0x18
 TITLE_D3D_PRIMITIVE_DRAW_ARGUMENT_COUNT = 6
 TITLE_D3D_PRIMITIVE_DRAW_SAMPLE_LIMIT = 16
+TITLE_WORLD_MATRIX_BUILD_ADDRESS = 0x000C4570
+TITLE_WORLD_MATRIX_ROTATE_ADDRESS = 0x000EA0E0
+TITLE_WORLD_MATRIX_ROTATION_BUILD_ADDRESS = 0x000E9F30
+TITLE_WORLD_MATRIX_ROTATION_BUILD_RETURN_ADDRESS = 0x000EA182
+TITLE_WORLD_MATRIX_ANGLE_SCALE_ADDRESS = 0x002C93E0
+TITLE_WORLD_MATRIX_ONE_CONSTANT_ADDRESS = 0x00294160
+TITLE_WORLD_MATRIX_ROTATE_RETURN_ADDRESSES = {
+    0x00085FF3,
+    0x00086016,
+}
+TITLE_WORLD_MATRIX_SAMPLE_LIMIT = 64
+TITLE_WORLD_MATRIX_OWNER_OFFSET = 0xD00
+TITLE_WORLD_DRAW_CALLBACK_ADDRESS = 0x000C4A70
+TITLE_CAMERA_UPDATE_ADDRESS = 0x000A6130
+TITLE_CAMERA_TARGET_FRAME_RETURN_ADDRESS = 0x000A5E7F
+TITLE_CAMERA_UPDATE_RETURN_ADDRESS = 0x000A63E3
+TITLE_CAMERA_CANDIDATE_X_ADDRESS = 0x00530638
+TITLE_CAMERA_CANDIDATE_Y_ADDRESS = 0x005306B8
+TITLE_CAMERA_CANDIDATE_Z_ADDRESS = 0x005307B8
+TITLE_CAMERA_CANDIDATE_FOV_ADDRESS = 0x00530738
+TITLE_CAMERA_CANDIDATE_COUNT = 32
+TITLE_GENERIC_CAMERA_UPDATE_ADDRESS = 0x000ADCA0
+TITLE_GENERIC_CAMERA_TARGET_FRAME_RETURN_ADDRESS = 0x000AA637
+TITLE_GENERIC_CAMERA_UPDATE_RETURN_ADDRESSES = {
+    0x000ADCDF,
+    0x000ADCFD,
+    0x000ADD1B,
+    0x000ADD39,
+    0x000ADD57,
+    0x000ADD75,
+    0x000ADD93,
+    0x000ADDB1,
+    0x000ADDCF,
+}
+TITLE_WORLD_DRAW_CALLBACK_OBJECT_ROOT_RETURNS = {
+    0x000860DC,
+    0x000861AD,
+}
+TITLE_WORLD_DRAW_CALLBACK_DIRECT_ROOT_RETURNS = {
+    0x0009AF98,
+    0x0009B105,
+}
+TITLE_D3D_INDEXED_DRAW_ADDRESS = 0x00219750
+TITLE_D3D_INDEXED_DRAW_WRAPPER_RETURN_ADDRESS = 0x000EE159
+TITLE_SCENE_RECORD_ROOT_POINTER_ADDRESS = 0x004B85B8
+TITLE_SCENE_RECORD_DRAW_RETURN_ADDRESS = 0x000C3C4A
+TITLE_SCENE_RECORD_DRAW_CALL_RETURNS = {
+    0x00091158: 0x00091153,
+    0x00091BED: 0x00091BE8,
+}
+TITLE_SCENE_RECORD_SIZE = 0x78
+TITLE_SCENE_RECORD_INDEX_POINTER_OFFSET = 0x0C
+TITLE_SCENE_RECORD_INDEX_COUNT_OFFSET = 0x10
+TITLE_SCENE_RECORD_TABLE_SPECS = (
+    ("primary", 0x18, 0x1C),
+    ("secondary", 0x20, 0x24),
+    ("tertiary", 0x28, 0x2C),
+)
+TITLE_SCENE_RECORD_MAX_COUNT = 4096
+TITLE_SCENE_RECORD_SAMPLE_LIMIT = 256
 TITLE_IMMEDIATE_DRAW_ADDRESS = 0x000EE1B0
 TITLE_IMMEDIATE_DRAW_ARGUMENT_COUNT = 4
 TITLE_IMMEDIATE_DRAW_SAMPLE_LIMIT = 32
 TITLE_IMMEDIATE_DRAW_MAX_VERTICES = 0x4000
+TITLE_QUAD_BATCH_FLUSH_ADDRESS = 0x000C1B70
+TITLE_QUAD_BATCH_MODE_OFFSET = 0x1C0C
+TITLE_QUAD_BATCH_TEXTURE_ADDRESS = 0x0057C058
+TITLE_QUAD_CLIP_UPDATE_ADDRESS = 0x000C2D70
+TITLE_QUAD_CLIP_NONEMPTY_ADDRESS = 0x000C2E25
+TITLE_QUAD_CLIP_EMPTY_ADDRESS = 0x000C2E4E
+TITLE_QUAD_CLIP_SURFACE_OWNER_ADDRESS = 0x005ADCA0
+TITLE_ENGINE_PLUGIN_OPEN_CALL_ADDRESS = 0x000F2B39
+TITLE_ENGINE_PLUGIN_OPEN_RETURN_ADDRESS = 0x000F2B3D
+TITLE_RENDER_MODULE_OPEN_ADDRESS = 0x000EBF60
+TITLE_D3D_CREATE_DEVICE_RETURN_ADDRESS = 0x000F408C
 TITLE_TEXT_DRAW_ADDRESS = 0x000BF6F0
 TITLE_TEXT_DRAW_STACK_CLEANUP = 0x14
 TITLE_TEXT_DRAW_MAX_SAMPLE_BYTES = 128
@@ -682,6 +800,8 @@ GUEST_ARGUMENT_COUNT_OVERRIDES = {
     "NtWriteFile": 8,
     "ObReferenceObjectByHandle": 3,
     "ObfDereferenceObject": 0,
+    "PhyGetLinkState": 1,
+    "PhyInitialize": 2,
     "PsCreateSystemThreadEx": 10,
     "RtlCompareMemoryUlong": 3,
 }
@@ -690,10 +810,12 @@ FILE_APPEND_DATA = 0x00000004
 FILE_WRITE_DATA = 0x00000002
 GENERIC_WRITE = 0x40000000
 FILE_SUPERSEDE = 0
+FILE_OPEN = 1
 FILE_CREATE = 2
 FILE_OPEN_IF = 3
 FILE_OVERWRITE = 4
 FILE_OVERWRITE_IF = 5
+FILE_DIRECTORY_FILE = 0x00000001
 MEM_COMMIT = 0x00001000
 
 
@@ -1215,7 +1337,12 @@ class TitleAllocationListCountFastPath:
 
 
 class TitleGlobalListRegistrationFastPath:
-    """Model the observed title intrusive-list registration edge."""
+    """Model the observed title intrusive-list registration edge.
+
+    The matching cleanup routine must execute as guest code. It not only resets
+    the intrusive list: it synchronizes every dirty frame and invokes callbacks
+    for attached objects such as cameras.
+    """
 
     def __init__(
         self,
@@ -1236,18 +1363,12 @@ class TitleGlobalListRegistrationFastPath:
         self.lazy_seed_count = 0
         self.insert_count = 0
         self.skip_count = 0
-        self.cleanup_count = 0
-        self.cleanup_node_count = 0
         self.registrations: list[dict[str, int | str | bool]] = []
-        self.cleanups: list[dict[str, int | str | bool]] = []
 
     def call_handlers(
         self,
     ) -> dict[int, Callable[[CpuState, SparseMemory, int, ExecutionTrace], None]]:
-        return {
-            self.register_address: self.register_handler,
-            self.cleanup_address: self.cleanup_handler,
-        }
+        return {self.register_address: self.register_handler}
 
     def register_handler(
         self,
@@ -1317,35 +1438,6 @@ class TitleGlobalListRegistrationFastPath:
             inserted=inserted,
         )
 
-    def cleanup_handler(
-        self,
-        cpu: CpuState,
-        memory: SparseMemory,
-        target: int,
-        trace: ExecutionTrace,
-    ) -> None:
-        seeded = self._seed_list_if_empty(memory)
-        node_count = self._count_list_nodes(memory, limit=64)
-        memory.write_u32(self.head_address, self.head_address)
-        memory.write_u32(self.tail_address, self.head_address)
-        cpu.set_register("eax", 1)
-        self.cleanup_count += 1
-        self.cleanup_node_count += node_count
-        cleanup = {
-            "target": target,
-            "target_hex": _hex32(target),
-            "node_count": node_count,
-            "seeded": seeded,
-        }
-        self.cleanups.append(cleanup)
-        trace.add(
-            target,
-            "title_global_list_cleanup",
-            invocation_count=self.cleanup_count,
-            node_count=node_count,
-            seeded=seeded,
-        )
-
     def _seed_list_if_empty(self, memory: SparseMemory) -> bool:
         if memory.read_u32(self.head_address) != 0:
             return False
@@ -1353,16 +1445,6 @@ class TitleGlobalListRegistrationFastPath:
         memory.write_u32(self.tail_address, self.head_address)
         self.lazy_seed_count += 1
         return True
-
-    def _count_list_nodes(self, memory: SparseMemory, *, limit: int) -> int:
-        node = memory.read_u32(self.head_address)
-        count = 0
-        seen: set[int] = set()
-        while node not in {0, self.head_address} and count < limit and node not in seen:
-            seen.add(node)
-            count += 1
-            node = memory.read_u32(node)
-        return count
 
     @staticmethod
     def _read_u8(memory: SparseMemory, address: int) -> int:
@@ -1388,10 +1470,8 @@ class TitleGlobalListRegistrationFastPath:
             "lazy_seed_count": self.lazy_seed_count,
             "insert_count": self.insert_count,
             "skip_count": self.skip_count,
-            "cleanup_count": self.cleanup_count,
-            "cleanup_node_count": self.cleanup_node_count,
+            "cleanup_fast_path_enabled": False,
             "recent_registrations": self.registrations[-16:],
-            "recent_cleanups": self.cleanups[-16:],
         }
 
 
@@ -1546,9 +1626,16 @@ class TitleFrontendAssetInitFastPath:
     def call_handlers(
         self,
     ) -> dict[int, Callable[[CpuState, SparseMemory, int, ExecutionTrace], None]]:
+        # 0xE8440/0xE8450 are shared RenderWare tail-call trampolines, not
+        # frontend-asset methods. Intercepting them also swallowed camera
+        # BeginUpdate/EndUpdate callbacks, leaving RwEngineInstance.curCamera
+        # null and causing the UI clipper to suppress every fullscreen batch.
+        # The synthetic manager already points both slots at this private HLE
+        # target, so native code can execute the real trampolines safely.
         return {
-            TITLE_FRONTEND_ASSET_METHOD_TRAMPOLINE_ADDRESS: self.method_handler,
-            TITLE_FRONTEND_ASSET_SECOND_METHOD_TRAMPOLINE_ADDRESS: self.method_handler,
+            TITLE_FRONTEND_SYNTHETIC_ASSET_METHOD_TARGET_ADDRESS: (
+                self.method_handler
+            ),
         }
 
     def init_handler(
@@ -1608,11 +1695,7 @@ class TitleFrontendAssetInitFastPath:
     ) -> None:
         esp = cpu.get_register("esp")
         manager_address = memory.read_u32(_u32(esp + 4))
-        dispatch_offset = (
-            0x1C
-            if target == TITLE_FRONTEND_ASSET_SECOND_METHOD_TRAMPOLINE_ADDRESS
-            else 0x18
-        )
+        dispatch_offset = 0x18
         method_target = memory.read_u32(_u32(manager_address + dispatch_offset))
         self.method_invocation_count += 1
         cpu.set_register("eax", 1)
@@ -1697,8 +1780,308 @@ class TitleAssetStreamOpenFastPath:
         self.status_poll_count = 0
         self.read_count = 0
         self.bytes_read = 0
+        self.ready_transition_count = 0
+        self.short_read_count = 0
+        self.eof_read_count = 0
+        self.terminal_read_count = 0
         self.seek_count = 0
+        self.recent_reads: list[dict[str, Any]] = []
+        self.track_descriptor_publication_count = 0
+        self.track_descriptor_table_count = 0
+        self.track_descriptor_table_repair_count = 0
+        self.track_descriptor_entry_count = 0
+        self.track_descriptor_validation_failure_count = 0
+        self.track_prelinked_image_publication_count = 0
+        self.track_prelinked_image_repair_count = 0
+        self.track_prelinked_image_bytes = 0
+        self.track_scene_record_table_count = 0
+        self.track_scene_record_table_repair_count = 0
+        self.track_scene_record_entry_count = 0
+        self.recent_track_descriptor_publications: list[dict[str, Any]] = []
         self._states: dict[int, dict[str, Any]] = {}
+
+    def _publish_ready(
+        self,
+        memory: SparseMemory,
+        object_address: int,
+        state: dict[str, Any],
+    ) -> None:
+        if int(state.get("status", 2)) != 1:
+            self.ready_transition_count += 1
+        state["status"] = 1
+        memory.write_u32(_u32(object_address + 0x2C), 1)
+
+    @staticmethod
+    def _is_track_pss_path(title_path: str) -> bool:
+        marker = "trackpss/"
+        marker_offset = title_path.find(marker)
+        if marker_offset < 0:
+            return False
+        parts = title_path[marker_offset:].split("/")
+        return (
+            len(parts) == 3
+            and parts[0] == "trackpss"
+            and parts[1] in {"forward", "reverse"}
+            and parts[2].endswith(".pss")
+        )
+
+    def _track_descriptor_validation_failure(
+        self,
+        state: dict[str, Any],
+        target: int,
+        trace: ExecutionTrace,
+        reason: str,
+    ) -> None:
+        self.track_descriptor_validation_failure_count += 1
+        state["track_descriptor_validation_error"] = reason
+        trace.add(
+            target,
+            "title_track_descriptor_publication_rejected",
+            title_path=state.get("title_path"),
+            reason=reason,
+        )
+
+    def _publish_track_descriptor_tables(
+        self,
+        memory: SparseMemory,
+        state: dict[str, Any],
+        target: int,
+        trace: ExecutionTrace,
+    ) -> None:
+        title_path = str(state.get("title_path", ""))
+        if not self._is_track_pss_path(title_path):
+            return
+        if bool(state.get("track_descriptor_publication_attempted", False)):
+            return
+        state["track_descriptor_publication_attempted"] = True
+
+        payload = state.get("payload", b"")
+        if not isinstance(payload, bytes) or len(payload) < TITLE_TRACK_PSS_HEADER_SIZE:
+            self._track_descriptor_validation_failure(
+                state,
+                target,
+                trace,
+                "track PSS payload is smaller than its descriptor header",
+            )
+            return
+
+        image_anchor = struct.unpack_from(
+            "<I",
+            payload,
+            TITLE_TRACK_PSS_IMAGE_ANCHOR_POINTER_OFFSET,
+        )[0]
+        if image_anchor < TITLE_TRACK_PSS_IMAGE_ANCHOR_OFFSET:
+            self._track_descriptor_validation_failure(
+                state,
+                target,
+                trace,
+                "track PSS image anchor cannot identify a guest image base",
+            )
+            return
+        image_base = image_anchor - TITLE_TRACK_PSS_IMAGE_ANCHOR_OFFSET
+        if image_base + len(payload) > 0x100000000:
+            self._track_descriptor_validation_failure(
+                state,
+                target,
+                trace,
+                "track PSS prelinked image exceeds guest address space",
+            )
+            return
+        descriptor_count = struct.unpack_from(
+            "<I",
+            payload,
+            TITLE_TRACK_PSS_DESCRIPTOR_COUNT_OFFSET,
+        )[0]
+        if not 0 < descriptor_count <= TITLE_TRACK_PSS_MAX_DESCRIPTOR_COUNT:
+            self._track_descriptor_validation_failure(
+                state,
+                target,
+                trace,
+                f"track PSS descriptor count {descriptor_count} is invalid",
+            )
+            return
+
+        table_size = descriptor_count * TITLE_TRACK_PSS_DESCRIPTOR_SIZE
+        validated_tables: list[tuple[int, int, bytes]] = []
+        for pointer_offset in TITLE_TRACK_PSS_DESCRIPTOR_POINTER_OFFSETS:
+            table_address = struct.unpack_from("<I", payload, pointer_offset)[0]
+            if table_address < image_base:
+                self._track_descriptor_validation_failure(
+                    state,
+                    target,
+                    trace,
+                    "track PSS descriptor pointer precedes its guest image base",
+                )
+                return
+            table_offset = table_address - image_base
+            if (
+                table_address + table_size > 0x100000000
+                or table_offset + table_size > len(payload)
+            ):
+                self._track_descriptor_validation_failure(
+                    state,
+                    target,
+                    trace,
+                    "track PSS descriptor table falls outside its payload",
+                )
+                return
+            table_payload = payload[table_offset : table_offset + table_size]
+            previous_end = 0
+            for descriptor_index in range(descriptor_count):
+                stream_offset, stream_length = struct.unpack_from(
+                    "<II",
+                    table_payload,
+                    descriptor_index * TITLE_TRACK_PSS_DESCRIPTOR_SIZE,
+                )
+                stream_end = stream_offset + stream_length
+                if (
+                    stream_length == 0
+                    or stream_length > TITLE_TRACK_STREAM_CHUNK_SIZE
+                    or stream_end > 0x100000000
+                    or (descriptor_index > 0 and stream_offset < previous_end)
+                ):
+                    self._track_descriptor_validation_failure(
+                        state,
+                        target,
+                        trace,
+                        (
+                            "track PSS descriptor "
+                            f"{descriptor_index} has an invalid offset or length"
+                        ),
+                    )
+                    return
+                previous_end = stream_end
+            validated_tables.append((table_address, table_offset, table_payload))
+
+        validated_scene_tables: list[tuple[str, int, int, int, bytes]] = []
+        for name, count_offset, pointer_offset in TITLE_SCENE_RECORD_TABLE_SPECS:
+            record_count = struct.unpack_from("<I", payload, count_offset)[0]
+            record_address = struct.unpack_from("<I", payload, pointer_offset)[0]
+            if record_count > TITLE_SCENE_RECORD_MAX_COUNT:
+                self._track_descriptor_validation_failure(
+                    state,
+                    target,
+                    trace,
+                    f"track PSS {name} scene-record count {record_count} is invalid",
+                )
+                return
+            if record_count == 0:
+                continue
+            if record_address < image_base:
+                self._track_descriptor_validation_failure(
+                    state,
+                    target,
+                    trace,
+                    f"track PSS {name} scene-record table precedes its image",
+                )
+                return
+            record_offset = record_address - image_base
+            record_size = record_count * TITLE_SCENE_RECORD_SIZE
+            if record_offset + record_size > len(payload):
+                self._track_descriptor_validation_failure(
+                    state,
+                    target,
+                    trace,
+                    f"track PSS {name} scene-record table falls outside its payload",
+                )
+                return
+            validated_scene_tables.append(
+                (
+                    name,
+                    record_count,
+                    record_address,
+                    record_offset,
+                    payload[record_offset : record_offset + record_size],
+                )
+            )
+
+        repaired_table_count = 0
+        tables = []
+        for table_address, table_offset, table_payload in validated_tables:
+            repaired = memory.read(table_address, table_size) != table_payload
+            if repaired:
+                repaired_table_count += 1
+            tables.append(
+                {
+                    "guest_address_hex": _hex32(table_address),
+                    "payload_offset_hex": _hex32(table_offset),
+                    "byte_count": table_size,
+                    "repaired": repaired,
+                }
+            )
+
+        repaired_scene_table_count = 0
+        scene_record_tables = []
+        for (
+            name,
+            record_count,
+            record_address,
+            record_offset,
+            record_payload,
+        ) in validated_scene_tables:
+            repaired = memory.read(record_address, len(record_payload)) != record_payload
+            repaired_scene_table_count += int(repaired)
+            scene_record_tables.append(
+                {
+                    "name": name,
+                    "record_count": record_count,
+                    "guest_address_hex": _hex32(record_address),
+                    "payload_offset_hex": _hex32(record_offset),
+                    "byte_count": len(record_payload),
+                    "repaired": repaired,
+                }
+            )
+
+        prelinked_image_repaired = memory.read(image_base, len(payload)) != payload
+        if prelinked_image_repaired:
+            memory.write(image_base, payload)
+
+        publication = {
+            "title_path": title_path,
+            "image_base_hex": _hex32(image_base),
+            "image_byte_count": len(payload),
+            "prelinked_image_repaired": prelinked_image_repaired,
+            "descriptor_count": descriptor_count,
+            "table_count": len(validated_tables),
+            "repaired_table_count": repaired_table_count,
+            "tables": tables,
+            "scene_record_count": sum(
+                record_count
+                for _, record_count, _, _, _ in validated_scene_tables
+            ),
+            "scene_record_table_count": len(validated_scene_tables),
+            "repaired_scene_record_table_count": repaired_scene_table_count,
+            "scene_record_tables": scene_record_tables,
+        }
+        state["track_descriptor_tables_published"] = True
+        state["track_prelinked_image_published"] = True
+        state["track_descriptor_publication"] = publication
+        self.track_descriptor_publication_count += 1
+        self.track_descriptor_table_count += len(validated_tables)
+        self.track_descriptor_table_repair_count += repaired_table_count
+        self.track_descriptor_entry_count += descriptor_count * len(validated_tables)
+        self.track_prelinked_image_publication_count += 1
+        self.track_prelinked_image_repair_count += int(prelinked_image_repaired)
+        self.track_prelinked_image_bytes += len(payload) * int(prelinked_image_repaired)
+        self.track_scene_record_table_count += len(validated_scene_tables)
+        self.track_scene_record_table_repair_count += repaired_scene_table_count
+        self.track_scene_record_entry_count += sum(
+            record_count for _, record_count, _, _, _ in validated_scene_tables
+        )
+        self.recent_track_descriptor_publications.append(publication)
+        del self.recent_track_descriptor_publications[:-16]
+        trace.add(
+            target,
+            "title_track_descriptor_publication",
+            title_path=title_path,
+            image_base_hex=_hex32(image_base),
+            descriptor_count=descriptor_count,
+            table_count=len(validated_tables),
+            repaired_table_count=repaired_table_count,
+            prelinked_image_repaired=prelinked_image_repaired,
+            scene_record_table_count=len(validated_scene_tables),
+            repaired_scene_record_table_count=repaired_scene_table_count,
+        )
 
     def call_handlers(
         self,
@@ -1748,9 +2131,22 @@ class TitleAssetStreamOpenFastPath:
                 "payload": payload,
                 "position": 0,
                 "title_path": title_path.replace("\\", "/").casefold(),
+                "status": 2,
+                "read_count": 0,
+                "requested_bytes": 0,
+                "bytes_read": 0,
+                "short_read_count": 0,
+                "eof_read_count": 0,
+                "terminal_read_count": 0,
+                "terminal": not payload,
+                "track_descriptor_publication_attempted": False,
+                "track_descriptor_tables_published": False,
             }
             memory.write_u32(result_address, self.vtable_address)
             memory.write_u32(_u32(result_address + 0x10), size)
+            memory.write_u32(_u32(result_address + 0x14), 0)
+            memory.write_u32(_u32(result_address + 0x18), 0)
+            memory.write_u32(_u32(result_address + 0x1C), 0)
             memory.write_u32(_u32(result_address + 0x2C), 2)
             memory.write_u32(_u32(self.vtable_address + 4), self.activate_target)
             memory.write_u32(_u32(self.vtable_address + 8), self.read_target)
@@ -1806,28 +2202,77 @@ class TitleAssetStreamOpenFastPath:
         destination = memory.read_u32(_u32(esp + 4))
         requested = memory.read_u32(_u32(esp + 8))
         object_address = cpu.get_register("ecx")
-        state = self._states.get(object_address, {"payload": b"", "position": 0})
-        payload = state["payload"]
-        position = int(state["position"])
-        chunk = payload[position : position + requested]
+        state = self._states.get(object_address)
+        if state is None:
+            payload = b""
+            position_before = 0
+        else:
+            payload = state["payload"]
+            position_before = int(state["position"])
+        chunk = payload[position_before : position_before + requested]
         if destination and chunk:
             memory.write(destination, chunk)
-        position += len(chunk)
-        state["position"] = position
+        if state is not None:
+            # Track PSS assets contain absolute guest pointers into a prelinked
+            # image. The synchronous HLE retains the file bytes, but the caller
+            # reads them into a separate heap allocation. Publish the validated
+            # image at its linked base so scene records, geometry, and the later
+            # PSW/P2W descriptor tables all remain source-exact.
+            self._publish_track_descriptor_tables(memory, state, target, trace)
+        position = position_before + len(chunk)
+        short_read = len(chunk) < requested
+        eof_read = requested > 0 and not chunk and position_before >= len(payload)
+        terminal = position >= len(payload)
+        if state is not None:
+            was_terminal = bool(state.get("terminal", False))
+            state["position"] = position
+            state["read_count"] = int(state.get("read_count", 0)) + 1
+            state["requested_bytes"] = int(state.get("requested_bytes", 0)) + requested
+            state["bytes_read"] = int(state.get("bytes_read", 0)) + len(chunk)
+            state["short_read_count"] = int(state.get("short_read_count", 0)) + int(
+                short_read
+            )
+            state["eof_read_count"] = int(state.get("eof_read_count", 0)) + int(
+                eof_read
+            )
+            state["terminal_read_count"] = int(
+                state.get("terminal_read_count", 0)
+            ) + int(terminal)
+            state["terminal"] = terminal
+            if terminal and not was_terminal:
+                state["terminal_transition_read_count"] = int(
+                    state.get("read_count", 0)
+                )
+        memory.write_u32(_u32(object_address + 0x18), position & 0xFFFFFFFF)
+        memory.write_u32(_u32(object_address + 0x1C), position >> 32)
+        if state is not None:
+            # The recovered provider publishes 2 while an open is pending and
+            # 1 once the synchronous read boundary is ready. Returning 1 from
+            # status without updating this guest-visible field left the title's
+            # second level loader observing a permanently pending stream.
+            self._publish_ready(memory, object_address, state)
         self.read_count += 1
         self.bytes_read += len(chunk)
+        self.short_read_count += int(short_read)
+        self.eof_read_count += int(eof_read)
+        self.terminal_read_count += int(terminal)
         cpu.set_register("eax", len(chunk))
         _prepare_stdcall_return(cpu, memory, 8)
-        trace.add(
-            target,
-            "title_asset_stream_read_fast_path",
-            read_count=self.read_count,
-            destination_hex=_hex32(destination),
-            requested=requested,
-            bytes_read=len(chunk),
-            object_address_hex=_hex32(object_address),
-            next_position=position,
-        )
+        read = {
+            "read_count": self.read_count,
+            "destination_hex": _hex32(destination),
+            "requested": requested,
+            "bytes_read": len(chunk),
+            "object_address_hex": _hex32(object_address),
+            "position_before": position_before,
+            "next_position": position,
+            "short_read": short_read,
+            "eof_read": eof_read,
+            "terminal": terminal,
+        }
+        self.recent_reads.append(read)
+        del self.recent_reads[:-32]
+        trace.add(target, "title_asset_stream_read_fast_path", **read)
 
     def status_handler(
         self,
@@ -1839,8 +2284,13 @@ class TitleAssetStreamOpenFastPath:
         object_address = cpu.get_register("ecx")
         object_mode = memory.read_u32(_u32(object_address + 0x2C))
         # The title's stream scheduler treats 2 as pending and 3 as failed.
-        # A validated synchronous host read is immediately ready (1).
-        status = 1 if object_address in self._states else 3
+        # A validated synchronous host read is immediately ready (1), and the
+        # real provider exposes that transition both as the return value and in
+        # its guest-visible mode field.
+        state = self._states.get(object_address)
+        status = 1 if state is not None else 3
+        if state is not None:
+            self._publish_ready(memory, object_address, state)
         self.status_poll_count += 1
         cpu.set_register("eax", status)
         _prepare_stdcall_return(cpu, memory, 0)
@@ -1866,15 +2316,20 @@ class TitleAssetStreamOpenFastPath:
         offset_high = memory.read_u32(_u32(esp + 8))
         origin = memory.read_u32(_u32(esp + 0xC))
         object_address = cpu.get_register("ecx")
-        state = self._states.get(object_address, {"payload": b"", "position": 0})
-        payload = state["payload"]
-        position = int(state["position"])
+        state = self._states.get(object_address)
+        payload = state["payload"] if state is not None else b""
+        position = int(state["position"]) if state is not None else 0
         signed_offset = (offset_high << 32) | offset_low
         if signed_offset & (1 << 63):
             signed_offset -= 1 << 64
         base = 0 if origin == 0 else position if origin == 1 else len(payload)
         position = max(0, min(len(payload), base + signed_offset))
-        state["position"] = position
+        if state is not None:
+            state["position"] = position
+            state["terminal"] = position >= len(payload)
+            self._publish_ready(memory, object_address, state)
+        memory.write_u32(_u32(object_address + 0x18), position & 0xFFFFFFFF)
+        memory.write_u32(_u32(object_address + 0x1C), position >> 32)
         self.seek_count += 1
         cpu.set_register("eax", position)
         _prepare_stdcall_return(cpu, memory, 12)
@@ -1889,6 +2344,48 @@ class TitleAssetStreamOpenFastPath:
         )
 
     def summary(self) -> dict[str, Any]:
+        stream_states = []
+        for object_address, state in sorted(self._states.items()):
+            payload = state.get("payload", b"")
+            size = len(payload) if isinstance(payload, bytes) else 0
+            position = int(state.get("position", 0))
+            stream_states.append(
+                {
+                    "object_address_hex": _hex32(object_address),
+                    "title_path": state.get("title_path"),
+                    "status": int(state.get("status", 2)),
+                    "position": position,
+                    "size": size,
+                    "complete": position >= size,
+                    "terminal": bool(state.get("terminal", False)),
+                    "read_count": int(state.get("read_count", 0)),
+                    "requested_bytes": int(state.get("requested_bytes", 0)),
+                    "bytes_read": int(state.get("bytes_read", 0)),
+                    "short_read_count": int(state.get("short_read_count", 0)),
+                    "eof_read_count": int(state.get("eof_read_count", 0)),
+                    "terminal_read_count": int(
+                        state.get("terminal_read_count", 0)
+                    ),
+                    "terminal_transition_read_count": state.get(
+                        "terminal_transition_read_count"
+                    ),
+                    "track_descriptor_publication_attempted": bool(
+                        state.get("track_descriptor_publication_attempted", False)
+                    ),
+                    "track_descriptor_tables_published": bool(
+                        state.get("track_descriptor_tables_published", False)
+                    ),
+                    "track_prelinked_image_published": bool(
+                        state.get("track_prelinked_image_published", False)
+                    ),
+                    "track_descriptor_validation_error": state.get(
+                        "track_descriptor_validation_error"
+                    ),
+                    "track_descriptor_publication": state.get(
+                        "track_descriptor_publication"
+                    ),
+                }
+            )
         return {
             "open_address_hex": _hex32(self.open_address),
             "invocation_count": len(self.invocations),
@@ -1899,8 +2396,26 @@ class TitleAssetStreamOpenFastPath:
             "status_poll_count": self.status_poll_count,
             "read_count": self.read_count,
             "bytes_read": self.bytes_read,
+            "ready_transition_count": self.ready_transition_count,
+            "short_read_count": self.short_read_count,
+            "eof_read_count": self.eof_read_count,
+            "terminal_read_count": self.terminal_read_count,
             "seek_count": self.seek_count,
+            "track_descriptor_publication_count": self.track_descriptor_publication_count,
+            "track_descriptor_table_count": self.track_descriptor_table_count,
+            "track_descriptor_table_repair_count": self.track_descriptor_table_repair_count,
+            "track_descriptor_entry_count": self.track_descriptor_entry_count,
+            "track_descriptor_validation_failure_count": self.track_descriptor_validation_failure_count,
+            "track_prelinked_image_publication_count": self.track_prelinked_image_publication_count,
+            "track_prelinked_image_repair_count": self.track_prelinked_image_repair_count,
+            "track_prelinked_image_bytes": self.track_prelinked_image_bytes,
+            "track_scene_record_table_count": self.track_scene_record_table_count,
+            "track_scene_record_table_repair_count": self.track_scene_record_table_repair_count,
+            "track_scene_record_entry_count": self.track_scene_record_entry_count,
             "active_stream_count": len(self._states),
+            "stream_states": stream_states,
+            "recent_reads": self.recent_reads,
+            "recent_track_descriptor_publications": self.recent_track_descriptor_publications,
             "recent_invocations": self.invocations[-16:],
         }
 
@@ -3476,6 +3991,2050 @@ class TitleRuntimeCallbackListRepair:
         }
 
 
+class TitleHeapLargeBinIntegrityRepair:
+    """Restore the title allocator's circular large-bin list invariant.
+
+    The five observed scans all walk the same intrusive doubly linked list. A
+    healthy walk must reach ``heap + 0x180``; a repeated link, a null/unaligned
+    link, or a link whose chunk header is not a large-bin size is conclusive
+    corruption. Native live runs yield at bounded instruction intervals, so the
+    repair can validate the complete list without adding a callback to this hot
+    guest loop.
+    """
+
+    _RETAINED_REPAIR_LIMIT = 32
+    _LINK_SAMPLE_LIMIT = 16
+
+    def __init__(self, *, max_nodes: int = TITLE_HEAP_LARGE_BIN_MAX_NODES) -> None:
+        if max_nodes <= 0:
+            raise ValueError("title heap large-bin scan limit must be positive")
+        self.max_nodes = max_nodes
+        self.observation_count = 0
+        self.healthy_count = 0
+        self.repair_count = 0
+        self.reroute_count = 0
+        self.invalid_heap_base_count = 0
+        self.scan_limit_count = 0
+        self.scan_observation_counts: dict[str, int] = {}
+        self.repair_counts_by_scan: dict[str, int] = {}
+        self.termination_counts: dict[str, int] = {}
+        self.repairs: list[dict[str, Any]] = []
+        self.last_scan_limit: dict[str, Any] | None = None
+
+    @staticmethod
+    def _scan_spec(
+        instruction_address: int,
+    ) -> tuple[str, int, int, str] | None:
+        for spec in TITLE_HEAP_LARGE_BIN_SCAN_SPECS:
+            _, loop_entry, loop_end, _ = spec
+            if loop_entry <= instruction_address < loop_end:
+                return spec
+        return None
+
+    def service_native_slice(
+        self,
+        cpu: CpuState,
+        memory: SparseMemory,
+        steps: int,
+    ) -> bool:
+        spec = self._scan_spec(cpu.eip)
+        if spec is None:
+            return False
+        scan_kind, loop_entry, _, cursor_register = spec
+        self.observation_count += 1
+        self.scan_observation_counts[scan_kind] = (
+            self.scan_observation_counts.get(scan_kind, 0) + 1
+        )
+
+        heap_base = cpu.get_register("ebx")
+        if heap_base == 0 or (heap_base & 0xF):
+            self.invalid_heap_base_count += 1
+            return False
+        sentinel = _u32(heap_base + TITLE_HEAP_LARGE_BIN_SENTINEL_OFFSET)
+        head_before = memory.read_u32(sentinel)
+        sentinel_previous_before = memory.read_u32(_u32(sentinel + 4))
+        nodes: list[int] = []
+        seen: dict[int, int] = {}
+        current = head_before
+        repeated_link: int | None = None
+        repeated_index: int | None = None
+        invalid_chunk_size: int | None = None
+        termination = "sentinel"
+
+        while current != sentinel:
+            if current == 0:
+                termination = "null_link"
+                break
+            if (current & 0xF) != 8:
+                termination = "unaligned_link"
+                break
+            if current in seen:
+                termination = "cycle"
+                repeated_link = current
+                repeated_index = seen[current]
+                break
+            if len(nodes) >= self.max_nodes:
+                termination = "scan_limit"
+                break
+            chunk_header = _u32(current - 8)
+            chunk_size = int.from_bytes(memory.read(chunk_header, 2), "little")
+            if not 0x80 <= chunk_size <= 0xFF00:
+                termination = "invalid_chunk_size"
+                invalid_chunk_size = chunk_size
+                break
+            seen[current] = len(nodes)
+            nodes.append(current)
+            current = memory.read_u32(current)
+
+        backlink_mismatches = 0
+        if termination == "sentinel":
+            expected_previous = sentinel
+            for node in nodes:
+                if memory.read_u32(_u32(node + 4)) != expected_previous:
+                    backlink_mismatches += 1
+                expected_previous = node
+            if sentinel_previous_before != expected_previous:
+                backlink_mismatches += 1
+            if backlink_mismatches == 0:
+                self.healthy_count += 1
+                return False
+            termination = "backlink_mismatch"
+
+        if termination == "scan_limit":
+            self.scan_limit_count += 1
+            self.last_scan_limit = {
+                "steps": steps,
+                "scan_kind": scan_kind,
+                "instruction_address_hex": _hex32(cpu.eip),
+                "heap_base_hex": _hex32(heap_base),
+                "sentinel_address_hex": _hex32(sentinel),
+                "node_count": len(nodes),
+                "next_link_hex": _hex32(current),
+            }
+            return False
+
+        instruction_address = cpu.eip
+        changed_links: list[dict[str, Any]] = []
+        changed_link_count = 0
+
+        def write_link(address: int, value: int, role: str) -> None:
+            nonlocal changed_link_count
+            before = memory.read_u32(address)
+            if before == value:
+                return
+            memory.write_u32(address, value)
+            changed_link_count += 1
+            if len(changed_links) < self._LINK_SAMPLE_LIMIT:
+                changed_links.append(
+                    {
+                        "role": role,
+                        "address_hex": _hex32(address),
+                        "before_hex": _hex32(before),
+                        "after_hex": _hex32(value),
+                    }
+                )
+
+        first = nodes[0] if nodes else sentinel
+        last = nodes[-1] if nodes else sentinel
+        write_link(sentinel, first, "sentinel.next")
+        write_link(_u32(sentinel + 4), last, "sentinel.previous")
+        for index, node in enumerate(nodes):
+            next_link = nodes[index + 1] if index + 1 < len(nodes) else sentinel
+            previous_link = nodes[index - 1] if index > 0 else sentinel
+            write_link(node, next_link, "node.next")
+            write_link(_u32(node + 4), previous_link, "node.previous")
+
+        rerouted = termination != "backlink_mismatch"
+        if rerouted:
+            # Resume at the real loop head with its cursor equal to the
+            # sentinel. The guest executes the ordinary compare and exit path;
+            # no allocation/free body is synthesized or skipped.
+            cpu.set_register(cursor_register, sentinel)
+            cpu.eip = loop_entry
+            self.reroute_count += 1
+
+        self.repair_count += 1
+        self.repair_counts_by_scan[scan_kind] = (
+            self.repair_counts_by_scan.get(scan_kind, 0) + 1
+        )
+        self.termination_counts[termination] = (
+            self.termination_counts.get(termination, 0) + 1
+        )
+        repair = {
+            "steps": steps,
+            "scan_kind": scan_kind,
+            "instruction_address_hex": _hex32(instruction_address),
+            "resume_address_hex": _hex32(cpu.eip),
+            "cursor_register": cursor_register,
+            "heap_base_hex": _hex32(heap_base),
+            "sentinel_address_hex": _hex32(sentinel),
+            "head_before_hex": _hex32(head_before),
+            "sentinel_previous_before_hex": _hex32(sentinel_previous_before),
+            "termination": termination,
+            "repeated_link_hex": (
+                _hex32(repeated_link) if repeated_link is not None else None
+            ),
+            "repeated_index": repeated_index,
+            "invalid_chunk_size": invalid_chunk_size,
+            "backlink_mismatch_count": backlink_mismatches,
+            "preserved_node_count": len(nodes),
+            "preserved_nodes_hex": [
+                _hex32(node) for node in nodes[: self._LINK_SAMPLE_LIMIT]
+            ],
+            "preserved_nodes_truncated": len(nodes) > self._LINK_SAMPLE_LIMIT,
+            "changed_link_count": changed_link_count,
+            "changed_links": changed_links,
+            "rerouted_to_loop_head": rerouted,
+        }
+        self.repairs.append(repair)
+        if len(self.repairs) > self._RETAINED_REPAIR_LIMIT:
+            del self.repairs[: len(self.repairs) - self._RETAINED_REPAIR_LIMIT]
+        return True
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "sentinel_offset_hex": _hex32(TITLE_HEAP_LARGE_BIN_SENTINEL_OFFSET),
+            "max_nodes": self.max_nodes,
+            "scan_specs": [
+                {
+                    "scan_kind": scan_kind,
+                    "loop_entry_hex": _hex32(loop_entry),
+                    "loop_end_hex": _hex32(loop_end),
+                    "cursor_register": cursor_register,
+                }
+                for scan_kind, loop_entry, loop_end, cursor_register in (
+                    TITLE_HEAP_LARGE_BIN_SCAN_SPECS
+                )
+            ],
+            "observation_count": self.observation_count,
+            "healthy_count": self.healthy_count,
+            "repair_count": self.repair_count,
+            "reroute_count": self.reroute_count,
+            "invalid_heap_base_count": self.invalid_heap_base_count,
+            "scan_limit_count": self.scan_limit_count,
+            "scan_observation_counts": self.scan_observation_counts,
+            "repair_counts_by_scan": self.repair_counts_by_scan,
+            "termination_counts": self.termination_counts,
+            "retained_repair_count": len(self.repairs),
+            "repairs": self.repairs,
+            "last_scan_limit": self.last_scan_limit,
+        }
+
+
+class TitleRuntimeCallbackAudit:
+    """Summarize frontend callback targets and their Boolean results."""
+
+    _OBSERVER_ADDRESSES = {
+        *TITLE_RUNTIME_CALLBACK_CALL_SITES,
+        *TITLE_RUNTIME_CALLBACK_RETURN_SITES,
+    }
+
+    def __init__(self, *, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self.observer_addresses = (
+            set(self._OBSERVER_ADDRESSES) if enabled else set()
+        )
+        self._pending: dict[int, list[tuple[str, int, int]]] = {}
+        self._targets: dict[tuple[str, int, int], dict[str, Any]] = {}
+        self.unmatched_return_count = 0
+
+    def observer(
+        self,
+        cpu: CpuState,
+        memory: SparseMemory,
+        trace: ExecutionTrace,
+        steps: int,
+    ) -> None:
+        call_spec = TITLE_RUNTIME_CALLBACK_CALL_SITES.get(cpu.eip)
+        thread_key = cpu.fs_base
+        if call_spec is not None:
+            kind, target_register, object_register = call_spec
+            target = cpu.get_register(target_register)
+            object_address = cpu.get_register(object_register)
+            self._pending.setdefault(thread_key, []).append(
+                (kind, target, object_address)
+            )
+            key = (kind, target, object_address)
+            item = self._targets.setdefault(
+                key,
+                {
+                    "kind": kind,
+                    "target": target,
+                    "target_hex": _hex32(target),
+                    "object_address": object_address,
+                    "object_address_hex": _hex32(object_address),
+                    "vtable_address_hex": _hex32(memory.read_u32(object_address)),
+                    "call_count": 0,
+                    "zero_result_count": 0,
+                    "nonzero_result_count": 0,
+                    "last_result": None,
+                    "last_result_hex": None,
+                    "first_steps": steps,
+                    "last_steps": steps,
+                },
+            )
+            item["call_count"] += 1
+            item["last_steps"] = steps
+            return
+
+        return_kind = TITLE_RUNTIME_CALLBACK_RETURN_SITES.get(cpu.eip)
+        if return_kind is None:
+            return
+        pending = self._pending.get(thread_key)
+        if not pending:
+            self.unmatched_return_count += 1
+            return
+        pending_index = next(
+            (
+                index
+                for index in range(len(pending) - 1, -1, -1)
+                if pending[index][0] == return_kind
+            ),
+            None,
+        )
+        if pending_index is None:
+            self.unmatched_return_count += 1
+            return
+        kind, target, object_address = pending.pop(pending_index)
+        result = cpu.get_register("eax")
+        item = self._targets[(kind, target, object_address)]
+        if result == 0:
+            item["zero_result_count"] += 1
+        else:
+            item["nonzero_result_count"] += 1
+        item["last_result"] = result
+        item["last_result_hex"] = _hex32(result)
+        item["last_steps"] = steps
+
+    def summary(self) -> dict[str, Any]:
+        targets = sorted(
+            self._targets.values(),
+            key=lambda item: (-item["call_count"], item["target"], item["kind"]),
+        )
+        return {
+            "enabled": self.enabled,
+            "observer_addresses_hex": [
+                _hex32(address) for address in sorted(self.observer_addresses)
+            ],
+            "target_count": len(targets),
+            "call_count": sum(item["call_count"] for item in targets),
+            "zero_result_count": sum(
+                item["zero_result_count"] for item in targets
+            ),
+            "nonzero_result_count": sum(
+                item["nonzero_result_count"] for item in targets
+            ),
+            "unmatched_return_count": self.unmatched_return_count,
+            "pending_call_count": sum(
+                len(pending) for pending in self._pending.values()
+            ),
+            "targets": targets,
+        }
+
+
+class TitleD3DPresentAudit:
+    """Record the title D3D Present path down to its flip packet write."""
+
+    observer_addresses = TITLE_D3D_PRESENT_OBSERVER_ADDRESSES
+
+    def __init__(self) -> None:
+        self.counts: dict[int, int] = {
+            address: 0 for address in self.observer_addresses
+        }
+        self.last_samples: dict[int, dict[str, Any]] = {}
+
+    def observer(
+        self,
+        cpu: CpuState,
+        memory: SparseMemory,
+        trace: ExecutionTrace,
+        steps: int,
+    ) -> None:
+        if cpu.eip not in self.observer_addresses:
+            return
+        self.counts[cpu.eip] += 1
+        context_address = memory.read_u32(TITLE_D3D_CONTEXT_GLOBAL_ADDRESS)
+        sample = {
+            "address_hex": _hex32(cpu.eip),
+            "steps": steps,
+            "eax_hex": _hex32(cpu.get_register("eax")),
+            "ebx_hex": _hex32(cpu.get_register("ebx")),
+            "esi_hex": _hex32(cpu.get_register("esi")),
+            "context_address_hex": _hex32(context_address),
+            "context_flags_hex": _hex32(
+                memory.read_u32(_u32(context_address + 8))
+                if context_address != 0
+                else 0
+            ),
+            "present_flags_hex": _hex32(
+                memory.read_u32(_u32(cpu.get_register("esp") + 4))
+                if cpu.eip == 0x002224A0
+                else cpu.get_register("ebx")
+            ),
+        }
+        self.last_samples[cpu.eip] = sample
+        trace.add(
+            cpu.eip,
+            "title_d3d_present_audit",
+            observation_count=self.counts[cpu.eip],
+            **sample,
+        )
+
+    def summary(self) -> dict[str, Any]:
+        observations = [
+            {
+                "address_hex": _hex32(address),
+                "observation_count": self.counts[address],
+                "last_sample": self.last_samples.get(address),
+            }
+            for address in sorted(self.observer_addresses)
+        ]
+        return {
+            "entry_count": self.counts[0x002224A0],
+            "immediate_path_count": self.counts[0x00222506],
+            "queued_path_count": self.counts[0x00222546],
+            "flip_header_write_count": sum(
+                self.counts[address]
+                for address in (0x00222271, 0x00222290, 0x002223F4)
+            ),
+            "observations": observations,
+        }
+
+
+class TitleWorldMatrixAudit:
+    """Observe RenderWare shader inputs and writes to one selected source matrix."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = False,
+        build_address: int = TITLE_WORLD_MATRIX_BUILD_ADDRESS,
+        sample_limit: int = TITLE_WORLD_MATRIX_SAMPLE_LIMIT,
+        render_watchpoint: RenderWriteWatchpoint | None = None,
+        write_watch_address: int | None = None,
+    ) -> None:
+        if write_watch_address is not None and not 0 <= write_watch_address <= 0xFFFFFFC0:
+            raise ValueError("world-matrix write watch must fit in the 32-bit address space")
+        self.enabled = enabled or write_watch_address is not None
+        self.build_address = build_address
+        self.sample_limit = max(2, sample_limit)
+        self.render_watchpoint = render_watchpoint
+        self.write_watch_address = (
+            _u32(write_watch_address) if write_watch_address is not None else None
+        )
+        self.observer_addresses = (
+            {
+                build_address,
+                TITLE_WORLD_DRAW_CALLBACK_ADDRESS,
+                TITLE_D3D_INDEXED_DRAW_ADDRESS,
+                TITLE_CAMERA_UPDATE_ADDRESS,
+                TITLE_CAMERA_TARGET_FRAME_RETURN_ADDRESS,
+                TITLE_CAMERA_UPDATE_RETURN_ADDRESS,
+                TITLE_GENERIC_CAMERA_UPDATE_ADDRESS,
+                TITLE_GENERIC_CAMERA_TARGET_FRAME_RETURN_ADDRESS,
+                *TITLE_GENERIC_CAMERA_UPDATE_RETURN_ADDRESSES,
+            }
+            if self.enabled
+            else set()
+        )
+        if self.write_watch_address is not None:
+            self.observer_addresses.update(
+                {
+                    TITLE_WORLD_MATRIX_ROTATE_ADDRESS,
+                    TITLE_WORLD_MATRIX_ROTATION_BUILD_ADDRESS,
+                    *TITLE_WORLD_MATRIX_ROTATE_RETURN_ADDRESSES,
+                }
+            )
+        self.memory_callback_addresses = (
+            set(range(self.write_watch_address, self.write_watch_address + 0x40, 4))
+            if self.write_watch_address is not None
+            else set()
+        )
+        self.invocation_count = 0
+        self.singular_matrix_count = 0
+        self.nonfinite_matrix_count = 0
+        self.caller_counts: Counter[int] = Counter()
+        self.source_counts: Counter[tuple[int, int]] = Counter()
+        self.singular_source_counts: Counter[tuple[int, int]] = Counter()
+        self.first_singular_samples: list[dict[str, Any]] = []
+        self.latest_singular_samples: deque[dict[str, Any]] = deque(
+            maxlen=self.sample_limit // 2
+        )
+        self.first_healthy_sample: dict[str, Any] | None = None
+        self.latest_healthy_sample: dict[str, Any] | None = None
+        self.latest_matrix_sample: dict[str, Any] | None = None
+        self.camera_update_count = 0
+        self.camera_target_frame_count = 0
+        self.camera_update_completion_count = 0
+        self.pending_camera_samples: list[dict[str, Any]] = []
+        self.first_camera_samples: list[dict[str, Any]] = []
+        self.latest_camera_samples: deque[dict[str, Any]] = deque(
+            maxlen=self.sample_limit // 2
+        )
+        self.camera_candidate_tables: dict[str, list[float | None]] | None = None
+        self.generic_camera_update_count = 0
+        self.generic_camera_target_frame_count = 0
+        self.generic_camera_update_completion_count = 0
+        self.pending_generic_camera_samples: list[dict[str, Any]] = []
+        self.first_generic_camera_samples: list[dict[str, Any]] = []
+        self.latest_generic_camera_samples: deque[dict[str, Any]] = deque(
+            maxlen=self.sample_limit // 2
+        )
+        self.world_draw_callback_count = 0
+        self.world_draw_callback_zero_index_count = 0
+        self.world_draw_callback_caller_counts: Counter[int] = Counter()
+        self.world_draw_callback_mode_counts: Counter[int] = Counter()
+        self.world_draw_callback_count_values: Counter[int] = Counter()
+        self.world_draw_callback_caller_samples: dict[int, dict[str, Any]] = {}
+        self.first_world_draw_callback_samples: list[dict[str, Any]] = []
+        self.latest_world_draw_callback_samples: deque[dict[str, Any]] = deque(
+            maxlen=self.sample_limit // 2
+        )
+        self.indexed_draw_count = 0
+        self.zero_index_draw_count = 0
+        self.indexed_draw_caller_counts: Counter[int] = Counter()
+        self.zero_index_draw_caller_counts: Counter[int] = Counter()
+        self.indexed_draw_count_values: Counter[int] = Counter()
+        self.first_indexed_draw_samples: list[dict[str, Any]] = []
+        self.latest_indexed_draw_samples: deque[dict[str, Any]] = deque(
+            maxlen=self.sample_limit // 2
+        )
+        self.write_count = 0
+        self.write_instruction_counts: Counter[int] = Counter()
+        self.singularizing_write_count = 0
+        self.restoring_write_count = 0
+        self.first_write_samples: list[dict[str, Any]] = []
+        self.latest_write_samples: deque[dict[str, Any]] = deque(
+            maxlen=self.sample_limit // 2
+        )
+        self.transition_samples: deque[dict[str, Any]] = deque(
+            maxlen=self.sample_limit
+        )
+        self.rotation_entry_count = 0
+        self.rotation_completion_count = 0
+        self.rotation_singular_input_count = 0
+        self.rotation_singular_output_count = 0
+        self.rotation_nonfinite_output_count = 0
+        self.rotation_return_counts: Counter[int] = Counter()
+        self.rotation_stage_counts: Counter[tuple[int, bool, bool]] = Counter()
+        self.rotation_unmatched_completion_count = 0
+        self.pending_rotation_calls: dict[int, deque[dict[str, Any]]] = {}
+        self.active_rotation_calls: list[dict[str, Any]] = []
+        self.first_rotation_samples: list[dict[str, Any]] = []
+        self.latest_rotation_samples: deque[dict[str, Any]] = deque(
+            maxlen=self.sample_limit // 2
+        )
+
+    @staticmethod
+    def _determinant(rows: tuple[tuple[float, float, float], ...]) -> float:
+        (a, b, c), (d, e, f), (g, h, i) = rows
+        return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+
+    @classmethod
+    def _describe_matrix(cls, raw: bytes) -> dict[str, Any]:
+        dwords = struct.unpack("<16I", raw)
+        values = struct.unpack("<16f", raw)
+        rows = tuple(
+            tuple(values[row * 4 + component] for component in range(3))
+            for row in range(4)
+        )
+        basis = rows[:3]
+        basis_finite = all(math.isfinite(value) for row in basis for value in row)
+        row_lengths = tuple(
+            math.sqrt(sum(value * value for value in row))
+            if all(math.isfinite(value) for value in row)
+            else math.inf
+            for row in basis
+        )
+        determinant = cls._determinant(basis) if basis_finite else math.nan
+        length_product = math.prod(row_lengths)
+        normalized_determinant = (
+            abs(determinant) / length_product
+            if basis_finite and length_product > 1.0e-30
+            else 0.0
+        )
+        reasons: list[str] = []
+        if not basis_finite:
+            reasons.append("nonfinite_basis")
+        if any(length <= 1.0e-8 for length in row_lengths):
+            reasons.append("degenerate_basis_axis")
+        if basis_finite and normalized_determinant <= 1.0e-5:
+            reasons.append("linearly_dependent_basis")
+        return {
+            "basis_rows": [list(row) for row in basis],
+            "position": list(rows[3]),
+            "basis_row_lengths": list(row_lengths),
+            "basis_determinant": determinant if math.isfinite(determinant) else None,
+            "normalized_basis_determinant": normalized_determinant,
+            "singular": bool(reasons),
+            "reasons": reasons,
+            "raw_dwords_hex": [_hex32(value) for value in dwords],
+        }
+
+    @staticmethod
+    def _describe_fpu(cpu: CpuState) -> dict[str, Any]:
+        stack = list(cpu.fpu_stack[:8])
+        return {
+            "mxcsr_hex": _hex32(cpu.mxcsr),
+            "control_word_hex": f"0x{cpu.fpu_control_word & 0xFFFF:04X}",
+            "status_word_hex": f"0x{cpu.fpu_status_word & 0xFFFF:04X}",
+            "stack_depth": len(cpu.fpu_stack),
+            "stack_values": [
+                value if math.isfinite(value) else None for value in stack
+            ],
+            "stack_values_f32_hex": [
+                _hex32(struct.unpack("<I", struct.pack("<f", value))[0])
+                if math.isfinite(value)
+                else None
+                for value in stack
+            ],
+        }
+
+    def _guest_flip_count(self) -> int | None:
+        return (
+            self.render_watchpoint.flip_count
+            if self.render_watchpoint is not None
+            else None
+        )
+
+    @staticmethod
+    def _read_float_vector(
+        memory: SparseMemory,
+        address: int,
+        count: int = 3,
+    ) -> list[float | None]:
+        values = struct.unpack(f"<{count}f", memory.read(address, count * 4))
+        return [value if math.isfinite(value) else None for value in values]
+
+    def _observe_camera_update_entry(
+        self,
+        cpu: CpuState,
+        memory: SparseMemory,
+        steps: int,
+    ) -> None:
+        esp = cpu.get_register("esp")
+        sample = {
+            "entry_steps": steps,
+            "entry_guest_flip_count": self._guest_flip_count(),
+            "strategy_address_hex": _hex32(cpu.get_register("ecx")),
+            "vehicle_address_hex": _hex32(memory.read_u32(_u32(esp + 4))),
+            "manager_address_hex": _hex32(memory.read_u32(_u32(esp + 8))),
+            "caller_return_address_hex": _hex32(memory.read_u32(esp)),
+        }
+        self.camera_update_count += 1
+        self.pending_camera_samples.append(sample)
+        if self.camera_candidate_tables is None:
+            self.camera_candidate_tables = {
+                name: self._read_float_vector(
+                    memory,
+                    address,
+                    TITLE_CAMERA_CANDIDATE_COUNT,
+                )
+                for name, address in (
+                    ("x", TITLE_CAMERA_CANDIDATE_X_ADDRESS),
+                    ("y", TITLE_CAMERA_CANDIDATE_Y_ADDRESS),
+                    ("z", TITLE_CAMERA_CANDIDATE_Z_ADDRESS),
+                    ("fov", TITLE_CAMERA_CANDIDATE_FOV_ADDRESS),
+                )
+            }
+
+    def _observe_camera_target_frame(
+        self,
+        cpu: CpuState,
+        memory: SparseMemory,
+        steps: int,
+    ) -> None:
+        if not self.pending_camera_samples:
+            return
+        sample = self.pending_camera_samples[-1]
+        vehicle_frame_address = cpu.get_register("eax")
+        camera_matrix_address = cpu.get_register("esi")
+        sample.update(
+            {
+                "target_frame_steps": steps,
+                "target_frame_guest_flip_count": self._guest_flip_count(),
+                "vehicle_frame_address_hex": _hex32(vehicle_frame_address),
+                "camera_matrix_address_hex": _hex32(camera_matrix_address),
+                "vehicle_frame": self._describe_matrix(
+                    memory.read(vehicle_frame_address, 0x40)
+                ),
+                "camera_before": self._describe_matrix(
+                    memory.read(camera_matrix_address, 0x40)
+                ),
+            }
+        )
+        self.camera_target_frame_count += 1
+
+    def _observe_camera_update_completion(
+        self,
+        cpu: CpuState,
+        memory: SparseMemory,
+        steps: int,
+    ) -> None:
+        if not self.pending_camera_samples:
+            return
+        sample = self.pending_camera_samples.pop()
+        strategy_address = cpu.get_register("esi")
+        camera_matrix_hex = sample.get("camera_matrix_address_hex")
+        camera_matrix_address = (
+            int(camera_matrix_hex, 16) if isinstance(camera_matrix_hex, str) else 0
+        )
+        sample.update(
+            {
+                "completion_steps": steps,
+                "completion_guest_flip_count": self._guest_flip_count(),
+                "camera_mode": memory.read_u32(_u32(strategy_address + 0x58)),
+                "camera_position": self._read_float_vector(
+                    memory, _u32(strategy_address + 0x5C)
+                ),
+                "look_vector": self._read_float_vector(
+                    memory, _u32(strategy_address + 0x68)
+                ),
+                "selected_offset": self._read_float_vector(
+                    memory, _u32(strategy_address + 0x74)
+                ),
+                "selected_candidate_index": memory.read_u32(
+                    _u32(strategy_address + 0x84)
+                ),
+                "collision_target": self._read_float_vector(
+                    memory, _u32(strategy_address + 0x140)
+                ),
+                "camera_after": (
+                    self._describe_matrix(memory.read(camera_matrix_address, 0x40))
+                    if camera_matrix_address
+                    else None
+                ),
+            }
+        )
+        vehicle_frame = sample.get("vehicle_frame")
+        camera_after = sample.get("camera_after")
+        if isinstance(vehicle_frame, dict) and isinstance(camera_after, dict):
+            vehicle_position = vehicle_frame["position"]
+            camera_position = camera_after["position"]
+            sample["camera_to_vehicle_distance"] = math.sqrt(
+                sum(
+                    (float(camera_position[index]) - float(vehicle_position[index])) ** 2
+                    for index in range(3)
+                )
+            )
+        self.camera_update_completion_count += 1
+        if len(self.first_camera_samples) < self.sample_limit // 2:
+            self.first_camera_samples.append(sample)
+        self.latest_camera_samples.append(sample)
+
+    def _observe_generic_camera_update_entry(
+        self,
+        cpu: CpuState,
+        memory: SparseMemory,
+        steps: int,
+    ) -> None:
+        esp = cpu.get_register("esp")
+        vehicle_address = memory.read_u32(_u32(esp + 4))
+        manager_address = memory.read_u32(_u32(esp + 8))
+        active_index = memory.read_u32(_u32(manager_address + 0x228))
+        active_entry_address = _u32(
+            manager_address + 0x170 + active_index * 0xBC
+        )
+        camera_owner_address = memory.read_u32(manager_address)
+        camera_frame_address = memory.read_u32(
+            _u32(camera_owner_address + 4)
+        )
+        camera_matrix_address = _u32(camera_frame_address + 0x10)
+        vehicle_index = memory.read_u32(_u32(vehicle_address + 4))
+        vehicle_data_address = memory.read_u32(_u32(vehicle_address + 8))
+        configuration_addresses = {
+            "angle": 0x005312B0,
+            "rotation_a": 0x005318F8,
+            "rotation_b": 0x005315D8,
+            "blend": 0x00531580,
+            "pitch_a": 0x00531308,
+            "height_a": 0x00530FF0,
+            "forward_a": 0x00531258,
+            "pitch_b": 0x005317F0,
+            "height_b": 0x00531630,
+            "forward_b": 0x00530E28,
+            "turn_scale": 0x00530D18,
+        }
+        sample = {
+            "entry_steps": steps,
+            "entry_guest_flip_count": self._guest_flip_count(),
+            "strategy_address_hex": _hex32(cpu.get_register("ecx")),
+            "vehicle_address_hex": _hex32(vehicle_address),
+            "manager_address_hex": _hex32(manager_address),
+            "caller_return_address_hex": _hex32(memory.read_u32(esp)),
+            "active_camera_index": active_index,
+            "active_camera_entry_address_hex": _hex32(active_entry_address),
+            "camera_type": memory.read_u32(active_entry_address),
+            "camera_frame_address_hex": _hex32(camera_frame_address),
+            "camera_matrix_address_hex": _hex32(camera_matrix_address),
+            "camera_before": self._describe_matrix(
+                memory.read(camera_matrix_address, 0x40)
+            ),
+            "vehicle_index": vehicle_index,
+            "vehicle_data_address_hex": _hex32(vehicle_data_address),
+            "vehicle_local_offset": self._read_float_vector(
+                memory, _u32(vehicle_data_address + 0xA0)
+            ),
+            "vehicle_motion_value": self._read_float_vector(
+                memory, _u32(vehicle_data_address + 0x134), 1
+            )[0],
+            "configuration": {
+                name: self._read_float_vector(
+                    memory,
+                    _u32(address + vehicle_index * 4),
+                    1,
+                )[0]
+                for name, address in configuration_addresses.items()
+            },
+            "active_camera_entry_dwords_hex": [
+                _hex32(memory.read_u32(_u32(active_entry_address + offset)))
+                for offset in range(0, 0xBC, 4)
+            ],
+        }
+        self.generic_camera_update_count += 1
+        self.pending_generic_camera_samples.append(sample)
+
+    def _observe_generic_camera_target_frame(
+        self,
+        cpu: CpuState,
+        memory: SparseMemory,
+        steps: int,
+    ) -> None:
+        if not self.pending_generic_camera_samples:
+            return
+        sample = self.pending_generic_camera_samples[-1]
+        vehicle_frame_address = cpu.get_register("eax")
+        sample.update(
+            {
+                "target_frame_steps": steps,
+                "target_frame_guest_flip_count": self._guest_flip_count(),
+                "vehicle_frame_address_hex": _hex32(vehicle_frame_address),
+                "vehicle_frame": self._describe_matrix(
+                    memory.read(vehicle_frame_address, 0x40)
+                ),
+            }
+        )
+        self.generic_camera_target_frame_count += 1
+
+    def _observe_generic_camera_update_completion(
+        self,
+        cpu: CpuState,
+        memory: SparseMemory,
+        steps: int,
+    ) -> None:
+        if not self.pending_generic_camera_samples:
+            return
+        sample = self.pending_generic_camera_samples.pop()
+        camera_matrix_address = int(sample["camera_matrix_address_hex"], 16)
+        camera_after = self._describe_matrix(
+            memory.read(camera_matrix_address, 0x40)
+        )
+        sample.update(
+            {
+                "completion_steps": steps,
+                "completion_guest_flip_count": self._guest_flip_count(),
+                "dispatch_return_address_hex": _hex32(cpu.eip),
+                "camera_after": camera_after,
+            }
+        )
+        vehicle_frame = sample.get("vehicle_frame")
+        if isinstance(vehicle_frame, dict):
+            vehicle_position = vehicle_frame["position"]
+            camera_position = camera_after["position"]
+            sample["camera_to_vehicle_distance"] = math.sqrt(
+                sum(
+                    (float(camera_position[index]) - float(vehicle_position[index])) ** 2
+                    for index in range(3)
+                )
+            )
+        self.generic_camera_update_completion_count += 1
+        if len(self.first_generic_camera_samples) < self.sample_limit // 2:
+            self.first_generic_camera_samples.append(sample)
+        self.latest_generic_camera_samples.append(sample)
+
+    def _observe_world_draw_callback(
+        self,
+        cpu: CpuState,
+        memory: SparseMemory,
+        steps: int,
+    ) -> None:
+        esp = cpu.get_register("esp")
+        owner_address = cpu.get_register("ecx")
+        mesh_entry_address = memory.read_u32(_u32(esp + 4))
+        mesh_entry_dwords = tuple(
+            memory.read_u32(_u32(mesh_entry_address + offset))
+            for offset in range(0, 0x20, 4)
+        )
+        index_data_address = mesh_entry_dwords[3]
+        index_count = mesh_entry_dwords[4]
+        mode = memory.read_u32(_u32(owner_address + 0x14))
+        caller_return_address = memory.read_u32(esp)
+        ebx = cpu.get_register("ebx")
+        if (
+            caller_return_address
+            in TITLE_WORLD_DRAW_CALLBACK_OBJECT_ROOT_RETURNS
+        ):
+            mesh_root_address = memory.read_u32(_u32(ebx + 0xCEC))
+        elif caller_return_address in TITLE_WORLD_DRAW_CALLBACK_DIRECT_ROOT_RETURNS:
+            mesh_root_address = ebx
+        else:
+            mesh_root_address = 0
+        mesh_root_dwords = (
+            tuple(
+                memory.read_u32(_u32(mesh_root_address + offset))
+                for offset in range(0, 0x40, 4)
+            )
+            if mesh_root_address
+            else ()
+        )
+        sample = {
+            "steps": steps,
+            "guest_flip_count": self._guest_flip_count(),
+            "caller_return_address_hex": _hex32(caller_return_address),
+            "owner_address_hex": _hex32(owner_address),
+            "owner_mode": mode,
+            "mesh_entry_address_hex": _hex32(mesh_entry_address),
+            "mesh_entry_index_count_address_hex": _hex32(
+                _u32(mesh_entry_address + 0x10)
+            ),
+            "mesh_entry_dwords_hex": [
+                _hex32(value) for value in mesh_entry_dwords
+            ],
+            "mesh_root_address_hex": (
+                _hex32(mesh_root_address) if mesh_root_address else None
+            ),
+            "mesh_root_dwords_hex": [
+                _hex32(value) for value in mesh_root_dwords
+            ],
+            "registers_hex": {
+                register: _hex32(cpu.get_register(register))
+                for register in ("eax", "ebx", "ecx", "edx", "esi", "edi")
+            },
+            "index_data_address_hex": _hex32(index_data_address),
+            "index_count": index_count,
+        }
+        if self.latest_matrix_sample is not None:
+            matrix_sample = self.latest_matrix_sample
+            sample["active_matrix"] = {
+                key: matrix_sample[key]
+                for key in (
+                    "steps",
+                    "guest_flip_count",
+                    "caller_return_address_hex",
+                    "source_address_hex",
+                    "matrix_owner_candidate_hex",
+                    "basis_rows",
+                    "position",
+                    "basis_row_lengths",
+                    "basis_determinant",
+                    "normalized_basis_determinant",
+                    "singular",
+                    "reasons",
+                )
+            }
+            sample["active_matrix_step_delta"] = steps - int(matrix_sample["steps"])
+        self.world_draw_callback_count += 1
+        self.world_draw_callback_caller_counts[caller_return_address] += 1
+        self.world_draw_callback_mode_counts[mode] += 1
+        self.world_draw_callback_count_values[index_count] += 1
+        if index_count == 0:
+            self.world_draw_callback_zero_index_count += 1
+        prior_caller_sample = self.world_draw_callback_caller_samples.get(
+            caller_return_address
+        )
+        if prior_caller_sample is None or (
+            prior_caller_sample["index_count"] != 0 and index_count == 0
+        ):
+            self.world_draw_callback_caller_samples[
+                caller_return_address
+            ] = sample
+        if len(self.first_world_draw_callback_samples) < self.sample_limit // 2:
+            self.first_world_draw_callback_samples.append(sample)
+        self.latest_world_draw_callback_samples.append(sample)
+
+    def _observe_indexed_draw(
+        self,
+        cpu: CpuState,
+        memory: SparseMemory,
+        steps: int,
+    ) -> None:
+        esp = cpu.get_register("esp")
+        caller_return_address = memory.read_u32(esp)
+        upstream_return_address = (
+            memory.read_u32(_u32(esp + 0x10))
+            if caller_return_address == TITLE_D3D_INDEXED_DRAW_WRAPPER_RETURN_ADDRESS
+            else caller_return_address
+        )
+        primitive_type = memory.read_u32(_u32(esp + 4))
+        index_count = memory.read_u32(_u32(esp + 8))
+        index_data_address = memory.read_u32(_u32(esp + 12))
+        sample = {
+            "steps": steps,
+            "guest_flip_count": self._guest_flip_count(),
+            "caller_return_address_hex": _hex32(caller_return_address),
+            "upstream_return_address_hex": _hex32(upstream_return_address),
+            "primitive_type": primitive_type,
+            "index_count": index_count,
+            "index_data_address_hex": _hex32(index_data_address),
+        }
+        self.indexed_draw_count += 1
+        self.indexed_draw_caller_counts[upstream_return_address] += 1
+        self.indexed_draw_count_values[index_count] += 1
+        if index_count == 0:
+            self.zero_index_draw_count += 1
+            self.zero_index_draw_caller_counts[upstream_return_address] += 1
+        if len(self.first_indexed_draw_samples) < self.sample_limit // 2:
+            self.first_indexed_draw_samples.append(sample)
+        self.latest_indexed_draw_samples.append(sample)
+
+    def _observe_rotation_entry(
+        self,
+        cpu: CpuState,
+        memory: SparseMemory,
+        steps: int,
+    ) -> None:
+        if self.write_watch_address is None:
+            return
+        esp = cpu.get_register("esp")
+        return_address = memory.read_u32(esp)
+        if return_address not in TITLE_WORLD_MATRIX_ROTATE_RETURN_ADDRESSES:
+            return
+        matrix_address = memory.read_u32(_u32(esp + 4))
+        if matrix_address != self.write_watch_address:
+            return
+        axis_address = memory.read_u32(_u32(esp + 8))
+        angle_raw = memory.read_u32(_u32(esp + 12))
+        angle = struct.unpack("<f", struct.pack("<I", angle_raw))[0]
+        angle_scale_raw = memory.read_u32(TITLE_WORLD_MATRIX_ANGLE_SCALE_ADDRESS)
+        angle_scale = struct.unpack(
+            "<f", struct.pack("<I", angle_scale_raw)
+        )[0]
+        one_constant_raw = memory.read_u32(
+            TITLE_WORLD_MATRIX_ONE_CONSTANT_ADDRESS
+        )
+        one_constant = struct.unpack(
+            "<f", struct.pack("<I", one_constant_raw)
+        )[0]
+        axis_raw = memory.read(axis_address, 12)
+        axis = struct.unpack("<3f", axis_raw)
+        sample = {
+            "entry_steps": steps,
+            "entry_guest_flip_count": self._guest_flip_count(),
+            "return_address_hex": _hex32(return_address),
+            "matrix_address_hex": _hex32(matrix_address),
+            "axis_address_hex": _hex32(axis_address),
+            "axis": list(axis),
+            "axis_raw_dwords_hex": [
+                _hex32(value) for value in struct.unpack("<3I", axis_raw)
+            ],
+            "angle_degrees": angle if math.isfinite(angle) else None,
+            "angle_raw_hex": _hex32(angle_raw),
+            "rotation_constants": {
+                "angle_scale": (
+                    angle_scale if math.isfinite(angle_scale) else None
+                ),
+                "angle_scale_raw_hex": _hex32(angle_scale_raw),
+                "one": one_constant if math.isfinite(one_constant) else None,
+                "one_raw_hex": _hex32(one_constant_raw),
+            },
+            "combine_mode": memory.read_u32(_u32(esp + 16)),
+            "entry_fpu": self._describe_fpu(cpu),
+            "input": self._describe_matrix(memory.read(matrix_address, 0x40)),
+        }
+        self.rotation_entry_count += 1
+        if sample["input"]["singular"]:
+            self.rotation_singular_input_count += 1
+        self.rotation_return_counts[return_address] += 1
+        self.pending_rotation_calls.setdefault(return_address, deque()).append(sample)
+        self.active_rotation_calls.append(sample)
+
+    def _observe_rotation_builder(
+        self,
+        cpu: CpuState,
+        memory: SparseMemory,
+        steps: int,
+    ) -> None:
+        if self.write_watch_address is None or not self.active_rotation_calls:
+            return
+        esp = cpu.get_register("esp")
+        if memory.read_u32(esp) != TITLE_WORLD_MATRIX_ROTATION_BUILD_RETURN_ADDRESS:
+            return
+        matrix_address = memory.read_u32(_u32(esp + 4))
+        if matrix_address != self.write_watch_address:
+            return
+        sample = self.active_rotation_calls[-1]
+        axis_address = memory.read_u32(_u32(esp + 8))
+        axis_raw = memory.read(axis_address, 12)
+        axis = struct.unpack("<3f", axis_raw)
+        one_minus_cosine_raw = memory.read_u32(_u32(esp + 12))
+        sine_raw = memory.read_u32(_u32(esp + 16))
+        one_minus_cosine = struct.unpack(
+            "<f", struct.pack("<I", one_minus_cosine_raw)
+        )[0]
+        sine = struct.unpack("<f", struct.pack("<I", sine_raw))[0]
+        cosine = 1.0 - one_minus_cosine
+        sample["builder"] = {
+            "steps": steps,
+            "guest_flip_count": self._guest_flip_count(),
+            "matrix_address_hex": _hex32(matrix_address),
+            "axis_address_hex": _hex32(axis_address),
+            "normalized_axis": list(axis),
+            "normalized_axis_raw_dwords_hex": [
+                _hex32(value) for value in struct.unpack("<3I", axis_raw)
+            ],
+            "normalized_axis_length": math.sqrt(
+                sum(value * value for value in axis)
+            )
+            if all(math.isfinite(value) for value in axis)
+            else None,
+            "one_minus_cosine": (
+                one_minus_cosine if math.isfinite(one_minus_cosine) else None
+            ),
+            "one_minus_cosine_raw_hex": _hex32(one_minus_cosine_raw),
+            "sine": sine if math.isfinite(sine) else None,
+            "sine_raw_hex": _hex32(sine_raw),
+            "derived_cosine": cosine if math.isfinite(cosine) else None,
+            "unit_circle_error": (
+                abs(sine * sine + cosine * cosine - 1.0)
+                if math.isfinite(sine) and math.isfinite(cosine)
+                else None
+            ),
+            "combine_mode": memory.read_u32(_u32(esp + 20)),
+            "fpu": self._describe_fpu(cpu),
+        }
+
+    def _observe_rotation_completion(
+        self,
+        cpu: CpuState,
+        memory: SparseMemory,
+        steps: int,
+    ) -> None:
+        if self.write_watch_address is None:
+            return
+        return_address = cpu.eip
+        pending = self.pending_rotation_calls.get(return_address)
+        if not pending:
+            self.rotation_unmatched_completion_count += 1
+            return
+        sample = pending.popleft()
+        if sample in self.active_rotation_calls:
+            self.active_rotation_calls.remove(sample)
+        output = self._describe_matrix(memory.read(self.write_watch_address, 0x40))
+        sample.update(
+            {
+                "completion_steps": steps,
+                "completion_guest_flip_count": self._guest_flip_count(),
+                "completion_fpu": self._describe_fpu(cpu),
+                "output": output,
+            }
+        )
+        self.rotation_completion_count += 1
+        output_singular = bool(output["singular"])
+        if output_singular:
+            self.rotation_singular_output_count += 1
+        if "nonfinite_basis" in output["reasons"]:
+            self.rotation_nonfinite_output_count += 1
+        input_singular = bool(sample["input"]["singular"])
+        self.rotation_stage_counts[
+            (return_address, input_singular, output_singular)
+        ] += 1
+        if len(self.first_rotation_samples) < self.sample_limit // 2:
+            self.first_rotation_samples.append(sample)
+        self.latest_rotation_samples.append(sample)
+
+    def observer(
+        self,
+        cpu: CpuState,
+        memory: SparseMemory,
+        trace: ExecutionTrace,
+        steps: int,
+    ) -> None:
+        if not self.enabled:
+            return
+        if cpu.eip == TITLE_GENERIC_CAMERA_UPDATE_ADDRESS:
+            self._observe_generic_camera_update_entry(cpu, memory, steps)
+            return
+        if cpu.eip == TITLE_GENERIC_CAMERA_TARGET_FRAME_RETURN_ADDRESS:
+            self._observe_generic_camera_target_frame(cpu, memory, steps)
+            return
+        if cpu.eip in TITLE_GENERIC_CAMERA_UPDATE_RETURN_ADDRESSES:
+            self._observe_generic_camera_update_completion(cpu, memory, steps)
+            return
+        if cpu.eip == TITLE_CAMERA_UPDATE_ADDRESS:
+            self._observe_camera_update_entry(cpu, memory, steps)
+            return
+        if cpu.eip == TITLE_CAMERA_TARGET_FRAME_RETURN_ADDRESS:
+            self._observe_camera_target_frame(cpu, memory, steps)
+            return
+        if cpu.eip == TITLE_CAMERA_UPDATE_RETURN_ADDRESS:
+            self._observe_camera_update_completion(cpu, memory, steps)
+            return
+        if cpu.eip == TITLE_WORLD_DRAW_CALLBACK_ADDRESS:
+            self._observe_world_draw_callback(cpu, memory, steps)
+            return
+        if cpu.eip == TITLE_D3D_INDEXED_DRAW_ADDRESS:
+            self._observe_indexed_draw(cpu, memory, steps)
+            return
+        if cpu.eip == TITLE_WORLD_MATRIX_ROTATE_ADDRESS:
+            self._observe_rotation_entry(cpu, memory, steps)
+            return
+        if cpu.eip == TITLE_WORLD_MATRIX_ROTATION_BUILD_ADDRESS:
+            self._observe_rotation_builder(cpu, memory, steps)
+            return
+        if cpu.eip in TITLE_WORLD_MATRIX_ROTATE_RETURN_ADDRESSES:
+            self._observe_rotation_completion(cpu, memory, steps)
+            return
+        if cpu.eip != self.build_address:
+            return
+        self.invocation_count += 1
+        esp = cpu.get_register("esp")
+        caller_return = memory.read_u32(esp)
+        source_address = memory.read_u32(_u32(esp + 4))
+        raw = memory.read(source_address, 0x40)
+        matrix = self._describe_matrix(raw)
+        reasons = matrix["reasons"]
+        if "nonfinite_basis" in reasons:
+            self.nonfinite_matrix_count += 1
+        singular = matrix["singular"]
+        if singular:
+            self.singular_matrix_count += 1
+        self.caller_counts[caller_return] += 1
+        source_key = (caller_return, source_address)
+        self.source_counts[source_key] += 1
+        if singular:
+            self.singular_source_counts[source_key] += 1
+        guest_flip_count = self._guest_flip_count()
+        sample = {
+            "steps": steps,
+            "guest_flip_count": guest_flip_count,
+            "caller_return_address_hex": _hex32(caller_return),
+            "source_address_hex": _hex32(source_address),
+            "matrix_owner_candidate_hex": _hex32(
+                _u32(source_address - TITLE_WORLD_MATRIX_OWNER_OFFSET)
+            ),
+            "eax_hex": _hex32(cpu.get_register("eax")),
+            "ebx_hex": _hex32(cpu.get_register("ebx")),
+            "ecx_hex": _hex32(cpu.get_register("ecx")),
+            "edx_hex": _hex32(cpu.get_register("edx")),
+            "esi_hex": _hex32(cpu.get_register("esi")),
+            "edi_hex": _hex32(cpu.get_register("edi")),
+            **matrix,
+        }
+        self.latest_matrix_sample = sample
+        if singular:
+            if len(self.first_singular_samples) < self.sample_limit // 2:
+                self.first_singular_samples.append(sample)
+            self.latest_singular_samples.append(sample)
+            trace.add(
+                cpu.eip,
+                "title_world_matrix_audit",
+                **sample,
+            )
+        else:
+            if self.first_healthy_sample is None:
+                self.first_healthy_sample = sample
+            self.latest_healthy_sample = sample
+
+    def observe_memory_write(
+        self,
+        memory: SparseMemory,
+        *,
+        instruction_address: int,
+        write_address: int,
+        size: int,
+        value: int,
+        steps: int,
+    ) -> None:
+        if self.write_watch_address is None or size <= 0:
+            return
+        matrix_start = self.write_watch_address
+        matrix_end = matrix_start + 0x40
+        write_end = write_address + size
+        if write_address >= matrix_end or write_end <= matrix_start:
+            return
+        payload = int(value).to_bytes(size, "little", signed=False)
+        before_raw = bytearray(memory.read(matrix_start, 0x40))
+        after_raw = bytearray(before_raw)
+        overlap_start = max(write_address, matrix_start)
+        overlap_end = min(write_end, matrix_end)
+        for current in range(overlap_start, overlap_end):
+            after_raw[current - matrix_start] = payload[current - write_address]
+        before = self._describe_matrix(bytes(before_raw))
+        after = self._describe_matrix(bytes(after_raw))
+        if before["singular"] and not after["singular"]:
+            transition = "restored_nonsingular"
+            self.restoring_write_count += 1
+        elif not before["singular"] and after["singular"]:
+            transition = "became_singular"
+            self.singularizing_write_count += 1
+        elif after["singular"]:
+            transition = "remained_singular"
+        else:
+            transition = "remained_nonsingular"
+        self.write_count += 1
+        self.write_instruction_counts[instruction_address] += 1
+        sample = {
+            "steps": steps,
+            "guest_flip_count": (
+                self.render_watchpoint.flip_count
+                if self.render_watchpoint is not None
+                else None
+            ),
+            "instruction_address_hex": _hex32(instruction_address),
+            "write_address_hex": _hex32(write_address),
+            "matrix_offset": overlap_start - matrix_start,
+            "size": size,
+            "value_hex": _hex32(value),
+            "transition": transition,
+            "before": before,
+            "after": after,
+        }
+        if len(self.first_write_samples) < self.sample_limit // 2:
+            self.first_write_samples.append(sample)
+        self.latest_write_samples.append(sample)
+        if transition in {"became_singular", "restored_nonsingular"}:
+            self.transition_samples.append(sample)
+
+    def summary(self) -> dict[str, Any]:
+        ranked_sources = sorted(
+            self.source_counts.items(),
+            key=lambda item: (
+                -self.singular_source_counts.get(item[0], 0),
+                -item[1],
+                item[0],
+            ),
+        )[: self.sample_limit * 2]
+        source_records = [
+            {
+                "caller_return_address_hex": _hex32(caller),
+                "source_address_hex": _hex32(source),
+                "matrix_owner_candidate_hex": _hex32(
+                    _u32(source - TITLE_WORLD_MATRIX_OWNER_OFFSET)
+                ),
+                "invocation_count": count,
+                "singular_matrix_count": self.singular_source_counts.get(
+                    (caller, source), 0
+                ),
+            }
+            for (caller, source), count in ranked_sources
+        ]
+        singular_samples = [
+            *self.first_singular_samples,
+            *(
+                sample
+                for sample in self.latest_singular_samples
+                if sample not in self.first_singular_samples
+            ),
+        ]
+        write_samples = [
+            *self.first_write_samples,
+            *(
+                sample
+                for sample in self.latest_write_samples
+                if sample not in self.first_write_samples
+            ),
+        ]
+        rotation_samples = [
+            *self.first_rotation_samples,
+            *(
+                sample
+                for sample in self.latest_rotation_samples
+                if sample not in self.first_rotation_samples
+            ),
+        ]
+        world_draw_callback_samples = [
+            *self.first_world_draw_callback_samples,
+            *(
+                sample
+                for sample in self.latest_world_draw_callback_samples
+                if sample not in self.first_world_draw_callback_samples
+            ),
+        ]
+        indexed_draw_samples = [
+            *self.first_indexed_draw_samples,
+            *(
+                sample
+                for sample in self.latest_indexed_draw_samples
+                if sample not in self.first_indexed_draw_samples
+            ),
+        ]
+        camera_samples = [
+            *self.first_camera_samples,
+            *(
+                sample
+                for sample in self.latest_camera_samples
+                if sample not in self.first_camera_samples
+            ),
+        ]
+        generic_camera_samples = [
+            *self.first_generic_camera_samples,
+            *(
+                sample
+                for sample in self.latest_generic_camera_samples
+                if sample not in self.first_generic_camera_samples
+            ),
+        ]
+        return {
+            "enabled": self.enabled,
+            "execution_mode": "observer_only_recovered_guest_code",
+            "build_address_hex": _hex32(self.build_address),
+            "observer_addresses_hex": [
+                _hex32(address) for address in sorted(self.observer_addresses)
+            ],
+            "invocation_count": self.invocation_count,
+            "singular_matrix_count": self.singular_matrix_count,
+            "nonfinite_matrix_count": self.nonfinite_matrix_count,
+            "caller_counts": [
+                {
+                    "caller_return_address_hex": _hex32(address),
+                    "invocation_count": count,
+                }
+                for address, count in self.caller_counts.most_common()
+            ],
+            "source_records": source_records,
+            "first_healthy_sample": self.first_healthy_sample,
+            "latest_healthy_sample": self.latest_healthy_sample,
+            "singular_samples": singular_samples,
+            "camera_audit": {
+                "entry_address_hex": _hex32(TITLE_CAMERA_UPDATE_ADDRESS),
+                "target_frame_return_address_hex": _hex32(
+                    TITLE_CAMERA_TARGET_FRAME_RETURN_ADDRESS
+                ),
+                "completion_address_hex": _hex32(
+                    TITLE_CAMERA_UPDATE_RETURN_ADDRESS
+                ),
+                "update_count": self.camera_update_count,
+                "target_frame_count": self.camera_target_frame_count,
+                "completion_count": self.camera_update_completion_count,
+                "pending_count": len(self.pending_camera_samples),
+                "candidate_tables": self.camera_candidate_tables,
+                "samples": camera_samples,
+            },
+            "generic_camera_audit": {
+                "entry_address_hex": _hex32(
+                    TITLE_GENERIC_CAMERA_UPDATE_ADDRESS
+                ),
+                "target_frame_return_address_hex": _hex32(
+                    TITLE_GENERIC_CAMERA_TARGET_FRAME_RETURN_ADDRESS
+                ),
+                "completion_addresses_hex": [
+                    _hex32(address)
+                    for address in sorted(
+                        TITLE_GENERIC_CAMERA_UPDATE_RETURN_ADDRESSES
+                    )
+                ],
+                "update_count": self.generic_camera_update_count,
+                "target_frame_count": self.generic_camera_target_frame_count,
+                "completion_count": self.generic_camera_update_completion_count,
+                "pending_count": len(self.pending_generic_camera_samples),
+                "samples": generic_camera_samples,
+            },
+            "indexed_draw_audit": {
+                "world_draw_callback_address_hex": _hex32(
+                    TITLE_WORLD_DRAW_CALLBACK_ADDRESS
+                ),
+                "indexed_draw_address_hex": _hex32(
+                    TITLE_D3D_INDEXED_DRAW_ADDRESS
+                ),
+                "world_draw_callback_count": self.world_draw_callback_count,
+                "world_draw_callback_zero_index_count": (
+                    self.world_draw_callback_zero_index_count
+                ),
+                "world_draw_callback_caller_counts": [
+                    {
+                        "caller_return_address_hex": _hex32(address),
+                        "invocation_count": count,
+                    }
+                    for address, count in self.world_draw_callback_caller_counts.most_common()
+                ],
+                "world_draw_callback_mode_counts": {
+                    str(mode): count
+                    for mode, count in self.world_draw_callback_mode_counts.most_common()
+                },
+                "world_draw_callback_count_values": {
+                    str(index_count): count
+                    for index_count, count in self.world_draw_callback_count_values.most_common()
+                },
+                "world_draw_callback_caller_samples": [
+                    self.world_draw_callback_caller_samples[address]
+                    for address in sorted(self.world_draw_callback_caller_samples)
+                ],
+                "indexed_draw_count": self.indexed_draw_count,
+                "zero_index_draw_count": self.zero_index_draw_count,
+                "indexed_draw_caller_counts": [
+                    {
+                        "caller_return_address_hex": _hex32(address),
+                        "invocation_count": count,
+                        "zero_index_count": self.zero_index_draw_caller_counts[address],
+                    }
+                    for address, count in self.indexed_draw_caller_counts.most_common()
+                ],
+                "indexed_draw_count_values": {
+                    str(index_count): count
+                    for index_count, count in self.indexed_draw_count_values.most_common()
+                },
+                "world_draw_callback_samples": world_draw_callback_samples,
+                "indexed_draw_samples": indexed_draw_samples,
+            },
+            "write_audit": {
+                "enabled": self.write_watch_address is not None,
+                "address_hex": (
+                    _hex32(self.write_watch_address)
+                    if self.write_watch_address is not None
+                    else None
+                ),
+                "byte_count": 0x40 if self.write_watch_address is not None else 0,
+                "write_count": self.write_count,
+                "singularizing_write_count": self.singularizing_write_count,
+                "restoring_write_count": self.restoring_write_count,
+                "instruction_counts": [
+                    {
+                        "instruction_address_hex": _hex32(address),
+                        "write_count": count,
+                    }
+                    for address, count in self.write_instruction_counts.most_common()
+                ],
+                "write_samples": write_samples,
+                "transition_samples": list(self.transition_samples),
+            },
+            "rotation_audit": {
+                "enabled": self.write_watch_address is not None,
+                "matrix_address_hex": (
+                    _hex32(self.write_watch_address)
+                    if self.write_watch_address is not None
+                    else None
+                ),
+                "entry_address_hex": _hex32(TITLE_WORLD_MATRIX_ROTATE_ADDRESS),
+                "builder_address_hex": _hex32(
+                    TITLE_WORLD_MATRIX_ROTATION_BUILD_ADDRESS
+                ),
+                "return_addresses_hex": [
+                    _hex32(address)
+                    for address in sorted(TITLE_WORLD_MATRIX_ROTATE_RETURN_ADDRESSES)
+                ],
+                "entry_count": self.rotation_entry_count,
+                "completion_count": self.rotation_completion_count,
+                "pending_count": sum(
+                    len(pending) for pending in self.pending_rotation_calls.values()
+                ),
+                "unmatched_completion_count": (
+                    self.rotation_unmatched_completion_count
+                ),
+                "singular_input_count": self.rotation_singular_input_count,
+                "singular_output_count": self.rotation_singular_output_count,
+                "nonfinite_output_count": self.rotation_nonfinite_output_count,
+                "return_counts": [
+                    {
+                        "return_address_hex": _hex32(address),
+                        "entry_count": count,
+                    }
+                    for address, count in self.rotation_return_counts.most_common()
+                ],
+                "stage_records": [
+                    {
+                        "return_address_hex": _hex32(address),
+                        "input_singular": input_singular,
+                        "output_singular": output_singular,
+                        "completion_count": count,
+                    }
+                    for (
+                        address,
+                        input_singular,
+                        output_singular,
+                    ), count in self.rotation_stage_counts.most_common()
+                ],
+                "samples": rotation_samples,
+            },
+        }
+
+
+@dataclass(frozen=True)
+class TitleSceneRecordTableLayout:
+    name: str
+    record_count: int
+    record_address: int
+    records: tuple[bytes, ...]
+
+
+@dataclass(frozen=True)
+class TitleSceneRecordSourceLayout:
+    title_path: str
+    image_base: int
+    header: bytes
+    tables: tuple[TitleSceneRecordTableLayout, ...]
+
+
+def _load_title_scene_record_sources(
+    extracted_root: Path | None,
+) -> tuple[tuple[TitleSceneRecordSourceLayout, ...], tuple[str, ...]]:
+    """Load only the small prelinked scene-record tables used by the audit."""
+
+    if extracted_root is None:
+        return (), ("extracted disc root is unavailable",)
+    track_root = extracted_root / "trackpss"
+    if not track_root.is_dir():
+        return (), (f"track PSS root does not exist: {track_root}",)
+
+    sources: list[TitleSceneRecordSourceLayout] = []
+    errors: list[str] = []
+    for path in sorted(track_root.rglob("*.pss")):
+        try:
+            file_size = path.stat().st_size
+            with path.open("rb") as stream:
+                header = stream.read(TITLE_TRACK_PSS_HEADER_SIZE)
+                if len(header) != TITLE_TRACK_PSS_HEADER_SIZE:
+                    raise ValueError("descriptor header is truncated")
+                image_anchor = struct.unpack_from(
+                    "<I", header, TITLE_TRACK_PSS_IMAGE_ANCHOR_POINTER_OFFSET
+                )[0]
+                if image_anchor < TITLE_TRACK_PSS_IMAGE_ANCHOR_OFFSET:
+                    raise ValueError("image anchor cannot identify a guest base")
+                image_base = image_anchor - TITLE_TRACK_PSS_IMAGE_ANCHOR_OFFSET
+                tables: list[TitleSceneRecordTableLayout] = []
+                for name, count_offset, pointer_offset in TITLE_SCENE_RECORD_TABLE_SPECS:
+                    record_count = struct.unpack_from("<I", header, count_offset)[0]
+                    record_address = struct.unpack_from("<I", header, pointer_offset)[0]
+                    if record_count > TITLE_SCENE_RECORD_MAX_COUNT:
+                        raise ValueError(
+                            f"{name} scene-record count {record_count} is invalid"
+                        )
+                    if record_count == 0:
+                        tables.append(
+                            TitleSceneRecordTableLayout(name, 0, record_address, ())
+                        )
+                        continue
+                    if record_address < image_base:
+                        raise ValueError(f"{name} scene-record table precedes its image")
+                    table_offset = record_address - image_base
+                    table_size = record_count * TITLE_SCENE_RECORD_SIZE
+                    if table_offset + table_size > file_size:
+                        raise ValueError(f"{name} scene-record table is truncated")
+                    stream.seek(table_offset)
+                    payload = stream.read(table_size)
+                    if len(payload) != table_size:
+                        raise ValueError(f"{name} scene-record table read was short")
+                    tables.append(
+                        TitleSceneRecordTableLayout(
+                            name,
+                            record_count,
+                            record_address,
+                            tuple(
+                                payload[
+                                    index * TITLE_SCENE_RECORD_SIZE :
+                                    (index + 1) * TITLE_SCENE_RECORD_SIZE
+                                ]
+                                for index in range(record_count)
+                            ),
+                        )
+                    )
+            sources.append(
+                TitleSceneRecordSourceLayout(
+                    path.relative_to(extracted_root).as_posix().lower(),
+                    image_base,
+                    header,
+                    tuple(tables),
+                )
+            )
+        except (OSError, ValueError, struct.error) as exc:
+            errors.append(f"{path.name}: {exc}")
+    return tuple(sources), tuple(errors)
+
+
+class TitleSceneRecordAudit:
+    """Correlate indexed-draw arguments with RAM and prelinked Track PSS records."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = False,
+        source_layouts: Iterable[TitleSceneRecordSourceLayout] = (),
+        source_errors: Iterable[str] = (),
+        render_watchpoint: RenderWriteWatchpoint | None = None,
+        sample_limit: int = TITLE_SCENE_RECORD_SAMPLE_LIMIT,
+    ) -> None:
+        self.enabled = enabled
+        self.source_layouts = tuple(source_layouts) if enabled else ()
+        self.source_errors = tuple(source_errors) if enabled else ()
+        self.render_watchpoint = render_watchpoint
+        self.sample_limit = max(16, sample_limit)
+        self.observer_addresses = (
+            {TITLE_D3D_INDEXED_DRAW_ADDRESS} if enabled else set()
+        )
+        pointer_fields = {
+            table.record_address
+            + index * TITLE_SCENE_RECORD_SIZE
+            + TITLE_SCENE_RECORD_INDEX_POINTER_OFFSET
+            for source in self.source_layouts
+            for table in source.tables
+            for index in range(table.record_count)
+        }
+        count_fields = {
+            table.record_address
+            + index * TITLE_SCENE_RECORD_SIZE
+            + TITLE_SCENE_RECORD_INDEX_COUNT_OFFSET
+            for source in self.source_layouts
+            for table in source.tables
+            for index in range(table.record_count)
+        }
+        self.pointer_field_addresses = frozenset(pointer_fields)
+        self.watched_field_addresses = tuple(sorted(pointer_fields | count_fields))
+        self.scene_draw_count = 0
+        self.passed_zero_count = 0
+        self.authoritative_zero_count = 0
+        self.argument_memory_divergence_count = 0
+        self.runtime_source_divergence_count = 0
+        self.source_match_counts: Counter[str] = Counter()
+        self.status_counts: Counter[str] = Counter()
+        self.record_observation_counts: Counter[int] = Counter()
+        self.record_samples: list[dict[str, Any]] = []
+        self._sample_signatures: set[tuple[Any, ...]] = set()
+        self._observed_table_indices: dict[tuple[int, str], set[int]] = {}
+        self.first_scene_flip: int | None = None
+        self.completed_scene_flip: int | None = None
+        self.complete = False
+        self.complete_reason: str | None = None
+        self.write_count = 0
+        self.write_source_counts: Counter[str] = Counter()
+        self.write_transition_counts: Counter[str] = Counter()
+        self.first_clearing_write: dict[str, Any] | None = None
+        self.write_samples: list[dict[str, Any]] = []
+        self.latest_write_samples: deque[dict[str, Any]] = deque(maxlen=64)
+
+    def _guest_flip_count(self) -> int | None:
+        return (
+            self.render_watchpoint.flip_count
+            if self.render_watchpoint is not None
+            else None
+        )
+
+    def _matching_sources(
+        self,
+        memory: SparseMemory,
+        root_address: int,
+    ) -> tuple[TitleSceneRecordSourceLayout, ...]:
+        runtime_tables = {
+            name: (
+                memory.read_u32(_u32(root_address + count_offset)),
+                memory.read_u32(_u32(root_address + pointer_offset)),
+            )
+            for name, count_offset, pointer_offset in TITLE_SCENE_RECORD_TABLE_SPECS
+        }
+        return tuple(
+            source
+            for source in self.source_layouts
+            if all(
+                runtime_tables.get(table.name)
+                == (table.record_count, table.record_address)
+                for table in source.tables
+            )
+        )
+
+    @staticmethod
+    def _runtime_table_record(
+        memory: SparseMemory,
+        root_address: int,
+        record_address: int,
+    ) -> tuple[str | None, int | None, int | None]:
+        for name, count_offset, pointer_offset in TITLE_SCENE_RECORD_TABLE_SPECS:
+            record_count = memory.read_u32(_u32(root_address + count_offset))
+            table_address = memory.read_u32(_u32(root_address + pointer_offset))
+            table_end = table_address + record_count * TITLE_SCENE_RECORD_SIZE
+            if (
+                record_count <= TITLE_SCENE_RECORD_MAX_COUNT
+                and table_address <= record_address < table_end
+                and (record_address - table_address) % TITLE_SCENE_RECORD_SIZE == 0
+            ):
+                return (
+                    name,
+                    (record_address - table_address) // TITLE_SCENE_RECORD_SIZE,
+                    record_count,
+                )
+        return None, None, None
+
+    @staticmethod
+    def _expected_pairs(
+        sources: Iterable[TitleSceneRecordSourceLayout],
+        table_name: str | None,
+        record_index: int | None,
+    ) -> tuple[tuple[int, int], ...]:
+        if table_name is None or record_index is None:
+            return ()
+        pairs = {
+            struct.unpack_from(
+                "<II",
+                table.records[record_index],
+                TITLE_SCENE_RECORD_INDEX_POINTER_OFFSET,
+            )
+            for source in sources
+            for table in source.tables
+            if table.name == table_name and record_index < table.record_count
+        }
+        return tuple(sorted(pairs))
+
+    def observer(
+        self,
+        cpu: CpuState,
+        memory: SparseMemory,
+        trace: ExecutionTrace,
+        steps: int,
+    ) -> None:
+        if not self.enabled or cpu.eip != TITLE_D3D_INDEXED_DRAW_ADDRESS:
+            return
+        esp = cpu.get_register("esp")
+        if memory.read_u32(esp) != TITLE_D3D_INDEXED_DRAW_WRAPPER_RETURN_ADDRESS:
+            return
+        if memory.read_u32(_u32(esp + 0x10)) != TITLE_SCENE_RECORD_DRAW_RETURN_ADDRESS:
+            return
+
+        scene_call_return = memory.read_u32(_u32(esp + 0x20))
+        scene_call_address = TITLE_SCENE_RECORD_DRAW_CALL_RETURNS.get(scene_call_return)
+        record_address = memory.read_u32(_u32(esp + 0x24))
+        if scene_call_address is None or record_address == 0:
+            return
+
+        passed_count = memory.read_u32(_u32(esp + 0x08))
+        passed_pointer = memory.read_u32(_u32(esp + 0x0C))
+        authoritative_pointer = memory.read_u32(
+            _u32(record_address + TITLE_SCENE_RECORD_INDEX_POINTER_OFFSET)
+        )
+        authoritative_count = memory.read_u32(
+            _u32(record_address + TITLE_SCENE_RECORD_INDEX_COUNT_OFFSET)
+        )
+        root_address = memory.read_u32(TITLE_SCENE_RECORD_ROOT_POINTER_ADDRESS)
+        table_name, record_index, runtime_table_count = self._runtime_table_record(
+            memory, root_address, record_address
+        )
+        matching_sources = self._matching_sources(memory, root_address)
+        expected_pairs = self._expected_pairs(
+            matching_sources, table_name, record_index
+        )
+        passed_pair = (passed_pointer, passed_count)
+        authoritative_pair = (authoritative_pointer, authoritative_count)
+        if passed_pair != authoritative_pair:
+            status = "native_argument_memory_divergence"
+            self.argument_memory_divergence_count += 1
+        elif expected_pairs and authoritative_pair not in expected_pairs:
+            status = "runtime_source_divergence"
+            self.runtime_source_divergence_count += 1
+        elif passed_pair == (0, 0):
+            status = "zero_indices_unattributed"
+        else:
+            status = "healthy"
+
+        guest_flip_count = self._guest_flip_count()
+        if self.first_scene_flip is None:
+            self.first_scene_flip = guest_flip_count
+        elif guest_flip_count != self.first_scene_flip and not self.complete:
+            self.complete = True
+            self.complete_reason = "next_scene_flip_observed"
+            self.completed_scene_flip = self.first_scene_flip
+
+        self.scene_draw_count += 1
+        self.passed_zero_count += int(passed_pair == (0, 0))
+        self.authoritative_zero_count += int(authoritative_pair == (0, 0))
+        self.status_counts[status] += 1
+        self.record_observation_counts[record_address] += 1
+        for source in matching_sources:
+            self.source_match_counts[source.title_path] += 1
+        if table_name is not None and record_index is not None:
+            observed = self._observed_table_indices.setdefault(
+                (root_address, table_name), set()
+            )
+            observed.add(record_index)
+            if (
+                table_name == "primary"
+                and runtime_table_count
+                and len(observed) >= runtime_table_count
+                and not self.complete
+            ):
+                self.complete = True
+                self.complete_reason = "complete_primary_table_observed"
+                self.completed_scene_flip = guest_flip_count
+
+        sample = {
+            "steps": steps,
+            "guest_flip_count": guest_flip_count,
+            "scene_loop_call_address_hex": _hex32(scene_call_address),
+            "scene_loop_return_address_hex": _hex32(scene_call_return),
+            "root_address_hex": _hex32(root_address),
+            "table": table_name,
+            "record_index": record_index,
+            "runtime_table_count": runtime_table_count,
+            "record_address_hex": _hex32(record_address),
+            "passed_index_pointer_hex": _hex32(passed_pointer),
+            "passed_index_count": passed_count,
+            "authoritative_index_pointer_hex": _hex32(authoritative_pointer),
+            "authoritative_index_count": authoritative_count,
+            "expected_pairs": [
+                {
+                    "index_pointer_hex": _hex32(pointer),
+                    "index_count": count,
+                }
+                for pointer, count in expected_pairs
+            ],
+            "matching_source_paths": [
+                source.title_path for source in matching_sources
+            ],
+            "status": status,
+        }
+        signature = (
+            record_address,
+            passed_pair,
+            authoritative_pair,
+            expected_pairs,
+            status,
+        )
+        if (
+            signature not in self._sample_signatures
+            and len(self.record_samples) < self.sample_limit
+        ):
+            self._sample_signatures.add(signature)
+            self.record_samples.append(sample)
+        if status != "healthy":
+            trace.add(cpu.eip, "title_scene_record_audit", **sample)
+
+    def observe_memory_write(
+        self,
+        memory: SparseMemory,
+        *,
+        source: str,
+        instruction_address: int | None,
+        write_address: int,
+        payload: bytes,
+        steps: int | None,
+    ) -> None:
+        if not self.enabled or not payload or not self.watched_field_addresses:
+            return
+        canonicalize = getattr(memory, "_canonical_address", None)
+        start = (
+            int(canonicalize(write_address))
+            if callable(canonicalize)
+            else _u32(write_address)
+        )
+        end = start + len(payload)
+        first = bisect.bisect_left(self.watched_field_addresses, max(0, start - 3))
+        for field_address in self.watched_field_addresses[first:]:
+            if field_address >= end:
+                break
+            if field_address + 4 <= start:
+                continue
+            before_bytes = bytearray(memory.read(field_address, 4))
+            after_bytes = bytearray(before_bytes)
+            overlap_start = max(start, field_address)
+            overlap_end = min(end, field_address + 4)
+            for current in range(overlap_start, overlap_end):
+                after_bytes[current - field_address] = payload[current - start]
+            before = int.from_bytes(before_bytes, "little")
+            after = int.from_bytes(after_bytes, "little")
+            if before == after:
+                continue
+            if before != 0 and after == 0:
+                transition = "cleared"
+            elif before == 0 and after != 0:
+                transition = "initialized"
+            else:
+                transition = "changed"
+            sample = {
+                "source": source,
+                "instruction_address_hex": (
+                    _hex32(instruction_address)
+                    if instruction_address is not None
+                    else None
+                ),
+                "steps": steps,
+                "guest_flip_count": self._guest_flip_count(),
+                "write_address_hex": _hex32(start),
+                "write_size": len(payload),
+                "field_address_hex": _hex32(field_address),
+                "field_kind": (
+                    "index_pointer"
+                    if field_address in self.pointer_field_addresses
+                    else "index_count"
+                ),
+                "before": before,
+                "before_hex": _hex32(before),
+                "after": after,
+                "after_hex": _hex32(after),
+                "transition": transition,
+            }
+            self.write_count += 1
+            self.write_source_counts[source] += 1
+            self.write_transition_counts[transition] += 1
+            if transition == "cleared" and self.first_clearing_write is None:
+                self.first_clearing_write = sample
+            if len(self.write_samples) < self.sample_limit // 2:
+                self.write_samples.append(sample)
+            self.latest_write_samples.append(sample)
+
+    def summary(self) -> dict[str, Any]:
+        if not self.enabled:
+            status = "disabled"
+        elif self.argument_memory_divergence_count:
+            status = "native_read_divergence"
+        elif self.runtime_source_divergence_count:
+            status = "runtime_record_corruption"
+        elif self.scene_draw_count and self.passed_zero_count:
+            status = "zero_indices_unattributed"
+        elif self.scene_draw_count:
+            status = "records_healthy"
+        else:
+            status = "waiting_for_scene"
+        write_samples = [
+            *self.write_samples,
+            *(
+                sample
+                for sample in self.latest_write_samples
+                if sample not in self.write_samples
+            ),
+        ]
+        return {
+            "enabled": self.enabled,
+            "status": status,
+            "execution_mode": "downstream_observer_only_recovered_guest_code",
+            "observer_addresses_hex": [
+                _hex32(address) for address in sorted(self.observer_addresses)
+            ],
+            "source_catalog": {
+                "layout_count": len(self.source_layouts),
+                "error_count": len(self.source_errors),
+                "errors": list(self.source_errors),
+                "watched_field_count": len(self.watched_field_addresses),
+            },
+            "complete": self.complete,
+            "complete_reason": self.complete_reason,
+            "first_scene_flip": self.first_scene_flip,
+            "completed_scene_flip": self.completed_scene_flip,
+            "scene_draw_count": self.scene_draw_count,
+            "passed_zero_count": self.passed_zero_count,
+            "authoritative_zero_count": self.authoritative_zero_count,
+            "argument_memory_divergence_count": (
+                self.argument_memory_divergence_count
+            ),
+            "runtime_source_divergence_count": (
+                self.runtime_source_divergence_count
+            ),
+            "status_counts": dict(self.status_counts.most_common()),
+            "matching_source_counts": dict(self.source_match_counts.most_common()),
+            "record_observation_counts": [
+                {
+                    "record_address_hex": _hex32(address),
+                    "observation_count": count,
+                }
+                for address, count in self.record_observation_counts.most_common()
+            ],
+            "record_samples": self.record_samples,
+            "write_audit": {
+                "write_count": self.write_count,
+                "source_counts": dict(self.write_source_counts.most_common()),
+                "transition_counts": dict(
+                    self.write_transition_counts.most_common()
+                ),
+                "first_clearing_write": self.first_clearing_write,
+                "samples": write_samples,
+            },
+        }
+
+
 class TitleD3DFlushFastPath:
     """Fast-path the observed D3D push-buffer flush/progress helper."""
 
@@ -3633,7 +6192,15 @@ class TitleD3DPacketAllocFastPath:
         wrapped = bool(packet["wrapped"])
         if wrapped:
             self.wrap_count += 1
-        if flags & 0x2 and context_address:
+        if (flags & 0x2) == 0 and context_address:
+            get_pointer_address = memory.read_u32(_u32(context_address + 0x30))
+            if get_pointer_address:
+                # Bit 0x2 skips the title's nested flush call. When the bit is
+                # clear, the native title waits on this GET counter after the
+                # marker is submitted. With no asynchronous NV2A command
+                # processor, completing only the DMA status word leaves the
+                # guest parked forever in the 0x0021B180 fence loop.
+                memory.write_u32(get_pointer_address, put_value)
             dma_state_address = memory.read_u32(_u32(context_address + 0x17F4))
             if dma_state_address:
                 memory.write_u32(
@@ -4041,10 +6608,39 @@ class TitleImmediateDrawAudit:
             maxlen=self.sample_limit // 2
         )
         self.flip_geometry_stats: dict[int, dict[str, Any]] = {}
+        self.batch_flush_count = 0
+        self.suppressed_batch_flush_count = 0
+        self.suppressed_batch_vertex_count = 0
+        self.batch_flush_caller_counts: Counter[int] = Counter()
+        self.suppressed_batch_flush_caller_counts: Counter[int] = Counter()
+        self.latest_batch_flushes: deque[dict[str, Any]] = deque(maxlen=64)
+        self.latest_suppressed_batch_flushes: deque[dict[str, Any]] = deque(
+            maxlen=64
+        )
+        self.clip_update_count = 0
+        self.empty_clip_update_count = 0
+        self.clip_update_caller_counts: Counter[int] = Counter()
+        self.empty_clip_update_caller_counts: Counter[int] = Counter()
+        self.latest_clip_updates: deque[dict[str, Any]] = deque(maxlen=64)
+        self.latest_empty_clip_updates: deque[dict[str, Any]] = deque(maxlen=64)
+        self.plugin_open_attempts: list[dict[str, Any]] = []
+        self.pending_plugin_open_attempts: list[dict[str, Any]] = []
+        self.render_module_open_count = 0
+        self.d3d_create_device_results: list[dict[str, Any]] = []
 
     @property
     def observer_addresses(self) -> set[int]:
-        return {self.draw_address}
+        return {
+            self.draw_address,
+            TITLE_QUAD_BATCH_FLUSH_ADDRESS,
+            TITLE_QUAD_CLIP_UPDATE_ADDRESS,
+            TITLE_QUAD_CLIP_NONEMPTY_ADDRESS,
+            TITLE_QUAD_CLIP_EMPTY_ADDRESS,
+            TITLE_ENGINE_PLUGIN_OPEN_CALL_ADDRESS,
+            TITLE_ENGINE_PLUGIN_OPEN_RETURN_ADDRESS,
+            TITLE_RENDER_MODULE_OPEN_ADDRESS,
+            TITLE_D3D_CREATE_DEVICE_RETURN_ADDRESS,
+        }
 
     def observer(
         self,
@@ -4053,6 +6649,38 @@ class TitleImmediateDrawAudit:
         trace: ExecutionTrace,
         _steps: int,
     ) -> None:
+        if cpu.eip == TITLE_ENGINE_PLUGIN_OPEN_CALL_ADDRESS:
+            self._record_plugin_open_call(cpu, memory)
+            return
+        if cpu.eip == TITLE_ENGINE_PLUGIN_OPEN_RETURN_ADDRESS:
+            self._record_plugin_open_return(cpu)
+            return
+        if cpu.eip == TITLE_RENDER_MODULE_OPEN_ADDRESS:
+            self.render_module_open_count += 1
+            return
+        if cpu.eip == TITLE_D3D_CREATE_DEVICE_RETURN_ADDRESS:
+            self.d3d_create_device_results.append(
+                {
+                    "result": cpu.get_register("eax"),
+                    "result_hex": _hex32(cpu.get_register("eax")),
+                    "width": memory.read_u32(0x005A66F0),
+                    "height": memory.read_u32(0x005A66F4),
+                    "back_buffer_count": memory.read_u32(0x005A66FC),
+                }
+            )
+            return
+        if cpu.eip == TITLE_QUAD_CLIP_UPDATE_ADDRESS:
+            self._record_clip_update(cpu, memory)
+            return
+        if cpu.eip in {
+            TITLE_QUAD_CLIP_NONEMPTY_ADDRESS,
+            TITLE_QUAD_CLIP_EMPTY_ADDRESS,
+        }:
+            self._record_clip_decision(cpu.eip == TITLE_QUAD_CLIP_EMPTY_ADDRESS)
+            return
+        if cpu.eip == TITLE_QUAD_BATCH_FLUSH_ADDRESS:
+            self._record_batch_flush(cpu, memory)
+            return
         if cpu.eip != self.draw_address:
             return
         esp = cpu.get_register("esp")
@@ -4168,6 +6796,161 @@ class TitleImmediateDrawAudit:
                 **sample,
             )
 
+    def _record_plugin_open_call(
+        self,
+        cpu: CpuState,
+        memory: SparseMemory,
+    ) -> None:
+        node_address = cpu.get_register("esi")
+        callback_address = memory.read_u32(_u32(node_address + 0x20))
+        sample = {
+            "node_address_hex": _hex32(node_address),
+            "plugin_id_hex": _hex32(memory.read_u32(node_address)),
+            "plugin_offset": memory.read_u32(_u32(node_address + 4)),
+            "callback_address_hex": _hex32(callback_address),
+            "result": None,
+            "result_hex": None,
+        }
+        self.plugin_open_attempts.append(sample)
+        self.pending_plugin_open_attempts.append(sample)
+
+    def _record_plugin_open_return(self, cpu: CpuState) -> None:
+        if not self.pending_plugin_open_attempts:
+            return
+        sample = self.pending_plugin_open_attempts.pop()
+        result = cpu.get_register("eax")
+        sample["result"] = result
+        sample["result_hex"] = _hex32(result)
+
+    def _record_batch_flush(
+        self,
+        cpu: CpuState,
+        memory: SparseMemory,
+    ) -> None:
+        object_address = cpu.get_register("ecx")
+        esp = cpu.get_register("esp")
+        caller_return_address = memory.read_u32(esp)
+        vertex_count = memory.read_u32(
+            _u32(object_address + TITLE_VERTEX_APPEND_COUNT_OFFSET)
+        )
+        batch_mode = memory.read_u32(
+            _u32(object_address + TITLE_QUAD_BATCH_MODE_OFFSET)
+        )
+        finite_vertex_count = 0
+        min_x: float | None = None
+        max_x: float | None = None
+        min_y: float | None = None
+        max_y: float | None = None
+        if vertex_count <= 0x100:
+            for vertex_index in range(vertex_count):
+                address = _u32(
+                    object_address + vertex_index * TITLE_VERTEX_APPEND_STRIDE
+                )
+                x = struct.unpack(
+                    "<f", struct.pack("<I", memory.read_u32(address))
+                )[0]
+                y = struct.unpack(
+                    "<f", struct.pack("<I", memory.read_u32(_u32(address + 4)))
+                )[0]
+                if not math.isfinite(x) or not math.isfinite(y):
+                    continue
+                finite_vertex_count += 1
+                min_x = x if min_x is None else min(min_x, x)
+                max_x = x if max_x is None else max(max_x, x)
+                min_y = y if min_y is None else min(min_y, y)
+                max_y = y if max_y is None else max(max_y, y)
+        suppressed = batch_mode == 2
+        sample = {
+            "invocation_count": self.batch_flush_count + 1,
+            "caller_return_address_hex": _hex32(caller_return_address),
+            "object_address_hex": _hex32(object_address),
+            "batch_mode": batch_mode,
+            "suppressed": suppressed,
+            "texture_address_hex": _hex32(
+                memory.read_u32(TITLE_QUAD_BATCH_TEXTURE_ADDRESS)
+            ),
+            "vertex_count": vertex_count,
+            "finite_vertex_count": finite_vertex_count,
+            "min_x": min_x,
+            "max_x": max_x,
+            "min_y": min_y,
+            "max_y": max_y,
+            "render_write_count": (
+                self.render_watchpoint.write_count
+                if self.render_watchpoint is not None
+                else None
+            ),
+            "guest_flip_count": (
+                self.render_watchpoint.flip_count
+                if self.render_watchpoint is not None
+                else None
+            ),
+        }
+        self.batch_flush_count += 1
+        self.batch_flush_caller_counts[caller_return_address] += 1
+        self.latest_batch_flushes.append(sample)
+        if suppressed:
+            self.suppressed_batch_flush_count += 1
+            self.suppressed_batch_vertex_count += vertex_count
+            self.suppressed_batch_flush_caller_counts[caller_return_address] += 1
+            self.latest_suppressed_batch_flushes.append(sample)
+
+    def _record_clip_update(
+        self,
+        cpu: CpuState,
+        memory: SparseMemory,
+    ) -> None:
+        esp = cpu.get_register("esp")
+        caller_return_address = memory.read_u32(esp)
+        argument_bits = [
+            memory.read_u32(_u32(esp + 4 + index * 4)) for index in range(4)
+        ]
+        arguments = [
+            struct.unpack("<f", struct.pack("<I", value))[0]
+            for value in argument_bits
+        ]
+        surface_owner = memory.read_u32(TITLE_QUAD_CLIP_SURFACE_OWNER_ADDRESS)
+        surface = (
+            memory.read_u32(_u32(surface_owner + 0x60)) if surface_owner else 0
+        )
+        sample = {
+            "invocation_count": self.clip_update_count + 1,
+            "caller_return_address_hex": _hex32(caller_return_address),
+            "arguments": arguments,
+            "argument_bits_hex": [_hex32(value) for value in argument_bits],
+            "surface_owner_address_hex": _hex32(surface_owner),
+            "surface_address_hex": _hex32(surface),
+            "surface_width": memory.read_u32(_u32(surface + 0x0C)) if surface else 0,
+            "surface_height": memory.read_u32(_u32(surface + 0x10)) if surface else 0,
+            "batch_mode_before": memory.read_u32(
+                _u32(TITLE_VERTEX_APPEND_OBJECT_ADDRESS + TITLE_QUAD_BATCH_MODE_OFFSET)
+            ),
+            "decision": None,
+            "guest_flip_count": (
+                self.render_watchpoint.flip_count
+                if self.render_watchpoint is not None
+                else None
+            ),
+        }
+        self.clip_update_count += 1
+        self.clip_update_caller_counts[caller_return_address] += 1
+        self.latest_clip_updates.append(sample)
+
+    def _record_clip_decision(self, empty: bool) -> None:
+        if not self.latest_clip_updates:
+            return
+        sample = self.latest_clip_updates[-1]
+        if sample["decision"] is not None:
+            return
+        sample["decision"] = "empty" if empty else "nonempty"
+        if empty:
+            self.empty_clip_update_count += 1
+            caller_return_address = int(
+                str(sample["caller_return_address_hex"]), 16
+            )
+            self.empty_clip_update_caller_counts[caller_return_address] += 1
+            self.latest_empty_clip_updates.append(dict(sample))
+
     def summary(self) -> dict[str, Any]:
         samples_by_invocation = {
             int(sample["invocation_count"]): sample
@@ -4212,6 +6995,48 @@ class TitleImmediateDrawAudit:
                 sample for _, sample in sorted(samples_by_invocation.items())
             ],
             "geometry_by_guest_flip": geometry_by_guest_flip,
+            "batch_flush_count": self.batch_flush_count,
+            "batch_flush_caller_counts": [
+                {
+                    "caller_return_address_hex": _hex32(address),
+                    "invocation_count": count,
+                }
+                for address, count in self.batch_flush_caller_counts.most_common()
+            ],
+            "suppressed_batch_flush_count": self.suppressed_batch_flush_count,
+            "suppressed_batch_vertex_count": self.suppressed_batch_vertex_count,
+            "suppressed_batch_flush_caller_counts": [
+                {
+                    "caller_return_address_hex": _hex32(address),
+                    "invocation_count": count,
+                }
+                for address, count in self.suppressed_batch_flush_caller_counts.most_common()
+            ],
+            "latest_batch_flushes": list(self.latest_batch_flushes),
+            "latest_suppressed_batch_flushes": list(
+                self.latest_suppressed_batch_flushes
+            ),
+            "clip_update_count": self.clip_update_count,
+            "empty_clip_update_count": self.empty_clip_update_count,
+            "clip_update_caller_counts": [
+                {
+                    "caller_return_address_hex": _hex32(address),
+                    "invocation_count": count,
+                }
+                for address, count in self.clip_update_caller_counts.most_common()
+            ],
+            "empty_clip_update_caller_counts": [
+                {
+                    "caller_return_address_hex": _hex32(address),
+                    "invocation_count": count,
+                }
+                for address, count in self.empty_clip_update_caller_counts.most_common()
+            ],
+            "latest_clip_updates": list(self.latest_clip_updates),
+            "latest_empty_clip_updates": list(self.latest_empty_clip_updates),
+            "plugin_open_attempts": self.plugin_open_attempts,
+            "render_module_open_count": self.render_module_open_count,
+            "d3d_create_device_results": self.d3d_create_device_results,
         }
 
 
@@ -4835,6 +7660,9 @@ class TitleTextDrawFastPath:
         self.last_arguments: tuple[int, ...] = ()
         self.sampled_strings: list[dict[str, Any]] = []
         self.latest_sampled_strings: deque[dict[str, Any]] = deque(maxlen=16)
+        self.frame_text: deque[
+            tuple[int, bytes, tuple[int, ...], int]
+        ] = deque(maxlen=64)
         self.caller_return_counts: Counter[int] = Counter()
         self.frontend_renderer_parent_return_counts: Counter[int] = Counter()
         self.source_text_counts: Counter[int] = Counter()
@@ -4860,6 +7688,7 @@ class TitleTextDrawFastPath:
         )
         arguments = tuple(memory.read_u32(_u32(esp + 4 + index * 4)) for index in range(5))
         string_address = arguments[0]
+        color_argb = _pack_title_vertex_color(memory, arguments[4])
         object_address = cpu.get_register("ecx")
         frontend_index = memory.read_u32(0x00353104)
         frontend_object_address = memory.read_u32(
@@ -4924,6 +7753,8 @@ class TitleTextDrawFastPath:
             "frontend_object_address_hex": _hex32(frontend_object_address),
             "source_text_address_hex": _hex32(source_text_address),
             "arguments": [_hex32(argument) for argument in arguments],
+            "color_argb": color_argb,
+            "color_argb_hex": _hex32(color_argb),
             "parent_stack_strings": parent_stack_strings,
             "render_write_count": (
                 self.render_watchpoint.write_count
@@ -4939,6 +7770,15 @@ class TitleTextDrawFastPath:
         if len(self.sampled_strings) < 16:
             self.sampled_strings.append(sample)
         self.latest_sampled_strings.append(sample)
+        if self.render_watchpoint is not None:
+            self.frame_text.append(
+                (
+                    self.render_watchpoint.flip_count,
+                    payload,
+                    arguments,
+                    color_argb,
+                )
+            )
         trace.add(
             target,
             "title_text_draw_fast_path",
@@ -4949,6 +7789,8 @@ class TitleTextDrawFastPath:
             string_address_hex=_hex32(string_address),
             character_count=character_count,
             arguments=[_hex32(argument) for argument in arguments],
+            color_argb=color_argb,
+            color_argb_hex=_hex32(color_argb),
             stack_cleanup=self.stack_cleanup,
             bytes_hex=sample["bytes_hex"],
             caller_return_address=caller_return_address,
@@ -4962,6 +7804,30 @@ class TitleTextDrawFastPath:
             render_write_count=sample["render_write_count"],
             guest_flip_count=sample["guest_flip_count"],
         )
+
+    def text_for_completed_flip(self, flip_index: int) -> str | None:
+        manifest = self.manifest_for_completed_flip(flip_index)
+        return str(manifest["frontend_text"]) if manifest is not None else None
+
+    def manifest_for_completed_flip(self, flip_index: int) -> dict[str, Any] | None:
+        source_flip = int(flip_index) - 1
+        for guest_flip, payload, arguments, color_argb in reversed(
+            self.frame_text
+        ):
+            if guest_flip != source_flip:
+                continue
+            try:
+                text = payload.decode("cp1252")
+            except UnicodeDecodeError:
+                return None
+            return {
+                "frontend_text": text,
+                "frontend_text_x_bits": arguments[1],
+                "frontend_text_y_bits": arguments[2],
+                "frontend_text_size_bits": arguments[3],
+                "frontend_text_color_argb": color_argb,
+            }
+        return None
 
     def summary(self) -> dict[str, Any]:
         samples_by_invocation = {
@@ -5128,6 +7994,83 @@ def _truncate_title_color_component(value: float) -> int:
     return int(value) & 0xFF
 
 
+class _FixedCommandRecordRing:
+    """Bounded fixed-size record storage with efficient packed batch appends."""
+
+    def __init__(self, capacity: int, *, record_size: int = 16) -> None:
+        if capacity <= 0:
+            raise ValueError("command record capacity must be positive")
+        if record_size <= 0:
+            raise ValueError("record size must be positive")
+        self.capacity = capacity
+        self.record_size = record_size
+        self._buffer = bytearray(capacity * self.record_size)
+        self._start = 0
+        self._count = 0
+
+    def __len__(self) -> int:
+        return self._count
+
+    def __iter__(self):
+        payload = self.to_bytes()
+        for offset in range(0, len(payload), self.record_size):
+            yield payload[offset : offset + self.record_size]
+
+    def append(self, record: bytes) -> None:
+        self.extend_packed(record)
+
+    def extend_packed(self, payload: bytes | bytearray | memoryview) -> None:
+        view = memoryview(payload).cast("B")
+        if len(view) % self.record_size:
+            raise ValueError(
+                f"packed records must be {self.record_size}-byte aligned"
+            )
+        incoming_count = len(view) // self.record_size
+        if incoming_count == 0:
+            return
+        if incoming_count >= self.capacity:
+            retained = view[
+                (incoming_count - self.capacity) * self.record_size :
+            ]
+            self._buffer[:] = retained
+            self._start = 0
+            self._count = self.capacity
+            return
+        overflow = max(0, self._count + incoming_count - self.capacity)
+        if overflow:
+            self._start = (self._start + overflow) % self.capacity
+            self._count -= overflow
+        write_index = (self._start + self._count) % self.capacity
+        first_count = min(incoming_count, self.capacity - write_index)
+        first_size = first_count * self.record_size
+        first_offset = write_index * self.record_size
+        self._buffer[first_offset : first_offset + first_size] = view[:first_size]
+        remaining_count = incoming_count - first_count
+        if remaining_count:
+            remaining_size = remaining_count * self.record_size
+            self._buffer[:remaining_size] = view[first_size:]
+        self._count += incoming_count
+
+    def tail_bytes(self, record_count: int) -> bytes:
+        record_count = max(0, min(int(record_count), self._count))
+        if record_count == 0:
+            return b""
+        start = (self._start + self._count - record_count) % self.capacity
+        first_count = min(record_count, self.capacity - start)
+        first_offset = start * self.record_size
+        first_size = first_count * self.record_size
+        if first_count == record_count:
+            return bytes(self._buffer[first_offset : first_offset + first_size])
+        remaining_size = (record_count - first_count) * self.record_size
+        return bytes(
+            self._buffer[first_offset : first_offset + first_size]
+            + self._buffer[:remaining_size]
+        )
+
+    def to_bytes(self) -> bytes:
+        return self.tail_bytes(self._count)
+
+
 class RenderWriteWatchpoint:
     """Capture D3D MMIO/push-buffer writes as memory-observer events."""
 
@@ -5137,76 +8080,388 @@ class RenderWriteWatchpoint:
         max_writes: int = DEFAULT_RENDER_STREAM_MAX_WRITES,
         stop_after: int | None = None,
         capture_after: int = 0,
+        retain_diagnostic_writes: bool = True,
     ) -> None:
         self.max_writes = max_writes
         self.stop_after = stop_after
         self.capture_after = max(0, capture_after)
+        self.retain_diagnostic_writes = retain_diagnostic_writes
         self.mmio_write_count = 0
         self.push_buffer_write_count = 0
         self.writes: list[dict[str, Any]] = []
         self.history_writes: deque[dict[str, Any]] = deque(maxlen=max_writes)
-        self.live_command_records: deque[bytes] = deque(maxlen=max_writes)
+        self.live_command_records = _FixedCommandRecordRing(max_writes)
+        self.live_command_eips = _FixedCommandRecordRing(max_writes, record_size=4)
+        self.live_command_sources = _FixedCommandRecordRing(max_writes, record_size=4)
+        self.live_command_steps = _FixedCommandRecordRing(max_writes, record_size=8)
         self._texture_offsets: dict[int, int] = {}
         self._texture_formats: dict[int, int] = {}
-        self._texture_bindings: list[tuple[int, int, int]] = []
-        self._texture_binding_seen: set[tuple[int, int, int]] = set()
+        self._texture_image_rects: dict[int, int] = {}
+        self._texture_bindings: list[tuple[int, int, int, int]] = []
+        self._texture_binding_seen: set[tuple[int, int, int, int]] = set()
         self._texture_pending = bytearray()
         self._texture_pending_end: int | None = None
+        self._vertex_array_offsets: dict[int, int] = {}
+        self._vertex_array_formats: dict[int, int] = {}
+        self._vertex_buffer_ranges: list[tuple[int, int]] = []
+        self._active_vertex_primitive = 0
+        self._active_vertex_max_index = -1
         self.flip_count = 0
         self._pending_flip_boundaries: deque[dict[str, int]] = deque()
+        self._push_buffer_range_provider: (
+            Callable[[], tuple[int, int] | None] | None
+        ) = None
+        self._dynamic_push_buffer_range: tuple[int, int] | None = None
+        self.native_batch_count = 0
+        self.native_batch_write_count = 0
+        self.native_batch_total_us = 0
+        self.native_batch_max_us = 0
+
+    def set_push_buffer_range_provider(
+        self,
+        provider: Callable[[], tuple[int, int] | None],
+    ) -> None:
+        self._push_buffer_range_provider = provider
+
+    def _normalize_dynamic_push_buffer_address(self, address: int) -> int | None:
+        canonical = XbeBackedSparseMemory._canonical_address(address)
+        if not 0x20000000 <= canonical < 0x30000000:
+            return None
+        active_range = self._dynamic_push_buffer_range
+        if active_range is None or not active_range[0] <= canonical < active_range[1]:
+            if self._push_buffer_range_provider is None:
+                return None
+            candidate = self._push_buffer_range_provider()
+            if (
+                candidate is None
+                or candidate[0] >= candidate[1]
+                or candidate[1] - candidate[0] > RENDER_PUSH_BUFFER_APERTURE_SIZE
+            ):
+                return None
+            active_range = candidate
+            self._dynamic_push_buffer_range = candidate
+        if not active_range[0] <= canonical < active_range[1]:
+            return None
+        # Preserve the complete title allocation in the host's stable
+        # push-buffer aperture. Folding this offset to 64 KiB aliases distinct
+        # command runs in Burnout 2's 2 MiB ring and yields incomplete frames.
+        return TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS + (
+            canonical - active_range[0]
+        )
 
     @property
     def write_count(self) -> int:
         return self.mmio_write_count + self.push_buffer_write_count
 
-    def observe(self, address: int, payload: bytes) -> None:
+    def observe(
+        self,
+        address: int,
+        payload: bytes,
+        *,
+        instruction_address: int | None = None,
+        source_address: int | None = None,
+        steps: int | None = None,
+    ) -> None:
+        if len(payload) > 8:
+            # Asset and filesystem HLE calls can copy multi-megabyte payloads
+            # through this observer. Reject bytes outside the three command
+            # apertures before splitting them into the decoder's 8-byte
+            # records; chunking first turned ordinary frontend loads into
+            # millions of Python calls.
+            end = address + len(payload)
+            if end > 0x1_0000_0000:
+                relevant_offsets = range(0, len(payload), 8)
+            else:
+                ranges = [
+                    (
+                        TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS,
+                        RENDER_PUSH_BUFFER_APERTURE_END_ADDRESS,
+                    ),
+                    (0xFED00000, 0xFED10000),
+                ]
+                dynamic_ranges: set[tuple[int, int]] = set()
+                if self._dynamic_push_buffer_range is not None:
+                    dynamic_ranges.add(self._dynamic_push_buffer_range)
+                if self._push_buffer_range_provider is not None:
+                    candidate = self._push_buffer_range_provider()
+                    if (
+                        candidate is not None
+                        and candidate[0] < candidate[1]
+                        and candidate[1] - candidate[0]
+                        <= RENDER_PUSH_BUFFER_APERTURE_SIZE
+                    ):
+                        dynamic_ranges.add(candidate)
+                for start, stop in dynamic_ranges:
+                    ranges.append((start, stop))
+                    ranges.append((start | 0x80000000, stop | 0x80000000))
+                relevant: set[int] = set()
+                for start, stop in ranges:
+                    overlap_start = max(address, start)
+                    overlap_end = min(end, stop)
+                    if overlap_start >= overlap_end:
+                        continue
+                    first_offset = (
+                        (overlap_start - address + 7) // 8
+                    ) * 8
+                    for offset in range(first_offset, overlap_end - address, 8):
+                        relevant.add(offset)
+                relevant_offsets = sorted(relevant)
+            for offset in relevant_offsets:
+                self.observe(
+                    address + offset,
+                    payload[offset : offset + 8],
+                    instruction_address=instruction_address,
+                    source_address=source_address,
+                    steps=steps,
+                )
+            return
         kind: str | None = None
         offset: int | None = None
+        guest_address = address
+        normalized_address = address
         if 0xFED00000 <= address <= 0xFED0FFFF:
             kind = "d3d_mmio"
             offset = address - 0xFED00000
             self.mmio_write_count += 1
-        elif 0x80000000 <= address <= 0x8000FFFF:
+        elif (
+            TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS
+            <= address
+            < RENDER_PUSH_BUFFER_APERTURE_END_ADDRESS
+        ):
             kind = "d3d_push_buffer"
-            offset = address - 0x80000000
+            offset = address - TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS
             self.push_buffer_write_count += 1
+        else:
+            normalized = self._normalize_dynamic_push_buffer_address(address)
+            if normalized is not None:
+                kind = "d3d_push_buffer"
+                normalized_address = normalized
+                offset = normalized - TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS
+                self.push_buffer_write_count += 1
         if kind is None:
             return
         if kind == "d3d_push_buffer":
-            self._observe_texture_write(address, payload)
+            self._observe_texture_write(normalized_address, payload)
         else:
             # The MMIO submission that closes the pending push-buffer run is
             # part of the audited flip and must be present in its replay.
             self._flush_texture_writes(boundary_write_count=self.write_count)
-        value = int.from_bytes(payload[: min(len(payload), 4)], "little", signed=False)
-        record = {
-            "sequence": self.write_count - 1,
-            "instruction_address_hex": None,
-            "kind": kind,
-            "address": _u32(address),
-            "address_hex": _hex32(address),
-            "offset": offset,
-            "offset_hex": _hex32(offset) if offset is not None else None,
-            "value": value,
-            "value_hex": _hex32(value),
-            "size": len(payload),
-            "bytes_hex": payload.hex().upper(),
-        }
         self.live_command_records.append(
             struct.pack(
                 "<BBHI8s",
                 0 if kind == "d3d_mmio" else 1,
                 len(payload),
                 0,
-                address,
+                normalized_address,
                 payload[:8].ljust(8, b"\x00"),
             )
         )
-        self.history_writes.append(record)
-        if self.write_count > self.capture_after and len(self.writes) < self.max_writes:
-            self.writes.append(record)
+        self.live_command_eips.append(
+            struct.pack("<I", _u32(instruction_address or 0))
+        )
+        self.live_command_sources.append(
+            struct.pack("<I", _u32(source_address or 0))
+        )
+        self.live_command_steps.append(
+            struct.pack("<Q", max(0, int(steps or 0)))
+        )
+        if self.retain_diagnostic_writes:
+            value = int.from_bytes(
+                payload[: min(len(payload), 4)],
+                "little",
+                signed=False,
+            )
+            record = {
+                "sequence": self.write_count - 1,
+                "instruction_address_hex": (
+                    _hex32(instruction_address)
+                    if instruction_address is not None
+                    else None
+                ),
+                "source_address_hex": (
+                    _hex32(source_address) if source_address is not None else None
+                ),
+                "steps": steps,
+                "kind": kind,
+                "address": _u32(normalized_address),
+                "address_hex": _hex32(normalized_address),
+                "guest_address": _u32(guest_address),
+                "guest_address_hex": _hex32(guest_address),
+                "offset": offset,
+                "offset_hex": _hex32(offset) if offset is not None else None,
+                "value": value,
+                "value_hex": _hex32(value),
+                "size": len(payload),
+                "bytes_hex": payload.hex().upper(),
+            }
+            self.history_writes.append(record)
+            if (
+                self.write_count > self.capture_after
+                and len(self.writes) < self.max_writes
+            ):
+                self.writes.append(record)
         if self.stop_after is not None and self.write_count >= self.stop_after:
             raise RenderWatchpointStop(self.to_stream())
+
+    def observe_native_write_batch(
+        self,
+        packed_records: Any | None,
+        addresses: Any,
+        values: Any,
+        sizes: Any,
+        eips: Any,
+        source_addresses: Any,
+        steps: Any,
+        count: int,
+        observed_range_start: int | None = None,
+        contiguous_u32: bool = False,
+    ) -> None:
+        """Consume the native low-memory push-buffer log without per-write calls."""
+        count = max(0, int(count))
+        if count == 0:
+            return
+        if self.retain_diagnostic_writes or self.stop_after is not None:
+            for index in range(count):
+                size = int(sizes[index])
+                self.observe(
+                    int(addresses[index]),
+                    int(values[index]).to_bytes(size, "little"),
+                    instruction_address=int(eips[index]),
+                    source_address=int(source_addresses[index]),
+                    steps=int(steps[index]),
+                )
+            return
+        active_range = (
+            self._push_buffer_range_provider()
+            if self._push_buffer_range_provider is not None
+            else self._dynamic_push_buffer_range
+        )
+        if (
+            active_range is None
+            or active_range[0] >= active_range[1]
+            or active_range[1] - active_range[0]
+            > RENDER_PUSH_BUFFER_APERTURE_SIZE
+        ):
+            for index in range(count):
+                size = int(sizes[index])
+                self.observe(
+                    int(addresses[index]),
+                    int(values[index]).to_bytes(size, "little"),
+                    instruction_address=int(eips[index]),
+                    source_address=int(source_addresses[index]),
+                    steps=int(steps[index]),
+                )
+            return
+
+        started_ns = time.perf_counter_ns()
+        self._dynamic_push_buffer_range = active_range
+        if (
+            packed_records is not None
+            and contiguous_u32
+            and observed_range_start == active_range[0]
+        ):
+            guest_address = int(addresses[0])
+            normalized_address = TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS + (
+                guest_address - active_range[0]
+            )
+            if (
+                self._texture_pending
+                and normalized_address != self._texture_pending_end
+            ):
+                self._flush_texture_writes(
+                    boundary_write_count=self.write_count
+                )
+            self._texture_pending.extend(
+                ctypes.string_at(ctypes.addressof(values), count * 4)
+            )
+            self._texture_pending_end = normalized_address + count * 4
+            self.push_buffer_write_count += count
+            self.live_command_records.extend_packed(
+                ctypes.string_at(ctypes.addressof(packed_records), count * 16)
+            )
+            self.live_command_eips.extend_packed(
+                ctypes.string_at(ctypes.addressof(eips), count * 4)
+            )
+            self.live_command_sources.extend_packed(
+                ctypes.string_at(ctypes.addressof(source_addresses), count * 4)
+            )
+            self.live_command_steps.extend_packed(
+                ctypes.string_at(ctypes.addressof(steps), count * 8)
+            )
+            elapsed_us = max(
+                0,
+                (time.perf_counter_ns() - started_ns) // 1_000,
+            )
+            self.native_batch_count += 1
+            self.native_batch_write_count += count
+            self.native_batch_total_us += elapsed_us
+            self.native_batch_max_us = max(
+                self.native_batch_max_us,
+                elapsed_us,
+            )
+            return
+        records = bytearray(count * 16)
+        eip_records = bytearray(count * 4)
+        source_records = bytearray(count * 4)
+        step_records = bytearray(count * 8)
+        record_count = 0
+        record_struct = struct.Struct("<BBHIII")
+        for index in range(count):
+            guest_address = XbeBackedSparseMemory._canonical_address(
+                int(addresses[index])
+            )
+            size = int(sizes[index])
+            if (
+                size not in {1, 4}
+                or not active_range[0] <= guest_address < active_range[1]
+                or guest_address + size > active_range[1]
+            ):
+                raise ValueError(
+                    "native render-write batch escaped its observed push-buffer range"
+                )
+            value = int(values[index]) & (0xFF if size == 1 else 0xFFFFFFFF)
+            normalized_address = TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS + (
+                guest_address - active_range[0]
+            )
+            self.push_buffer_write_count += 1
+            payload = value.to_bytes(size, "little")
+            self._observe_texture_write(normalized_address, payload)
+            record_struct.pack_into(
+                records,
+                record_count * 16,
+                1,
+                size,
+                0,
+                normalized_address,
+                value,
+                0,
+            )
+            struct.pack_into("<I", eip_records, record_count * 4, int(eips[index]))
+            struct.pack_into(
+                "<I",
+                source_records,
+                record_count * 4,
+                int(source_addresses[index]),
+            )
+            struct.pack_into("<Q", step_records, record_count * 8, int(steps[index]))
+            record_count += 1
+        self.live_command_records.extend_packed(
+            memoryview(records)[: record_count * 16]
+        )
+        self.live_command_eips.extend_packed(
+            memoryview(eip_records)[: record_count * 4]
+        )
+        self.live_command_sources.extend_packed(
+            memoryview(source_records)[: record_count * 4]
+        )
+        self.live_command_steps.extend_packed(
+            memoryview(step_records)[: record_count * 8]
+        )
+        elapsed_us = max(0, (time.perf_counter_ns() - started_ns) // 1_000)
+        self.native_batch_count += 1
+        self.native_batch_write_count += record_count
+        self.native_batch_total_us += elapsed_us
+        self.native_batch_max_us = max(self.native_batch_max_us, elapsed_us)
 
     def to_stream(self) -> dict[str, Any]:
         return {
@@ -5215,8 +8470,21 @@ class RenderWriteWatchpoint:
             "push_buffer_write_count": self.push_buffer_write_count,
             "captured_write_count": len(self.writes),
             "capture_after_write_count": self.capture_after,
+            "diagnostic_write_retention": self.retain_diagnostic_writes,
             "skipped_write_count": min(self.write_count, self.capture_after),
             "truncated": self.write_count > len(self.writes),
+            "dynamic_push_buffer_range": (
+                {
+                    "base_hex": _hex32(self._dynamic_push_buffer_range[0]),
+                    "end_hex": _hex32(self._dynamic_push_buffer_range[1]),
+                }
+                if self._dynamic_push_buffer_range is not None
+                else None
+            ),
+            "native_write_batch": self._native_write_batch_summary(),
+            "transform_constant_upload_provenance": (
+                self._transform_constant_upload_provenance_summary()
+            ),
             "writes": list(self.writes),
         }
 
@@ -5227,16 +8495,27 @@ class RenderWriteWatchpoint:
             "mmio_write_count": self.mmio_write_count,
             "push_buffer_write_count": self.push_buffer_write_count,
             "captured_write_count": len(self.history_writes),
+            "diagnostic_write_retention": self.retain_diagnostic_writes,
             "truncated": self.write_count > len(self.history_writes),
+            "native_write_batch": self._native_write_batch_summary(),
+            "transform_constant_upload_provenance": (
+                self._transform_constant_upload_provenance_summary()
+            ),
             "writes": list(self.history_writes),
             "texture_bindings": [list(binding) for binding in self._texture_bindings],
+            "vertex_buffer_ranges": [
+                [start, end] for start, end in self._vertex_buffer_ranges
+            ],
         }
 
     def resource_binding_stream(self) -> dict[str, Any]:
-        """Return retained texture bindings without cloning diagnostic writes."""
+        """Return retained GPU resource bindings without cloning diagnostic writes."""
         self._flush_texture_writes(clear=False)
         return {
-            "texture_bindings": [list(binding) for binding in self._texture_bindings]
+            "texture_bindings": [list(binding) for binding in self._texture_bindings],
+            "vertex_buffer_ranges": [
+                [start, end] for start, end in self._vertex_buffer_ranges
+            ],
         }
 
     def live_epoch_stream(self) -> dict[str, Any]:
@@ -5245,8 +8524,237 @@ class RenderWriteWatchpoint:
             "mmio_write_count": self.mmio_write_count,
             "push_buffer_write_count": self.push_buffer_write_count,
             "captured_write_count": len(self.live_command_records),
+            "diagnostic_write_retention": self.retain_diagnostic_writes,
             "truncated": self.write_count > len(self.live_command_records),
+            "native_write_batch": self._native_write_batch_summary(),
             "writes": [],
+        }
+
+    def _native_write_batch_summary(self) -> dict[str, Any]:
+        return {
+            "batch_count": self.native_batch_count,
+            "write_count": self.native_batch_write_count,
+            "total_us": self.native_batch_total_us,
+            "max_us": self.native_batch_max_us,
+            "average_us": round(
+                self.native_batch_total_us / max(1, self.native_batch_count),
+                3,
+            ),
+        }
+
+    def _transform_constant_upload_provenance_summary(self) -> dict[str, Any]:
+        retained_count = min(
+            len(self.live_command_records),
+            len(self.live_command_eips),
+            len(self.live_command_sources),
+            len(self.live_command_steps),
+        )
+        if retained_count == 0:
+            return {
+                "status": "not_captured",
+                "retained_command_count": 0,
+                "matrix_upload_count": 0,
+                "near_zero_basis_matrix_upload_count": 0,
+                "near_zero_producer_instruction_counts": [],
+                "near_zero_matrix_uploads": [],
+                "latest_matrix_upload": None,
+            }
+
+        command_bytes = self.live_command_records.tail_bytes(retained_count)
+        eip_bytes = self.live_command_eips.tail_bytes(retained_count)
+        source_bytes = self.live_command_sources.tail_bytes(retained_count)
+        step_bytes = self.live_command_steps.tail_bytes(retained_count)
+        command_record = struct.Struct("<BBHI8s")
+        method_records: list[dict[str, int]] = []
+        run_base: int | None = None
+        run_payload = bytearray()
+        run_eips: list[int] = []
+        run_sources: list[int] = []
+        run_steps: list[int] = []
+
+        def flush_run() -> None:
+            nonlocal run_base, run_payload, run_eips, run_sources, run_steps
+            if run_base is None or len(run_payload) < 4:
+                run_base = None
+                run_payload = bytearray()
+                run_eips = []
+                run_sources = []
+                run_steps = []
+                return
+            aligned_size = len(run_payload) & ~3
+            words = memoryview(run_payload)[:aligned_size].cast("I")
+            index = 0
+            while index < len(words):
+                command = int(words[index])
+                non_increasing = False
+                header_words = 1
+                if command & 0xE0030003 == 0:
+                    count = (command >> 18) & 0x7FF
+                elif command & 0xE0030003 == 0x40000000:
+                    count = (command >> 18) & 0x7FF
+                    non_increasing = True
+                elif (
+                    command & 0xFFFF0003 == 0x00030000
+                    and index + 1 < len(words)
+                ):
+                    count = int(words[index + 1]) & 0x00FFFFFF
+                    non_increasing = True
+                    header_words = 2
+                else:
+                    index += 1
+                    continue
+                first_method = ((command >> 2) & 0x7FF) * 4
+                data_start = index + header_words
+                data_end = min(data_start + count, len(words))
+                for data_index in range(data_start, data_end):
+                    method_offset = 0 if non_increasing else data_index - data_start
+                    byte_offset = data_index * 4
+                    method_records.append(
+                        {
+                            "method": first_method + method_offset * 4,
+                            "data": int(words[data_index]),
+                            "push_buffer_address": run_base + byte_offset,
+                            "instruction_address": run_eips[byte_offset],
+                            "source_address": run_sources[byte_offset],
+                            "steps": run_steps[byte_offset],
+                        }
+                    )
+                index = data_end
+            run_base = None
+            run_payload = bytearray()
+            run_eips = []
+            run_sources = []
+            run_steps = []
+
+        for index in range(retained_count):
+            record_offset = index * command_record.size
+            kind, size, _reserved, address, payload = command_record.unpack_from(
+                command_bytes,
+                record_offset,
+            )
+            eip = struct.unpack_from("<I", eip_bytes, index * 4)[0]
+            source = struct.unpack_from("<I", source_bytes, index * 4)[0]
+            steps = struct.unpack_from("<Q", step_bytes, index * 8)[0]
+            if kind != 1 or size == 0 or size > len(payload):
+                flush_run()
+                continue
+            if run_base is None or address != run_base + len(run_payload):
+                flush_run()
+                run_base = address
+            run_payload.extend(payload[:size])
+            run_eips.extend([eip] * size)
+            run_sources.extend([source] * size)
+            run_steps.extend([steps] * size)
+        flush_run()
+
+        tail_flip_count = sum(
+            1 for record in method_records if record["method"] == 0x012C
+        )
+        first_tail_flip = max(0, self.flip_count - tail_flip_count)
+        flip_ordinal = 0
+        constant_load = 0
+        active_matrix: dict[int, list[dict[str, int]]] | None = None
+        matrices: list[dict[str, Any]] = []
+        for record in method_records:
+            method = record["method"]
+            data = record["data"]
+            if method == 0x012C:
+                flip_ordinal += 1
+                continue
+            if method == 0x1EA4:
+                constant_load = data
+                if constant_load != 96:
+                    active_matrix = None
+                continue
+            if not (0x0B80 <= method <= 0x0BFC and (method - 0x0B80) % 4 == 0):
+                continue
+            lane = ((method - 0x0B80) // 4) % 4
+            if lane == 0 and constant_load == 96:
+                active_matrix = {}
+            if active_matrix is not None and 96 <= constant_load <= 99:
+                active_matrix.setdefault(constant_load, []).append(record)
+            if lane != 3:
+                continue
+            if (
+                active_matrix is not None
+                and constant_load == 99
+                and all(len(active_matrix.get(row, [])) == 4 for row in range(96, 100))
+            ):
+                ordered = [
+                    active_matrix[row][component]
+                    for row in range(96, 100)
+                    for component in range(4)
+                ]
+                bits = [item["data"] for item in ordered]
+                values = list(struct.unpack("<16f", struct.pack("<16I", *bits)))
+                rows = [values[offset : offset + 4] for offset in range(0, 16, 4)]
+                max_abs_basis = max(
+                    abs(component) for row in rows for component in row[:3]
+                )
+                instruction_counts = Counter(
+                    item["instruction_address"]
+                    for item in ordered
+                    if item["instruction_address"]
+                )
+                sources = [item["source_address"] for item in ordered if item["source_address"]]
+                steps = [item["steps"] for item in ordered if item["steps"]]
+                matrices.append(
+                    {
+                        "next_guest_flip_count": first_tail_flip + flip_ordinal + 1,
+                        "position_c96_c99_max_abs_basis": round(max_abs_basis, 9),
+                        "position_c96_c99_near_zero_basis": max_abs_basis < 0.01,
+                        "position_c96_c99_rows": [
+                            [round(component, 9) for component in row] for row in rows
+                        ],
+                        "position_c96_c99_bits": [
+                            bits[offset : offset + 4] for offset in range(0, 16, 4)
+                        ],
+                        "producer_instruction_counts": [
+                            {
+                                "instruction_address_hex": _hex32(address),
+                                "word_count": count,
+                            }
+                            for address, count in instruction_counts.most_common()
+                        ],
+                        "source_address_min_hex": _hex32(min(sources)) if sources else None,
+                        "source_address_max_hex": _hex32(max(sources)) if sources else None,
+                        "step_min": min(steps) if steps else None,
+                        "step_max": max(steps) if steps else None,
+                        "push_buffer_address_min_hex": _hex32(
+                            min(item["push_buffer_address"] for item in ordered)
+                        ),
+                        "push_buffer_address_max_hex": _hex32(
+                            max(item["push_buffer_address"] for item in ordered)
+                        ),
+                    }
+                )
+                active_matrix = None
+            constant_load += 1
+
+        near_zero_matrices = [
+            matrix
+            for matrix in matrices
+            if matrix["position_c96_c99_near_zero_basis"]
+        ]
+        near_zero_producers: Counter[int] = Counter()
+        for matrix in near_zero_matrices:
+            for producer in matrix["producer_instruction_counts"]:
+                near_zero_producers[int(producer["instruction_address_hex"], 0)] += 1
+        return {
+            "status": "captured" if matrices else "no_position_matrix_uploads_retained",
+            "retained_command_count": retained_count,
+            "tail_flip_count": tail_flip_count,
+            "matrix_upload_count": len(matrices),
+            "near_zero_basis_matrix_upload_count": len(near_zero_matrices),
+            "near_zero_producer_instruction_counts": [
+                {
+                    "instruction_address_hex": _hex32(address),
+                    "matrix_upload_count": count,
+                }
+                for address, count in near_zero_producers.most_common(16)
+            ],
+            "near_zero_matrix_uploads": near_zero_matrices[-16:],
+            "latest_matrix_upload": matrices[-1] if matrices else None,
         }
 
     def has_pending_flip(self) -> bool:
@@ -5272,6 +8780,8 @@ class RenderWriteWatchpoint:
         boundary_write_count: int,
     ) -> None:
         if method == 0x012C:
+            self._retain_active_vertex_buffer_range()
+            self._active_vertex_max_index = -1
             if record_flips:
                 self.flip_count += 1
                 self._pending_flip_boundaries.append(
@@ -5282,16 +8792,46 @@ class RenderWriteWatchpoint:
                     }
                 )
             return
-        if method == 0x17FC and data != 0:
-            for stage in sorted(self._texture_offsets.keys() & self._texture_formats.keys()):
-                binding = (
-                    stage,
-                    self._texture_offsets[stage],
-                    self._texture_formats[stage],
-                )
-                if binding not in self._texture_binding_seen:
-                    self._texture_binding_seen.add(binding)
-                    self._texture_bindings.append(binding)
+        if method == 0x17FC:
+            if data != 0:
+                self._retain_active_vertex_buffer_range()
+                self._active_vertex_primitive = data
+                self._active_vertex_max_index = -1
+                for stage in sorted(
+                    self._texture_offsets.keys() & self._texture_formats.keys()
+                ):
+                    binding = (
+                        stage,
+                        self._texture_offsets[stage],
+                        self._texture_formats[stage],
+                        self._texture_image_rects.get(stage, 0),
+                    )
+                    if binding not in self._texture_binding_seen:
+                        self._texture_binding_seen.add(binding)
+                        self._texture_bindings.append(binding)
+            else:
+                self._retain_active_vertex_buffer_range()
+                self._active_vertex_primitive = 0
+                self._active_vertex_max_index = -1
+            return
+        if method == 0x1800 and self._active_vertex_primitive:
+            self._active_vertex_max_index = max(
+                self._active_vertex_max_index,
+                data & 0xFFFF,
+                (data >> 16) & 0xFFFF,
+            )
+            return
+        if method == 0x1808 and self._active_vertex_primitive:
+            self._active_vertex_max_index = max(
+                self._active_vertex_max_index,
+                data,
+            )
+            return
+        if 0x1720 <= method <= 0x175C and (method - 0x1720) % 4 == 0:
+            self._vertex_array_offsets[(method - 0x1720) // 4] = data
+            return
+        if 0x1760 <= method <= 0x179C and (method - 0x1760) % 4 == 0:
+            self._vertex_array_formats[(method - 0x1760) // 4] = data
             return
         if not 0x1B00 <= method < 0x1C00:
             return
@@ -5301,6 +8841,51 @@ class RenderWriteWatchpoint:
             self._texture_offsets[stage] = data
         elif register == 4:
             self._texture_formats[stage] = data
+        elif register == 0x18:
+            self._texture_image_rects[stage] = data
+
+    @staticmethod
+    def _vertex_array_element_size(format_raw: int) -> int:
+        value_type = format_raw & 0xF
+        components = (format_raw >> 4) & 0xF
+        if components == 0:
+            return 0
+        if value_type == 2:
+            return components * 4
+        if value_type in {0, 4, 6}:
+            return 4
+        return components * 2
+
+    def _retain_active_vertex_buffer_range(self) -> None:
+        if self._active_vertex_max_index < 0:
+            return
+        starts: list[int] = []
+        ends: list[int] = []
+        for slot in sorted(
+            self._vertex_array_offsets.keys() & self._vertex_array_formats.keys()
+        ):
+            address = self._vertex_array_offsets[slot]
+            format_raw = self._vertex_array_formats[slot]
+            stride = (format_raw >> 8) & 0xFFFFFF
+            element_size = self._vertex_array_element_size(format_raw)
+            if address == 0 or stride == 0 or element_size == 0:
+                continue
+            end = address + self._active_vertex_max_index * stride + element_size
+            if end <= address or end - address > 16 * 1024 * 1024:
+                continue
+            starts.append(address)
+            ends.append(end)
+        if not starts:
+            return
+        merged: list[tuple[int, int]] = []
+        for start, end in sorted(
+            [*self._vertex_buffer_ranges, *zip(starts, ends)]
+        ):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        self._vertex_buffer_ranges = merged
 
     def _flush_texture_writes(
         self,
@@ -5310,14 +8895,8 @@ class RenderWriteWatchpoint:
     ) -> None:
         if boundary_write_count is None:
             boundary_write_count = self.write_count
-        words = [
-            int.from_bytes(self._texture_pending[offset : offset + 4], "little")
-            for offset in range(
-                0,
-                len(self._texture_pending) - (len(self._texture_pending) % 4),
-                4,
-            )
-        ]
+        aligned_size = len(self._texture_pending) & ~3
+        words = memoryview(self._texture_pending)[:aligned_size].cast("I")
         index = 0
         while index < len(words):
             command = words[index]
@@ -5376,6 +8955,10 @@ class LiveHostBridge:
         flip_audit_max_flips: int = 0,
         presentation_ack_path: Path | None = None,
         data_export_synchronizer: Callable[[SparseMemory], None] | None = None,
+        frontend_text_provider: Callable[
+            [int], str | dict[str, Any] | None
+        ]
+        | None = None,
     ) -> None:
         self.runtime = runtime
         self.render_watchpoint = render_watchpoint
@@ -5389,6 +8972,13 @@ class LiveHostBridge:
             render_stream_path.name
             + f".{self.command_stream_generation}.commands.bin"
         )
+        self.command_snapshot_base_record_count = 0
+        self.command_epoch = 0
+        self.command_epoch_rotation_count = 0
+        self.retired_snapshot_delete_count = 0
+        self.retired_snapshot_delete_bytes = 0
+        self._retired_command_paths: list[Path] = []
+        self._retired_resource_paths: list[Path] = []
         self._render_command_file: BinaryIO | None = None
         self.controller_state_path = controller_state_path
         self.controller_consumed_path = controller_state_path.with_name(
@@ -5446,6 +9036,7 @@ class LiveHostBridge:
         self.flip_audit_health_interval = max(0, int(flip_audit_health_interval))
         self.flip_audit_max_flips = max(0, int(flip_audit_max_flips))
         self.data_export_synchronizer = data_export_synchronizer
+        self.frontend_text_provider = frontend_text_provider
         if self.flip_audit_ack_path is not None:
             self.render_command_path = (
                 self.flip_audit_ack_path.parent
@@ -5469,7 +9060,9 @@ class LiveHostBridge:
         self.render_resource_publish_count = 0
         self.render_resource_scan_count = 0
         self.last_render_resource_scan_time = 0.0
-        self.last_render_resource_signatures: tuple[tuple[int, str], ...] | None = None
+        self.last_render_resource_signatures: (
+            tuple[tuple[int, int, int, str, str], ...] | None
+        ) = None
         self.last_render_publish_time = 0.0
         self.last_command_flush_time = 0.0
         self.last_published_manifest_flip_count = 0
@@ -5490,7 +9083,7 @@ class LiveHostBridge:
         self._flip_audit_ledger_buffer: list[str] = []
         self._last_published_manifest: dict[str, Any] | None = None
         self._resource_snapshot_cache: dict[
-            tuple[int, int, int], tuple[tuple[int, ...], dict[str, Any]]
+            tuple[int, int, int, int], tuple[tuple[int, ...], dict[str, Any]]
         ] = {}
         self._performance: dict[str, dict[str, int]] = {}
         self._publish_cadence_samples: deque[tuple[int, int]] = deque(maxlen=120)
@@ -5593,10 +9186,10 @@ class LiveHostBridge:
     @staticmethod
     def _reset_live_commands_atomic(
         path: Path,
-        records: deque[bytes],
+        records: bytes,
     ) -> None:
         payload = bytearray(b"B2APPND1")
-        payload.extend(b"".join(records))
+        payload.extend(records)
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(path.name + ".tmp")
         temporary.write_bytes(payload)
@@ -5610,18 +9203,81 @@ class LiveHostBridge:
                     raise
                 time.sleep(0.02)
 
-    def _append_live_commands(self, path: Path, records: list[bytes]) -> None:
+    def _append_live_commands(self, path: Path, records: bytes) -> None:
         if not records:
             return
         if self._render_command_file is None or self._render_command_file.closed:
             self._render_command_file = path.open("ab", buffering=0)
-        self._render_command_file.write(b"".join(records))
+        self._render_command_file.write(records)
 
     def _close_render_command_file(self) -> None:
         if self._render_command_file is None:
             return
         self._render_command_file.close()
         self._render_command_file = None
+
+    def _delete_retired_snapshot(self, path: Path) -> bool:
+        try:
+            byte_count = path.stat().st_size
+            path.unlink()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        self.retired_snapshot_delete_count += 1
+        self.retired_snapshot_delete_bytes += byte_count
+        return True
+
+    def _cleanup_retired_snapshots(self) -> None:
+        if self.presentation_ack_path is None or self.flip_audit_ack_path is not None:
+            return
+        self._retired_command_paths = [
+            path
+            for path in self._retired_command_paths
+            if not self._delete_retired_snapshot(path)
+        ]
+        self._retired_resource_paths = [
+            path
+            for path in self._retired_resource_paths
+            if not self._delete_retired_snapshot(path)
+        ]
+
+    def _rotate_live_command_epoch(
+        self,
+        *,
+        completed_write_count: int,
+        completed_flip_index: int,
+    ) -> None:
+        if self.presentation_ack_path is None or self.flip_audit_ack_path is not None:
+            return
+        completed_write_count = max(0, int(completed_write_count))
+        if completed_write_count > self.published_command_record_count:
+            raise RuntimeError(
+                "cannot rotate live command epoch beyond its published command tail"
+            )
+        carried_record_count = (
+            self.published_command_record_count - completed_write_count
+        )
+        if carried_record_count > len(self.render_watchpoint.live_command_records):
+            raise RuntimeError(
+                "live render command epoch carry overflowed retained command history"
+            )
+        self._close_render_command_file()
+        if self.render_command_path.is_file():
+            self._retired_command_paths.append(self.render_command_path)
+        self.command_snapshot_base_record_count = completed_write_count
+        self.command_epoch += 1
+        self.command_epoch_rotation_count += 1
+        self.render_command_path = self.render_stream_path.with_name(
+            self.render_stream_path.name
+            + f".{self.command_stream_generation}.epoch-{completed_flip_index:08d}.commands.bin"
+        )
+        self._reset_live_commands_atomic(
+            self.render_command_path,
+            self.render_watchpoint.live_command_records.tail_bytes(
+                carried_record_count
+            ),
+        )
 
     def _record_performance(self, name: str, started_ns: int) -> None:
         elapsed_us = max(0, (time.perf_counter_ns() - started_ns) // 1_000)
@@ -5680,9 +9336,17 @@ class LiveHostBridge:
         command_publish_started_ns = time.perf_counter_ns()
         live_records = self.render_watchpoint.live_command_records
         if self.published_write_count < 0 or not self.render_command_path.is_file():
+            epoch_record_count = write_count - self.command_snapshot_base_record_count
+            if epoch_record_count < 0 or epoch_record_count > len(live_records):
+                raise RuntimeError(
+                    "live render command epoch overflowed before sidecar publication"
+                )
             self._close_render_command_file()
-            self._reset_live_commands_atomic(self.render_command_path, live_records)
-            self.published_command_record_count = len(live_records)
+            self._reset_live_commands_atomic(
+                self.render_command_path,
+                live_records.tail_bytes(epoch_record_count),
+            )
+            self.published_command_record_count = write_count
         else:
             new_record_count = write_count - self.published_write_count
             if new_record_count > len(live_records):
@@ -5693,15 +9357,9 @@ class LiveHostBridge:
                 raise RuntimeError(
                     "live render command history overflowed before sidecar flush"
                 )
-            new_records = list(
-                itertools.islice(
-                    live_records,
-                    len(live_records) - new_record_count,
-                    None,
-                )
-            )
+            new_records = live_records.tail_bytes(new_record_count)
             self._append_live_commands(self.render_command_path, new_records)
-            self.published_command_record_count += len(new_records)
+            self.published_command_record_count += new_record_count
         self.published_write_count = write_count
         self.last_command_flush_time = now
         self._record_performance("render_command_publish", command_publish_started_ns)
@@ -5759,12 +9417,18 @@ class LiveHostBridge:
                 cache=self._resource_snapshot_cache,
             )
             resource_signatures = tuple(
-                (int(resource["address"]), str(resource["sha256"]))
+                (
+                    int(resource["address"]),
+                    int(resource["width"]),
+                    int(resource["height"]),
+                    str(resource["format"]),
+                    str(resource["sha256"]),
+                )
                 for resource in stream["resource_snapshots"]
             )
             if resource_signatures != self.last_render_resource_signatures:
                 self.resource_stream_generation = time.time_ns()
-                self.current_render_resource_path = (
+                next_render_resource_path = (
                     self.flip_audit_ack_path.parent
                     / "resources"
                     / f"resources.{self.resource_stream_generation}.json"
@@ -5774,6 +9438,15 @@ class LiveHostBridge:
                         + f".resources.{self.resource_stream_generation}.bin"
                     )
                 )
+                if (
+                    self.presentation_ack_path is not None
+                    and self.flip_audit_ack_path is None
+                    and self.current_render_resource_path.is_file()
+                ):
+                    self._retired_resource_paths.append(
+                        self.current_render_resource_path
+                    )
+                self.current_render_resource_path = next_render_resource_path
                 if self.flip_audit_ack_path is not None:
                     self._write_json_atomic(
                         self.current_render_resource_path,
@@ -5816,6 +9489,13 @@ class LiveHostBridge:
                 "captured_write_count": stream["captured_write_count"],
                 "published_command_record_count": self.published_command_record_count,
                 "presentable_command_record_count": presentable_command_record_count,
+                "command_snapshot_base_record_count": (
+                    self.command_snapshot_base_record_count
+                ),
+                "command_snapshot_record_count": (
+                    self.published_command_record_count
+                    - self.command_snapshot_base_record_count
+                ),
                 "command_stream_generation": self.command_stream_generation,
                 "resource_stream_generation": self.resource_stream_generation,
                 "guest_flip_count": manifest_guest_flip_count,
@@ -5823,6 +9503,22 @@ class LiveHostBridge:
                 "command_snapshot_path": str(self.render_command_path).replace("\\", "/"),
             "resource_snapshot_path": str(self.current_render_resource_path).replace("\\", "/"),
         }
+        if selected_flip is not None and self.frontend_text_provider is not None:
+            frontend_text = self.frontend_text_provider(manifest_guest_flip_count)
+            if isinstance(frontend_text, str) and frontend_text:
+                manifest["frontend_text"] = frontend_text
+            elif isinstance(frontend_text, dict) and frontend_text.get(
+                "frontend_text"
+            ):
+                for field in (
+                    "frontend_text",
+                    "frontend_text_x_bits",
+                    "frontend_text_y_bits",
+                    "frontend_text_size_bits",
+                    "frontend_text_color_argb",
+                ):
+                    if field in frontend_text:
+                        manifest[field] = frontend_text[field]
         if self.presentation_ack_path is not None:
             manifest["presentation_ack_path"] = str(
                 self.presentation_ack_path
@@ -6004,12 +9700,16 @@ class LiveHostBridge:
             self._flush_flip_audit_ledger()
 
     def _cached_audit_resource_changed(self, memory: SparseMemory) -> bool:
-        for (_stage, address, _format_raw), (generations, resource) in (
+        for (_stage, address, _format_raw, _image_rect), (
+            generations,
+            resource,
+        ) in (
             self._resource_snapshot_cache.items()
         ):
             byte_count = int(resource["byte_count"])
-            first_page = address & ~memory._PAGE_MASK
-            last_page = (address + byte_count - 1) & ~memory._PAGE_MASK
+            source_address = int(resource.get("source_address", address))
+            first_page = source_address & ~memory._PAGE_MASK
+            last_page = (source_address + byte_count - 1) & ~memory._PAGE_MASK
             current = tuple(
                 memory.page_generation(page_address)
                 for page_address in range(
@@ -6101,6 +9801,11 @@ class LiveHostBridge:
             },
         )
         return True
+
+    def should_continue_native_recovery(self) -> bool:
+        """Poll host control between synchronous native frontier builds."""
+        self.sample_controller()
+        return not self.stop_requested
 
     def on_slice(
         self,
@@ -6221,6 +9926,11 @@ class LiveHostBridge:
                 if not acknowledged:
                     self._record_performance("on_slice_total", slice_started_ns)
                     return False
+                self._cleanup_retired_snapshots()
+                self._rotate_live_command_epoch(
+                    completed_write_count=int(completed_flip["write_count"]),
+                    completed_flip_index=int(completed_flip["flip_index"]),
+                )
         self._record_performance("on_slice_total", slice_started_ns)
         return not self.stop_requested
 
@@ -6258,6 +9968,13 @@ class LiveHostBridge:
             "render_resource_path": str(self.render_resource_path),
             "current_render_resource_path": str(self.current_render_resource_path),
             "render_command_path": str(self.render_command_path),
+            "command_snapshot_base_record_count": (
+                self.command_snapshot_base_record_count
+            ),
+            "command_epoch": self.command_epoch,
+            "command_epoch_rotation_count": self.command_epoch_rotation_count,
+            "retired_snapshot_delete_count": self.retired_snapshot_delete_count,
+            "retired_snapshot_delete_bytes": self.retired_snapshot_delete_bytes,
             "controller_state_path": str(self.controller_state_path),
             "controller_consumed_path": str(self.controller_consumed_path),
             "stop_requested": self.stop_requested,
@@ -6306,13 +10023,29 @@ class LiveHostBridge:
         }
 
 
+def _render_resource_memory_address(
+    memory: SparseMemory,
+    nv2a_address: int,
+) -> int:
+    """Resolve an NV2A physical offset to the populated Xbox CPU direct map."""
+
+    if not 0 < nv2a_address < TITLE_XBOX_PHYSICAL_RAM_SIZE:
+        return nv2a_address
+    cpu_direct_address = _u32(nv2a_address | 0x80000000)
+    return (
+        cpu_direct_address
+        if memory.has_allocated_page(cpu_direct_address)
+        else nv2a_address
+    )
+
+
 def _snapshot_render_texture_resources(
     stream: dict[str, Any],
     history_stream: dict[str, Any],
     memory: SparseMemory,
     *,
     cache: dict[
-        tuple[int, int, int], tuple[tuple[int, ...], dict[str, Any]]
+        tuple[int, int, int, int], tuple[tuple[int, ...], dict[str, Any]]
     ] | None = None,
 ) -> dict[str, Any]:
     retained_bindings = history_stream.get("texture_bindings", [])
@@ -6321,10 +10054,10 @@ def _snapshot_render_texture_resources(
         if retained_bindings
         else _scan_render_texture_bindings(history_stream.get("writes", []))
     )
-    resources: dict[int, dict[str, Any]] = {}
-    for stage, address, format_raw in texture_states:
-        width = 1 << ((format_raw >> 20) & 0xF)
-        height = 1 << ((format_raw >> 24) & 0xF)
+    resources: dict[tuple[int, int, int, str], dict[str, Any]] = {}
+    for binding in texture_states:
+        stage, address, format_raw = binding[:3]
+        image_rect = binding[3] if len(binding) >= 4 else 0
         color_format = (format_raw >> 8) & 0xFF
         format_name = {
             0x05: "R5G6B5",
@@ -6336,43 +10069,111 @@ def _snapshot_render_texture_resources(
             0x12: "A8R8G8B8_LINEAR",
             0x1E: "X8R8G8B8_LINEAR",
         }.get(color_format, f"format_{color_format:02X}")
+        if format_name in {"A8R8G8B8_LINEAR", "X8R8G8B8_LINEAR"} and image_rect:
+            width = (image_rect >> 16) & 0xFFFF
+            height = image_rect & 0xFFFF
+        else:
+            width = 1 << ((format_raw >> 20) & 0xF)
+            height = 1 << ((format_raw >> 24) & 0xF)
         if address == 0 or width <= 0 or height <= 0:
             continue
-        if format_name == "DXT1":
-            byte_count = max(8, ((width + 3) // 4) * ((height + 3) // 4) * 8)
-        elif format_name in {"DXT3", "DXT5"}:
-            byte_count = max(16, ((width + 3) // 4) * ((height + 3) // 4) * 16)
-        elif format_name in {"R5G6B5"}:
-            byte_count = width * height * 2
-        else:
-            byte_count = width * height * 4
+        declared_mipmap_levels = max(1, (format_raw >> 16) & 0xF)
+        mipmap_levels = (
+            1
+            if format_name.endswith("_LINEAR")
+            else min(declared_mipmap_levels, max(width, height).bit_length())
+        )
+        byte_count = 0
+        mip_width = width
+        mip_height = height
+        for _ in range(mipmap_levels):
+            if format_name == "DXT1":
+                byte_count += max(
+                    8,
+                    ((mip_width + 3) // 4) * ((mip_height + 3) // 4) * 8,
+                )
+            elif format_name in {"DXT3", "DXT5"}:
+                byte_count += max(
+                    16,
+                    ((mip_width + 3) // 4) * ((mip_height + 3) // 4) * 16,
+                )
+            elif format_name == "R5G6B5":
+                byte_count += mip_width * mip_height * 2
+            else:
+                byte_count += mip_width * mip_height * 4
+            mip_width = max(1, mip_width // 2)
+            mip_height = max(1, mip_height // 2)
         if byte_count > 16 * 1024 * 1024:
             continue
-        cache_key = (stage, address, format_raw)
-        first_page = address & ~memory._PAGE_MASK
-        last_page = (address + byte_count - 1) & ~memory._PAGE_MASK
+        resource_key = (address, width, height, format_name)
+        cache_key = (stage, address, format_raw, image_rect)
+        source_address = _render_resource_memory_address(memory, address)
+        first_page = source_address & ~memory._PAGE_MASK
+        last_page = (source_address + byte_count - 1) & ~memory._PAGE_MASK
         page_generations = tuple(
             memory.page_generation(page_address)
             for page_address in range(first_page, last_page + 1, memory._PAGE_SIZE)
         )
         cached = cache.get(cache_key) if cache is not None else None
         if cached is not None and cached[0] == page_generations:
-            resources[address] = cached[1]
+            resources[resource_key] = cached[1]
             continue
-        payload = memory.read(address, byte_count)
+        payload = memory.read(source_address, byte_count)
         resource = {
             "stage": stage,
             "address": address,
             "address_hex": _hex32(address),
+            "source_address": source_address,
+            "source_address_hex": _hex32(source_address),
             "format": format_name,
             "width": width,
             "height": height,
+            "mipmap_levels": mipmap_levels,
             "byte_count": byte_count,
             "nonzero_byte_count": sum(byte != 0 for byte in payload),
             "sha256": hashlib.sha256(payload).hexdigest().upper(),
             "bytes_hex": payload.hex().upper(),
         }
-        resources[address] = resource
+        resources[resource_key] = resource
+        if cache is not None:
+            cache[cache_key] = (page_generations, resource)
+    for vertex_range in history_stream.get("vertex_buffer_ranges", []):
+        if not isinstance(vertex_range, (list, tuple)) or len(vertex_range) != 2:
+            continue
+        address = int(vertex_range[0])
+        end = int(vertex_range[1])
+        byte_count = end - address
+        if address == 0 or byte_count <= 0 or byte_count > 16 * 1024 * 1024:
+            continue
+        resource_key = (address, byte_count, 1, "VERTEX_BUFFER")
+        cache_key = (-1, address, byte_count, 0)
+        source_address = _render_resource_memory_address(memory, address)
+        first_page = source_address & ~memory._PAGE_MASK
+        last_page = (source_address + byte_count - 1) & ~memory._PAGE_MASK
+        page_generations = tuple(
+            memory.page_generation(page_address)
+            for page_address in range(first_page, last_page + 1, memory._PAGE_SIZE)
+        )
+        cached = cache.get(cache_key) if cache is not None else None
+        if cached is not None and cached[0] == page_generations:
+            resources[resource_key] = cached[1]
+            continue
+        payload = memory.read(source_address, byte_count)
+        resource = {
+            "stage": 0,
+            "address": address,
+            "address_hex": _hex32(address),
+            "source_address": source_address,
+            "source_address_hex": _hex32(source_address),
+            "format": "VERTEX_BUFFER",
+            "width": byte_count,
+            "height": 1,
+            "byte_count": byte_count,
+            "nonzero_byte_count": sum(byte != 0 for byte in payload),
+            "sha256": hashlib.sha256(payload).hexdigest().upper(),
+            "bytes_hex": payload.hex().upper(),
+        }
+        resources[resource_key] = resource
         if cache is not None:
             cache[cache_key] = (page_generations, resource)
     stream["resource_snapshots"] = list(resources.values())
@@ -6382,22 +10183,28 @@ def _snapshot_render_texture_resources(
 
 def _scan_render_texture_bindings(
     writes: list[dict[str, Any]],
-) -> list[tuple[int, int, int]]:
+) -> list[tuple[int, int, int, int]]:
     """Find texture offset/format pairs without materializing a full frame decode."""
 
-    bindings: list[tuple[int, int, int]] = []
-    seen: set[tuple[int, int, int]] = set()
-    drawn_bindings: list[tuple[int, int, int]] = []
-    drawn_seen: set[tuple[int, int, int]] = set()
+    bindings: list[tuple[int, int, int, int]] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    drawn_bindings: list[tuple[int, int, int, int]] = []
+    drawn_seen: set[tuple[int, int, int, int]] = set()
     offsets: dict[int, int] = {}
     formats: dict[int, int] = {}
+    image_rects: dict[int, int] = {}
     pending = bytearray()
     pending_end: int | None = None
 
     def observe_method(method: int, data: int) -> None:
         if method == 0x17FC and data != 0:
             for stage in sorted(offsets.keys() & formats.keys()):
-                binding = (stage, offsets[stage], formats[stage])
+                binding = (
+                    stage,
+                    offsets[stage],
+                    formats[stage],
+                    image_rects.get(stage, 0),
+                )
                 if binding not in drawn_seen:
                     drawn_seen.add(binding)
                     drawn_bindings.append(binding)
@@ -6410,8 +10217,15 @@ def _scan_render_texture_bindings(
             offsets[stage] = data
         elif register == 4:
             formats[stage] = data
+        elif register == 0x18:
+            image_rects[stage] = data
         if stage in offsets and stage in formats:
-            binding = (stage, offsets[stage], formats[stage])
+            binding = (
+                stage,
+                offsets[stage],
+                formats[stage],
+                image_rects.get(stage, 0),
+            )
             if binding not in seen:
                 seen.add(binding)
                 bindings.append(binding)
@@ -6728,6 +10542,11 @@ class RuntimeAbiBridge:
             returned_value = self._invoke_guest_compare_memory_ulong_api(
                 arguments, memory, trace
             )
+        elif shim.name == "RtlEqualString":
+            handler_arguments = arguments
+            returned_value = self._invoke_guest_equal_string_api(
+                arguments, memory, trace
+            )
         elif shim.name == "ObfDereferenceObject":
             handler_arguments = (cpu.get_register("ecx"),)
             try:
@@ -6918,7 +10737,21 @@ class RuntimeAbiBridge:
                 "decode_error": "object name not decoded",
             }
         else:
-            result = self.runtime.filesystem.open_file(decoded["guest_path"], mode)
+            directory_requested = (
+                shim.name == "NtCreateFile"
+                and bool(create_options & FILE_DIRECTORY_FILE)
+            )
+            if directory_requested:
+                result = self.runtime.filesystem.open_directory(
+                    decoded["guest_path"],
+                    create_disposition=create_disposition,
+                )
+            else:
+                result = self.runtime.filesystem.open_file(
+                    decoded["guest_path"],
+                    mode,
+                    create_disposition=create_disposition,
+                )
             result.update(decoded)
         result.update(
             {
@@ -7190,6 +11023,47 @@ class RuntimeAbiBridge:
             status=result.get("status"),
             status_hex=_hex32(result.get("status", 0)),
             file_size=result.get("size", 0),
+        )
+        return result
+
+    def _invoke_guest_equal_string_api(
+        self,
+        arguments: tuple[int, ...],
+        memory: SparseMemory,
+        trace: ExecutionTrace,
+    ) -> bool:
+        left_address, right_address, case_insensitive = arguments[:3]
+        left = _read_guest_ansi_string(
+            memory,
+            left_address,
+            require_path=False,
+        )
+        right = _read_guest_ansi_string(
+            memory,
+            right_address,
+            require_path=False,
+        )
+        result = bool(
+            left is not None
+            and right is not None
+            and self.runtime.rtl_equal_string(
+                left[0],
+                right[0],
+                bool(case_insensitive),
+            )
+        )
+        trace.add(
+            None,
+            "runtime_equal_string_api",
+            shim_name="RtlEqualString",
+            left_address=left_address,
+            left_address_hex=_hex32(left_address),
+            right_address=right_address,
+            right_address_hex=_hex32(right_address),
+            left=left[0] if left is not None else None,
+            right=right[0] if right is not None else None,
+            case_insensitive=bool(case_insensitive),
+            result=result,
         )
         return result
 
@@ -7590,6 +11464,26 @@ class RuntimeAbiBridge:
                     value_hex=f"0x{value:016X}",
                 )
                 writes.append(write)
+            return writes
+        if shim.name == "AvSendTVEncoderOption":
+            result_address = returned_value.get("result_address")
+            result_value = returned_value.get("result_value")
+            if (
+                returned_value.get("status") == XboxStatus.SUCCESS
+                and isinstance(result_address, int)
+                and result_address
+                and isinstance(result_value, int)
+            ):
+                writes.append(
+                    _write_runtime_out_u32(
+                        memory,
+                        trace,
+                        shim.name,
+                        "encoder_option_result",
+                        result_address,
+                        result_value,
+                    )
+                )
             return writes
         if shim.name == "PsCreateSystemThreadEx":
             handle = returned_value.get("handle")
@@ -8181,7 +12075,7 @@ class RuntimeAbiBridge:
                         shim.name,
                         "io_information",
                         _u32(io_status_block_address + 4),
-                        0,
+                        int(returned_value.get("io_information", 0)),
                     )
                 )
         return writes
@@ -8191,6 +12085,7 @@ class XbeBackedSparseMemory(SparseMemory):
     """Sparse writable overlay that falls back to mapped XBE image bytes."""
 
     _FULL_PAGE_WRITTEN_MASK = b"\x01" * SparseMemory._PAGE_SIZE
+    native_cache_physical_aliases = True
 
     @staticmethod
     def _canonical_address(address: int) -> int:
@@ -8202,6 +12097,85 @@ class XbeBackedSparseMemory(SparseMemory):
             return address & 0x7FFFFFFF
         return address
 
+    def native_cache_address(self, address: int) -> int:
+        return self._canonical_address(address)
+
+    def native_cacheable_address(self, address: int) -> bool:
+        """Allow native snapshots for ordinary title RAM, including its high arena."""
+        address = self._canonical_address(address)
+        return address < 0x80000000 or 0x82000000 <= address < 0x84000000
+
+    def add_native_observer_only_callback_addresses(
+        self, addresses: Iterable[int]
+    ) -> None:
+        self._native_observer_only_callback_addresses.update(
+            self._canonical_address(address) for address in addresses
+        )
+
+    def native_memory_callback_dependency_addresses(
+        self,
+        address: int,
+        size: int,
+        *,
+        is_write: bool,
+    ) -> tuple[int, ...] | None:
+        """Return cached guest addresses needed by one exact callback.
+
+        Exact callback locations are never written through the native page
+        cache themselves. Most title hardware/sentinel callbacks therefore do
+        not need to flush unrelated dirty pages. The D3D GET-pointer read and
+        command-kick write are the exceptions because their modeled semantics
+        consult fields in the synthetic context.
+        """
+        start = self._canonical_address(address)
+        end = start + max(0, int(size))
+
+        def overlaps(target: int) -> bool:
+            target = self._canonical_address(target)
+            return start < target + 4 and target < end
+
+        if not is_write and overlaps(TITLE_D3D_CONTEXT_GET_POINTER_ADDRESS):
+            return (_u32(TITLE_D3D_CONTEXT_SYNTHETIC_ADDRESS + 0x2C),)
+        if is_write and overlaps(TITLE_GPU_COMMAND_KICK_ADDRESS):
+            return (
+                _u32(
+                    TITLE_GPU_SUBMISSION_BASE_ADDRESS
+                    + TITLE_GPU_COMPLETION_DMA_POINTER_OFFSET
+                ),
+            )
+
+        exact_callback_addresses = {
+            TITLE_AUDIO_DSP_CONTROL_ADDRESS,
+            TITLE_AUDIO_DSP_STATUS_ADDRESS,
+            *TITLE_AUDIO_DSP_VOICE_COMMAND_ADDRESSES,
+            TITLE_MCPX_FRAME_COUNTER_ADDRESS,
+            TITLE_GPU_COMMAND_KICK_ADDRESS,
+            TITLE_GPU_PROGRESS_COUNTER_ADDRESS,
+            TITLE_GPU_SOFTWARE_COMPLETION_FLAG_ADDRESS,
+            TITLE_D3D_CONTEXT_GET_POINTER_ADDRESS,
+            TITLE_GPU_SUBMISSION_BASE_ADDRESS,
+            TITLE_GPU_SUBMISSION_LIMIT_ADDRESS,
+            TITLE_D3D_CONTEXT_GLOBAL_ADDRESS,
+            TITLE_CLEANUP_LIST_SENTINEL_ADDRESS,
+            TITLE_FRONTEND_RESOURCE_CACHE_SENTINEL_ADDRESS,
+            TITLE_FRONTEND_REGISTRY_LIST_SENTINEL_ADDRESS,
+            TITLE_FRONTEND_INITIALIZER_LIST_SENTINEL_ADDRESS,
+        }
+        if any(
+            overlaps(target)
+            for target in self._native_observer_only_callback_addresses
+        ):
+            return ()
+        if any(overlaps(target) for target in exact_callback_addresses):
+            return ()
+        return None
+
+    def has_allocated_page(self, address: int) -> bool:
+        return super().has_allocated_page(self._canonical_address(address))
+
+    def page_generation(self, address: int) -> int:
+        return super().page_generation(self._canonical_address(address))
+
     def __init__(
         self,
         loaded: LoadedXbeImage,
@@ -8211,9 +12185,11 @@ class XbeBackedSparseMemory(SparseMemory):
         enable_title_sentinel_fallbacks: bool = False,
     ) -> None:
         self._loaded = loaded
+        self._native_observer_only_callback_addresses: set[int] = set()
         self._write_observers = (
             [write_observer] if write_observer is not None else []
         )
+        self._native_writeback_active = False
         self._title_sentinel_fallbacks_enabled = enable_title_sentinel_fallbacks
         self._nv2a_status_busy_clear_count = 0
         self._title_gpu_completion_poll_count = 0
@@ -8278,6 +12254,7 @@ class XbeBackedSparseMemory(SparseMemory):
         }
         clone._page_generations = self._page_generations.copy()
         clone._changed_pages = self._changed_pages.copy()
+        clone._changed_page_ranges = self._changed_page_ranges.copy()
         clone._write_observers = []
         return clone
 
@@ -8387,6 +12364,36 @@ class XbeBackedSparseMemory(SparseMemory):
             cursor = end
         return bytes(payload)
 
+    def native_page_range_snapshot(self, address: int, size: int) -> bytes:
+        """Materialize a cache-coherence span without dynamic read semantics."""
+        current = self._canonical_address(address)
+        if size < 0 or (current & self._PAGE_MASK) + size > self._PAGE_SIZE:
+            raise X86ExecutionError(
+                "native page range snapshot crossed a cache-page boundary"
+            )
+        payload = bytearray(size)
+        requested_end = current + size
+        for region in self._loaded.arena.regions:
+            start = max(current, region.virtual_address)
+            end = min(requested_end, region.virtual_end)
+            if start >= end:
+                continue
+            payload[start - current : end - current] = self._loaded.arena.read(
+                start,
+                end - start,
+            )
+        page_number = current >> self._PAGE_BITS
+        page_offset = current & self._PAGE_MASK
+        overlay = self._pages.get(page_number)
+        written = self._written_pages.get(page_number)
+        if overlay is None or written is None:
+            return bytes(payload)
+        for offset in range(size):
+            source_offset = page_offset + offset
+            if written[source_offset]:
+                payload[offset] = overlay[source_offset]
+        return bytes(payload)
+
     def write(self, address: int, payload: bytes) -> None:
         self._observe_write(address, payload)
         if self._apply_title_mmio_write(address, payload):
@@ -8401,7 +12408,11 @@ class XbeBackedSparseMemory(SparseMemory):
             return
         if page_offset + len(payload) > self._PAGE_SIZE:
             raise X86ExecutionError("native page writeback crossed a cache-page boundary")
-        self._observe_write(address, payload)
+        self._native_writeback_active = True
+        try:
+            self._observe_write(address, payload)
+        finally:
+            self._native_writeback_active = False
         page_number = current >> self._PAGE_BITS
         page = self._pages.setdefault(page_number, bytearray(self._PAGE_SIZE))
         written = self._written_pages.setdefault(
@@ -9133,24 +13144,192 @@ class XbeBackedSparseMemory(SparseMemory):
 class DynamicBlockCache:
     """JSON-backed decoded dynamic-block cache for local probe iteration."""
 
-    VERSION = 1
+    VERSION = 2
+    LEGACY_VERSIONS = {1}
 
     def __init__(self, path: Path | None) -> None:
         self.path = path
         self.records: dict[str, dict[str, Any]] = {}
         self.load_errors: list[str] = []
+        self.loaded_version: int | None = None
+        self.prepared_image_sha256: str | None = None
+        self.dirty = False
         self.hits = 0
         self.misses = 0
         self.stores = 0
+        self.migration_performed = False
+        self.migration_validated_record_count = 0
+        self.migration_decode_count = 0
+        self.migration_refreshed_record_count = 0
+        self.migration_rejected_record_count = 0
+        self.migration_foreign_record_count = 0
+        self.migration_samples: list[dict[str, Any]] = []
         if path is not None and path.exists():
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 if data.get("format") == "b2-recomp-dynamic-block-cache":
-                    records = data.get("records", {})
-                    if isinstance(records, dict):
-                        self.records = records
+                    version = int(data.get("version", 1))
+                    self.loaded_version = version
+                    if version == self.VERSION or version in self.LEGACY_VERSIONS:
+                        records = data.get("records", {})
+                        if isinstance(records, dict):
+                            self.records = records
+                    else:
+                        self.load_errors.append(
+                            f"unsupported dynamic-block cache version: {version}"
+                        )
             except (OSError, json.JSONDecodeError) as exc:
                 self.load_errors.append(str(exc))
+
+    @staticmethod
+    def _key_parts(key: str) -> tuple[int, str, str, str, str] | None:
+        parts = key.split(":")
+        if len(parts) != 5:
+            return None
+        try:
+            version = int(parts[0])
+        except ValueError:
+            return None
+        return version, parts[1], parts[2], parts[3], parts[4]
+
+    @classmethod
+    def _current_key(cls, key: str) -> str | None:
+        parts = cls._key_parts(key)
+        if parts is None:
+            return None
+        _, image_sha256, target, entry_bytes, max_block_instructions = parts
+        return ":".join(
+            [
+                str(cls.VERSION),
+                image_sha256,
+                target,
+                entry_bytes,
+                max_block_instructions,
+            ]
+        )
+
+    @staticmethod
+    def _instruction_refreshes(
+        cached: LiftedFunction,
+        refreshed: LiftedFunction,
+    ) -> list[dict[str, Any]]:
+        changes: list[dict[str, Any]] = []
+        for previous, current in itertools.zip_longest(
+            cached.instructions,
+            refreshed.instructions,
+        ):
+            if (
+                previous is not None
+                and current is not None
+                and previous.to_dict() == current.to_dict()
+            ):
+                continue
+            changes.append(
+                {
+                    "address_hex": _hex32(
+                        current.address if current is not None else previous.address
+                    ),
+                    "cached_mnemonic": (
+                        previous.mnemonic if previous is not None else None
+                    ),
+                    "refreshed_mnemonic": (
+                        current.mnemonic if current is not None else None
+                    ),
+                }
+            )
+            if len(changes) >= 8:
+                break
+        return changes
+
+    def prepare_for_image(
+        self,
+        loaded: LoadedXbeImage,
+        *,
+        image_sha256: str,
+    ) -> None:
+        """Refresh legacy decoded semantics while retaining warmed block coverage."""
+
+        if self.prepared_image_sha256 == image_sha256:
+            return
+        self.prepared_image_sha256 = image_sha256
+        if not self.records:
+            return
+
+        source_version = self.loaded_version
+        needs_decoder_refresh = source_version in self.LEGACY_VERSIONS
+        refreshed_by_range: dict[tuple[int, int, str], LiftedFunction] = {}
+        prepared_records: dict[str, dict[str, Any]] = {}
+        for key, record in self.records.items():
+            parts = self._key_parts(key)
+            if parts is None:
+                self.migration_rejected_record_count += 1
+                continue
+            _, record_image_sha256, _, _, _ = parts
+            if record_image_sha256 != image_sha256:
+                self.migration_foreign_record_count += 1
+                continue
+            current_key = self._current_key(key)
+            if current_key is None:
+                self.migration_rejected_record_count += 1
+                continue
+            if not needs_decoder_refresh:
+                prepared_records[current_key] = record
+                continue
+
+            self.migration_validated_record_count += 1
+            try:
+                cached = _lifted_function_from_cache_record(record)
+                if cached.code_size <= 0 or not cached.instructions:
+                    raise ValueError("cached block is empty")
+                range_key = (cached.base_address, cached.code_size, cached.symbol)
+                refreshed = refreshed_by_range.get(range_key)
+                if refreshed is None:
+                    code = loaded.arena.read(cached.base_address, cached.code_size)
+                    refreshed = lift_x86_function(
+                        code,
+                        base_address=cached.base_address,
+                        symbol=cached.symbol,
+                        max_instructions=max(2, cached.code_size + 1),
+                    )
+                    if refreshed.code_size != cached.code_size:
+                        raise ValueError(
+                            "fresh decode ended before the cached block boundary"
+                        )
+                    refreshed_by_range[range_key] = refreshed
+                    self.migration_decode_count += 1
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+                X86DecodeError,
+                XbeMemoryAccessError,
+            ) as exc:
+                self.migration_rejected_record_count += 1
+                if len(self.load_errors) < 32:
+                    self.load_errors.append(f"{key}: legacy refresh failed: {exc}")
+                continue
+
+            refreshed_record = _lifted_function_to_cache_record(refreshed)
+            if refreshed_record != record:
+                self.migration_refreshed_record_count += 1
+                if len(self.migration_samples) < 16:
+                    self.migration_samples.append(
+                        {
+                            "key": key,
+                            "base_address_hex": _hex32(cached.base_address),
+                            "instruction_changes": self._instruction_refreshes(
+                                cached,
+                                refreshed,
+                            ),
+                        }
+                    )
+            prepared_records[current_key] = refreshed_record
+
+        records_changed = prepared_records != self.records
+        self.records = prepared_records
+        self.migration_performed = needs_decoder_refresh
+        if records_changed or needs_decoder_refresh:
+            self.dirty = True
 
     def key(
         self,
@@ -9189,9 +13368,10 @@ class DynamicBlockCache:
             return
         self.records[key] = _lifted_function_to_cache_record(function)
         self.stores += 1
+        self.dirty = True
 
     def save(self) -> None:
-        if self.path is None or self.stores == 0:
+        if self.path is None or not self.dirty:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -9200,20 +13380,38 @@ class DynamicBlockCache:
             "version": self.VERSION,
             "records": self.records,
         }
-        self.path.write_text(
+        temporary_path = self.path.with_name(f"{self.path.name}.tmp")
+        temporary_path.write_text(
             json.dumps(payload, sort_keys=True) + "\n",
             encoding="utf-8",
             newline="\n",
         )
+        temporary_path.replace(self.path)
+        self.dirty = False
 
     def summary(self) -> dict[str, Any]:
         return {
             "enabled": self.path is not None,
             "path": str(self.path) if self.path is not None else None,
+            "version": self.VERSION,
+            "loaded_version": self.loaded_version,
             "record_count": len(self.records),
             "hits": self.hits,
             "misses": self.misses,
             "stores": self.stores,
+            "migration_performed": self.migration_performed,
+            "migration_validated_record_count": (
+                self.migration_validated_record_count
+            ),
+            "migration_decode_count": self.migration_decode_count,
+            "migration_refreshed_record_count": (
+                self.migration_refreshed_record_count
+            ),
+            "migration_rejected_record_count": (
+                self.migration_rejected_record_count
+            ),
+            "migration_foreign_record_count": self.migration_foreign_record_count,
+            "migration_samples": self.migration_samples,
             "load_errors": self.load_errors,
         }
 
@@ -9254,6 +13452,9 @@ def build_playability_probe_summary(
     live_flip_audit_max_flips: int = 0,
     native_slice_steps: int = 100000,
     audit_title_main_loop_exit: bool = False,
+    audit_world_matrices: bool = False,
+    audit_world_matrix_address: int | None = None,
+    audit_scene_records: bool = False,
 ) -> dict[str, Any]:
     info = parse_xbe_file(xbe_path)
     image_sha256 = _file_sha256(xbe_path)
@@ -9278,6 +13479,15 @@ def build_playability_probe_summary(
         resolution for resolution in loaded.import_resolutions if not resolution.resolved
     ]
     dynamic_block_cache = DynamicBlockCache(dynamic_block_cache_path)
+    dynamic_block_cache.prepare_for_image(
+        loaded,
+        image_sha256=image_sha256,
+    )
+    scene_record_sources, scene_record_source_errors = (
+        _load_title_scene_record_sources(extracted_root)
+        if audit_scene_records
+        else ((), ())
+    )
 
     entry_summary = _recover_entry_summary(
         loaded,
@@ -9303,6 +13513,11 @@ def build_playability_probe_summary(
         live_flip_audit_max_flips=live_flip_audit_max_flips,
         native_slice_steps=native_slice_steps,
         audit_title_main_loop_exit=audit_title_main_loop_exit,
+        audit_world_matrices=audit_world_matrices,
+        audit_world_matrix_address=audit_world_matrix_address,
+        audit_scene_records=audit_scene_records,
+        scene_record_sources=scene_record_sources,
+        scene_record_source_errors=scene_record_source_errors,
     )
     dynamic_block_cache.save()
 
@@ -9333,6 +13548,7 @@ def build_playability_probe_summary(
             "open_handles": runtime_summary["open_handles"],
             "open_files": runtime_summary["open_files"],
             "threads": runtime_summary["threads"],
+            "encoder_options": runtime_summary["encoder_options"],
             "input": runtime_summary["input"],
             "audio_initialized": runtime_summary["audio_initialized"],
             "audio_streams": runtime_summary["audio_streams"],
@@ -9351,6 +13567,56 @@ def build_playability_probe_summary(
 
 def summary_json(summary: dict[str, Any], *, pretty: bool = False) -> str:
     return json.dumps(summary, indent=2 if pretty else None, sort_keys=True)
+
+
+def build_title_scene_record_audit_report(
+    summary: dict[str, Any],
+) -> dict[str, Any]:
+    execution = summary.get("entry_recovery", {}).get("execution", {})
+    contexts = []
+    for thread in execution.get("guest_thread_executions", []):
+        if not isinstance(thread, dict):
+            continue
+        audit = thread.get("title_scene_record_audit")
+        if isinstance(audit, dict) and audit.get("enabled"):
+            contexts.append(audit)
+    priority = (
+        "native_read_divergence",
+        "runtime_record_corruption",
+        "zero_indices_unattributed",
+        "records_healthy",
+        "waiting_for_scene",
+    )
+    statuses = {str(context.get("status")) for context in contexts}
+    status = next(
+        (candidate for candidate in priority if candidate in statuses),
+        "audit_context_missing" if not contexts else "unknown",
+    )
+    return {
+        "format": "b2-recomp-title-scene-record-audit-report",
+        "public_safe": False,
+        "status": status,
+        "context_count": len(contexts),
+        "complete": any(bool(context.get("complete")) for context in contexts),
+        "scene_draw_count": sum(
+            int(context.get("scene_draw_count", 0)) for context in contexts
+        ),
+        "passed_zero_count": sum(
+            int(context.get("passed_zero_count", 0)) for context in contexts
+        ),
+        "authoritative_zero_count": sum(
+            int(context.get("authoritative_zero_count", 0)) for context in contexts
+        ),
+        "argument_memory_divergence_count": sum(
+            int(context.get("argument_memory_divergence_count", 0))
+            for context in contexts
+        ),
+        "runtime_source_divergence_count": sum(
+            int(context.get("runtime_source_divergence_count", 0))
+            for context in contexts
+        ),
+        "contexts": contexts,
+    }
 
 
 def _recover_entry_summary(
@@ -9378,6 +13644,11 @@ def _recover_entry_summary(
     live_flip_audit_max_flips: int,
     native_slice_steps: int,
     audit_title_main_loop_exit: bool,
+    audit_world_matrices: bool,
+    audit_world_matrix_address: int | None,
+    audit_scene_records: bool,
+    scene_record_sources: tuple[TitleSceneRecordSourceLayout, ...],
+    scene_record_source_errors: tuple[str, ...],
 ) -> dict[str, Any]:
     if loaded.entry_point is None:
         return {"status": "missing_entry_point"}
@@ -9461,6 +13732,11 @@ def _recover_entry_summary(
             live_flip_audit_max_flips=live_flip_audit_max_flips,
             native_slice_steps=native_slice_steps,
             audit_title_main_loop_exit=audit_title_main_loop_exit,
+            audit_world_matrices=audit_world_matrices,
+            audit_world_matrix_address=audit_world_matrix_address,
+            audit_scene_records=audit_scene_records,
+            scene_record_sources=scene_record_sources,
+            scene_record_source_errors=scene_record_source_errors,
         )
     else:
         summary["execution"] = {"status": "skipped"}
@@ -9706,6 +13982,29 @@ def _recover_native_frontier_batch(
     return recovered
 
 
+def _append_native_frontier_module_batch(
+    recovered_batch: list[LiftedFunction],
+    *,
+    frontier_functions: list[LiftedFunction],
+    frontier_modules: list[LiftedFunction],
+    symbol_prefix: str,
+) -> None:
+    """Retain each recovered CFG batch as an independently cached module."""
+
+    if not recovered_batch:
+        return
+    batch_index = len(frontier_modules)
+    frontier_functions.extend(recovered_batch)
+    frontier_modules.append(
+        _merge_lifted_functions(
+            recovered_batch[0],
+            recovered_batch[1:],
+            symbol=f"{symbol_prefix}_batch_{batch_index:04d}",
+            base_address=recovered_batch[0].base_address,
+        )
+    )
+
+
 def _seed_guest_thread_fs_block(memory: SparseMemory, fs_base: int) -> None:
     memory.write_u32(_u32(fs_base + THREAD_FS_SELF_POINTER_OFFSET), fs_base)
     memory.write_u32(_u32(fs_base + THREAD_FS_CALLBACK_TABLE_OFFSET), 0)
@@ -9734,6 +14033,11 @@ def _execute_recovered_control_flow_frame(
     live_flip_audit_max_flips: int,
     native_slice_steps: int,
     audit_title_main_loop_exit: bool,
+    audit_world_matrices: bool,
+    audit_world_matrix_address: int | None,
+    audit_scene_records: bool,
+    scene_record_sources: tuple[TitleSceneRecordSourceLayout, ...],
+    scene_record_source_errors: tuple[str, ...],
 ) -> dict[str, Any]:
     state = CpuState.with_registers(
         esp=DEFAULT_STACK_BASE,
@@ -9749,12 +14053,74 @@ def _execute_recovered_control_flow_frame(
             else None
         ),
         capture_after=render_watchpoint_start,
+        retain_diagnostic_writes=(
+            live_render_stream_path is None
+            or live_flip_audit_ack_path is not None
+            or render_watchpoint_limit is not None
+            or audit_title_main_loop_exit
+        ),
     )
+    memory_holder: dict[str, XbeBackedSparseMemory] = {}
+    pending_direct_native_render_writes: deque[tuple[int, bytes]] = deque()
+
+    def observe_render_memory_write(address: int, payload: bytes) -> None:
+        pending = (address, payload)
+        if (
+            pending_direct_native_render_writes
+            and pending_direct_native_render_writes[0] == pending
+        ):
+            pending_direct_native_render_writes.popleft()
+            return
+        active_memory = memory_holder.get("memory")
+        if (
+            active_memory is not None
+            and active_memory._native_writeback_active
+        ):
+            return
+        render_watchpoint.observe(address, payload)
+
     memory = XbeBackedSparseMemory(
         loaded,
         {DEFAULT_STACK_BASE: BOOT_PROBE_RETURN},
-        write_observer=render_watchpoint.observe,
+        write_observer=observe_render_memory_write,
     )
+    memory_holder["memory"] = memory
+    memory._pending_direct_native_render_writes = (
+        pending_direct_native_render_writes
+    )
+
+    def active_title_push_buffer_range() -> tuple[int, int] | None:
+        context = memory._read_overlay_or_image_u32(
+            TITLE_D3D_CONTEXT_GLOBAL_ADDRESS
+        )
+        if context:
+            ring_base = memory._read_overlay_or_image_u32(_u32(context + 0x24))
+            ring_end = memory._read_overlay_or_image_u32(_u32(context + 0x28))
+            if ring_base and ring_end > ring_base:
+                return (
+                    XbeBackedSparseMemory._canonical_address(ring_base),
+                    XbeBackedSparseMemory._canonical_address(ring_end),
+                )
+        submission = memory._read_overlay_or_image_u32(
+            TITLE_GPU_SUBMISSION_BASE_ADDRESS
+        )
+        limit = memory._read_overlay_or_image_u32(
+            TITLE_GPU_SUBMISSION_LIMIT_ADDRESS
+        )
+        if submission and limit > submission:
+            return (
+                XbeBackedSparseMemory._canonical_address(submission),
+                XbeBackedSparseMemory._canonical_address(limit),
+            )
+        return None
+
+    render_watchpoint.set_push_buffer_range_provider(
+        active_title_push_buffer_range
+    )
+
+    def active_title_memory_callback_ranges() -> tuple[tuple[int, int], ...]:
+        active_range = active_title_push_buffer_range()
+        return (active_range,) if active_range is not None else ()
     # Kernel data imports point at storage, unlike callable kernel imports.
     # Seed their scalar values before any recovered guest code can dereference
     # the resolved target address.
@@ -9807,6 +14173,11 @@ def _execute_recovered_control_flow_frame(
     )
     title_directsound_buffer_sync_fast_path = TitleDirectSoundBufferSyncFastPath()
     title_xinput_fast_path = TitleXInputFastPath(bridge.runtime.input)
+    title_vertex_append_handlers = (
+        {}
+        if native_guest_loop
+        else title_vertex_append_fast_path.call_handlers()
+    )
     handlers = {
         **bridge.call_handlers(),
         **spin_delay_fast_path.call_handlers(),
@@ -9825,7 +14196,7 @@ def _execute_recovered_control_flow_frame(
         **title_d3d_packet_alloc_fast_path.call_handlers(),
         **title_d3d_reserve_fast_path.call_handlers(),
         **title_d3d_primitive_draw_fast_path.call_handlers(),
-        **title_vertex_append_fast_path.call_handlers(),
+        **title_vertex_append_handlers,
         **title_text_draw_fast_path.call_handlers(),
         **title_directsound_buffer_sync_fast_path.call_handlers(),
         **title_xinput_fast_path.call_handlers(),
@@ -10114,6 +14485,9 @@ def _execute_recovered_control_flow_frame(
                 thread_index=len(thread_executions),
                 memory=memory,
                 render_watchpoint=render_watchpoint,
+                memory_write_observer_ranges_provider=(
+                    active_title_memory_callback_ranges
+                ),
                 handlers=handlers,
                 frontend_crt_initializer_audit=(
                     title_frontend_crt_initializer_audit
@@ -10122,6 +14496,7 @@ def _execute_recovered_control_flow_frame(
                     title_d3d_primitive_draw_fast_path
                 ),
                 title_immediate_draw_audit=title_immediate_draw_audit,
+                title_text_draw_fast_path=title_text_draw_fast_path,
                 block_loader=dynamic_block_loader,
                 max_dynamic_blocks=max_dynamic_blocks,
                 max_steps=(
@@ -10150,9 +14525,22 @@ def _execute_recovered_control_flow_frame(
                 live_flip_audit_max_flips=live_flip_audit_max_flips,
                 native_slice_steps=native_slice_steps,
                 audit_title_main_loop_exit=audit_title_main_loop_exit,
+                audit_world_matrices=audit_world_matrices,
+                audit_world_matrix_address=audit_world_matrix_address,
+                audit_scene_records=audit_scene_records,
+                scene_record_sources=scene_record_sources,
+                scene_record_source_errors=scene_record_source_errors,
                 cached_functions=dynamic_block_cache.lifted_functions(),
             )
             thread_executions.append(thread_execution)
+            cooperative_scheduler = thread_execution.get(
+                "cooperative_guest_thread_scheduler"
+            )
+            if isinstance(cooperative_scheduler, dict):
+                for session in cooperative_scheduler.get("sessions", []):
+                    handle = session.get("handle") if isinstance(session, dict) else None
+                    if isinstance(handle, int):
+                        executed_thread_keys.add(handle)
             # A live controller stop terminates the process, not merely the
             # first Xbox system thread. Starting another unlimited guest
             # thread here would orphan it after the presenter has closed.
@@ -10326,36 +14714,66 @@ def _scheduled_guest_threads(
     loaded: LoadedXbeImage,
 ) -> list[dict[str, Any]]:
     threads: list[dict[str, Any]] = []
-    for index, invocation in enumerate(bridge.invocations):
-        if invocation.shim_name != "PsCreateSystemThreadEx":
+    for index, snapshot in enumerate(bridge.runtime.sync.thread_snapshot()):
+        start_address = snapshot.get("start_address")
+        if not isinstance(start_address, int) or not start_address:
             continue
-        result = invocation.result if isinstance(invocation.result, dict) else {}
-        start_address = result.get("start_address")
-        if not isinstance(start_address, int):
-            start_address = 0
-        handle = result.get("handle")
+        handle = snapshot.get("handle")
+        start_context1 = snapshot.get("start_context1")
+        start_context2 = snapshot.get("start_context2")
         thread = {
             "invocation_index": index,
             "handle": handle if isinstance(handle, int) else None,
             "handle_hex": _hex32(handle) if isinstance(handle, int) else None,
             "start_address": start_address,
             "start_address_hex": _hex32(start_address),
-            "start_context1": result.get("start_context1", 0),
-            "start_context1_hex": _hex32(result.get("start_context1", 0)),
-            "start_context2": result.get("start_context2", 0),
-            "start_context2_hex": _hex32(result.get("start_context2", 0)),
-            "suspended": bool(result.get("suspended", False)),
+            "start_context1": start_context1 if isinstance(start_context1, int) else 0,
+            "start_context1_hex": _hex32(
+                start_context1 if isinstance(start_context1, int) else 0
+            ),
+            "start_context2": start_context2 if isinstance(start_context2, int) else 0,
+            "start_context2_hex": _hex32(
+                start_context2 if isinstance(start_context2, int) else 0
+            ),
+            "suspended": bool(snapshot.get("suspended", False)),
             "executable": bool(start_address and _is_executable_address(loaded, start_address)),
         }
         threads.append(thread)
     return threads
 
 
+def _initialize_guest_thread_state(
+    thread: dict[str, Any],
+    *,
+    thread_index: int,
+    memory: SparseMemory,
+) -> tuple[CpuState, int]:
+    stack_base = DEFAULT_THREAD_STACK_BASE + thread_index * THREAD_STACK_STRIDE
+    return_sentinel = BOOT_THREAD_RETURN_BASE + thread_index * 4
+    memory.write_u32(stack_base, return_sentinel)
+    memory.write_u32(stack_base + 4, thread["start_context1"])
+    memory.write_u32(stack_base + 8, thread["start_context2"])
+    fs_base = DEFAULT_FS_BASE + (thread_index + 1) * THREAD_STACK_STRIDE
+    _seed_guest_thread_fs_block(memory, fs_base)
+    state = CpuState.with_registers(
+        esp=stack_base,
+        ebp=0,
+        esi=0,
+        edi=0,
+        fs_base=fs_base,
+    )
+    state.eip = thread["start_address"]
+    return state, return_sentinel
+
+
 def _guest_thread_requested_live_stop(execution: dict[str, Any]) -> bool:
     native_run = execution.get("native_run")
     return (
-        isinstance(native_run, dict)
-        and native_run.get("reason") == "yield_handler_stop"
+        execution.get("status") == "live_stop"
+        or (
+            isinstance(native_run, dict)
+            and native_run.get("reason") == "yield_handler_stop"
+        )
     )
 
 
@@ -10370,10 +14788,15 @@ def _execute_guest_thread_start(
     thread_index: int,
     memory: SparseMemory,
     render_watchpoint: RenderWriteWatchpoint,
+    memory_write_observer_ranges_provider: Callable[
+        [], Iterable[tuple[int, int]]
+    ]
+    | None = None,
     handlers: dict[int, Callable[[CpuState, SparseMemory, int, ExecutionTrace], None]],
     frontend_crt_initializer_audit: TitleFrontendCrtInitializerAudit,
     title_d3d_primitive_draw_audit: TitleD3DPrimitiveDrawFastPath,
     title_immediate_draw_audit: TitleImmediateDrawAudit,
+    title_text_draw_fast_path: TitleTextDrawFastPath,
     block_loader: Callable[[int], LiftedFunction | None],
     max_dynamic_blocks: int,
     max_steps: int,
@@ -10388,6 +14811,11 @@ def _execute_guest_thread_start(
     native_slice_steps: int = 100000,
     enable_title_repair_fallbacks: bool = False,
     audit_title_main_loop_exit: bool = False,
+    audit_world_matrices: bool = False,
+    audit_world_matrix_address: int | None = None,
+    audit_scene_records: bool = False,
+    scene_record_sources: tuple[TitleSceneRecordSourceLayout, ...] = (),
+    scene_record_source_errors: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     start_address = thread["start_address"]
     summary = {
@@ -10409,19 +14837,10 @@ def _execute_guest_thread_start(
     if not thread["executable"] or not _is_executable_address(loaded, start_address):
         return {**summary, "status": "skipped_non_executable_start"}
 
-    stack_base = DEFAULT_THREAD_STACK_BASE + thread_index * THREAD_STACK_STRIDE
-    return_sentinel = BOOT_THREAD_RETURN_BASE + thread_index * 4
-    memory.write_u32(stack_base, return_sentinel)
-    memory.write_u32(stack_base + 4, thread["start_context1"])
-    memory.write_u32(stack_base + 8, thread["start_context2"])
-    fs_base = DEFAULT_FS_BASE + (thread_index + 1) * THREAD_STACK_STRIDE
-    _seed_guest_thread_fs_block(memory, fs_base)
-    state = CpuState.with_registers(
-        esp=stack_base,
-        ebp=0,
-        esi=0,
-        edi=0,
-        fs_base=fs_base,
+    state, return_sentinel = _initialize_guest_thread_state(
+        thread,
+        thread_index=thread_index,
+        memory=memory,
     )
     frame_functions = [
         *internal_functions,
@@ -10455,15 +14874,45 @@ def _execute_guest_thread_start(
     frontend_static_singleton_repair = TitleFrontendStaticSingletonRepair()
     runtime_object_table_repair = TitleRuntimeObjectTableConstructorRepair()
     runtime_callback_list_repair = TitleRuntimeCallbackListRepair()
+    title_heap_large_bin_integrity_repair = TitleHeapLargeBinIntegrityRepair()
+    # Full call/return pairing observes very hot frontend dispatch sites and
+    # is useful only alongside the explicit control-flow audit. Keeping it
+    # out of normal live runs avoids a Python callback on roughly every 50th
+    # guest instruction.
+    runtime_callback_audit = TitleRuntimeCallbackAudit(
+        enabled=audit_title_main_loop_exit
+    )
+    title_d3d_present_audit = TitleD3DPresentAudit()
+    title_world_matrix_audit = TitleWorldMatrixAudit(
+        enabled=audit_world_matrices,
+        render_watchpoint=render_watchpoint,
+        write_watch_address=audit_world_matrix_address,
+    )
+    title_scene_record_audit = TitleSceneRecordAudit(
+        enabled=audit_scene_records,
+        source_layouts=scene_record_sources,
+        source_errors=scene_record_source_errors,
+        render_watchpoint=render_watchpoint,
+    )
+    if isinstance(memory, XbeBackedSparseMemory):
+        memory.add_native_observer_only_callback_addresses(
+            title_world_matrix_audit.memory_callback_addresses
+        )
     native_run_summary: dict[str, Any] | None = None
     native_run_summaries: list[dict[str, Any]] = []
     native_frontier_functions: list[LiftedFunction] = []
+    native_frontier_modules: list[LiftedFunction] = []
     title_main_loop_exit_initial_value = memory.read_u32(
         TITLE_MAIN_LOOP_EXIT_FLAG_ADDRESS
     )
     title_main_loop_exit_writes: list[dict[str, Any]] = []
     title_main_loop_control_events: list[dict[str, Any]] = []
     pending_native_write_observations: list[tuple[int, bytes]] = []
+    cooperative_scheduler_summary: dict[str, Any] | None = None
+    enable_hot_render_audits = (
+        live_render_stream_path is None or audit_title_main_loop_exit
+    )
+    summary["hot_render_audits_enabled"] = enable_hot_render_audits
 
     def record_title_main_loop_exit_write(
         *,
@@ -10510,9 +14959,29 @@ def _execute_guest_thread_start(
         value: int,
         steps: int,
     ) -> None:
+        payload = int(value).to_bytes(size, "little", signed=False)
+        render_watchpoint.observe(
+            write_address,
+            payload,
+            instruction_address=instruction_address,
+            steps=steps,
+        )
+        title_world_matrix_audit.observe_memory_write(
+            memory,
+            instruction_address=instruction_address,
+            write_address=write_address,
+            size=size,
+            value=value,
+            steps=steps,
+        )
+        if write_address >= 0x80000000 and isinstance(
+            memory, XbeBackedSparseMemory
+        ):
+            memory._pending_direct_native_render_writes.append(
+                (write_address, payload)
+            )
         if not audit_title_main_loop_exit:
             return
-        payload = int(value).to_bytes(size, "little", signed=False)
         pending_native_write_observations.append((write_address, payload))
         record_title_main_loop_exit_write(
             source="native_guest",
@@ -10522,10 +14991,49 @@ def _execute_guest_thread_start(
             steps=steps,
         )
 
+    def observe_native_memory_write_batch(
+        packed_records: Any,
+        addresses: Any,
+        values: Any,
+        sizes: Any,
+        eips: Any,
+        source_addresses: Any,
+        steps: Any,
+        count: int,
+        observed_range_start: int,
+        contiguous_u32: bool,
+    ) -> None:
+        render_watchpoint.observe_native_write_batch(
+            packed_records,
+            addresses,
+            values,
+            sizes,
+            eips,
+            source_addresses,
+            steps,
+            count,
+            observed_range_start,
+            contiguous_u32,
+        )
+
     def observe_host_memory_write(write_address: int, payload: bytes) -> None:
+        pending = (write_address, payload)
+        if audit_scene_records:
+            title_scene_record_audit.observe_memory_write(
+                memory,
+                source=(
+                    "native_page_writeback"
+                    if isinstance(memory, XbeBackedSparseMemory)
+                    and memory._native_writeback_active
+                    else "host_model"
+                ),
+                instruction_address=None,
+                write_address=write_address,
+                payload=payload,
+                steps=None,
+            )
         if not audit_title_main_loop_exit:
             return
-        pending = (write_address, payload)
         if pending in pending_native_write_observations:
             pending_native_write_observations.remove(pending)
             return
@@ -10537,7 +15045,9 @@ def _execute_guest_thread_start(
             steps=None,
         )
 
-    if audit_title_main_loop_exit and isinstance(memory, XbeBackedSparseMemory):
+    if (
+        audit_title_main_loop_exit or audit_scene_records
+    ) and isinstance(memory, XbeBackedSparseMemory):
         memory.add_write_observer(observe_host_memory_write)
 
     def title_main_loop_exit_audit_summary() -> dict[str, Any]:
@@ -10575,6 +15085,9 @@ def _execute_guest_thread_start(
             data_export_synchronizer=lambda memory: bridge.synchronize_data_exports(
                 memory,
                 volatile_only=True,
+            ),
+            frontend_text_provider=(
+                title_text_draw_fast_path.manifest_for_completed_flip
             ),
         )
         if live_render_stream_path is not None
@@ -10658,6 +15171,10 @@ def _execute_guest_thread_start(
             cpu, observed_memory, trace, steps
         )
         scheduler_loop_detector.observer(cpu, observed_memory, trace, steps)
+        runtime_callback_audit.observer(cpu, observed_memory, trace, steps)
+        title_d3d_present_audit.observer(cpu, observed_memory, trace, steps)
+        title_world_matrix_audit.observer(cpu, observed_memory, trace, steps)
+        title_scene_record_audit.observer(cpu, observed_memory, trace, steps)
         title_d3d_primitive_draw_audit.observer(
             cpu, observed_memory, trace, steps
         )
@@ -10670,8 +15187,21 @@ def _execute_guest_thread_start(
             observer_addresses = {
                 *subsystem_initializer_audit.observer_addresses,
                 *frontend_registry_audit.observer_addresses,
-                *title_d3d_primitive_draw_audit.observer_addresses,
-                *title_immediate_draw_audit.observer_addresses,
+                *(
+                    title_d3d_primitive_draw_audit.observer_addresses
+                    if enable_hot_render_audits
+                    else set()
+                ),
+                *(
+                    title_immediate_draw_audit.observer_addresses
+                    if enable_hot_render_audits
+                    else {
+                        TITLE_ENGINE_PLUGIN_OPEN_CALL_ADDRESS,
+                        TITLE_ENGINE_PLUGIN_OPEN_RETURN_ADDRESS,
+                        TITLE_RENDER_MODULE_OPEN_ADDRESS,
+                        TITLE_D3D_CREATE_DEVICE_RETURN_ADDRESS,
+                    }
+                ),
                 TITLE_FRONTEND_COMPARE_SEARCH_ADDRESS,
                 TITLE_FRONTEND_RECORD_TABLE_SCAN_ADDRESS,
                 TITLE_FRONTEND_POST_AUDIO_LIST_ADVANCE_ADDRESS,
@@ -10680,15 +15210,361 @@ def _execute_guest_thread_start(
                 TITLE_FRONTEND_DYNAMIC_OBJECT_RESET_USE_ADDRESS,
                 TITLE_RUNTIME_OBJECT_TABLE_USE_ADDRESS,
                 *TITLE_RUNTIME_CALLBACK_DISPATCH_ADDRESSES,
+                *runtime_callback_audit.observer_addresses,
+                *title_world_matrix_audit.observer_addresses,
+                *title_scene_record_audit.observer_addresses,
+                *(
+                    title_d3d_present_audit.observer_addresses
+                    if enable_hot_render_audits
+                    else set()
+                ),
                 *(
                     TITLE_MAIN_LOOP_AUDIT_ADDRESSES
                     if audit_title_main_loop_exit
                     else set()
                 ),
             }
+            native_memory_callback_addresses = {
+                TITLE_AUDIO_DSP_CONTROL_ADDRESS,
+                TITLE_AUDIO_DSP_STATUS_ADDRESS,
+                *TITLE_AUDIO_DSP_VOICE_COMMAND_ADDRESSES,
+                TITLE_MCPX_FRAME_COUNTER_ADDRESS,
+                TITLE_GPU_COMMAND_KICK_ADDRESS,
+                TITLE_GPU_PROGRESS_COUNTER_ADDRESS,
+                TITLE_GPU_SOFTWARE_COMPLETION_FLAG_ADDRESS,
+                TITLE_D3D_CONTEXT_GET_POINTER_ADDRESS,
+                TITLE_GPU_SUBMISSION_BASE_ADDRESS,
+                TITLE_GPU_SUBMISSION_LIMIT_ADDRESS,
+                TITLE_D3D_CONTEXT_GLOBAL_ADDRESS,
+                TITLE_CLEANUP_LIST_SENTINEL_ADDRESS,
+                TITLE_FRONTEND_RESOURCE_CACHE_SENTINEL_ADDRESS,
+                TITLE_FRONTEND_REGISTRY_LIST_SENTINEL_ADDRESS,
+                TITLE_FRONTEND_INITIALIZER_LIST_SENTINEL_ADDRESS,
+                *(
+                    {TITLE_MAIN_LOOP_EXIT_FLAG_ADDRESS}
+                    if audit_title_main_loop_exit
+                    else set()
+                ),
+                *title_world_matrix_audit.memory_callback_addresses,
+            }
+
+            def create_native_executor(
+                active_frame: LiftedFunction,
+                module_functions: list[LiftedFunction],
+            ) -> NativeResumableExecutor:
+                return NativeResumableExecutor(
+                    active_frame,
+                    build_dir=native_build_dir,
+                    module_functions=module_functions,
+                    observer_addresses=observer_addresses,
+                    callback_addresses=handlers.keys(),
+                    memory_callback_addresses=native_memory_callback_addresses,
+                    synchronize_eip_for_callbacks=audit_title_main_loop_exit,
+                )
+
+            cooperative_sessions: dict[int, dict[str, Any]] = {}
+            cooperative_executor: NativeResumableExecutor | None = None
+            cooperative_service_active = False
+            cooperative_changed_pages: set[int] = set()
+            # Re-entering both workers at the former 2,500-instruction live
+            # input cadence rebuilt native execution state thousands of times.
+            # Before the first Present, use a larger instruction quantum; once
+            # video is active, service each worker once per completed flip.
+            cooperative_quantum = max(100_000, native_slice_steps or 100_000)
+            cooperative_blocking_targets = {
+                shim.target_address: shim.name
+                for shim in bridge.runtime.registered_shims
+                if shim.name
+                in {
+                    "KeDelayExecutionThread",
+                    "KeWaitForSingleObject",
+                    "NtWaitForSingleObject",
+                    "NtWaitForSingleObjectEx",
+                }
+            }
+            cooperative_pending_main_steps = 0
+            cooperative_last_slice_steps = 0
+            cooperative_last_serviced_flip = 0
+            cooperative_service_count = 0
+            cooperative_service_total_us = 0
+            cooperative_service_max_us = 0
+            cooperative_instruction_tick_count = 0
+            cooperative_video_tick_count = 0
+            primary_handle = thread.get("handle")
+            pre_first_flip_slice_steps = 0
+
+            def observe_cooperative_write(address: int, payload: bytes) -> None:
+                if not cooperative_service_active or not payload:
+                    return
+                first = XbeBackedSparseMemory._canonical_address(address) >> 12
+                last = XbeBackedSparseMemory._canonical_address(
+                    _u32(address + len(payload) - 1)
+                ) >> 12
+                cooperative_changed_pages.update(range(first, last + 1))
+
+            if thread_index == 0 and isinstance(memory, XbeBackedSparseMemory):
+                memory.add_write_observer(observe_cooperative_write)
+
+            def service_cooperative_threads() -> None:
+                nonlocal cooperative_executor, cooperative_service_active
+                if thread_index != 0:
+                    return
+                for candidate in _scheduled_guest_threads(bridge, loaded):
+                    handle = candidate.get("handle")
+                    if (
+                        not isinstance(handle, int)
+                        or handle == primary_handle
+                        or handle in cooperative_sessions
+                        or candidate["suspended"]
+                        or not candidate["executable"]
+                    ):
+                        continue
+                    worker_index = thread_index + 1 + len(cooperative_sessions)
+                    worker_state, worker_return = _initialize_guest_thread_state(
+                        candidate,
+                        thread_index=worker_index,
+                        memory=memory,
+                    )
+                    cooperative_sessions[handle] = {
+                        "thread": candidate,
+                        "thread_index": worker_index,
+                        "state": worker_state,
+                        "return_sentinel": worker_return,
+                        "status": "ready",
+                        "run_count": 0,
+                        "steps": 0,
+                        "last_run": None,
+                    }
+                active_sessions = [
+                    session
+                    for session in cooperative_sessions.values()
+                    if session["status"] in {"ready", "running", "waiting"}
+                ]
+                if not active_sessions:
+                    return
+                for session in active_sessions:
+                    if cooperative_executor is None:
+                        cooperative_frame = _merge_lifted_functions(
+                            entry_function,
+                            [
+                                *frame_functions,
+                                *native_branch_functions,
+                                *native_frontier_functions,
+                            ],
+                            symbol=(
+                                f"guest_thread_{thread_index:02d}_cooperative"
+                            ),
+                            base_address=start_address,
+                        )
+                        cooperative_executor = create_native_executor(
+                            cooperative_frame,
+                            [
+                                native_base_frame,
+                                *native_frontier_modules,
+                            ],
+                        )
+                    changed_before = set(cooperative_changed_pages)
+                    cooperative_service_active = True
+                    try:
+                        returned = cooperative_executor.run(
+                            session["state"],
+                            memory,
+                            call_handlers=handlers,
+                            step_observer=observe_guest_thread_step,
+                            memory_write_observer=observe_native_memory_write,
+                            memory_write_batch_observer=(
+                                observe_native_memory_write_batch
+                                if live_host_bridge is not None
+                                and not audit_title_main_loop_exit
+                                and not render_watchpoint.retain_diagnostic_writes
+                                else None
+                            ),
+                            memory_write_batch_address_base=(
+                                TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS
+                            ),
+                            memory_write_observer_ranges_provider=(
+                                memory_write_observer_ranges_provider
+                            ),
+                            call_handler_yield_predicate=(
+                                cooperative_blocking_targets.__contains__
+                            ),
+                            max_steps=cooperative_quantum,
+                        )
+                    except NativeExecutorError as exc:
+                        session["status"] = "execution_failed"
+                        session["error"] = str(exc)
+                        returned = session["state"].eip
+                    finally:
+                        cooperative_service_active = False
+                    run = cooperative_executor.last_run_summary
+                    if run is not None:
+                        session["run_count"] += 1
+                        session["steps"] += int(run.get("steps", 0))
+                        session["last_run"] = {
+                            "reason": run.get("reason"),
+                            "target": run.get("target"),
+                            "target_hex": run.get("target_hex"),
+                            "steps": run.get("steps"),
+                        }
+                        if returned in {0, session["return_sentinel"]}:
+                            session["status"] = "completed"
+                        elif run.get("reason") == "step_budget":
+                            session["status"] = "running"
+                        elif run.get("reason") == "call_handler_yield":
+                            session["status"] = "waiting"
+                            session["last_blocking_shim"] = (
+                                bridge.invocations[-1].shim_name
+                                if bridge.invocations
+                                else None
+                            )
+                        elif (
+                            run.get("reason") == "unhandled_target"
+                            and _is_executable_address(loaded, returned)
+                            and len(native_frontier_functions) < max_dynamic_blocks
+                        ):
+                            recovered = block_loader(returned)
+                            if recovered is not None:
+                                known_native_addresses = {
+                                    instruction.address
+                                    for function in (
+                                        entry_function,
+                                        *frame_functions,
+                                        *native_branch_functions,
+                                        *native_frontier_functions,
+                                    )
+                                    for instruction in function.instructions
+                                }
+                                recovered_batch = _recover_native_frontier_batch(
+                                    recovered,
+                                    block_loader=block_loader,
+                                    external_targets=set(handlers),
+                                    covered_addresses=known_native_addresses,
+                                    max_depth=DEFAULT_INTERNAL_DEPTH,
+                                    max_blocks=min(
+                                        DEFAULT_MAX_RECOVERED_BLOCKS,
+                                        max_dynamic_blocks
+                                        - len(native_frontier_functions),
+                                    ),
+                                )
+                                _append_native_frontier_module_batch(
+                                    recovered_batch,
+                                    frontier_functions=native_frontier_functions,
+                                    frontier_modules=native_frontier_modules,
+                                    symbol_prefix=(
+                                        f"guest_thread_{thread_index:02d}_frontier"
+                                    ),
+                                )
+                                cooperative_executor = None
+                                session["status"] = "running"
+                            else:
+                                session["status"] = "blocked"
+                        elif session["status"] != "execution_failed":
+                            session["status"] = "blocked"
+                    newly_changed = cooperative_changed_pages - changed_before
+                    if newly_changed:
+                        memory.mark_changed_pages(newly_changed)
+                if cooperative_changed_pages:
+                    # Nested native executors consume the shared invalidation
+                    # worklist. Republish every worker-written page so the
+                    # suspended main-thread cache observes all worker results.
+                    memory.mark_changed_pages(cooperative_changed_pages)
+
+            def run_cooperative_service(*, video_tick: bool) -> None:
+                nonlocal cooperative_service_count
+                nonlocal cooperative_service_total_us
+                nonlocal cooperative_service_max_us
+                nonlocal cooperative_instruction_tick_count
+                nonlocal cooperative_video_tick_count
+                started_ns = time.perf_counter_ns()
+                service_cooperative_threads()
+                elapsed_us = max(
+                    0,
+                    (time.perf_counter_ns() - started_ns) // 1_000,
+                )
+                cooperative_service_count += 1
+                cooperative_service_total_us += elapsed_us
+                cooperative_service_max_us = max(
+                    cooperative_service_max_us,
+                    elapsed_us,
+                )
+                if video_tick:
+                    cooperative_video_tick_count += 1
+                else:
+                    cooperative_instruction_tick_count += 1
+
+            def service_native_slice(
+                cpu: CpuState,
+                observed_memory: SparseMemory,
+                steps: int,
+            ) -> bool | None:
+                nonlocal pre_first_flip_slice_steps
+                nonlocal cooperative_pending_main_steps
+                nonlocal cooperative_last_slice_steps
+                nonlocal cooperative_last_serviced_flip
+                if title_scene_record_audit.complete:
+                    return False
+                title_heap_large_bin_integrity_repair.service_native_slice(
+                    cpu,
+                    observed_memory,
+                    steps,
+                )
+                if render_watchpoint.flip_count == 0:
+                    delta_steps = (
+                        steps - pre_first_flip_slice_steps
+                        if steps >= pre_first_flip_slice_steps
+                        else steps
+                    )
+                    if delta_steps > 0:
+                        # Before the first Present there is no video cadence
+                        # to drive the deterministic clock. Model elapsed CPU
+                        # time from retired guest instructions so async
+                        # frontend work and timers cannot remain frozen near
+                        # their boot timestamp. At the current native model,
+                        # 100k instructions represent one 60 Hz interval.
+                        bridge.runtime.clock.advance_100ns(
+                            delta_steps * 166_667 // 100_000
+                        )
+                        bridge.synchronize_data_exports(
+                            observed_memory,
+                            volatile_only=True,
+                        )
+                    pre_first_flip_slice_steps = steps
+                cooperative_delta_steps = (
+                    steps - cooperative_last_slice_steps
+                    if steps >= cooperative_last_slice_steps
+                    else steps
+                )
+                cooperative_last_slice_steps = steps
+                cooperative_pending_main_steps += cooperative_delta_steps
+                if live_host_bridge is not None:
+                    continue_running = live_host_bridge.on_slice(
+                        cpu,
+                        observed_memory,
+                        steps,
+                    )
+                    if continue_running is False:
+                        return False
+                    completed_flips = render_watchpoint.flip_count
+                    if completed_flips > 0:
+                        while cooperative_last_serviced_flip < completed_flips:
+                            run_cooperative_service(video_tick=True)
+                            cooperative_last_serviced_flip += 1
+                        cooperative_pending_main_steps = 0
+                        return continue_running
+                while cooperative_pending_main_steps >= cooperative_quantum:
+                    run_cooperative_service(video_tick=False)
+                    cooperative_pending_main_steps -= cooperative_quantum
+                return None
+
             native_steps = 0
             returned_to = state.eip
+            native_cache_donor: NativeResumableExecutor | None = None
             while max_steps == 0 or native_steps < max_steps:
+                if (
+                    live_host_bridge is not None
+                    and not live_host_bridge.should_continue_native_recovery()
+                ):
+                    break
                 if native_frontier_functions:
                     frame = _merge_lifted_functions(
                         entry_function,
@@ -10700,65 +15576,50 @@ def _execute_guest_thread_start(
                         symbol=f"guest_thread_{thread_index:02d}_{start_address:08X}",
                         base_address=start_address,
                     )
-                    native_frontier_frame = _merge_lifted_functions(
-                        native_frontier_functions[0],
-                        native_frontier_functions[1:],
-                        symbol=f"guest_thread_{thread_index:02d}_frontier",
-                        base_address=native_frontier_functions[0].base_address,
-                    )
-                else:
-                    native_frontier_frame = None
-                native = NativeResumableExecutor(
+                native = create_native_executor(
                     frame,
-                    build_dir=native_build_dir,
-                    # Keep the already-compiled base frame and the recovered
-                    # frontier batch in independent native modules. Otherwise
-                    # appending one block changes the final large module's
-                    # digest and recompiles it synchronously.
-                    module_functions=[
+                    [
                         native_base_frame,
-                        *([native_frontier_frame] if native_frontier_frame else []),
+                        # Keep every recovered CFG batch independent. Extending a
+                        # cumulative frontier frame changes its digest and forces
+                        # the whole dense address bucket to compile again.
+                        *native_frontier_modules,
                     ],
-                    observer_addresses=observer_addresses,
-                    callback_addresses=handlers.keys(),
-                    memory_callback_addresses={
-                        TITLE_AUDIO_DSP_CONTROL_ADDRESS,
-                        TITLE_AUDIO_DSP_STATUS_ADDRESS,
-                        *TITLE_AUDIO_DSP_VOICE_COMMAND_ADDRESSES,
-                        TITLE_MCPX_FRAME_COUNTER_ADDRESS,
-                        TITLE_GPU_COMMAND_KICK_ADDRESS,
-                        TITLE_GPU_PROGRESS_COUNTER_ADDRESS,
-                        TITLE_GPU_SOFTWARE_COMPLETION_FLAG_ADDRESS,
-                        TITLE_D3D_CONTEXT_GET_POINTER_ADDRESS,
-                        TITLE_GPU_SUBMISSION_BASE_ADDRESS,
-                        TITLE_GPU_SUBMISSION_LIMIT_ADDRESS,
-                        TITLE_D3D_CONTEXT_GLOBAL_ADDRESS,
-                        TITLE_CLEANUP_LIST_SENTINEL_ADDRESS,
-                        TITLE_FRONTEND_RESOURCE_CACHE_SENTINEL_ADDRESS,
-                        TITLE_FRONTEND_REGISTRY_LIST_SENTINEL_ADDRESS,
-                        TITLE_FRONTEND_INITIALIZER_LIST_SENTINEL_ADDRESS,
-                        *(
-                            {TITLE_MAIN_LOOP_EXIT_FLAG_ADDRESS}
-                            if audit_title_main_loop_exit
-                            else set()
-                        ),
-                    },
-                    synchronize_eip_for_callbacks=audit_title_main_loop_exit,
                 )
+                if native_cache_donor is not None:
+                    native.seed_page_cache_from(native_cache_donor, memory)
+                cooperative_executor = None
                 try:
                     returned_to = native.run(
                         state,
                         memory,
                         call_handlers=handlers,
                         step_observer=observe_guest_thread_step,
-                        memory_write_observer=(
-                            observe_native_memory_write
-                            if audit_title_main_loop_exit
+                        memory_write_observer=observe_native_memory_write,
+                        memory_write_batch_observer=(
+                            observe_native_memory_write_batch
+                            if live_host_bridge is not None
+                            and not audit_title_main_loop_exit
+                            and not render_watchpoint.retain_diagnostic_writes
                             else None
                         ),
+                        memory_write_batch_address_base=(
+                            TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS
+                        ),
+                        memory_write_observer_ranges_provider=(
+                            memory_write_observer_ranges_provider
+                        ),
                         max_steps=max_steps - native_steps if max_steps else 0,
-                        slice_steps=native_slice_steps if live_host_bridge is not None else 0,
-                        yield_handler=live_host_bridge.on_slice if live_host_bridge is not None else None,
+                        slice_steps=(
+                            native_slice_steps
+                            if live_host_bridge is not None or thread_index == 0
+                            else 0
+                        ),
+                        yield_handler=(
+                            service_native_slice
+                            if live_host_bridge is not None or thread_index == 0
+                            else None
+                        ),
                         yield_predicate=(
                             live_host_bridge.should_yield_for_completed_flip
                             if live_host_bridge is not None
@@ -10770,6 +15631,7 @@ def _execute_guest_thread_start(
                 if native_run_summary is None:
                     break
                 native_run_summaries.append(native_run_summary)
+                native_cache_donor = native
                 native_steps += int(native_run_summary["steps"])
                 if (
                     native_run_summary["reason"] != "unhandled_target"
@@ -10783,6 +15645,15 @@ def _execute_guest_thread_start(
                     break
                 recovered = block_loader(returned_to)
                 if recovered is None:
+                    if any(
+                        returned_to
+                        in {
+                            instruction.address
+                            for instruction in recovered_function.instructions
+                        }
+                        for recovered_function in native_frontier_functions
+                    ):
+                        continue
                     break
                 known_native_addresses = {
                     instruction.address
@@ -10808,7 +15679,54 @@ def _execute_guest_thread_start(
                         remaining_frontiers,
                     ),
                 )
-                native_frontier_functions.extend(recovered_batch)
+                _append_native_frontier_module_batch(
+                    recovered_batch,
+                    frontier_functions=native_frontier_functions,
+                    frontier_modules=native_frontier_modules,
+                    symbol_prefix=f"guest_thread_{thread_index:02d}_frontier",
+                )
+            cooperative_scheduler_summary = {
+                "enabled": thread_index == 0,
+                "cadence": (
+                    "completed_video_flip_after_first_present"
+                    if live_host_bridge is not None
+                    else "retired_guest_instructions"
+                ),
+                "quantum_steps": cooperative_quantum,
+                "service_count": cooperative_service_count,
+                "instruction_tick_count": cooperative_instruction_tick_count,
+                "video_tick_count": cooperative_video_tick_count,
+                "service_total_us": cooperative_service_total_us,
+                "service_max_us": cooperative_service_max_us,
+                "service_average_us": round(
+                    cooperative_service_total_us
+                    / max(1, cooperative_service_count),
+                    3,
+                ),
+                "session_count": len(cooperative_sessions),
+                "worker_write_page_count": len(cooperative_changed_pages),
+                "sessions": [
+                    {
+                        "handle": handle,
+                        "handle_hex": _hex32(handle),
+                        "thread_index": session["thread_index"],
+                        "start_address_hex": session["thread"]["start_address_hex"],
+                        "start_context1_hex": session["thread"]["start_context1_hex"],
+                        "start_context2_hex": session["thread"]["start_context2_hex"],
+                        "status": session["status"],
+                        "run_count": session["run_count"],
+                        "steps": session["steps"],
+                        "state_eip_hex": _hex32(session["state"].eip),
+                        "last_run": session["last_run"],
+                        **(
+                            {"error": session["error"]}
+                            if "error" in session
+                            else {}
+                        ),
+                    }
+                    for handle, session in sorted(cooperative_sessions.items())
+                ],
+            }
             if live_host_bridge is not None:
                 live_host_bridge.on_slice(state, memory, native_steps, True)
             result = ExecutionResult(
@@ -10856,6 +15774,11 @@ def _execute_guest_thread_start(
             "title_frontend_static_singleton_repair": frontend_static_singleton_repair.summary(),
             "title_runtime_object_table_constructor_repair": runtime_object_table_repair.summary(),
             "title_runtime_callback_list_repair": runtime_callback_list_repair.summary(),
+            "title_heap_large_bin_integrity_repair": title_heap_large_bin_integrity_repair.summary(),
+            "title_runtime_callback_audit": runtime_callback_audit.summary(),
+            "title_d3d_present_audit": title_d3d_present_audit.summary(),
+            "title_world_matrix_audit": title_world_matrix_audit.summary(),
+            "title_scene_record_audit": title_scene_record_audit.summary(),
         }
     except BootProbeStop as exc:
         trace_events = exc.trace.to_list()
@@ -10886,8 +15809,13 @@ def _execute_guest_thread_start(
             ],
             "native_run": native_run_summary,
             "native_runs": native_run_summaries,
+            "cooperative_guest_thread_scheduler": cooperative_scheduler_summary,
             "native_frontier_recovery": {
                 "recovered_block_count": len(native_frontier_functions),
+                "recovered_module_count": len(native_frontier_modules),
+                "module_instruction_counts": [
+                    len(module.instructions) for module in native_frontier_modules
+                ],
                 "recovered_targets": [
                     _hex32(function.base_address)
                     for function in native_frontier_functions
@@ -10904,6 +15832,11 @@ def _execute_guest_thread_start(
             "title_frontend_static_singleton_repair": frontend_static_singleton_repair.summary(),
             "title_runtime_object_table_constructor_repair": runtime_object_table_repair.summary(),
             "title_runtime_callback_list_repair": runtime_callback_list_repair.summary(),
+            "title_heap_large_bin_integrity_repair": title_heap_large_bin_integrity_repair.summary(),
+            "title_runtime_callback_audit": runtime_callback_audit.summary(),
+            "title_d3d_present_audit": title_d3d_present_audit.summary(),
+            "title_world_matrix_audit": title_world_matrix_audit.summary(),
+            "title_scene_record_audit": title_scene_record_audit.summary(),
             "executed_internal_targets": _executed_internal_targets(
                 trace_events,
                 {
@@ -10956,6 +15889,11 @@ def _execute_guest_thread_start(
                 "title_frontend_static_singleton_repair": frontend_static_singleton_repair.summary(),
                 "title_runtime_object_table_constructor_repair": runtime_object_table_repair.summary(),
                 "title_runtime_callback_list_repair": runtime_callback_list_repair.summary(),
+                "title_heap_large_bin_integrity_repair": title_heap_large_bin_integrity_repair.summary(),
+                "title_runtime_callback_audit": runtime_callback_audit.summary(),
+                "title_d3d_present_audit": title_d3d_present_audit.summary(),
+                "title_world_matrix_audit": title_world_matrix_audit.summary(),
+                "title_scene_record_audit": title_scene_record_audit.summary(),
                 "executed_internal_targets": _executed_internal_targets(
                     trace_events,
                     {
@@ -10980,6 +15918,11 @@ def _execute_guest_thread_start(
             "title_frontend_static_singleton_repair": frontend_static_singleton_repair.summary(),
             "title_runtime_object_table_constructor_repair": runtime_object_table_repair.summary(),
             "title_runtime_callback_list_repair": runtime_callback_list_repair.summary(),
+            "title_heap_large_bin_integrity_repair": title_heap_large_bin_integrity_repair.summary(),
+            "title_runtime_callback_audit": runtime_callback_audit.summary(),
+            "title_d3d_present_audit": title_d3d_present_audit.summary(),
+            "title_world_matrix_audit": title_world_matrix_audit.summary(),
+            "title_scene_record_audit": title_scene_record_audit.summary(),
             "native_run": native_run_summary,
             "native_runs": native_run_summaries,
         }
@@ -11020,8 +15963,11 @@ def _execute_guest_thread_start(
         and native_run_summary.get("reason") == "step_budget"
     )
     reached_live_stop = (
-        native_run_summary is not None
-        and native_run_summary.get("reason") == "yield_handler_stop"
+        (live_host_bridge is not None and live_host_bridge.stop_requested)
+        or (
+            native_run_summary is not None
+            and native_run_summary.get("reason") == "yield_handler_stop"
+        )
     )
     return {
         **summary,
@@ -11058,8 +16004,13 @@ def _execute_guest_thread_start(
         },
         "native_run": native_run_summary,
         "native_runs": native_run_summaries,
+        "cooperative_guest_thread_scheduler": cooperative_scheduler_summary,
         "native_frontier_recovery": {
             "recovered_block_count": len(native_frontier_functions),
+            "recovered_module_count": len(native_frontier_modules),
+            "module_instruction_counts": [
+                len(module.instructions) for module in native_frontier_modules
+            ],
             "recovered_targets": [
                 _hex32(function.base_address) for function in native_frontier_functions
             ],
@@ -11076,6 +16027,11 @@ def _execute_guest_thread_start(
         "title_frontend_static_singleton_repair": frontend_static_singleton_repair.summary(),
         "title_runtime_object_table_constructor_repair": runtime_object_table_repair.summary(),
         "title_runtime_callback_list_repair": runtime_callback_list_repair.summary(),
+        "title_heap_large_bin_integrity_repair": title_heap_large_bin_integrity_repair.summary(),
+        "title_runtime_callback_audit": runtime_callback_audit.summary(),
+        "title_d3d_present_audit": title_d3d_present_audit.summary(),
+        "title_world_matrix_audit": title_world_matrix_audit.summary(),
+        "title_scene_record_audit": title_scene_record_audit.summary(),
         "title_main_loop_exit_audit": title_main_loop_exit_audit_summary(),
         "runtime_abi_invocations": [
             invocation.to_dict()
@@ -11115,9 +16071,13 @@ def _recovered_render_command_stream(
             kind = "d3d_mmio"
             offset = address - 0xFED00000
             mmio_count += 1
-        elif 0x80000000 <= address <= 0x8000FFFF:
+        elif (
+            TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS
+            <= address
+            < RENDER_PUSH_BUFFER_APERTURE_END_ADDRESS
+        ):
             kind = "d3d_push_buffer"
-            offset = address - 0x80000000
+            offset = address - TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS
             push_buffer_count += 1
         if kind is None:
             continue
@@ -13508,8 +18468,11 @@ def main() -> int:
     parser.add_argument(
         "--native-slice-steps",
         type=int,
-        default=2500,
-        help="Guest instructions per live render/input exchange.",
+        default=100_000,
+        help=(
+            "Guest instructions per input exchange; completed flips still "
+            "yield immediately."
+        ),
     )
     parser.add_argument(
         "--audit-title-main-loop-exit",
@@ -13518,6 +18481,35 @@ def main() -> int:
             "Record exact native guest writes overlapping the title main-loop "
             "exit flag; uses an opt-in instrumented native build."
         ),
+    )
+    parser.add_argument(
+        "--audit-world-matrices",
+        action="store_true",
+        help=(
+            "Capture singular RenderWare matrices entering the Lesson One "
+            "shader-constant builder; uses an opt-in observer callback."
+        ),
+    )
+    parser.add_argument(
+        "--audit-world-matrix-address",
+        type=_parse_int,
+        help=(
+            "Capture exact native writes to this 64-byte RenderWare matrix; "
+            "also enables the shader-input audit."
+        ),
+    )
+    parser.add_argument(
+        "--audit-scene-records",
+        action="store_true",
+        help=(
+            "Compare Lesson One indexed-draw arguments with authoritative RAM "
+            "and local Track PSS records, then stop after one complete scene table."
+        ),
+    )
+    parser.add_argument(
+        "--scene-record-audit-output",
+        type=Path,
+        help="Optional compact JSON output for --audit-scene-records.",
     )
     parser.add_argument(
         "--render-watchpoint-limit",
@@ -13550,6 +18542,11 @@ def main() -> int:
         action="store_true",
         help="Pretty-print JSON output.",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Write requested artifacts without duplicating the full summary to stdout.",
+    )
     args = parser.parse_args()
     if (args.live_render_stream is None) != (args.live_controller_state is None):
         parser.error("--live-render-stream and --live-controller-state must be used together")
@@ -13563,6 +18560,12 @@ def main() -> int:
         parser.error("--live-flip-audit-health-interval must not be negative")
     if args.live_flip_audit_max_flips < 0:
         parser.error("--live-flip-audit-max-flips must not be negative")
+    if args.audit_world_matrix_address is not None and not (
+        0 <= args.audit_world_matrix_address <= 0xFFFFFFC0
+    ):
+        parser.error("--audit-world-matrix-address must fit a 64-byte 32-bit range")
+    if args.scene_record_audit_output is not None and not args.audit_scene_records:
+        parser.error("--scene-record-audit-output requires --audit-scene-records")
 
     summary = build_playability_probe_summary(
         args.xbe,
@@ -13590,6 +18593,9 @@ def main() -> int:
         live_flip_audit_max_flips=args.live_flip_audit_max_flips,
         native_slice_steps=args.native_slice_steps,
         audit_title_main_loop_exit=args.audit_title_main_loop_exit,
+        audit_world_matrices=args.audit_world_matrices,
+        audit_world_matrix_address=args.audit_world_matrix_address,
+        audit_scene_records=args.audit_scene_records,
     )
     output = summary_json(summary, pretty=args.pretty)
     if args.json_output is not None:
@@ -13600,7 +18606,16 @@ def main() -> int:
         if not streams:
             raise RuntimeError("probe summary did not contain a recovered render stream")
         write_json(args.render_stream_output, streams[0], pretty=args.pretty)
-    print(output)
+    if args.scene_record_audit_output is not None:
+        scene_report = build_title_scene_record_audit_report(summary)
+        args.scene_record_audit_output.parent.mkdir(parents=True, exist_ok=True)
+        args.scene_record_audit_output.write_text(
+            json.dumps(scene_report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+    if not args.quiet:
+        print(output)
     return 0
 
 

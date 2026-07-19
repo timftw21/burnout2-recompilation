@@ -19,7 +19,7 @@ REPLAY_FORMAT = "b2-recomp-render-command-replay"
 D3D_MMIO_BASE = 0xFED00000
 D3D_MMIO_END = 0xFED0FFFF
 D3D_PUSH_BUFFER_BASE = 0x80000000
-D3D_PUSH_BUFFER_END = 0x8000FFFF
+D3D_PUSH_BUFFER_END = 0x80FFFFFF
 
 MMIO_METHODS = {
     0x0008: {
@@ -153,11 +153,20 @@ def merge_render_streams(
             merged["source_sequence"] = write.get("sequence")
             merged["sequence"] = len(writes)
             writes.append(merged)
-    resources: dict[int, dict[str, Any]] = {}
+    resources: dict[tuple[int, int, int, str], dict[str, Any]] = {}
     for stream in (first, second):
         for resource in stream.get("resource_snapshots", []):
             if isinstance(resource, dict) and isinstance(resource.get("address"), int):
-                resources[int(resource["address"])] = dict(resource)
+                width = resource.get("width")
+                height = resource.get("height")
+                format_name = resource.get("format")
+                resource_key = (
+                    int(resource["address"]),
+                    int(width) if isinstance(width, int) else 0,
+                    int(height) if isinstance(height, int) else 0,
+                    str(format_name) if isinstance(format_name, str) else "",
+                )
+                resources[resource_key] = dict(resource)
     return {
         "format": STREAM_FORMAT,
         "public_safe": False,

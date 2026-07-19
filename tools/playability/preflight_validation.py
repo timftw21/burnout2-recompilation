@@ -42,7 +42,7 @@ SUPPORTED_TEXTURE_FORMATS = {
     "A8R8G8B8_LINEAR",
     "X8R8G8B8_LINEAR",
 }
-SUPPORTED_PRIMITIVES = {"triangle_strip"}
+SUPPORTED_PRIMITIVES = {"triangle_strip", "quad_list"}
 SUPPORTED_DRAW_SOURCES = {"inline_array"}
 TEXTURE_FORMAT_NAMES = {
     0x05: "R5G6B5",
@@ -309,11 +309,23 @@ def _draw_texture_requirement(draw: dict[str, Any]) -> dict[str, Any] | None:
             "width": None,
             "height": None,
         }
+    format_name = texture_format.get("color_format_name")
+    width = texture_format.get("width")
+    height = texture_format.get("height")
+    if format_name in {"A8R8G8B8_LINEAR", "X8R8G8B8_LINEAR"}:
+        image_rect = stage.get("texture_image_rect", {})
+        if isinstance(image_rect, dict):
+            rect_width = image_rect.get("width")
+            rect_height = image_rect.get("height")
+            if isinstance(rect_width, int) and rect_width > 0:
+                width = rect_width
+            if isinstance(rect_height, int) and rect_height > 0:
+                height = rect_height
     return {
         "address": offset.get("raw"),
-        "format": texture_format.get("color_format_name"),
-        "width": texture_format.get("width"),
-        "height": texture_format.get("height"),
+        "format": format_name,
+        "width": width,
+        "height": height,
     }
 
 

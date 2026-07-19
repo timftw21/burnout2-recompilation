@@ -37,12 +37,17 @@ DEFAULT_RENDER_DEBUG_EVENTS = (
 DEFAULT_RENDER_DEBUG_REPORT = (
     REPO_ROOT / "reports" / "local" / "playability" / "render-debug-report.json"
 )
+DEFAULT_SCENE_RECORD_AUDIT_REPORT = (
+    REPO_ROOT / "reports" / "local" / "playability" / "scene-record-audit.json"
+)
 DEFAULT_AUDIT_ROOT = REPO_ROOT / "reports" / "local" / "flip-audit"
+DEFAULT_NATIVE_SLICE_STEPS = 100_000
 
 
 def build_guest_command(args: argparse.Namespace) -> list[str]:
     command = [
         sys.executable,
+        "-u",
         str(REPO_ROOT / "tools" / "playability" / "playability_probe.py"),
         str(args.xbe),
         "--extracted-root", str(args.extracted_root),
@@ -56,6 +61,7 @@ def build_guest_command(args: argparse.Namespace) -> list[str]:
         "--live-render-stream", str(args.live_render_stream),
         "--live-controller-state", str(args.live_controller_state),
         "--json-output", str(args.json_output),
+        "--quiet",
     ]
     if getattr(args, "lossless_flip_audit", False):
         command.extend(
@@ -66,6 +72,21 @@ def build_guest_command(args: argparse.Namespace) -> list[str]:
                 str(getattr(args, "flip_audit_health_interval", 30)),
                 "--live-flip-audit-max-flips",
                 str(getattr(args, "flip_audit_max_flips", 0)),
+            ]
+        )
+    audit_world_matrix_address = getattr(args, "audit_world_matrix_address", None)
+    if getattr(args, "audit_world_matrices", False) or audit_world_matrix_address is not None:
+        command.append("--audit-world-matrices")
+    if audit_world_matrix_address is not None:
+        command.extend(
+            ["--audit-world-matrix-address", f"0x{audit_world_matrix_address:08X}"]
+        )
+    if getattr(args, "audit_scene_records", False):
+        command.extend(
+            [
+                "--audit-scene-records",
+                "--scene-record-audit-output",
+                str(args.scene_record_audit_output),
             ]
         )
     return command
@@ -292,6 +313,20 @@ def _stop_process(process: subprocess.Popen[bytes] | None) -> None:
         process.wait()
 
 
+def _wait_for_guest_shutdown(
+    process: subprocess.Popen[bytes],
+    *,
+    timeout_seconds: float = 30.0,
+) -> tuple[int, bool]:
+    try:
+        return process.wait(timeout=timeout_seconds), False
+    except subprocess.TimeoutExpired:
+        print("Guest did not stop after the presenter closed; terminating it.")
+        _stop_process(process)
+        returncode = process.poll()
+        return (returncode if returncode not in {None, 0} else 1), True
+
+
 def _request_presenter_close(process: subprocess.Popen[bytes]) -> bool:
     if sys.platform != "win32" or process.poll() is not None:
         return False
@@ -455,6 +490,25 @@ def _finalize_render_diagnostics(args: argparse.Namespace) -> None:
         print(f"Could not finalize render diagnostics: {exc}")
 
 
+def _summarize_scene_record_audit(args: argparse.Namespace) -> None:
+    if not getattr(args, "audit_scene_records", False):
+        return
+    try:
+        report = json.loads(args.scene_record_audit_output.read_text(encoding="utf-8"))
+        print(
+            "Scene-record audit: "
+            f"{report.get('status', 'unknown')}; "
+            f"draws={report.get('scene_draw_count', 0)}, "
+            f"argument/RAM divergences="
+            f"{report.get('argument_memory_divergence_count', 0)}, "
+            f"RAM/source divergences="
+            f"{report.get('runtime_source_divergence_count', 0)}; "
+            f"report={args.scene_record_audit_output}"
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"Could not summarize scene-record audit: {exc}")
+
+
 def run_live_test(args: argparse.Namespace) -> int:
     run_started = time.monotonic()
     args.runner_log.parent.mkdir(parents=True, exist_ok=True)
@@ -463,6 +517,8 @@ def run_live_test(args: argparse.Namespace) -> int:
     args.json_output.parent.mkdir(parents=True, exist_ok=True)
     args.render_debug_events.parent.mkdir(parents=True, exist_ok=True)
     args.render_debug_report.parent.mkdir(parents=True, exist_ok=True)
+    if getattr(args, "audit_scene_records", False):
+        args.scene_record_audit_output.parent.mkdir(parents=True, exist_ok=True)
     args.save_data_root.mkdir(parents=True, exist_ok=True)
     args.dashboard_root.mkdir(parents=True, exist_ok=True)
     args.cache_root.mkdir(parents=True, exist_ok=True)
@@ -484,9 +540,16 @@ def run_live_test(args: argparse.Namespace) -> int:
         args.live_render_stream.unlink()
     if args.live_controller_state.exists():
         args.live_controller_state.unlink()
+    if args.json_output.exists():
+        args.json_output.unlink()
     for stale in (args.render_debug_events, args.render_debug_report):
         if stale.exists():
             stale.unlink()
+    if (
+        getattr(args, "audit_scene_records", False)
+        and args.scene_record_audit_output.exists()
+    ):
+        args.scene_record_audit_output.unlink()
     controller_consumed = args.live_controller_state.with_name(
         args.live_controller_state.name + ".consumed.json"
     )
@@ -519,11 +582,46 @@ def run_live_test(args: argparse.Namespace) -> int:
 
             print("Starting Vulkan presenter. Close the window or press Escape to stop.")
             presenter_started = time.monotonic()
-            presenter = subprocess.Popen(build_presenter_command(args), cwd=REPO_ROOT)
+            presenter = subprocess.Popen(
+                build_presenter_command(args),
+                cwd=REPO_ROOT,
+                stdout=runner_log,
+                stderr=subprocess.STDOUT,
+            )
+            scene_audit_run = getattr(args, "audit_scene_records", False)
             bounded_guest_run = args.max_steps > 0 or (
                 args.lossless_flip_audit and args.flip_audit_max_flips > 0
             )
-            if bounded_guest_run:
+            if scene_audit_run:
+                while guest.poll() is None and presenter.poll() is None:
+                    time.sleep(0.05)
+                guest_returncode = guest.poll()
+                if guest_returncode is not None:
+                    if presenter.poll() is None and not _request_presenter_close(presenter):
+                        print("Could not request a graceful presenter close.")
+                    try:
+                        presenter_returncode = presenter.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        print("Presenter did not close after the scene-record audit.")
+                        presenter_returncode = 1
+                else:
+                    presenter_returncode = presenter.returncode
+                    args.live_controller_state.write_text(
+                        json.dumps({"stop": True}, separators=(",", ":")) + "\n",
+                        encoding="utf-8",
+                    )
+                    guest_returncode, forced_guest_stop = _wait_for_guest_shutdown(guest)
+                    if forced_guest_stop:
+                        _finalize_render_diagnostics(args)
+                        args.flip_audit_total_elapsed_seconds = (
+                            time.monotonic() - run_started
+                        )
+                        if presenter_started is not None:
+                            args.flip_audit_presenter_elapsed_seconds = (
+                                time.monotonic() - presenter_started
+                            )
+                        return _finalize_lossless_flip_audit(args, guest_returncode)
+            elif bounded_guest_run:
                 guest_returncode = guest.wait()
                 if presenter.poll() is None and not _request_presenter_close(presenter):
                     print("Could not request a graceful presenter close.")
@@ -538,11 +636,17 @@ def run_live_test(args: argparse.Namespace) -> int:
                     json.dumps({"stop": True}, separators=(",", ":")) + "\n",
                     encoding="utf-8",
                 )
-                try:
-                    guest_returncode = guest.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    print("Guest did not stop after the presenter closed; terminating it.")
-                    return presenter_returncode
+                guest_returncode, forced_guest_stop = _wait_for_guest_shutdown(guest)
+                if forced_guest_stop:
+                    _finalize_render_diagnostics(args)
+                    args.flip_audit_total_elapsed_seconds = (
+                        time.monotonic() - run_started
+                    )
+                    if presenter_started is not None:
+                        args.flip_audit_presenter_elapsed_seconds = (
+                            time.monotonic() - presenter_started
+                        )
+                    return _finalize_lossless_flip_audit(args, guest_returncode)
             if guest_returncode != 0:
                 print(f"Guest runner exited with code {guest_returncode}. See {args.runner_log}")
                 _finalize_render_diagnostics(args)
@@ -558,6 +662,7 @@ def run_live_test(args: argparse.Namespace) -> int:
                     time.monotonic() - presenter_started
                 )
             _finalize_render_diagnostics(args)
+            _summarize_scene_record_audit(args)
             return _finalize_lossless_flip_audit(args, presenter_returncode)
         except KeyboardInterrupt:
             print("Stopping live test...")
@@ -595,12 +700,50 @@ def main() -> int:
         default=DEFAULT_RENDER_DEBUG_REPORT,
         help="Post-run guest/host geometry provenance report.",
     )
-    parser.add_argument("--native-slice-steps", type=int, default=2500)
+    parser.add_argument(
+        "--native-slice-steps",
+        type=int,
+        default=DEFAULT_NATIVE_SLICE_STEPS,
+        help=(
+            "Guest instructions per input exchange; completed flips still "
+            "yield immediately."
+        ),
+    )
     parser.add_argument(
         "--max-steps",
         type=int,
         default=0,
         help="Maximum guest instructions; 0 (the default) runs until the presenter closes.",
+    )
+    parser.add_argument(
+        "--audit-world-matrices",
+        action="store_true",
+        help=(
+            "Capture singular RenderWare world-matrix inputs and their guest "
+            "callers for the render debug report."
+        ),
+    )
+    parser.add_argument(
+        "--audit-world-matrix-address",
+        type=lambda value: int(value, 0),
+        help=(
+            "Capture exact writes to one 64-byte RenderWare matrix and include "
+            "the transitions in the render debug report."
+        ),
+    )
+    parser.add_argument(
+        "--audit-scene-records",
+        action="store_true",
+        help=(
+            "Run the compact Lesson One scene-record/source audit and close "
+            "automatically after its first complete table."
+        ),
+    )
+    parser.add_argument(
+        "--scene-record-audit-output",
+        type=Path,
+        default=DEFAULT_SCENE_RECORD_AUDIT_REPORT,
+        help="Compact scene-record audit JSON written by the guest.",
     )
     parser.add_argument("--startup-timeout-seconds", type=float, default=180.0)
     parser.add_argument("--skip-host-build", action="store_true")
@@ -643,6 +786,10 @@ def main() -> int:
         parser.error("--flip-audit-max-flips must not be negative")
     if args.flip_audit_health_interval < 0:
         parser.error("--flip-audit-health-interval must not be negative")
+    if args.audit_world_matrix_address is not None and not (
+        0 <= args.audit_world_matrix_address <= 0xFFFFFFC0
+    ):
+        parser.error("--audit-world-matrix-address must fit a 64-byte 32-bit range")
     if args.flip_audit_max_flips and not args.lossless_flip_audit:
         parser.error("--flip-audit-max-flips requires --lossless-flip-audit")
     if args.lossless_flip_audit:

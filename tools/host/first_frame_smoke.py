@@ -80,6 +80,7 @@ def build_command(
     return [
         str(toolchain.clangxx),
         "-std=c++17",
+        "-O2",
         "-DUNICODE",
         "-D_UNICODE",
         f"-I{toolchain.include_dir}",
@@ -188,6 +189,7 @@ def run_first_frame(
     flip_audit_frame_directory: Path | None = None,
     flip_audit_max_flips: int = 0,
     flip_audit_health_interval: int = 30,
+    analyze_render_stream: bool = False,
 ) -> dict[str, Any]:
     if not executable.exists():
         raise FirstFrameSmokeError(f"first-frame executable is missing: {executable}")
@@ -205,23 +207,33 @@ def run_first_frame(
         "--debug-json",
         str(debug_json),
     ]
-    if inject_input:
+    if analyze_render_stream:
+        command.append("--analyze-render-stream")
+    if inject_input and not analyze_render_stream:
         command.append("--inject-input")
     if render_stream_json is not None:
         command.extend([
-            "--live-render-stream-json" if live_render_stream else "--render-stream-json",
+            (
+                "--live-render-stream-json"
+                if live_render_stream or analyze_render_stream
+                else "--render-stream-json"
+            ),
             str(render_stream_json),
         ])
-    if controller_state_json is not None:
+    if controller_state_json is not None and not analyze_render_stream:
         controller_state_json.parent.mkdir(parents=True, exist_ok=True)
         command.extend(["--controller-state-json", str(controller_state_json)])
-    if strict_render_validation:
+    if strict_render_validation and not analyze_render_stream:
         command.append("--strict-render-validation")
     if (flip_audit_ack is None) != (flip_audit_frame_directory is None):
         raise FirstFrameSmokeError(
             "flip audit acknowledgement and frame directory must be used together"
         )
-    if flip_audit_ack is not None and flip_audit_frame_directory is not None:
+    if (
+        flip_audit_ack is not None
+        and flip_audit_frame_directory is not None
+        and not analyze_render_stream
+    ):
         flip_audit_ack.parent.mkdir(parents=True, exist_ok=True)
         flip_audit_frame_directory.mkdir(parents=True, exist_ok=True)
         command.extend(["--flip-audit-ack", str(flip_audit_ack)])
@@ -233,19 +245,20 @@ def run_first_frame(
         command.extend(
             ["--flip-audit-health-interval", str(flip_audit_health_interval)]
         )
-    if screenshot is not None:
+    if screenshot is not None and not analyze_render_stream:
         screenshot.parent.mkdir(parents=True, exist_ok=True)
         if screenshot.exists():
             screenshot.unlink()
         command.extend(["--screenshot", str(screenshot)])
-    if hotkey_screenshot_directory is not None:
+    if hotkey_screenshot_directory is not None and not analyze_render_stream:
         hotkey_screenshot_directory.mkdir(parents=True, exist_ok=True)
         command.extend([
             "--hotkey-screenshot-directory",
             str(hotkey_screenshot_directory),
         ])
-    command.extend(["--vertex-shader", str(vertex_shader)])
-    command.extend(["--fragment-shader", str(fragment_shader)])
+    if not analyze_render_stream:
+        command.extend(["--vertex-shader", str(vertex_shader)])
+        command.extend(["--fragment-shader", str(fragment_shader)])
 
     env = os.environ.copy()
     llvm_bin = str(DEFAULT_LLVM_BIN)
@@ -274,6 +287,7 @@ def run_first_frame(
             if hotkey_screenshot_directory is not None
             else None
         ),
+        "analyze_render_stream": analyze_render_stream,
         "events": events,
     }
 
@@ -346,6 +360,11 @@ def summarize_smoke(
     readback_events = [
         event for event in events if event.get("event") == "frame_readback_captured"
     ]
+    hotkey_capture_events = [
+        event
+        for event in events
+        if event.get("event") == "hotkey_render_capture_retained"
+    ]
     flip_audit_events = [
         event
         for event in events
@@ -360,6 +379,16 @@ def summarize_smoke(
     ]
     render_validation_events = [
         event for event in events if event.get("event") == "render_validation"
+    ]
+    vertex_transform_events = [
+        event
+        for event in events
+        if event.get("event") == "nv2a_vertex_transform_diagnostics"
+    ]
+    stream_analysis_events = [
+        event
+        for event in events
+        if event.get("event") == "render_stream_analysis_complete"
     ]
     screenshot_path = run_result.get("screenshot")
     screenshot = (
@@ -417,6 +446,10 @@ def summarize_smoke(
             "event_counts": dict(sorted(counts.items())),
             "main_loop_entered": counts.get("main_loop_enter", 0) == 1,
             "main_loop_exited": counts.get("main_loop_exit", 0) == 1,
+            "render_stream_analysis_completed": len(stream_analysis_events) == 1,
+            "vertex_transform_diagnostics": (
+                vertex_transform_events[-1] if vertex_transform_events else None
+            ),
             "frames_presented": len(frame_events),
             "input_events": len(input_events),
             "input_keydown_events": sum(
@@ -452,6 +485,14 @@ def summarize_smoke(
                 event.get("output")
                 for event in readback_events
                 if event.get("trigger") == "f12" and event.get("output")
+            ],
+            "hotkey_render_capture_count": sum(
+                1 for event in hotkey_capture_events if event.get("manifest")
+            ),
+            "hotkey_render_capture_manifests": [
+                event.get("manifest")
+                for event in hotkey_capture_events
+                if event.get("manifest")
             ],
             "recovered_frontend_text_drawn": len(frontend_text_events) == 1,
             "recovered_frontend_text": next(
@@ -508,6 +549,46 @@ def summarize_smoke(
                 (
                     int(event.get("unsupported_presented_primitive_count", 0))
                     for event in render_validation_events
+                ),
+                default=0,
+            ),
+            "missing_presented_indexed_resource_draw_count": max(
+                (
+                    int(
+                        event.get(
+                            "missing_presented_indexed_resource_draw_count",
+                            0,
+                        )
+                    )
+                    for event in render_validation_events
+                ),
+                default=0,
+            ),
+            "vertex_buffer_resource_count": max(
+                (
+                    int(event.get("vertex_buffer_resource_count", 0))
+                    for event in render_validation_events
+                ),
+                default=0,
+            ),
+            "offscreen_render_target_draw_count": max(
+                (
+                    int(event.get("offscreen_render_target_draw_count", 0))
+                    for event in render_validation_events
+                ),
+                default=0,
+            ),
+            "materialized_indexed_draw_count": max(
+                (
+                    int(event.get("materialized_indexed_draws", 0))
+                    for event in native_resource_events
+                ),
+                default=0,
+            ),
+            "materialized_indexed_vertex_count": max(
+                (
+                    int(event.get("materialized_indexed_vertices", 0))
+                    for event in native_resource_events
                 ),
                 default=0,
             ),
@@ -749,6 +830,11 @@ def main() -> int:
         help="Hot-reload --render-stream-json snapshots published by the resumable runner.",
     )
     parser.add_argument(
+        "--analyze-render-stream",
+        action="store_true",
+        help="Interpret and diagnose a frozen live render manifest without Vulkan or a window.",
+    )
+    parser.add_argument(
         "--controller-state-json",
         type=Path,
         help="Publish keyboard-mapped Xbox controller state for the resumable runner.",
@@ -776,6 +862,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.live_render_stream and args.render_stream_json is None:
         parser.error("--live-render-stream requires --render-stream-json")
+    if args.analyze_render_stream and args.render_stream_json is None:
+        parser.error("--analyze-render-stream requires --render-stream-json")
     if (args.flip_audit_ack is None) != (args.flip_audit_frame_directory is None):
         parser.error(
             "--flip-audit-ack and --flip-audit-frame-directory must be used together"
@@ -797,8 +885,9 @@ def main() -> int:
             output=args.exe,
             toolchain=toolchain,
         )
-        shader_result = compile_shaders(toolchain=toolchain)
-        compile_result["shaders"] = shader_result
+        if not args.analyze_render_stream:
+            shader_result = compile_shaders(toolchain=toolchain)
+            compile_result["shaders"] = shader_result
 
     run_result = run_first_frame(
         executable=args.exe,
@@ -806,7 +895,7 @@ def main() -> int:
         width=args.width,
         height=args.height,
         max_frames=args.max_frames,
-        inject_input=not args.no_inject_input,
+        inject_input=not args.no_inject_input and not args.analyze_render_stream,
         timeout_seconds=args.timeout_seconds,
         render_stream_json=args.render_stream_json,
         live_render_stream=args.live_render_stream,
@@ -816,8 +905,15 @@ def main() -> int:
         flip_audit_frame_directory=args.flip_audit_frame_directory,
         flip_audit_max_flips=args.flip_audit_max_flips,
         flip_audit_health_interval=args.flip_audit_health_interval,
-        screenshot=None if args.no_automatic_screenshot else args.screenshot_output,
-        hotkey_screenshot_directory=args.hotkey_screenshot_directory,
+        screenshot=(
+            None
+            if args.no_automatic_screenshot or args.analyze_render_stream
+            else args.screenshot_output
+        ),
+        hotkey_screenshot_directory=(
+            None if args.analyze_render_stream else args.hotkey_screenshot_directory
+        ),
+        analyze_render_stream=args.analyze_render_stream,
     )
     summary = summarize_smoke(
         compile_result=compile_result,

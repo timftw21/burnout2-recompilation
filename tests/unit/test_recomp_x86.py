@@ -1036,6 +1036,89 @@ class X86RecompPrototypeTests(unittest.TestCase):
         self.assertEqual(result.return_address, 0xDEADC0DE)
         self.assertIn("static_cast<int32_t>", emitted)
 
+        fpu_integer_multiply = lift_x86_function(
+            bytes.fromhex(
+                "D9442404"  # fld dword [esp+4]
+                "DA4C2408"  # fimul dword [esp+8]
+                "D91D08200000"  # fstp dword [0x2008]
+                "C3"
+            ),
+            base_address=0x00082E71,
+            symbol="fpu_integer_multiply",
+        )
+        state = CpuState.with_registers(esp=0x9000)
+        memory = SparseMemory(
+            {
+                0x9000: 0xDEADC0DE,
+                0x9004: struct.pack("<f", 1.5),
+                0x9008: -3,
+            }
+        )
+
+        result = execute_lifted_function(
+            fpu_integer_multiply,
+            state=state,
+            memory=memory,
+        )
+        emitted = emit_cpp(
+            fpu_integer_multiply,
+            exported_symbol="fpu_integer_multiply",
+        )
+
+        self.assertEqual(
+            [
+                instruction.mnemonic
+                for instruction in fpu_integer_multiply.instructions[:3]
+            ],
+            ["fld", "fimul", "fstp"],
+        )
+        self.assertEqual(fpu_integer_multiply.instructions[1].address, 0x00082E75)
+        self.assertEqual(struct.unpack("<f", memory.read(0x2008, 4))[0], -4.5)
+        self.assertEqual(result.state.fpu_stack, [])
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        self.assertIn("*= static_cast<float>(static_cast<int32_t>", emitted)
+
+        fpu_integer_divide = lift_x86_function(
+            bytes.fromhex(
+                "DB0500200000"  # fild dword [0x2000]
+                "DA3504200000"  # fidiv dword [0x2004]
+                "D91D08200000"  # fstp dword [0x2008]
+                "C3"
+            ),
+            base_address=0x3848,
+            symbol="fpu_integer_divide",
+        )
+        state = CpuState.with_registers(esp=0x9000)
+        memory = SparseMemory(
+            {
+                0x9000: 0xDEADC0DE,
+                0x2000: 10,
+                0x2004: 4,
+            }
+        )
+
+        result = execute_lifted_function(
+            fpu_integer_divide,
+            state=state,
+            memory=memory,
+        )
+        emitted = emit_cpp(
+            fpu_integer_divide,
+            exported_symbol="fpu_integer_divide",
+        )
+
+        self.assertEqual(
+            [
+                instruction.mnemonic
+                for instruction in fpu_integer_divide.instructions[:3]
+            ],
+            ["fild", "fidiv", "fstp"],
+        )
+        self.assertEqual(struct.unpack("<f", memory.read(0x2008, 4))[0], 2.5)
+        self.assertEqual(result.state.fpu_stack, [])
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        self.assertIn("/= static_cast<float>(static_cast<int32_t>", emitted)
+
         fld_scalar = lift_x86_function(
             bytes.fromhex(
                 "D90500200000"  # fld dword [0x2000]
@@ -1239,6 +1322,63 @@ class X86RecompPrototypeTests(unittest.TestCase):
         self.assertIn("fpu_status_word", emitted)
         self.assertIn("b2r_fpu_pop", emitted)
 
+        fpu_compare_pop_twice = lift_x86_function(
+            bytes.fromhex(
+                "D90500200000"  # fld dword [0x2000]
+                "D90504200000"  # fld dword [0x2004]
+                "DED9"  # fcompp
+                "DFE0"  # fnstsw ax
+                "C3"
+            ),
+            base_address=0x38D0,
+            symbol="fpu_compare_pop_twice",
+        )
+        state = CpuState.with_registers(
+            esp=0x9000,
+            fpu_status_word=0x4000,
+        )
+        memory = SparseMemory(
+            {
+                0x9000: 0xDEADC0DE,
+                0x2000: struct.pack("<f", 3.0),
+                0x2004: struct.pack("<f", 2.0),
+            }
+        )
+
+        result = execute_lifted_function(
+            fpu_compare_pop_twice,
+            state=state,
+            memory=memory,
+        )
+        emitted = emit_cpp(
+            fpu_compare_pop_twice,
+            exported_symbol="fpu_compare_pop_twice",
+        )
+        compare_event = next(
+            event
+            for event in result.trace.to_list()
+            if event["operation"] == "fpu_compare_pop_twice"
+        )
+
+        self.assertEqual(
+            [
+                instruction.mnemonic
+                for instruction in fpu_compare_pop_twice.instructions[:4]
+            ],
+            ["fld", "fld", "fcompp", "fnstsw"],
+        )
+        self.assertEqual(result.state.fpu_stack, [])
+        self.assertEqual(result.state.fpu_status_word, 0x0100)
+        self.assertEqual(result.state.get_register("eax") & 0xFFFF, 0x0100)
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        self.assertEqual(compare_event["details"]["comparison"], "less")
+        self.assertEqual(compare_event["details"]["stack_depth"], 0)
+        self.assertIn(
+            "b2r_fpu_compare_status(ctx->fpu_stack[0], ctx->fpu_stack[1]",
+            emitted,
+        )
+        self.assertEqual(emitted.count("(void)b2r_fpu_pop(ctx);"), 2)
+
         fpu_add_pop = lift_x86_function(
             bytes.fromhex(
                 "D90500200000"  # fld dword [0x2000]
@@ -1335,12 +1475,15 @@ class X86RecompPrototypeTests(unittest.TestCase):
 
         self.assertEqual(
             [instruction.mnemonic for instruction in fpu_double_top.instructions[:3]],
-            ["fld", "fadd", "fstp"],
+            ["fld", "fadd_st", "fstp"],
         )
         self.assertAlmostEqual(struct.unpack("<f", memory.read(0x2004, 4))[0], 6.0)
         self.assertEqual(result.state.fpu_stack, [])
         self.assertEqual(result.return_address, 0xDEADC0DE)
-        self.assertIn("+= ctx->fpu_stack[0u]", emitted)
+        self.assertIn(
+            "ctx->fpu_stack[0u] + ctx->fpu_stack[0]",
+            emitted,
+        )
 
         fpu_add_float64 = lift_x86_function(
             bytes.fromhex(
@@ -1511,6 +1654,80 @@ class X86RecompPrototypeTests(unittest.TestCase):
             ["fld1", "fldl2t", "fldl2e", "fldpi", "fldlg2", "fldln2", "fldz"],
         )
 
+        register_destination = lift_x86_function(
+            bytes.fromhex("D9C0D9FCDCE1C3"),
+            base_address=0x3B20,
+            symbol="x87_exponential_register_destination",
+        )
+        state = CpuState.with_registers(esp=0x9000)
+        state.fpu_stack = [1.75]
+        memory = SparseMemory({0x9000: 0xDEADC0DE})
+
+        result = execute_lifted_function(
+            register_destination,
+            state=state,
+            memory=memory,
+        )
+        emitted = emit_cpp(
+            register_destination,
+            exported_symbol="x87_exponential_register_destination",
+        )
+
+        self.assertEqual(
+            [
+                instruction.mnemonic
+                for instruction in register_destination.instructions[:3]
+            ],
+            ["fld", "frndint", "fsubr_st"],
+        )
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        self.assertEqual(result.state.fpu_stack, [2.0, 0.25])
+        self.assertIn(
+            "ctx->fpu_stack[1u] = ctx->fpu_stack[0] - ctx->fpu_stack[1u]",
+            emitted,
+        )
+
+        test_and_absolute = lift_x86_function(
+            bytes.fromhex(
+                "D90500200000"  # fld dword [0x2000]
+                "D9E4"  # ftst
+                "9B"  # wait
+                "DD3D04200000"  # fnstsw word [0x2004]
+                "D9E1"  # fabs
+                "D91D08200000"  # fstp dword [0x2008]
+                "C3"
+            ),
+            base_address=0x3B30,
+            symbol="x87_test_and_absolute",
+        )
+        state = CpuState.with_registers(esp=0x9000)
+        memory = SparseMemory(
+            {
+                0x9000: 0xDEADC0DE,
+                0x2000: struct.pack("<f", -2.5),
+            }
+        )
+
+        result = execute_lifted_function(
+            test_and_absolute,
+            state=state,
+            memory=memory,
+        )
+        emitted = emit_cpp(
+            test_and_absolute,
+            exported_symbol="x87_test_and_absolute",
+        )
+
+        self.assertEqual(
+            [instruction.mnemonic for instruction in test_and_absolute.instructions[:6]],
+            ["fld", "ftst", "fwait", "fnstsw", "fabs", "fstp"],
+        )
+        self.assertEqual(memory.read(0x2004, 2), struct.pack("<H", 0x0100))
+        self.assertAlmostEqual(struct.unpack("<f", memory.read(0x2008, 4))[0], 2.5)
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        self.assertIn("b2r_fpu_compare_status(ctx->fpu_stack[0], 0.0f", emitted)
+        self.assertIn("std::fabs(ctx->fpu_stack[0])", emitted)
+
     def test_observed_x87_stack_register_arithmetic_and_pop_forms(self) -> None:
         function = lift_x86_function(
             bytes.fromhex(
@@ -1550,6 +1767,53 @@ class X86RecompPrototypeTests(unittest.TestCase):
         self.assertIn("ctx->fpu_stack[1u] - ctx->fpu_stack[0]", emitted)
         self.assertIn("ctx->fpu_stack[1u] /= ctx->fpu_stack[0]", emitted)
         self.assertIn("ctx->fpu_stack[1u] -= ctx->fpu_stack[0]", emitted)
+
+    def test_observed_fsubrp_reverse_subtracts_and_pops(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex(
+                "D90500200000"  # fld dword [0x2000]
+                "D90504200000"  # fld dword [0x2004]
+                "DEE1"  # fsubrp st(1), st
+                "D91D08200000"  # fstp dword [0x2008]
+                "C3"
+            ),
+            base_address=0x00062561,
+            symbol="observed_fsubrp",
+        )
+        state = CpuState.with_registers(esp=0x9000)
+        memory = SparseMemory(
+            {
+                0x9000: 0xDEADC0DE,
+                0x2000: struct.pack("<f", 4.0),
+                0x2004: struct.pack("<f", 10.0),
+            }
+        )
+
+        result = execute_lifted_function(function, state=state, memory=memory)
+        emitted = emit_cpp(function, exported_symbol="observed_fsubrp")
+        reverse_subtract = next(
+            event
+            for event in result.trace.to_list()
+            if event["operation"] == "fpu_reverse_subtract_pop"
+        )
+
+        self.assertEqual(
+            [instruction.mnemonic for instruction in function.instructions[:4]],
+            ["fld", "fld", "fsubrp", "fstp"],
+        )
+        self.assertEqual(function.instructions[2].address, 0x0006256D)
+        self.assertAlmostEqual(struct.unpack("<f", memory.read(0x2008, 4))[0], 6.0)
+        self.assertEqual(result.state.fpu_stack, [])
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        self.assertEqual(reverse_subtract["details"]["top"], "10.0")
+        self.assertEqual(reverse_subtract["details"]["target"], "4.0")
+        self.assertEqual(reverse_subtract["details"]["result"], "6.0")
+        self.assertEqual(reverse_subtract["details"]["stack_depth"], 1)
+        self.assertIn(
+            "ctx->fpu_stack[1u] = ctx->fpu_stack[0] - ctx->fpu_stack[1u]",
+            emitted,
+        )
+        self.assertEqual(emitted.count("b2r_fpu_pop(ctx)"), 2)
 
     def test_observed_x87_stack_store_and_stack_pop_forms(self) -> None:
         function = lift_x86_function(
@@ -2390,6 +2654,15 @@ class X86RecompPrototypeTests(unittest.TestCase):
         self.assertIn("eip = 0x00002000u", resumable)
         self.assertNotIn("ctx->call(ctx->user, 0x00002000u, ctx);", resumable)
         self.assertIn("ctx->eip = return_address", resumable)
+        self.assertIn("b2r_read_u8(ctx, address + 1u)", resumable)
+        self.assertIn("b2r_write_u8(ctx, address + 1u", resumable)
+        self.assertIn("b2r_read_u32(ctx, address + 4u)", resumable)
+        self.assertIn("b2r_write_u32(ctx, address + 4u", resumable)
+        self.assertNotIn("ctx->read_u8(ctx->user, address + 1u)", resumable)
+        self.assertNotIn("ctx->read_u32(ctx->user, address + 4u)", resumable)
+        self.assertIn("b2r_cache_address(B2RContext* ctx", resumable)
+        self.assertIn("ctx->cache_physical_aliases", resumable)
+        self.assertIn("address >= 0xa0000000u", resumable)
 
         observed = emit_cpp(
             function,
@@ -2491,6 +2764,249 @@ class X86RecompPrototypeTests(unittest.TestCase):
         )
         self.assertIn("ctx->timestamp_counter", timestamp)
         self.assertIn("ctx->edx = static_cast<uint32_t>(value >> 32)", timestamp)
+
+    def test_reachable_coverage_batch_decodes_all_observed_forms(self) -> None:
+        cases = {
+            "FC": "cld",
+            "FA": "cli",
+            "F30F2DC0": "cvtss2si",
+            "DEF1": "fdivrp",
+            "DDC3": "ffree",
+            "DA4640": "fiadd",
+            "DB5C240C": "fistp",
+            "DB2D20803400": "fld",
+            "DD7108": "fnsave",
+            "D9F3": "fpatan",
+            "DD6108": "frstor",
+            "EC": "in",
+            "EA2C6D0E000800": "jmp_far",
+            "F00FC102": "xadd",
+            "0F5F0570635A00": "maxps",
+            "0F5D05E0303400": "minps",
+            "0F7F01": "movq",
+            "0F1000": "movups",
+            "D1D8": "rcr",
+            "C1C910": "ror",
+            "9E": "sahf",
+            "1CFF": "sbb",
+            "0F01442406": "sgdt",
+            "0FADD0": "shrd",
+            "FD": "std",
+            "FB": "sti",
+            "0FC101": "xadd",
+            "86E0": "xchg",
+            "91": "xchg",
+            "3401": "xor",
+        }
+
+        for index, (bytes_hex, mnemonic) in enumerate(cases.items()):
+            with self.subTest(bytes_hex=bytes_hex, mnemonic=mnemonic):
+                function = X86Decoder().decode_function(
+                    bytes.fromhex(bytes_hex),
+                    base_address=0x5000 + index * 0x20,
+                    symbol=f"coverage_{mnemonic}_{index}",
+                    max_instructions=1,
+                    stop_at_ret=False,
+                )
+                self.assertEqual(function.instructions[0].mnemonic, mnemonic)
+                self.assertEqual(function.instructions[0].bytes_hex, bytes_hex)
+
+    def test_batched_x87_frontiers_execute_with_stack_and_state_semantics(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex(
+                "D9E8"  # fld1: y
+                "D9E8"  # fld1: x
+                "D9F3"  # fpatan
+                "DA0500200000"  # fiadd dword [0x2000]
+                "D90504200000"  # fld dword [0x2004]
+                "DEF1"  # fdivrp st(1), st
+                "DB1D08200000"  # fistp dword [0x2008]
+                "DB2D10200000"  # fld tbyte [0x2010]
+                "DD3500210000"  # fnsave [0x2100]
+                "DD2500210000"  # frstor [0x2100]
+                "DDC0"  # ffree st(0)
+                "C3"
+            ),
+            base_address=0x6000,
+            symbol="batched_x87_frontiers",
+        )
+        state = CpuState.with_registers(esp=0x8000)
+        memory = SparseMemory(
+            {
+                0x2000: struct.pack("<i", 2),
+                0x2004: struct.pack("<f", 8.0),
+                0x2010: bytes.fromhex("00000000000000C00040"),
+                0x2100: bytes(108),
+                0x8000: 0xDEADC0DE,
+            }
+        )
+
+        result = execute_lifted_function(function, state=state, memory=memory)
+        operations = [event["operation"] for event in result.trace.to_list()]
+
+        self.assertEqual(memory.read_u32(0x2008), 3)
+        self.assertEqual(result.state.fpu_stack, [])
+        self.assertEqual(result.state.fpu_control_word, 0x037F)
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        self.assertIn("fpu_partial_arctangent", operations)
+        self.assertIn("fpu_integer_add", operations)
+        self.assertIn("fpu_reverse_divide_pop", operations)
+        self.assertIn("fpu_save_state", operations)
+        self.assertIn("fpu_restore_state", operations)
+        self.assertIn("b2r_read_f80", emit_cpp(function))
+
+    def test_batched_sse_and_mmx_frontiers_preserve_values(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex(
+                "0F100500200000"  # movups xmm0, [0x2000]
+                "0F5D0510200000"  # minps xmm0, [0x2010]
+                "0F5F0520200000"  # maxps xmm0, [0x2020]
+                "0F110530200000"  # movups [0x2030], xmm0
+                "F30F2DC0"  # cvtss2si eax, xmm0
+                "0F7F0540200000"  # movq [0x2040], mm0
+                "C3"
+            ),
+            base_address=0x6100,
+            symbol="batched_vector_frontiers",
+        )
+        state = CpuState.with_registers(esp=0x8000)
+        state.set_mmx_register("mm0", 0x1122334455667788)
+        memory = SparseMemory(
+            {
+                0x2000: struct.pack("<4f", 5.0, -2.0, float("nan"), -0.0),
+                0x2010: struct.pack("<4f", 4.0, -3.0, 1.0, 0.0),
+                0x2020: struct.pack("<4f", 6.0, -4.0, 2.0, -0.0),
+                0x2030: bytes(16),
+                0x2040: bytes(8),
+                0x8000: 0xDEADC0DE,
+            }
+        )
+
+        result = execute_lifted_function(function, state=state, memory=memory)
+        vector = struct.unpack("<4f", memory.read(0x2030, 16))
+
+        self.assertEqual(vector[:3], (6.0, -3.0, 2.0))
+        self.assertLess(math.copysign(1.0, vector[3]), 0.0)
+        self.assertEqual(result.state.get_register("eax"), 6)
+        self.assertEqual(
+            memory.read(0x2040, 8),
+            bytes.fromhex("8877665544332211"),
+        )
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+
+        rounding = lift_x86_function(
+            bytes.fromhex("F30F2DC0C3"),
+            base_address=0x6200,
+            symbol="cvtss2si_rounding",
+        )
+        round_state = CpuState.with_registers(esp=0x8100, mxcsr=0x00005F80)
+        round_state.set_xmm_register("xmm0", (2.5, 0.0, 0.0, 0.0))
+        round_result = execute_lifted_function(
+            rounding,
+            state=round_state,
+            memory=SparseMemory({0x8100: 0xDEADC0DE}),
+        )
+        self.assertEqual(round_result.state.get_register("eax"), 3)
+
+    def test_batched_integer_string_and_system_frontiers_execute(self) -> None:
+        reverse_copy = lift_x86_function(
+            bytes.fromhex("FDF3A5FCC3"),
+            base_address=0x6300,
+            symbol="reverse_copy",
+        )
+        copy_state = CpuState.with_registers(
+            esi=0x3008,
+            edi=0x4008,
+            ecx=3,
+            esp=0x8000,
+        )
+        copy_memory = SparseMemory(
+            {
+                0x3000: struct.pack("<III", 1, 2, 3),
+                0x4000: bytes(12),
+                0x8000: 0xDEADC0DE,
+            }
+        )
+        copy_result = execute_lifted_function(
+            reverse_copy,
+            state=copy_state,
+            memory=copy_memory,
+        )
+        self.assertEqual(copy_memory.read(0x4000, 12), struct.pack("<III", 1, 2, 3))
+        self.assertEqual(copy_result.state.get_register("esi"), 0x2FFC)
+        self.assertEqual(copy_result.state.get_register("edi"), 0x3FFC)
+        self.assertFalse(copy_result.state.flags.df)
+
+        arithmetic = lift_x86_function(
+            bytes.fromhex(
+                "C1C910"  # ror ecx, 16
+                "66C1C808"  # ror ax, 8
+                "D1D8"  # rcr eax, 1
+                "C3"
+            ),
+            base_address=0x6400,
+            symbol="batched_rotates",
+        )
+        arithmetic_state = CpuState.with_registers(
+            eax=0xAABBCCDD,
+            ecx=0x12345678,
+            esp=0x8100,
+        )
+        arithmetic_state.flags.cf = True
+        arithmetic_result = execute_lifted_function(
+            arithmetic,
+            state=arithmetic_state,
+            memory=SparseMemory({0x8100: 0xDEADC0DE}),
+        )
+        self.assertEqual(arithmetic_result.state.get_register("ecx"), 0x56781234)
+        self.assertEqual(arithmetic_result.state.get_register("eax"), 0xD55DEEE6)
+        self.assertFalse(arithmetic_result.state.flags.cf)
+
+        exchange_add = lift_x86_function(
+            bytes.fromhex("F00FC102C3"),
+            base_address=0x6500,
+            symbol="locked_exchange_add",
+        )
+        exchange_state = CpuState.with_registers(eax=3, edx=0x5000, esp=0x8200)
+        exchange_memory = SparseMemory({0x5000: 5, 0x8200: 0xDEADC0DE})
+        exchange_result = execute_lifted_function(
+            exchange_add,
+            state=exchange_state,
+            memory=exchange_memory,
+        )
+        self.assertEqual(exchange_memory.read_u32(0x5000), 8)
+        self.assertEqual(exchange_result.state.get_register("eax"), 5)
+
+        system = lift_x86_function(
+            bytes.fromhex(
+                "0F010500600000"  # sgdt [0x6000]
+                "FA"  # cli
+                "FB"  # sti
+                "EC"  # in al, dx
+                "EA117000000800"  # jmp 0x0008:0x00007011
+                "C3"
+            ),
+            base_address=0x7000,
+            symbol="batched_system_frontiers",
+        )
+        system_state = CpuState.with_registers(
+            eax=0xFFFFFFFF,
+            edx=0x80C0,
+            esp=0x8300,
+            gdtr_base=0x12345000,
+            gdtr_limit=0x03FF,
+        )
+        system_memory = SparseMemory({0x6000: bytes(6), 0x8300: 0xDEADC0DE})
+        system_result = execute_lifted_function(
+            system,
+            state=system_state,
+            memory=system_memory,
+        )
+        self.assertEqual(system_memory.read(0x6000, 6), struct.pack("<HI", 0x03FF, 0x12345000))
+        self.assertEqual(system_result.state.get_register("eax"), 0xFFFFFF00)
+        self.assertTrue(system_result.state.flags.interrupt_enabled)
+        self.assertEqual(system_result.state.cs_selector, 0x0008)
+        self.assertEqual(system_result.return_address, 0xDEADC0DE)
 
     def test_summary_and_generated_cpp_can_be_written_to_ignored_artifact_paths(self) -> None:
         function = lift_x86_function(
