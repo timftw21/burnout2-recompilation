@@ -9,12 +9,14 @@ from unittest.mock import Mock, patch
 
 from tools.playability import live_test
 from tools.playability.live_test import (
+    _finalize_lossless_flip_audit,
+    _startup_wait_status,
     _wait_for_guest_shutdown,
     build_guest_command,
     build_lossless_flip_audit_report,
     build_presenter_command,
-    _finalize_lossless_flip_audit,
 )
+
 
 class LiveTestTests(unittest.TestCase):
     def _args(self) -> argparse.Namespace:
@@ -33,6 +35,7 @@ class LiveTestTests(unittest.TestCase):
             render_debug_events=Path("render-debug-events.jsonl"),
             render_debug_report=Path("render-debug-report.json"),
             skip_host_build=True,
+            no_diagnostics=False,
             audit_world_matrices=False,
             audit_world_matrix_address=None,
             audit_scene_records=False,
@@ -58,6 +61,27 @@ class LiveTestTests(unittest.TestCase):
 
     def test_default_native_slice_cadence_targets_frame_rate(self) -> None:
         self.assertEqual(live_test.DEFAULT_NATIVE_SLICE_STEPS, 100_000)
+
+    def test_startup_timeout_allows_one_time_cache_recovery(self) -> None:
+        self.assertEqual(live_test.DEFAULT_STARTUP_TIMEOUT_SECONDS, 600.0)
+
+    def test_startup_wait_status_reports_cache_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = Path(temp_dir) / "decoded-blocks.sqlite3"
+            cache.write_bytes(bytes(1024 * 1024))
+            (cache.parent / "native-loop-one.dll").touch()
+
+            status = _startup_wait_status(cache, 30.0)
+
+        self.assertIn("after 30s", status)
+        self.assertIn("decoded store 1.0 MiB", status)
+        self.assertIn("native DLLs 1", status)
+
+    def test_hot_path_profile_is_opt_in_and_forwarded_to_guest(self) -> None:
+        args = self._args()
+        self.assertNotIn("--profile-hot-paths", build_guest_command(args))
+        args.profile_hot_paths = True
+        self.assertIn("--profile-hot-paths", build_guest_command(args))
 
     def test_world_matrix_audit_is_forwarded_to_guest(self) -> None:
         args = self._args()
@@ -100,6 +124,47 @@ class LiveTestTests(unittest.TestCase):
             command[command.index("--debug-json") + 1],
             "render-debug-events.jsonl",
         )
+
+    def test_no_diagnostics_omits_guest_and_presenter_artifacts(self) -> None:
+        args = self._args()
+        args.no_diagnostics = True
+
+        guest = build_guest_command(args)
+        presenter = build_presenter_command(args)
+
+        self.assertNotIn("--json-output", guest)
+        self.assertIn("--quiet", guest)
+        self.assertNotIn("--debug-json", presenter)
+        self.assertIn("--no-diagnostics", presenter)
+
+    def test_presenter_cpu_vertex_ab_flags_are_opt_in(self) -> None:
+        args = self._args()
+        self.assertNotIn("--cpu-vertex-programs", build_presenter_command(args))
+        self.assertNotIn("--cpu-vertex-attributes", build_presenter_command(args))
+        self.assertNotIn("--cpu-texture-conversion", build_presenter_command(args))
+
+        args.cpu_vertex_programs = True
+        args.cpu_vertex_attributes = True
+        args.cpu_texture_conversion = True
+        command = build_presenter_command(args)
+
+        self.assertIn("--cpu-vertex-programs", command)
+        self.assertIn("--cpu-vertex-attributes", command)
+        self.assertIn("--cpu-texture-conversion", command)
+
+    def test_presentation_pipeline_depth_two_is_default(self) -> None:
+        args = self._args()
+        command = build_presenter_command(args)
+
+        self.assertEqual(
+            command[command.index("--presentation-pipeline-depth") + 1],
+            "2",
+        )
+
+        args.presentation_pipeline_depth = 1
+        command = build_presenter_command(args)
+
+        self.assertNotIn("--presentation-pipeline-depth", command)
 
     def test_windows_forced_cleanup_terminates_the_presenter_process_tree(self) -> None:
         process = Mock()
@@ -152,6 +217,7 @@ class LiveTestTests(unittest.TestCase):
             guest[guest.index("--live-flip-audit-ack") + 1], "audit\\ack.bin"
         )
         self.assertIn("--strict-render-validation", presenter)
+        self.assertNotIn("--presentation-pipeline-depth", presenter)
         self.assertEqual(
             presenter[presenter.index("--flip-audit-frame-directory") + 1],
             "audit\\frames",

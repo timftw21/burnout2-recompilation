@@ -8,7 +8,7 @@ import json
 import math
 import struct
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -62,6 +62,22 @@ class RecompilationError(RuntimeError):
 
 class X86DecodeError(RecompilationError):
     """Raised when the prototype decoder reaches an unsupported instruction."""
+
+
+@dataclass(frozen=True)
+class NativeFastPath:
+    """Guarded native C++ replacement for a recovered guest function entry."""
+
+    name: str
+    guard: str
+    body: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "guard": self.guard,
+            "body": list(self.body),
+        }
 
 
 class X86ExecutionError(RecompilationError):
@@ -2300,6 +2316,9 @@ def execute_lifted_function(
     record_instruction_trace: bool = True,
     record_trace: bool = True,
     trace_max_events: int | None = None,
+    return_on_missing_instruction: bool = False,
+    call_handler_yield_predicate: Callable[[int], bool] | None = None,
+    execution_yield_predicate: Callable[[int], bool] | None = None,
 ) -> ExecutionResult:
     active_state = state or CpuState()
     active_memory = memory or SparseMemory()
@@ -2324,6 +2343,17 @@ def execute_lifted_function(
     while max_steps == 0 or steps < max_steps:
         if step_observer is not None:
             step_observer(active_state, active_memory, trace, steps)
+        if (
+            execution_yield_predicate is not None
+            and execution_yield_predicate(steps)
+        ):
+            return ExecutionResult(
+                active_state,
+                active_memory,
+                trace,
+                return_address=active_state.eip,
+                steps=steps,
+            )
         instruction = instructions.get(active_state.eip)
         if instruction is None and install_block(active_state.eip):
             instruction = instructions.get(active_state.eip)
@@ -2334,6 +2364,14 @@ def execute_lifted_function(
                 eip=active_state.eip,
                 eip_hex=_hex32(active_state.eip),
             )
+            if return_on_missing_instruction:
+                return ExecutionResult(
+                    active_state,
+                    active_memory,
+                    trace,
+                    return_address=active_state.eip,
+                    steps=steps,
+                )
             raise X86ExecutionError(
                 f"no lifted instruction at {_hex32(active_state.eip)}",
                 state=active_state,
@@ -4359,6 +4397,17 @@ def execute_lifted_function(
                         f"expected {_hex32(next_eip)}"
                     )
                 active_state.eip = returned_to
+                if (
+                    call_handler_yield_predicate is not None
+                    and call_handler_yield_predicate(target)
+                ):
+                    return ExecutionResult(
+                        active_state,
+                        active_memory,
+                        trace,
+                        return_address=returned_to,
+                        steps=steps,
+                    )
             elif target in valid_addresses:
                 active_state.eip = target
             elif install_block(target):
@@ -4370,8 +4419,17 @@ def execute_lifted_function(
                     raise X86ExecutionError(
                         f"external call returned to {_hex32(returned_to)}, "
                         f"expected {_hex32(next_eip)}"
-                    )
+                )
                 active_state.eip = returned_to
+            elif return_on_missing_instruction:
+                active_state.eip = target
+                return ExecutionResult(
+                    active_state,
+                    active_memory,
+                    trace,
+                    return_address=target,
+                    steps=steps,
+                )
             else:
                 raise X86ExecutionError(f"unhandled external call target {_hex32(target)}")
             continue
@@ -4447,7 +4505,7 @@ def execute_lifted_function(
                 esp=active_state.get_register("esp"),
             )
             active_state.eip = return_address
-            if return_address in valid_addresses:
+            if return_address in valid_addresses or install_block(return_address):
                 continue
             return ExecutionResult(
                 active_state,
@@ -5442,12 +5500,27 @@ class CppEmitter:
         resumable: bool = False,
         observer_addresses: Iterable[int] = (),
         callback_addresses: Iterable[int] = (),
+        native_fast_paths: Mapping[int, NativeFastPath] | None = None,
         synchronize_eip_for_callbacks: bool = False,
     ) -> str:
         self._resumable = resumable
         self._observer_addresses = {_u32(address) for address in observer_addresses}
         self._callback_addresses = {_u32(address) for address in callback_addresses}
+        self._native_fast_paths = {
+            _u32(address): fast_path
+            for address, fast_path in (native_fast_paths or {}).items()
+        }
+        if self._native_fast_paths and not resumable:
+            raise ValueError("native fast paths require resumable C++ emission")
         self._synchronize_eip_for_callbacks = synchronize_eip_for_callbacks
+        self._direct_fallthrough_addresses = {
+            _u32(current.address)
+            for current, following in zip(
+                function.instructions,
+                function.instructions[1:],
+            )
+            if _u32(current.next_address) == _u32(following.address)
+        }
         symbol = _cpp_identifier(exported_symbol or function.symbol)
         lines = [
             "// Generated by b2_recomp Milestone 5 prototype.",
@@ -5501,9 +5574,11 @@ class CppEmitter:
             "    uint32_t eip;",
             "    uint32_t fault_code;",
             "    uint32_t fault_eip;",
+            "    uint32_t module_exit_reason;",
             "    uint64_t steps;",
             "    uint64_t step_budget;",
             "    bool yield_requested;",
+            "    bool direct_observed_write_transport;",
             "    void* user;",
             "    uint32_t (*read_u32)(void*, uint32_t);",
             "    void (*write_u32)(void*, uint32_t, uint32_t);",
@@ -5515,6 +5590,12 @@ class CppEmitter:
             "    uint8_t* callback_pages;",
             "    uint32_t* callback_address_keys;",
             "    uint32_t callback_address_mask;",
+            "    uint8_t* write_callback_pages;",
+            "    uint32_t* write_callback_address_keys;",
+            "    uint32_t write_callback_address_mask;",
+            "    uint8_t* zero_read_callback_pages;",
+            "    uint32_t* zero_read_callback_address_keys;",
+            "    uint32_t zero_read_callback_address_mask;",
             "    bool cache_physical_aliases;",
             "    uint8_t* dirty_pages;",
             "    uint32_t* dirty_page_indices;",
@@ -5527,18 +5608,81 @@ class CppEmitter:
             "    uint32_t* observed_write_eips;",
             "    uint32_t* observed_write_source_addresses;",
             "    uint32_t* observed_write_addresses;",
-            "    uint32_t* observed_write_values;",
+            "    uint64_t* observed_write_values;",
             "    uint64_t* observed_write_steps;",
             "    uint8_t* observed_write_sizes;",
             "    uint32_t observed_write_count;",
             "    uint32_t observed_write_capacity;",
+            "    uint32_t observed_write_packet_header;",
+            "    uint32_t observed_write_packet_next_address;",
+            "    uint64_t observed_write_packet_yield_count;",
+            "    uint64_t zero_read_callback_bypass_count;",
+            "    uint64_t direct_observed_write_count;",
+            "    uint64_t direct_observed_write_byte_count;",
+            "    uint8_t* direct_observed_payload;",
+            "    uint32_t direct_observed_payload_size;",
+            "    uint32_t direct_observed_payload_capacity;",
+            "    uint32_t* direct_observed_span_addresses;",
+            "    uint32_t* direct_observed_span_payload_offsets;",
+            "    uint32_t* direct_observed_span_payload_sizes;",
+            "    uint32_t* direct_observed_span_write_counts;",
+            "    uint8_t* direct_observed_span_flags;",
+            "    uint32_t direct_observed_span_count;",
+            "    uint32_t direct_observed_span_capacity;",
+            "    bool direct_observed_span_sealed;",
+            "    uint32_t* native_fast_path_address_keys;",
+            "    uint64_t* native_fast_path_call_counts;",
+            "    uint32_t native_fast_path_address_mask;",
             "};",
+            "",
+            "enum B2RModuleExitReason : uint32_t {",
+            "    B2R_MODULE_EXIT_FALLTHROUGH_OR_UNKNOWN = 0u,",
+            "    B2R_MODULE_EXIT_BRANCH = 1u,",
+            "    B2R_MODULE_EXIT_CALL = 2u,",
+            "    B2R_MODULE_EXIT_RETURN = 3u,",
+            "    B2R_MODULE_EXIT_CALLBACK = 4u,",
+            "    B2R_MODULE_EXIT_YIELD = 5u,",
+            "    B2R_MODULE_EXIT_STEP_BUDGET = 6u,",
+            "    B2R_MODULE_EXIT_FAULT = 7u,",
+            "    B2R_MODULE_EXIT_SOFTWARE_INTERRUPT = 8u,",
+            "};",
+            "",
+            "static inline bool b2r_begin_instruction(",
+            "    B2RContext* ctx, uint32_t address) {",
+            "    if (ctx->step_budget != 0u && ctx->steps >= ctx->step_budget) {",
+            "        ctx->eip = address;",
+            "        ctx->module_exit_reason = B2R_MODULE_EXIT_STEP_BUDGET;",
+            "        return false;",
+            "    }",
+            "    ++ctx->steps;",
+            "    return true;",
+            "}",
             "",
             "static inline bool b2r_parity8(uint32_t value) {",
             "    value &= 0xffu;",
             "    value ^= value >> 4;",
             "    value &= 0x0fu;",
             "    return ((0x6996u >> value) & 1u) == 0u;",
+            "}",
+            "",
+            "static inline void b2r_record_native_fast_path(",
+            "    B2RContext* ctx, uint32_t address) {",
+            "    if (ctx->native_fast_path_address_keys == nullptr ||",
+            "        ctx->native_fast_path_call_counts == nullptr) {",
+            "        return;",
+            "    }",
+            "    uint32_t slot = (address * 2654435761u) &",
+            "        ctx->native_fast_path_address_mask;",
+            "    for (uint32_t probe = 0u;",
+            "         probe <= ctx->native_fast_path_address_mask; ++probe) {",
+            "        const uint32_t key = ctx->native_fast_path_address_keys[slot];",
+            "        if (key == address) {",
+            "            ++ctx->native_fast_path_call_counts[slot];",
+            "            return;",
+            "        }",
+            "        if (key == 0xffffffffu) { return; }",
+            "        slot = (slot + 1u) & ctx->native_fast_path_address_mask;",
+            "    }",
             "}",
             "",
             "static inline uint32_t b2r_mask_for_bits(uint32_t bits) {",
@@ -5568,7 +5712,7 @@ class CppEmitter:
             "    return address;",
             "}",
             "",
-            "static inline bool b2r_requires_memory_callback(",
+            "static inline bool b2r_requires_read_memory_callback(",
             "    B2RContext* ctx, uint32_t address, uint32_t size) {",
             "    if (ctx->callback_pages == nullptr ||",
             "        ctx->callback_address_keys == nullptr || size == 0u) {",
@@ -5576,10 +5720,9 @@ class CppEmitter:
             "    }",
             "    for (uint32_t offset = 0u; offset < size; ++offset) {",
             "        const uint32_t current = b2r_cache_address(ctx, address + offset);",
-            "        if (ctx->callback_pages[current >> 12u] == 0u) {",
-            "            continue;",
-            "        }",
-            "        uint32_t slot = (current * 2654435761u) & ctx->callback_address_mask;",
+            "        if (ctx->callback_pages[current >> 12u] == 0u) { continue; }",
+            "        uint32_t slot =",
+            "            (current * 2654435761u) & ctx->callback_address_mask;",
             "        for (;;) {",
             "            const uint32_t key = ctx->callback_address_keys[slot];",
             "            if (key == current) { return true; }",
@@ -5590,12 +5733,51 @@ class CppEmitter:
             "    return false;",
             "}",
             "",
+            "static inline bool b2r_requires_write_memory_callback(",
+            "    B2RContext* ctx, uint32_t address, uint32_t size) {",
+            "    if (ctx->write_callback_pages == nullptr ||",
+            "        ctx->write_callback_address_keys == nullptr || size == 0u) {",
+            "        return false;",
+            "    }",
+            "    for (uint32_t offset = 0u; offset < size; ++offset) {",
+            "        const uint32_t current = b2r_cache_address(ctx, address + offset);",
+            "        if (ctx->write_callback_pages[current >> 12u] == 0u) { continue; }",
+            "        uint32_t slot = (current * 2654435761u) &",
+            "            ctx->write_callback_address_mask;",
+            "        for (;;) {",
+            "            const uint32_t key = ctx->write_callback_address_keys[slot];",
+            "            if (key == current) { return true; }",
+            "            if (key == 0xffffffffu) { break; }",
+            "            slot = (slot + 1u) & ctx->write_callback_address_mask;",
+            "        }",
+            "    }",
+            "    return false;",
+            "}",
+            "",
+            "static inline bool b2r_is_zero_guarded_read_callback(",
+            "    B2RContext* ctx, uint32_t address) {",
+            "    const uint32_t current = b2r_cache_address(ctx, address);",
+            "    if (ctx->zero_read_callback_pages == nullptr ||",
+            "        ctx->zero_read_callback_address_keys == nullptr ||",
+            "        ctx->zero_read_callback_pages[current >> 12u] == 0u) {",
+            "        return false;",
+            "    }",
+            "    uint32_t slot = (current * 2654435761u) &",
+            "        ctx->zero_read_callback_address_mask;",
+            "    for (;;) {",
+            "        const uint32_t key = ctx->zero_read_callback_address_keys[slot];",
+            "        if (key == current) { return true; }",
+            "        if (key == 0xffffffffu) { return false; }",
+            "        slot = (slot + 1u) & ctx->zero_read_callback_address_mask;",
+            "    }",
+            "}",
+            "",
             "static inline uint8_t b2r_read_u8(B2RContext* ctx, uint32_t address) {",
             "    const uint32_t cache_address = b2r_cache_address(ctx, address);",
             "    const uint32_t page = cache_address >> 12u;",
             "    if (ctx->read_pages != nullptr &&",
-            "        !b2r_requires_memory_callback(ctx, address, 1u) &&",
-            "        ctx->read_pages[page] != nullptr) {",
+            "        ctx->read_pages[page] != nullptr &&",
+            "        !b2r_requires_read_memory_callback(ctx, address, 1u)) {",
             "        return ctx->read_pages[page][cache_address & 0xfffu];",
             "    }",
             "    return (ctx->read_u8)(ctx->user, address);",
@@ -5606,11 +5788,17 @@ class CppEmitter:
             "    const uint32_t page = cache_address >> 12u;",
             "    if ((cache_address & 0xfffu) <= 0xffcu &&",
             "        ctx->read_pages != nullptr &&",
-            "        !b2r_requires_memory_callback(ctx, address, 4u) &&",
             "        ctx->read_pages[page] != nullptr) {",
             "        uint32_t value;",
             "        std::memcpy(&value, ctx->read_pages[page] + (cache_address & 0xfffu), sizeof(value));",
-            "        return value;",
+            "        const bool requires_callback =",
+            "            b2r_requires_read_memory_callback(ctx, address, 4u);",
+            "        if (!requires_callback) { return value; }",
+            "        if (value != 0u &&",
+            "            b2r_is_zero_guarded_read_callback(ctx, address)) {",
+            "            ++ctx->zero_read_callback_bypass_count;",
+            "            return value;",
+            "        }",
             "    }",
             "    return (ctx->read_u32)(ctx->user, address);",
             "}",
@@ -5641,8 +5829,42 @@ class CppEmitter:
             "    }",
             "}",
             "",
+            "static inline bool b2r_track_observed_write_packet(",
+            "    B2RContext* ctx, uint32_t address, uint8_t size, uint64_t value) {",
+            "    const uint64_t initial_yield_count =",
+            "        ctx->observed_write_packet_yield_count;",
+            "    if (ctx->observed_write_packet_header == 0u || size < 4u) { return false; }",
+            "    for (uint32_t offset = 0u; offset + 4u <= size; offset += 4u) {",
+            "        uint32_t word_address = address + offset;",
+            "        if (word_address == ctx->observed_write_range_end) {",
+            "            word_address = ctx->observed_write_range_start;",
+            "        }",
+            "        const uint32_t word = static_cast<uint32_t>(value >> (offset * 8u));",
+            "        const uint32_t pending_address =",
+            "            ctx->observed_write_packet_next_address;",
+            "        if (pending_address != 0u) {",
+            "            ctx->observed_write_packet_next_address = 0u;",
+            "            if (word_address == pending_address) {",
+            "                ++ctx->observed_write_packet_yield_count;",
+            "                ctx->yield_requested = true;",
+            "            }",
+            "        }",
+            "        if (word == ctx->observed_write_packet_header) {",
+            "            uint32_t next_address = word_address + 4u;",
+            "            if (next_address == ctx->observed_write_range_end) {",
+            "                next_address = ctx->observed_write_range_start;",
+            "            }",
+            "            if (next_address >= ctx->observed_write_range_start &&",
+            "                next_address < ctx->observed_write_range_end) {",
+            "                ctx->observed_write_packet_next_address = next_address;",
+            "            }",
+            "        }",
+            "    }",
+            "    return ctx->observed_write_packet_yield_count != initial_yield_count;",
+            "}",
+            "",
             "static inline void b2r_record_observed_write(",
-            "    B2RContext* ctx, uint32_t address, uint8_t size, uint32_t value) {",
+            "    B2RContext* ctx, uint32_t address, uint8_t size, uint64_t value) {",
             "    if (ctx->observed_write_addresses == nullptr ||",
             "        address < ctx->observed_write_range_start ||",
             "        address >= ctx->observed_write_range_end) {",
@@ -5653,21 +5875,94 @@ class CppEmitter:
             "        ctx->yield_requested = true;",
             "        return;",
             "    }",
-            "    ctx->observed_write_eips[index] = ctx->eip;",
-            "    ctx->observed_write_source_addresses[index] = ctx->esi;",
+            "    if (ctx->observed_write_eips != nullptr) {",
+            "        ctx->observed_write_eips[index] = ctx->eip;",
+            "    }",
+            "    if (ctx->observed_write_source_addresses != nullptr) {",
+            "        ctx->observed_write_source_addresses[index] = ctx->esi;",
+            "    }",
             "    ctx->observed_write_addresses[index] = address;",
             "    ctx->observed_write_values[index] = value;",
-            "    ctx->observed_write_steps[index] = ctx->steps;",
+            "    if (ctx->observed_write_steps != nullptr) {",
+            "        ctx->observed_write_steps[index] = ctx->steps;",
+            "    }",
             "    ctx->observed_write_sizes[index] = size;",
             "    ctx->observed_write_count = index + 1u;",
+            "    b2r_track_observed_write_packet(ctx, address, size, value);",
+            "}",
+            "",
+            "static inline bool b2r_record_direct_observed_write(",
+            "    B2RContext* ctx, uint32_t address, uint8_t size, uint64_t value) {",
+            "    if (ctx->direct_observed_payload == nullptr ||",
+            "        ctx->direct_observed_span_addresses == nullptr ||",
+            "        ctx->direct_observed_span_payload_offsets == nullptr ||",
+            "        ctx->direct_observed_span_payload_sizes == nullptr ||",
+            "        ctx->direct_observed_span_write_counts == nullptr ||",
+            "        ctx->direct_observed_span_flags == nullptr ||",
+            "        ctx->direct_observed_payload_size",
+            "            > ctx->direct_observed_payload_capacity ||",
+            "        size > ctx->direct_observed_payload_capacity",
+            "            - ctx->direct_observed_payload_size) {",
+            "        ctx->yield_requested = true;",
+            "        return false;",
+            "    }",
+            "    bool start_span = ctx->direct_observed_span_count == 0u ||",
+            "        ctx->direct_observed_span_sealed;",
+            "    if (!start_span) {",
+            "        const uint32_t last = ctx->direct_observed_span_count - 1u;",
+            "        start_span = ctx->direct_observed_span_addresses[last]",
+            "                + ctx->direct_observed_span_payload_sizes[last] != address ||",
+            "            ctx->direct_observed_span_payload_offsets[last]",
+            "                + ctx->direct_observed_span_payload_sizes[last]",
+            "                != ctx->direct_observed_payload_size;",
+            "    }",
+            "    if (start_span) {",
+            "        if (ctx->direct_observed_span_count",
+            "            >= ctx->direct_observed_span_capacity) {",
+            "            ctx->yield_requested = true;",
+            "            return false;",
+            "        }",
+            "        const uint32_t span = ctx->direct_observed_span_count++;",
+            "        ctx->direct_observed_span_addresses[span] = address;",
+            "        ctx->direct_observed_span_payload_offsets[span] =",
+            "            ctx->direct_observed_payload_size;",
+            "        ctx->direct_observed_span_payload_sizes[span] = 0u;",
+            "        ctx->direct_observed_span_write_counts[span] = 0u;",
+            "        ctx->direct_observed_span_flags[span] = 0u;",
+            "        ctx->direct_observed_span_sealed = false;",
+            "    }",
+            "    const uint32_t span = ctx->direct_observed_span_count - 1u;",
+            "    std::memcpy(",
+            "        ctx->direct_observed_payload + ctx->direct_observed_payload_size,",
+            "        &value, size);",
+            "    ctx->direct_observed_payload_size += size;",
+            "    ctx->direct_observed_span_payload_sizes[span] += size;",
+            "    ++ctx->direct_observed_span_write_counts[span];",
+            "    ++ctx->direct_observed_write_count;",
+            "    ctx->direct_observed_write_byte_count += size;",
+            "    if (b2r_track_observed_write_packet(ctx, address, size, value)) {",
+            "        ctx->direct_observed_span_flags[span] |= 1u;",
+            "        ctx->direct_observed_span_sealed = true;",
+            "    }",
+            "    return true;",
             "}",
             "",
             "static inline void b2r_write_u8(B2RContext* ctx, uint32_t address, uint8_t value) {",
             "    const uint32_t cache_address = b2r_cache_address(ctx, address);",
             "    const uint32_t page = cache_address >> 12u;",
+            "    if (ctx->direct_observed_write_transport &&",
+            "        ctx->observed_write_range_start < ctx->observed_write_range_end &&",
+            "        ctx->observed_write_range_end - ctx->observed_write_range_start >= 1u &&",
+            "        cache_address >= ctx->observed_write_range_start &&",
+            "        cache_address < ctx->observed_write_range_end &&",
+            "        !b2r_requires_write_memory_callback(ctx, address, 1u) &&",
+            "        b2r_record_direct_observed_write(",
+            "            ctx, cache_address, 1u, value)) {",
+            "        return;",
+            "    }",
             "    if (ctx->read_pages != nullptr &&",
-            "        !b2r_requires_memory_callback(ctx, address, 1u) &&",
-            "        ctx->read_pages[page] != nullptr) {",
+            "        ctx->read_pages[page] != nullptr &&",
+            "        !b2r_requires_write_memory_callback(ctx, address, 1u)) {",
             "        b2r_record_observed_write(ctx, cache_address, 1u, value);",
             "        ctx->read_pages[page][cache_address & 0xfffu] = value;",
             "        b2r_mark_dirty_page(ctx, page, static_cast<uint16_t>(cache_address & 0xfffu), 1u);",
@@ -5679,16 +5974,43 @@ class CppEmitter:
             "static inline void b2r_write_u32(B2RContext* ctx, uint32_t address, uint32_t value) {",
             "    const uint32_t cache_address = b2r_cache_address(ctx, address);",
             "    const uint32_t page = cache_address >> 12u;",
+            "    if (ctx->direct_observed_write_transport &&",
+            "        ctx->observed_write_range_start < ctx->observed_write_range_end &&",
+            "        ctx->observed_write_range_end - ctx->observed_write_range_start >= 4u &&",
+            "        cache_address >= ctx->observed_write_range_start &&",
+            "        cache_address <= ctx->observed_write_range_end - 4u &&",
+            "        !b2r_requires_write_memory_callback(ctx, address, 4u) &&",
+            "        b2r_record_direct_observed_write(",
+            "            ctx, cache_address, 4u, value)) {",
+            "        return;",
+            "    }",
             "    if ((cache_address & 0xfffu) <= 0xffcu &&",
             "        ctx->read_pages != nullptr &&",
-            "        !b2r_requires_memory_callback(ctx, address, 4u) &&",
-            "        ctx->read_pages[page] != nullptr) {",
+            "        ctx->read_pages[page] != nullptr &&",
+            "        !b2r_requires_write_memory_callback(ctx, address, 4u)) {",
             "        b2r_record_observed_write(ctx, cache_address, 4u, value);",
             "        std::memcpy(ctx->read_pages[page] + (cache_address & 0xfffu), &value, sizeof(value));",
             "        b2r_mark_dirty_page(ctx, page, static_cast<uint16_t>(cache_address & 0xfffu), 4u);",
             "        return;",
             "    }",
             "    (ctx->write_u32)(ctx->user, address, value);",
+            "}",
+            "",
+            "static inline void b2r_write_push_u64(",
+            "    B2RContext* ctx, uint32_t address, uint64_t value) {",
+            "    const uint32_t cache_address = b2r_cache_address(ctx, address);",
+            "    if (ctx->direct_observed_write_transport &&",
+            "        ctx->observed_write_range_start < ctx->observed_write_range_end &&",
+            "        ctx->observed_write_range_end - ctx->observed_write_range_start >= 8u &&",
+            "        cache_address >= ctx->observed_write_range_start &&",
+            "        cache_address <= ctx->observed_write_range_end - 8u &&",
+            "        !b2r_requires_write_memory_callback(ctx, address, 8u) &&",
+            "        b2r_record_direct_observed_write(",
+            "            ctx, cache_address, 8u, value)) {",
+            "        return;",
+            "    }",
+            "    b2r_write_u32(ctx, address, static_cast<uint32_t>(value));",
+            "    b2r_write_u32(ctx, address + 4u, static_cast<uint32_t>(value >> 32u));",
             "}",
             "",
             "static inline uint16_t b2r_read_u16(B2RContext* ctx, uint32_t address) {",
@@ -6076,29 +6398,41 @@ class CppEmitter:
                 if resumable
                 else f"    uint32_t eip = {_cpp_u32(function.base_address)};"
             ),
+            *(
+                [
+                    "    uint32_t pending_module_exit_reason = ",
+                    "        B2R_MODULE_EXIT_FALLTHROUGH_OR_UNKNOWN;",
+                ]
+                if resumable
+                else []
+            ),
             "    for (;;) {",
         ]
         if resumable:
-            if self._callback_addresses:
+            local_callback_addresses = self._callback_addresses & {
+                instruction.address for instruction in function.instructions
+            }
+            if local_callback_addresses:
                 callback_condition = " || ".join(
                     f"eip == {_cpp_u32(address)}"
-                    for address in sorted(self._callback_addresses)
+                    for address in sorted(local_callback_addresses)
                 )
                 lines.extend(
                     [
                         f"        if ({callback_condition}) {{",
                         "            ctx->eip = eip;",
+                        "            ctx->module_exit_reason = B2R_MODULE_EXIT_CALLBACK;",
                         "            return eip;",
                         "        }",
                     ]
                 )
             lines.extend(
                 [
-                    "        if (ctx->yield_requested || (ctx->step_budget != 0u && ctx->steps >= ctx->step_budget)) {",
+                    "        if (ctx->yield_requested) {",
                     "            ctx->eip = eip;",
+                    "            ctx->module_exit_reason = B2R_MODULE_EXIT_YIELD;",
                     "            return eip;",
                     "        }",
-                    "        ++ctx->steps;",
                 ]
             )
         lines.extend(
@@ -6107,17 +6441,14 @@ class CppEmitter:
             ]
         )
         for instruction in function.instructions:
+            native_fast_path = self._native_fast_paths.get(instruction.address)
             emitted_lines = self._emit_instruction(instruction)
-            lines.append(f"        case {_cpp_u32(instruction.address)}: {{")
-            lines.append(f"            // {instruction.text()}")
-            # Native observed-write provenance needs the exact producer EIP,
-            # but synchronizing it for every guest instruction measurably
-            # slows the live loop. Store instructions are the only default
-            # path that records it, so keep those precise without imposing
-            # the full callback-audit cost.
             instruction_records_memory_write = any(
                 token in line
-                for line in emitted_lines
+                for line in (
+                    *emitted_lines,
+                    *(native_fast_path.body if native_fast_path is not None else ()),
+                )
                 for token in (
                     "ctx->write_u8(ctx->user,",
                     "ctx->write_u32(ctx->user,",
@@ -6126,17 +6457,67 @@ class CppEmitter:
                 )
             )
             if (
+                resumable
+                and not instruction_records_memory_write
+                and native_fast_path is None
+                and instruction.address not in self._observer_addresses
+                and instruction.next_address not in self._callback_addresses
+            ):
+                emitted_lines = self._direct_thread_fallthrough(
+                    instruction,
+                    emitted_lines,
+                )
+            lines.append(f"        case {_cpp_u32(instruction.address)}: {{")
+            if resumable:
+                lines.append(
+                    "            if (!b2r_begin_instruction(ctx, "
+                    f"{_cpp_u32(instruction.address)})) "
+                    f"{{ return {_cpp_u32(instruction.address)}; }}"
+                )
+                lines.append(
+                    "            pending_module_exit_reason = "
+                    "B2R_MODULE_EXIT_FALLTHROUGH_OR_UNKNOWN;"
+                )
+            lines.append(f"            // {instruction.text()}")
+            # Native observed-write provenance needs the exact producer EIP,
+            # but synchronizing it for every guest instruction measurably
+            # slows the live loop. Store instructions are the only default
+            # path that records it, so keep those precise without imposing
+            # the full callback-audit cost.
+            if (
                 self._synchronize_eip_for_callbacks
                 or instruction_records_memory_write
             ):
-                lines.append("            ctx->eip = eip;")
+                lines.append(
+                    f"            ctx->eip = {_cpp_u32(instruction.address)};"
+                )
             if instruction.address in self._observer_addresses:
-                lines.append("            if (ctx->observe != nullptr) { ctx->eip = eip; ctx->observe(ctx->user, ctx); }")
+                lines.append(
+                    "            if (ctx->observe != nullptr) { "
+                    f"ctx->eip = {_cpp_u32(instruction.address)}; "
+                    "ctx->observe(ctx->user, ctx); }"
+                )
+            if native_fast_path is not None:
+                lines.append(
+                    f"            // Native fast path: {native_fast_path.name}"
+                )
+                lines.append(f"            if ({native_fast_path.guard}) {{")
+                lines.extend(
+                    f"                {line}" for line in native_fast_path.body
+                )
+                lines.append("            }")
             lines.extend(f"            {line}" for line in emitted_lines)
             lines.append("        }")
         lines.extend(
             [
                 "        default:",
+                *(
+                    [
+                        "            ctx->module_exit_reason = pending_module_exit_reason;",
+                    ]
+                    if resumable
+                    else []
+                ),
                 *( ["            ctx->eip = eip;"] if resumable else [] ),
                 "            return eip;",
                 "        }",
@@ -6153,6 +6534,20 @@ class CppEmitter:
             .replace("ctx->write_u8(ctx->user,", "b2r_write_u8(ctx,")
         )
 
+    def _direct_thread_fallthrough(
+        self,
+        instruction: X86Instruction,
+        emitted_lines: list[str],
+    ) -> list[str]:
+        if emitted_lines[-2:] != [
+            f"eip = {_cpp_u32(instruction.next_address)};",
+            "continue;",
+        ]:
+            return emitted_lines
+        if _u32(instruction.address) not in self._direct_fallthrough_addresses:
+            return emitted_lines
+        return emitted_lines[:-2]
+
     def _repeat_checkpoint_lines(self, instruction: X86Instruction) -> list[str]:
         if not self._resumable:
             return []
@@ -6166,6 +6561,7 @@ class CppEmitter:
             f"        ctx->eip = {address};",
             "        --ctx->steps;",
             "        ctx->yield_requested = true;",
+            "        ctx->module_exit_reason = B2R_MODULE_EXIT_YIELD;",
             f"        return {address};",
             "    }",
         ]
@@ -7276,18 +7672,24 @@ class CppEmitter:
             lines.extend([f"eip = {next_eip};", "continue;"])
             return lines
         if instruction.mnemonic == "int3":
-            return [f"return {_cpp_u32(instruction.address)};"]
+            return [
+                "ctx->module_exit_reason = B2R_MODULE_EXIT_SOFTWARE_INTERRUPT;",
+                f"return {_cpp_u32(instruction.address)};",
+            ]
         if instruction.mnemonic == "int":
-            return [f"return {_cpp_u32(instruction.address)};"]
+            return [
+                "ctx->module_exit_reason = B2R_MODULE_EXIT_SOFTWARE_INTERRUPT;",
+                f"return {_cpp_u32(instruction.address)};",
+            ]
         if instruction.mnemonic == "idiv":
             return [
                 f"const int64_t high = static_cast<int64_t>(static_cast<int32_t>(ctx->edx));",
                 f"const int64_t dividend = (high * 0x100000000ll) + ctx->eax;",
                 f"const int32_t divisor = static_cast<int32_t>({self._operand_read(instruction.operands[0])});",
-                f"if (divisor == 0) {{ ctx->fault_code = 1u; ctx->fault_eip = {_cpp_u32(instruction.address)}; ctx->eip = ctx->fault_eip; return ctx->fault_eip; }}",
-                f"if (divisor == -1 && dividend == std::numeric_limits<int64_t>::min()) {{ ctx->fault_code = 2u; ctx->fault_eip = {_cpp_u32(instruction.address)}; ctx->eip = ctx->fault_eip; return ctx->fault_eip; }}",
+                f"if (divisor == 0) {{ ctx->fault_code = 1u; ctx->fault_eip = {_cpp_u32(instruction.address)}; ctx->eip = ctx->fault_eip; ctx->module_exit_reason = B2R_MODULE_EXIT_FAULT; return ctx->fault_eip; }}",
+                f"if (divisor == -1 && dividend == std::numeric_limits<int64_t>::min()) {{ ctx->fault_code = 2u; ctx->fault_eip = {_cpp_u32(instruction.address)}; ctx->eip = ctx->fault_eip; ctx->module_exit_reason = B2R_MODULE_EXIT_FAULT; return ctx->fault_eip; }}",
                 "const int64_t quotient = dividend / divisor;",
-                f"if (quotient < std::numeric_limits<int32_t>::min() || quotient > std::numeric_limits<int32_t>::max()) {{ ctx->fault_code = 2u; ctx->fault_eip = {_cpp_u32(instruction.address)}; ctx->eip = ctx->fault_eip; return ctx->fault_eip; }}",
+                f"if (quotient < std::numeric_limits<int32_t>::min() || quotient > std::numeric_limits<int32_t>::max()) {{ ctx->fault_code = 2u; ctx->fault_eip = {_cpp_u32(instruction.address)}; ctx->eip = ctx->fault_eip; ctx->module_exit_reason = B2R_MODULE_EXIT_FAULT; return ctx->fault_eip; }}",
                 "const int64_t remainder = dividend - (quotient * divisor);",
                 "ctx->eax = static_cast<uint32_t>(quotient);",
                 "ctx->edx = static_cast<uint32_t>(remainder);",
@@ -7298,9 +7700,9 @@ class CppEmitter:
             return [
                 "const uint64_t dividend = (static_cast<uint64_t>(ctx->edx) << 32) | ctx->eax;",
                 f"const uint32_t divisor = {self._operand_read(instruction.operands[0])};",
-                f"if (divisor == 0u) {{ ctx->fault_code = 1u; ctx->fault_eip = {_cpp_u32(instruction.address)}; ctx->eip = ctx->fault_eip; return ctx->fault_eip; }}",
+                f"if (divisor == 0u) {{ ctx->fault_code = 1u; ctx->fault_eip = {_cpp_u32(instruction.address)}; ctx->eip = ctx->fault_eip; ctx->module_exit_reason = B2R_MODULE_EXIT_FAULT; return ctx->fault_eip; }}",
                 "const uint64_t quotient = dividend / divisor;",
-                f"if (quotient > std::numeric_limits<uint32_t>::max()) {{ ctx->fault_code = 2u; ctx->fault_eip = {_cpp_u32(instruction.address)}; ctx->eip = ctx->fault_eip; return ctx->fault_eip; }}",
+                f"if (quotient > std::numeric_limits<uint32_t>::max()) {{ ctx->fault_code = 2u; ctx->fault_eip = {_cpp_u32(instruction.address)}; ctx->eip = ctx->fault_eip; ctx->module_exit_reason = B2R_MODULE_EXIT_FAULT; return ctx->fault_eip; }}",
                 "const uint64_t remainder = dividend - (quotient * divisor);",
                 "ctx->eax = static_cast<uint32_t>(quotient);",
                 "ctx->edx = static_cast<uint32_t>(remainder);",
@@ -7329,9 +7731,15 @@ class CppEmitter:
             )
             target_expr = target if instruction.target is not None else "call_target"
             if self._resumable:
+                exit_reason = (
+                    "B2R_MODULE_EXIT_CALLBACK"
+                    if instruction.target in self._callback_addresses
+                    else "B2R_MODULE_EXIT_CALL"
+                )
                 return [
                     *target_setup,
                     f"b2r_push(ctx, {next_eip});",
+                    f"pending_module_exit_reason = {exit_reason};",
                     f"eip = {target_expr};",
                     "continue;",
                 ]
@@ -7349,21 +7757,46 @@ class CppEmitter:
                 if instruction.target is not None
                 else self._operand_read(instruction.operands[0])
             )
-            return [f"eip = {target};", "continue;"]
+            exit_reason = (
+                "B2R_MODULE_EXIT_CALLBACK"
+                if instruction.target in self._callback_addresses
+                else "B2R_MODULE_EXIT_BRANCH"
+            )
+            return [
+                f"pending_module_exit_reason = {exit_reason};",
+                f"eip = {target};",
+                "continue;",
+            ]
         if instruction.mnemonic == "jcc":
             if instruction.target is None or instruction.condition is None:
                 raise X86DecodeError("conditional branch missing target")
             condition = self._condition_expr(instruction.condition)
+            exit_reason = (
+                "B2R_MODULE_EXIT_CALLBACK"
+                if instruction.target in self._callback_addresses
+                else "B2R_MODULE_EXIT_BRANCH"
+            )
             return [
-                f"eip = ({condition}) ? {_cpp_u32(instruction.target)} : {next_eip};",
+                f"if ({condition}) {{",
+                f"    pending_module_exit_reason = {exit_reason};",
+                f"    eip = {_cpp_u32(instruction.target)};",
+                "} else {",
+                f"    eip = {next_eip};",
+                "}",
                 "continue;",
             ]
         if instruction.mnemonic == "jmp_far":
             if instruction.target is None:
                 raise X86DecodeError("far jump missing target")
             selector = instruction.operands[0].immediate or 0
+            exit_reason = (
+                "B2R_MODULE_EXIT_CALLBACK"
+                if instruction.target in self._callback_addresses
+                else "B2R_MODULE_EXIT_BRANCH"
+            )
             return [
                 f"ctx->cs_selector = {_cpp_u32(selector & 0xFFFF)};",
+                f"pending_module_exit_reason = {exit_reason};",
                 f"eip = {_cpp_u32(instruction.target)};",
                 "continue;",
             ]
@@ -7372,8 +7805,16 @@ class CppEmitter:
             if instruction.ret_stack_adjust:
                 lines.append(f"ctx->esp += {_cpp_u32(instruction.ret_stack_adjust)};")
             if self._resumable:
-                lines.append("ctx->eip = return_address;")
-            lines.append("return return_address;")
+                lines.extend(
+                    [
+                        "ctx->eip = return_address;",
+                        "pending_module_exit_reason = B2R_MODULE_EXIT_RETURN;",
+                        "eip = return_address;",
+                        "continue;",
+                    ]
+                )
+            else:
+                lines.append("return return_address;")
             return lines
         raise X86DecodeError(f"cannot emit C++ for {instruction.mnemonic}")
 
@@ -7575,6 +8016,7 @@ def emit_cpp(
     resumable: bool = False,
     observer_addresses: Iterable[int] = (),
     callback_addresses: Iterable[int] = (),
+    native_fast_paths: Mapping[int, NativeFastPath] | None = None,
     synchronize_eip_for_callbacks: bool = False,
 ) -> str:
     return CppEmitter().emit(
@@ -7583,6 +8025,7 @@ def emit_cpp(
         resumable=resumable,
         observer_addresses=observer_addresses,
         callback_addresses=callback_addresses,
+        native_fast_paths=native_fast_paths,
         synchronize_eip_for_callbacks=synchronize_eip_for_callbacks,
     )
 

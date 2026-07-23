@@ -782,7 +782,7 @@ def _decode_zero_count_method_word(
         "method_count": 0,
         "decoded_method_count": 0,
         "methods": [],
-        "hle_role": "preserved command-shaped push-buffer word with no method payload",
+        "hle_role": "valid zero-count NV method no-op; the next word begins a new command",
     }
 
 

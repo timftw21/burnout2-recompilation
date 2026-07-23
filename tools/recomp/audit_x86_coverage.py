@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 from collections import Counter, deque
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,28 @@ DEFAULT_MAX_BLOCKS = 65536
 DEFAULT_MAX_BLOCK_BYTES = 4096
 
 
+def _dynamic_block_cache_seed_addresses(path: Path) -> tuple[int, set[int]]:
+    with path.open("rb") as source:
+        prefix = source.read(16)
+    if prefix.startswith(b"SQLite format 3"):
+        connection = sqlite3.connect(str(path))
+        try:
+            rows = connection.execute(
+                "SELECT target FROM decoded_blocks"
+            ).fetchall()
+        finally:
+            connection.close()
+        return len(rows), {int(row[0]) for row in rows}
+
+    cache = json.loads(path.read_text(encoding="utf-8"))
+    records = cache.get("records", {})
+    return len(records), {
+        int(record["base_address"])
+        for record in records.values()
+        if isinstance(record, dict) and "base_address" in record
+    }
+
+
 def audit_x86_coverage(
     xbe_path: Path,
     *,
@@ -48,14 +71,10 @@ def audit_x86_coverage(
     initial_seeds = set(seeds or [])
     cache_record_count = 0
     if dynamic_block_cache_path is not None and dynamic_block_cache_path.exists():
-        cache = json.loads(dynamic_block_cache_path.read_text(encoding="utf-8"))
-        records = cache.get("records", {})
-        cache_record_count = len(records)
-        initial_seeds.update(
-            int(record["base_address"])
-            for record in records.values()
-            if isinstance(record, dict) and "base_address" in record
+        cache_record_count, cache_seeds = _dynamic_block_cache_seed_addresses(
+            dynamic_block_cache_path
         )
+        initial_seeds.update(cache_seeds)
 
     def executable_range(address: int) -> tuple[int, int] | None:
         for start, end in executable_ranges:

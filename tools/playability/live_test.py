@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import datetime as dt
 import json
@@ -21,12 +22,17 @@ from tools.playability.render_debug_report import (
     build_render_debug_report,
     write_render_debug_report,
 )
+from tools.playability.performance_debug_report import (
+    build_performance_debug_report,
+    write_performance_debug_report,
+)
+
 DEFAULT_XBE = REPO_ROOT / "data" / "local" / "extracted" / "burnout_2_poi_usa" / "default.xbe"
 DEFAULT_EXTRACTED_ROOT = DEFAULT_XBE.parent
 DEFAULT_SAVE_DATA_ROOT = REPO_ROOT / "data" / "local" / "save-data"
 DEFAULT_DASHBOARD_ROOT = REPO_ROOT / "data" / "local" / "dashboard-data"
 DEFAULT_CACHE_ROOT = REPO_ROOT / "data" / "local" / "cache-data"
-DEFAULT_BLOCK_CACHE = REPO_ROOT / "reports" / "local" / "playability" / "dynamic-block-cache.json"
+DEFAULT_BLOCK_CACHE = REPO_ROOT / "build" / "native-guest-loop" / "decoded-blocks.sqlite3"
 DEFAULT_RENDER_STREAM = REPO_ROOT / "reports" / "local" / "live" / "render.json"
 DEFAULT_CONTROLLER_STATE = REPO_ROOT / "reports" / "local" / "live" / "controller.json"
 DEFAULT_PROBE_SUMMARY = REPO_ROOT / "reports" / "local" / "playability" / "native-live.json"
@@ -37,11 +43,16 @@ DEFAULT_RENDER_DEBUG_EVENTS = (
 DEFAULT_RENDER_DEBUG_REPORT = (
     REPO_ROOT / "reports" / "local" / "playability" / "render-debug-report.json"
 )
+DEFAULT_PERFORMANCE_DEBUG_REPORT = (
+    REPO_ROOT / "reports" / "local" / "playability" / "performance-debug-report.json"
+)
 DEFAULT_SCENE_RECORD_AUDIT_REPORT = (
     REPO_ROOT / "reports" / "local" / "playability" / "scene-record-audit.json"
 )
 DEFAULT_AUDIT_ROOT = REPO_ROOT / "reports" / "local" / "flip-audit"
 DEFAULT_NATIVE_SLICE_STEPS = 100_000
+DEFAULT_STARTUP_TIMEOUT_SECONDS = 600.0
+DEFAULT_PRESENTATION_PIPELINE_DEPTH = 2
 
 
 def build_guest_command(args: argparse.Namespace) -> list[str]:
@@ -60,9 +71,10 @@ def build_guest_command(args: argparse.Namespace) -> list[str]:
         "--max-steps", str(args.max_steps),
         "--live-render-stream", str(args.live_render_stream),
         "--live-controller-state", str(args.live_controller_state),
-        "--json-output", str(args.json_output),
         "--quiet",
     ]
+    if not getattr(args, "no_diagnostics", False):
+        command.extend(["--json-output", str(args.json_output)])
     if getattr(args, "lossless_flip_audit", False):
         command.extend(
             [
@@ -74,6 +86,8 @@ def build_guest_command(args: argparse.Namespace) -> list[str]:
                 str(getattr(args, "flip_audit_max_flips", 0)),
             ]
         )
+    if getattr(args, "profile_hot_paths", False):
+        command.append("--profile-hot-paths")
     audit_world_matrix_address = getattr(args, "audit_world_matrix_address", None)
     if getattr(args, "audit_world_matrices", False) or audit_world_matrix_address is not None:
         command.append("--audit-world-matrices")
@@ -104,8 +118,25 @@ def build_presenter_command(args: argparse.Namespace) -> list[str]:
         "--no-inject-input",
         "--pretty",
     ]
+    if getattr(args, "no_diagnostics", False):
+        command.append("--no-diagnostics")
     if args.skip_host_build:
         command.append("--skip-build")
+    if getattr(args, "cpu_vertex_programs", False):
+        command.append("--cpu-vertex-programs")
+    if getattr(args, "cpu_vertex_attributes", False):
+        command.append("--cpu-vertex-attributes")
+    if getattr(args, "cpu_texture_conversion", False):
+        command.append("--cpu-texture-conversion")
+    requested_pipeline_depth = getattr(args, "presentation_pipeline_depth", None)
+    presentation_pipeline_depth = (
+        1
+        if getattr(args, "lossless_flip_audit", False)
+        and requested_pipeline_depth is None
+        else requested_pipeline_depth or DEFAULT_PRESENTATION_PIPELINE_DEPTH
+    )
+    if presentation_pipeline_depth == 2:
+        command.extend(["--presentation-pipeline-depth", "2"])
     if getattr(args, "lossless_flip_audit", False):
         command.extend(
             [
@@ -123,7 +154,7 @@ def build_presenter_command(args: argparse.Namespace) -> list[str]:
             command.extend(
                 ["--flip-audit-max-flips", str(args.flip_audit_max_flips)]
             )
-    else:
+    elif not getattr(args, "no_diagnostics", False):
         command.extend(
             [
                 "--debug-json",
@@ -490,6 +521,28 @@ def _finalize_render_diagnostics(args: argparse.Namespace) -> None:
         print(f"Could not finalize render diagnostics: {exc}")
 
 
+def _finalize_performance_diagnostics(args: argparse.Namespace) -> None:
+    try:
+        report = build_performance_debug_report(
+            args.json_output,
+            render_debug_report_path=args.render_debug_report,
+        )
+        write_performance_debug_report(report, args.performance_debug_report)
+        print(
+            "Performance diagnostics: "
+            f"{report['status']}; report={args.performance_debug_report}"
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(f"Could not finalize performance diagnostics: {exc}")
+
+
+def _finalize_diagnostics(args: argparse.Namespace) -> None:
+    if getattr(args, "no_diagnostics", False):
+        return
+    _finalize_render_diagnostics(args)
+    _finalize_performance_diagnostics(args)
+
+
 def _summarize_scene_record_audit(args: argparse.Namespace) -> None:
     if not getattr(args, "audit_scene_records", False):
         return
@@ -509,14 +562,28 @@ def _summarize_scene_record_audit(args: argparse.Namespace) -> None:
         print(f"Could not summarize scene-record audit: {exc}")
 
 
+def _startup_wait_status(cache_path: Path, elapsed_seconds: float) -> str:
+    cache_bytes = cache_path.stat().st_size if cache_path.is_file() else 0
+    native_dll_count = sum(1 for _ in cache_path.parent.glob("native-loop-*.dll"))
+    return (
+        f"Guest is still preparing after {elapsed_seconds:.0f}s "
+        f"(decoded store {cache_bytes / (1024 * 1024):.1f} MiB, "
+        f"native DLLs {native_dll_count})."
+    )
+
+
 def run_live_test(args: argparse.Namespace) -> int:
     run_started = time.monotonic()
-    args.runner_log.parent.mkdir(parents=True, exist_ok=True)
+    diagnostics_enabled = not getattr(args, "no_diagnostics", False)
+    if diagnostics_enabled:
+        args.runner_log.parent.mkdir(parents=True, exist_ok=True)
     args.live_render_stream.parent.mkdir(parents=True, exist_ok=True)
     args.live_controller_state.parent.mkdir(parents=True, exist_ok=True)
-    args.json_output.parent.mkdir(parents=True, exist_ok=True)
-    args.render_debug_events.parent.mkdir(parents=True, exist_ok=True)
-    args.render_debug_report.parent.mkdir(parents=True, exist_ok=True)
+    if diagnostics_enabled:
+        args.json_output.parent.mkdir(parents=True, exist_ok=True)
+        args.render_debug_events.parent.mkdir(parents=True, exist_ok=True)
+        args.render_debug_report.parent.mkdir(parents=True, exist_ok=True)
+        args.performance_debug_report.parent.mkdir(parents=True, exist_ok=True)
     if getattr(args, "audit_scene_records", False):
         args.scene_record_audit_output.parent.mkdir(parents=True, exist_ok=True)
     args.save_data_root.mkdir(parents=True, exist_ok=True)
@@ -540,11 +607,16 @@ def run_live_test(args: argparse.Namespace) -> int:
         args.live_render_stream.unlink()
     if args.live_controller_state.exists():
         args.live_controller_state.unlink()
-    if args.json_output.exists():
+    if diagnostics_enabled and args.json_output.exists():
         args.json_output.unlink()
-    for stale in (args.render_debug_events, args.render_debug_report):
-        if stale.exists():
-            stale.unlink()
+    if diagnostics_enabled:
+        for stale in (
+            args.render_debug_events,
+            args.render_debug_report,
+            args.performance_debug_report,
+        ):
+            if stale.exists():
+                stale.unlink()
     if (
         getattr(args, "audit_scene_records", False)
         and args.scene_record_audit_output.exists()
@@ -559,7 +631,12 @@ def run_live_test(args: argparse.Namespace) -> int:
     guest: subprocess.Popen[bytes] | None = None
     presenter: subprocess.Popen[bytes] | None = None
     presenter_started: float | None = None
-    with args.runner_log.open("wb") as runner_log:
+    runner_output = (
+        args.runner_log.open("wb")
+        if diagnostics_enabled
+        else contextlib.nullcontext(subprocess.DEVNULL)
+    )
+    with runner_output as runner_log:
         try:
             print("Starting native guest loop...")
             guest = subprocess.Popen(
@@ -569,6 +646,7 @@ def run_live_test(args: argparse.Namespace) -> int:
                 stderr=subprocess.STDOUT,
             )
             deadline = time.monotonic() + args.startup_timeout_seconds
+            next_startup_status = time.monotonic() + 30.0
             while not args.live_render_stream.is_file():
                 returncode = guest.poll()
                 if returncode is not None:
@@ -578,6 +656,14 @@ def run_live_test(args: argparse.Namespace) -> int:
                 if time.monotonic() >= deadline:
                     print(f"Timed out waiting for the first guest frame. See {args.runner_log}")
                     return 1
+                if time.monotonic() >= next_startup_status:
+                    print(
+                        _startup_wait_status(
+                            args.dynamic_block_cache,
+                            time.monotonic() - run_started,
+                        )
+                    )
+                    next_startup_status = time.monotonic() + 30.0
                 time.sleep(0.05)
 
             print("Starting Vulkan presenter. Close the window or press Escape to stop.")
@@ -612,7 +698,7 @@ def run_live_test(args: argparse.Namespace) -> int:
                     )
                     guest_returncode, forced_guest_stop = _wait_for_guest_shutdown(guest)
                     if forced_guest_stop:
-                        _finalize_render_diagnostics(args)
+                        _finalize_diagnostics(args)
                         args.flip_audit_total_elapsed_seconds = (
                             time.monotonic() - run_started
                         )
@@ -638,7 +724,7 @@ def run_live_test(args: argparse.Namespace) -> int:
                 )
                 guest_returncode, forced_guest_stop = _wait_for_guest_shutdown(guest)
                 if forced_guest_stop:
-                    _finalize_render_diagnostics(args)
+                    _finalize_diagnostics(args)
                     args.flip_audit_total_elapsed_seconds = (
                         time.monotonic() - run_started
                     )
@@ -649,7 +735,7 @@ def run_live_test(args: argparse.Namespace) -> int:
                     return _finalize_lossless_flip_audit(args, guest_returncode)
             if guest_returncode != 0:
                 print(f"Guest runner exited with code {guest_returncode}. See {args.runner_log}")
-                _finalize_render_diagnostics(args)
+                _finalize_diagnostics(args)
                 args.flip_audit_total_elapsed_seconds = time.monotonic() - run_started
                 if presenter_started is not None:
                     args.flip_audit_presenter_elapsed_seconds = (
@@ -661,7 +747,7 @@ def run_live_test(args: argparse.Namespace) -> int:
                 args.flip_audit_presenter_elapsed_seconds = (
                     time.monotonic() - presenter_started
                 )
-            _finalize_render_diagnostics(args)
+            _finalize_diagnostics(args)
             _summarize_scene_record_audit(args)
             return _finalize_lossless_flip_audit(args, presenter_returncode)
         except KeyboardInterrupt:
@@ -701,6 +787,12 @@ def main() -> int:
         help="Post-run guest/host geometry provenance report.",
     )
     parser.add_argument(
+        "--performance-debug-report",
+        type=Path,
+        default=DEFAULT_PERFORMANCE_DEBUG_REPORT,
+        help="Post-run guest throughput and hot-path report against the 60 FPS target.",
+    )
+    parser.add_argument(
         "--native-slice-steps",
         type=int,
         default=DEFAULT_NATIVE_SLICE_STEPS,
@@ -714,6 +806,15 @@ def main() -> int:
         type=int,
         default=0,
         help="Maximum guest instructions; 0 (the default) runs until the presenter closes.",
+    )
+    parser.add_argument(
+        "--profile-hot-paths",
+        action="store_true",
+        help=(
+            "Enable sampled callback latency, exact native module edges, and "
+            "exclusive dispatcher timing; use only for profiling runs because "
+            "it adds diagnostic accounting."
+        ),
     )
     parser.add_argument(
         "--audit-world-matrices",
@@ -745,8 +846,50 @@ def main() -> int:
         default=DEFAULT_SCENE_RECORD_AUDIT_REPORT,
         help="Compact scene-record audit JSON written by the guest.",
     )
-    parser.add_argument("--startup-timeout-seconds", type=float, default=180.0)
+    parser.add_argument(
+        "--startup-timeout-seconds",
+        type=float,
+        default=DEFAULT_STARTUP_TIMEOUT_SECONDS,
+        help=(
+            "Maximum wait for the first guest frame; the default allows a "
+            "one-time decoded-store migration or native partition rebuild."
+        ),
+    )
     parser.add_argument("--skip-host-build", action="store_true")
+    parser.add_argument(
+        "--no-diagnostics",
+        action="store_true",
+        help=(
+            "Disable guest summaries, presenter event logging, screenshots, runner "
+            "logging, and post-run reports for a minimal-overhead manual run."
+        ),
+    )
+    parser.add_argument(
+        "--cpu-vertex-programs",
+        action="store_true",
+        help="Force the CPU vertex-program interpreter for presenter A/B runs.",
+    )
+    parser.add_argument(
+        "--cpu-vertex-attributes",
+        action="store_true",
+        help="Force CPU indexed-attribute decoding while retaining GPU programs.",
+    )
+    parser.add_argument(
+        "--cpu-texture-conversion",
+        action="store_true",
+        help="Force the CPU texture converter for presenter A/B runs.",
+    )
+    parser.add_argument(
+        "--presentation-pipeline-depth",
+        type=int,
+        choices=(1, 2),
+        default=None,
+        help=(
+            "Presenter handshake depth; normal live runs default to 2 so guest "
+            "computation overlaps interpretation and Vulkan preparation. "
+            "Lossless flip audits default to the required lock-step depth 1."
+        ),
+    )
     parser.add_argument(
         "--lossless-flip-audit",
         action="store_true",
@@ -776,6 +919,12 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+    if args.presentation_pipeline_depth is None:
+        args.presentation_pipeline_depth = (
+            1
+            if args.lossless_flip_audit
+            else DEFAULT_PRESENTATION_PIPELINE_DEPTH
+        )
     if args.max_steps < 0:
         parser.error("--max-steps must not be negative")
     if args.native_slice_steps <= 0:
@@ -786,12 +935,25 @@ def main() -> int:
         parser.error("--flip-audit-max-flips must not be negative")
     if args.flip_audit_health_interval < 0:
         parser.error("--flip-audit-health-interval must not be negative")
+    if args.lossless_flip_audit and args.presentation_pipeline_depth != 1:
+        parser.error(
+            "--presentation-pipeline-depth 2 cannot be combined with "
+            "--lossless-flip-audit"
+        )
     if args.audit_world_matrix_address is not None and not (
         0 <= args.audit_world_matrix_address <= 0xFFFFFFC0
     ):
         parser.error("--audit-world-matrix-address must fit a 64-byte 32-bit range")
     if args.flip_audit_max_flips and not args.lossless_flip_audit:
         parser.error("--flip-audit-max-flips requires --lossless-flip-audit")
+    if args.no_diagnostics and (
+        args.profile_hot_paths
+        or args.audit_world_matrices
+        or args.audit_world_matrix_address is not None
+        or args.audit_scene_records
+        or args.lossless_flip_audit
+    ):
+        parser.error("--no-diagnostics cannot be combined with profiling or audits")
     if args.lossless_flip_audit:
         if args.flip_audit_output_dir is None:
             stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]

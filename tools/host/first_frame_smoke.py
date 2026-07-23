@@ -10,7 +10,9 @@ import os
 import shutil
 import struct
 import subprocess
+import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,11 +26,17 @@ DEFAULT_DEBUG_JSON = REPO_ROOT / "reports" / "local" / "first-frame" / "events.j
 DEFAULT_SUMMARY_JSON = REPO_ROOT / "reports" / "local" / "first-frame" / "summary.json"
 DEFAULT_SCREENSHOT = REPO_ROOT / "reports" / "local" / "first-frame" / "frame.bmp"
 DEFAULT_HOTKEY_SCREENSHOT_DIR = REPO_ROOT / "reports" / "local" / "screenshots"
+DEFAULT_METRICS_REPORT_DIR = REPO_ROOT / "reports" / "local"
 DEFAULT_RENDER_STREAM_JSON = REPO_ROOT / "reports" / "local" / "render" / "recovered-d3d-stream.json"
 DEFAULT_VERTEX_SHADER = REPO_ROOT / "runtime" / "host" / "shaders" / "nv2a_inline.vert"
 DEFAULT_FRAGMENT_SHADER = REPO_ROOT / "runtime" / "host" / "shaders" / "nv2a_inline.frag"
+DEFAULT_TEXTURE_CONVERT_SHADER = (
+    REPO_ROOT / "runtime" / "host" / "shaders" / "nv2a_texture_convert.comp"
+)
 DEFAULT_VERTEX_SPV = DEFAULT_BUILD_DIR / "nv2a_inline.vert.spv"
 DEFAULT_FRAGMENT_SPV = DEFAULT_BUILD_DIR / "nv2a_inline.frag.spv"
+DEFAULT_TEXTURE_CONVERT_SPV = DEFAULT_BUILD_DIR / "nv2a_texture_convert.comp.spv"
+DEFAULT_PIPELINE_CACHE = DEFAULT_BUILD_DIR / "vulkan-pipeline-cache.bin"
 DEFAULT_VULKAN_SDK = Path("C:/VulkanSDK/1.4.341.1")
 DEFAULT_LLVM_BIN = Path("C:/Program Files/LLVM/bin")
 
@@ -54,6 +62,14 @@ class Toolchain:
     def vulkan_lib(self) -> Path:
         return self.lib_dir / "vulkan-1.lib"
 
+    @property
+    def sdl3_lib(self) -> Path:
+        return self.lib_dir / "SDL3.lib"
+
+    @property
+    def sdl3_dll(self) -> Path:
+        return self.vulkan_sdk / "Bin" / "SDL3.dll"
+
 
 def discover_toolchain(
     *,
@@ -68,6 +84,12 @@ def discover_toolchain(
         raise FirstFrameSmokeError(f"Vulkan headers not found under {sdk_candidate}")
     if not (sdk_candidate / "Lib" / "vulkan-1.lib").exists():
         raise FirstFrameSmokeError(f"Vulkan import library not found under {sdk_candidate}")
+    if not (sdk_candidate / "Include" / "SDL3" / "SDL.h").exists():
+        raise FirstFrameSmokeError(f"SDL3 headers not found under {sdk_candidate}")
+    if not (sdk_candidate / "Lib" / "SDL3.lib").exists():
+        raise FirstFrameSmokeError(f"SDL3 import library not found under {sdk_candidate}")
+    if not (sdk_candidate / "Bin" / "SDL3.dll").exists():
+        raise FirstFrameSmokeError(f"SDL3 runtime not found under {sdk_candidate}")
     return Toolchain(clang_candidate, sdk_candidate)
 
 
@@ -87,6 +109,7 @@ def build_command(
         str(source),
         f"-L{toolchain.lib_dir}",
         "-lvulkan-1",
+        "-lSDL3",
         "-luser32",
         "-lgdi32",
         "-lshell32",
@@ -118,12 +141,15 @@ def compile_first_frame(
             f"stdout:\n{completed.stdout}\n"
             f"stderr:\n{completed.stderr}"
         )
+    sdl3_runtime = output.parent / "SDL3.dll"
+    shutil.copy2(active_toolchain.sdl3_dll, sdl3_runtime)
     return {
         "command": command,
         "returncode": completed.returncode,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
         "output": str(output),
+        "sdl3_runtime": str(sdl3_runtime),
     }
 
 
@@ -132,19 +158,42 @@ def compile_shaders(
     toolchain: Toolchain,
     vertex_source: Path = DEFAULT_VERTEX_SHADER,
     fragment_source: Path = DEFAULT_FRAGMENT_SHADER,
+    texture_convert_source: Path = DEFAULT_TEXTURE_CONVERT_SHADER,
     vertex_output: Path = DEFAULT_VERTEX_SPV,
     fragment_output: Path = DEFAULT_FRAGMENT_SPV,
+    texture_convert_output: Path = DEFAULT_TEXTURE_CONVERT_SPV,
 ) -> dict[str, Any]:
+    started = time.perf_counter()
     glslc = toolchain.vulkan_sdk / "Bin" / "glslc.exe"
     if not glslc.exists():
         raise FirstFrameSmokeError(f"glslc not found: {glslc}")
-    commands: list[list[str]] = []
+    shader_jobs: list[list[str]] = []
+    cached_outputs: list[str] = []
+    compiler_mtime_ns = glslc.stat().st_mtime_ns
     for source, output in (
         (vertex_source, vertex_output),
         (fragment_source, fragment_output),
+        (texture_convert_source, texture_convert_output),
     ):
+        if not source.is_file():
+            raise FirstFrameSmokeError(f"shader source is missing: {source}")
         output.parent.mkdir(parents=True, exist_ok=True)
         command = [str(glslc), str(source), "-o", str(output)]
+        output_stat = output.stat() if output.is_file() else None
+        if (
+            output_stat is not None
+            and output_stat.st_size >= 4
+            and output_stat.st_mtime_ns
+            >= max(source.stat().st_mtime_ns, compiler_mtime_ns)
+            and output.read_bytes()[:4] == struct.pack("<I", 0x07230203)
+        ):
+            cached_outputs.append(str(output))
+            continue
+        shader_jobs.append(command)
+
+    def compile_shader(
+        command: list[str],
+    ) -> tuple[list[str], subprocess.CompletedProcess[str]]:
         completed = subprocess.run(
             command,
             cwd=REPO_ROOT,
@@ -159,19 +208,33 @@ def compile_shaders(
                 f"stdout:\n{completed.stdout}\n"
                 f"stderr:\n{completed.stderr}"
             )
-        commands.append(command)
+        return command, completed
+
+    # Each module is independent. Cold builds let glslc compile them in
+    # parallel, while warm builds avoid launching the compiler altogether.
+    if shader_jobs:
+        with ThreadPoolExecutor(max_workers=len(shader_jobs)) as executor:
+            completed_jobs = list(executor.map(compile_shader, shader_jobs))
+    else:
+        completed_jobs = []
+    commands = [command for command, _completed in completed_jobs]
     return {
         "returncode": 0,
         "commands": commands,
+        "compiled_count": len(commands),
+        "cache_hit_count": len(cached_outputs),
+        "cached_outputs": cached_outputs,
+        "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
         "vertex_output": str(vertex_output),
         "fragment_output": str(fragment_output),
+        "texture_convert_output": str(texture_convert_output),
     }
 
 
 def run_first_frame(
     *,
     executable: Path = DEFAULT_EXE,
-    debug_json: Path = DEFAULT_DEBUG_JSON,
+    debug_json: Path | None = DEFAULT_DEBUG_JSON,
     width: int = 640,
     height: int = 480,
     max_frames: int = 3,
@@ -180,8 +243,11 @@ def run_first_frame(
     render_stream_json: Path | None = None,
     screenshot: Path | None = None,
     hotkey_screenshot_directory: Path | None = DEFAULT_HOTKEY_SCREENSHOT_DIR,
+    metrics_report_directory: Path | None = DEFAULT_METRICS_REPORT_DIR,
     vertex_shader: Path = DEFAULT_VERTEX_SPV,
     fragment_shader: Path = DEFAULT_FRAGMENT_SPV,
+    texture_convert_shader: Path = DEFAULT_TEXTURE_CONVERT_SPV,
+    pipeline_cache: Path | None = DEFAULT_PIPELINE_CACHE,
     live_render_stream: bool = False,
     controller_state_json: Path | None = None,
     strict_render_validation: bool = False,
@@ -190,12 +256,17 @@ def run_first_frame(
     flip_audit_max_flips: int = 0,
     flip_audit_health_interval: int = 30,
     analyze_render_stream: bool = False,
+    cpu_vertex_programs: bool = False,
+    cpu_vertex_attributes: bool = False,
+    cpu_texture_conversion: bool = False,
+    presentation_pipeline_depth: int = 1,
 ) -> dict[str, Any]:
     if not executable.exists():
         raise FirstFrameSmokeError(f"first-frame executable is missing: {executable}")
-    debug_json.parent.mkdir(parents=True, exist_ok=True)
-    if debug_json.exists():
-        debug_json.unlink()
+    if debug_json is not None:
+        debug_json.parent.mkdir(parents=True, exist_ok=True)
+        if debug_json.exists():
+            debug_json.unlink()
     command = [
         str(executable),
         "--width",
@@ -204,11 +275,27 @@ def run_first_frame(
         str(height),
         "--max-frames",
         str(max_frames),
-        "--debug-json",
-        str(debug_json),
     ]
+    if debug_json is not None:
+        command.extend(["--debug-json", str(debug_json)])
     if analyze_render_stream:
         command.append("--analyze-render-stream")
+    if cpu_vertex_programs:
+        command.append("--cpu-vertex-programs")
+    if cpu_vertex_attributes:
+        command.append("--cpu-vertex-attributes")
+    if cpu_texture_conversion:
+        command.append("--cpu-texture-conversion")
+    if presentation_pipeline_depth not in (1, 2):
+        raise FirstFrameSmokeError("presentation pipeline depth must be 1 or 2")
+    if presentation_pipeline_depth == 2:
+        if not live_render_stream:
+            raise FirstFrameSmokeError(
+                "presentation pipeline depth 2 requires a live render stream"
+            )
+        command.extend(
+            ["--presentation-pipeline-depth", str(presentation_pipeline_depth)]
+        )
     if inject_input and not analyze_render_stream:
         command.append("--inject-input")
     if render_stream_json is not None:
@@ -256,9 +343,22 @@ def run_first_frame(
             "--hotkey-screenshot-directory",
             str(hotkey_screenshot_directory),
         ])
+    if metrics_report_directory is not None and not analyze_render_stream:
+        metrics_report_directory.mkdir(parents=True, exist_ok=True)
+        command.extend([
+            "--metrics-report-directory",
+            str(metrics_report_directory),
+        ])
     if not analyze_render_stream:
+        if pipeline_cache is not None:
+            pipeline_cache.parent.mkdir(parents=True, exist_ok=True)
+            command.extend(["--pipeline-cache", str(pipeline_cache)])
         command.extend(["--vertex-shader", str(vertex_shader)])
         command.extend(["--fragment-shader", str(fragment_shader)])
+        if not cpu_texture_conversion:
+            command.extend(
+                ["--texture-convert-shader", str(texture_convert_shader)]
+            )
 
     env = os.environ.copy()
     llvm_bin = str(DEFAULT_LLVM_BIN)
@@ -274,17 +374,22 @@ def run_first_frame(
         check=False,
         env=env,
     )
-    events = read_debug_events(debug_json)
+    events = read_debug_events(debug_json) if debug_json is not None else []
     return {
         "command": command,
         "returncode": completed.returncode,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
-        "debug_json": str(debug_json),
+        "debug_json": str(debug_json) if debug_json is not None else None,
         "screenshot": str(screenshot) if screenshot is not None else None,
         "hotkey_screenshot_directory": (
             str(hotkey_screenshot_directory)
             if hotkey_screenshot_directory is not None
+            else None
+        ),
+        "metrics_report_directory": (
+            str(metrics_report_directory)
+            if metrics_report_directory is not None
             else None
         ),
         "analyze_render_stream": analyze_render_stream,
@@ -385,10 +490,35 @@ def summarize_smoke(
         for event in events
         if event.get("event") == "nv2a_vertex_transform_diagnostics"
     ]
+    texture_refresh_events = [
+        event
+        for event in events
+        if event.get("event") == "nv2a_texture_resources_refreshed"
+    ]
+    texture_conversion_batches = [
+        event
+        for event in events
+        if event.get("event") == "nv2a_gpu_texture_conversion_batch"
+    ]
+    texture_conversion_validations = [
+        event
+        for event in events
+        if event.get("event") == "nv2a_gpu_texture_conversion_validation"
+    ]
     stream_analysis_events = [
         event
         for event in events
         if event.get("event") == "render_stream_analysis_complete"
+    ]
+    pipeline_cache_open_events = [
+        event
+        for event in events
+        if event.get("event") == "vulkan_pipeline_cache_opened"
+    ]
+    pipeline_cache_save_events = [
+        event
+        for event in events
+        if event.get("event") == "vulkan_pipeline_cache_saved"
     ]
     screenshot_path = run_result.get("screenshot")
     screenshot = (
@@ -447,6 +577,36 @@ def summarize_smoke(
             "main_loop_entered": counts.get("main_loop_enter", 0) == 1,
             "main_loop_exited": counts.get("main_loop_exit", 0) == 1,
             "render_stream_analysis_completed": len(stream_analysis_events) == 1,
+            "pipeline_cache": {
+                "path": (
+                    pipeline_cache_open_events[-1].get("path")
+                    if pipeline_cache_open_events
+                    else None
+                ),
+                "loaded_bytes": (
+                    int(pipeline_cache_open_events[-1].get("loaded_bytes", 0))
+                    if pipeline_cache_open_events
+                    else 0
+                ),
+                "initial_data_rejected": (
+                    pipeline_cache_open_events[-1].get(
+                        "initial_data_rejected",
+                        False,
+                    )
+                    if pipeline_cache_open_events
+                    else False
+                ),
+                "saved_bytes": (
+                    int(pipeline_cache_save_events[-1].get("bytes", 0))
+                    if pipeline_cache_save_events
+                    else 0
+                ),
+                "written": (
+                    pipeline_cache_save_events[-1].get("written", False)
+                    if pipeline_cache_save_events
+                    else False
+                ),
+            },
             "vertex_transform_diagnostics": (
                 vertex_transform_events[-1] if vertex_transform_events else None
             ),
@@ -531,6 +691,132 @@ def summarize_smoke(
                 event.get("passed") in (True, "true", 1, "1")
                 for event in render_validation_events
             ),
+            "texture_conversion": {
+                "backend": (
+                    texture_refresh_events[-1].get("gpu_conversion_backend")
+                    if texture_refresh_events
+                    else None
+                ),
+                "refresh_count": len(texture_refresh_events),
+                "batch_count": len(texture_conversion_batches),
+                "gpu_converted_textures": sum(
+                    int(event.get("gpu_converted", 0))
+                    for event in texture_refresh_events
+                ),
+                "cpu_converted_textures": sum(
+                    int(event.get("cpu_converted", 0))
+                    for event in texture_refresh_events
+                ),
+                "dxt1_textures": sum(
+                    int(event.get("dxt1_textures", 0))
+                    for event in texture_conversion_batches
+                ),
+                "dxt5_textures": sum(
+                    int(event.get("dxt5_textures", 0))
+                    for event in texture_conversion_batches
+                ),
+                "mips": sum(
+                    int(event.get("mips", 0))
+                    for event in texture_conversion_batches
+                ),
+                "generated_mips": sum(
+                    int(event.get("generated_mips", 0))
+                    for event in texture_conversion_batches
+                ),
+                "compressed_input_bytes": sum(
+                    int(event.get("input_bytes", 0))
+                    for event in texture_conversion_batches
+                ),
+                "rgba_output_bytes": sum(
+                    int(event.get("output_bytes", 0))
+                    for event in texture_conversion_batches
+                ),
+                "conversion_us": sum(
+                    int(event.get("conversion_us", 0))
+                    for event in texture_conversion_batches
+                ),
+                "gpu_submission_us": sum(
+                    int(event.get("gpu_submission_us", 0))
+                    for event in texture_conversion_batches
+                ),
+                "validation_passed": (
+                    all(
+                        event.get("passed") in (True, "true", 1, "1")
+                        for event in texture_conversion_validations
+                    )
+                    if texture_conversion_validations
+                    else None
+                ),
+                "validation_coverage_complete": (
+                    texture_conversion_validations[-1].get(
+                        "coverage_complete"
+                    )
+                    if texture_conversion_validations
+                    else None
+                ),
+                "validation_mismatch_bytes": sum(
+                    int(event.get("mismatch_bytes", 0))
+                    for event in texture_conversion_validations
+                ),
+            },
+            "render_target_feedback_image_cache": {
+                "hit_count": sum(
+                    int(
+                        event.get(
+                            "render_target_feedback_image_cache_hits",
+                            0,
+                        )
+                    )
+                    for event in texture_refresh_events
+                ),
+                "miss_count": sum(
+                    int(
+                        event.get(
+                            "render_target_feedback_image_cache_misses",
+                            0,
+                        )
+                    )
+                    for event in texture_refresh_events
+                ),
+                "store_count": sum(
+                    int(
+                        event.get(
+                            "render_target_feedback_image_cache_stores",
+                            0,
+                        )
+                    )
+                    for event in texture_refresh_events
+                ),
+                "eviction_count": sum(
+                    int(
+                        event.get(
+                            "render_target_feedback_image_cache_evictions",
+                            0,
+                        )
+                    )
+                    for event in texture_refresh_events
+                ),
+                "resident_count": (
+                    int(
+                        texture_refresh_events[-1].get(
+                            "render_target_feedback_image_cache_resident",
+                            0,
+                        )
+                    )
+                    if texture_refresh_events
+                    else 0
+                ),
+                "capacity": (
+                    int(
+                        texture_refresh_events[-1].get(
+                            "render_target_feedback_image_cache_capacity",
+                            0,
+                        )
+                    )
+                    if texture_refresh_events
+                    else 0
+                ),
+            },
             "unsupported_texture_resource_count": max(
                 (
                     int(event.get("unsupported_texture_resource_count", 0))
@@ -803,6 +1089,12 @@ def main() -> int:
         default=DEFAULT_HOTKEY_SCREENSHOT_DIR,
         help="Directory for timestamped BMP captures created with F12.",
     )
+    parser.add_argument(
+        "--metrics-report-directory",
+        type=Path,
+        default=DEFAULT_METRICS_REPORT_DIR,
+        help="Directory for timestamped text metric snapshots created with F11.",
+    )
     parser.add_argument("--clangxx", type=Path)
     parser.add_argument("--vulkan-sdk", type=Path)
     parser.add_argument("--width", type=int, default=640)
@@ -835,11 +1127,50 @@ def main() -> int:
         help="Interpret and diagnose a frozen live render manifest without Vulkan or a window.",
     )
     parser.add_argument(
+        "--cpu-vertex-programs",
+        action="store_true",
+        help="Use the exact CPU vertex-program interpreter for A/B validation.",
+    )
+    parser.add_argument(
+        "--cpu-vertex-attributes",
+        action="store_true",
+        help="Keep CPU indexed-attribute decoding while using GPU vertex programs.",
+    )
+    parser.add_argument(
+        "--cpu-texture-conversion",
+        action="store_true",
+        help="Use the exact CPU texture converter for visual/performance A/B runs.",
+    )
+    parser.add_argument(
+        "--presentation-pipeline-depth",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help=(
+            "Presenter acknowledgement pipeline depth; 2 releases the guest "
+            "after immutable command/resource loading for an opt-in A/B run."
+        ),
+    )
+    parser.add_argument(
+        "--pipeline-cache",
+        type=Path,
+        default=DEFAULT_PIPELINE_CACHE,
+        help="Persistent Vulkan driver pipeline cache.",
+    )
+    parser.add_argument(
         "--controller-state-json",
         type=Path,
         help="Publish keyboard-mapped Xbox controller state for the resumable runner.",
     )
     parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument(
+        "--no-diagnostics",
+        action="store_true",
+        help=(
+            "Disable presenter JSONL/summary output and automatic or hotkey "
+            "screenshots."
+        ),
+    )
     parser.add_argument("--no-inject-input", action="store_true")
     parser.add_argument(
         "--strict-render-validation",
@@ -891,7 +1222,7 @@ def main() -> int:
 
     run_result = run_first_frame(
         executable=args.exe,
-        debug_json=args.debug_json,
+        debug_json=None if args.no_diagnostics else args.debug_json,
         width=args.width,
         height=args.height,
         max_frames=args.max_frames,
@@ -907,14 +1238,28 @@ def main() -> int:
         flip_audit_health_interval=args.flip_audit_health_interval,
         screenshot=(
             None
-            if args.no_automatic_screenshot or args.analyze_render_stream
+            if args.no_diagnostics
+            or args.no_automatic_screenshot
+            or args.analyze_render_stream
             else args.screenshot_output
         ),
         hotkey_screenshot_directory=(
-            None if args.analyze_render_stream else args.hotkey_screenshot_directory
+            None
+            if args.no_diagnostics or args.analyze_render_stream
+            else args.hotkey_screenshot_directory
+        ),
+        metrics_report_directory=(
+            None if args.analyze_render_stream else args.metrics_report_directory
         ),
         analyze_render_stream=args.analyze_render_stream,
+        cpu_vertex_programs=args.cpu_vertex_programs,
+        cpu_vertex_attributes=args.cpu_vertex_attributes,
+        cpu_texture_conversion=args.cpu_texture_conversion,
+        presentation_pipeline_depth=args.presentation_pipeline_depth,
+        pipeline_cache=args.pipeline_cache,
     )
+    if args.no_diagnostics:
+        return int(run_result["returncode"])
     summary = summarize_smoke(
         compile_result=compile_result,
         run_result=run_result,

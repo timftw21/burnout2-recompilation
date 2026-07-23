@@ -64,6 +64,14 @@ PRESENTER_EVENT_NAMES = (
     "nv2a_presented_transform_constant",
     "nv2a_fixed_function_vertex_diagnostics",
     "nv2a_offscreen_render_targets_created",
+    "nv2a_gpu_raw_attribute_validation",
+    "nv2a_gpu_raw_dirty_range_validation",
+    "nv2a_raw_vertex_buffers_refreshed",
+    "nv2a_texture_resources_refreshed",
+    "nv2a_graphics_pipeline_created",
+    "nv2a_gpu_texture_conversion_pipeline_created",
+    "nv2a_gpu_texture_conversion_batch",
+    "nv2a_gpu_texture_conversion_validation",
     "hotkey_screenshot_queued",
     "hotkey_render_capture_retained",
     "render_stream_continuation_bootstrapped",
@@ -72,14 +80,57 @@ PRESENTER_EVENT_NAMES = (
 
 RELOAD_STAGE_FIELDS = (
     "wait_us",
+    "source_residency_us",
     "command_load_us",
     "interpret_us",
+    "method_interpret_us",
+    "push_buffer_collect_us",
+    "method_apply_us",
+    "method_finalize_us",
+    "indexed_materialize_us",
     "resource_update_us",
+    "resource_prepare_us",
+    "resource_preflight_us",
+    "resource_destroy_us",
+    "native_resource_create_us",
+    "vertex_resource_prepare_us",
+    "state_resource_prepare_us",
+    "texture_resource_prepare_us",
+    "texture_refresh_us",
+    "offscreen_resource_prepare_us",
+    "resource_bookkeeping_us",
+    "pipeline_prepare_us",
+    "pipeline_state_discovery_us",
+    "feedback_spec_build_us",
+    "texture_binding_update_us",
+    "render_validation_us",
     "vertex_transform_us",
+    "vertex_state_upload_us",
+    "raw_vertex_upload_us",
     "vertex_map_us",
     "vertex_copy_us",
     "command_record_us",
     "total_us",
+)
+
+FRAME_BOUNDARY_FIELDS = (
+    "live_reload_us",
+    "window_message_pump_us",
+    "controller_poll_us",
+    "keyboard_latch_us",
+    "reload_probe_us",
+    "pre_render_unattributed_us",
+    "reload_fence_wait_us",
+    "draw_fence_wait_us",
+    "gpu_query_us",
+    "fence_reset_us",
+    "acquire_us",
+    "submit_us",
+    "readback_wait_us",
+    "readback_process_us",
+    "present_us",
+    "audit_ack_us",
+    "draw_unattributed_us",
 )
 
 NATIVE_COUNTER_FIELDS = (
@@ -96,6 +147,9 @@ NATIVE_COUNTER_FIELDS = (
     "write_u8_callback_count",
     "native_observed_write_count",
     "native_observed_write_batch_count",
+    "native_observed_write_span_count",
+    "native_observed_write_span_batch_count",
+    "native_observed_write_span_byte_count",
     "observer_callback_count",
     "page_cache_fill_count",
     "dirty_sync_call_count",
@@ -113,6 +167,14 @@ NATIVE_COUNTER_FIELDS = (
     "cached_range_refresh_count",
     "cached_range_refresh_byte_count",
     "cached_range_refresh_no_change_count",
+    "observer_drain_deferred_count",
+    "empty_dependency_sync_bypass_count",
+    "memory_callback_policy_cache_hit_count",
+    "memory_callback_policy_cache_miss_count",
+    "observed_write_packet_yield_count",
+    "zero_read_callback_bypass_count",
+    "direct_observed_write_count",
+    "direct_observed_write_byte_count",
 )
 
 
@@ -177,6 +239,12 @@ def _summarize_presenter_performance(
     reloads: list[dict[str, Any]],
     frames: list[dict[str, Any]],
     skipped_reloads: list[dict[str, Any]],
+    raw_vertex_uploads: list[dict[str, Any]],
+    texture_refreshes: list[dict[str, Any]],
+    graphics_pipeline_creations: list[dict[str, Any]],
+    compute_pipeline_creations: list[dict[str, Any]],
+    texture_conversion_batches: list[dict[str, Any]],
+    texture_conversion_validations: list[dict[str, Any]],
 ) -> dict[str, Any]:
     stages = {
         field: _duration_summary(
@@ -221,6 +289,74 @@ def _summarize_presenter_performance(
         elapsed > target
         for elapsed, target in zip(elapsed_us, target_us, strict=True)
     )
+    reload_cursor = 0
+    previous_frame_sequence = -1
+    attributed_frames: list[dict[str, Any]] = []
+    for frame in frames:
+        attributed = dict(frame)
+        frame_sequence = _as_int(frame.get("sequence"), -1)
+        live_reload_us = 0
+        if frame_sequence >= 0:
+            while reload_cursor < len(reloads):
+                reload_sequence = _as_int(
+                    reloads[reload_cursor].get("sequence"), -1
+                )
+                if reload_sequence < 0:
+                    reload_cursor += 1
+                    continue
+                if reload_sequence >= frame_sequence:
+                    break
+                if reload_sequence > previous_frame_sequence:
+                    live_reload_us += _as_int(
+                        reloads[reload_cursor].get("total_us")
+                    )
+                reload_cursor += 1
+            previous_frame_sequence = frame_sequence
+        if live_reload_us or reloads:
+            attributed["live_reload_us"] = live_reload_us
+        attributed_frames.append(attributed)
+    boundary_frames = [
+        event
+        for event in attributed_frames
+        if any(event.get(field) is not None for field in FRAME_BOUNDARY_FIELDS)
+    ]
+    boundary_stages = {
+        field: _duration_summary(
+            [_as_int(event.get(field)) for event in boundary_frames]
+        )
+        for field in FRAME_BOUNDARY_FIELDS
+    }
+    slow_boundary_frames: list[dict[str, Any]] = []
+    dominant_boundary_counts: Counter[str] = Counter()
+    for event in boundary_frames:
+        elapsed = _as_int(event.get("elapsed_us"))
+        target = _as_int(event.get("target_frame_us"), 16_667)
+        if elapsed <= target * 2:
+            continue
+        boundary_values = {
+            field: _as_int(event.get(field))
+            for field in FRAME_BOUNDARY_FIELDS
+        }
+        dominant_boundary = max(
+            FRAME_BOUNDARY_FIELDS,
+            key=lambda field: boundary_values[field],
+        )
+        dominant_boundary_counts[dominant_boundary.removesuffix("_us")] += 1
+        slow_boundary_frames.append(
+            {
+                "sequence": event.get("sequence"),
+                "frame": event.get("frame"),
+                "elapsed_us": elapsed,
+                "draw_us": _as_int(event.get("draw_us")),
+                "cpu_render_us": _as_int(event.get("cpu_render_us")),
+                "dominant_boundary": dominant_boundary.removesuffix("_us"),
+                "dominant_boundary_us": boundary_values[dominant_boundary],
+                **boundary_values,
+            }
+        )
+    slow_boundary_frames.sort(
+        key=lambda event: -_as_int(event.get("elapsed_us"))
+    )
     reload_busy_us = sum(
         _as_int(event.get("total_us"))
         for event in reloads
@@ -248,6 +384,210 @@ def _summarize_presenter_performance(
         ),
         key=lambda item: (-item["reload_count"], item["manifest_guest_flip_count"]),
     )
+    latest_reload = reloads[-1] if reloads else {}
+    gpu_program_vertices = _as_int(
+        latest_reload.get("gpu_vertex_program_vertices")
+    )
+    cpu_fallback_vertices = _as_int(
+        latest_reload.get("cpu_vertex_program_fallback_vertices")
+    )
+    programmable_vertices = gpu_program_vertices + cpu_fallback_vertices
+    gpu_raw_attribute_vertices = _as_int(
+        latest_reload.get("gpu_raw_attribute_vertices")
+    )
+    detailed_raw_uploads = [
+        event
+        for event in raw_vertex_uploads
+        if event.get("resource_upload_bytes") is not None
+    ]
+    resource_upload_bytes = sum(
+        _as_int(event.get("resource_upload_bytes"))
+        for event in detailed_raw_uploads
+    )
+    index_upload_bytes = sum(
+        _as_int(event.get("index_upload_bytes"))
+        for event in detailed_raw_uploads
+    )
+    eligible_resource_bytes = sum(
+        _as_int(event.get("resource_bytes"))
+        for event in detailed_raw_uploads
+    )
+    latest_raw_upload = detailed_raw_uploads[-1] if detailed_raw_uploads else {}
+    gpu_texture_input_bytes = sum(
+        _as_int(event.get("input_bytes"))
+        for event in texture_conversion_batches
+    )
+    gpu_texture_output_bytes = sum(
+        _as_int(event.get("output_bytes"))
+        for event in texture_conversion_batches
+    )
+    latest_texture_validation = (
+        texture_conversion_validations[-1]
+        if texture_conversion_validations
+        else {}
+    )
+    offscreen_reload_samples = [
+        event
+        for event in reloads
+        if event.get("offscreen_render_target_count") is not None
+    ]
+    offscreen_target_reloads = [
+        event
+        for event in offscreen_reload_samples
+        if _as_int(event.get("offscreen_render_target_count")) > 0
+    ]
+    reused_offscreen_target_reloads = [
+        event
+        for event in offscreen_target_reloads
+        if event.get("offscreen_render_targets_reused") is True
+    ]
+    recreated_offscreen_target_reloads = [
+        event
+        for event in offscreen_target_reloads
+        if event.get("offscreen_render_targets_reused") is not True
+    ]
+    presentation_pipeline_reloads = [
+        event
+        for event in reloads
+        if event.get("presentation_pipeline_depth") is not None
+    ]
+    pipelined_presentation_reloads = [
+        event
+        for event in presentation_pipeline_reloads
+        if _as_int(event.get("presentation_pipeline_depth")) == 2
+    ]
+    presentation_pipeline_depth_counts = Counter(
+        _as_int(event.get("presentation_pipeline_depth"))
+        for event in presentation_pipeline_reloads
+    )
+    diagnostic_sampling_reloads = [
+        event
+        for event in reloads
+        if event.get("presented_diagnostics_sampled") is not None
+    ]
+    sampled_diagnostic_reloads = [
+        event
+        for event in diagnostic_sampling_reloads
+        if event.get("presented_diagnostics_sampled") is True
+    ]
+    unsampled_diagnostic_reloads = [
+        event
+        for event in diagnostic_sampling_reloads
+        if event.get("presented_diagnostics_sampled") is not True
+    ]
+    changed_resource_reloads = [
+        event
+        for event in diagnostic_sampling_reloads
+        if event.get("resource_generation_changed") is True
+    ]
+    command_loading_reloads = [
+        event for event in reloads if event.get("command_transport") is not None
+    ]
+    command_transport_counts = Counter(
+        str(event.get("command_transport")) for event in command_loading_reloads
+    )
+    command_file_reuse_reloads = [
+        event
+        for event in command_loading_reloads
+        if event.get("command_file_reused") is not None
+    ]
+    reused_command_file_reloads = [
+        event
+        for event in command_file_reuse_reloads
+        if event.get("command_file_reused") is True
+    ]
+    reopened_command_file_reloads = [
+        event
+        for event in command_file_reuse_reloads
+        if event.get("command_file_reused") is not True
+    ]
+    command_read_bytes = sum(
+        _as_int(event.get("command_read_bytes"))
+        for event in command_loading_reloads
+    )
+    command_file_read_us = sum(
+        _as_int(event.get("command_file_read_us"))
+        for event in command_loading_reloads
+        if event.get("command_file_read_us") is not None
+    )
+    resource_snapshot_reuse_reloads = [
+        event
+        for event in reloads
+        if event.get("resource_snapshot_reused_resources") is not None
+        and event.get("resource_snapshot_reused_bytes") is not None
+    ]
+    reused_resource_snapshot_reloads = [
+        event
+        for event in resource_snapshot_reuse_reloads
+        if _as_int(event.get("resource_snapshot_reused_resources")) > 0
+    ]
+    texture_binding_reloads = [
+        event
+        for event in reloads
+        if event.get("texture_binding_set_reused") is not None
+    ]
+    reused_texture_binding_reloads = [
+        event
+        for event in texture_binding_reloads
+        if event.get("texture_binding_set_reused") is True
+    ]
+    feedback_image_cache_reloads = [
+        event
+        for event in reloads
+        if event.get("render_target_feedback_image_cache_hits") is not None
+    ]
+    feedback_image_cache_hit_count = sum(
+        _as_int(event.get("render_target_feedback_image_cache_hits"))
+        for event in feedback_image_cache_reloads
+    )
+    feedback_image_cache_miss_count = sum(
+        _as_int(event.get("render_target_feedback_image_cache_misses"))
+        for event in feedback_image_cache_reloads
+    )
+    feedback_image_cache_lookup_count = (
+        feedback_image_cache_hit_count + feedback_image_cache_miss_count
+    )
+    method_interpretation_reloads = [
+        event
+        for event in reloads
+        if event.get("interpreted_method_delta") is not None
+    ]
+    interpreted_method_count = sum(
+        _as_int(event.get("interpreted_method_delta"))
+        for event in method_interpretation_reloads
+    )
+    bulk_indexed_method_count = sum(
+        _as_int(event.get("bulk_indexed_method_delta"))
+        for event in method_interpretation_reloads
+    )
+    bulk_inline_method_count = sum(
+        _as_int(event.get("bulk_inline_method_delta"))
+        for event in method_interpretation_reloads
+    )
+    bulk_method_count = bulk_indexed_method_count + bulk_inline_method_count
+    state_seed_status_reloads = [
+        event
+        for event in method_interpretation_reloads
+        if event.get("state_seed_updates_required") is not None
+    ]
+    state_seed_update_reload_count = sum(
+        1
+        for event in state_seed_status_reloads
+        if event.get("state_seed_updates_required") is True
+    )
+    resource_breakdown_reloads = [
+        event
+        for event in reloads
+        if event.get("native_resource_create_us") is not None
+    ]
+    texture_indexed_lookup_count = sum(
+        _as_int(event.get("texture_indexed_lookup_count"))
+        for event in resource_breakdown_reloads
+    )
+    texture_indexed_lookup_candidate_count = sum(
+        _as_int(event.get("texture_indexed_lookup_candidates"))
+        for event in resource_breakdown_reloads
+    )
     return {
         "reload_count": len(reloads),
         "reload_stages": stages,
@@ -264,6 +604,601 @@ def _summarize_presenter_performance(
         "skipped_redundant_reload_count": len(skipped_reloads),
         "latest_skipped_reload": skipped_reloads[-1] if skipped_reloads else None,
         "repeated_manifest_flips": repeated_manifest_flips[:32],
+        "presentation_pipeline": {
+            "instrumented_reload_count": len(presentation_pipeline_reloads),
+            "depth_counts": {
+                str(depth): count
+                for depth, count in sorted(
+                    presentation_pipeline_depth_counts.items()
+                )
+            },
+            "latest_depth": (
+                _as_int(
+                    presentation_pipeline_reloads[-1].get(
+                        "presentation_pipeline_depth"
+                    )
+                )
+                if presentation_pipeline_reloads
+                else None
+            ),
+            "pipelined_reload_count": len(pipelined_presentation_reloads),
+            "acknowledgement_publish_count": sum(
+                event.get("presentation_ack_published") is True
+                for event in presentation_pipeline_reloads
+            ),
+            "ack_write_us": _duration_summary(
+                [
+                    _as_int(event.get("presentation_ack_us"))
+                    for event in presentation_pipeline_reloads
+                    if event.get("presentation_ack_us") is not None
+                ]
+            ),
+            "pre_ack_us": _duration_summary(
+                [
+                    _as_int(event.get("pre_ack_us"))
+                    for event in presentation_pipeline_reloads
+                    if event.get("pre_ack_us") is not None
+                ]
+            ),
+            "source_residency_us": _duration_summary(
+                [
+                    _as_int(event.get("source_residency_us"))
+                    for event in presentation_pipeline_reloads
+                    if event.get("source_residency_us") is not None
+                ]
+            ),
+            "pipelined_post_ack_us": _duration_summary(
+                [
+                    _as_int(event.get("post_ack_us"))
+                    for event in pipelined_presentation_reloads
+                    if event.get("post_ack_us") is not None
+                ]
+            ),
+            "latest_ack_phase": (
+                presentation_pipeline_reloads[-1].get(
+                    "presentation_ack_phase"
+                )
+                if presentation_pipeline_reloads
+                else None
+            ),
+        },
+        "command_stream_loading": {
+            "instrumented_reload_count": len(command_loading_reloads),
+            "transport_counts": dict(sorted(command_transport_counts.items())),
+            "file_reuse_instrumented_reload_count": len(
+                command_file_reuse_reloads
+            ),
+            "file_reused_reload_count": len(reused_command_file_reloads),
+            "file_reopened_reload_count": len(reopened_command_file_reloads),
+            "file_reuse_ratio": (
+                round(
+                    len(reused_command_file_reloads)
+                    / len(command_file_reuse_reloads),
+                    6,
+                )
+                if command_file_reuse_reloads
+                else None
+            ),
+            "read_bytes": command_read_bytes,
+            "file_open_us": _duration_summary(
+                [
+                    _as_int(event.get("command_file_open_us"))
+                    for event in command_loading_reloads
+                    if event.get("command_file_open_us") is not None
+                ]
+            ),
+            "file_read_us": _duration_summary(
+                [
+                    _as_int(event.get("command_file_read_us"))
+                    for event in command_loading_reloads
+                    if event.get("command_file_read_us") is not None
+                ]
+            ),
+            "file_reopen_us": _duration_summary(
+                [
+                    _as_int(event.get("command_file_open_us"))
+                    for event in reopened_command_file_reloads
+                    if event.get("command_file_open_us") is not None
+                ]
+            ),
+            "record_validation_us": _duration_summary(
+                [
+                    _as_int(event.get("command_record_validation_us"))
+                    for event in command_loading_reloads
+                    if event.get("command_record_validation_us") is not None
+                ]
+            ),
+            "read_mib_per_second": (
+                round(
+                    command_read_bytes
+                    / (1024 * 1024)
+                    / (command_file_read_us / 1_000_000),
+                    3,
+                )
+                if command_file_read_us
+                else None
+            ),
+        },
+        "resource_snapshot_payload_reuse": {
+            "instrumented_reload_count": len(resource_snapshot_reuse_reloads),
+            "reused_reload_count": len(reused_resource_snapshot_reloads),
+            "reused_resource_count": sum(
+                _as_int(event.get("resource_snapshot_reused_resources"))
+                for event in resource_snapshot_reuse_reloads
+            ),
+            "reused_payload_bytes": sum(
+                _as_int(event.get("resource_snapshot_reused_bytes"))
+                for event in resource_snapshot_reuse_reloads
+            ),
+        },
+        "texture_binding_lifecycle": {
+            "instrumented_reload_count": len(texture_binding_reloads),
+            "reused_reload_count": len(reused_texture_binding_reloads),
+            "rebuilt_reload_count": (
+                len(texture_binding_reloads)
+                - len(reused_texture_binding_reloads)
+            ),
+            "reuse_ratio": (
+                round(
+                    len(reused_texture_binding_reloads)
+                    / len(texture_binding_reloads),
+                    6,
+                )
+                if texture_binding_reloads
+                else None
+            ),
+            "image_descriptor_update_count": sum(
+                _as_int(
+                    event.get(
+                        "texture_binding_image_descriptor_updates"
+                    )
+                )
+                for event in texture_binding_reloads
+            ),
+            "descriptor_set_allocation_count": sum(
+                _as_int(
+                    event.get(
+                        "texture_binding_descriptor_sets_allocated"
+                    )
+                )
+                for event in texture_binding_reloads
+            ),
+            "update_us": _duration_summary(
+                [
+                    _as_int(event.get("texture_binding_update_us"))
+                    for event in texture_binding_reloads
+                    if event.get("texture_binding_update_us") is not None
+                ]
+            ),
+        },
+        "method_interpretation": {
+            "instrumented_reload_count": len(method_interpretation_reloads),
+            "interpreted_method_count": interpreted_method_count,
+            "bulk_indexed_method_count": bulk_indexed_method_count,
+            "bulk_inline_method_count": bulk_inline_method_count,
+            "scalar_method_count": max(
+                0,
+                interpreted_method_count - bulk_method_count,
+            ),
+            "bulk_method_ratio": (
+                round(bulk_method_count / interpreted_method_count, 6)
+                if interpreted_method_count
+                else None
+            ),
+            "state_seed_status_reload_count": len(state_seed_status_reloads),
+            "state_seed_update_reload_count": state_seed_update_reload_count,
+            "state_seed_bypass_reload_count": (
+                len(state_seed_status_reloads)
+                - state_seed_update_reload_count
+            ),
+            "nanoseconds_per_method": (
+                round(
+                    sum(
+                        _as_int(event.get("method_interpret_us"))
+                        for event in method_interpretation_reloads
+                    )
+                    * 1000
+                    / interpreted_method_count,
+                    3,
+                )
+                if interpreted_method_count
+                else None
+            ),
+            "push_buffer_collect_us": _duration_summary(
+                [
+                    _as_int(event.get("push_buffer_collect_us"))
+                    for event in method_interpretation_reloads
+                ]
+            ),
+            "method_apply_us": _duration_summary(
+                [
+                    _as_int(event.get("method_apply_us"))
+                    for event in method_interpretation_reloads
+                ]
+            ),
+            "method_finalize_us": _duration_summary(
+                [
+                    _as_int(event.get("method_finalize_us"))
+                    for event in method_interpretation_reloads
+                ]
+            ),
+        },
+        "pipeline_compilation": {
+            "graphics_event_count": len(graphics_pipeline_creations),
+            "compute_event_count": len(compute_pipeline_creations),
+            "graphics_pipeline_count": sum(
+                _as_int(event.get("created_count"))
+                for event in graphics_pipeline_creations
+            ),
+            "compute_pipeline_count": len(compute_pipeline_creations),
+            "batched_graphics_event_count": sum(
+                event.get("batched") is True
+                for event in graphics_pipeline_creations
+            ),
+            "shader_module_us": _duration_summary(
+                [
+                    _as_int(event.get("shader_module_us"))
+                    for event in (
+                        graphics_pipeline_creations
+                        + compute_pipeline_creations
+                    )
+                    if event.get("shader_module_us") is not None
+                ]
+            ),
+            "pipeline_create_us": _duration_summary(
+                [
+                    _as_int(event.get("pipeline_create_us"))
+                    for event in (
+                        graphics_pipeline_creations
+                        + compute_pipeline_creations
+                    )
+                    if event.get("pipeline_create_us") is not None
+                ]
+            ),
+            "latest_graphics": (
+                graphics_pipeline_creations[-1]
+                if graphics_pipeline_creations
+                else None
+            ),
+            "latest_compute": (
+                compute_pipeline_creations[-1]
+                if compute_pipeline_creations
+                else None
+            ),
+        },
+        "render_target_feedback_image_cache": {
+            "instrumented_reload_count": len(feedback_image_cache_reloads),
+            "hit_count": feedback_image_cache_hit_count,
+            "miss_count": feedback_image_cache_miss_count,
+            "lookup_hit_ratio": (
+                round(
+                    feedback_image_cache_hit_count
+                    / feedback_image_cache_lookup_count,
+                    6,
+                )
+                if feedback_image_cache_lookup_count
+                else None
+            ),
+            "store_count": sum(
+                _as_int(event.get("render_target_feedback_image_cache_stores"))
+                for event in feedback_image_cache_reloads
+            ),
+            "eviction_count": sum(
+                _as_int(
+                    event.get("render_target_feedback_image_cache_evictions")
+                )
+                for event in feedback_image_cache_reloads
+            ),
+            "latest_resident_count": _as_int(
+                latest_reload.get(
+                    "render_target_feedback_image_cache_resident"
+                )
+            ),
+            "capacity": _as_int(
+                latest_reload.get(
+                    "render_target_feedback_image_cache_capacity"
+                )
+            ),
+        },
+        "resource_update_breakdown": {
+            "instrumented_reload_count": len(resource_breakdown_reloads),
+            "texture_indexed_lookup_count": texture_indexed_lookup_count,
+            "texture_indexed_lookup_candidate_count": (
+                texture_indexed_lookup_candidate_count
+            ),
+            "texture_indexed_lookup_candidates_average": (
+                round(
+                    texture_indexed_lookup_candidate_count
+                    / texture_indexed_lookup_count,
+                    6,
+                )
+                if texture_indexed_lookup_count
+                else None
+            ),
+            "texture_constant_lookup_count": sum(
+                _as_int(event.get("texture_constant_lookup_count"))
+                for event in resource_breakdown_reloads
+            ),
+            "latest_pipeline_candidate_draws": _as_int(
+                latest_reload.get("pipeline_candidate_draws")
+            ),
+            "latest_pipeline_unique_states": _as_int(
+                latest_reload.get("pipeline_unique_states")
+            ),
+            "latest_pipeline_missing_states": _as_int(
+                latest_reload.get("pipeline_missing_states")
+            ),
+        },
+        "presented_diagnostics_sampling": {
+            "instrumented_reload_count": len(diagnostic_sampling_reloads),
+            "sampled_reload_count": len(sampled_diagnostic_reloads),
+            "sample_ratio": (
+                round(
+                    len(sampled_diagnostic_reloads)
+                    / len(diagnostic_sampling_reloads),
+                    6,
+                )
+                if diagnostic_sampling_reloads
+                else None
+            ),
+            "resource_generation_reload_count": len(changed_resource_reloads),
+            "resource_generation_sampled_count": sum(
+                event.get("presented_diagnostics_sampled") is True
+                for event in changed_resource_reloads
+            ),
+            "sampled_render_validation_us": _duration_summary(
+                [
+                    _as_int(event.get("render_validation_us"))
+                    for event in sampled_diagnostic_reloads
+                    if event.get("render_validation_us") is not None
+                ]
+            ),
+            "unsampled_render_validation_us": _duration_summary(
+                [
+                    _as_int(event.get("render_validation_us"))
+                    for event in unsampled_diagnostic_reloads
+                    if event.get("render_validation_us") is not None
+                ]
+            ),
+        },
+        "offscreen_target_lifecycle": {
+            "instrumented_reload_count": len(offscreen_reload_samples),
+            "target_reload_count": len(offscreen_target_reloads),
+            "reused_reload_count": len(reused_offscreen_target_reloads),
+            "recreated_reload_count": len(recreated_offscreen_target_reloads),
+            "reuse_ratio": (
+                round(
+                    len(reused_offscreen_target_reloads)
+                    / len(offscreen_target_reloads),
+                    6,
+                )
+                if offscreen_target_reloads
+                else None
+            ),
+            "reused_resource_update_us": _duration_summary(
+                [
+                    _as_int(event.get("resource_update_us"))
+                    for event in reused_offscreen_target_reloads
+                    if event.get("resource_update_us") is not None
+                ]
+            ),
+            "recreated_resource_update_us": _duration_summary(
+                [
+                    _as_int(event.get("resource_update_us"))
+                    for event in recreated_offscreen_target_reloads
+                    if event.get("resource_update_us") is not None
+                ]
+            ),
+        },
+        "vertex_program_execution": {
+            "gpu_draws": _as_int(
+                latest_reload.get("gpu_vertex_program_draws")
+            ),
+            "gpu_vertices": gpu_program_vertices,
+            "cpu_fallback_draws": _as_int(
+                latest_reload.get("cpu_vertex_program_fallback_draws")
+            ),
+            "cpu_fallback_vertices": cpu_fallback_vertices,
+            "gpu_vertex_ratio": (
+                round(gpu_program_vertices / programmable_vertices, 6)
+                if programmable_vertices
+                else None
+            ),
+        },
+        "raw_attribute_fetch": {
+            "gpu_draws": _as_int(
+                latest_reload.get("gpu_raw_attribute_draws")
+            ),
+            "gpu_vertices": gpu_raw_attribute_vertices,
+            "gpu_program_vertex_ratio": (
+                round(gpu_raw_attribute_vertices / gpu_program_vertices, 6)
+                if gpu_program_vertices
+                else None
+            ),
+            "expanded_vertex_bytes_avoided": _as_int(
+                latest_reload.get("expanded_vertex_bytes_avoided")
+            ),
+        },
+        "persistent_raw_resource_uploads": {
+            "refresh_count": len(raw_vertex_uploads),
+            "detailed_refresh_count": len(detailed_raw_uploads),
+            "legacy_refresh_count": len(raw_vertex_uploads)
+            - len(detailed_raw_uploads),
+            "resident_resource_bytes": _as_int(
+                latest_raw_upload.get("resource_bytes")
+            ),
+            "layout_rebuild_count": _as_int(
+                latest_raw_upload.get("layout_rebuilds")
+            ),
+            "buffer_replacement_count": sum(
+                event.get("buffer_replaced") is True
+                for event in detailed_raw_uploads
+            ),
+            "dirty_upload_count": sum(
+                0 < _as_int(event.get("resource_upload_bytes"))
+                < _as_int(event.get("resource_bytes"))
+                for event in detailed_raw_uploads
+            ),
+            "no_resource_upload_count": sum(
+                _as_int(event.get("resource_upload_bytes")) == 0
+                for event in detailed_raw_uploads
+            ),
+            "compared_bytes": sum(
+                _as_int(event.get("compared_bytes"))
+                for event in detailed_raw_uploads
+            ),
+            "cache_refresh_us": _duration_summary(
+                [
+                    _as_int(event.get("cache_refresh_us"))
+                    for event in detailed_raw_uploads
+                    if event.get("cache_refresh_us") is not None
+                ]
+            ),
+            "resource_upload_bytes": resource_upload_bytes,
+            "index_upload_bytes": index_upload_bytes,
+            "resource_upload_bytes_avoided": max(
+                0, eligible_resource_bytes - resource_upload_bytes
+            ),
+            "resource_upload_ratio": (
+                round(resource_upload_bytes / eligible_resource_bytes, 6)
+                if eligible_resource_bytes
+                else None
+            ),
+            "latest": latest_raw_upload or None,
+        },
+        "gpu_texture_conversion": {
+            "batch_count": len(texture_conversion_batches),
+            "refresh_count": len(texture_refreshes),
+            "gpu_converted_textures": sum(
+                _as_int(event.get("gpu_converted"))
+                for event in texture_refreshes
+            ),
+            "cpu_converted_textures": sum(
+                _as_int(event.get("cpu_converted"))
+                for event in texture_refreshes
+            ),
+            "dxt1_textures": sum(
+                _as_int(event.get("dxt1_textures"))
+                for event in texture_conversion_batches
+            ),
+            "dxt5_textures": sum(
+                _as_int(event.get("dxt5_textures"))
+                for event in texture_conversion_batches
+            ),
+            "recovered_chain_textures": sum(
+                _as_int(event.get("recovered_chain_textures"))
+                for event in texture_conversion_batches
+            ),
+            "generated_chain_textures": sum(
+                _as_int(event.get("generated_chain_textures"))
+                for event in texture_conversion_batches
+            ),
+            "mip_count": sum(
+                _as_int(event.get("mips"))
+                for event in texture_conversion_batches
+            ),
+            "generated_mip_count": sum(
+                _as_int(event.get("generated_mips"))
+                for event in texture_conversion_batches
+            ),
+            "dispatch_count": sum(
+                _as_int(event.get("dispatches"))
+                for event in texture_conversion_batches
+            ),
+            "compressed_input_bytes": gpu_texture_input_bytes,
+            "dxt1_input_bytes": sum(
+                _as_int(event.get("dxt1_input_bytes"))
+                for event in texture_conversion_batches
+            ),
+            "dxt5_input_bytes": sum(
+                _as_int(event.get("dxt5_input_bytes"))
+                for event in texture_conversion_batches
+            ),
+            "rgba_output_bytes": gpu_texture_output_bytes,
+            "output_to_input_ratio": (
+                round(gpu_texture_output_bytes / gpu_texture_input_bytes, 6)
+                if gpu_texture_input_bytes
+                else None
+            ),
+            "gpu_batch_us": _duration_summary(
+                [
+                    _as_int(event.get("conversion_us"))
+                    for event in texture_conversion_batches
+                    if event.get("conversion_us") is not None
+                ]
+            ),
+            "gpu_submission_us": _duration_summary(
+                [
+                    _as_int(event.get("gpu_submission_us"))
+                    for event in texture_conversion_batches
+                    if event.get("gpu_submission_us") is not None
+                ]
+            ),
+            "setup_us": _duration_summary(
+                [
+                    _as_int(event.get("setup_us"))
+                    for event in texture_conversion_batches
+                    if event.get("setup_us") is not None
+                ]
+            ),
+            "cpu_texture_path_us": _duration_summary(
+                [
+                    _as_int(event.get("cpu_texture_path_us"))
+                    for event in texture_refreshes
+                    if event.get("cpu_texture_path_us") is not None
+                ]
+            ),
+            "backend_counts": dict(
+                Counter(
+                    str(event.get("gpu_conversion_backend", "unknown"))
+                    for event in texture_refreshes
+                )
+            ),
+            "validation": {
+                "event_count": len(texture_conversion_validations),
+                "passed": (
+                    all(
+                        event.get("passed") is True
+                        for event in texture_conversion_validations
+                    )
+                    if texture_conversion_validations
+                    else None
+                ),
+                "coverage_complete": latest_texture_validation.get(
+                    "coverage_complete"
+                ),
+                "validated_textures": sum(
+                    _as_int(event.get("textures"))
+                    for event in texture_conversion_validations
+                ),
+                "validated_mips": sum(
+                    _as_int(event.get("mips"))
+                    for event in texture_conversion_validations
+                ),
+                "validated_bytes": sum(
+                    _as_int(event.get("bytes"))
+                    for event in texture_conversion_validations
+                ),
+                "mismatch_bytes": sum(
+                    _as_int(event.get("mismatch_bytes"))
+                    for event in texture_conversion_validations
+                ),
+                "cpu_us": _duration_summary(
+                    [
+                        _as_int(event.get("validation_cpu_us"))
+                        for event in texture_conversion_validations
+                        if event.get("validation_cpu_us") is not None
+                    ]
+                ),
+                "latest": latest_texture_validation or None,
+            },
+            "latest_batch": (
+                texture_conversion_batches[-1]
+                if texture_conversion_batches
+                else None
+            ),
+            "latest_refresh": texture_refreshes[-1] if texture_refreshes else None,
+        },
         "frame_pacing": {
             "frame_count": len(elapsed_us),
             "elapsed_total_seconds": round(elapsed_total_us / 1_000_000, 6),
@@ -278,6 +1213,14 @@ def _summarize_presenter_performance(
             ),
             "elapsed_us": _duration_summary(elapsed_us),
             "elapsed_ms": _duration_summary(elapsed_us),
+            "boundary_attribution": {
+                "instrumented_frame_count": len(boundary_frames),
+                "slow_frame_threshold": "elapsed_us > 2 * target_frame_us",
+                "slow_frame_count": len(slow_boundary_frames),
+                "dominant_boundary_counts": dict(dominant_boundary_counts),
+                "stages": boundary_stages,
+                "slowest_frames": slow_boundary_frames[:20],
+            },
         },
     }
 
@@ -692,6 +1635,18 @@ def _summarize_composition_coverage(
         )
     text_samples = text_draw.get("sampled_strings", [])
     interpreter = latest["d3d8_stream_interpreted"]
+    if interpreter is not None:
+        interpreter = dict(interpreter)
+        legacy_indexed_noops = interpreter.pop(
+            "zero_count_indexed_array_packets", None
+        )
+        if (
+            "zero_count_indexed_array_noop_packets" not in interpreter
+            and legacy_indexed_noops is not None
+        ):
+            interpreter["zero_count_indexed_array_noop_packets"] = (
+                legacy_indexed_noops
+            )
     issues: list[dict[str, Any]] = []
     submission_audit_available = bool(submitted_draw.get("draw_address_hex"))
     if not submission_audit_available:
@@ -1224,6 +2179,7 @@ def _summarize_guest_performance(execution: dict[str, Any]) -> dict[str, Any]:
     )
     native_runs: list[dict[str, Any]] = []
     live_bridges: list[dict[str, Any]] = []
+    latest_live_bridge_summary: dict[str, Any] | None = None
     for context in contexts:
         context_execution = context["execution"]
         context_runs = context_execution.get("native_runs", [])
@@ -1242,6 +2198,7 @@ def _summarize_guest_performance(execution: dict[str, Any]) -> dict[str, Any]:
         )
         bridge = context_execution.get("live_host_bridge")
         if bridge and bridge.get("performance"):
+            latest_live_bridge_summary = bridge
             live_bridges.append(
                 {
                     "scope": context["scope"],
@@ -1292,8 +2249,73 @@ def _summarize_guest_performance(execution: dict[str, Any]) -> dict[str, Any]:
     aggregate_timings: dict[str, dict[str, Any]] = {}
     read_callback_sample_counts: Counter[tuple[str, int]] = Counter()
     read_callback_sample_intervals: set[int] = set()
+    memory_callback_samples: dict[tuple[str, int], dict[str, int]] = {}
+    dispatch_targets: dict[int, dict[str, Any]] = {}
+    dispatch_edges: dict[tuple[int, int], dict[str, Any]] = {}
+    module_exit_reason_counts: Counter[str] = Counter()
+    module_exit_profiled_run_count = 0
+    module_exit_unclassified_call_count = 0
+    module_edge_profiled_run_count = 0
+    module_edge_profiles_exact = True
+    module_edge_overflow_call_count = 0
+    module_edge_unclassified_call_count = 0
+    module_edge_table_capacities: set[int] = set()
+    profiled_native_run_count = 0
     for run in native_runs:
         performance = run.get("performance") or {}
+        if performance.get("hot_path_profiling_enabled"):
+            profiled_native_run_count += 1
+        module_exit_profile = performance.get("native_module_exit_profile") or {}
+        if module_exit_profile.get("enabled"):
+            module_exit_profiled_run_count += 1
+            module_exit_unclassified_call_count += _as_int(
+                module_exit_profile.get("unclassified_module_calls")
+            )
+            module_exit_reason_counts.update(
+                {
+                    str(name): _as_int(count)
+                    for name, count in (
+                        module_exit_profile.get("reason_counts") or {}
+                    ).items()
+                }
+            )
+        module_edge_profile = performance.get("native_module_edge_profile") or {}
+        if module_edge_profile.get("enabled"):
+            module_edge_profiled_run_count += 1
+            module_edge_profiles_exact = (
+                module_edge_profiles_exact
+                and module_edge_profile.get("exact") is True
+            )
+            module_edge_overflow_call_count += _as_int(
+                module_edge_profile.get("overflow_module_calls")
+            )
+            module_edge_unclassified_call_count += _as_int(
+                module_edge_profile.get("unclassified_module_calls")
+            )
+            table_capacity = _as_int(module_edge_profile.get("table_capacity"))
+            if table_capacity:
+                module_edge_table_capacities.add(table_capacity)
+            for edge in module_edge_profile.get("edges", []):
+                entry_target = _as_int(edge.get("entry_target"), -1)
+                exit_target = _as_int(edge.get("exit_target"), -1)
+                if entry_target < 0 or exit_target < 0:
+                    continue
+                aggregate = dispatch_edges.setdefault(
+                    (entry_target, exit_target),
+                    {
+                        "module_calls": 0,
+                        "module_exit_reasons": Counter(),
+                    },
+                )
+                aggregate["module_calls"] += _as_int(edge.get("module_calls"))
+                aggregate["module_exit_reasons"].update(
+                    {
+                        str(name): _as_int(count)
+                        for name, count in (
+                            edge.get("module_exit_reasons") or {}
+                        ).items()
+                    }
+                )
         for field in NATIVE_COUNTER_FIELDS:
             if field in performance:
                 observed_counter_fields.add(field)
@@ -1320,6 +2342,47 @@ def _summarize_guest_performance(execution: dict[str, Any]) -> dict[str, Any]:
             read_callback_sample_counts[(str(sample.get("kind")), address)] += (
                 _as_int(sample.get("sample_count"))
             )
+        callback_sampling = performance.get("memory_callback_sampling") or {}
+        for sample in callback_sampling.get("hot_addresses", []):
+            try:
+                address = int(sample.get("address"))
+            except (TypeError, ValueError):
+                continue
+            key = (str(sample.get("kind")), address)
+            aggregate = memory_callback_samples.setdefault(
+                key,
+                {"sample_count": 0, "sampled_total_us": 0, "sampled_max_us": 0},
+            )
+            aggregate["sample_count"] += _as_int(sample.get("sample_count"))
+            aggregate["sampled_total_us"] += _as_int(
+                sample.get("sampled_total_us")
+            )
+            aggregate["sampled_max_us"] = max(
+                aggregate["sampled_max_us"],
+                _as_int(sample.get("sampled_max_us")),
+            )
+        for target in performance.get("native_dispatch_hot_targets", []):
+            address = _as_int(target.get("target"), -1)
+            if address < 0:
+                continue
+            aggregate = dispatch_targets.setdefault(
+                address,
+                {
+                    "module_calls": 0,
+                    "guest_steps": 0,
+                    "module_exit_reasons": Counter(),
+                },
+            )
+            aggregate["module_calls"] += _as_int(target.get("module_calls"))
+            aggregate["guest_steps"] += _as_int(target.get("guest_steps"))
+            aggregate["module_exit_reasons"].update(
+                {
+                    str(name): _as_int(count)
+                    for name, count in (
+                        target.get("module_exit_reasons") or {}
+                    ).items()
+                }
+            )
     timing_hot_paths = sorted(
         (
             {
@@ -1333,6 +2396,12 @@ def _summarize_guest_performance(execution: dict[str, Any]) -> dict[str, Any]:
         ),
         key=lambda item: (-item["total_us"], item["name"]),
     )
+    native_dispatch_inclusive_us = _as_int(
+        aggregate_timings.get("native_dispatch", {}).get("total_us")
+    )
+    native_dispatch_self_us = _as_int(
+        aggregate_timings.get("native_dispatch_self", {}).get("total_us")
+    )
     dirty_sync_calls = counter_totals["dirty_sync_call_count"]
     memory_read_callbacks = (
         counter_totals["read_u32_callback_count"]
@@ -1345,8 +2414,73 @@ def _summarize_guest_performance(execution: dict[str, Any]) -> dict[str, Any]:
     dirty_page_sync_total_us = _as_int(
         aggregate_timings.get("dirty_page_sync", {}).get("total_us")
     )
+    module_calls = counter_totals["native_module_call_count"]
+    observed_write_batches = counter_totals["native_observed_write_batch_count"]
+    observed_writes = counter_totals["native_observed_write_count"]
+    callback_policy_cache_hits = counter_totals[
+        "memory_callback_policy_cache_hit_count"
+    ]
+    callback_policy_cache_misses = counter_totals[
+        "memory_callback_policy_cache_miss_count"
+    ]
+    callback_policy_cache_queries = (
+        callback_policy_cache_hits + callback_policy_cache_misses
+    )
+    empty_dependency_sync_bypasses = counter_totals[
+        "empty_dependency_sync_bypass_count"
+    ]
+    callback_sync_boundaries = (
+        counter_totals["selective_dirty_sync_call_count"]
+        + empty_dependency_sync_bypasses
+    )
+    dispatch_edge_records = [
+        {
+            "entry_target": entry_target,
+            "entry_target_hex": f"0x{entry_target:08X}",
+            "exit_target": exit_target,
+            "exit_target_hex": f"0x{exit_target:08X}",
+            "module_calls": metric["module_calls"],
+            "module_exit_reasons": dict(
+                sorted(metric["module_exit_reasons"].items())
+            ),
+        }
+        for (entry_target, exit_target), metric in sorted(
+            dispatch_edges.items(),
+            key=lambda item: (
+                -item[1]["module_calls"],
+                item[0][0],
+                item[0][1],
+            ),
+        )
+    ]
     return {
         "native_run_count": len(native_runs),
+        "profiled_native_run_count": profiled_native_run_count,
+        "native_module_exit_profile": {
+            "enabled": module_exit_profiled_run_count > 0,
+            "profiled_native_run_count": module_exit_profiled_run_count,
+            "reason_counts": dict(sorted(module_exit_reason_counts.items())),
+            "classified_module_calls": sum(module_exit_reason_counts.values()),
+            "unclassified_module_calls": module_exit_unclassified_call_count,
+        },
+        "native_module_edge_profile": {
+            "enabled": module_edge_profiled_run_count > 0,
+            "profiled_native_run_count": module_edge_profiled_run_count,
+            "exact": (
+                module_edge_profiled_run_count > 0
+                and module_edge_profiles_exact
+                and module_edge_overflow_call_count == 0
+                and module_edge_unclassified_call_count == 0
+            ),
+            "table_capacities": sorted(module_edge_table_capacities),
+            "unique_edge_count": len(dispatch_edge_records),
+            "classified_module_calls": sum(
+                edge["module_calls"] for edge in dispatch_edge_records
+            ),
+            "unclassified_module_calls": module_edge_unclassified_call_count,
+            "overflow_module_calls": module_edge_overflow_call_count,
+            "edges": dispatch_edge_records,
+        },
         "native_runs": native_runs,
         "total_steps": total_steps,
         "elapsed_total_us": total_elapsed_us,
@@ -1359,6 +2493,26 @@ def _summarize_guest_performance(execution: dict[str, Any]) -> dict[str, Any]:
         "counter_totals": counter_totals,
         "counter_fields_observed": sorted(observed_counter_fields),
         "timing_hot_paths": timing_hot_paths,
+        "native_dispatch_timing": {
+            "inclusive_us": native_dispatch_inclusive_us,
+            "self_us": native_dispatch_self_us,
+            "compiled_module_and_call_us": max(
+                0,
+                native_dispatch_inclusive_us - native_dispatch_self_us,
+            ),
+            "self_ratio": (
+                round(
+                    native_dispatch_self_us / native_dispatch_inclusive_us,
+                    6,
+                )
+                if native_dispatch_inclusive_us
+                and "native_dispatch_self" in aggregate_timings
+                else None
+            ),
+            "exclusive_measurement_available": (
+                "native_dispatch_self" in aggregate_timings
+            ),
+        },
         "dirty_sync_no_work_ratio": (
             round(counter_totals["dirty_sync_no_work_count"] / dirty_sync_calls, 6)
             if dirty_sync_calls and "dirty_sync_no_work_count" in observed_counter_fields
@@ -1377,6 +2531,27 @@ def _summarize_guest_performance(execution: dict[str, Any]) -> dict[str, Any]:
         "memory_read_callbacks_per_million_steps": (
             round(memory_read_callbacks * 1_000_000 / total_steps, 3)
             if total_steps
+            else None
+        ),
+        "native_module_calls_per_million_steps": (
+            round(module_calls * 1_000_000 / total_steps, 3)
+            if total_steps
+            else None
+        ),
+        "average_observed_writes_per_batch": (
+            round(observed_writes / observed_write_batches, 3)
+            if observed_write_batches
+            else None
+        ),
+        "memory_callback_policy_cache_hit_ratio": (
+            round(callback_policy_cache_hits / callback_policy_cache_queries, 6)
+            if callback_policy_cache_queries
+            else None
+        ),
+        "empty_dependency_sync_bypass_ratio": (
+            round(empty_dependency_sync_bypasses / callback_sync_boundaries, 6)
+            if callback_sync_boundaries
+            and "empty_dependency_sync_bypass_count" in observed_counter_fields
             else None
         ),
         "exact_read_callback_ratio": (
@@ -1408,8 +2583,58 @@ def _summarize_guest_performance(execution: dict[str, Any]) -> dict[str, Any]:
                 )
             ],
         },
+        "memory_callback_sampling": {
+            "sample_count": sum(
+                metric["sample_count"] for metric in memory_callback_samples.values()
+            ),
+            "hot_addresses": [
+                {
+                    "kind": kind,
+                    "address": address,
+                    "address_hex": f"0x{address:08X}",
+                    **metric,
+                    "sampled_average_us": round(
+                        metric["sampled_total_us"]
+                        / max(1, metric["sample_count"]),
+                        3,
+                    ),
+                }
+                for (kind, address), metric in sorted(
+                    memory_callback_samples.items(),
+                    key=lambda item: (
+                        -item[1]["sampled_total_us"],
+                        item[0][0],
+                        item[0][1],
+                    ),
+                )[:32]
+            ],
+        },
+        "native_dispatch_hot_targets": [
+            {
+                "target": address,
+                "target_hex": f"0x{address:08X}",
+                "module_calls": metric["module_calls"],
+                "guest_steps": metric["guest_steps"],
+                "module_exit_reasons": dict(
+                    sorted(metric["module_exit_reasons"].items())
+                ),
+                "average_guest_steps_per_call": round(
+                    metric["guest_steps"] / max(1, metric["module_calls"]),
+                    3,
+                ),
+            }
+            for address, metric in sorted(
+                dispatch_targets.items(),
+                key=lambda item: (
+                    -item[1]["guest_steps"],
+                    -item[1]["module_calls"],
+                    item[0],
+                ),
+            )[:64]
+        ],
         "handler_hot_paths": handler_hot_paths,
         "live_host_bridge": live_bridges[-1]["performance"] if live_bridges else None,
+        "live_host_bridge_summary": latest_live_bridge_summary,
         "live_host_bridges": live_bridges,
     }
 
@@ -1745,32 +2970,6 @@ def _rank_diagnostic_findings(
                     "latest_indexed_draw_samples": indexed_draw_audit.get(
                         "indexed_draw_samples", []
                     )[-8:],
-                },
-            }
-        )
-    latest_interpreter = composition_coverage.get("latest_interpreter") or {}
-    zero_count_indexed_array_packets = _as_int(
-        latest_interpreter.get("zero_count_indexed_array_packets")
-    )
-    if (
-        zero_count_indexed_array_packets
-        and not _as_int(indexed_draw_audit.get("zero_index_draw_count"))
-    ):
-        findings.append(
-            {
-                "id": "zero_count_indexed_array_packets",
-                "severity": "critical",
-                "category": "rendering",
-                "evidence": {
-                    "zero_count_indexed_array_packets": (
-                        zero_count_indexed_array_packets
-                    ),
-                    "zero_count_method_words": latest_interpreter.get(
-                        "zero_count_method_words"
-                    ),
-                    "indexed_array_draws": latest_interpreter.get(
-                        "indexed_array_draws"
-                    ),
                 },
             }
         )
@@ -2385,6 +3584,22 @@ def build_render_debug_report(
         retained_events["nv2a_presented_transform_diagnostics"],
         retained_events["nv2a_fixed_function_vertex_diagnostics"],
     )
+    raw_attribute_events = retained_events[
+        "nv2a_gpu_raw_attribute_validation"
+    ]
+    raw_attribute_validation = (
+        raw_attribute_events[-1]
+        if raw_attribute_events
+        else {"status": "not_captured", "passed": None}
+    )
+    dirty_range_events = retained_events[
+        "nv2a_gpu_raw_dirty_range_validation"
+    ]
+    dirty_range_validation = (
+        dirty_range_events[-1]
+        if dirty_range_events
+        else {"status": "not_captured", "passed": None}
+    )
     samples = vertex.get("anomalous_samples", [])
     builder_geometry_by_flip = vertex.get("geometry_by_guest_flip", [])
     guest_geometry_by_flip = submitted_draw.get("geometry_by_guest_flip", [])
@@ -2499,6 +3714,12 @@ def build_render_debug_report(
         retained_events["live_render_stream_reloaded"],
         retained_events["frame_presented"],
         retained_events["live_render_stream_reload_skipped"],
+        retained_events["nv2a_raw_vertex_buffers_refreshed"],
+        retained_events["nv2a_texture_resources_refreshed"],
+        retained_events["nv2a_graphics_pipeline_created"],
+        retained_events["nv2a_gpu_texture_conversion_pipeline_created"],
+        retained_events["nv2a_gpu_texture_conversion_batch"],
+        retained_events["nv2a_gpu_texture_conversion_validation"],
     )
     composition_coverage = _summarize_composition_coverage(
         submitted_geometry_by_flip=guest_geometry_by_flip,
@@ -2525,6 +3746,61 @@ def build_render_debug_report(
         live_capture_coverage=live_capture_coverage,
         render_target_feedback_cache=render_target_feedback_cache,
     )
+    if raw_attribute_validation.get("passed") is False:
+        diagnostic_findings.insert(
+            0,
+            {
+                "id": "gpu_raw_attribute_validation_failed",
+                "severity": "critical",
+                "category": "rendering",
+                "evidence": {
+                    "mismatch_vertices": raw_attribute_validation.get(
+                        "mismatch_vertices"
+                    ),
+                    "compared_vertices": raw_attribute_validation.get(
+                        "compared_vertices"
+                    ),
+                    "mapping_fallback_draws": raw_attribute_validation.get(
+                        "mapping_fallback_draws"
+                    ),
+                },
+            },
+        )
+    if dirty_range_validation.get("passed") is False:
+        diagnostic_findings.insert(
+            0,
+            {
+                "id": "gpu_raw_dirty_range_validation_failed",
+                "severity": "critical",
+                "category": "rendering",
+                "evidence": {
+                    "unchanged_generation_passed": dirty_range_validation.get(
+                        "unchanged_generation_passed"
+                    ),
+                    "changed_generation_passed": dirty_range_validation.get(
+                        "changed_generation_passed"
+                    ),
+                    "layout_change_passed": dirty_range_validation.get(
+                        "layout_change_passed"
+                    ),
+                },
+            },
+        )
+    texture_conversion_validation = (
+        retained_events["nv2a_gpu_texture_conversion_validation"][-1]
+        if retained_events["nv2a_gpu_texture_conversion_validation"]
+        else {}
+    )
+    if texture_conversion_validation.get("passed") is False:
+        diagnostic_findings.insert(
+            0,
+            {
+                "id": "gpu_texture_conversion_validation_failed",
+                "severity": "critical",
+                "category": "rendering",
+                "evidence": texture_conversion_validation,
+            },
+        )
     status = (
         "correlated_guest_and_host_geometry"
         if guest_geometry_by_flip and geometry_events
@@ -2537,7 +3813,7 @@ def build_render_debug_report(
         else "diagnostic_data_missing"
     )
     return {
-        "format": "b2-recomp-render-debug-report-v12",
+        "format": "b2-recomp-render-debug-report-v17",
         "status": status,
         "probe_summary": {
             "path": str(probe_summary_path),
@@ -2598,6 +3874,9 @@ def build_render_debug_report(
         "render_target_feedback_cache": render_target_feedback_cache,
         "host_geometry": host_geometry,
         "vertex_transforms": vertex_transforms,
+        "gpu_raw_attribute_validation": raw_attribute_validation,
+        "gpu_raw_dirty_range_validation": dirty_range_validation,
+        "gpu_texture_conversion_validation": texture_conversion_validation,
         "render_state_coverage": render_state_coverage,
         "guest_host_correlations": correlations,
         "guest_host_flip_timeline": guest_host_flip_timeline,

@@ -336,8 +336,44 @@ class RenderD3D8StreamTests(unittest.TestCase):
         self.assertEqual(decoded["push_buffer_method_packet_count"], 0)
         self.assertEqual(decoded["zero_count_method_word_count"], 1)
         self.assertEqual(decoded["commands"][1]["category"], "push-buffer-zero-count-word")
+        self.assertIn("no-op", decoded["commands"][1]["hle_role"])
         self.assertEqual(replay["push_buffer_method_packet_count"], 0)
         self.assertEqual(replay["zero_count_method_word_count"], 1)
+
+    def test_zero_count_index_prefix_preserves_populated_packet(self) -> None:
+        words = (
+            0x40001800,
+            0x40000000 | (2 << 18) | 0x1800,
+            0x00010000,
+            0x00030002,
+        )
+        stream = {
+            "format": "b2-recomp-render-command-stream",
+            "write_count": len(words),
+            "writes": [
+                {
+                    "kind": "d3d_push_buffer",
+                    "address": 0x80000080 + index * 4,
+                    "value": value,
+                }
+                for index, value in enumerate(words)
+            ],
+        }
+
+        decoded = decode_render_stream(stream)
+        replay = replay_render_stream(stream)
+
+        self.assertEqual(
+            decoded["commands"][1]["category"],
+            "push-buffer-zero-count-word",
+        )
+        self.assertEqual(decoded["commands"][2]["method_count"], 2)
+        self.assertEqual(
+            [method["data"] for method in decoded["commands"][2]["methods"]],
+            [0x00010000, 0x00030002],
+        )
+        self.assertEqual(replay["zero_count_method_word_count"], 1)
+        self.assertEqual(replay["push_buffer_method_packet_count"], 1)
 
     def test_replays_stream_to_deterministic_interpreted_render_work(self) -> None:
         stream = {

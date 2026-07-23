@@ -353,6 +353,104 @@ class X86RecompPrototypeTests(unittest.TestCase):
         self.assertEqual(trace[-1]["operation"], "missing_instruction")
         self.assertEqual(trace[-1]["details"]["eip"], 0x900008C2)
 
+    def test_missing_call_target_can_return_to_hybrid_dispatcher(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex("E8FB0F0000C3"),  # call 0x2000; ret
+            base_address=0x1000,
+            symbol="call_to_deferred_native_target",
+        )
+        state = CpuState.with_registers(esp=0x9000)
+        memory = SparseMemory({0x9000: 0xDEADC0DE})
+
+        result = execute_lifted_function(
+            function,
+            state=state,
+            memory=memory,
+            return_on_missing_instruction=True,
+        )
+
+        self.assertEqual(result.return_address, 0x2000)
+        self.assertEqual(result.steps, 1)
+        self.assertEqual(state.eip, 0x2000)
+        self.assertEqual(state.get_register("esp"), 0x8FFC)
+        self.assertEqual(memory.read_u32(0x8FFC), 0x1005)
+
+    def test_call_handler_can_yield_after_guest_return(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex("E8FB0F000040C3"),  # call 0x2000; inc eax; ret
+            base_address=0x1000,
+            symbol="cooperative_interpreter_call_yield",
+        )
+        state = CpuState.with_registers(eax=3, esp=0x9000)
+        memory = SparseMemory({0x9000: 0xDEADC0DE})
+
+        def handler(cpu, _memory, _target, _trace) -> None:
+            cpu.set_register("eax", cpu.get_register("eax") + 4)
+
+        result = execute_lifted_function(
+            function,
+            state=state,
+            memory=memory,
+            call_handlers={0x2000: handler},
+            call_handler_yield_predicate=lambda target: target == 0x2000,
+        )
+
+        self.assertEqual(result.return_address, 0x1005)
+        self.assertEqual(result.steps, 1)
+        self.assertEqual(state.eip, 0x1005)
+        self.assertEqual(state.get_register("esp"), 0x9000)
+        self.assertEqual(state.get_register("eax"), 7)
+
+    def test_return_can_load_known_hybrid_dispatcher_block(self) -> None:
+        callee = lift_x86_function(
+            bytes.fromhex("C3"),
+            base_address=0x2000,
+            symbol="frontier_callee",
+        )
+        caller = lift_x86_function(
+            bytes.fromhex("40C3"),
+            base_address=0x1000,
+            symbol="frontier_caller",
+        )
+        state = CpuState.with_registers(eax=4, esp=0x9000)
+        memory = SparseMemory(
+            {
+                0x9000: 0x1000,
+                0x9004: 0xDEADC0DE,
+            }
+        )
+
+        result = execute_lifted_function(
+            callee,
+            state=state,
+            memory=memory,
+            block_loader=lambda target: caller if target == 0x1000 else None,
+            return_on_missing_instruction=True,
+        )
+
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        self.assertEqual(result.steps, 3)
+        self.assertEqual(state.get_register("eax"), 5)
+
+    def test_hybrid_dispatcher_can_yield_at_execution_deadline(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex("40EBFD"),  # inc eax; jmp 0x1000
+            base_address=0x1000,
+            symbol="frontier_deadline_loop",
+        )
+        state = CpuState.with_registers(eax=1)
+
+        result = execute_lifted_function(
+            function,
+            state=state,
+            execution_yield_predicate=lambda steps: steps >= 5,
+            max_steps=100,
+        )
+
+        self.assertEqual(result.steps, 5)
+        self.assertEqual(result.return_address, 0x1001)
+        self.assertEqual(state.get_register("eax"), 4)
+
     def test_signed_extend_and_signed_divide_match_entry_probe_semantics(self) -> None:
         function = lift_x86_function(
             bytes.fromhex("B8F4FFFFFF99B9FEFFFFFFF7F9C3"),
@@ -2629,6 +2727,15 @@ class X86RecompPrototypeTests(unittest.TestCase):
         )
         self.assertEqual(interrupt_block.instruction_count, 2)
         self.assertEqual(interrupt_block.instructions[-1].mnemonic, "int")
+        interrupt_source = emit_cpp(
+            interrupt_block,
+            exported_symbol="interrupt_block",
+            resumable=True,
+        )
+        self.assertIn(
+            "ctx->module_exit_reason = B2R_MODULE_EXIT_SOFTWARE_INTERRUPT;",
+            interrupt_source,
+        )
 
     def test_cplusplus_emission_is_deterministic_and_windows_scoped(self) -> None:
         function = lift_x86_function(
@@ -2653,7 +2760,17 @@ class X86RecompPrototypeTests(unittest.TestCase):
         self.assertIn("ctx->step_budget", resumable)
         self.assertIn("eip = 0x00002000u", resumable)
         self.assertNotIn("ctx->call(ctx->user, 0x00002000u, ctx);", resumable)
-        self.assertIn("ctx->eip = return_address", resumable)
+        self.assertIn("ctx->eip = return_address;", resumable)
+        self.assertIn(
+            "pending_module_exit_reason = B2R_MODULE_EXIT_RETURN;",
+            resumable,
+        )
+        self.assertIn("b2r_begin_instruction(ctx, 0x00001000u)", resumable)
+        self.assertNotIn("--ctx->steps", resumable)
+        self.assertIn("ctx->module_exit_reason", resumable)
+        self.assertIn("B2R_MODULE_EXIT_CALL", resumable)
+        self.assertIn("eip = return_address;", resumable)
+        self.assertNotIn("return return_address;", resumable)
         self.assertIn("b2r_read_u8(ctx, address + 1u)", resumable)
         self.assertIn("b2r_write_u8(ctx, address + 1u", resumable)
         self.assertIn("b2r_read_u32(ctx, address + 4u)", resumable)

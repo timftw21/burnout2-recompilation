@@ -1,9 +1,12 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #define VK_USE_PLATFORM_WIN32_KHR
+#define SDL_MAIN_HANDLED
 
 #include <windows.h>
 #include <shellapi.h>
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_main.h>
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
@@ -11,6 +14,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <cstdint>
 #include <filesystem>
@@ -28,6 +32,7 @@
 #include <system_error>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -40,10 +45,29 @@ constexpr uint32_t kDefaultHeight = 480;
 constexpr uint32_t kDefaultFrames = 120;
 constexpr int64_t kTargetFrameUs = 16667;
 constexpr auto kTargetFrameInterval = std::chrono::nanoseconds(16666667);
+constexpr auto kFpsCounterSampleInterval = std::chrono::seconds(1);
 constexpr DWORD kHighResolutionWaitableTimerFlag = 0x00000002u;
 constexpr int64_t kControllerMinimumPulseMs = 150;
 constexpr int64_t kControllerMaximumPulseMs = 2000;
 constexpr uint64_t kControllerMinimumPulseGuestFlips = 2u;
+constexpr auto kControllerDiscoveryInterval = std::chrono::milliseconds(500);
+constexpr int32_t kControllerStickDeadzone = 4096;
+constexpr int32_t kControllerStickPublishHysteresis = 256;
+constexpr int32_t kControllerTriggerPublishHysteresis = 8;
+constexpr uint16_t kControllerDpadUp = 0x0001u;
+constexpr uint16_t kControllerDpadDown = 0x0002u;
+constexpr uint16_t kControllerDpadLeft = 0x0004u;
+constexpr uint16_t kControllerDpadRight = 0x0008u;
+constexpr uint16_t kControllerStart = 0x0010u;
+constexpr uint16_t kControllerBack = 0x0020u;
+constexpr uint16_t kControllerLeftThumb = 0x0040u;
+constexpr uint16_t kControllerRightThumb = 0x0080u;
+constexpr uint16_t kControllerBlack = 0x0100u;
+constexpr uint16_t kControllerWhite = 0x0200u;
+constexpr uint16_t kControllerA = 0x1000u;
+constexpr uint16_t kControllerB = 0x2000u;
+constexpr uint16_t kControllerX = 0x4000u;
+constexpr uint16_t kControllerY = 0x8000u;
 constexpr uint32_t kRecoveredPushBufferBase = 0x80000000u;
 constexpr uint32_t kRecoveredPushBufferApertureSize = 0x01000000u;
 constexpr uint32_t kRecoveredPushBufferEnd =
@@ -75,6 +99,122 @@ std::wstring widen(const std::string& value) {
     std::wstring result(static_cast<size_t>(size), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size);
     return result;
+}
+
+struct HostControllerState {
+    bool connected = false;
+    uint16_t buttons = 0u;
+    uint8_t left_trigger = 0u;
+    uint8_t right_trigger = 0u;
+    int16_t thumb_lx = 0;
+    int16_t thumb_ly = 0;
+    int16_t thumb_rx = 0;
+    int16_t thumb_ry = 0;
+};
+
+bool controller_axis_equivalent(int32_t left, int32_t right, int32_t limit) {
+    if (left == right) {
+        return true;
+    }
+    if (left == 0 || right == 0
+        || std::abs(left) == limit || std::abs(right) == limit) {
+        return false;
+    }
+    return std::abs(left - right) <= kControllerStickPublishHysteresis;
+}
+
+bool controller_trigger_equivalent(uint8_t left, uint8_t right) {
+    if (left == right) {
+        return true;
+    }
+    if (left == 0u || right == 0u || left == 255u || right == 255u) {
+        return false;
+    }
+    return std::abs(static_cast<int32_t>(left) - right)
+        <= kControllerTriggerPublishHysteresis;
+}
+
+bool controller_states_equivalent(
+    const HostControllerState& left,
+    const HostControllerState& right) {
+    return left.connected == right.connected
+        && left.buttons == right.buttons
+        && controller_trigger_equivalent(
+            left.left_trigger, right.left_trigger)
+        && controller_trigger_equivalent(
+            left.right_trigger, right.right_trigger)
+        && controller_axis_equivalent(left.thumb_lx, right.thumb_lx, 32767)
+        && controller_axis_equivalent(left.thumb_ly, right.thumb_ly, 32767)
+        && controller_axis_equivalent(left.thumb_rx, right.thumb_rx, 32767)
+        && controller_axis_equivalent(left.thumb_ry, right.thumb_ry, 32767);
+}
+
+int16_t normalize_sdl_stick(int16_t raw_value, bool invert = false) {
+    int32_t value = raw_value;
+    if (invert) {
+        value = value == -32768 ? 32767 : -value;
+    }
+    const int32_t magnitude = std::abs(value);
+    if (magnitude <= kControllerStickDeadzone) {
+        return 0;
+    }
+    const int32_t adjusted = std::min<int32_t>(
+        32767,
+        (magnitude - kControllerStickDeadzone) * 32767
+            / (32767 - kControllerStickDeadzone));
+    const int32_t signed_adjusted = value < 0 ? -adjusted : adjusted;
+    if (adjusted == 32767) {
+        return static_cast<int16_t>(signed_adjusted);
+    }
+    return static_cast<int16_t>((signed_adjusted / 128) * 128);
+}
+
+uint8_t normalize_sdl_trigger(int16_t raw_value) {
+    const int32_t clamped = std::clamp<int32_t>(raw_value, 0, 32767);
+    const int32_t value = (clamped * 255 + 16383) / 32767;
+    if (value <= 4) {
+        return 0u;
+    }
+    return static_cast<uint8_t>(value >= 252 ? 255 : (value / 4) * 4);
+}
+
+HostControllerState map_sdl_gamepad_state(SDL_Gamepad* gamepad) {
+    HostControllerState state{};
+    if (gamepad == nullptr || !SDL_GamepadConnected(gamepad)) {
+        return state;
+    }
+    state.connected = true;
+    const auto button_down = [gamepad](SDL_GamepadButton button) {
+        return SDL_GetGamepadButton(gamepad, button);
+    };
+    if (button_down(SDL_GAMEPAD_BUTTON_SOUTH)) state.buttons |= kControllerA;
+    if (button_down(SDL_GAMEPAD_BUTTON_EAST)) state.buttons |= kControllerB;
+    if (button_down(SDL_GAMEPAD_BUTTON_WEST)) state.buttons |= kControllerX;
+    if (button_down(SDL_GAMEPAD_BUTTON_NORTH)) state.buttons |= kControllerY;
+    if (button_down(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER)) state.buttons |= kControllerWhite;
+    if (button_down(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER)) state.buttons |= kControllerBlack;
+    if (button_down(SDL_GAMEPAD_BUTTON_BACK)) state.buttons |= kControllerBack;
+    if (button_down(SDL_GAMEPAD_BUTTON_START)) state.buttons |= kControllerStart;
+    if (button_down(SDL_GAMEPAD_BUTTON_LEFT_STICK)) state.buttons |= kControllerLeftThumb;
+    if (button_down(SDL_GAMEPAD_BUTTON_RIGHT_STICK)) state.buttons |= kControllerRightThumb;
+    if (button_down(SDL_GAMEPAD_BUTTON_DPAD_UP)) state.buttons |= kControllerDpadUp;
+    if (button_down(SDL_GAMEPAD_BUTTON_DPAD_DOWN)) state.buttons |= kControllerDpadDown;
+    if (button_down(SDL_GAMEPAD_BUTTON_DPAD_LEFT)) state.buttons |= kControllerDpadLeft;
+    if (button_down(SDL_GAMEPAD_BUTTON_DPAD_RIGHT)) state.buttons |= kControllerDpadRight;
+
+    state.thumb_lx = normalize_sdl_stick(
+        SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFTX));
+    state.thumb_ly = normalize_sdl_stick(
+        SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFTY), true);
+    state.thumb_rx = normalize_sdl_stick(
+        SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_RIGHTX));
+    state.thumb_ry = normalize_sdl_stick(
+        SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_RIGHTY), true);
+    state.left_trigger = normalize_sdl_trigger(
+        SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
+    state.right_trigger = normalize_sdl_trigger(
+        SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
+    return state;
 }
 
 std::optional<std::string> read_text_handle_shared(HANDLE file) {
@@ -212,6 +352,7 @@ struct Options {
     uint32_t max_frames = kDefaultFrames;
     uint32_t presented_draw_begin = 0;
     uint32_t presented_draw_end = std::numeric_limits<uint32_t>::max();
+    uint32_t presentation_pipeline_depth = 1;
     uint32_t flip_audit_max_flips = 0;
     uint32_t flip_audit_health_interval = 30;
     bool inject_input = false;
@@ -221,18 +362,25 @@ struct Options {
     std::filesystem::path render_stream_json;
     std::filesystem::path screenshot;
     std::filesystem::path hotkey_screenshot_directory;
+    std::filesystem::path metrics_report_directory;
     std::filesystem::path flip_audit_ack;
     std::filesystem::path flip_audit_frame_directory;
     std::filesystem::path vertex_shader;
     std::filesystem::path fragment_shader;
+    std::filesystem::path texture_convert_shader;
+    std::filesystem::path pipeline_cache;
     bool live_render_stream = false;
     bool strict_render_validation = false;
     bool analyze_render_stream_only = false;
+    bool cpu_vertex_programs = false;
+    bool cpu_vertex_attributes = false;
+    bool cpu_texture_conversion = false;
     std::filesystem::path controller_state_json;
 };
 
 struct QueueFamilySelection {
     uint32_t index = 0;
+    bool supports_compute = false;
 };
 
 struct SwapchainSupport {
@@ -255,11 +403,40 @@ struct RecoveredD3DCommand {
     uint8_t payload_size = 0;
 };
 
+struct RecoveredD3DPayloadView {
+    const uint8_t* bytes = nullptr;
+    size_t length = 0u;
+
+    const uint8_t* data() const { return bytes; }
+    size_t size() const { return length; }
+};
+
+struct RecoveredD3DCommandSpan {
+    RecoveredD3DCommandKind kind = RecoveredD3DCommandKind::MmioWrite;
+    uint32_t address = 0u;
+    uint32_t value = 0u;
+    uint32_t size = 0u;
+    RecoveredD3DPayloadView payload{};
+    size_t payload_size = 0u;
+    uint32_t logical_write_count = 0u;
+    uint8_t flags = 0u;
+};
+
+constexpr size_t kRecoveredD3DCommandRecordSize = 16u;
+constexpr size_t kRecoveredD3DCommandSpanHeaderSize = 16u;
+constexpr size_t kRenderTargetFeedbackImageCacheCapacity = 8u;
+
 struct PushBufferWord {
     uint32_t address = 0;
     uint32_t value = 0;
-    bool run_start = false;
+    uint32_t run_id = 0;
 };
+
+bool push_buffer_word_starts_run(
+    const std::vector<PushBufferWord>& words,
+    size_t index) {
+    return index == 0u || words[index].run_id != words[index - 1u].run_id;
+}
 
 struct NativeVertex {
     uint32_t raw_x_bits = 0;
@@ -285,6 +462,9 @@ struct NativeVertex {
     bool program_inputs_valid = false;
     std::array<std::array<float, 4>, 16> program_inputs{};
 };
+
+static_assert(sizeof(NativeVertex) % sizeof(uint32_t) == 0u);
+static_assert(offsetof(NativeVertex, program_inputs) % 16u == 0u);
 
 using Nv2aVertexAttributes = std::array<std::array<float, 4>, 16>;
 
@@ -316,6 +496,9 @@ struct NativeDraw {
         default_nv2a_vertex_attributes();
     std::vector<uint32_t> vertex_indices;
     bool indexed_array = false;
+    bool gpu_raw_attribute_fetch = false;
+    uint32_t gpu_raw_source_index_base = 0;
+    std::array<uint32_t, 16> gpu_raw_attribute_base_offsets{};
     uint32_t blend_enable = 0;
     uint32_t blend_source_factor = 1;
     uint32_t blend_destination_factor = 0;
@@ -582,6 +765,46 @@ struct HostTexture {
     VkImageView view = VK_NULL_HANDLE;
 };
 
+struct GpuTextureConversionMip {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t input_byte_offset = 0;
+    uint32_t output_byte_offset = 0;
+    uint32_t source_output_byte_offset = 0;
+    bool generated = false;
+};
+
+struct GpuTextureConversionJob {
+    const RecoveredTextureResource* resource = nullptr;
+    size_t host_texture_index = 0;
+    uint32_t input_byte_offset = 0;
+    std::vector<GpuTextureConversionMip> mips;
+};
+
+struct GpuTextureValidationCoverage {
+    bool dxt1 = false;
+    bool dxt5 = false;
+    bool recovered_mips = false;
+    bool generated_mips = false;
+
+    bool complete() const {
+        return dxt1 && dxt5 && recovered_mips && generated_mips;
+    }
+};
+
+struct NativeTextureConvertPushConstants {
+    uint32_t input_byte_offset = 0;
+    uint32_t output_word_offset = 0;
+    uint32_t source_word_offset = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t source_width = 0;
+    uint32_t source_height = 0;
+    uint32_t mode = 0;
+};
+
+static_assert(sizeof(NativeTextureConvertPushConstants) == 32u);
+
 struct HostTextureBindingSpec {
     size_t texture_index = 0;
     uint32_t address = 0;
@@ -603,6 +826,8 @@ struct HostTextureBinding {
     uint32_t format = 0;
     uint32_t control = 0;
     uint32_t filter = 0;
+    uint32_t texture_mip_levels = 0;
+    VkImageView texture_view = VK_NULL_HANDLE;
     VkSampler sampler = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
 };
@@ -635,6 +860,39 @@ struct NativeFragmentPushConstants {
     uint32_t state_index = 0;
 };
 
+struct NativeVertexProgramState {
+    uint32_t enabled = 0;
+    uint32_t transform_program_start = 0;
+    uint32_t target_width = 0;
+    uint32_t target_height = 0;
+    uint32_t texture_linear = 0;
+    uint32_t texture_width = 0;
+    uint32_t texture_height = 0;
+    uint32_t specular_enable = 0;
+    uint32_t fog_mode = 0;
+    uint32_t fog_enable = 0;
+    uint32_t fog_parameter0 = 0;
+    uint32_t fog_parameter1 = 0;
+    uint32_t vertex_stride_words = sizeof(NativeVertex) / sizeof(uint32_t);
+    uint32_t program_input_word_offset =
+        offsetof(NativeVertex, program_inputs) / sizeof(uint32_t);
+    uint32_t texture_output = 9;
+    uint32_t raw_attribute_fetch = 0;
+    std::array<std::array<uint32_t, 4>, 136> transform_program{};
+    std::array<std::array<uint32_t, 4>, 192> transform_constants{};
+    std::array<std::array<uint32_t, 4>, 4> raw_attribute_formats{};
+    std::array<std::array<uint32_t, 4>, 4> raw_attribute_base_offsets{};
+    std::array<std::array<uint32_t, 4>, 16> current_vertex_attributes{};
+    uint32_t raw_source_index_base = 0;
+    uint32_t reserved1 = 0;
+    uint32_t reserved2 = 0;
+    uint32_t reserved3 = 0;
+};
+
+static_assert(offsetof(NativeVertexProgramState, transform_program) == 64u);
+static_assert(offsetof(NativeVertexProgramState, raw_attribute_formats) == 5312u);
+static_assert(sizeof(NativeVertexProgramState) == 5712u);
+
 struct RenderTargetFeedbackSpec {
     uint32_t address = 0;
     uint32_t width = 0;
@@ -642,11 +900,21 @@ struct RenderTargetFeedbackSpec {
     std::string format = "A8R8G8B8_LINEAR";
     uint32_t producer_address = 0;
     bool offscreen_produced = false;
+
+    bool operator==(const RenderTargetFeedbackSpec& other) const {
+        return address == other.address
+            && width == other.width
+            && height == other.height
+            && format == other.format
+            && producer_address == other.producer_address
+            && offscreen_produced == other.offscreen_produced;
+    }
 };
 
 struct OffscreenRenderTarget {
     RenderTargetFeedbackSpec spec{};
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
+    VkImageView color_view = VK_NULL_HANDLE;
     VkImage depth_image = VK_NULL_HANDLE;
     VkDeviceMemory depth_memory = VK_NULL_HANDLE;
     VkImageView depth_view = VK_NULL_HANDLE;
@@ -758,6 +1026,7 @@ struct NativePipelineState {
     uint32_t cull_face_enable = 0;
     uint32_t cull_face = 0x0405;
     uint32_t front_face = 0x0900;
+    bool raw_attribute_fetch = false;
     bool operator==(const NativePipelineState& other) const {
         return primitive == other.primitive
             && blend_enable == other.blend_enable
@@ -770,7 +1039,32 @@ struct NativePipelineState {
             && depth_write_enable == other.depth_write_enable
             && cull_face_enable == other.cull_face_enable
             && cull_face == other.cull_face
-            && front_face == other.front_face;
+            && front_face == other.front_face
+            && raw_attribute_fetch == other.raw_attribute_fetch;
+    }
+};
+
+struct NativePipelineStateHash {
+    size_t operator()(const NativePipelineState& state) const noexcept {
+        size_t value = 1469598103934665603ull;
+        const auto mix = [&](uint32_t field) {
+            value ^= static_cast<size_t>(field);
+            value *= 1099511628211ull;
+        };
+        mix(state.primitive);
+        mix(state.blend_enable);
+        mix(state.blend_source_factor);
+        mix(state.blend_destination_factor);
+        mix(state.blend_equation);
+        mix(state.color_mask);
+        mix(state.depth_test_enable);
+        mix(state.depth_function);
+        mix(state.depth_write_enable);
+        mix(state.cull_face_enable);
+        mix(state.cull_face);
+        mix(state.front_face);
+        mix(state.raw_attribute_fetch ? 1u : 0u);
+        return value;
     }
 };
 
@@ -793,6 +1087,7 @@ NativePipelineState pipeline_state_for_draw(const NativeDraw& draw) {
         draw.cull_face_enable,
         draw.cull_face,
         draw.front_face,
+        draw.gpu_raw_attribute_fetch,
     };
     return state;
 }
@@ -854,6 +1149,117 @@ NativeFragmentState frontend_text_fragment_state() {
     state.combiner_alpha_outputs[0] = 0x00000C00u;
     state.final_combiner_inputs0 = 0x0000000Cu;
     state.final_combiner_inputs1 = 0x00001C80u;
+    return state;
+}
+
+bool gpu_vertex_program_compatible(const NativeDraw& draw) {
+    if ((draw.transform_execution_mode & 3u) != 2u
+        || !draw.indexed_array
+        || draw.texture_stage >= draw.texture_formats.size()
+        || draw.transform_program_start >= draw.transform_program.size()) {
+        return false;
+    }
+    // The indexed materializer produces a complete, immutable 16-register
+    // input bank. Inline arrays currently reconstruct missing attributes in
+    // the CPU executor, so they remain on that exact path until the shader
+    // receives an equivalent validity/fallback contract.
+    // Preserve the CPU path for the title's recovered half-surface and
+    // overscan quad fixups. They inspect post-program output before modifying
+    // the final vertices and are intentionally outside the generic program.
+    const size_t effective_vertex_count = draw.vertex_count != 0u
+        ? draw.vertex_count
+        : draw.vertex_indices.size();
+    if (draw.primitive == 6u && effective_vertex_count == 4u
+        && draw.texture_address != 0u) {
+        return false;
+    }
+    const auto temporary_source_valid = [](uint32_t type, uint32_t index) {
+        return type != 1u || index == 12u || index < 12u;
+    };
+    for (uint32_t instruction = draw.transform_program_start;
+         instruction < draw.transform_program.size();
+         ++instruction) {
+        const auto& token = draw.transform_program[instruction];
+        const uint32_t mac_opcode = nv2a_vsh::field(token[1], 21, 4);
+        const uint32_t ilu_opcode = nv2a_vsh::field(token[1], 25, 3);
+        if (mac_opcode > 13u || ilu_opcode > 7u) {
+            return false;
+        }
+        const uint32_t a_type = nv2a_vsh::field(token[2], 26, 2);
+        const uint32_t a_register = nv2a_vsh::field(token[2], 28, 4);
+        const uint32_t b_type = nv2a_vsh::field(token[2], 11, 2);
+        const uint32_t b_register = nv2a_vsh::field(token[2], 13, 4);
+        const uint32_t c_type = nv2a_vsh::field(token[3], 28, 2);
+        const uint32_t c_register = nv2a_vsh::field(token[2], 0, 2) * 4u
+            + nv2a_vsh::field(token[3], 30, 2);
+        if (!temporary_source_valid(a_type, a_register)
+            || !temporary_source_valid(b_type, b_register)
+            || !temporary_source_valid(c_type, c_register)) {
+            return false;
+        }
+        const uint32_t output_mask = nv2a_vsh::field(token[3], 12, 4);
+        if (output_mask != 0u) {
+            // Context-constant writes are legal NV2A behavior, but the first
+            // GPU slice keeps constants immutable. Such programs retain the
+            // exact CPU implementation until a writable GPU context exists.
+            if (nv2a_vsh::field(token[3], 11, 1) == 0u
+                || nv2a_vsh::field(token[3], 3, 8) >= 13u) {
+                return false;
+            }
+        }
+        if (nv2a_vsh::field(token[3], 0, 1) != 0u) {
+            return true;
+        }
+    }
+    return false;
+}
+
+NativeVertexProgramState vertex_program_state_for_draw(
+    const NativeDraw& draw,
+    VkExtent2D target_extent,
+    bool enable_gpu_program) {
+    NativeVertexProgramState state{};
+    state.enabled = enable_gpu_program && gpu_vertex_program_compatible(draw)
+        ? 1u
+        : 0u;
+    state.transform_program_start = draw.transform_program_start;
+    state.target_width = target_extent.width;
+    state.target_height = target_extent.height;
+    state.specular_enable = draw.specular_enable;
+    state.fog_mode = draw.fog_mode;
+    state.fog_enable = draw.fog_enable;
+    state.fog_parameter0 = draw.fog_params[0];
+    state.fog_parameter1 = draw.fog_params[1];
+    state.texture_output = 9u + draw.texture_stage;
+    state.raw_attribute_fetch = draw.gpu_raw_attribute_fetch ? 1u : 0u;
+    state.raw_source_index_base = draw.gpu_raw_source_index_base;
+    for (uint32_t slot = 0u; slot < 16u; ++slot) {
+        const uint32_t row = slot / 4u;
+        const uint32_t lane = slot % 4u;
+        state.raw_attribute_formats[row][lane] = draw.vertex_formats[slot];
+        state.raw_attribute_base_offsets[row][lane] =
+            draw.gpu_raw_attribute_base_offsets[slot];
+        for (uint32_t component = 0u; component < 4u; ++component) {
+            std::memcpy(
+                &state.current_vertex_attributes[slot][component],
+                &draw.current_vertex_attributes[slot][component],
+                sizeof(uint32_t));
+        }
+    }
+    if (draw.texture_enabled
+        && draw.texture_stage < draw.texture_formats.size()) {
+        const uint32_t format = draw.texture_formats[draw.texture_stage];
+        const auto [width, height] = nv2a_texture_extent(
+            format,
+            draw.texture_image_rects[draw.texture_stage]);
+        state.texture_linear = nv2a_texture_format_is_linear(format) ? 1u : 0u;
+        state.texture_width = width;
+        state.texture_height = height;
+    }
+    if (state.enabled != 0u) {
+        state.transform_program = draw.transform_program;
+        state.transform_constants = draw.transform_constants;
+    }
     return state;
 }
 
@@ -1324,11 +1730,23 @@ struct InterpretedD3DStream {
     uint32_t surface_payload_argb = 0;
     uint32_t surface_payload_sample_count = 0;
     uint32_t surface_payload_dominant_count = 0;
+    uint32_t surface_payload_scan_skipped_count = 0;
+    uint32_t ordered_push_buffer_append_count = 0;
+    uint32_t indexed_word_push_buffer_append_count = 0;
+    uint32_t reconstructed_push_buffer_append_count = 0;
     uint32_t push_buffer_word_count = 0;
     uint32_t method_packet_count = 0;
     uint32_t interpreted_method_count = 0;
+    uint32_t bulk_indexed_method_count = 0;
+    uint32_t bulk_inline_method_count = 0;
+    uint32_t last_interpreted_method_count = 0;
+    uint32_t last_bulk_indexed_method_count = 0;
+    uint32_t last_bulk_inline_method_count = 0;
+    uint64_t last_push_buffer_collect_us = 0;
+    uint64_t last_method_apply_us = 0;
+    uint64_t last_method_finalize_us = 0;
     uint32_t zero_count_method_word_count = 0;
-    uint32_t zero_count_indexed_array_packet_count = 0;
+    uint32_t zero_count_indexed_array_noop_packet_count = 0;
     uint32_t control_flow_packet_count = 0;
     uint32_t mmio_setup_write_count = 0;
     uint32_t submission_kick_count = 0;
@@ -1350,6 +1768,7 @@ struct InterpretedD3DStream {
     uint32_t converted_quad_count = 0;
     uint32_t discarded_quad_vertex_count = 0;
     uint32_t state_seed = 0;
+    bool state_seed_updates_required = true;
     std::array<uint32_t, 16> vertex_offsets{};
     std::array<uint32_t, 16> vertex_formats{};
     Nv2aVertexAttributes current_vertex_attributes =
@@ -1416,8 +1835,39 @@ struct InterpretedD3DStream {
     uint32_t flip_count = 0;
     std::vector<uint32_t> inline_words;
     std::vector<uint32_t> active_vertex_indices;
+    std::vector<PushBufferWord> push_buffer_words_scratch;
     std::vector<NativeVertex> vertices;
     std::vector<NativeDraw> draws;
+    std::vector<uint32_t> gpu_raw_vertex_indices;
+    uint32_t gpu_raw_attribute_draw_count = 0;
+    uint32_t gpu_raw_attribute_vertex_count = 0;
+};
+
+struct GpuRawVertexResourceLayout {
+    uint32_t guest_address = 0;
+    uint32_t packed_offset = 0;
+    uint32_t byte_size = 0;
+};
+
+struct GpuRawVertexDirtyRange {
+    uint32_t offset = 0;
+    uint32_t size = 0;
+};
+
+struct GpuRawVertexResourceCache {
+    std::vector<GpuRawVertexResourceLayout> layout;
+    std::vector<uint8_t> gpu_raw_vertex_bytes;
+    std::vector<GpuRawVertexDirtyRange> dirty_ranges;
+    uint64_t refresh_count = 0;
+    uint64_t layout_rebuild_count = 0;
+    bool layout_rebuilt = false;
+    uint32_t resource_count = 0;
+    uint32_t compared_resource_count = 0;
+    uint32_t changed_resource_count = 0;
+    uint32_t reused_resource_count = 0;
+    uint64_t compared_bytes = 0;
+    uint64_t dirty_bytes = 0;
+    uint64_t refresh_us = 0;
 };
 
 std::pair<size_t, size_t> presented_vertex_span(
@@ -1432,6 +1882,9 @@ std::pair<size_t, size_t> presented_vertex_span(
     size_t end_vertex = 0;
     for (size_t draw_index = first_draw; draw_index < end_draw; ++draw_index) {
         const NativeDraw& draw = stream.draws[draw_index];
+        if (draw.gpu_raw_attribute_fetch) {
+            continue;
+        }
         const size_t draw_first = draw.first_vertex;
         const size_t draw_end = draw_first + draw.vertex_count;
         if (draw.vertex_count == 0u || draw_end > stream.vertices.size()) {
@@ -1599,6 +2052,23 @@ RecoveredD3DCommand make_recovered_d3d_command(
     return command;
 }
 
+RecoveredD3DCommand recovered_d3d_command_from_packed_record(
+    const uint8_t* record) {
+    RecoveredD3DCommand command{};
+    command.kind = record[0] == 0u
+        ? RecoveredD3DCommandKind::MmioWrite
+        : RecoveredD3DCommandKind::PushBufferWrite;
+    command.size = record[1];
+    command.payload_size = record[1];
+    std::memcpy(&command.address, record + 4u, sizeof(command.address));
+    std::memcpy(
+        &command.value,
+        record + 8u,
+        std::min<size_t>(command.size, sizeof(command.value)));
+    std::memcpy(command.payload.data(), record + 8u, command.payload_size);
+    return command;
+}
+
 std::optional<std::string> json_object_field_text(
     const std::string& object,
     const std::string& field) {
@@ -1711,8 +2181,63 @@ std::vector<RecoveredD3DCommand> load_recovered_d3d_binary_stream(
     file.read(magic.data(), static_cast<std::streamsize>(magic.size()));
     const std::string magic_text(magic.data(), magic.size());
     if (magic_text != "B2RLIVE1" && magic_text != "B2RING01"
-        && magic_text != "B2APPND1") {
+        && magic_text != "B2APPND1" && magic_text != "B2SPAN01") {
         throw std::runtime_error("invalid live command snapshot header");
+    }
+    if (magic_text == "B2SPAN01") {
+        std::vector<RecoveredD3DCommand> commands;
+        for (;;) {
+            std::array<uint8_t, kRecoveredD3DCommandSpanHeaderSize> header{};
+            file.read(
+                reinterpret_cast<char*>(header.data()),
+                static_cast<std::streamsize>(header.size()));
+            if (file.eof() && file.gcount() == 0) {
+                break;
+            }
+            if (!file || header[0] > 1u || (header[1] & ~1u) != 0u) {
+                throw std::runtime_error("invalid live command span header");
+            }
+            uint32_t address = 0u;
+            uint32_t payload_size = 0u;
+            uint32_t logical_write_count = 0u;
+            std::memcpy(&address, header.data() + 4u, sizeof(address));
+            std::memcpy(&payload_size, header.data() + 8u, sizeof(payload_size));
+            std::memcpy(
+                &logical_write_count,
+                header.data() + 12u,
+                sizeof(logical_write_count));
+            if (payload_size == 0u || logical_write_count == 0u) {
+                throw std::runtime_error("invalid live command span size");
+            }
+            std::vector<uint8_t> payload(payload_size);
+            file.read(
+                reinterpret_cast<char*>(payload.data()),
+                static_cast<std::streamsize>(payload.size()));
+            if (!file) {
+                throw std::runtime_error("truncated live command span payload");
+            }
+            for (size_t offset = 0u; offset < payload.size(); offset += 8u) {
+                const size_t size = std::min<size_t>(8u, payload.size() - offset);
+                uint32_t value = 0u;
+                std::memcpy(
+                    &value,
+                    payload.data() + offset,
+                    std::min<size_t>(size, sizeof(value)));
+                commands.push_back(make_recovered_d3d_command(
+                    header[0] == 0u
+                        ? RecoveredD3DCommandKind::MmioWrite
+                        : RecoveredD3DCommandKind::PushBufferWrite,
+                    address + static_cast<uint32_t>(offset),
+                    value,
+                    static_cast<uint32_t>(size),
+                    payload.data() + offset,
+                    size));
+            }
+        }
+        if (commands.empty()) {
+            throw std::runtime_error("live command span snapshot is empty");
+        }
+        return commands;
     }
     uint32_t count = 0;
     if (magic_text == "B2APPND1") {
@@ -1841,14 +2366,44 @@ bool append_recovered_d3d_binary_stream(
 }
 
 std::vector<RecoveredTextureResource> load_recovered_texture_resources(
-    const std::filesystem::path& path) {
+    const std::filesystem::path& path,
+    bool required = false,
+    std::vector<RecoveredTextureResource>* reusable_resources = nullptr,
+    uint64_t* reused_resource_count = nullptr,
+    uint64_t* reused_payload_bytes = nullptr) {
+    if (reused_resource_count != nullptr) {
+        *reused_resource_count = 0u;
+    }
+    if (reused_payload_bytes != nullptr) {
+        *reused_payload_bytes = 0u;
+    }
     std::ifstream file(path, std::ios::binary);
     if (!file) {
+        if (required) {
+            throw std::runtime_error(
+                "cannot open live resource snapshot: " + path.string());
+        }
         return {};
     }
     std::array<char, 8> magic{};
     file.read(magic.data(), static_cast<std::streamsize>(magic.size()));
     if (file && std::string(magic.data(), magic.size()) == "B2TEX001") {
+        const std::streampos body_begin = file.tellg();
+        file.seekg(0, std::ios::end);
+        const std::streampos file_end = file.tellg();
+        file.seekg(body_begin);
+        if (!file || body_begin < 0 || file_end < body_begin) {
+            throw std::runtime_error("invalid binary live texture resource size");
+        }
+        std::unordered_map<uint32_t, std::vector<size_t>> reusable_by_address;
+        std::vector<bool> reusable_claimed;
+        if (reusable_resources != nullptr) {
+            reusable_claimed.resize(reusable_resources->size());
+            for (size_t index = 0u; index < reusable_resources->size(); ++index) {
+                reusable_by_address[(*reusable_resources)[index].address]
+                    .push_back(index);
+            }
+        }
         uint32_t resource_count = 0;
         file.read(reinterpret_cast<char*>(&resource_count), sizeof(resource_count));
         std::vector<RecoveredTextureResource> resources;
@@ -1874,25 +2429,76 @@ std::vector<RecoveredTextureResource> load_recovered_texture_resources(
                 || payload_size > 256u * 1024u * 1024u) {
                 throw std::runtime_error("invalid binary live texture resource header");
             }
+            std::string format(format_size, '\0');
+            file.read(format.data(), static_cast<std::streamsize>(format_size));
+            if (!file) {
+                throw std::runtime_error("truncated binary live texture resource");
+            }
+            const std::streampos payload_begin = file.tellg();
+            if (payload_begin < 0
+                || static_cast<uint64_t>(file_end - payload_begin)
+                    < payload_size) {
+                throw std::runtime_error("truncated binary live texture resource");
+            }
+            constexpr char kHexDigits[] = "0123456789ABCDEF";
+            std::string hash(content_hash.size() * 2u, '0');
+            for (size_t byte_index = 0u;
+                 byte_index < content_hash.size();
+                 ++byte_index) {
+                const uint8_t byte = content_hash[byte_index];
+                hash[byte_index * 2u] = kHexDigits[byte >> 4u];
+                hash[byte_index * 2u + 1u] = kHexDigits[byte & 0xFu];
+            }
+
             RecoveredTextureResource resource{};
             resource.address = address;
             resource.width = width;
             resource.height = height;
-            resource.format.resize(format_size);
-            resource.payload.resize(payload_size);
-            file.read(resource.format.data(), static_cast<std::streamsize>(format_size));
-            file.read(
-                reinterpret_cast<char*>(resource.payload.data()),
-                static_cast<std::streamsize>(payload_size));
-            if (!file) {
-                throw std::runtime_error("truncated binary live texture resource");
+            resource.format = std::move(format);
+            resource.content_hash = std::move(hash);
+            bool reused_payload = false;
+            const auto candidates = reusable_by_address.find(address);
+            if (candidates != reusable_by_address.end()) {
+                for (const size_t candidate_index : candidates->second) {
+                    RecoveredTextureResource& candidate =
+                        (*reusable_resources)[candidate_index];
+                    if (reusable_claimed[candidate_index]
+                        || candidate.width != width
+                        || candidate.height != height
+                        || candidate.format != resource.format
+                        || candidate.content_hash != resource.content_hash
+                        || candidate.payload.size() != payload_size) {
+                        continue;
+                    }
+                    file.seekg(
+                        static_cast<std::streamoff>(payload_size),
+                        std::ios::cur);
+                    if (!file) {
+                        throw std::runtime_error(
+                            "truncated binary live texture resource");
+                    }
+                    resource.payload = std::move(candidate.payload);
+                    reusable_claimed[candidate_index] = true;
+                    reused_payload = true;
+                    if (reused_resource_count != nullptr) {
+                        ++*reused_resource_count;
+                    }
+                    if (reused_payload_bytes != nullptr) {
+                        *reused_payload_bytes += payload_size;
+                    }
+                    break;
+                }
             }
-            std::ostringstream hash;
-            hash << std::hex << std::uppercase << std::setfill('0');
-            for (const uint8_t byte : content_hash) {
-                hash << std::setw(2) << static_cast<uint32_t>(byte);
+            if (!reused_payload) {
+                resource.payload.resize(payload_size);
+                file.read(
+                    reinterpret_cast<char*>(resource.payload.data()),
+                    static_cast<std::streamsize>(payload_size));
+                if (!file) {
+                    throw std::runtime_error(
+                        "truncated binary live texture resource");
+                }
             }
-            resource.content_hash = hash.str();
             resources.push_back(std::move(resource));
             (void)stage;
         }
@@ -1976,7 +2582,11 @@ RecoveredD3DStreamSource load_or_build_recovered_d3d_command_stream(
     const std::filesystem::path& render_stream_json,
     bool load_textures = true,
     const std::string* supplied_manifest_text = nullptr,
-    bool load_commands = true) {
+    bool load_commands = true,
+    bool require_resource_source = false,
+    std::vector<RecoveredTextureResource>* reusable_resources = nullptr,
+    uint64_t* reused_resource_count = nullptr,
+    uint64_t* reused_payload_bytes = nullptr) {
     if (!render_stream_json.empty()) {
         std::string owned_manifest_text;
         if (supplied_manifest_text == nullptr) {
@@ -2040,8 +2650,13 @@ RecoveredD3DStreamSource load_or_build_recovered_d3d_command_stream(
         }
         return {
             std::move(commands),
-            load_textures ? load_recovered_texture_resources(resource_source)
-                          : std::vector<RecoveredTextureResource>{},
+             load_textures ? load_recovered_texture_resources(
+                                 resource_source,
+                                 require_resource_source,
+                                 reusable_resources,
+                                 reused_resource_count,
+                                 reused_payload_bytes)
+                           : std::vector<RecoveredTextureResource>{},
             render_stream_json.string(),
             frontend_field.value_or(std::string{}),
             frontend_x_field.has_value()
@@ -2094,6 +2709,15 @@ uint32_t mix_d3d_state_seed(uint32_t seed, uint32_t value) {
     return seed;
 }
 
+inline void update_d3d_state_seed(
+    InterpretedD3DStream& interpreted,
+    uint32_t value) {
+    if (interpreted.state_seed_updates_required) {
+        interpreted.state_seed = mix_d3d_state_seed(
+            interpreted.state_seed, value);
+    }
+}
+
 VkClearValue color_from_interpreted_d3d_state(uint32_t seed) {
     const float red = 0.18f + static_cast<float>((seed >> 16) & 0xFFu) / 255.0f * 0.62f;
     const float green = 0.18f + static_cast<float>((seed >> 8) & 0xFFu) / 255.0f * 0.62f;
@@ -2113,22 +2737,45 @@ VkClearValue color_from_d3d_argb(uint32_t argb) {
     return color;
 }
 
-std::vector<PushBufferWord> push_buffer_words_from_recovered_stream(
-    const std::vector<RecoveredD3DCommand>& stream,
-    size_t begin,
-    size_t end) {
-    std::vector<PushBufferWord> words;
-    const size_t bounded_begin = std::min(begin, stream.size());
-    const size_t bounded_end = std::min(std::max(end, bounded_begin), stream.size());
+template <typename CommandAt>
+void push_buffer_words_from_recovered_commands(
+    size_t command_count,
+    CommandAt command_at,
+    InterpretedD3DStream& interpreted,
+    std::vector<PushBufferWord>& words) {
+    words.clear();
+    if (words.capacity() < command_count) {
+        words.reserve(command_count);
+    }
     uint32_t aperture_begin_offset = kRecoveredPushBufferApertureSize;
     uint32_t aperture_end_offset = 0u;
-    for (size_t command_index = bounded_begin;
-         command_index < bounded_end;
+    bool ordered_word_writes = true;
+    bool indexed_word_writes = true;
+    uint32_t indexed_word_alignment = std::numeric_limits<uint32_t>::max();
+    bool ordered_run_active = false;
+    uint32_t ordered_previous_address = 0u;
+    uint32_t ordered_pending_max_address = 0u;
+    size_t ordered_word_count = 0u;
+    for (size_t command_index = 0u;
+         command_index < command_count;
          ++command_index) {
-        const RecoveredD3DCommand& command = stream[command_index];
+        const auto command = command_at(command_index);
+        update_d3d_state_seed(interpreted, command.address);
+        update_d3d_state_seed(interpreted, command.value);
+        if (command.kind == RecoveredD3DCommandKind::MmioWrite) {
+            const uint32_t offset = command.address - 0xFED00000u;
+            if (offset == 0x0008u) {
+                ++interpreted.submission_kick_count;
+            } else if (offset == 0x0040u || offset == 0x0048u
+                       || offset == 0x004Cu || offset == 0x0050u) {
+                ++interpreted.mmio_setup_write_count;
+            }
+        }
         if (command.kind != RecoveredD3DCommandKind::PushBufferWrite
             || command.address < kRecoveredPushBufferBase
             || command.address >= kRecoveredPushBufferEnd) {
+            ordered_run_active = false;
+            ordered_pending_max_address = 0u;
             continue;
         }
         const size_t payload_size = command.payload_size != 0u
@@ -2141,16 +2788,174 @@ std::vector<PushBufferWord> push_buffer_words_from_recovered_stream(
                 static_cast<uint64_t>(command_offset) + payload_size));
         aperture_begin_offset = std::min(aperture_begin_offset, command_offset);
         aperture_end_offset = std::max(aperture_end_offset, command_end_offset);
+        if (payload_size == 0u || payload_size % sizeof(uint32_t) != 0u
+            || (command.address & 3u) != 0u) {
+            ordered_word_writes = false;
+            indexed_word_writes = false;
+        } else if (payload_size != sizeof(uint32_t)) {
+            indexed_word_writes = false;
+        }
+        ordered_word_count += payload_size / sizeof(uint32_t);
+        const uint32_t command_alignment = command.address & 3u;
+        if (indexed_word_alignment == std::numeric_limits<uint32_t>::max()) {
+            indexed_word_alignment = command_alignment;
+        } else if (command_alignment != indexed_word_alignment) {
+            indexed_word_writes = false;
+        }
+        if (ordered_run_active
+            && command.address + 0x1000u < ordered_pending_max_address) {
+            ordered_run_active = false;
+            ordered_pending_max_address = 0u;
+        }
+        if (ordered_run_active
+            && command.address < ordered_previous_address + sizeof(uint32_t)) {
+            ordered_word_writes = false;
+        }
+        ordered_run_active = true;
+        ordered_previous_address = command.address
+            + static_cast<uint32_t>(
+                payload_size >= sizeof(uint32_t)
+                    ? payload_size - sizeof(uint32_t)
+                    : 0u);
+        ordered_pending_max_address = std::max(
+            ordered_pending_max_address,
+            command.address + static_cast<uint32_t>(payload_size));
     }
     if (aperture_begin_offset >= aperture_end_offset) {
-        return words;
+        return;
+    }
+    if (ordered_word_writes) {
+        if (words.capacity() < ordered_word_count) {
+            words.reserve(ordered_word_count);
+        }
+        bool run_active = false;
+        uint32_t previous_address = 0u;
+        uint32_t pending_max_address = 0u;
+        uint32_t run_id = 0u;
+        for (size_t command_index = 0u;
+             command_index < command_count;
+             ++command_index) {
+            const auto command = command_at(command_index);
+            if (command.kind != RecoveredD3DCommandKind::PushBufferWrite
+                || command.address < kRecoveredPushBufferBase
+                || command.address >= kRecoveredPushBufferEnd) {
+                run_active = false;
+                pending_max_address = 0u;
+                continue;
+            }
+            if (run_active
+                && command.address + 0x1000u < pending_max_address) {
+                run_active = false;
+                pending_max_address = 0u;
+            }
+            const size_t payload_size = command.payload_size != 0u
+                ? command.payload_size
+                : std::min<size_t>(command.size, command.payload.size());
+            const uint8_t* payload = command.payload.data();
+            for (size_t payload_offset = 0u;
+                 payload_offset + sizeof(uint32_t) <= payload_size;
+                 payload_offset += sizeof(uint32_t)) {
+                const uint32_t address = command.address
+                    + static_cast<uint32_t>(payload_offset);
+                const bool contiguous = run_active
+                    && address == previous_address + sizeof(uint32_t);
+                if (!contiguous) {
+                    ++run_id;
+                }
+                uint32_t value = 0u;
+                std::memcpy(&value, payload + payload_offset, sizeof(value));
+                words.push_back({address, value, run_id});
+                run_active = true;
+                previous_address = address;
+            }
+            pending_max_address = std::max(
+                pending_max_address,
+                command.address + static_cast<uint32_t>(payload_size));
+        }
+        ++interpreted.ordered_push_buffer_append_count;
+        return;
     }
     const uint32_t aperture_span = aperture_end_offset - aperture_begin_offset;
+    if (indexed_word_writes) {
+        const uint32_t word_span = (aperture_span + 3u) / 4u;
+        std::vector<uint32_t> pending_words(word_span);
+        std::vector<uint8_t> pending_valid(word_span);
+        uint32_t pending_min_word = word_span;
+        uint32_t pending_max_word = 0u;
+        uint32_t pending_max_address = 0u;
+        uint32_t run_id = 0u;
+
+        auto flush_pending_words = [&]() {
+            uint32_t previous_address = 0u;
+            bool emitted_word = false;
+            for (uint32_t word_offset = pending_min_word;
+                 word_offset < pending_max_word;
+                 ++word_offset) {
+                if (pending_valid[word_offset] == 0u) {
+                    continue;
+                }
+                const uint32_t address = kRecoveredPushBufferBase
+                    + aperture_begin_offset + word_offset * 4u;
+                const bool contiguous = emitted_word
+                    && address == previous_address + 4u;
+                if (!contiguous) {
+                    ++run_id;
+                }
+                words.push_back({
+                    address,
+                    pending_words[word_offset],
+                    run_id,
+                });
+                previous_address = address;
+                emitted_word = true;
+            }
+            if (pending_min_word < pending_max_word) {
+                std::fill(
+                    pending_valid.begin() + pending_min_word,
+                    pending_valid.begin() + pending_max_word,
+                    0u);
+            }
+            pending_min_word = word_span;
+            pending_max_word = 0u;
+            pending_max_address = 0u;
+        };
+
+        for (size_t command_index = 0u;
+             command_index < command_count;
+             ++command_index) {
+            const auto command = command_at(command_index);
+            if (command.kind != RecoveredD3DCommandKind::PushBufferWrite
+                || command.address < kRecoveredPushBufferBase
+                || command.address >= kRecoveredPushBufferEnd) {
+                flush_pending_words();
+                continue;
+            }
+            if (pending_min_word != word_span
+                && command.address + 0x1000u < pending_max_address) {
+                flush_pending_words();
+            }
+            const uint32_t word_offset = (
+                command.address - kRecoveredPushBufferBase
+                - aperture_begin_offset) / 4u;
+            pending_words[word_offset] = command.value;
+            pending_valid[word_offset] = 1u;
+            pending_min_word = std::min(pending_min_word, word_offset);
+            pending_max_word = std::max(pending_max_word, word_offset + 1u);
+            pending_max_address = std::max(
+                pending_max_address,
+                command.address + static_cast<uint32_t>(sizeof(uint32_t)));
+        }
+        flush_pending_words();
+        ++interpreted.indexed_word_push_buffer_append_count;
+        return;
+    }
+    ++interpreted.reconstructed_push_buffer_append_count;
     std::vector<uint8_t> pending_bytes(aperture_span);
     std::vector<uint8_t> pending_valid(aperture_span);
     uint32_t pending_min_offset = aperture_span;
     uint32_t pending_max_offset = 0u;
     uint32_t pending_max_address = 0;
+    uint32_t run_id = 0u;
 
     auto flush_pending = [&]() {
         uint32_t previous_address = 0;
@@ -2169,7 +2974,10 @@ std::vector<PushBufferWord> push_buffer_words_from_recovered_stream(
                 (static_cast<uint32_t>(pending_bytes[offset + 1u]) << 8u) |
                 (static_cast<uint32_t>(pending_bytes[offset + 2u]) << 16u) |
                 (static_cast<uint32_t>(pending_bytes[offset + 3u]) << 24u);
-            words.push_back({address, value, !contiguous});
+            if (!contiguous) {
+                ++run_id;
+            }
+            words.push_back({address, value, run_id});
             previous_address = address;
             emitted_word = true;
             offset += 4u;
@@ -2185,10 +2993,10 @@ std::vector<PushBufferWord> push_buffer_words_from_recovered_stream(
         pending_max_address = 0;
     };
 
-    for (size_t command_index = bounded_begin;
-         command_index < bounded_end;
+    for (size_t command_index = 0u;
+         command_index < command_count;
          ++command_index) {
-        const RecoveredD3DCommand& command = stream[command_index];
+        const auto command = command_at(command_index);
         if (command.kind != RecoveredD3DCommandKind::PushBufferWrite
             || command.address < kRecoveredPushBufferBase
             || command.address >= kRecoveredPushBufferEnd) {
@@ -2226,7 +3034,6 @@ std::vector<PushBufferWord> push_buffer_words_from_recovered_stream(
             command.address + static_cast<uint32_t>(payload_size));
     }
     flush_pending();
-    return words;
 }
 
 struct SurfacePayloadCandidate {
@@ -2908,15 +3715,87 @@ void interpret_push_buffer_method_packet(
     ++index;
     if (method_count == 0) {
         ++interpreted.zero_count_method_word_count;
+        // NV4/NV10 DMA-pusher method headers with a zero count are legal
+        // no-ops. Burnout 2 emits one before each populated ARRAY_ELEMENT16
+        // packet, so retain the telemetry without treating it as a lost draw.
         if (interpreted.active_primitive != 0u
             && (first_method == 0x1800u || first_method == 0x1808u)) {
-            ++interpreted.zero_count_indexed_array_packet_count;
+            ++interpreted.zero_count_indexed_array_noop_packet_count;
         }
-        interpreted.state_seed = mix_d3d_state_seed(interpreted.state_seed, command);
+        update_d3d_state_seed(interpreted, command);
         return;
     }
     ++interpreted.method_packet_count;
-    interpreted.state_seed = mix_d3d_state_seed(interpreted.state_seed, command);
+    update_d3d_state_seed(interpreted, command);
+    const bool bulk_indexed = non_increasing
+        && first_method == 0x1800u
+        && interpreted.active_primitive != 0u;
+    const bool bulk_inline = non_increasing
+        && first_method == 0x1818u
+        && interpreted.active_primitive != 0u;
+    const bool complete_packet = method_count <= words.size() - index;
+    if ((bulk_indexed || bulk_inline) && complete_packet) {
+        const auto packet_begin = words.begin()
+            + static_cast<std::ptrdiff_t>(index);
+        const auto packet_end = packet_begin
+            + static_cast<std::ptrdiff_t>(method_count);
+        const bool one_contiguous_run =
+            words[index - 1u].run_id == packet_begin->run_id
+            && packet_begin->run_id == (packet_end - 1)->run_id;
+        if (one_contiguous_run) {
+            if (bulk_indexed) {
+                const size_t output_begin =
+                    interpreted.active_vertex_indices.size();
+                interpreted.active_vertex_indices.resize(
+                    output_begin + static_cast<size_t>(method_count) * 2u);
+                if (interpreted.state_seed_updates_required) {
+                    for (uint32_t method_index = 0u;
+                         method_index < method_count;
+                         ++method_index) {
+                        update_d3d_state_seed(interpreted, first_method);
+                        update_d3d_state_seed(
+                            interpreted, words[index + method_index].value);
+                    }
+                }
+                for (uint32_t method_index = 0u;
+                     method_index < method_count;
+                     ++method_index) {
+                    const uint32_t data = words[index + method_index].value;
+                    interpreted.active_vertex_indices[
+                        output_begin + method_index * 2u] =
+                            data & 0xFFFFu;
+                    interpreted.active_vertex_indices[
+                        output_begin + method_index * 2u + 1u] =
+                            (data >> 16u) & 0xFFFFu;
+                }
+                interpreted.bulk_indexed_method_count += method_count;
+                interpreted.last_bulk_indexed_method_count += method_count;
+            } else {
+                const size_t output_begin = interpreted.inline_words.size();
+                interpreted.inline_words.resize(output_begin + method_count);
+                if (interpreted.state_seed_updates_required) {
+                    for (uint32_t method_index = 0u;
+                         method_index < method_count;
+                         ++method_index) {
+                        update_d3d_state_seed(interpreted, first_method);
+                        update_d3d_state_seed(
+                            interpreted, words[index + method_index].value);
+                    }
+                }
+                for (uint32_t method_index = 0u;
+                     method_index < method_count;
+                     ++method_index) {
+                    const uint32_t data = words[index + method_index].value;
+                    interpreted.inline_words[output_begin + method_index] = data;
+                }
+                interpreted.bulk_inline_method_count += method_count;
+                interpreted.last_bulk_inline_method_count += method_count;
+            }
+            interpreted.interpreted_method_count += method_count;
+            index += method_count;
+            return;
+        }
+    }
     for (uint32_t method_index = 0; method_index < method_count; ++method_index) {
         if (index >= words.size()) {
             interpreted.pending_method_packet = true;
@@ -2928,14 +3807,14 @@ void interpret_push_buffer_method_packet(
             interpreted.pending_next_address = words[index - 1u].address + 4u;
             return;
         }
-        if (words[index].run_start) {
+        if (push_buffer_word_starts_run(words, index)) {
             ++interpreted.truncated_packet_count;
             return;
         }
         const uint32_t method = non_increasing ? first_method : first_method + method_index * 4u;
         const uint32_t data = words[index].value;
-        interpreted.state_seed = mix_d3d_state_seed(interpreted.state_seed, method);
-        interpreted.state_seed = mix_d3d_state_seed(interpreted.state_seed, data);
+        update_d3d_state_seed(interpreted, method);
+        update_d3d_state_seed(interpreted, data);
         interpret_nv2a_method(method, data, interpreted);
         ++interpreted.interpreted_method_count;
         ++index;
@@ -2948,7 +3827,7 @@ void interpret_long_non_increasing_packet(
     InterpretedD3DStream& interpreted) {
     const uint32_t command = words[index].value;
     const uint32_t first_method = ((command >> 2u) & 0x7FFu) * 4u;
-    interpreted.state_seed = mix_d3d_state_seed(interpreted.state_seed, command);
+    update_d3d_state_seed(interpreted, command);
     ++index;
     if (index >= words.size()) {
         interpreted.pending_method_packet = true;
@@ -2960,12 +3839,12 @@ void interpret_long_non_increasing_packet(
         interpreted.pending_next_address = words[index - 1u].address + 4u;
         return;
     }
-    if (words[index].run_start) {
+    if (push_buffer_word_starts_run(words, index)) {
         ++interpreted.truncated_packet_count;
         return;
     }
     const uint32_t method_count = words[index].value & 0x00FFFFFFu;
-    interpreted.state_seed = mix_d3d_state_seed(interpreted.state_seed, method_count);
+    update_d3d_state_seed(interpreted, method_count);
     ++index;
     if (method_count == 0) {
         ++interpreted.zero_count_method_word_count;
@@ -2983,13 +3862,13 @@ void interpret_long_non_increasing_packet(
             interpreted.pending_next_address = words[index - 1u].address + 4u;
             return;
         }
-        if (words[index].run_start) {
+        if (push_buffer_word_starts_run(words, index)) {
             ++interpreted.truncated_packet_count;
             return;
         }
         interpret_nv2a_method(first_method, words[index].value, interpreted);
-        interpreted.state_seed = mix_d3d_state_seed(interpreted.state_seed, first_method);
-        interpreted.state_seed = mix_d3d_state_seed(interpreted.state_seed, words[index].value);
+        update_d3d_state_seed(interpreted, first_method);
+        update_d3d_state_seed(interpreted, words[index].value);
         ++interpreted.interpreted_method_count;
         ++index;
     }
@@ -3010,8 +3889,7 @@ void interpret_pending_push_buffer_method_packet(
     }
     if (interpreted.pending_long_count_word) {
         const uint32_t method_count = words[index].value & 0x00FFFFFFu;
-        interpreted.state_seed = mix_d3d_state_seed(
-            interpreted.state_seed, method_count);
+        update_d3d_state_seed(interpreted, method_count);
         interpreted.pending_long_count_word = false;
         interpreted.pending_method_count = method_count;
         interpreted.pending_method_index = 0u;
@@ -3038,8 +3916,8 @@ void interpret_pending_push_buffer_method_packet(
             ? interpreted.pending_first_method
             : interpreted.pending_first_method + method_index * 4u;
         const uint32_t data = words[index].value;
-        interpreted.state_seed = mix_d3d_state_seed(interpreted.state_seed, method);
-        interpreted.state_seed = mix_d3d_state_seed(interpreted.state_seed, data);
+        update_d3d_state_seed(interpreted, method);
+        update_d3d_state_seed(interpreted, data);
         interpret_nv2a_method(method, data, interpreted);
         ++interpreted.interpreted_method_count;
         ++interpreted.pending_method_index;
@@ -3049,42 +3927,36 @@ void interpret_pending_push_buffer_method_packet(
     interpreted.pending_method_packet = false;
 }
 
-void interpret_recovered_d3d_append(
-    const std::vector<RecoveredD3DCommand>& stream,
-    size_t begin,
-    size_t end,
+template <typename CommandAt>
+void interpret_recovered_d3d_command_append(
+    size_t command_count,
+    CommandAt command_at,
     InterpretedD3DStream& interpreted) {
-    const size_t bounded_begin = std::min(begin, stream.size());
-    const size_t bounded_end = std::min(std::max(end, bounded_begin), stream.size());
+    const auto collect_begin = std::chrono::steady_clock::now();
+    interpreted.last_interpreted_method_count = 0u;
+    interpreted.last_bulk_indexed_method_count = 0u;
+    interpreted.last_bulk_inline_method_count = 0u;
+    interpreted.last_push_buffer_collect_us = 0u;
+    interpreted.last_method_apply_us = 0u;
+    interpreted.last_method_finalize_us = 0u;
+    interpreted.state_seed_updates_required =
+        !interpreted.clear_color_valid
+        && !interpreted.surface_payload_color_valid;
     if (interpreted.state_seed == 0u) {
         interpreted.state_seed = 0xB200D3D8u;
     }
     const uint32_t starting_flip_count = interpreted.flip_count;
-    for (size_t command_index = bounded_begin;
-         command_index < bounded_end;
-         ++command_index) {
-        const RecoveredD3DCommand& command = stream[command_index];
-        interpreted.state_seed = mix_d3d_state_seed(interpreted.state_seed, command.address);
-        interpreted.state_seed = mix_d3d_state_seed(interpreted.state_seed, command.value);
-        if (command.kind == RecoveredD3DCommandKind::MmioWrite) {
-            const uint32_t offset = command.address - 0xFED00000u;
-            if (offset == 0x0008u) {
-                ++interpreted.submission_kick_count;
-            } else if (offset == 0x0040u || offset == 0x0048u || offset == 0x004Cu || offset == 0x0050u) {
-                ++interpreted.mmio_setup_write_count;
-            }
-        }
-    }
-    const std::vector<PushBufferWord> words = push_buffer_words_from_recovered_stream(
-        stream, bounded_begin, bounded_end);
+    const uint32_t starting_method_count =
+        interpreted.interpreted_method_count;
+    const bool surface_payload_scan_required = !interpreted.clear_color_valid;
+    std::vector<PushBufferWord>& words =
+        interpreted.push_buffer_words_scratch;
+    push_buffer_words_from_recovered_commands(
+        command_count, command_at, interpreted, words);
+    const auto after_collect = std::chrono::steady_clock::now();
+    interpreted.last_push_buffer_collect_us = std::chrono::duration_cast<
+        std::chrono::microseconds>(after_collect - collect_begin).count();
     interpreted.push_buffer_word_count += static_cast<uint32_t>(words.size());
-    const SurfacePayloadCandidate surface_payload = dominant_surface_payload_from_words(words);
-    if (surface_payload.valid) {
-        interpreted.surface_payload_color_valid = true;
-        interpreted.surface_payload_argb = surface_payload.argb;
-        interpreted.surface_payload_sample_count = surface_payload.sample_count;
-        interpreted.surface_payload_dominant_count = surface_payload.dominant_count;
-    }
     size_t index = 0;
     interpret_pending_push_buffer_method_packet(words, index, interpreted);
     while (index < words.size()) {
@@ -3098,23 +3970,47 @@ void interpret_recovered_d3d_append(
         } else if ((word & 0xE0000003u) == 0x20000000u || (word & 0x3u) == 0x1u ||
                    (word & 0x3u) == 0x2u || word == 0x00020000u) {
             ++interpreted.control_flow_packet_count;
-            interpreted.state_seed = mix_d3d_state_seed(interpreted.state_seed, word);
+            update_d3d_state_seed(interpreted, word);
             ++index;
         } else {
             ++interpreted.unknown_packet_count;
-            interpreted.state_seed = mix_d3d_state_seed(interpreted.state_seed, word);
+            update_d3d_state_seed(interpreted, word);
             ++index;
         }
+    }
+    const auto after_method_apply = std::chrono::steady_clock::now();
+    interpreted.last_method_apply_us = std::chrono::duration_cast<
+        std::chrono::microseconds>(
+            after_method_apply - after_collect).count();
+    if (surface_payload_scan_required) {
+        const SurfacePayloadCandidate surface_payload =
+            dominant_surface_payload_from_words(words);
+        if (surface_payload.valid) {
+            interpreted.surface_payload_color_valid = true;
+            interpreted.surface_payload_argb = surface_payload.argb;
+            interpreted.surface_payload_sample_count = surface_payload.sample_count;
+            interpreted.surface_payload_dominant_count =
+                surface_payload.dominant_count;
+        }
+    } else {
+        ++interpreted.surface_payload_scan_skipped_count;
     }
     if (interpreted.flip_count != starting_flip_count) {
         std::vector<NativeVertex> retained_vertices;
         std::vector<NativeDraw> retained_draws;
+        retained_vertices.reserve(interpreted.vertices.size());
+        retained_draws.reserve(interpreted.draws.size());
         auto retain_draw_range = [&](size_t first, size_t count) {
             const size_t draw_end = std::min(first + count, interpreted.draws.size());
             for (size_t draw_index = std::min(first, interpreted.draws.size());
                  draw_index < draw_end;
                  ++draw_index) {
-                NativeDraw draw = interpreted.draws[draw_index];
+                NativeDraw draw = std::move(interpreted.draws[draw_index]);
+                if (draw.gpu_raw_attribute_fetch) {
+                    draw.first_vertex = 0u;
+                    retained_draws.push_back(std::move(draw));
+                    continue;
+                }
                 const size_t vertex_begin = std::min<size_t>(
                     draw.first_vertex, interpreted.vertices.size());
                 const size_t vertex_end = std::min<size_t>(
@@ -3150,6 +4046,109 @@ void interpret_recovered_d3d_append(
     } else {
         interpreted.diagnostic_clear_color = color_from_interpreted_d3d_state(interpreted.state_seed);
     }
+    interpreted.last_interpreted_method_count =
+        interpreted.interpreted_method_count - starting_method_count;
+    interpreted.last_method_finalize_us = std::chrono::duration_cast<
+        std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - after_method_apply).count();
+}
+
+void interpret_recovered_d3d_append(
+    const std::vector<RecoveredD3DCommand>& stream,
+    size_t begin,
+    size_t end,
+    InterpretedD3DStream& interpreted) {
+    const size_t bounded_begin = std::min(begin, stream.size());
+    const size_t bounded_end = std::min(std::max(end, bounded_begin), stream.size());
+    interpret_recovered_d3d_command_append(
+        bounded_end - bounded_begin,
+        [&](size_t command_index) -> const RecoveredD3DCommand& {
+            return stream[bounded_begin + command_index];
+        },
+        interpreted);
+}
+
+void interpret_recovered_d3d_packed_append(
+    const std::vector<uint8_t>& packed_commands,
+    InterpretedD3DStream& interpreted) {
+    if (packed_commands.size() % kRecoveredD3DCommandRecordSize != 0u) {
+        throw std::runtime_error("packed live command delta is truncated");
+    }
+    interpret_recovered_d3d_command_append(
+        packed_commands.size() / kRecoveredD3DCommandRecordSize,
+        [&](size_t command_index) {
+            return recovered_d3d_command_from_packed_record(
+                packed_commands.data()
+                + command_index * kRecoveredD3DCommandRecordSize);
+        },
+        interpreted);
+}
+
+std::vector<RecoveredD3DCommandSpan> recovered_d3d_command_spans_from_packed(
+    const std::vector<uint8_t>& packed_spans,
+    uint64_t* logical_write_count = nullptr) {
+    std::vector<RecoveredD3DCommandSpan> spans;
+    uint64_t writes = 0u;
+    size_t cursor = 0u;
+    while (cursor < packed_spans.size()) {
+        if (packed_spans.size() - cursor
+            < kRecoveredD3DCommandSpanHeaderSize) {
+            throw std::runtime_error("packed live command span header is truncated");
+        }
+        const uint8_t* header = packed_spans.data() + cursor;
+        const uint8_t kind = header[0];
+        const uint8_t flags = header[1];
+        uint32_t address = 0u;
+        uint32_t payload_size = 0u;
+        uint32_t span_write_count = 0u;
+        std::memcpy(&address, header + 4u, sizeof(address));
+        std::memcpy(&payload_size, header + 8u, sizeof(payload_size));
+        std::memcpy(&span_write_count, header + 12u, sizeof(span_write_count));
+        cursor += kRecoveredD3DCommandSpanHeaderSize;
+        if (kind > 1u || (flags & ~1u) != 0u || payload_size == 0u
+            || span_write_count == 0u
+            || payload_size > packed_spans.size() - cursor) {
+            throw std::runtime_error("packed live command span is invalid");
+        }
+        uint32_t value = 0u;
+        std::memcpy(
+            &value,
+            packed_spans.data() + cursor,
+            std::min<size_t>(payload_size, sizeof(value)));
+        spans.push_back({
+            kind == 0u ? RecoveredD3DCommandKind::MmioWrite
+                       : RecoveredD3DCommandKind::PushBufferWrite,
+            address,
+            value,
+            payload_size,
+            {packed_spans.data() + cursor, payload_size},
+            payload_size,
+            span_write_count,
+            flags,
+        });
+        writes += span_write_count;
+        cursor += payload_size;
+    }
+    if (logical_write_count != nullptr) {
+        *logical_write_count = writes;
+    }
+    return spans;
+}
+
+uint64_t interpret_recovered_d3d_span_append(
+    const std::vector<uint8_t>& packed_spans,
+    InterpretedD3DStream& interpreted) {
+    uint64_t logical_write_count = 0u;
+    const auto spans = recovered_d3d_command_spans_from_packed(
+        packed_spans,
+        &logical_write_count);
+    interpret_recovered_d3d_command_append(
+        spans.size(),
+        [&](size_t span_index) -> const RecoveredD3DCommandSpan& {
+            return spans[span_index];
+        },
+        interpreted);
+    return logical_write_count;
 }
 
 InterpretedD3DStream interpret_recovered_d3d_stream(
@@ -3187,25 +4186,59 @@ uint32_t nv2a_vertex_element_size(uint32_t format_raw) {
     return components * 2u;
 }
 
-const uint8_t* recovered_vertex_bytes(
-    const std::vector<RecoveredTextureResource>& resources,
-    uint32_t address,
-    uint32_t size) {
-    const uint64_t requested_begin = address;
-    const uint64_t requested_end = requested_begin + size;
+using RecoveredVertexResourceIndex = std::unordered_map<
+    uint32_t,
+    std::vector<const RecoveredTextureResource*>>;
+
+RecoveredVertexResourceIndex build_recovered_vertex_resource_index(
+    const std::vector<RecoveredTextureResource>& resources) {
+    RecoveredVertexResourceIndex index;
     for (const RecoveredTextureResource& resource : resources) {
-        if (resource.format != "VERTEX_BUFFER") {
+        if (resource.format != "VERTEX_BUFFER" || resource.payload.empty()) {
             continue;
         }
         const uint64_t resource_begin = resource.address;
         const uint64_t resource_end = resource_begin + resource.payload.size();
+        const uint64_t first_page = resource_begin >> 12u;
+        const uint64_t last_page = (resource_end - 1u) >> 12u;
+        for (uint64_t page = first_page; page <= last_page; ++page) {
+            index[static_cast<uint32_t>(page)].push_back(&resource);
+        }
+    }
+    return index;
+}
+
+const RecoveredTextureResource* recovered_vertex_resource(
+    const RecoveredVertexResourceIndex& resource_index,
+    uint32_t address,
+    uint32_t size) {
+    const uint64_t requested_begin = address;
+    const uint64_t requested_end = requested_begin + size;
+    const auto candidates = resource_index.find(address >> 12u);
+    if (candidates == resource_index.end()) {
+        return nullptr;
+    }
+    for (const RecoveredTextureResource* resource : candidates->second) {
+        const uint64_t resource_begin = resource->address;
+        const uint64_t resource_end = resource_begin + resource->payload.size();
         if (requested_begin < resource_begin || requested_end > resource_end) {
             continue;
         }
-        return resource.payload.data()
-            + static_cast<size_t>(requested_begin - resource_begin);
+        return resource;
     }
     return nullptr;
+}
+
+const uint8_t* recovered_vertex_bytes(
+    const RecoveredVertexResourceIndex& resource_index,
+    uint32_t address,
+    uint32_t size) {
+    const RecoveredTextureResource* resource = recovered_vertex_resource(
+        resource_index, address, size);
+    return resource == nullptr
+        ? nullptr
+        : resource->payload.data()
+            + static_cast<size_t>(address - resource->address);
 }
 
 int32_t sign_extend_vertex_component(uint32_t value, uint32_t bits) {
@@ -3213,16 +4246,12 @@ int32_t sign_extend_vertex_component(uint32_t value, uint32_t bits) {
     return static_cast<int32_t>(value << shift) >> shift;
 }
 
-bool decode_indexed_vertex_attribute(
-    const std::vector<RecoveredTextureResource>& resources,
-    uint32_t address,
+bool decode_indexed_vertex_attribute_payload(
+    const uint8_t* payload,
     uint32_t format_raw,
     std::array<float, 4>& output) {
     const uint32_t type = format_raw & 0xFu;
     const uint32_t components = (format_raw >> 4u) & 0xFu;
-    const uint32_t element_size = nv2a_vertex_element_size(format_raw);
-    const uint8_t* payload = recovered_vertex_bytes(
-        resources, address, element_size);
     if (payload == nullptr || components == 0u) {
         return false;
     }
@@ -3275,12 +4304,311 @@ bool decode_indexed_vertex_attribute(
     return false;
 }
 
+bool decode_indexed_vertex_attribute(
+    const RecoveredVertexResourceIndex& resource_index,
+    uint32_t address,
+    uint32_t format_raw,
+    std::array<float, 4>& output) {
+    return decode_indexed_vertex_attribute_payload(
+        recovered_vertex_bytes(
+            resource_index,
+            address,
+            nv2a_vertex_element_size(format_raw)),
+        format_raw,
+        output);
+}
+
+bool prepare_gpu_raw_attribute_fetch(
+    NativeDraw& draw,
+    const RecoveredVertexResourceIndex& resource_index,
+    const std::unordered_map<const RecoveredTextureResource*, uint32_t>&
+        packed_resource_offsets,
+    uint32_t raw_index_word_base,
+    std::vector<uint32_t>& raw_indices) {
+    if (!gpu_vertex_program_compatible(draw)
+        || draw.vertex_indices.empty()
+        || static_cast<uint64_t>(raw_index_word_base)
+                + raw_indices.size() + draw.vertex_indices.size()
+            > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    const auto [minimum_index, maximum_index] = std::minmax_element(
+        draw.vertex_indices.begin(), draw.vertex_indices.end());
+    std::array<uint32_t, 16> base_offsets{};
+    for (uint32_t slot = 0; slot < draw.vertex_formats.size(); ++slot) {
+        const uint32_t format_raw = draw.vertex_formats[slot];
+        const uint32_t type = format_raw & 0xFu;
+        const uint32_t element_size = nv2a_vertex_element_size(format_raw);
+        if (element_size == 0u) {
+            continue;
+        }
+        if ((type != 0u && type != 1u && type != 2u && type != 4u
+                && type != 5u && type != 6u)
+            || draw.vertex_offsets[slot] == 0u
+            || (format_raw >> 8u) == 0u) {
+            return false;
+        }
+        const uint64_t minimum_address = static_cast<uint64_t>(
+            draw.vertex_offsets[slot])
+            + static_cast<uint64_t>(*minimum_index) * (format_raw >> 8u);
+        const uint64_t maximum_address = static_cast<uint64_t>(
+            draw.vertex_offsets[slot])
+            + static_cast<uint64_t>(*maximum_index) * (format_raw >> 8u);
+        if (maximum_address > std::numeric_limits<uint32_t>::max()) {
+            return false;
+        }
+        // A vertex resource is one contiguous address interval. If both index
+        // extrema, including the final element width, resolve to the same
+        // resource, every linearly-strided index between them is resident too.
+        const RecoveredTextureResource* selected_resource =
+            recovered_vertex_resource(
+                resource_index,
+                static_cast<uint32_t>(minimum_address),
+                element_size);
+        const RecoveredTextureResource* maximum_resource =
+            recovered_vertex_resource(
+                resource_index,
+                static_cast<uint32_t>(maximum_address),
+                element_size);
+        if (selected_resource == nullptr
+            || maximum_resource != selected_resource) {
+            return false;
+        }
+        const auto packed = packed_resource_offsets.find(selected_resource);
+        if (packed == packed_resource_offsets.end()) {
+            return false;
+        }
+        // Unsigned wrap preserves packed + (array base - guest resource base)
+        // for captures whose resource begins at the first referenced vertex
+        // instead of the array's logical index-zero address.
+        base_offsets[slot] = packed->second
+            + draw.vertex_offsets[slot]
+            - selected_resource->address;
+    }
+    draw.gpu_raw_attribute_fetch = true;
+    draw.gpu_raw_source_index_base = raw_index_word_base
+        + static_cast<uint32_t>(raw_indices.size());
+    draw.gpu_raw_attribute_base_offsets = base_offsets;
+    draw.first_vertex = 0u;
+    draw.vertex_count = static_cast<uint32_t>(draw.vertex_indices.size());
+    raw_indices.insert(
+        raw_indices.end(),
+        draw.vertex_indices.begin(),
+        draw.vertex_indices.end());
+    return true;
+}
+
+void append_gpu_raw_vertex_dirty_range(
+    GpuRawVertexResourceCache& cache,
+    uint32_t offset,
+    uint32_t size) {
+    if (size == 0u) {
+        return;
+    }
+    constexpr uint64_t kMergeGapBytes = 64u;
+    const uint64_t range_end = static_cast<uint64_t>(offset) + size;
+    if (!cache.dirty_ranges.empty()) {
+        GpuRawVertexDirtyRange& previous = cache.dirty_ranges.back();
+        const uint64_t previous_end = static_cast<uint64_t>(previous.offset)
+            + previous.size;
+        if (offset <= previous_end + kMergeGapBytes) {
+            previous.size = static_cast<uint32_t>(
+                std::max(previous_end, range_end) - previous.offset);
+            return;
+        }
+    }
+    cache.dirty_ranges.push_back({offset, size});
+}
+
+bool refresh_gpu_raw_vertex_resource_cache(
+    const std::vector<RecoveredTextureResource>& resources,
+    bool resources_unchanged,
+    GpuRawVertexResourceCache& cache,
+    std::unordered_map<const RecoveredTextureResource*, uint32_t>&
+        packed_resource_offsets) {
+    const auto refresh_begin = std::chrono::steady_clock::now();
+    std::vector<const RecoveredTextureResource*> vertex_resources;
+    std::vector<GpuRawVertexResourceLayout> next_layout;
+    uint64_t packed_size = 0u;
+    for (const RecoveredTextureResource& resource : resources) {
+        if (resource.format != "VERTEX_BUFFER" || resource.payload.empty()) {
+            continue;
+        }
+        packed_size = (packed_size + 3u) & ~uint64_t{3u};
+        if (packed_size > std::numeric_limits<uint32_t>::max()
+            || resource.payload.size()
+                > std::numeric_limits<uint32_t>::max() - packed_size) {
+            cache = GpuRawVertexResourceCache{};
+            cache.refresh_us = std::chrono::duration_cast<
+                std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - refresh_begin).count();
+            packed_resource_offsets.clear();
+            return false;
+        }
+        vertex_resources.push_back(&resource);
+        next_layout.push_back({
+            resource.address,
+            static_cast<uint32_t>(packed_size),
+            static_cast<uint32_t>(resource.payload.size()),
+        });
+        packed_size += resource.payload.size();
+    }
+    packed_size = (packed_size + 3u) & ~uint64_t{3u};
+    if (packed_size > std::numeric_limits<uint32_t>::max()) {
+        cache = GpuRawVertexResourceCache{};
+        cache.refresh_us = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - refresh_begin).count();
+        packed_resource_offsets.clear();
+        return false;
+    }
+
+    ++cache.refresh_count;
+    cache.layout_rebuilt = cache.layout.size() != next_layout.size()
+        || cache.gpu_raw_vertex_bytes.size() != packed_size;
+    if (!cache.layout_rebuilt) {
+        for (size_t index = 0u; index < next_layout.size(); ++index) {
+            const GpuRawVertexResourceLayout& current = cache.layout[index];
+            const GpuRawVertexResourceLayout& next = next_layout[index];
+            if (current.guest_address != next.guest_address
+                || current.packed_offset != next.packed_offset
+                || current.byte_size != next.byte_size) {
+                cache.layout_rebuilt = true;
+                break;
+            }
+        }
+    }
+    cache.resource_count = static_cast<uint32_t>(vertex_resources.size());
+    cache.compared_resource_count = 0u;
+    cache.changed_resource_count = 0u;
+    cache.reused_resource_count = 0u;
+    cache.compared_bytes = 0u;
+    cache.dirty_bytes = 0u;
+    cache.dirty_ranges.clear();
+
+    if (cache.layout_rebuilt) {
+        ++cache.layout_rebuild_count;
+        cache.layout = next_layout;
+        cache.gpu_raw_vertex_bytes.assign(
+            static_cast<size_t>(packed_size), 0u);
+        for (size_t index = 0u; index < vertex_resources.size(); ++index) {
+            const RecoveredTextureResource& resource = *vertex_resources[index];
+            std::memcpy(
+                cache.gpu_raw_vertex_bytes.data()
+                    + cache.layout[index].packed_offset,
+                resource.payload.data(),
+                resource.payload.size());
+        }
+        cache.changed_resource_count = cache.resource_count;
+        if (packed_size != 0u) {
+            append_gpu_raw_vertex_dirty_range(
+                cache, 0u, static_cast<uint32_t>(packed_size));
+        }
+    } else if (resources_unchanged) {
+        // The live bridge retains the same immutable resource vector for an
+        // unchanged generation, so neither hashing nor another byte scan is
+        // needed to prove residency.
+        cache.reused_resource_count = cache.resource_count;
+    } else {
+        constexpr size_t kCompareChunkBytes = 64u;
+        for (size_t index = 0u; index < vertex_resources.size(); ++index) {
+            const RecoveredTextureResource& resource = *vertex_resources[index];
+            const GpuRawVertexResourceLayout& slot = cache.layout[index];
+            ++cache.compared_resource_count;
+            cache.compared_bytes += resource.payload.size();
+            uint8_t* resident_payload = cache.gpu_raw_vertex_bytes.data()
+                + slot.packed_offset;
+            if (std::memcmp(
+                    resident_payload,
+                    resource.payload.data(),
+                    resource.payload.size()) == 0) {
+                ++cache.reused_resource_count;
+                continue;
+            }
+            ++cache.changed_resource_count;
+            for (size_t local_offset = 0u;
+                 local_offset < resource.payload.size();
+                 local_offset += kCompareChunkBytes) {
+                const size_t chunk_size = std::min(
+                    kCompareChunkBytes,
+                    resource.payload.size() - local_offset);
+                uint8_t* resident = resident_payload + local_offset;
+                const uint8_t* current = resource.payload.data() + local_offset;
+                if (std::memcmp(resident, current, chunk_size) == 0) {
+                    continue;
+                }
+                std::memcpy(resident, current, chunk_size);
+                append_gpu_raw_vertex_dirty_range(
+                    cache,
+                    slot.packed_offset + static_cast<uint32_t>(local_offset),
+                    static_cast<uint32_t>(chunk_size));
+            }
+        }
+    }
+    for (const GpuRawVertexDirtyRange& range : cache.dirty_ranges) {
+        cache.dirty_bytes += range.size;
+    }
+    for (size_t index = 0u; index < vertex_resources.size(); ++index) {
+        packed_resource_offsets.emplace(
+            vertex_resources[index], cache.layout[index].packed_offset);
+    }
+    cache.refresh_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - refresh_begin).count();
+    return true;
+}
+
 void materialize_indexed_draws(
     InterpretedD3DStream& interpreted,
-    const std::vector<RecoveredTextureResource>& resources) {
+    const std::vector<RecoveredTextureResource>& resources,
+    GpuRawVertexResourceCache& raw_resource_cache,
+    bool enable_gpu_raw_attribute_fetch = false,
+    bool resources_unchanged = false) {
+    const RecoveredVertexResourceIndex resource_index =
+        build_recovered_vertex_resource_index(resources);
+    std::unordered_map<const RecoveredTextureResource*, uint32_t>
+        packed_resource_offsets;
+    if (enable_gpu_raw_attribute_fetch
+        && !refresh_gpu_raw_vertex_resource_cache(
+            resources,
+            resources_unchanged,
+            raw_resource_cache,
+            packed_resource_offsets)) {
+        enable_gpu_raw_attribute_fetch = false;
+    }
+    interpreted.gpu_raw_vertex_indices.clear();
+    interpreted.gpu_raw_attribute_draw_count = 0u;
+    interpreted.gpu_raw_attribute_vertex_count = 0u;
     for (NativeDraw& draw : interpreted.draws) {
-        if (!draw.indexed_array || draw.vertex_count != 0u
-            || draw.vertex_indices.empty()) {
+        if (!draw.indexed_array || draw.vertex_indices.empty()) {
+            continue;
+        }
+        const bool was_raw = draw.gpu_raw_attribute_fetch;
+        const bool was_materialized = was_raw || draw.vertex_count != 0u;
+        if (was_raw) {
+            draw.vertex_count = 0u;
+        }
+        draw.gpu_raw_attribute_fetch = false;
+        draw.gpu_raw_source_index_base = 0u;
+        draw.gpu_raw_attribute_base_offsets = {};
+        if (enable_gpu_raw_attribute_fetch
+            && prepare_gpu_raw_attribute_fetch(
+                draw,
+                resource_index,
+                packed_resource_offsets,
+                static_cast<uint32_t>(
+                    raw_resource_cache.gpu_raw_vertex_bytes.size()
+                        / sizeof(uint32_t)),
+                interpreted.gpu_raw_vertex_indices)) {
+            ++interpreted.gpu_raw_attribute_draw_count;
+            interpreted.gpu_raw_attribute_vertex_count += draw.vertex_count;
+            if (!was_materialized) {
+                ++interpreted.materialized_indexed_draw_count;
+                interpreted.materialized_indexed_vertex_count +=
+                    draw.vertex_count;
+            }
+            continue;
+        }
+        if (draw.vertex_count != 0u) {
             continue;
         }
         std::vector<NativeVertex> decoded;
@@ -3305,7 +4633,7 @@ void materialize_indexed_draws(
                     + static_cast<uint64_t>(vertex_index) * stride;
                 if (attribute_address > std::numeric_limits<uint32_t>::max()
                     || !decode_indexed_vertex_attribute(
-                        resources,
+                        resource_index,
                         static_cast<uint32_t>(attribute_address),
                         format_raw,
                         vertex.program_inputs[slot])) {
@@ -3353,6 +4681,202 @@ void materialize_indexed_draws(
     }
 }
 
+struct GpuRawAttributeValidation {
+    uint32_t eligible_draw_count = 0;
+    uint64_t eligible_vertex_count = 0;
+    uint64_t decoded_attribute_count = 0;
+    uint64_t compared_vertex_count = 0;
+    uint64_t mismatch_vertex_count = 0;
+    uint32_t mapping_fallback_draw_count = 0;
+    uint64_t packed_resource_bytes = 0;
+};
+
+GpuRawAttributeValidation validate_gpu_raw_attribute_fetch(
+    const InterpretedD3DStream& cpu_stream,
+    const std::vector<RecoveredTextureResource>& resources) {
+    InterpretedD3DStream gpu_stream = cpu_stream;
+    GpuRawVertexResourceCache raw_resource_cache;
+    materialize_indexed_draws(
+        gpu_stream, resources, raw_resource_cache, true, false);
+    GpuRawAttributeValidation validation{};
+    validation.packed_resource_bytes =
+        raw_resource_cache.gpu_raw_vertex_bytes.size();
+    const size_t first_draw = std::min<size_t>(
+        cpu_stream.presented_draw_begin, cpu_stream.draws.size());
+    const size_t end_draw = std::min<size_t>(
+        first_draw + cpu_stream.presented_draw_count,
+        cpu_stream.draws.size());
+    for (size_t draw_index = first_draw;
+         draw_index < end_draw;
+         ++draw_index) {
+        const NativeDraw& cpu_draw = cpu_stream.draws[draw_index];
+        const NativeDraw& gpu_draw = gpu_stream.draws[draw_index];
+        if (!gpu_vertex_program_compatible(cpu_draw)) {
+            continue;
+        }
+        if (!gpu_draw.gpu_raw_attribute_fetch) {
+            ++validation.mapping_fallback_draw_count;
+            continue;
+        }
+        ++validation.eligible_draw_count;
+        validation.eligible_vertex_count += gpu_draw.vertex_count;
+        if (cpu_draw.first_vertex + cpu_draw.vertex_count
+            > cpu_stream.vertices.size()) {
+            validation.mismatch_vertex_count += gpu_draw.vertex_count;
+            continue;
+        }
+        for (uint32_t vertex_index = 0u;
+             vertex_index < gpu_draw.vertex_count;
+             ++vertex_index) {
+            Nv2aVertexAttributes attributes =
+                cpu_draw.current_vertex_attributes;
+            bool decoded = true;
+            const uint64_t index_word = static_cast<uint64_t>(
+                gpu_draw.gpu_raw_source_index_base) + vertex_index;
+            const uint64_t first_index_word =
+                raw_resource_cache.gpu_raw_vertex_bytes.size()
+                    / sizeof(uint32_t);
+            if (index_word < first_index_word
+                || index_word - first_index_word
+                    >= gpu_stream.gpu_raw_vertex_indices.size()) {
+                ++validation.compared_vertex_count;
+                ++validation.mismatch_vertex_count;
+                continue;
+            }
+            const uint32_t source_index =
+                gpu_stream.gpu_raw_vertex_indices[
+                    static_cast<size_t>(index_word - first_index_word)];
+            for (uint32_t slot = 0u; slot < 16u; ++slot) {
+                const uint32_t format_raw = gpu_draw.vertex_formats[slot];
+                const uint32_t element_size =
+                    nv2a_vertex_element_size(format_raw);
+                if (element_size == 0u) {
+                    continue;
+                }
+                const uint32_t packed_offset =
+                    gpu_draw.gpu_raw_attribute_base_offsets[slot]
+                    + source_index * (format_raw >> 8u);
+                if (static_cast<uint64_t>(packed_offset) + element_size
+                        > raw_resource_cache.gpu_raw_vertex_bytes.size()
+                    || !decode_indexed_vertex_attribute_payload(
+                        raw_resource_cache.gpu_raw_vertex_bytes.data()
+                            + packed_offset,
+                        format_raw,
+                        attributes[slot])) {
+                    decoded = false;
+                    break;
+                }
+                ++validation.decoded_attribute_count;
+            }
+            ++validation.compared_vertex_count;
+            const NativeVertex& reference = cpu_stream.vertices[
+                cpu_draw.first_vertex + vertex_index];
+            if (!decoded
+                || std::memcmp(
+                    attributes.data(),
+                    reference.program_inputs.data(),
+                    sizeof(attributes)) != 0) {
+                ++validation.mismatch_vertex_count;
+            }
+        }
+    }
+    return validation;
+}
+
+struct GpuRawDirtyRangeValidation {
+    bool unchanged_generation_passed = false;
+    bool changed_generation_passed = false;
+    bool layout_change_passed = false;
+    uint32_t changed_range_count = 0;
+    uint64_t changed_upload_bytes = 0;
+    uint64_t packed_resource_bytes = 0;
+
+    bool passed() const {
+        return unchanged_generation_passed
+            && changed_generation_passed
+            && layout_change_passed;
+    }
+};
+
+GpuRawDirtyRangeValidation validate_gpu_raw_dirty_range_uploads() {
+    std::vector<RecoveredTextureResource> resources(2u);
+    resources[0].address = 0x1000u;
+    resources[0].format = "VERTEX_BUFFER";
+    resources[0].payload.resize(192u);
+    resources[1].address = 0x2000u;
+    resources[1].format = "VERTEX_BUFFER";
+    resources[1].payload.resize(192u);
+    for (size_t index = 0u; index < resources[0].payload.size(); ++index) {
+        resources[0].payload[index] = static_cast<uint8_t>(index * 13u + 7u);
+        resources[1].payload[index] = static_cast<uint8_t>(index * 29u + 3u);
+    }
+
+    GpuRawVertexResourceCache cache;
+    std::unordered_map<const RecoveredTextureResource*, uint32_t> offsets;
+    refresh_gpu_raw_vertex_resource_cache(resources, false, cache, offsets);
+    const std::vector<uint8_t> initial_bytes = cache.gpu_raw_vertex_bytes;
+    cache.dirty_ranges.clear();
+    offsets.clear();
+    refresh_gpu_raw_vertex_resource_cache(resources, false, cache, offsets);
+
+    GpuRawDirtyRangeValidation validation{};
+    validation.unchanged_generation_passed = !cache.layout_rebuilt
+        && cache.dirty_ranges.empty()
+        && cache.changed_resource_count == 0u
+        && cache.reused_resource_count == resources.size()
+        && cache.gpu_raw_vertex_bytes == initial_bytes;
+
+    resources[0].payload[3] ^= 0x5Au;
+    resources[0].payload[130] ^= 0xA5u;
+    resources[1].payload[20] ^= 0x3Cu;
+    const std::vector<uint8_t> before_dirty_upload =
+        cache.gpu_raw_vertex_bytes;
+    offsets.clear();
+    refresh_gpu_raw_vertex_resource_cache(resources, false, cache, offsets);
+    const std::vector<GpuRawVertexDirtyRange> changed_ranges =
+        cache.dirty_ranges;
+    std::vector<uint8_t> replayed_bytes = before_dirty_upload;
+    for (const GpuRawVertexDirtyRange& range : changed_ranges) {
+        if (static_cast<uint64_t>(range.offset) + range.size
+            > replayed_bytes.size()) {
+            replayed_bytes.clear();
+            break;
+        }
+        std::memcpy(
+            replayed_bytes.data() + range.offset,
+            cache.gpu_raw_vertex_bytes.data() + range.offset,
+            range.size);
+    }
+    GpuRawVertexResourceCache clean_repack;
+    std::unordered_map<const RecoveredTextureResource*, uint32_t>
+        clean_offsets;
+    refresh_gpu_raw_vertex_resource_cache(
+        resources, false, clean_repack, clean_offsets);
+    validation.changed_range_count = static_cast<uint32_t>(
+        changed_ranges.size());
+    validation.changed_upload_bytes = cache.dirty_bytes;
+    validation.packed_resource_bytes = cache.gpu_raw_vertex_bytes.size();
+    validation.changed_generation_passed = !cache.layout_rebuilt
+        && cache.changed_resource_count == 2u
+        && !changed_ranges.empty()
+        && cache.dirty_bytes < cache.gpu_raw_vertex_bytes.size()
+        && cache.gpu_raw_vertex_bytes == clean_repack.gpu_raw_vertex_bytes
+        && replayed_bytes == cache.gpu_raw_vertex_bytes;
+
+    resources[1].payload.push_back(0x91u);
+    offsets.clear();
+    refresh_gpu_raw_vertex_resource_cache(resources, false, cache, offsets);
+    clean_repack = GpuRawVertexResourceCache{};
+    clean_offsets.clear();
+    refresh_gpu_raw_vertex_resource_cache(
+        resources, false, clean_repack, clean_offsets);
+    validation.layout_change_passed = cache.layout_rebuilt
+        && cache.dirty_ranges.size() == 1u
+        && cache.dirty_bytes == cache.gpu_raw_vertex_bytes.size()
+        && cache.gpu_raw_vertex_bytes == clean_repack.gpu_raw_vertex_bytes;
+    return validation;
+}
+
 class DebugLog {
 public:
     void configure_live_mode(bool live_mode) {
@@ -3362,6 +4886,7 @@ public:
 
     void open(const std::filesystem::path& path) {
         if (path.empty()) {
+            enabled_ = false;
             return;
         }
         if (path.has_parent_path()) {
@@ -3377,6 +4902,9 @@ public:
     void emit(
         const std::string& event,
         std::initializer_list<std::pair<std::string, std::string>> fields = {}) {
+        if (!enabled_) {
+            return;
+        }
         std::ostringstream line;
         line << "{\"sequence\":" << sequence_++ << ",\"event\":" << json_string(event);
         for (const auto& [key, value] : fields) {
@@ -3399,11 +4927,16 @@ public:
         return path_;
     }
 
+    bool enabled() const {
+        return enabled_;
+    }
+
 private:
     uint64_t sequence_ = 0;
     uint32_t pending_lines_ = 0;
     uint32_t flush_interval_ = 1;
     bool echo_stdout_ = true;
+    bool enabled_ = true;
     std::ofstream file_;
     std::filesystem::path path_;
 };
@@ -3424,6 +4957,14 @@ public:
                 {"width", std::to_string(options_.width)},
                 {"height", std::to_string(options_.height)},
                 {"max_frames", std::to_string(options_.max_frames)},
+                {"vertex_program_backend", json_string(
+                    options_.cpu_vertex_programs ? "cpu" : "gpu")},
+                {"vertex_attribute_backend", json_string(
+                    options_.cpu_vertex_attributes ? "cpu" : "gpu")},
+                {"texture_conversion_backend", json_string(
+                    options_.cpu_texture_conversion ? "cpu" : "gpu")},
+                {"presentation_pipeline_depth", std::to_string(
+                    options_.presentation_pipeline_depth)},
             });
 
         if (options_.analyze_render_stream_only) {
@@ -3432,6 +4973,48 @@ public:
                 throw std::runtime_error(
                     "render manifest was incomplete during headless analysis");
             }
+            const GpuRawAttributeValidation raw_attribute_validation =
+                validate_gpu_raw_attribute_fetch(
+                    interpreted_stream_, recovered_source_.textures);
+            log_.emit(
+                "nv2a_gpu_raw_attribute_validation",
+                {
+                    {"eligible_draws", std::to_string(
+                        raw_attribute_validation.eligible_draw_count)},
+                    {"eligible_vertices", std::to_string(
+                        raw_attribute_validation.eligible_vertex_count)},
+                    {"decoded_attributes", std::to_string(
+                        raw_attribute_validation.decoded_attribute_count)},
+                    {"compared_vertices", std::to_string(
+                        raw_attribute_validation.compared_vertex_count)},
+                    {"mismatch_vertices", std::to_string(
+                        raw_attribute_validation.mismatch_vertex_count)},
+                    {"mapping_fallback_draws", std::to_string(
+                        raw_attribute_validation.mapping_fallback_draw_count)},
+                    {"packed_resource_bytes", std::to_string(
+                        raw_attribute_validation.packed_resource_bytes)},
+                    {"passed", json_bool(
+                        raw_attribute_validation.mismatch_vertex_count == 0u)},
+                });
+            const GpuRawDirtyRangeValidation dirty_range_validation =
+                validate_gpu_raw_dirty_range_uploads();
+            log_.emit(
+                "nv2a_gpu_raw_dirty_range_validation",
+                {
+                    {"unchanged_generation_passed", json_bool(
+                        dirty_range_validation.unchanged_generation_passed)},
+                    {"changed_generation_passed", json_bool(
+                        dirty_range_validation.changed_generation_passed)},
+                    {"layout_change_passed", json_bool(
+                        dirty_range_validation.layout_change_passed)},
+                    {"changed_ranges", std::to_string(
+                        dirty_range_validation.changed_range_count)},
+                    {"changed_upload_bytes", std::to_string(
+                        dirty_range_validation.changed_upload_bytes)},
+                    {"packed_resource_bytes", std::to_string(
+                        dirty_range_validation.packed_resource_bytes)},
+                    {"passed", json_bool(dirty_range_validation.passed())},
+                });
             const std::vector<NativeVertex> vertices =
                 prepare_presented_vertices();
             emit_presented_vertex_transform_diagnostics(true);
@@ -3439,13 +5022,28 @@ public:
             log_.emit(
                 "render_stream_analysis_complete",
                 {
-                    {"source_commands", std::to_string(recovered_source_.commands.size())},
+                    {"source_commands", std::to_string(
+                        options_.live_render_stream
+                            ? interpreted_source_command_count_
+                            : recovered_source_.commands.size())},
                     {"guest_flips", std::to_string(interpreted_stream_.flip_count)},
                     {"launch_transform_program_count", std::to_string(interpreted_stream_.launch_transform_program_count)},
                     {"failed_launch_transform_program_count", std::to_string(interpreted_stream_.failed_launch_transform_program_count)},
                     {"presented_draws", std::to_string(interpreted_stream_.presented_draw_count)},
                     {"zero_count_method_words", std::to_string(interpreted_stream_.zero_count_method_word_count)},
-                    {"zero_count_indexed_array_packets", std::to_string(interpreted_stream_.zero_count_indexed_array_packet_count)},
+                    {"zero_count_indexed_array_noop_packets", std::to_string(interpreted_stream_.zero_count_indexed_array_noop_packet_count)},
+                    {"ordered_push_buffer_appends", std::to_string(
+                        interpreted_stream_.ordered_push_buffer_append_count)},
+                    {"indexed_word_push_buffer_appends", std::to_string(
+                        interpreted_stream_.indexed_word_push_buffer_append_count)},
+                    {"reconstructed_push_buffer_appends", std::to_string(
+                        interpreted_stream_.reconstructed_push_buffer_append_count)},
+                    {"surface_payload_scans_skipped", std::to_string(
+                        interpreted_stream_.surface_payload_scan_skipped_count)},
+                    {"feedback_spec_cache_builds", std::to_string(
+                        feedback_spec_cache_build_count_)},
+                    {"feedback_spec_cache_hits", std::to_string(
+                        feedback_spec_cache_hit_count_)},
                     {"uploaded_vertices", std::to_string(vertices.size())},
                     {"presented_surface_color_offset", std::to_string(presented_surface_color_offset_)},
                     {"continuation_bootstrapped", json_bool(continuation_analysis_bootstrap_)},
@@ -3462,15 +5060,18 @@ public:
             return 0;
         }
         create_window();
+        initialize_controller_backend();
         create_surface();
         pick_physical_device();
         create_logical_device();
+        create_pipeline_cache();
         create_swapchain();
         create_image_views();
         create_depth_resources();
         create_render_pass();
         create_framebuffers();
         create_command_pool();
+        create_gpu_timing_resources();
         if (!load_initial_recovered_render_work()) {
             throw std::runtime_error("live render manifest was incomplete at startup");
         }
@@ -3593,14 +5194,27 @@ private:
         return {};
     }
 
-    bool append_live_command_stream(
+    bool read_live_command_stream_delta(
         const std::filesystem::path& path,
-        size_t required_record_count,
-        std::vector<RecoveredD3DCommand>& commands) {
-        if (path != live_command_file_path_ || !live_command_file_.is_open()) {
+        uint64_t snapshot_base_record_count,
+        uint64_t first_record_count,
+        uint64_t required_record_count) {
+        last_command_file_open_us_ = 0;
+        last_command_file_read_us_ = 0;
+        last_command_record_validation_us_ = 0;
+        last_command_read_bytes_ = 0u;
+        last_live_command_mmio_count_ = 0u;
+        last_command_file_reused_ = path == live_command_file_path_
+            && live_command_file_.is_open();
+        if (first_record_count < snapshot_base_record_count
+            || required_record_count < first_record_count) {
+            throw std::runtime_error(
+                "live command cursor is outside the published snapshot");
+        }
+        if (!last_command_file_reused_) {
+            const auto open_begin = std::chrono::steady_clock::now();
             live_command_file_.close();
             live_command_file_.clear();
-            commands.clear();
             live_command_file_.open(path, std::ios::binary);
             if (!live_command_file_) {
                 return false;
@@ -3613,58 +5227,186 @@ private:
                 return false;
             }
             live_command_file_path_ = path;
+            last_command_file_open_us_ = std::chrono::duration_cast<
+                std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - open_begin).count();
         }
-        constexpr uintmax_t header_size = 8;
-        constexpr uintmax_t record_size = 16;
+        constexpr uint64_t header_size = 8u;
+        constexpr uint64_t record_size = kRecoveredD3DCommandRecordSize;
         // The manifest is the validated publication boundary and is written
         // only after the producer flushes this many records. Avoid a separate
         // filesystem metadata query and do not parse commands from a newer,
         // in-progress guest frame merely because they already exist on disk.
-        const size_t record_count = required_record_count;
-        if (record_count <= commands.size()) {
+        const uint64_t local_first_record =
+            first_record_count - snapshot_base_record_count;
+        const uint64_t appended_count_u64 =
+            required_record_count - first_record_count;
+        if (local_first_record
+                > (static_cast<uint64_t>(
+                    std::numeric_limits<std::streamoff>::max()) - header_size)
+                    / record_size
+            || appended_count_u64
+                > std::numeric_limits<size_t>::max() / record_size) {
+            throw std::runtime_error("live command delta is too large");
+        }
+        live_command_delta_bytes_.clear();
+        last_native_command_read_count_ = 0u;
+        if (appended_count_u64 == 0u) {
             return true;
         }
+        const size_t appended_count = static_cast<size_t>(appended_count_u64);
+        live_command_delta_bytes_.resize(appended_count * record_size);
+        const auto read_begin = std::chrono::steady_clock::now();
         live_command_file_.clear();
         live_command_file_.seekg(
-            static_cast<std::streamoff>(header_size + commands.size() * record_size),
+            static_cast<std::streamoff>(
+                header_size + local_first_record * record_size),
             std::ios::beg);
-        if (record_count > commands.capacity()) {
-            // The sidecar is append-only. Leave geometric slack so a live
-            // reload does not relocate the complete command history for every
-            // small producer append.
-            const size_t growth = std::max<size_t>(
-                65536u,
-                commands.size() / 4u);
-            commands.reserve(std::max(record_count, commands.size() + growth));
-        }
-        const size_t appended_count = record_count - commands.size();
-        std::vector<uint8_t> appended_bytes(appended_count * record_size);
         live_command_file_.read(
-            reinterpret_cast<char*>(appended_bytes.data()),
-            static_cast<std::streamsize>(appended_bytes.size()));
+            reinterpret_cast<char*>(live_command_delta_bytes_.data()),
+            static_cast<std::streamsize>(live_command_delta_bytes_.size()));
+        last_command_file_read_us_ = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - read_begin).count();
         if (!live_command_file_) {
+            live_command_delta_bytes_.clear();
             return false;
         }
+        last_command_read_bytes_ = live_command_delta_bytes_.size();
+        const auto validation_begin = std::chrono::steady_clock::now();
         for (size_t record_index = 0; record_index < appended_count; ++record_index) {
-            const uint8_t* record = appended_bytes.data() + record_index * record_size;
+            const uint8_t* record = live_command_delta_bytes_.data()
+                + record_index * record_size;
             const uint8_t kind_raw = record[0];
             const uint8_t size = record[1];
-            uint32_t address = 0;
-            std::memcpy(&address, record + 4u, sizeof(address));
             if (size == 0 || size > 8u || kind_raw > 1u) {
+                live_command_delta_bytes_.clear();
                 return false;
             }
-            uint32_t value = 0;
-            std::memcpy(&value, record + 8u, std::min<size_t>(size, sizeof(value)));
-            commands.push_back(make_recovered_d3d_command(
-                kind_raw == 0u ? RecoveredD3DCommandKind::MmioWrite
-                               : RecoveredD3DCommandKind::PushBufferWrite,
-                address,
-                value,
-                size,
-                record + 8u,
-                size));
+            last_live_command_mmio_count_ += static_cast<uint32_t>(kind_raw == 0u);
         }
+        last_command_record_validation_us_ = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - validation_begin).count();
+        last_native_command_read_count_ = appended_count;
+        native_command_read_count_ += appended_count;
+        return true;
+    }
+
+    bool read_live_command_span_stream_delta(
+        const std::filesystem::path& path,
+        uint64_t snapshot_base_byte_count,
+        uint64_t first_byte_count,
+        uint64_t required_byte_count,
+        uint64_t expected_logical_write_count) {
+        last_command_file_open_us_ = 0;
+        last_command_file_read_us_ = 0;
+        last_command_record_validation_us_ = 0;
+        last_command_read_bytes_ = 0u;
+        last_live_command_mmio_count_ = 0u;
+        last_native_command_span_count_ = 0u;
+        last_command_file_reused_ = path == live_command_file_path_
+            && live_command_file_.is_open();
+        if (first_byte_count < snapshot_base_byte_count
+            || required_byte_count < first_byte_count) {
+            throw std::runtime_error(
+                "live command span cursor is outside the published snapshot");
+        }
+        if (!last_command_file_reused_) {
+            const auto open_begin = std::chrono::steady_clock::now();
+            live_command_file_.close();
+            live_command_file_.clear();
+            live_command_file_.open(path, std::ios::binary);
+            if (!live_command_file_) {
+                return false;
+            }
+            std::array<char, 8> magic{};
+            live_command_file_.read(
+                magic.data(), static_cast<std::streamsize>(magic.size()));
+            if (std::string(magic.data(), magic.size()) != "B2SPAN01") {
+                live_command_file_.close();
+                return false;
+            }
+            live_command_file_path_ = path;
+            last_command_file_open_us_ = std::chrono::duration_cast<
+                std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - open_begin).count();
+        }
+        constexpr uint64_t header_size = 8u;
+        const uint64_t local_first_byte =
+            first_byte_count - snapshot_base_byte_count;
+        const uint64_t appended_byte_count =
+            required_byte_count - first_byte_count;
+        if (local_first_byte
+                > static_cast<uint64_t>(
+                    std::numeric_limits<std::streamoff>::max()) - header_size
+            || appended_byte_count > std::numeric_limits<size_t>::max()) {
+            throw std::runtime_error("live command span delta is too large");
+        }
+        live_command_delta_bytes_.clear();
+        last_native_command_read_count_ = 0u;
+        if (appended_byte_count == 0u) {
+            return expected_logical_write_count == 0u;
+        }
+        live_command_delta_bytes_.resize(
+            static_cast<size_t>(appended_byte_count));
+        const auto read_begin = std::chrono::steady_clock::now();
+        live_command_file_.clear();
+        live_command_file_.seekg(
+            static_cast<std::streamoff>(header_size + local_first_byte),
+            std::ios::beg);
+        live_command_file_.read(
+            reinterpret_cast<char*>(live_command_delta_bytes_.data()),
+            static_cast<std::streamsize>(live_command_delta_bytes_.size()));
+        last_command_file_read_us_ = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - read_begin).count();
+        if (!live_command_file_) {
+            live_command_delta_bytes_.clear();
+            return false;
+        }
+        last_command_read_bytes_ = live_command_delta_bytes_.size();
+        const auto validation_begin = std::chrono::steady_clock::now();
+        uint64_t logical_write_count = 0u;
+        size_t cursor = 0u;
+        while (cursor < live_command_delta_bytes_.size()) {
+            if (live_command_delta_bytes_.size() - cursor
+                < kRecoveredD3DCommandSpanHeaderSize) {
+                live_command_delta_bytes_.clear();
+                return false;
+            }
+            const uint8_t* header = live_command_delta_bytes_.data() + cursor;
+            const uint8_t kind = header[0];
+            const uint8_t flags = header[1];
+            uint32_t payload_size = 0u;
+            uint32_t span_write_count = 0u;
+            std::memcpy(&payload_size, header + 8u, sizeof(payload_size));
+            std::memcpy(
+                &span_write_count,
+                header + 12u,
+                sizeof(span_write_count));
+            cursor += kRecoveredD3DCommandSpanHeaderSize;
+            if (kind > 1u || (flags & ~1u) != 0u || payload_size == 0u
+                || span_write_count == 0u
+                || payload_size > live_command_delta_bytes_.size() - cursor) {
+                live_command_delta_bytes_.clear();
+                return false;
+            }
+            last_live_command_mmio_count_ += static_cast<uint32_t>(kind == 0u);
+            logical_write_count += span_write_count;
+            ++last_native_command_span_count_;
+            cursor += payload_size;
+        }
+        last_command_record_validation_us_ = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - validation_begin).count();
+        if (logical_write_count != expected_logical_write_count) {
+            live_command_delta_bytes_.clear();
+            return false;
+        }
+        last_native_command_read_count_ = static_cast<size_t>(logical_write_count);
+        native_command_read_count_ += logical_write_count;
+        native_command_span_read_count_ += last_native_command_span_count_;
         return true;
     }
 
@@ -3813,8 +5555,12 @@ private:
         for (uint32_t index = 0; index < count; ++index) {
             VkBool32 present_supported = VK_FALSE;
             vkGetPhysicalDeviceSurfaceSupportKHR(device, index, surface_, &present_supported);
-            if ((families[index].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present_supported == VK_TRUE) {
-                return QueueFamilySelection{index};
+            if ((families[index].queueFlags & VK_QUEUE_GRAPHICS_BIT)
+                && present_supported == VK_TRUE) {
+                return QueueFamilySelection{
+                    index,
+                    (families[index].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0u,
+                };
             }
         }
         return std::nullopt;
@@ -3882,7 +5628,122 @@ private:
 
         vk_check(vkCreateDevice(physical_device_, &create_info, nullptr, &device_), "vkCreateDevice");
         vkGetDeviceQueue(device_, queue_family_.index, 0, &graphics_queue_);
-        log_.emit("logical_device_created", {{"queue_family", std::to_string(queue_family_.index)}});
+        log_.emit(
+            "logical_device_created",
+            {
+                {"queue_family", std::to_string(queue_family_.index)},
+                {"compute_supported", json_bool(
+                    queue_family_.supports_compute)},
+            });
+    }
+
+    void create_pipeline_cache() {
+        std::vector<uint8_t> initial_data;
+        if (!options_.pipeline_cache.empty()) {
+            std::ifstream input(options_.pipeline_cache, std::ios::binary);
+            if (input) {
+                input.seekg(0, std::ios::end);
+                const std::streamoff size = input.tellg();
+                if (size > 0 && size <= 256 * 1024 * 1024) {
+                    initial_data.resize(static_cast<size_t>(size));
+                    input.seekg(0, std::ios::beg);
+                    input.read(
+                        reinterpret_cast<char*>(initial_data.data()),
+                        static_cast<std::streamsize>(initial_data.size()));
+                    if (!input) {
+                        initial_data.clear();
+                    }
+                }
+            }
+        }
+        VkPipelineCacheCreateInfo cache_info{};
+        cache_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+        cache_info.initialDataSize = initial_data.size();
+        cache_info.pInitialData = initial_data.empty()
+            ? nullptr
+            : initial_data.data();
+        VkResult result = vkCreatePipelineCache(
+            device_, &cache_info, nullptr, &pipeline_cache_);
+        if (result != VK_SUCCESS && !initial_data.empty()) {
+            pipeline_cache_ = VK_NULL_HANDLE;
+            cache_info.initialDataSize = 0u;
+            cache_info.pInitialData = nullptr;
+            result = vkCreatePipelineCache(
+                device_, &cache_info, nullptr, &pipeline_cache_);
+            pipeline_cache_rejected_ = true;
+        }
+        vk_check(result, "vkCreatePipelineCache");
+        pipeline_cache_loaded_bytes_ = pipeline_cache_rejected_
+            ? 0u
+            : initial_data.size();
+        log_.emit(
+            "vulkan_pipeline_cache_opened",
+            {
+                {"path", options_.pipeline_cache.empty()
+                    ? "null" : json_string(options_.pipeline_cache.string())},
+                {"loaded_bytes", std::to_string(
+                    pipeline_cache_loaded_bytes_)},
+                {"initial_data_rejected", json_bool(
+                    pipeline_cache_rejected_)},
+            });
+    }
+
+    void persist_pipeline_cache() {
+        if (pipeline_cache_ == VK_NULL_HANDLE) {
+            return;
+        }
+        size_t byte_count = 0u;
+        VkResult result = vkGetPipelineCacheData(
+            device_, pipeline_cache_, &byte_count, nullptr);
+        std::vector<uint8_t> data;
+        if (result == VK_SUCCESS && byte_count != 0u) {
+            data.resize(byte_count);
+            result = vkGetPipelineCacheData(
+                device_, pipeline_cache_, &byte_count, data.data());
+            if (result == VK_SUCCESS) {
+                data.resize(byte_count);
+            }
+        }
+        bool written = false;
+        if (result == VK_SUCCESS
+            && !data.empty()
+            && !options_.pipeline_cache.empty()) {
+            std::error_code directory_error;
+            if (options_.pipeline_cache.has_parent_path()) {
+                std::filesystem::create_directories(
+                    options_.pipeline_cache.parent_path(),
+                    directory_error);
+            }
+            const std::filesystem::path temporary =
+                options_.pipeline_cache.string() + ".tmp";
+            if (!directory_error) {
+                std::ofstream output(
+                    temporary,
+                    std::ios::binary | std::ios::trunc);
+                output.write(
+                    reinterpret_cast<const char*>(data.data()),
+                    static_cast<std::streamsize>(data.size()));
+                output.close();
+                written = static_cast<bool>(output)
+                    && MoveFileExW(
+                        temporary.c_str(),
+                        options_.pipeline_cache.c_str(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+            }
+            if (!written) {
+                std::error_code ignored;
+                std::filesystem::remove(temporary, ignored);
+            }
+        }
+        pipeline_cache_saved_bytes_ = written ? data.size() : 0u;
+        log_.emit(
+            "vulkan_pipeline_cache_saved",
+            {
+                {"path", options_.pipeline_cache.empty()
+                    ? "null" : json_string(options_.pipeline_cache.string())},
+                {"bytes", std::to_string(pipeline_cache_saved_bytes_)},
+                {"written", json_bool(written)},
+            });
     }
 
     void create_swapchain() {
@@ -4213,6 +6074,40 @@ private:
         log_.emit("command_pool_created");
     }
 
+    void create_gpu_timing_resources() {
+        uint32_t family_count = 0u;
+        vkGetPhysicalDeviceQueueFamilyProperties(
+            physical_device_, &family_count, nullptr);
+        std::vector<VkQueueFamilyProperties> families(family_count);
+        vkGetPhysicalDeviceQueueFamilyProperties(
+            physical_device_, &family_count, families.data());
+        if (queue_family_.index >= families.size()
+            || families[queue_family_.index].timestampValidBits == 0u
+            || framebuffers_.empty()) {
+            log_.emit("gpu_frame_timing_unavailable");
+            return;
+        }
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(physical_device_, &properties);
+        gpu_timestamp_period_ns_ = properties.limits.timestampPeriod;
+        gpu_timestamp_valid_bits_ =
+            families[queue_family_.index].timestampValidBits;
+        VkQueryPoolCreateInfo create_info{};
+        create_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        create_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        create_info.queryCount = static_cast<uint32_t>(framebuffers_.size()) * 2u;
+        vk_check(
+            vkCreateQueryPool(device_, &create_info, nullptr, &gpu_timing_query_pool_),
+            "vkCreateQueryPool(frame timing)");
+        log_.emit(
+            "gpu_frame_timing_ready",
+            {
+                {"timestamp_period_ns", json_float(gpu_timestamp_period_ns_)},
+                {"timestamp_valid_bits", std::to_string(
+                    gpu_timestamp_valid_bits_)},
+            });
+    }
+
     uint32_t find_memory_type(uint32_t type_bits, VkMemoryPropertyFlags properties) const {
         VkPhysicalDeviceMemoryProperties memory_properties{};
         vkGetPhysicalDeviceMemoryProperties(physical_device_, &memory_properties);
@@ -4263,12 +6158,18 @@ private:
             });
     }
 
-    bool load_recovered_render_work() {
+    bool load_recovered_render_work(
+        const std::function<void()>& source_resident_callback = {}) {
         const auto command_load_begin = std::chrono::steady_clock::now();
+        last_resource_snapshot_reused_count_ = 0u;
+        last_resource_snapshot_reused_bytes_ = 0u;
         auto after_manifest_read = command_load_begin;
         bool resources_unchanged = false;
+        bool resource_generation_changed = false;
+        bool resource_generation_declared = false;
         std::filesystem::path resource_source;
         std::filesystem::file_time_type resource_write_time{};
+        std::string next_resource_generation = live_resource_generation_;
         std::string manifest_text;
         if (options_.live_render_stream && !options_.render_stream_json.empty()) {
             manifest_text = read_live_render_manifest().value_or(
@@ -4296,12 +6197,22 @@ private:
                 manifest_text, "guest_flip_count");
             const auto guest_steps_field = json_object_field_text(
                 manifest_text, "guest_steps");
+            const auto guest_compiled_blocks_field = json_object_field_text(
+                manifest_text, "guest_compiled_blocks");
+            const auto guest_invalidations_field = json_object_field_text(
+                manifest_text, "guest_invalidations");
             const auto presentable_command_field = json_object_field_text(
                 manifest_text, "presentable_command_record_count");
             const auto published_command_field = json_object_field_text(
                 manifest_text, "published_command_record_count");
             const auto command_base_field = json_object_field_text(
                 manifest_text, "command_snapshot_base_record_count");
+            const auto command_transport_field = json_object_field_text(
+                manifest_text, "command_transport_format");
+            const auto presentable_command_byte_field = json_object_field_text(
+                manifest_text, "presentable_command_byte_count");
+            const auto command_base_byte_field = json_object_field_text(
+                manifest_text, "command_snapshot_base_byte_count");
             if (guest_flip_field.has_value()) {
                 current_manifest_guest_flip_count_ = parse_json_u64_text(
                     *guest_flip_field, "guest flip count");
@@ -4309,6 +6220,14 @@ private:
             if (guest_steps_field.has_value()) {
                 current_manifest_guest_steps_ = parse_json_u64_text(
                     *guest_steps_field, "guest steps");
+            }
+            if (guest_compiled_blocks_field.has_value()) {
+                current_manifest_guest_compiled_blocks_ = parse_json_u64_text(
+                    *guest_compiled_blocks_field, "guest compiled blocks");
+            }
+            if (guest_invalidations_field.has_value()) {
+                current_manifest_guest_invalidations_ = parse_json_u64_text(
+                    *guest_invalidations_field, "guest invalidations");
             }
             if (presentable_command_field.has_value()) {
                 current_manifest_presentable_command_count_ = parse_json_u64_text(
@@ -4321,6 +6240,29 @@ private:
                 ? parse_json_u64_text(
                     *command_base_field, "command snapshot base record count")
                 : 0u;
+            current_manifest_bulk_span_commands_ =
+                command_transport_field.has_value()
+                && *command_transport_field == "bulk_span_v1";
+            current_manifest_presentable_command_byte_count_ =
+                presentable_command_byte_field.has_value()
+                ? parse_json_u64_text(
+                    *presentable_command_byte_field,
+                    "presentable command byte count")
+                : 0u;
+            current_manifest_command_base_byte_count_ =
+                command_base_byte_field.has_value()
+                ? parse_json_u64_text(
+                    *command_base_byte_field,
+                    "command snapshot base byte count")
+                : 0u;
+            if (current_manifest_bulk_span_commands_
+                && (!presentable_command_byte_field.has_value()
+                    || !command_base_byte_field.has_value()
+                    || current_manifest_command_base_byte_count_
+                        > current_manifest_presentable_command_byte_count_)) {
+                throw std::runtime_error(
+                    "bulk-span manifest has an invalid command byte boundary");
+            }
             if (current_manifest_command_base_count_
                 > current_manifest_presentable_command_count_) {
                 throw std::runtime_error(
@@ -4330,15 +6272,23 @@ private:
                 manifest_text, "resource_snapshot_path");
             const auto resource_generation_field = json_object_field_text(
                 manifest_text, "resource_stream_generation");
+            resource_generation_declared = resource_generation_field.has_value();
             resource_source = resource_field.has_value()
                 ? std::filesystem::path(*resource_field)
                 : options_.render_stream_json;
-            if (resource_generation_field.has_value()
-                && !live_resource_generation_.empty()
-                && *resource_generation_field == live_resource_generation_) {
-                resources_unchanged = true;
-            } else if (resource_generation_field.has_value()) {
-                live_resource_generation_ = *resource_generation_field;
+            if (resource_generation_field.has_value()) {
+                next_resource_generation = *resource_generation_field;
+                resources_unchanged = !live_resource_generation_.empty()
+                    && next_resource_generation == live_resource_generation_
+                    && resource_source == live_resource_source_;
+                if (!live_resource_generation_.empty()
+                    && next_resource_generation == live_resource_generation_
+                    && !live_resource_source_.empty()
+                    && resource_source != live_resource_source_) {
+                    throw std::runtime_error(
+                        "live resource generation changed snapshot paths");
+                }
+                resource_generation_changed = !resources_unchanged;
             } else {
                 std::error_code resource_error;
                 resource_write_time = std::filesystem::last_write_time(
@@ -4348,7 +6298,7 @@ private:
                     && resource_write_time == live_resource_write_time_) {
                     resources_unchanged = true;
                 } else if (!resource_error) {
-                    live_resource_write_time_ = resource_write_time;
+                    resource_generation_changed = true;
                 }
             }
         }
@@ -4399,6 +6349,7 @@ private:
         }
         if (publication_event_field.has_value()
             && *publication_event_field != publication_event_name_) {
+            publication_retry_pending_ = false;
             if (publication_event_) {
                 CloseHandle(publication_event_);
                 publication_event_ = nullptr;
@@ -4412,153 +6363,170 @@ private:
         const bool command_generation_changed = options_.live_render_stream
             && generation_field.has_value()
             && *generation_field != live_command_generation_;
-        const bool incremental_commands = options_.live_render_stream
+        const bool native_incremental_commands = options_.live_render_stream
             && command_field.has_value()
-            && generation_field.has_value()
-            && *generation_field == live_command_generation_;
-        std::vector<RecoveredD3DCommand> retained_commands;
-        std::vector<RecoveredTextureResource> retained_resources;
-        if (incremental_commands) {
-            retained_commands = std::move(recovered_source_.commands);
+            && generation_field.has_value();
+        if (options_.live_render_stream && !native_incremental_commands) {
+            throw std::runtime_error(
+                "live render manifest is missing its command snapshot identity");
         }
-        if (resources_unchanged) {
-            retained_resources = std::move(recovered_source_.textures);
-        }
-        const auto before_source_load = std::chrono::steady_clock::now();
-        RecoveredD3DStreamSource next_source = load_or_build_recovered_d3d_command_stream(
-            options_.render_stream_json,
-            !resources_unchanged,
-            manifest_text.empty() ? nullptr : &manifest_text,
-            !incremental_commands);
-        if (incremental_commands) {
-            const uint64_t required_record_count_u64 =
-                current_manifest_presentable_command_count_
-                - current_manifest_command_base_count_;
-            const size_t required_record_count = static_cast<size_t>(
-                std::min<uint64_t>(
-                    required_record_count_u64,
-                    std::numeric_limits<size_t>::max()));
-            if (append_live_command_stream(
-                    std::filesystem::path(*command_field),
-                    required_record_count,
-                    retained_commands)) {
-                next_source.commands = std::move(retained_commands);
-            } else {
-                next_source.commands = load_recovered_d3d_binary_stream(
-                    std::filesystem::path(*command_field));
+        uint64_t target_command_count =
+            current_manifest_presentable_command_count_;
+        const uint64_t target_command_byte_count =
+            current_manifest_presentable_command_byte_count_;
+        if (!options_.flip_audit_ack.empty()) {
+            if (current_audit_command_count_ > target_command_count) {
+                throw std::runtime_error(
+                    "lossless flip audit exceeds the presentable command boundary");
             }
+            target_command_count = current_audit_command_count_;
         }
-        if (resources_unchanged) {
-            next_source.textures = std::move(retained_resources);
-        }
-        const auto after_source_load = std::chrono::steady_clock::now();
-        if (options_.live_render_stream) {
-            if (generation_field.has_value()
-                && *generation_field != live_command_generation_
-                && command_field.has_value()) {
-                live_command_file_.close();
-                live_command_file_.clear();
-                live_command_file_path_ = std::filesystem::path(*command_field);
-            }
-            live_command_generation_ = generation_field.value_or(std::string{});
-        }
-        next_source.resources_unchanged = resources_unchanged;
-        recovered_source_ = std::move(next_source);
-        if (!options_.flip_audit_ack.empty()
-            && current_audit_command_count_
-                - std::min<uint64_t>(
-                    current_audit_command_count_,
-                    current_manifest_command_base_count_)
-                > recovered_source_.commands.size()) {
-            std::ostringstream message;
-            message << "lossless flip audit command stream is short for flip "
-                    << current_audit_flip_ << ": manifest="
-                    << current_audit_command_count_ << " loaded="
-                    << recovered_source_.commands.size();
-            throw std::runtime_error(message.str());
-        }
-        if (!options_.flip_audit_ack.empty()
-            && recovered_source_.commands.size()
-                > current_audit_command_count_
-                    - std::min<uint64_t>(
-                        current_audit_command_count_,
-                        current_manifest_command_base_count_)) {
-            recovered_source_.commands.resize(static_cast<size_t>(
-                current_audit_command_count_ - current_manifest_command_base_count_));
-        }
-        const auto before_interpret = std::chrono::steady_clock::now();
-        if (options_.live_render_stream) {
-            const size_t presentable_command_count = static_cast<size_t>(
-                std::min<uint64_t>(
-                    current_manifest_presentable_command_count_,
-                    std::numeric_limits<size_t>::max()));
-            const size_t command_base_count = static_cast<size_t>(
-                std::min<uint64_t>(
-                    current_manifest_command_base_count_,
-                    std::numeric_limits<size_t>::max()));
-            const size_t resident_presentable_command_count =
-                presentable_command_count - command_base_count;
-            if (resident_presentable_command_count
-                > recovered_source_.commands.size()) {
-                std::ostringstream message;
-                message << "live render manifest requires "
-                        << resident_presentable_command_count
-                        << " resident commands but sidecar has "
-                        << recovered_source_.commands.size();
-                throw std::runtime_error(message.str());
-            }
-            if (command_generation_changed
-                || interpreted_source_command_count_ > presentable_command_count) {
-                if (command_base_count != 0u
+        bool reset_interpreter = false;
+        uint64_t command_read_begin = 0u;
+        uint64_t command_read_begin_byte = 0u;
+        if (native_incremental_commands) {
+            reset_interpreter = command_generation_changed
+                || interpreted_source_command_count_ > target_command_count
+                || (current_manifest_bulk_span_commands_
+                    && interpreted_source_command_byte_count_
+                        > target_command_byte_count);
+            if (reset_interpreter) {
+                if (current_manifest_command_base_count_ != 0u
                     && !options_.analyze_render_stream_only) {
                     throw std::runtime_error(
                         "live render continuation snapshot cannot bootstrap a new presenter");
                 }
+                command_read_begin = current_manifest_command_base_count_;
+                command_read_begin_byte =
+                    current_manifest_command_base_byte_count_;
+            } else if (interpreted_source_command_count_
+                < current_manifest_command_base_count_) {
+                if (!options_.analyze_render_stream_only) {
+                    throw std::runtime_error(
+                        "live render continuation snapshot skipped uninterpreted commands");
+                }
+                reset_interpreter = true;
+                command_read_begin = current_manifest_command_base_count_;
+                command_read_begin_byte =
+                    current_manifest_command_base_byte_count_;
+            } else {
+                command_read_begin = interpreted_source_command_count_;
+                command_read_begin_byte = interpreted_source_command_byte_count_;
+            }
+            if (command_read_begin > target_command_count) {
+                throw std::runtime_error(
+                    "live command cursor passed the presentable boundary");
+            }
+            if (current_manifest_bulk_span_commands_
+                && command_read_begin_byte > target_command_byte_count) {
+                throw std::runtime_error(
+                    "live command byte cursor passed the presentable boundary");
+            }
+        }
+        const auto before_source_load = std::chrono::steady_clock::now();
+        if (native_incremental_commands) {
+            const bool loaded_commands = current_manifest_bulk_span_commands_
+                ? read_live_command_span_stream_delta(
+                    std::filesystem::path(*command_field),
+                    current_manifest_command_base_byte_count_,
+                    command_read_begin_byte,
+                    target_command_byte_count,
+                    target_command_count - command_read_begin)
+                : read_live_command_stream_delta(
+                    std::filesystem::path(*command_field),
+                    current_manifest_command_base_count_,
+                    command_read_begin,
+                    target_command_count);
+            if (!loaded_commands) {
+                return false;
+            }
+        }
+        // Validate and retain the command delta before moving hash-identical
+        // payloads out of the active resource snapshot. An incomplete sidecar
+        // retry must leave the currently presented resources intact.
+        RecoveredD3DStreamSource next_source = load_or_build_recovered_d3d_command_stream(
+            options_.render_stream_json,
+            !resources_unchanged,
+            manifest_text.empty() ? nullptr : &manifest_text,
+            !native_incremental_commands,
+            options_.live_render_stream && !resources_unchanged,
+            options_.live_render_stream && !resources_unchanged
+                ? &recovered_source_.textures : nullptr,
+            &last_resource_snapshot_reused_count_,
+            &last_resource_snapshot_reused_bytes_);
+        if (resources_unchanged) {
+            next_source.textures = std::move(recovered_source_.textures);
+        }
+        const auto after_source_load = std::chrono::steady_clock::now();
+        if (options_.live_render_stream) {
+            live_command_generation_ = *generation_field;
+            live_resource_generation_ = next_resource_generation;
+            live_resource_source_ = resource_source;
+            if (!resource_generation_declared) {
+                live_resource_write_time_ = resource_write_time;
+            }
+        }
+        next_source.resources_unchanged = resources_unchanged;
+        recovered_source_ = std::move(next_source);
+        last_resource_generation_changed_ = resource_generation_changed;
+        last_command_cursor_reset_ = reset_interpreter;
+        const auto after_command_load = std::chrono::steady_clock::now();
+        if (source_resident_callback) {
+            // The packed command delta and resource payloads are private to the
+            // presenter now. A depth-two reload may release the producer before
+            // interpreting either buffer; subsequent epoch rotation cannot
+            // invalidate these resident copies.
+            source_resident_callback();
+        }
+        const auto before_interpret = std::chrono::steady_clock::now();
+        if (options_.live_render_stream) {
+            if (reset_interpreter) {
                 interpreted_stream_ = InterpretedD3DStream{};
                 interpreted_stream_.state_seed = 0xB200D3D8u;
-                interpreted_source_command_count_ = command_base_count;
-                continuation_analysis_bootstrap_ = command_base_count != 0u;
+                interpreted_source_command_count_ = static_cast<size_t>(
+                    current_manifest_command_base_count_);
+                interpreted_source_command_byte_count_ =
+                    current_manifest_command_base_byte_count_;
+                continuation_analysis_bootstrap_ =
+                    current_manifest_command_base_count_ != 0u;
                 if (continuation_analysis_bootstrap_) {
                     log_.emit(
                         "render_stream_continuation_bootstrapped",
                         {
                             {"analysis_only", json_bool(true)},
                             {"state_history_complete", json_bool(false)},
-                            {"command_snapshot_base_record_count", std::to_string(command_base_count)},
-                            {"presentable_command_record_count", std::to_string(presentable_command_count)},
-                            {"resident_command_record_count", std::to_string(resident_presentable_command_count)},
+                            {"command_snapshot_base_record_count", std::to_string(current_manifest_command_base_count_)},
+                            {"presentable_command_record_count", std::to_string(target_command_count)},
+                            {"resident_command_record_count", std::to_string(
+                                target_command_count - current_manifest_command_base_count_)},
                         });
                 }
             }
-            if (interpreted_source_command_count_ < command_base_count) {
-                if (!options_.analyze_render_stream_only) {
+            const uint64_t expected_delta = target_command_count - command_read_begin;
+            if (current_manifest_bulk_span_commands_) {
+                const uint64_t interpreted_delta =
+                    interpret_recovered_d3d_span_append(
+                        live_command_delta_bytes_,
+                        interpreted_stream_);
+                if (interpreted_delta != expected_delta) {
                     throw std::runtime_error(
-                        "live render continuation snapshot skipped uninterpreted commands");
+                        "bulk live command interpreter returned an incomplete delta");
                 }
-                interpreted_stream_ = InterpretedD3DStream{};
-                interpreted_stream_.state_seed = 0xB200D3D8u;
-                interpreted_source_command_count_ = command_base_count;
-                continuation_analysis_bootstrap_ = true;
-                log_.emit(
-                    "render_stream_continuation_bootstrapped",
-                    {
-                        {"analysis_only", json_bool(true)},
-                        {"state_history_complete", json_bool(false)},
-                        {"command_snapshot_base_record_count", std::to_string(command_base_count)},
-                        {"presentable_command_record_count", std::to_string(presentable_command_count)},
-                        {"resident_command_record_count", std::to_string(resident_presentable_command_count)},
-                    });
+            } else {
+                if (expected_delta
+                    != live_command_delta_bytes_.size()
+                        / kRecoveredD3DCommandRecordSize) {
+                    throw std::runtime_error(
+                        "native live command reader returned an incomplete delta");
+                }
+                interpret_recovered_d3d_packed_append(
+                    live_command_delta_bytes_,
+                    interpreted_stream_);
             }
-            last_interpreted_command_delta_ =
-                presentable_command_count - interpreted_source_command_count_;
-            const size_t resident_interpret_begin =
-                interpreted_source_command_count_ - command_base_count;
-            interpret_recovered_d3d_append(
-                recovered_source_.commands,
-                resident_interpret_begin,
-                resident_presentable_command_count,
-                interpreted_stream_);
-            interpreted_source_command_count_ = presentable_command_count;
+            last_interpreted_command_delta_ = static_cast<size_t>(expected_delta);
+            interpreted_source_command_count_ = static_cast<size_t>(
+                target_command_count);
+            interpreted_source_command_byte_count_ = target_command_byte_count;
         } else {
             interpreted_stream_ = interpret_recovered_d3d_stream(
                 recovered_source_.commands,
@@ -4566,13 +6534,25 @@ private:
             interpreted_source_command_count_ = recovered_source_.commands.size();
             last_interpreted_command_delta_ = interpreted_source_command_count_;
         }
+        const auto after_method_interpret = std::chrono::steady_clock::now();
         materialize_indexed_draws(
-            interpreted_stream_, recovered_source_.textures);
+            interpreted_stream_,
+            recovered_source_.textures,
+            gpu_raw_vertex_resource_cache_,
+            !options_.cpu_vertex_programs
+                && !options_.cpu_vertex_attributes
+                && !options_.analyze_render_stream_only,
+            recovered_source_.resources_unchanged);
+        if (last_interpreted_command_delta_ != 0u
+            || last_resource_generation_changed_) {
+            ++render_work_generation_;
+            presented_diagnostics_valid_ = false;
+        }
         presented_surface_color_offset_ =
             select_presented_surface_color_offset();
         const auto after_interpret = std::chrono::steady_clock::now();
         last_command_load_us_ = std::chrono::duration_cast<std::chrono::microseconds>(
-            before_interpret - command_load_begin).count();
+            after_command_load - command_load_begin).count();
         last_manifest_read_us_ = std::chrono::duration_cast<std::chrono::microseconds>(
             after_manifest_read - command_load_begin).count();
         last_manifest_parse_us_ = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -4581,8 +6561,14 @@ private:
             after_source_load - before_source_load).count();
         last_interpret_us_ = std::chrono::duration_cast<std::chrono::microseconds>(
             after_interpret - before_interpret).count();
+        last_method_interpret_us_ = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                after_method_interpret - before_interpret).count();
+        last_indexed_materialize_us_ = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                after_interpret - after_method_interpret).count();
         recovered_frontend_text_ = recovered_source_.frontend_text;
-        if (options_.live_render_stream) {
+        if (options_.live_render_stream && !publication_event_) {
             std::error_code error;
             live_render_write_time_ = std::filesystem::last_write_time(
                 options_.render_stream_json, error);
@@ -4592,15 +6578,22 @@ private:
 
     void destroy_native_render_resources(
         bool preserve_textures = false,
-        bool preserve_vertex_buffer = false) {
-        destroy_offscreen_render_targets();
+        bool preserve_vertex_buffer = false,
+        bool preserve_offscreen_render_targets = false) {
+        if (!preserve_offscreen_render_targets) {
+            destroy_offscreen_render_targets();
+        }
         if (!command_buffers_.empty()) {
             vkFreeCommandBuffers(
                 device_, command_pool_, static_cast<uint32_t>(command_buffers_.size()),
                 command_buffers_.data());
             command_buffers_.clear();
+            command_buffer_draw_counts_.clear();
+            command_buffer_triangle_counts_.clear();
+            command_buffer_barrier_counts_.clear();
         }
         if (!preserve_vertex_buffer) {
+            destroy_host_texture_bindings();
             if (vertex_mapped_) {
                 vkUnmapMemory(device_, vertex_memory_);
                 vertex_mapped_ = nullptr;
@@ -4623,6 +6616,11 @@ private:
                 if (texture.memory) vkFreeMemory(device_, texture.memory, nullptr);
             }
             host_textures_.clear();
+            for (HostTexture& texture :
+                 render_target_feedback_image_cache_) {
+                destroy_host_texture(texture);
+            }
+            render_target_feedback_image_cache_.clear();
         }
         presented_half_quad_recovered_ = false;
         presented_overscan_height_recovered_ = false;
@@ -4642,27 +6640,70 @@ private:
         if (!options_.live_render_stream) {
             return;
         }
-        std::error_code error;
-        const auto write_time = std::filesystem::last_write_time(
-            options_.render_stream_json, error);
+        const auto probe_begin = std::chrono::steady_clock::now();
+        if (publication_event_ && !publication_signaled) {
+            if (publication_retry_pending_) {
+                publication_signaled = true;
+            } else {
+                const DWORD result = WaitForSingleObject(publication_event_, 0u);
+                if (result == WAIT_TIMEOUT) {
+                    last_reload_probe_us_ += static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - probe_begin).count());
+                    return;
+                }
+                if (result != WAIT_OBJECT_0) {
+                    throw std::runtime_error(
+                        "publication event probe failed");
+                }
+                publication_signaled = true;
+            }
+        }
         // The validated manifest is the publication boundary. Command/resource
         // sidecars are written first and may grow while a guest frame is still
         // under construction; consuming them directly would replay partial
         // work under a stale flip identity.
-        if (error || (!publication_signaled && write_time == live_render_write_time_)) {
-            return;
+        if (!publication_signaled) {
+            std::error_code error;
+            const auto write_time = std::filesystem::last_write_time(
+                options_.render_stream_json, error);
+            if (error || write_time == live_render_write_time_) {
+                last_reload_probe_us_ += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - probe_begin).count());
+                return;
+            }
         }
+        last_reload_probe_us_ += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - probe_begin).count());
         const auto reload_begin = std::chrono::steady_clock::now();
         // Only one frame can be in flight. Waiting for its fence is sufficient
         // before replacing command buffers/resources and avoids draining the
         // entire device on every guest publication.
-        vk_check(
-            vkWaitForFences(device_, 1, &in_flight_, VK_TRUE, UINT64_MAX),
-            "vkWaitForFences(live reload)");
+        wait_for_in_flight_fence("vkWaitForFences(live reload)");
         const auto after_wait = std::chrono::steady_clock::now();
-        if (!load_recovered_render_work()) {
+        auto source_resident = after_wait;
+        auto presentation_ack_begin = after_wait;
+        auto presentation_ack_end = after_wait;
+        bool presentation_ack_published = false;
+        const auto source_resident_callback = [&]() {
+            source_resident = std::chrono::steady_clock::now();
+            if (options_.presentation_pipeline_depth == 2u) {
+                // Both sidecars are fully loaded into presenter-owned memory.
+                // Releasing the guest here overlaps method interpretation,
+                // indexed materialization, and all Vulkan preparation with its
+                // next flip while preserving one-future-publication ordering.
+                presentation_ack_begin = source_resident;
+                presentation_ack_published = acknowledge_current_presentation();
+                presentation_ack_end = std::chrono::steady_clock::now();
+            }
+        };
+        if (!load_recovered_render_work(source_resident_callback)) {
+            publication_retry_pending_ = publication_event_ != nullptr;
             return;
         }
+        publication_retry_pending_ = false;
         const auto after_load = std::chrono::steady_clock::now();
         if (last_interpreted_command_delta_ == 0u
             && recovered_source_.resources_unchanged
@@ -4688,24 +6729,67 @@ private:
         const auto [presented_vertex_begin, presented_vertex_end] =
             presented_vertex_span(interpreted_stream_);
         const VkDeviceSize required_vertex_bytes =
-            (presented_vertex_end - presented_vertex_begin)
-            * sizeof(NativeVertex);
+            std::max<VkDeviceSize>(
+                (presented_vertex_end - presented_vertex_begin)
+                    * sizeof(NativeVertex),
+                sizeof(NativeVertex));
         const bool preserve_vertex_buffer = vertex_buffer_ != VK_NULL_HANDLE
-            && required_vertex_bytes != 0
             && required_vertex_bytes <= vertex_buffer_size_;
-        destroy_native_render_resources(preserve_textures, preserve_vertex_buffer);
-        create_native_render_resources(!recovered_source_.resources_unchanged);
+        // Resource payload generations do not own GPU-produced feedback
+        // attachments. Keep an offscreen framebuffer when the newly loaded
+        // command stream requests the same target and its exact backing view
+        // is still resident; refresh_host_textures verifies the view again
+        // after applying the new generation.
+        const bool preserve_offscreen_render_targets =
+            preserve_textures
+            && !offscreen_render_targets_.empty()
+            && offscreen_render_targets_match_presented_specs();
+        const auto resource_destroy_begin =
+            std::chrono::steady_clock::now();
+        destroy_native_render_resources(
+            preserve_textures,
+            preserve_vertex_buffer,
+            preserve_offscreen_render_targets);
+        const auto after_resource_destroy =
+            std::chrono::steady_clock::now();
+        create_native_render_resources(
+            !recovered_source_.resources_unchanged,
+            preserve_offscreen_render_targets);
+        const auto after_native_resources =
+            std::chrono::steady_clock::now();
         create_native_graphics_pipeline();
         const auto after_resources = std::chrono::steady_clock::now();
+        const int64_t resource_preflight_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                resource_destroy_begin - after_load).count();
+        const int64_t resource_destroy_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                after_resource_destroy - resource_destroy_begin).count();
+        const int64_t native_resource_create_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                after_native_resources - after_resource_destroy).count();
+        const int64_t pipeline_prepare_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                after_resources - after_native_resources).count();
+        const int64_t resource_update_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                after_resources - after_load).count();
+        const int64_t resource_prepare_us = std::max<int64_t>(
+            resource_update_us - last_render_validation_us_,
+            0);
         create_command_buffers();
         const auto after_commands = std::chrono::steady_clock::now();
-        acknowledge_current_presentation();
+        if (options_.presentation_pipeline_depth == 1u) {
+            presentation_ack_begin = std::chrono::steady_clock::now();
+            presentation_ack_published = acknowledge_current_presentation();
+            presentation_ack_end = std::chrono::steady_clock::now();
+        }
         ++live_render_reload_count_;
         log_.emit(
             "live_render_stream_reloaded",
             {
                 {"reload", std::to_string(live_render_reload_count_)},
-                {"writes", std::to_string(recovered_source_.commands.size())},
+                {"writes", std::to_string(interpreted_source_command_count_)},
                 {"guest_flips", std::to_string(interpreted_stream_.flip_count)},
                 {"manifest_guest_flip_count", std::to_string(current_manifest_guest_flip_count_)},
                 {"manifest_guest_steps", std::to_string(current_manifest_guest_steps_)},
@@ -4713,29 +6797,205 @@ private:
                 {"failed_launch_transform_program_count", std::to_string(interpreted_stream_.failed_launch_transform_program_count)},
                 {"presentable_command_record_count", std::to_string(current_manifest_presentable_command_count_)},
                 {"command_snapshot_base_record_count", std::to_string(current_manifest_command_base_count_)},
-                {"resident_command_record_count", std::to_string(recovered_source_.commands.size())},
+                {"resident_command_record_count", std::to_string(
+                    current_manifest_presentable_command_count_
+                        - current_manifest_command_base_count_)},
+                {"native_command_records_read", std::to_string(
+                    last_native_command_read_count_)},
+                {"native_command_records_read_total", std::to_string(
+                    native_command_read_count_)},
+                {"native_command_spans_read", std::to_string(
+                    last_native_command_span_count_)},
+                {"native_command_spans_read_total", std::to_string(
+                    native_command_span_read_count_)},
+                {"command_transport", json_string(
+                    current_manifest_bulk_span_commands_
+                        ? "bulk_span_v1" : "packed_direct")},
+                {"command_file_reused", json_bool(last_command_file_reused_)},
+                {"command_read_bytes", std::to_string(last_command_read_bytes_)},
+                {"command_file_open_us", std::to_string(
+                    last_command_file_open_us_)},
+                {"command_file_read_us", std::to_string(
+                    last_command_file_read_us_)},
+                {"command_record_validation_us", std::to_string(
+                    last_command_record_validation_us_)},
                 {"interpreted_source_commands", std::to_string(interpreted_source_command_count_)},
                 {"interpreted_command_delta", std::to_string(last_interpreted_command_delta_)},
                 {"pending_method_packet", json_bool(interpreted_stream_.pending_method_packet)},
                 {"truncated_packets", std::to_string(interpreted_stream_.truncated_packet_count)},
                 {"control_flow_packets", std::to_string(interpreted_stream_.control_flow_packet_count)},
                 {"unknown_packets", std::to_string(interpreted_stream_.unknown_packet_count)},
-                {"zero_count_indexed_array_packets", std::to_string(interpreted_stream_.zero_count_indexed_array_packet_count)},
+                {"zero_count_indexed_array_noop_packets", std::to_string(interpreted_stream_.zero_count_indexed_array_noop_packet_count)},
+                {"ordered_push_buffer_appends", std::to_string(
+                    interpreted_stream_.ordered_push_buffer_append_count)},
+                {"indexed_word_push_buffer_appends", std::to_string(
+                    interpreted_stream_.indexed_word_push_buffer_append_count)},
+                {"reconstructed_push_buffer_appends", std::to_string(
+                    interpreted_stream_.reconstructed_push_buffer_append_count)},
+                {"surface_payload_scans_skipped", std::to_string(
+                    interpreted_stream_.surface_payload_scan_skipped_count)},
                 {"exact_completed_flip", json_bool(
                     interpreted_source_command_count_
                         == current_manifest_presentable_command_count_
                     && interpreted_stream_.flip_count
                         == current_manifest_guest_flip_count_)},
                 {"resources_unchanged", json_bool(recovered_source_.resources_unchanged)},
+                {"resource_generation_changed", json_bool(
+                    last_resource_generation_changed_)},
+                {"resource_snapshot_reused_resources", std::to_string(
+                    last_resource_snapshot_reused_count_)},
+                {"resource_snapshot_reused_bytes", std::to_string(
+                    last_resource_snapshot_reused_bytes_)},
+                {"render_work_generation", std::to_string(
+                    render_work_generation_)},
+                {"presented_diagnostics_valid", json_bool(
+                    presented_diagnostics_valid_
+                    && presented_diagnostics_generation_
+                        == render_work_generation_)},
+                {"presented_diagnostics_sampled", json_bool(
+                    last_presented_diagnostics_sampled_)},
+                {"offscreen_render_targets_reused", json_bool(
+                    last_offscreen_render_targets_reused_)},
+                {"offscreen_render_target_count", std::to_string(
+                    offscreen_render_targets_.size())},
+                {"presentation_pipeline_depth", std::to_string(
+                    options_.presentation_pipeline_depth)},
+                {"presentation_ack_phase", json_string(
+                    options_.presentation_pipeline_depth == 2u
+                        ? "after_source_load"
+                        : "after_command_record")},
+                {"presentation_ack_published", json_bool(
+                    presentation_ack_published)},
+                {"presentation_ack_us", std::to_string(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        presentation_ack_end - presentation_ack_begin).count())},
+                {"pre_ack_us", std::to_string(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        presentation_ack_end - reload_begin).count())},
+                {"post_ack_us", std::to_string(
+                    options_.presentation_pipeline_depth == 2u
+                        ? std::chrono::duration_cast<std::chrono::microseconds>(
+                            after_commands - presentation_ack_end).count()
+                        : 0)},
                 {"wait_us", std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(after_wait - reload_begin).count())},
+                {"source_residency_us", std::to_string(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        source_resident - after_wait).count())},
                 {"load_interpret_us", std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(after_load - after_wait).count())},
                 {"command_load_us", std::to_string(last_command_load_us_)},
                 {"manifest_read_us", std::to_string(last_manifest_read_us_)},
                 {"manifest_parse_us", std::to_string(last_manifest_parse_us_)},
                 {"source_load_us", std::to_string(last_source_load_us_)},
                 {"interpret_us", std::to_string(last_interpret_us_)},
-                {"resource_update_us", std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(after_resources - after_load).count())},
+                {"method_interpret_us", std::to_string(last_method_interpret_us_)},
+                {"push_buffer_collect_us", std::to_string(
+                    interpreted_stream_.last_push_buffer_collect_us)},
+                {"method_apply_us", std::to_string(
+                    interpreted_stream_.last_method_apply_us)},
+                {"method_finalize_us", std::to_string(
+                    interpreted_stream_.last_method_finalize_us)},
+                {"interpreted_method_delta", std::to_string(
+                    interpreted_stream_.last_interpreted_method_count)},
+                {"bulk_indexed_method_delta", std::to_string(
+                    interpreted_stream_.last_bulk_indexed_method_count)},
+                {"bulk_inline_method_delta", std::to_string(
+                    interpreted_stream_.last_bulk_inline_method_count)},
+                {"state_seed_updates_required", json_bool(
+                    interpreted_stream_.state_seed_updates_required)},
+                {"indexed_materialize_us", std::to_string(
+                    last_indexed_materialize_us_)},
+                {"resource_update_us", std::to_string(resource_update_us)},
+                {"resource_prepare_us", std::to_string(resource_prepare_us)},
+                {"resource_preflight_us", std::to_string(
+                    resource_preflight_us)},
+                {"resource_destroy_us", std::to_string(resource_destroy_us)},
+                {"native_resource_create_us", std::to_string(
+                    native_resource_create_us)},
+                {"vertex_resource_prepare_us", std::to_string(
+                    last_vertex_resource_prepare_us_)},
+                {"state_resource_prepare_us", std::to_string(
+                    last_state_resource_prepare_us_)},
+                {"texture_resource_prepare_us", std::to_string(
+                    last_texture_resource_prepare_us_)},
+                {"texture_refresh_us", std::to_string(
+                    last_texture_refresh_us_)},
+                {"texture_indexed_lookup_count", std::to_string(
+                    last_texture_indexed_lookup_count_)},
+                {"texture_indexed_lookup_candidates", std::to_string(
+                    last_texture_indexed_lookup_candidate_count_)},
+                {"texture_constant_lookup_count", std::to_string(
+                    last_texture_constant_lookup_count_)},
+                {"render_target_feedback_image_cache_hits", std::to_string(
+                    last_render_target_feedback_image_cache_hit_count_)},
+                {"render_target_feedback_image_cache_misses", std::to_string(
+                    last_render_target_feedback_image_cache_miss_count_)},
+                {"render_target_feedback_image_cache_stores", std::to_string(
+                    last_render_target_feedback_image_cache_store_count_)},
+                {"render_target_feedback_image_cache_evictions", std::to_string(
+                    last_render_target_feedback_image_cache_eviction_count_)},
+                {"render_target_feedback_image_cache_resident", std::to_string(
+                    render_target_feedback_image_cache_.size())},
+                {"render_target_feedback_image_cache_capacity", std::to_string(
+                    kRenderTargetFeedbackImageCacheCapacity)},
+                {"offscreen_resource_prepare_us", std::to_string(
+                    last_offscreen_resource_prepare_us_)},
+                {"resource_bookkeeping_us", std::to_string(
+                    last_resource_bookkeeping_us_)},
+                {"pipeline_prepare_us", std::to_string(
+                    pipeline_prepare_us)},
+                {"pipeline_state_discovery_us", std::to_string(
+                    last_pipeline_state_discovery_us_)},
+                {"pipeline_candidate_draws", std::to_string(
+                    last_pipeline_candidate_draw_count_)},
+                {"pipeline_unique_states", std::to_string(
+                    last_pipeline_unique_state_count_)},
+                {"pipeline_missing_states", std::to_string(
+                    last_pipeline_missing_state_count_)},
+                {"feedback_spec_build_us", std::to_string(
+                    last_feedback_spec_build_us_)},
+                {"feedback_spec_cache_builds", std::to_string(
+                    feedback_spec_cache_build_count_)},
+                {"feedback_spec_cache_hits", std::to_string(
+                    feedback_spec_cache_hit_count_)},
+                {"texture_binding_update_us", std::to_string(
+                    last_texture_binding_update_us_)},
+                {"texture_binding_set_reused", json_bool(
+                    last_texture_binding_set_reused_)},
+                {"texture_binding_image_descriptor_updates", std::to_string(
+                    last_texture_binding_image_descriptor_update_count_)},
+                {"texture_binding_descriptor_sets_allocated", std::to_string(
+                    last_texture_binding_descriptor_set_allocation_count_)},
+                {"texture_binding_set_reuses", std::to_string(
+                    texture_binding_set_reuse_count_)},
+                {"texture_binding_set_rebuilds", std::to_string(
+                    texture_binding_set_rebuild_count_)},
+                {"texture_binding_image_descriptor_updates_total", std::to_string(
+                    texture_binding_image_descriptor_update_count_)},
+                {"texture_binding_descriptor_sets_allocated_total", std::to_string(
+                    texture_binding_descriptor_set_allocation_count_)},
+                {"render_validation_us", std::to_string(
+                    last_render_validation_us_)},
                 {"vertex_transform_us", std::to_string(last_vertex_transform_us_)},
+                {"vertex_state_upload_us", std::to_string(
+                    last_vertex_state_upload_us_)},
+                {"raw_vertex_upload_us", std::to_string(
+                    last_raw_vertex_upload_us_)},
+                {"gpu_raw_attribute_draws", std::to_string(
+                    gpu_raw_attribute_draw_count_)},
+                {"gpu_raw_attribute_vertices", std::to_string(
+                    gpu_raw_attribute_vertex_count_)},
+                {"expanded_vertex_bytes_avoided", std::to_string(
+                    static_cast<uint64_t>(
+                        gpu_raw_attribute_vertex_count_)
+                        * sizeof(NativeVertex))},
+                {"gpu_vertex_program_draws", std::to_string(
+                    gpu_vertex_program_draw_count_)},
+                {"gpu_vertex_program_vertices", std::to_string(
+                    gpu_vertex_program_vertex_count_)},
+                {"cpu_vertex_program_fallback_draws", std::to_string(
+                    cpu_vertex_program_fallback_draw_count_)},
+                {"cpu_vertex_program_fallback_vertices", std::to_string(
+                    cpu_vertex_program_fallback_vertex_count_)},
                 {"vertex_map_us", std::to_string(last_vertex_map_us_)},
                 {"vertex_copy_us", std::to_string(last_vertex_copy_us_)},
                 {"command_record_us", std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(after_commands - after_resources).count())},
@@ -4769,9 +7029,101 @@ private:
         return module;
     }
 
+    bool ensure_texture_conversion_pipeline() {
+        if (options_.cpu_texture_conversion
+            || !queue_family_.supports_compute
+            || options_.texture_convert_shader.empty()) {
+            return false;
+        }
+        if (texture_convert_pipeline_ != VK_NULL_HANDLE) {
+            return true;
+        }
+        std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
+        for (uint32_t index = 0u; index < bindings.size(); ++index) {
+            bindings[index].binding = index;
+            bindings[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[index].descriptorCount = 1u;
+            bindings[index].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo descriptor_info{};
+        descriptor_info.sType =
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        descriptor_info.bindingCount = static_cast<uint32_t>(bindings.size());
+        descriptor_info.pBindings = bindings.data();
+        vk_check(
+            vkCreateDescriptorSetLayout(
+                device_,
+                &descriptor_info,
+                nullptr,
+                &texture_convert_descriptor_layout_),
+            "vkCreateDescriptorSetLayout(texture conversion)");
+
+        VkPushConstantRange push_constants{};
+        push_constants.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        push_constants.size = sizeof(NativeTextureConvertPushConstants);
+        VkPipelineLayoutCreateInfo layout_info{};
+        layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layout_info.setLayoutCount = 1u;
+        layout_info.pSetLayouts = &texture_convert_descriptor_layout_;
+        layout_info.pushConstantRangeCount = 1u;
+        layout_info.pPushConstantRanges = &push_constants;
+        vk_check(
+            vkCreatePipelineLayout(
+                device_,
+                &layout_info,
+                nullptr,
+                &texture_convert_pipeline_layout_),
+            "vkCreatePipelineLayout(texture conversion)");
+
+        const auto shader_module_begin = std::chrono::steady_clock::now();
+        const VkShaderModule shader = create_shader_module(
+            options_.texture_convert_shader);
+        const auto shader_module_end = std::chrono::steady_clock::now();
+        VkPipelineShaderStageCreateInfo stage{};
+        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        stage.module = shader;
+        stage.pName = "main";
+        VkComputePipelineCreateInfo pipeline_info{};
+        pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        pipeline_info.stage = stage;
+        pipeline_info.layout = texture_convert_pipeline_layout_;
+        const auto pipeline_create_begin = std::chrono::steady_clock::now();
+        const VkResult create_result = vkCreateComputePipelines(
+            device_,
+            pipeline_cache_,
+            1u,
+            &pipeline_info,
+            nullptr,
+            &texture_convert_pipeline_);
+        const auto pipeline_create_end = std::chrono::steady_clock::now();
+        vkDestroyShaderModule(device_, shader, nullptr);
+        vk_check(create_result, "vkCreateComputePipelines(texture conversion)");
+        ++pipeline_creation_count_;
+        ++pipeline_cache_miss_count_;
+        log_.emit(
+            "nv2a_gpu_texture_conversion_pipeline_created",
+            {
+                {"queue_family", std::to_string(queue_family_.index)},
+                {"shader", json_string(
+                    options_.texture_convert_shader.string())},
+                {"shader_module_us", std::to_string(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        shader_module_end - shader_module_begin).count())},
+                {"pipeline_create_us", std::to_string(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        pipeline_create_end - pipeline_create_begin).count())},
+            });
+        return true;
+    }
+
     void create_native_graphics_pipeline() {
+        last_pipeline_state_discovery_us_ = 0u;
+        last_pipeline_candidate_draw_count_ = 0u;
+        last_pipeline_unique_state_count_ = 0u;
+        last_pipeline_missing_state_count_ = 0u;
         if (!texture_descriptor_layout_) {
-            std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
+            std::array<VkDescriptorSetLayoutBinding, 5> bindings{};
             bindings[0].binding = 0;
             bindings[0].descriptorType =
                 VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -4781,6 +7133,18 @@ private:
             bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             bindings[1].descriptorCount = 1;
             bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            bindings[2].binding = 2;
+            bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[2].descriptorCount = 1;
+            bindings[2].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+            bindings[3].binding = 3;
+            bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[3].descriptorCount = 1;
+            bindings[3].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+            bindings[4].binding = 4;
+            bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[4].descriptorCount = 1;
+            bindings[4].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
             VkDescriptorSetLayoutCreateInfo descriptor_info{};
             descriptor_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
             descriptor_info.bindingCount = static_cast<uint32_t>(
@@ -4795,17 +7159,28 @@ private:
             layout_info.setLayoutCount = 1;
             layout_info.pSetLayouts = &texture_descriptor_layout_;
             VkPushConstantRange push_constant_range{};
-            push_constant_range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            push_constant_range.stageFlags =
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
             push_constant_range.size = sizeof(NativeFragmentPushConstants);
             layout_info.pushConstantRangeCount = 1;
             layout_info.pPushConstantRanges = &push_constant_range;
             vk_check(vkCreatePipelineLayout(device_, &layout_info, nullptr, &pipeline_layout_), "vkCreatePipelineLayout");
         }
 
+        const auto discovery_begin = std::chrono::steady_clock::now();
         std::vector<NativePipelineState> states;
+        std::unordered_set<NativePipelineState, NativePipelineStateHash>
+            unique_states;
         const size_t first_draw = std::min<size_t>(interpreted_stream_.presented_draw_begin, interpreted_stream_.draws.size());
         const size_t end_draw = std::min<size_t>(first_draw + interpreted_stream_.presented_draw_count, interpreted_stream_.draws.size());
-        const std::vector<RenderTargetFeedbackSpec> feedback_specs =
+        states.reserve(end_draw - first_draw + 1u);
+        unique_states.reserve((end_draw - first_draw) * 2u + 1u);
+        const auto append_unique_state = [&](NativePipelineState state) {
+            if (unique_states.insert(state).second) {
+                states.push_back(std::move(state));
+            }
+        };
+        const std::vector<RenderTargetFeedbackSpec>& feedback_specs =
             presented_render_target_feedback_specs();
         for (size_t draw_index = first_draw; draw_index < end_draw; ++draw_index) {
             const size_t presented_index = draw_index - first_draw;
@@ -4830,36 +7205,55 @@ private:
                 || (draw.primitive != 5u && draw.primitive != 6u)) {
                 continue;
             }
-            const NativePipelineState state = pipeline_state_for_draw(draw);
-            if (std::find(states.begin(), states.end(), state) == states.end()) states.push_back(state);
+            ++last_pipeline_candidate_draw_count_;
+            append_unique_state(pipeline_state_for_draw(draw));
         }
         if (!recovered_frontend_text_.empty()) {
-            const NativePipelineState state = frontend_text_pipeline_state();
-            if (std::find(states.begin(), states.end(), state) == states.end()) {
-                states.push_back(state);
-            }
+            append_unique_state(frontend_text_pipeline_state());
         }
-        if (states.empty()) states.push_back({});
+        if (states.empty()) {
+            append_unique_state({});
+        }
+        last_pipeline_unique_state_count_ = static_cast<uint32_t>(
+            states.size());
+        std::unordered_set<NativePipelineState, NativePipelineStateHash>
+            resident_states;
+        resident_states.reserve(graphics_pipelines_.size() * 2u + 1u);
+        for (const HostPipeline& pipeline : graphics_pipelines_) {
+            resident_states.insert(pipeline.state);
+        }
         states.erase(
             std::remove_if(
                 states.begin(), states.end(),
-                [this](const NativePipelineState& state) {
-                    return std::find_if(
-                        graphics_pipelines_.begin(), graphics_pipelines_.end(),
-                        [&state](const HostPipeline& pipeline) {
-                            return pipeline.state == state;
-                        }) != graphics_pipelines_.end();
+                [&](const NativePipelineState& state) {
+                    return resident_states.find(state)
+                        != resident_states.end();
                 }),
             states.end());
+        last_pipeline_missing_state_count_ = static_cast<uint32_t>(
+            states.size());
+        last_pipeline_state_discovery_us_ = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - discovery_begin).count();
         if (states.empty()) {
             log_.emit(
                 "nv2a_graphics_pipeline_cache_hit",
-                {{"pipeline_count", std::to_string(graphics_pipelines_.size())}});
+                {
+                    {"pipeline_count", std::to_string(graphics_pipelines_.size())},
+                    {"candidate_draws", std::to_string(
+                        last_pipeline_candidate_draw_count_)},
+                    {"unique_states", std::to_string(
+                        last_pipeline_unique_state_count_)},
+                    {"state_discovery_us", std::to_string(
+                        last_pipeline_state_discovery_us_)},
+                });
             return;
         }
 
+        const auto shader_module_begin = std::chrono::steady_clock::now();
         const VkShaderModule vertex_shader = create_shader_module(options_.vertex_shader);
         const VkShaderModule fragment_shader = create_shader_module(options_.fragment_shader);
+        const auto shader_module_end = std::chrono::steady_clock::now();
         VkPipelineShaderStageCreateInfo stages[2]{};
         stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -4941,37 +7335,90 @@ private:
         pipeline_info.layout = pipeline_layout_;
         pipeline_info.renderPass = render_pass_;
         pipeline_info.subpass = 0;
-        for (const NativePipelineState& state : states) {
-            assembly.topology = state.primitive == 5u
+        const size_t pipeline_count = states.size();
+        std::vector<VkPipelineVertexInputStateCreateInfo> vertex_inputs(
+            pipeline_count, vertex_input);
+        std::vector<VkPipelineInputAssemblyStateCreateInfo> assemblies(
+            pipeline_count, assembly);
+        std::vector<VkPipelineRasterizationStateCreateInfo> rasters(
+            pipeline_count, raster);
+        std::vector<VkPipelineDepthStencilStateCreateInfo> depth_stencils(
+            pipeline_count, depth_stencil);
+        std::vector<VkPipelineColorBlendAttachmentState> blend_attachments(
+            pipeline_count, blend_attachment);
+        std::vector<VkPipelineColorBlendStateCreateInfo> blends(
+            pipeline_count, blend);
+        std::vector<VkGraphicsPipelineCreateInfo> pipeline_infos(
+            pipeline_count, pipeline_info);
+        std::vector<VkPipeline> pipelines(
+            pipeline_count, VK_NULL_HANDLE);
+        for (size_t index = 0; index < pipeline_count; ++index) {
+            const NativePipelineState& state = states[index];
+            VkPipelineVertexInputStateCreateInfo& state_vertex_input =
+                vertex_inputs[index];
+            state_vertex_input.vertexBindingDescriptionCount =
+                state.raw_attribute_fetch ? 0u : 1u;
+            state_vertex_input.vertexAttributeDescriptionCount =
+                state.raw_attribute_fetch
+                ? 0u
+                : static_cast<uint32_t>(attributes.size());
+            assemblies[index].topology = state.primitive == 5u
                 ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
                 : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
-            blend_attachment.blendEnable = state.blend_enable ? VK_TRUE : VK_FALSE;
-            blend_attachment.srcColorBlendFactor = nv2a_blend_factor(
+            VkPipelineColorBlendAttachmentState& state_blend =
+                blend_attachments[index];
+            state_blend.blendEnable = state.blend_enable ? VK_TRUE : VK_FALSE;
+            state_blend.srcColorBlendFactor = nv2a_blend_factor(
                 state.blend_source_factor,
                 VK_BLEND_FACTOR_ONE);
-            blend_attachment.dstColorBlendFactor = nv2a_blend_factor(
+            state_blend.dstColorBlendFactor = nv2a_blend_factor(
                 state.blend_destination_factor,
                 VK_BLEND_FACTOR_ZERO);
-            blend_attachment.colorBlendOp = nv2a_blend_op(state.blend_equation);
-            blend_attachment.srcAlphaBlendFactor =
-                blend_attachment.srcColorBlendFactor;
-            blend_attachment.dstAlphaBlendFactor =
-                blend_attachment.dstColorBlendFactor;
-            blend_attachment.alphaBlendOp = blend_attachment.colorBlendOp;
-            blend_attachment.colorWriteMask = nv2a_color_write_mask(state.color_mask);
-            depth_stencil.depthTestEnable =
+            state_blend.colorBlendOp = nv2a_blend_op(state.blend_equation);
+            state_blend.srcAlphaBlendFactor = state_blend.srcColorBlendFactor;
+            state_blend.dstAlphaBlendFactor = state_blend.dstColorBlendFactor;
+            state_blend.alphaBlendOp = state_blend.colorBlendOp;
+            state_blend.colorWriteMask = nv2a_color_write_mask(state.color_mask);
+            depth_stencils[index].depthTestEnable =
                 state.depth_test_enable ? VK_TRUE : VK_FALSE;
-            depth_stencil.depthWriteEnable =
+            depth_stencils[index].depthWriteEnable =
                 state.depth_write_enable ? VK_TRUE : VK_FALSE;
-            depth_stencil.depthCompareOp =
+            depth_stencils[index].depthCompareOp =
                 nv2a_depth_compare_op(state.depth_function);
-            raster.cullMode =
+            rasters[index].cullMode =
                 nv2a_cull_mode(state.cull_face_enable, state.cull_face);
-            raster.frontFace = nv2a_front_face(state.front_face);
-            VkPipeline pipeline = VK_NULL_HANDLE;
-            vk_check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline), "vkCreateGraphicsPipelines");
-            graphics_pipelines_.push_back({state, pipeline});
+            rasters[index].frontFace = nv2a_front_face(state.front_face);
+            blends[index].pAttachments = &blend_attachments[index];
+            pipeline_infos[index].pVertexInputState = &vertex_inputs[index];
+            pipeline_infos[index].pInputAssemblyState = &assemblies[index];
+            pipeline_infos[index].pRasterizationState = &rasters[index];
+            pipeline_infos[index].pDepthStencilState = &depth_stencils[index];
+            pipeline_infos[index].pColorBlendState = &blends[index];
         }
+        const auto pipeline_create_begin = std::chrono::steady_clock::now();
+        const VkResult create_result = vkCreateGraphicsPipelines(
+            device_,
+            pipeline_cache_,
+            static_cast<uint32_t>(pipeline_infos.size()),
+            pipeline_infos.data(),
+            nullptr,
+            pipelines.data());
+        const auto pipeline_create_end = std::chrono::steady_clock::now();
+        if (create_result != VK_SUCCESS) {
+            for (VkPipeline pipeline : pipelines) {
+                if (pipeline != VK_NULL_HANDLE) {
+                    vkDestroyPipeline(device_, pipeline, nullptr);
+                }
+            }
+            vkDestroyShaderModule(device_, fragment_shader, nullptr);
+            vkDestroyShaderModule(device_, vertex_shader, nullptr);
+            vk_check(create_result, "vkCreateGraphicsPipelines");
+        }
+        for (size_t index = 0; index < pipeline_count; ++index) {
+            graphics_pipelines_.push_back({states[index], pipelines[index]});
+        }
+        pipeline_creation_count_ += pipeline_count;
+        pipeline_cache_miss_count_ += pipeline_count;
         vkDestroyShaderModule(device_, fragment_shader, nullptr);
         vkDestroyShaderModule(device_, vertex_shader, nullptr);
         log_.emit(
@@ -4979,6 +7426,19 @@ private:
             {
                 {"created_count", std::to_string(states.size())},
                 {"pipeline_count", std::to_string(graphics_pipelines_.size())},
+                {"candidate_draws", std::to_string(
+                    last_pipeline_candidate_draw_count_)},
+                {"unique_states", std::to_string(
+                    last_pipeline_unique_state_count_)},
+                {"state_discovery_us", std::to_string(
+                    last_pipeline_state_discovery_us_)},
+                {"shader_module_us", std::to_string(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        shader_module_end - shader_module_begin).count())},
+                {"pipeline_create_us", std::to_string(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        pipeline_create_end - pipeline_create_begin).count())},
+                {"batched", json_bool(true)},
             });
     }
 
@@ -5002,6 +7462,155 @@ private:
         allocation.memoryTypeIndex = find_memory_type(requirements.memoryTypeBits, properties);
         vk_check(vkAllocateMemory(device_, &allocation, nullptr, &memory), "vkAllocateMemory(native)");
         vk_check(vkBindBufferMemory(device_, buffer, memory, 0), "vkBindBufferMemory(native)");
+    }
+
+    void refresh_raw_vertex_buffers() {
+        const auto upload_begin = std::chrono::steady_clock::now();
+        const std::vector<uint8_t>& resource_bytes =
+            gpu_raw_vertex_resource_cache_.gpu_raw_vertex_bytes;
+        const VkDeviceSize index_offset =
+            resource_bytes.size();
+        const VkDeviceSize required_size = std::max<VkDeviceSize>(
+            index_offset
+                + interpreted_stream_.gpu_raw_vertex_indices.size()
+                    * sizeof(uint32_t),
+            4u);
+        const VkDeviceSize minimum_live_size = options_.live_render_stream
+            ? index_offset + 1024u * 1024u
+            : required_size;
+        bool buffer_replaced = false;
+        if (raw_vertex_resource_buffer_ == VK_NULL_HANDLE
+            || required_size > raw_vertex_resource_buffer_size_) {
+            destroy_host_texture_bindings();
+            if (raw_vertex_resource_mapped_ != nullptr) {
+                vkUnmapMemory(device_, raw_vertex_resource_memory_);
+                raw_vertex_resource_mapped_ = nullptr;
+            }
+            if (raw_vertex_resource_buffer_ != VK_NULL_HANDLE) {
+                vkDestroyBuffer(
+                    device_, raw_vertex_resource_buffer_, nullptr);
+            }
+            if (raw_vertex_resource_memory_ != VK_NULL_HANDLE) {
+                vkFreeMemory(
+                    device_, raw_vertex_resource_memory_, nullptr);
+            }
+            raw_vertex_resource_buffer_size_ = std::max(
+                required_size, minimum_live_size);
+            create_buffer(
+                raw_vertex_resource_buffer_size_,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                    | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                raw_vertex_resource_buffer_,
+                raw_vertex_resource_memory_);
+            vk_check(
+                vkMapMemory(
+                    device_,
+                    raw_vertex_resource_memory_,
+                    0,
+                    raw_vertex_resource_buffer_size_,
+                    0,
+                    &raw_vertex_resource_mapped_),
+                "vkMapMemory(raw vertex resources)");
+            buffer_replaced = true;
+        }
+        const uint32_t pending_dirty_range_count = static_cast<uint32_t>(
+            gpu_raw_vertex_resource_cache_.dirty_ranges.size());
+        uint64_t resource_upload_bytes = 0u;
+        uint32_t resource_upload_range_count = 0u;
+        if (buffer_replaced && !resource_bytes.empty()) {
+            std::memcpy(
+                raw_vertex_resource_mapped_,
+                resource_bytes.data(),
+                resource_bytes.size());
+            resource_upload_bytes = resource_bytes.size();
+            resource_upload_range_count = 1u;
+        } else if (!buffer_replaced) {
+            for (const GpuRawVertexDirtyRange& range :
+                 gpu_raw_vertex_resource_cache_.dirty_ranges) {
+                std::memcpy(
+                    static_cast<uint8_t*>(raw_vertex_resource_mapped_)
+                        + range.offset,
+                    resource_bytes.data() + range.offset,
+                    range.size);
+                resource_upload_bytes += range.size;
+                ++resource_upload_range_count;
+            }
+        }
+        gpu_raw_vertex_resource_cache_.dirty_ranges.clear();
+        if (interpreted_stream_.gpu_raw_vertex_indices.empty()) {
+            if (required_size == 4u) {
+                std::memset(raw_vertex_resource_mapped_, 0, 4u);
+            }
+        } else {
+            std::memcpy(
+                static_cast<uint8_t*>(raw_vertex_resource_mapped_)
+                    + index_offset,
+                interpreted_stream_.gpu_raw_vertex_indices.data(),
+                interpreted_stream_.gpu_raw_vertex_indices.size()
+                    * sizeof(uint32_t));
+        }
+        const uint64_t index_upload_bytes =
+            interpreted_stream_.gpu_raw_vertex_indices.size()
+                * sizeof(uint32_t);
+        upload_bytes_ += resource_upload_bytes + index_upload_bytes;
+        raw_vertex_resource_upload_bytes_ += resource_upload_bytes;
+        raw_vertex_index_upload_bytes_ += index_upload_bytes;
+        last_raw_vertex_upload_us_ = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - upload_begin).count();
+        log_.emit(
+            "nv2a_raw_vertex_buffers_refreshed",
+            {
+                {"reload", std::to_string(live_render_reload_count_ + 1u)},
+                {"manifest_guest_flip_count", std::to_string(
+                    current_manifest_guest_flip_count_)},
+                {"resources_unchanged", json_bool(
+                    recovered_source_.resources_unchanged)},
+                {"resource_bytes", std::to_string(
+                    resource_bytes.size())},
+                {"source_indices", std::to_string(
+                    interpreted_stream_.gpu_raw_vertex_indices.size())},
+                {"gpu_draws", std::to_string(
+                    interpreted_stream_.gpu_raw_attribute_draw_count)},
+                {"gpu_vertices", std::to_string(
+                    interpreted_stream_.gpu_raw_attribute_vertex_count)},
+                {"buffer_replaced", json_bool(buffer_replaced)},
+                {"layout_rebuilt", json_bool(
+                    gpu_raw_vertex_resource_cache_.layout_rebuilt)},
+                {"cache_refreshes", std::to_string(
+                    gpu_raw_vertex_resource_cache_.refresh_count)},
+                {"layout_rebuilds", std::to_string(
+                    gpu_raw_vertex_resource_cache_.layout_rebuild_count)},
+                {"resource_count", std::to_string(
+                    gpu_raw_vertex_resource_cache_.resource_count)},
+                {"compared_resources", std::to_string(
+                    gpu_raw_vertex_resource_cache_.compared_resource_count)},
+                {"changed_resources", std::to_string(
+                    gpu_raw_vertex_resource_cache_.changed_resource_count)},
+                {"reused_resources", std::to_string(
+                    gpu_raw_vertex_resource_cache_.reused_resource_count)},
+                {"compared_bytes", std::to_string(
+                    gpu_raw_vertex_resource_cache_.compared_bytes)},
+                {"pending_dirty_ranges", std::to_string(
+                    pending_dirty_range_count)},
+                {"dirty_bytes", std::to_string(
+                    gpu_raw_vertex_resource_cache_.dirty_bytes)},
+                {"cache_refresh_us", std::to_string(
+                    gpu_raw_vertex_resource_cache_.refresh_us)},
+                {"resource_upload_ranges", std::to_string(
+                    resource_upload_range_count)},
+                {"resource_upload_bytes", std::to_string(
+                    resource_upload_bytes)},
+                {"index_upload_bytes", std::to_string(index_upload_bytes)},
+                {"cumulative_resource_upload_bytes", std::to_string(
+                    raw_vertex_resource_upload_bytes_)},
+                {"cumulative_index_upload_bytes", std::to_string(
+                    raw_vertex_index_upload_bytes_)},
+                {"resource_bytes_uploaded", json_bool(
+                    resource_upload_bytes != 0u)},
+                {"upload_us", std::to_string(last_raw_vertex_upload_us_)},
+            });
     }
 
     void refresh_fragment_states() {
@@ -5074,6 +7683,7 @@ private:
             fragment_state_mapped_,
             states.data(),
             static_cast<size_t>(required_size));
+        upload_bytes_ += static_cast<uint64_t>(required_size);
         fragment_state_count_ = static_cast<uint32_t>(states.size());
         log_.emit(
             "nv2a_fragment_states_refreshed",
@@ -5082,6 +7692,150 @@ private:
                 {"state_bytes", std::to_string(required_size)},
                 {"buffer_bytes", std::to_string(fragment_state_buffer_size_)},
                 {"buffer_replaced", json_bool(buffer_replaced)},
+            });
+    }
+
+    void refresh_vertex_program_states() {
+        const auto upload_begin = std::chrono::steady_clock::now();
+        const size_t first_draw = std::min<size_t>(
+            interpreted_stream_.presented_draw_begin,
+            interpreted_stream_.draws.size());
+        const size_t end_draw = std::min<size_t>(
+            first_draw + interpreted_stream_.presented_draw_count,
+            interpreted_stream_.draws.size());
+        const std::vector<RenderTargetFeedbackSpec>& feedback_specs =
+            presented_render_target_feedback_specs();
+        const bool enable_gpu_programs = !options_.cpu_vertex_programs
+            && !options_.analyze_render_stream_only;
+        std::vector<NativeVertexProgramState> states;
+        states.reserve(std::max<size_t>(end_draw - first_draw, 1u));
+        gpu_vertex_program_draw_count_ = 0u;
+        gpu_vertex_program_vertex_count_ = 0u;
+        gpu_raw_attribute_draw_count_ = 0u;
+        gpu_raw_attribute_vertex_count_ = 0u;
+        cpu_vertex_program_fallback_draw_count_ = 0u;
+        cpu_vertex_program_fallback_vertex_count_ = 0u;
+        for (size_t draw_index = first_draw;
+             draw_index < end_draw;
+             ++draw_index) {
+            const NativeDraw& draw = interpreted_stream_.draws[draw_index];
+            VkExtent2D target_extent = swapchain_extent_;
+            if (!draw_targets_presented_surface(draw)) {
+                const auto target = std::find_if(
+                    feedback_specs.begin(),
+                    feedback_specs.end(),
+                    [&](const RenderTargetFeedbackSpec& spec) {
+                        return spec.offscreen_produced
+                            && nv2a_canonical_resource_address(
+                                spec.producer_address)
+                                == nv2a_canonical_resource_address(
+                                    draw.surface_color_offset);
+                    });
+                if (target != feedback_specs.end()) {
+                    target_extent = {target->width, target->height};
+                }
+            }
+            NativeVertexProgramState state = vertex_program_state_for_draw(
+                draw,
+                target_extent,
+                enable_gpu_programs);
+            if ((draw.transform_execution_mode & 3u) == 2u) {
+                if (state.enabled != 0u) {
+                    ++gpu_vertex_program_draw_count_;
+                    gpu_vertex_program_vertex_count_ += draw.vertex_count;
+                    if (draw.gpu_raw_attribute_fetch) {
+                        ++gpu_raw_attribute_draw_count_;
+                        gpu_raw_attribute_vertex_count_ += draw.vertex_count;
+                    }
+                } else {
+                    ++cpu_vertex_program_fallback_draw_count_;
+                    cpu_vertex_program_fallback_vertex_count_ +=
+                        draw.vertex_count;
+                }
+            }
+            states.push_back(std::move(state));
+        }
+        if (!recovered_frontend_text_.empty()) {
+            states.emplace_back();
+        }
+        if (states.empty()) {
+            states.emplace_back();
+        }
+
+        const VkDeviceSize required_size = states.size()
+            * sizeof(NativeVertexProgramState);
+        bool buffer_replaced = false;
+        if (vertex_program_state_buffer_ == VK_NULL_HANDLE
+            || required_size > vertex_program_state_buffer_size_) {
+            destroy_host_texture_bindings();
+            if (vertex_program_state_mapped_ != nullptr) {
+                vkUnmapMemory(device_, vertex_program_state_memory_);
+                vertex_program_state_mapped_ = nullptr;
+            }
+            if (vertex_program_state_buffer_ != VK_NULL_HANDLE) {
+                vkDestroyBuffer(
+                    device_, vertex_program_state_buffer_, nullptr);
+                vertex_program_state_buffer_ = VK_NULL_HANDLE;
+            }
+            if (vertex_program_state_memory_ != VK_NULL_HANDLE) {
+                vkFreeMemory(
+                    device_, vertex_program_state_memory_, nullptr);
+                vertex_program_state_memory_ = VK_NULL_HANDLE;
+            }
+            const VkDeviceSize minimum_live_size = options_.live_render_stream
+                ? 1024u * sizeof(NativeVertexProgramState)
+                : required_size;
+            vertex_program_state_buffer_size_ = std::max(
+                required_size,
+                minimum_live_size);
+            create_buffer(
+                vertex_program_state_buffer_size_,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                    | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                vertex_program_state_buffer_,
+                vertex_program_state_memory_);
+            vk_check(
+                vkMapMemory(
+                    device_,
+                    vertex_program_state_memory_,
+                    0,
+                    vertex_program_state_buffer_size_,
+                    0,
+                    &vertex_program_state_mapped_),
+                "vkMapMemory(vertex program states)");
+            buffer_replaced = true;
+        }
+        std::memcpy(
+            vertex_program_state_mapped_,
+            states.data(),
+            static_cast<size_t>(required_size));
+        upload_bytes_ += static_cast<uint64_t>(required_size);
+        vertex_program_state_count_ = static_cast<uint32_t>(states.size());
+        last_vertex_state_upload_us_ = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - upload_begin).count();
+        log_.emit(
+            "nv2a_vertex_program_states_refreshed",
+            {
+                {"states", std::to_string(vertex_program_state_count_)},
+                {"state_bytes", std::to_string(required_size)},
+                {"buffer_bytes", std::to_string(
+                    vertex_program_state_buffer_size_)},
+                {"buffer_replaced", json_bool(buffer_replaced)},
+                {"gpu_draws", std::to_string(
+                    gpu_vertex_program_draw_count_)},
+                {"gpu_vertices", std::to_string(
+                    gpu_vertex_program_vertex_count_)},
+                {"gpu_raw_attribute_draws", std::to_string(
+                    gpu_raw_attribute_draw_count_)},
+                {"gpu_raw_attribute_vertices", std::to_string(
+                    gpu_raw_attribute_vertex_count_)},
+                {"cpu_fallback_draws", std::to_string(
+                    cpu_vertex_program_fallback_draw_count_)},
+                {"cpu_fallback_vertices", std::to_string(
+                    cpu_vertex_program_fallback_vertex_count_)},
+                {"upload_us", std::to_string(last_vertex_state_upload_us_)},
             });
     }
 
@@ -5262,6 +8016,56 @@ private:
         return mips;
     }
 
+    std::vector<std::vector<uint8_t>> build_cpu_dxt_conversion_mips(
+        const RecoveredTextureResource& resource) const {
+        std::vector<std::vector<uint8_t>> mips =
+            decompress_dxt_mip_chain(resource);
+        if (mips.size() != 1u) {
+            return mips;
+        }
+        uint32_t width = resource.width;
+        uint32_t height = resource.height;
+        while (width != 1u || height != 1u) {
+            const std::vector<uint8_t>& source = mips.back();
+            const uint32_t next_width = std::max(width / 2u, 1u);
+            const uint32_t next_height = std::max(height / 2u, 1u);
+            std::vector<uint8_t> next(
+                static_cast<size_t>(next_width) * next_height * 4u,
+                0u);
+            for (uint32_t y = 0u; y < next_height; ++y) {
+                for (uint32_t x = 0u; x < next_width; ++x) {
+                    for (uint32_t channel = 0u; channel < 4u; ++channel) {
+                        uint32_t sum = 0u;
+                        uint32_t count = 0u;
+                        for (uint32_t dy = 0u; dy < 2u; ++dy) {
+                            for (uint32_t dx = 0u; dx < 2u; ++dx) {
+                                const uint32_t source_x = x * 2u + dx;
+                                const uint32_t source_y = y * 2u + dy;
+                                if (source_x >= width || source_y >= height) {
+                                    continue;
+                                }
+                                const size_t source_offset =
+                                    (static_cast<size_t>(source_y) * width
+                                        + source_x) * 4u + channel;
+                                sum += source[source_offset];
+                                ++count;
+                            }
+                        }
+                        const size_t destination =
+                            (static_cast<size_t>(y) * next_width + x) * 4u
+                            + channel;
+                        next[destination] = static_cast<uint8_t>(
+                            sum / std::max(count, 1u));
+                    }
+                }
+            }
+            mips.push_back(std::move(next));
+            width = next_width;
+            height = next_height;
+        }
+        return mips;
+    }
+
     std::vector<uint8_t> unswizzle_texture_2d(
         const RecoveredTextureResource& resource,
         uint32_t bytes_per_pixel) const {
@@ -5367,10 +8171,12 @@ private:
         allocation.commandBufferCount = 1;
         VkCommandBuffer command = VK_NULL_HANDLE;
         vk_check(vkAllocateCommandBuffers(device_, &allocation, &command), "vkAllocateCommandBuffers(immediate)");
+        ++command_buffer_allocation_count_;
         VkCommandBufferBeginInfo begin{};
         begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vk_check(vkBeginCommandBuffer(command, &begin), "vkBeginCommandBuffer(immediate)");
+        recording_barrier_count_ = 0u;
         record(command);
         vk_check(vkEndCommandBuffer(command), "vkEndCommandBuffer(immediate)");
         VkSubmitInfo submit{};
@@ -5378,7 +8184,10 @@ private:
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &command;
         vk_check(vkQueueSubmit(graphics_queue_, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit(immediate)");
+        ++queue_submission_count_;
         vk_check(vkQueueWaitIdle(graphics_queue_), "vkQueueWaitIdle(immediate)");
+        barrier_count_ += recording_barrier_count_;
+        recording_barrier_count_ = 0u;
         vkFreeCommandBuffers(device_, command_pool_, 1, &command);
     }
 
@@ -5491,6 +8300,7 @@ private:
         void* mapped = nullptr;
         vk_check(vkMapMemory(device_, staging_memory, 0, upload_rgba.size(), 0, &mapped), "vkMapMemory(texture)");
         std::memcpy(mapped, upload_rgba.data(), upload_rgba.size());
+        upload_bytes_ += upload_rgba.size();
         vkUnmapMemory(device_, staging_memory);
 
         VkImageCreateInfo image_info{};
@@ -5533,6 +8343,7 @@ private:
             to_transfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             to_transfer.subresourceRange.levelCount = texture.mip_levels;
             to_transfer.subresourceRange.layerCount = 1;
+            ++recording_barrier_count_;
             vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_transfer);
             vkCmdCopyBufferToImage(
                 command,
@@ -5551,6 +8362,7 @@ private:
             to_shader.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             to_shader.image = texture.image;
             to_shader.subresourceRange = to_transfer.subresourceRange;
+            ++recording_barrier_count_;
             vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_shader);
         });
         vkDestroyBuffer(device_, staging, nullptr);
@@ -5566,6 +8378,859 @@ private:
         view_info.subresourceRange.layerCount = 1;
         vk_check(vkCreateImageView(device_, &view_info, nullptr, &texture.view), "vkCreateImageView(texture)");
         return texture;
+    }
+
+    bool build_gpu_texture_conversion_job(
+        const RecoveredTextureResource& resource,
+        size_t host_texture_index,
+        GpuTextureConversionJob& job) const {
+        if ((resource.format != "DXT1" && resource.format != "DXT5")
+            || resource.width == 0u
+            || resource.height == 0u
+            || resource.payload.size() > std::numeric_limits<uint32_t>::max()) {
+            return false;
+        }
+        const uint32_t block_bytes = resource.format == "DXT1" ? 8u : 16u;
+        uint64_t payload_offset = 0u;
+        uint32_t width = resource.width;
+        uint32_t height = resource.height;
+        while (width != 0u && height != 0u) {
+            const uint64_t payload_size = static_cast<uint64_t>(
+                (width + 3u) / 4u) * ((height + 3u) / 4u) * block_bytes;
+            if (payload_offset + payload_size > resource.payload.size()) {
+                break;
+            }
+            job.mips.push_back({
+                width,
+                height,
+                static_cast<uint32_t>(payload_offset),
+                0u,
+                0u,
+                false,
+            });
+            payload_offset += payload_size;
+            if (width == 1u && height == 1u) {
+                break;
+            }
+            width = std::max(width / 2u, 1u);
+            height = std::max(height / 2u, 1u);
+        }
+        if (job.mips.empty()) {
+            return false;
+        }
+        // Match create_host_texture exactly: a resource containing only its
+        // base level receives a complete box-filtered mip chain, while a
+        // recovered multi-level chain is authoritative and stops where the
+        // guest payload stops.
+        if (job.mips.size() == 1u) {
+            width = resource.width;
+            height = resource.height;
+            while (width != 1u || height != 1u) {
+                width = std::max(width / 2u, 1u);
+                height = std::max(height / 2u, 1u);
+                job.mips.push_back({
+                    width,
+                    height,
+                    0u,
+                    0u,
+                    0u,
+                    true,
+                });
+            }
+        }
+        job.resource = &resource;
+        job.host_texture_index = host_texture_index;
+        return true;
+    }
+
+    bool execute_gpu_texture_conversion_batch(
+        std::vector<GpuTextureConversionJob>& jobs) {
+        if (jobs.empty() || !ensure_texture_conversion_pipeline()) {
+            return false;
+        }
+        const auto conversion_begin = std::chrono::steady_clock::now();
+        uint64_t input_size = 0u;
+        uint64_t output_size = 0u;
+        uint32_t mip_count = 0u;
+        uint32_t generated_mip_count = 0u;
+        uint32_t dxt1_texture_count = 0u;
+        uint32_t dxt5_texture_count = 0u;
+        uint32_t recovered_chain_texture_count = 0u;
+        uint32_t generated_chain_texture_count = 0u;
+        uint64_t dxt1_input_bytes = 0u;
+        uint64_t dxt5_input_bytes = 0u;
+        for (GpuTextureConversionJob& job : jobs) {
+            input_size = (input_size + 3u) & ~uint64_t{3u};
+            if (input_size > std::numeric_limits<uint32_t>::max()
+                || job.resource->payload.size()
+                    > std::numeric_limits<uint32_t>::max() - input_size) {
+                return false;
+            }
+            job.input_byte_offset = static_cast<uint32_t>(input_size);
+            input_size += job.resource->payload.size();
+            if (job.resource->format == "DXT1") {
+                ++dxt1_texture_count;
+                dxt1_input_bytes += job.resource->payload.size();
+            } else {
+                ++dxt5_texture_count;
+                dxt5_input_bytes += job.resource->payload.size();
+            }
+            const bool generated_chain = std::any_of(
+                job.mips.begin(),
+                job.mips.end(),
+                [](const GpuTextureConversionMip& mip) {
+                    return mip.generated;
+                });
+            generated_chain_texture_count += generated_chain ? 1u : 0u;
+            recovered_chain_texture_count +=
+                job.mips.size() > 1u && !generated_chain ? 1u : 0u;
+            for (size_t mip_index = 0u;
+                 mip_index < job.mips.size();
+                 ++mip_index) {
+                GpuTextureConversionMip& mip = job.mips[mip_index];
+                output_size = (output_size + 3u) & ~uint64_t{3u};
+                const uint64_t mip_size = static_cast<uint64_t>(mip.width)
+                    * mip.height * 4u;
+                if (output_size > std::numeric_limits<uint32_t>::max()
+                    || mip_size
+                        > std::numeric_limits<uint32_t>::max() - output_size) {
+                    return false;
+                }
+                mip.output_byte_offset = static_cast<uint32_t>(output_size);
+                if (mip.generated) {
+                    mip.source_output_byte_offset =
+                        job.mips[mip_index - 1u].output_byte_offset;
+                    ++generated_mip_count;
+                }
+                output_size += mip_size;
+                ++mip_count;
+            }
+        }
+        input_size = (input_size + 3u) & ~uint64_t{3u};
+        output_size = (output_size + 3u) & ~uint64_t{3u};
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(physical_device_, &properties);
+        if (input_size == 0u
+            || output_size == 0u
+            || input_size > properties.limits.maxStorageBufferRange
+            || output_size > properties.limits.maxStorageBufferRange) {
+            return false;
+        }
+
+        GpuTextureValidationCoverage pending_validation_coverage =
+            gpu_texture_validation_coverage_;
+        std::vector<size_t> validation_job_indices;
+        uint32_t validation_mip_count = 0u;
+        uint64_t validation_byte_count = 0u;
+        const bool validate_gpu_texture_conversion =
+            options_.strict_render_validation
+            || !options_.live_render_stream;
+        if (validate_gpu_texture_conversion
+            && !gpu_texture_validation_coverage_.complete()) {
+            const auto generated_mips = [](
+                const GpuTextureConversionJob& job) {
+                return std::any_of(
+                    job.mips.begin(),
+                    job.mips.end(),
+                    [](const GpuTextureConversionMip& mip) {
+                        return mip.generated;
+                    });
+            };
+            const auto converted_bytes = [](
+                const GpuTextureConversionJob& job) {
+                uint64_t bytes = 0u;
+                for (const GpuTextureConversionMip& mip : job.mips) {
+                    bytes += static_cast<uint64_t>(mip.width)
+                        * mip.height * 4u;
+                }
+                return bytes;
+            };
+            const auto add_smallest_candidate = [&](const auto& predicate) {
+                size_t selected = jobs.size();
+                uint64_t selected_bytes =
+                    std::numeric_limits<uint64_t>::max();
+                for (size_t job_index = 0u;
+                     job_index < jobs.size();
+                     ++job_index) {
+                    const GpuTextureConversionJob& job = jobs[job_index];
+                    const uint64_t bytes = converted_bytes(job);
+                    if (predicate(job) && bytes < selected_bytes) {
+                        selected = job_index;
+                        selected_bytes = bytes;
+                    }
+                }
+                if (selected != jobs.size()
+                    && std::find(
+                        validation_job_indices.begin(),
+                        validation_job_indices.end(),
+                        selected) == validation_job_indices.end()) {
+                    validation_job_indices.push_back(selected);
+                }
+            };
+            if (!gpu_texture_validation_coverage_.dxt1) {
+                add_smallest_candidate([](
+                    const GpuTextureConversionJob& job) {
+                    return job.resource->format == "DXT1";
+                });
+            }
+            if (!gpu_texture_validation_coverage_.dxt5) {
+                add_smallest_candidate([](
+                    const GpuTextureConversionJob& job) {
+                    return job.resource->format == "DXT5";
+                });
+            }
+            if (!gpu_texture_validation_coverage_.recovered_mips) {
+                add_smallest_candidate([&](
+                    const GpuTextureConversionJob& job) {
+                    return job.mips.size() > 1u && !generated_mips(job);
+                });
+            }
+            if (!gpu_texture_validation_coverage_.generated_mips) {
+                add_smallest_candidate([&](
+                    const GpuTextureConversionJob& job) {
+                    return generated_mips(job);
+                });
+            }
+            for (const size_t job_index : validation_job_indices) {
+                const GpuTextureConversionJob& job = jobs[job_index];
+                const bool has_generated_mips = generated_mips(job);
+                const bool has_recovered_mips =
+                    job.mips.size() > 1u && !has_generated_mips;
+                validation_mip_count += static_cast<uint32_t>(
+                    job.mips.size());
+                validation_byte_count += converted_bytes(job);
+                pending_validation_coverage.dxt1 =
+                    pending_validation_coverage.dxt1
+                    || job.resource->format == "DXT1";
+                pending_validation_coverage.dxt5 =
+                    pending_validation_coverage.dxt5
+                    || job.resource->format == "DXT5";
+                pending_validation_coverage.recovered_mips =
+                    pending_validation_coverage.recovered_mips
+                    || has_recovered_mips;
+                pending_validation_coverage.generated_mips =
+                    pending_validation_coverage.generated_mips
+                    || has_generated_mips;
+            }
+        }
+        std::vector<VkBufferCopy> validation_copies;
+        uint64_t validation_buffer_size = 0u;
+        for (const size_t job_index : validation_job_indices) {
+            for (const GpuTextureConversionMip& mip : jobs[job_index].mips) {
+                VkBufferCopy copy{};
+                copy.srcOffset = mip.output_byte_offset;
+                copy.dstOffset = validation_buffer_size;
+                copy.size = static_cast<uint64_t>(mip.width)
+                    * mip.height * 4u;
+                validation_copies.push_back(copy);
+                validation_buffer_size += copy.size;
+            }
+        }
+
+        std::vector<uint8_t> input_bytes(static_cast<size_t>(input_size), 0u);
+        for (const GpuTextureConversionJob& job : jobs) {
+            std::memcpy(
+                input_bytes.data() + job.input_byte_offset,
+                job.resource->payload.data(),
+                job.resource->payload.size());
+            HostTexture& texture = host_textures_[job.host_texture_index];
+            texture.image_format = VK_FORMAT_R8G8B8A8_UNORM;
+            texture.mip_levels = static_cast<uint32_t>(job.mips.size());
+            VkImageCreateInfo image_info{};
+            image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            image_info.imageType = VK_IMAGE_TYPE_2D;
+            image_info.extent = {texture.width, texture.height, 1u};
+            image_info.mipLevels = texture.mip_levels;
+            image_info.arrayLayers = 1u;
+            image_info.format = texture.image_format;
+            image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+            image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            image_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                | VK_IMAGE_USAGE_SAMPLED_BIT;
+            image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+            image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            vk_check(
+                vkCreateImage(
+                    device_, &image_info, nullptr, &texture.image),
+                "vkCreateImage(GPU-converted texture)");
+            VkMemoryRequirements requirements{};
+            vkGetImageMemoryRequirements(
+                device_, texture.image, &requirements);
+            VkMemoryAllocateInfo allocation{};
+            allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            allocation.allocationSize = requirements.size;
+            allocation.memoryTypeIndex = find_memory_type(
+                requirements.memoryTypeBits,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            vk_check(
+                vkAllocateMemory(
+                    device_, &allocation, nullptr, &texture.memory),
+                "vkAllocateMemory(GPU-converted texture)");
+            vk_check(
+                vkBindImageMemory(
+                    device_, texture.image, texture.memory, 0u),
+                "vkBindImageMemory(GPU-converted texture)");
+            VkImageViewCreateInfo view_info{};
+            view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            view_info.image = texture.image;
+            view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            view_info.format = texture.image_format;
+            view_info.subresourceRange.aspectMask =
+                VK_IMAGE_ASPECT_COLOR_BIT;
+            view_info.subresourceRange.levelCount = texture.mip_levels;
+            view_info.subresourceRange.layerCount = 1u;
+            vk_check(
+                vkCreateImageView(
+                    device_, &view_info, nullptr, &texture.view),
+                "vkCreateImageView(GPU-converted texture)");
+        }
+
+        VkBuffer input_buffer = VK_NULL_HANDLE;
+        VkDeviceMemory input_memory = VK_NULL_HANDLE;
+        VkBuffer output_buffer = VK_NULL_HANDLE;
+        VkDeviceMemory output_memory = VK_NULL_HANDLE;
+        VkBuffer validation_buffer = VK_NULL_HANDLE;
+        VkDeviceMemory validation_memory = VK_NULL_HANDLE;
+        create_buffer(
+            input_size,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            input_buffer,
+            input_memory);
+        create_buffer(
+            output_size,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            output_buffer,
+            output_memory);
+        if (!validation_job_indices.empty()) {
+            create_buffer(
+                validation_buffer_size,
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                    | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                validation_buffer,
+                validation_memory);
+        }
+        void* mapped = nullptr;
+        vk_check(
+            vkMapMemory(
+                device_, input_memory, 0u, input_size, 0u, &mapped),
+            "vkMapMemory(texture conversion input)");
+        std::memcpy(mapped, input_bytes.data(), input_bytes.size());
+        upload_bytes_ += input_bytes.size();
+        vkUnmapMemory(device_, input_memory);
+
+        VkDescriptorPoolSize pool_size{};
+        pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        pool_size.descriptorCount = 2u;
+        VkDescriptorPoolCreateInfo pool_info{};
+        pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pool_info.maxSets = 1u;
+        pool_info.poolSizeCount = 1u;
+        pool_info.pPoolSizes = &pool_size;
+        VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+        vk_check(
+            vkCreateDescriptorPool(
+                device_, &pool_info, nullptr, &descriptor_pool),
+            "vkCreateDescriptorPool(texture conversion)");
+        VkDescriptorSetAllocateInfo descriptor_allocation{};
+        descriptor_allocation.sType =
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        descriptor_allocation.descriptorPool = descriptor_pool;
+        descriptor_allocation.descriptorSetCount = 1u;
+        descriptor_allocation.pSetLayouts =
+            &texture_convert_descriptor_layout_;
+        VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+        vk_check(
+            vkAllocateDescriptorSets(
+                device_, &descriptor_allocation, &descriptor_set),
+            "vkAllocateDescriptorSets(texture conversion)");
+        ++descriptor_allocation_count_;
+        const std::array<VkDescriptorBufferInfo, 2> buffer_infos{{
+            {input_buffer, 0u, input_size},
+            {output_buffer, 0u, output_size},
+        }};
+        std::array<VkWriteDescriptorSet, 2> descriptor_writes{};
+        for (uint32_t index = 0u; index < descriptor_writes.size(); ++index) {
+            descriptor_writes[index].sType =
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptor_writes[index].dstSet = descriptor_set;
+            descriptor_writes[index].dstBinding = index;
+            descriptor_writes[index].descriptorCount = 1u;
+            descriptor_writes[index].descriptorType =
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            descriptor_writes[index].pBufferInfo = &buffer_infos[index];
+        }
+        vkUpdateDescriptorSets(
+            device_,
+            static_cast<uint32_t>(descriptor_writes.size()),
+            descriptor_writes.data(),
+            0u,
+            nullptr);
+
+        const auto submission_begin = std::chrono::steady_clock::now();
+        submit_immediate([&](VkCommandBuffer command) {
+            vkCmdBindPipeline(
+                command,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                texture_convert_pipeline_);
+            vkCmdBindDescriptorSets(
+                command,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                texture_convert_pipeline_layout_,
+                0u,
+                1u,
+                &descriptor_set,
+                0u,
+                nullptr);
+            for (const GpuTextureConversionJob& job : jobs) {
+                for (size_t mip_index = 0u;
+                     mip_index < job.mips.size();
+                     ++mip_index) {
+                    const GpuTextureConversionMip& mip = job.mips[mip_index];
+                    if (mip.generated) {
+                        VkBufferMemoryBarrier dependency{};
+                        dependency.sType =
+                            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                        dependency.srcAccessMask =
+                            VK_ACCESS_SHADER_WRITE_BIT;
+                        dependency.dstAccessMask =
+                            VK_ACCESS_SHADER_READ_BIT
+                            | VK_ACCESS_SHADER_WRITE_BIT;
+                        dependency.srcQueueFamilyIndex =
+                            VK_QUEUE_FAMILY_IGNORED;
+                        dependency.dstQueueFamilyIndex =
+                            VK_QUEUE_FAMILY_IGNORED;
+                        dependency.buffer = output_buffer;
+                        dependency.offset = 0u;
+                        dependency.size = output_size;
+                        ++recording_barrier_count_;
+                        vkCmdPipelineBarrier(
+                            command,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            0u,
+                            0u,
+                            nullptr,
+                            1u,
+                            &dependency,
+                            0u,
+                            nullptr);
+                    }
+                    NativeTextureConvertPushConstants push{};
+                    push.input_byte_offset = job.input_byte_offset
+                        + mip.input_byte_offset;
+                    push.output_word_offset = mip.output_byte_offset
+                        / sizeof(uint32_t);
+                    push.source_word_offset = mip.source_output_byte_offset
+                        / sizeof(uint32_t);
+                    push.width = mip.width;
+                    push.height = mip.height;
+                    if (mip.generated) {
+                        const GpuTextureConversionMip& source =
+                            job.mips[mip_index - 1u];
+                        push.source_width = source.width;
+                        push.source_height = source.height;
+                        push.mode = 2u;
+                    } else {
+                        push.mode = job.resource->format == "DXT1" ? 0u : 1u;
+                    }
+                    vkCmdPushConstants(
+                        command,
+                        texture_convert_pipeline_layout_,
+                        VK_SHADER_STAGE_COMPUTE_BIT,
+                        0u,
+                        sizeof(push),
+                        &push);
+                    vkCmdDispatch(
+                        command,
+                        (mip.width + 7u) / 8u,
+                        (mip.height + 7u) / 8u,
+                        1u);
+                }
+            }
+            VkBufferMemoryBarrier output_ready{};
+            output_ready.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            output_ready.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            output_ready.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            output_ready.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            output_ready.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            output_ready.buffer = output_buffer;
+            output_ready.offset = 0u;
+            output_ready.size = output_size;
+            ++recording_barrier_count_;
+            vkCmdPipelineBarrier(
+                command,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0u,
+                0u,
+                nullptr,
+                1u,
+                &output_ready,
+                0u,
+                nullptr);
+            if (validation_buffer != VK_NULL_HANDLE) {
+                vkCmdCopyBuffer(
+                    command,
+                    output_buffer,
+                    validation_buffer,
+                    static_cast<uint32_t>(validation_copies.size()),
+                    validation_copies.data());
+            }
+
+            std::vector<VkImageMemoryBarrier> to_transfer;
+            to_transfer.reserve(jobs.size());
+            for (const GpuTextureConversionJob& job : jobs) {
+                const HostTexture& texture =
+                    host_textures_[job.host_texture_index];
+                VkImageMemoryBarrier barrier{};
+                barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier.image = texture.image;
+                barrier.subresourceRange.aspectMask =
+                    VK_IMAGE_ASPECT_COLOR_BIT;
+                barrier.subresourceRange.levelCount = texture.mip_levels;
+                barrier.subresourceRange.layerCount = 1u;
+                to_transfer.push_back(barrier);
+            }
+            ++recording_barrier_count_;
+            vkCmdPipelineBarrier(
+                command,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0u,
+                0u,
+                nullptr,
+                0u,
+                nullptr,
+                static_cast<uint32_t>(to_transfer.size()),
+                to_transfer.data());
+            for (const GpuTextureConversionJob& job : jobs) {
+                const HostTexture& texture =
+                    host_textures_[job.host_texture_index];
+                std::vector<VkBufferImageCopy> regions;
+                regions.reserve(job.mips.size());
+                for (uint32_t mip_index = 0u;
+                     mip_index < job.mips.size();
+                     ++mip_index) {
+                    const GpuTextureConversionMip& mip = job.mips[mip_index];
+                    VkBufferImageCopy region{};
+                    region.bufferOffset = mip.output_byte_offset;
+                    region.imageSubresource.aspectMask =
+                        VK_IMAGE_ASPECT_COLOR_BIT;
+                    region.imageSubresource.mipLevel = mip_index;
+                    region.imageSubresource.layerCount = 1u;
+                    region.imageExtent = {mip.width, mip.height, 1u};
+                    regions.push_back(region);
+                }
+                vkCmdCopyBufferToImage(
+                    command,
+                    output_buffer,
+                    texture.image,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    static_cast<uint32_t>(regions.size()),
+                    regions.data());
+            }
+            std::vector<VkImageMemoryBarrier> to_shader = to_transfer;
+            for (VkImageMemoryBarrier& barrier : to_shader) {
+                barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            }
+            ++recording_barrier_count_;
+            vkCmdPipelineBarrier(
+                command,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0u,
+                0u,
+                nullptr,
+                0u,
+                nullptr,
+                static_cast<uint32_t>(to_shader.size()),
+                to_shader.data());
+            if (validation_buffer != VK_NULL_HANDLE) {
+                VkBufferMemoryBarrier validation_ready{};
+                validation_ready.sType =
+                    VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                validation_ready.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                validation_ready.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+                validation_ready.srcQueueFamilyIndex =
+                    VK_QUEUE_FAMILY_IGNORED;
+                validation_ready.dstQueueFamilyIndex =
+                    VK_QUEUE_FAMILY_IGNORED;
+                validation_ready.buffer = validation_buffer;
+                validation_ready.offset = 0u;
+                validation_ready.size = validation_buffer_size;
+                ++recording_barrier_count_;
+                vkCmdPipelineBarrier(
+                    command,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_HOST_BIT,
+                    0u,
+                    0u,
+                    nullptr,
+                    1u,
+                    &validation_ready,
+                    0u,
+                nullptr);
+            }
+        });
+        const uint64_t gpu_submission_us = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - submission_begin).count();
+        const uint64_t setup_us = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                submission_begin - conversion_begin).count();
+
+        bool validation_passed = true;
+        uint64_t validation_mismatch_bytes = 0u;
+        uint32_t first_mismatch_address = 0u;
+        uint32_t first_mismatch_mip = 0u;
+        uint64_t first_mismatch_byte = 0u;
+        uint32_t first_mismatch_expected = 0u;
+        uint32_t first_mismatch_actual = 0u;
+        uint64_t validation_cpu_us = 0u;
+        if (validation_buffer != VK_NULL_HANDLE) {
+            readback_bytes_ += static_cast<uint64_t>(validation_buffer_size);
+            const auto validation_begin = std::chrono::steady_clock::now();
+            void* validation_mapped = nullptr;
+            vk_check(
+                vkMapMemory(
+                    device_,
+                    validation_memory,
+                    0u,
+                    validation_buffer_size,
+                    0u,
+                    &validation_mapped),
+                "vkMapMemory(texture conversion validation)");
+            const auto* actual = static_cast<const uint8_t*>(
+                validation_mapped);
+            bool first_mismatch_recorded = false;
+            size_t validation_copy_index = 0u;
+            for (const size_t job_index : validation_job_indices) {
+                const GpuTextureConversionJob& job = jobs[job_index];
+                const std::vector<std::vector<uint8_t>> expected_mips =
+                    build_cpu_dxt_conversion_mips(*job.resource);
+                if (expected_mips.size() != job.mips.size()) {
+                    validation_passed = false;
+                    ++validation_mismatch_bytes;
+                    if (!first_mismatch_recorded) {
+                        first_mismatch_recorded = true;
+                        first_mismatch_address = job.resource->address;
+                        first_mismatch_mip = static_cast<uint32_t>(
+                            std::min(expected_mips.size(), job.mips.size()));
+                    }
+                    validation_copy_index += job.mips.size();
+                    continue;
+                }
+                for (size_t mip_index = 0u;
+                     mip_index < job.mips.size();
+                     ++mip_index) {
+                    const GpuTextureConversionMip& mip =
+                        job.mips[mip_index];
+                    const std::vector<uint8_t>& expected =
+                        expected_mips[mip_index];
+                    const VkBufferCopy& validation_copy =
+                        validation_copies[validation_copy_index++];
+                    const size_t expected_size = static_cast<size_t>(
+                        mip.width) * mip.height * 4u;
+                    if (expected.size() != expected_size) {
+                        validation_passed = false;
+                        ++validation_mismatch_bytes;
+                        if (!first_mismatch_recorded) {
+                            first_mismatch_recorded = true;
+                            first_mismatch_address = job.resource->address;
+                            first_mismatch_mip = static_cast<uint32_t>(
+                                mip_index);
+                        }
+                        continue;
+                    }
+                    const uint8_t* actual_mip = actual
+                        + validation_copy.dstOffset;
+                    for (size_t byte_index = 0u;
+                         byte_index < expected.size();
+                         ++byte_index) {
+                        if (actual_mip[byte_index] == expected[byte_index]) {
+                            continue;
+                        }
+                        validation_passed = false;
+                        ++validation_mismatch_bytes;
+                        if (!first_mismatch_recorded) {
+                            first_mismatch_recorded = true;
+                            first_mismatch_address = job.resource->address;
+                            first_mismatch_mip = static_cast<uint32_t>(
+                                mip_index);
+                            first_mismatch_byte = byte_index;
+                            first_mismatch_expected = expected[byte_index];
+                            first_mismatch_actual = actual_mip[byte_index];
+                        }
+                    }
+                }
+            }
+            vkUnmapMemory(device_, validation_memory);
+            validation_cpu_us = std::chrono::duration_cast<
+                std::chrono::microseconds>(
+                    std::chrono::steady_clock::now()
+                    - validation_begin).count();
+            if (validation_passed) {
+                gpu_texture_validation_coverage_ =
+                    pending_validation_coverage;
+            }
+            log_.emit(
+                "nv2a_gpu_texture_conversion_validation",
+                {
+                    {"passed", json_bool(validation_passed)},
+                    {"textures", std::to_string(
+                        validation_job_indices.size())},
+                    {"mips", std::to_string(validation_mip_count)},
+                    {"bytes", std::to_string(validation_byte_count)},
+                    {"mismatch_bytes", std::to_string(
+                        validation_mismatch_bytes)},
+                    {"first_mismatch_address", std::to_string(
+                        first_mismatch_address)},
+                    {"first_mismatch_mip", std::to_string(
+                        first_mismatch_mip)},
+                    {"first_mismatch_byte", std::to_string(
+                        first_mismatch_byte)},
+                    {"first_mismatch_expected", std::to_string(
+                        first_mismatch_expected)},
+                    {"first_mismatch_actual", std::to_string(
+                        first_mismatch_actual)},
+                    {"validation_cpu_us", std::to_string(
+                        validation_cpu_us)},
+                    {"dxt1_covered", json_bool(
+                        gpu_texture_validation_coverage_.dxt1)},
+                    {"dxt5_covered", json_bool(
+                        gpu_texture_validation_coverage_.dxt5)},
+                    {"recovered_mips_covered", json_bool(
+                        gpu_texture_validation_coverage_.recovered_mips)},
+                    {"generated_mips_covered", json_bool(
+                        gpu_texture_validation_coverage_.generated_mips)},
+                    {"coverage_complete", json_bool(
+                        gpu_texture_validation_coverage_.complete())},
+                    {"failure_action", json_string(
+                        validation_passed
+                            ? "accept_gpu_batch"
+                            : "destroy_gpu_batch_and_use_cpu")},
+                });
+        }
+
+        vkDestroyDescriptorPool(device_, descriptor_pool, nullptr);
+        if (validation_buffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(device_, validation_buffer, nullptr);
+            vkFreeMemory(device_, validation_memory, nullptr);
+        }
+        vkDestroyBuffer(device_, output_buffer, nullptr);
+        vkFreeMemory(device_, output_memory, nullptr);
+        vkDestroyBuffer(device_, input_buffer, nullptr);
+        vkFreeMemory(device_, input_memory, nullptr);
+        if (!validation_passed) {
+            for (const GpuTextureConversionJob& job : jobs) {
+                destroy_host_texture(
+                    host_textures_[job.host_texture_index]);
+            }
+            ++gpu_texture_conversion_rejected_batch_count_;
+            return false;
+        }
+        last_gpu_texture_conversion_us_ = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - conversion_begin).count();
+        gpu_texture_conversion_batch_count_ += 1u;
+        gpu_texture_conversion_texture_count_ += jobs.size();
+        gpu_texture_conversion_mip_count_ += mip_count;
+        gpu_texture_conversion_input_bytes_ += input_size;
+        gpu_texture_conversion_output_bytes_ += output_size;
+        log_.emit(
+            "nv2a_gpu_texture_conversion_batch",
+            {
+                {"textures", std::to_string(jobs.size())},
+                {"dxt1_textures", std::to_string(dxt1_texture_count)},
+                {"dxt5_textures", std::to_string(dxt5_texture_count)},
+                {"recovered_chain_textures", std::to_string(
+                    recovered_chain_texture_count)},
+                {"generated_chain_textures", std::to_string(
+                    generated_chain_texture_count)},
+                {"mips", std::to_string(mip_count)},
+                {"generated_mips", std::to_string(generated_mip_count)},
+                {"input_bytes", std::to_string(input_size)},
+                {"dxt1_input_bytes", std::to_string(dxt1_input_bytes)},
+                {"dxt5_input_bytes", std::to_string(dxt5_input_bytes)},
+                {"output_bytes", std::to_string(output_size)},
+                {"dispatches", std::to_string(mip_count)},
+                {"setup_us", std::to_string(setup_us)},
+                {"gpu_submission_us", std::to_string(gpu_submission_us)},
+                {"validation_cpu_us", std::to_string(validation_cpu_us)},
+                {"conversion_us", std::to_string(
+                    last_gpu_texture_conversion_us_)},
+                {"cumulative_batches", std::to_string(
+                    gpu_texture_conversion_batch_count_)},
+                {"cumulative_textures", std::to_string(
+                    gpu_texture_conversion_texture_count_)},
+                {"cumulative_mips", std::to_string(
+                    gpu_texture_conversion_mip_count_)},
+                {"cumulative_input_bytes", std::to_string(
+                    gpu_texture_conversion_input_bytes_)},
+                {"cumulative_output_bytes", std::to_string(
+                    gpu_texture_conversion_output_bytes_)},
+                {"cumulative_rejected_batches", std::to_string(
+                    gpu_texture_conversion_rejected_batch_count_)},
+            });
+        return true;
+    }
+
+    std::optional<HostTexture> create_cpu_converted_host_texture(
+        const RecoveredTextureResource& resource,
+        const std::string& content_identity) {
+        std::vector<uint8_t> rgba;
+        std::vector<std::vector<uint8_t>> recovered_mips;
+        if (resource.format == "DXT1" || resource.format == "DXT5") {
+            recovered_mips = build_cpu_dxt_conversion_mips(resource);
+            if (recovered_mips.empty()) {
+                return std::nullopt;
+            }
+            rgba = recovered_mips.front();
+        } else if (resource.format == "R5G6B5") {
+            rgba = convert_r5g6b5_texture(resource);
+        } else if (resource.format == "A8R8G8B8"
+                   || resource.format == "A8R8G8B8_LINEAR") {
+            rgba = convert_bgra8_texture(
+                resource,
+                false,
+                resource.format == "A8R8G8B8");
+        } else if (resource.format == "X8R8G8B8"
+                   || resource.format == "X8R8G8B8_LINEAR") {
+            rgba = convert_bgra8_texture(
+                resource,
+                true,
+                resource.format == "X8R8G8B8");
+        } else {
+            const size_t rgba_size = static_cast<size_t>(resource.width)
+                * resource.height * 4u;
+            rgba.assign(
+                resource.payload.begin(),
+                resource.payload.begin()
+                    + static_cast<std::ptrdiff_t>(rgba_size));
+        }
+        return create_host_texture(
+            resource.address,
+            resource.width,
+            resource.height,
+            resource.format,
+            content_identity,
+            rgba,
+            VK_FORMAT_R8G8B8A8_UNORM,
+            false,
+            recovered_mips);
     }
 
     static void clear_moved_texture_handles(HostTexture& texture) {
@@ -5755,9 +9420,15 @@ private:
             || (mode == 0u && fixed_function_composite_matrix_valid(draw));
     }
 
-    std::vector<RenderTargetFeedbackSpec>
+    const std::vector<RenderTargetFeedbackSpec>&
     presented_render_target_feedback_specs() const {
-        std::vector<RenderTargetFeedbackSpec> specs;
+        if (feedback_spec_cache_generation_ == render_work_generation_) {
+            ++feedback_spec_cache_hit_count_;
+            return feedback_spec_cache_;
+        }
+        const auto build_begin = std::chrono::steady_clock::now();
+        feedback_spec_cache_.clear();
+        std::vector<RenderTargetFeedbackSpec>& specs = feedback_spec_cache_;
         auto append_unique = [&](RenderTargetFeedbackSpec spec) {
             if (spec.address == 0u
                 || spec.width == 0u
@@ -5848,63 +9519,70 @@ private:
         // through different NV2A windows. Retain any offscreen surface that is
         // sampled later in the frame so the producer pass can be replayed into
         // the host texture instead of uploading stale CPU backing bytes.
+        std::map<std::array<uint32_t, 3>, const NativeDraw*>
+            latest_offscreen_producers;
         for (size_t consumer_index = first_draw;
              consumer_index < end_draw;
              ++consumer_index) {
             const NativeDraw& consumer =
                 interpreted_stream_.draws[consumer_index];
-            if (!consumer.texture_enabled
-                || consumer.texture_stage >= consumer.texture_formats.size()
-                || consumer.texture_address == 0u) {
-                continue;
-            }
-            const uint32_t format_raw =
-                consumer.texture_formats[consumer.texture_stage];
-            const uint32_t color_format = (format_raw >> 8u) & 0xFFu;
-            std::string format;
-            switch (color_format) {
-            case 0x06u: format = "A8R8G8B8"; break;
-            case 0x07u: format = "X8R8G8B8"; break;
-            case 0x12u: format = "A8R8G8B8_LINEAR"; break;
-            case 0x1Eu: format = "X8R8G8B8_LINEAR"; break;
-            default: continue;
-            }
-            const auto [texture_width, texture_height] = nv2a_texture_extent(
-                format_raw,
-                consumer.texture_image_rects[consumer.texture_stage]);
-            const uint32_t canonical_texture =
-                nv2a_canonical_resource_address(consumer.texture_address);
-            const NativeDraw* producer = nullptr;
-            for (size_t producer_index = first_draw;
-                 producer_index < consumer_index;
-                 ++producer_index) {
-                const NativeDraw& candidate =
-                    interpreted_stream_.draws[producer_index];
-                if (nv2a_canonical_resource_address(
-                        candidate.surface_color_offset)
-                        != canonical_texture
-                    || draw_targets_presented_surface(candidate)) {
-                    continue;
+            if (consumer.texture_enabled
+                && consumer.texture_stage < consumer.texture_formats.size()
+                && consumer.texture_address != 0u) {
+                const uint32_t format_raw =
+                    consumer.texture_formats[consumer.texture_stage];
+                const uint32_t color_format = (format_raw >> 8u) & 0xFFu;
+                std::string format;
+                switch (color_format) {
+                case 0x06u: format = "A8R8G8B8"; break;
+                case 0x07u: format = "X8R8G8B8"; break;
+                case 0x12u: format = "A8R8G8B8_LINEAR"; break;
+                case 0x1Eu: format = "X8R8G8B8_LINEAR"; break;
+                default: break;
                 }
+                if (!format.empty()) {
+                    const auto [texture_width, texture_height] =
+                        nv2a_texture_extent(
+                            format_raw,
+                            consumer.texture_image_rects[
+                                consumer.texture_stage]);
+                    const std::array<uint32_t, 3> producer_key{
+                        nv2a_canonical_resource_address(
+                            consumer.texture_address),
+                        texture_width,
+                        texture_height,
+                    };
+                    const auto producer = latest_offscreen_producers.find(
+                        producer_key);
+                    if (producer != latest_offscreen_producers.end()) {
+                        append_unique({
+                            consumer.texture_address,
+                            texture_width,
+                            texture_height,
+                            std::move(format),
+                            producer->second->surface_color_offset,
+                            true,
+                        });
+                    }
+                }
+            }
+            if (!draw_targets_presented_surface(consumer)) {
                 const auto [surface_width, surface_height] =
-                    draw_surface_extent(candidate);
-                if (surface_width == texture_width
-                    && surface_height == texture_height) {
-                    producer = &candidate;
-                }
-            }
-            if (producer != nullptr) {
-                append_unique({
-                    consumer.texture_address,
-                    texture_width,
-                    texture_height,
-                    std::move(format),
-                    producer->surface_color_offset,
-                    true,
-                });
+                    draw_surface_extent(consumer);
+                latest_offscreen_producers[{
+                    nv2a_canonical_resource_address(
+                        consumer.surface_color_offset),
+                    surface_width,
+                    surface_height,
+                }] = &consumer;
             }
         }
-        return specs;
+        feedback_spec_cache_generation_ = render_work_generation_;
+        ++feedback_spec_cache_build_count_;
+        last_feedback_spec_build_us_ = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - build_begin).count();
+        return feedback_spec_cache_;
     }
 
     static bool render_target_feedback_texture_matches_spec(
@@ -5917,8 +9595,47 @@ private:
             && texture.format == spec.format;
     }
 
+    void cache_render_target_feedback_texture(HostTexture& texture) {
+        if (!texture.render_target_feedback
+            || texture.image == VK_NULL_HANDLE
+            || texture.memory == VK_NULL_HANDLE
+            || texture.view == VK_NULL_HANDLE) {
+            return;
+        }
+        const auto duplicate = std::find_if(
+            render_target_feedback_image_cache_.begin(),
+            render_target_feedback_image_cache_.end(),
+            [&](const HostTexture& cached) {
+                return cached.guest_address == texture.guest_address
+                    && cached.width == texture.width
+                    && cached.height == texture.height
+                    && cached.format == texture.format;
+            });
+        if (duplicate != render_target_feedback_image_cache_.end()) {
+            destroy_host_texture(*duplicate);
+            render_target_feedback_image_cache_.erase(duplicate);
+            ++last_render_target_feedback_image_cache_eviction_count_;
+            ++render_target_feedback_image_cache_eviction_count_;
+        }
+        render_target_feedback_image_cache_.push_back(std::move(texture));
+        clear_moved_texture_handles(texture);
+        ++last_render_target_feedback_image_cache_store_count_;
+        ++render_target_feedback_image_cache_store_count_;
+    }
+
+    void trim_render_target_feedback_image_cache() {
+        while (render_target_feedback_image_cache_.size()
+               > kRenderTargetFeedbackImageCacheCapacity) {
+            destroy_host_texture(render_target_feedback_image_cache_.front());
+            render_target_feedback_image_cache_.erase(
+                render_target_feedback_image_cache_.begin());
+            ++last_render_target_feedback_image_cache_eviction_count_;
+            ++render_target_feedback_image_cache_eviction_count_;
+        }
+    }
+
     bool render_target_feedback_refresh_required() const {
-        const std::vector<RenderTargetFeedbackSpec> specs =
+        const std::vector<RenderTargetFeedbackSpec>& specs =
             presented_render_target_feedback_specs();
         const size_t active_count = static_cast<size_t>(std::count_if(
             host_textures_.begin(),
@@ -5969,13 +9686,54 @@ private:
                 target.depth_image,
                 target.depth_memory,
                 target.depth_view);
+            target.color_view = VK_NULL_HANDLE;
         }
         offscreen_render_targets_.clear();
     }
 
+    bool offscreen_render_targets_match_presented_specs() const {
+        const std::vector<RenderTargetFeedbackSpec>& specs =
+            presented_render_target_feedback_specs();
+        std::vector<RenderTargetFeedbackSpec> expected;
+        for (const RenderTargetFeedbackSpec& spec : specs) {
+            if (spec.offscreen_produced) {
+                expected.push_back(spec);
+            }
+        }
+        if (expected.size() != offscreen_render_targets_.size()) {
+            return false;
+        }
+        for (size_t index = 0; index < expected.size(); ++index) {
+            const OffscreenRenderTarget& target = offscreen_render_targets_[index];
+            if (!(target.spec == expected[index])
+                || target.framebuffer == VK_NULL_HANDLE
+                || target.color_view == VK_NULL_HANDLE
+                || target.depth_image == VK_NULL_HANDLE
+                || target.depth_memory == VK_NULL_HANDLE
+                || target.depth_view == VK_NULL_HANDLE) {
+                return false;
+            }
+            const auto backing_texture = std::find_if(
+                host_textures_.begin(),
+                host_textures_.end(),
+                [&](const HostTexture& texture) {
+                    return texture.image != VK_NULL_HANDLE
+                        && texture.memory != VK_NULL_HANDLE
+                        && texture.view == target.color_view
+                        && render_target_feedback_texture_matches_spec(
+                            texture,
+                            expected[index]);
+                });
+            if (backing_texture == host_textures_.end()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     void create_offscreen_render_targets() {
         destroy_offscreen_render_targets();
-        const std::vector<RenderTargetFeedbackSpec> specs =
+        const std::vector<RenderTargetFeedbackSpec>& specs =
             presented_render_target_feedback_specs();
         offscreen_render_targets_.reserve(specs.size());
         for (const RenderTargetFeedbackSpec& spec : specs) {
@@ -5998,6 +9756,7 @@ private:
             }
             OffscreenRenderTarget target{};
             target.spec = spec;
+            target.color_view = texture->view;
             try {
                 create_depth_attachment(
                     spec.width,
@@ -6006,7 +9765,7 @@ private:
                     target.depth_memory,
                     target.depth_view);
                 const std::array<VkImageView, 2> attachments = {
-                    texture->view,
+                    target.color_view,
                     target.depth_view,
                 };
                 VkFramebufferCreateInfo create_info{};
@@ -6083,7 +9842,7 @@ private:
         const size_t end_draw = std::min<size_t>(
             first_draw + interpreted_stream_.presented_draw_count,
             interpreted_stream_.draws.size());
-        const std::vector<RenderTargetFeedbackSpec> feedback_specs =
+        const std::vector<RenderTargetFeedbackSpec>& feedback_specs =
             presented_render_target_feedback_specs();
         for (size_t draw_index = first_draw; draw_index < end_draw; ++draw_index) {
             const size_t presented_index = draw_index - first_draw;
@@ -6131,25 +9890,91 @@ private:
         return required;
     }
 
-    void refresh_host_texture_bindings(bool force = false) {
+    void refresh_host_texture_bindings() {
+        const auto update_begin = std::chrono::steady_clock::now();
+        last_texture_binding_update_us_ = 0;
+        last_texture_binding_set_reused_ = false;
+        last_texture_binding_image_descriptor_update_count_ = 0u;
+        last_texture_binding_descriptor_set_allocation_count_ = 0u;
         if (host_textures_.empty()) {
+            destroy_host_texture_bindings();
+            last_texture_binding_update_us_ = std::chrono::duration_cast<
+                std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - update_begin).count();
             return;
         }
         const std::vector<HostTextureBindingSpec> required =
             required_host_texture_bindings();
-        const bool unchanged = !force
+        const bool layout_unchanged = texture_descriptor_pool_ != VK_NULL_HANDLE
             && required.size() == host_texture_bindings_.size()
             && std::equal(
                 required.begin(), required.end(),
                 host_texture_bindings_.begin(),
-                [](const auto& spec, const HostTextureBinding& binding) {
+                [&](const auto& spec, const HostTextureBinding& binding) {
                     return spec.texture_index == binding.texture_index
                         && spec.address == binding.address
                         && spec.format == binding.format
                         && spec.control == binding.control
-                        && spec.filter == binding.filter;
+                        && spec.filter == binding.filter
+                        && spec.texture_index < host_textures_.size()
+                        && binding.texture_mip_levels
+                            == host_textures_[spec.texture_index].mip_levels;
                 });
-        if (unchanged) {
+        if (layout_unchanged) {
+            uint32_t image_descriptor_update_count = 0u;
+            uint32_t repeat_binding_count = 0u;
+            uint32_t mirrored_repeat_binding_count = 0u;
+            for (HostTextureBinding& binding : host_texture_bindings_) {
+                const HostTexture& texture =
+                    host_textures_[binding.texture_index];
+                if (binding.texture_view != texture.view) {
+                    VkDescriptorImageInfo image_info{
+                        binding.sampler,
+                        texture.view,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                    VkWriteDescriptorSet write{};
+                    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    write.dstSet = binding.descriptor_set;
+                    write.dstBinding = 0u;
+                    write.descriptorCount = 1u;
+                    write.descriptorType =
+                        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                    write.pImageInfo = &image_info;
+                    vkUpdateDescriptorSets(
+                        device_, 1u, &write, 0u, nullptr);
+                    binding.texture_view = texture.view;
+                    ++image_descriptor_update_count;
+                }
+                const uint32_t u_mode = binding.address & 7u;
+                const uint32_t v_mode = (binding.address >> 8u) & 7u;
+                repeat_binding_count +=
+                    u_mode == 1u || v_mode == 1u ? 1u : 0u;
+                mirrored_repeat_binding_count +=
+                    u_mode == 2u || v_mode == 2u ? 1u : 0u;
+            }
+            ++texture_binding_set_reuse_count_;
+            texture_binding_image_descriptor_update_count_ +=
+                image_descriptor_update_count;
+            last_texture_binding_set_reused_ = true;
+            last_texture_binding_image_descriptor_update_count_ =
+                image_descriptor_update_count;
+            last_texture_binding_update_us_ = std::chrono::duration_cast<
+                std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - update_begin).count();
+            log_.emit(
+                "nv2a_texture_sampler_bindings_refreshed",
+                {
+                    {"bindings", std::to_string(host_texture_bindings_.size())},
+                    {"binding_set_reused", json_bool(true)},
+                    {"image_descriptor_updates", std::to_string(
+                        image_descriptor_update_count)},
+                    {"descriptor_sets_allocated", "0"},
+                    {"update_us", std::to_string(
+                        last_texture_binding_update_us_)},
+                    {"repeat_bindings", std::to_string(repeat_binding_count)},
+                    {"mirrored_repeat_bindings", std::to_string(
+                        mirrored_repeat_binding_count)},
+                });
             return;
         }
         destroy_host_texture_bindings();
@@ -6161,6 +9986,9 @@ private:
             binding.format = spec.format;
             binding.control = spec.control;
             binding.filter = spec.filter;
+            binding.texture_mip_levels =
+                host_textures_[spec.texture_index].mip_levels;
+            binding.texture_view = host_textures_[spec.texture_index].view;
             VkSamplerCreateInfo sampler_info{};
             sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
             const uint32_t min_filter = (spec.filter >> 16u) & 0xFFu;
@@ -6207,7 +10035,7 @@ private:
             },
             {
                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                descriptor_count,
+                descriptor_count * 4u,
             },
         }};
         VkDescriptorPoolCreateInfo pool_info{};
@@ -6233,6 +10061,7 @@ private:
             vkAllocateDescriptorSets(
                 device_, &descriptor_allocation, descriptor_sets.data()),
             "vkAllocateDescriptorSets");
+        descriptor_allocation_count_ += descriptor_count;
         uint32_t repeat_binding_count = 0u;
         uint32_t mirrored_repeat_binding_count = 0u;
         for (size_t index = 0; index < host_texture_bindings_.size(); ++index) {
@@ -6243,11 +10072,23 @@ private:
                 binding.sampler,
                 texture.view,
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-            VkDescriptorBufferInfo buffer_info{
+            VkDescriptorBufferInfo fragment_buffer_info{
                 fragment_state_buffer_,
                 0,
                 fragment_state_buffer_size_};
-            std::array<VkWriteDescriptorSet, 2> writes{};
+            VkDescriptorBufferInfo vertex_program_buffer_info{
+                vertex_program_state_buffer_,
+                0,
+                vertex_program_state_buffer_size_};
+            VkDescriptorBufferInfo vertex_buffer_info{
+                vertex_buffer_,
+                0,
+                vertex_buffer_size_};
+            VkDescriptorBufferInfo raw_resource_buffer_info{
+                raw_vertex_resource_buffer_,
+                0,
+                raw_vertex_resource_buffer_size_};
+            std::array<VkWriteDescriptorSet, 5> writes{};
             writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[0].dstSet = binding.descriptor_set;
             writes[0].dstBinding = 0;
@@ -6260,7 +10101,25 @@ private:
             writes[1].dstBinding = 1;
             writes[1].descriptorCount = 1;
             writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[1].pBufferInfo = &buffer_info;
+            writes[1].pBufferInfo = &fragment_buffer_info;
+            writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[2].dstSet = binding.descriptor_set;
+            writes[2].dstBinding = 2;
+            writes[2].descriptorCount = 1;
+            writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[2].pBufferInfo = &vertex_program_buffer_info;
+            writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[3].dstSet = binding.descriptor_set;
+            writes[3].dstBinding = 3;
+            writes[3].descriptorCount = 1;
+            writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[3].pBufferInfo = &vertex_buffer_info;
+            writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[4].dstSet = binding.descriptor_set;
+            writes[4].dstBinding = 4;
+            writes[4].descriptorCount = 1;
+            writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[4].pBufferInfo = &raw_resource_buffer_info;
             vkUpdateDescriptorSets(
                 device_,
                 static_cast<uint32_t>(writes.size()),
@@ -6273,21 +10132,45 @@ private:
             mirrored_repeat_binding_count +=
                 u_mode == 2u || v_mode == 2u ? 1u : 0u;
         }
+        ++texture_binding_set_rebuild_count_;
+        texture_binding_image_descriptor_update_count_ += descriptor_count;
+        texture_binding_descriptor_set_allocation_count_ += descriptor_count;
+        last_texture_binding_image_descriptor_update_count_ = descriptor_count;
+        last_texture_binding_descriptor_set_allocation_count_ =
+            descriptor_count;
+        last_texture_binding_update_us_ = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - update_begin).count();
         log_.emit(
             "nv2a_texture_sampler_bindings_refreshed",
             {
                 {"bindings", std::to_string(host_texture_bindings_.size())},
+                {"binding_set_reused", json_bool(false)},
+                {"image_descriptor_updates", std::to_string(
+                    descriptor_count)},
+                {"descriptor_sets_allocated", std::to_string(
+                    descriptor_count)},
+                {"update_us", std::to_string(
+                    last_texture_binding_update_us_)},
                 {"repeat_bindings", std::to_string(repeat_binding_count)},
                 {"mirrored_repeat_bindings", std::to_string(mirrored_repeat_binding_count)},
             });
     }
 
     void refresh_host_textures(bool retain_unlisted_resources = false) {
-        destroy_host_texture_bindings();
+        const auto refresh_begin = std::chrono::steady_clock::now();
+        last_texture_refresh_us_ = 0u;
+        last_texture_indexed_lookup_count_ = 0u;
+        last_texture_indexed_lookup_candidate_count_ = 0u;
+        last_texture_constant_lookup_count_ = 0u;
+        last_render_target_feedback_image_cache_hit_count_ = 0u;
+        last_render_target_feedback_image_cache_miss_count_ = 0u;
+        last_render_target_feedback_image_cache_store_count_ = 0u;
+        last_render_target_feedback_image_cache_eviction_count_ = 0u;
         std::vector<HostTexture> previous = std::move(host_textures_);
         host_textures_.clear();
         last_render_target_feedback_pruned_count_ = 0u;
-        const std::vector<RenderTargetFeedbackSpec> feedback_specs =
+        const std::vector<RenderTargetFeedbackSpec>& feedback_specs =
             presented_render_target_feedback_specs();
         host_textures_.reserve(
             recovered_source_.textures.size()
@@ -6297,28 +10180,95 @@ private:
         uint32_t reused_texture_count = 0;
         uint32_t uploaded_texture_count = 0;
         uint32_t feedback_texture_count = 0;
+        uint32_t gpu_converted_texture_count = 0;
+        uint32_t cpu_converted_texture_count = 0;
+        uint64_t cpu_texture_path_us = 0u;
+        std::vector<GpuTextureConversionJob> gpu_conversion_jobs;
+        std::unordered_map<uint32_t, std::vector<size_t>>
+            previous_indices_by_address;
+        previous_indices_by_address.reserve(previous.size() * 2u + 1u);
+        for (size_t index = 0u; index < previous.size(); ++index) {
+            previous_indices_by_address[previous[index].guest_address]
+                .push_back(index);
+        }
+        std::unordered_map<uint32_t, std::vector<size_t>>
+            active_indices_by_address;
+        active_indices_by_address.reserve(
+            recovered_source_.textures.size() * 2u + 1u);
+        std::unordered_set<uint32_t> feedback_canonical_addresses;
+        feedback_canonical_addresses.reserve(feedback_specs.size() * 2u + 1u);
+        for (const RenderTargetFeedbackSpec& spec : feedback_specs) {
+            feedback_canonical_addresses.insert(
+                nv2a_canonical_resource_address(spec.address));
+        }
+
+        const auto find_previous_index =
+            [&](uint32_t address, const auto& matches) -> size_t {
+                ++last_texture_indexed_lookup_count_;
+                const auto bucket = previous_indices_by_address.find(address);
+                if (bucket == previous_indices_by_address.end()) {
+                    return previous.size();
+                }
+                for (const size_t index : bucket->second) {
+                    ++last_texture_indexed_lookup_candidate_count_;
+                    if (matches(previous[index])) {
+                        return index;
+                    }
+                }
+                return previous.size();
+            };
+        const auto index_active_texture = [&]() {
+            const size_t index = host_textures_.size() - 1u;
+            const HostTexture& texture = host_textures_[index];
+            if (!texture.render_target_feedback) {
+                active_indices_by_address[texture.guest_address]
+                    .push_back(index);
+            }
+        };
+        const auto active_texture_already_present =
+            [&](uint32_t address,
+                uint32_t width,
+                uint32_t height,
+                const std::string& format,
+                const std::string& content_hash) {
+                ++last_texture_indexed_lookup_count_;
+                const auto bucket = active_indices_by_address.find(address);
+                if (bucket == active_indices_by_address.end()) {
+                    return false;
+                }
+                for (const size_t index : bucket->second) {
+                    ++last_texture_indexed_lookup_candidate_count_;
+                    const HostTexture& texture = host_textures_[index];
+                    if (texture.width == width
+                        && texture.height == height
+                        && texture.format == format
+                        && texture.content_hash == content_hash) {
+                        return true;
+                    }
+                }
+                return false;
+            };
 
         auto retain_matching = [&](uint32_t address,
                                    uint32_t width,
                                    uint32_t height,
                                    const std::string& format,
                                    const std::string& content_hash) -> bool {
-            const auto match = std::find_if(
-                previous.begin(),
-                previous.end(),
+            const size_t match = find_previous_index(
+                address,
                 [&](const HostTexture& texture) {
                     return texture.image != VK_NULL_HANDLE
-                        && texture.guest_address == address
                         && texture.width == width
                         && texture.height == height
                         && texture.format == format
                         && texture.content_hash == content_hash;
                 });
-            if (match == previous.end()) {
+            if (match == previous.size()) {
                 return false;
             }
-            host_textures_.push_back(std::move(*match));
-            clear_moved_texture_handles(*match);
+            host_textures_.push_back(std::move(previous[match]));
+            clear_moved_texture_handles(previous[match]);
+            index_active_texture();
             ++reused_texture_count;
             return true;
         };
@@ -6326,25 +10276,48 @@ private:
         if (!retain_matching(0u, 1u, 1u, "fallback", "white")) {
             host_textures_.push_back(create_host_texture(
                 0u, 1u, 1u, "fallback", "white", {255, 255, 255, 255}));
+            index_active_texture();
             ++uploaded_texture_count;
         }
         for (const RenderTargetFeedbackSpec& spec : feedback_specs) {
-            const auto retained = std::find_if(
-                previous.begin(),
-                previous.end(),
+            const size_t retained = find_previous_index(
+                spec.address,
                 [&](const HostTexture& texture) {
                     return texture.image != VK_NULL_HANDLE
                         && render_target_feedback_texture_matches_spec(
                             texture,
                             spec);
                 });
-            if (retained != previous.end()) {
-                host_textures_.push_back(std::move(*retained));
-                clear_moved_texture_handles(*retained);
+            if (retained != previous.size()) {
+                host_textures_.push_back(std::move(previous[retained]));
+                clear_moved_texture_handles(previous[retained]);
                 ++reused_texture_count;
                 ++feedback_texture_count;
                 continue;
             }
+            const auto cached = std::find_if(
+                render_target_feedback_image_cache_.begin(),
+                render_target_feedback_image_cache_.end(),
+                [&](const HostTexture& texture) {
+                    return texture.image != VK_NULL_HANDLE
+                        && texture.memory != VK_NULL_HANDLE
+                        && texture.view != VK_NULL_HANDLE
+                        && render_target_feedback_texture_matches_spec(
+                            texture,
+                            spec);
+                });
+            if (cached != render_target_feedback_image_cache_.end()) {
+                host_textures_.push_back(std::move(*cached));
+                clear_moved_texture_handles(*cached);
+                render_target_feedback_image_cache_.erase(cached);
+                ++reused_texture_count;
+                ++feedback_texture_count;
+                ++last_render_target_feedback_image_cache_hit_count_;
+                ++render_target_feedback_image_cache_hit_count_;
+                continue;
+            }
+            ++last_render_target_feedback_image_cache_miss_count_;
+            ++render_target_feedback_image_cache_miss_count_;
             host_textures_.push_back(
                 create_render_target_feedback_texture(spec));
             ++uploaded_texture_count;
@@ -6354,16 +10327,11 @@ private:
             if (resource.format == "VERTEX_BUFFER") {
                 continue;
             }
-            const bool replaced_by_feedback = std::any_of(
-                host_textures_.begin(),
-                host_textures_.end(),
-                [&](const HostTexture& texture) {
-                    return texture.render_target_feedback
-                        && nv2a_canonical_resource_address(
-                            texture.guest_address)
-                            == nv2a_canonical_resource_address(
-                                resource.address);
-                });
+            ++last_texture_constant_lookup_count_;
+            const bool replaced_by_feedback =
+                feedback_canonical_addresses.find(
+                    nv2a_canonical_resource_address(resource.address))
+                != feedback_canonical_addresses.end();
             if (replaced_by_feedback) {
                 continue;
             }
@@ -6390,17 +10358,12 @@ private:
                     });
                 continue;
             }
-            const bool already_retained = std::any_of(
-                host_textures_.begin(),
-                host_textures_.end(),
-                [&](const HostTexture& texture) {
-                    return !texture.render_target_feedback
-                        && texture.guest_address == resource.address
-                        && texture.width == resource.width
-                        && texture.height == resource.height
-                        && texture.format == resource.format
-                        && texture.content_hash == content_identity;
-                });
+            const bool already_retained = active_texture_already_present(
+                resource.address,
+                resource.width,
+                resource.height,
+                resource.format,
+                content_identity);
             if (already_retained
                 || retain_matching(
                     resource.address,
@@ -6410,50 +10373,64 @@ private:
                     content_identity)) {
                 continue;
             }
-            std::vector<uint8_t> rgba;
-            std::vector<std::vector<uint8_t>> recovered_mips;
-            if (resource.format == "DXT1") {
-                recovered_mips = decompress_dxt_mip_chain(resource);
-                if (recovered_mips.empty()) {
-                    ++unsupported_texture_resource_count_;
-                    continue;
-                }
-                rgba = recovered_mips.front();
-            } else if (resource.format == "DXT5") {
-                recovered_mips = decompress_dxt_mip_chain(resource);
-                if (recovered_mips.empty()) {
-                    ++unsupported_texture_resource_count_;
-                    continue;
-                }
-                rgba = recovered_mips.front();
-            } else if (resource.format == "R5G6B5") {
-                rgba = convert_r5g6b5_texture(resource);
-            } else if (resource.format == "A8R8G8B8"
-                       || resource.format == "A8R8G8B8_LINEAR") {
-                rgba = convert_bgra8_texture(
+            GpuTextureConversionJob gpu_job{};
+            if (build_gpu_texture_conversion_job(
                     resource,
-                    false,
-                    resource.format == "A8R8G8B8");
-            } else if (resource.format == "X8R8G8B8"
-                       || resource.format == "X8R8G8B8_LINEAR") {
-                rgba = convert_bgra8_texture(
-                    resource,
-                    true,
-                    resource.format == "X8R8G8B8");
-            } else {
-                rgba.assign(resource.payload.begin(), resource.payload.begin() + rgba_size);
+                    host_textures_.size(),
+                    gpu_job)
+                && ensure_texture_conversion_pipeline()) {
+                HostTexture placeholder{};
+                placeholder.guest_address = resource.address;
+                placeholder.width = resource.width;
+                placeholder.height = resource.height;
+                placeholder.format = resource.format;
+                placeholder.content_hash = content_identity;
+                host_textures_.push_back(std::move(placeholder));
+                index_active_texture();
+                gpu_conversion_jobs.push_back(std::move(gpu_job));
+                ++uploaded_texture_count;
+                continue;
             }
-            host_textures_.push_back(create_host_texture(
-                resource.address,
-                resource.width,
-                resource.height,
-                resource.format,
-                content_identity,
-                rgba,
-                VK_FORMAT_R8G8B8A8_UNORM,
-                false,
-                recovered_mips));
+            const auto cpu_begin = std::chrono::steady_clock::now();
+            std::optional<HostTexture> texture =
+                create_cpu_converted_host_texture(
+                    resource, content_identity);
+            cpu_texture_path_us += std::chrono::duration_cast<
+                std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - cpu_begin).count();
+            if (!texture.has_value()) {
+                ++unsupported_texture_resource_count_;
+                continue;
+            }
+            host_textures_.push_back(std::move(*texture));
+            index_active_texture();
             ++uploaded_texture_count;
+            ++cpu_converted_texture_count;
+        }
+        if (!gpu_conversion_jobs.empty()) {
+            if (execute_gpu_texture_conversion_batch(gpu_conversion_jobs)) {
+                gpu_converted_texture_count = static_cast<uint32_t>(
+                    gpu_conversion_jobs.size());
+            } else {
+                for (const GpuTextureConversionJob& job :
+                     gpu_conversion_jobs) {
+                    const auto cpu_begin = std::chrono::steady_clock::now();
+                    std::optional<HostTexture> texture =
+                        create_cpu_converted_host_texture(
+                            *job.resource,
+                            host_textures_[job.host_texture_index].content_hash);
+                    cpu_texture_path_us += std::chrono::duration_cast<
+                        std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - cpu_begin).count();
+                    if (!texture.has_value()) {
+                        throw std::runtime_error(
+                            "GPU texture conversion fallback rejected a validated resource");
+                    }
+                    host_textures_[job.host_texture_index] =
+                        std::move(*texture);
+                    ++cpu_converted_texture_count;
+                }
+            }
         }
         if (retain_unlisted_resources) {
             for (HostTexture& texture : previous) {
@@ -6461,16 +10438,12 @@ private:
                     || texture.render_target_feedback) {
                     continue;
                 }
-                const bool replaced_by_feedback = std::any_of(
-                    host_textures_.begin(),
-                    host_textures_.end(),
-                    [&](const HostTexture& active) {
-                        return active.render_target_feedback
-                            && nv2a_canonical_resource_address(
-                                active.guest_address)
-                                == nv2a_canonical_resource_address(
-                                    texture.guest_address);
-                    });
+                ++last_texture_constant_lookup_count_;
+                const bool replaced_by_feedback =
+                    feedback_canonical_addresses.find(
+                        nv2a_canonical_resource_address(
+                            texture.guest_address))
+                    != feedback_canonical_addresses.end();
                 if (replaced_by_feedback) {
                     continue;
                 }
@@ -6483,25 +10456,81 @@ private:
             if (texture.render_target_feedback
                 && texture.image != VK_NULL_HANDLE) {
                 ++last_render_target_feedback_pruned_count_;
+                cache_render_target_feedback_texture(texture);
+                continue;
             }
             destroy_host_texture(texture);
         }
 
-        refresh_host_texture_bindings(true);
+        // Retained images keep their descriptor sets and samplers. The binding
+        // refresh rewrites only image descriptors whose backing view changed;
+        // layout or mip-count changes still rebuild the complete set.
+        refresh_host_texture_bindings();
+        // Descriptor updates above retire every reference to an inactive
+        // feedback view. Capacity eviction is therefore safe only after the
+        // active descriptor set no longer points at that image.
+        trim_render_target_feedback_image_cache();
+        last_texture_refresh_us_ = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - refresh_begin).count();
         log_.emit(
             "nv2a_texture_resources_refreshed",
             {
                 {"textures", std::to_string(host_textures_.size() - 1u)},
                 {"reused", std::to_string(reused_texture_count)},
                 {"uploaded", std::to_string(uploaded_texture_count)},
+                {"gpu_converted", std::to_string(
+                    gpu_converted_texture_count)},
+                {"cpu_converted", std::to_string(
+                    cpu_converted_texture_count)},
+                {"cpu_texture_path_us", std::to_string(
+                    cpu_texture_path_us)},
+                {"refresh_us", std::to_string(last_texture_refresh_us_)},
+                {"indexed_lookup_count", std::to_string(
+                    last_texture_indexed_lookup_count_)},
+                {"indexed_lookup_candidates", std::to_string(
+                    last_texture_indexed_lookup_candidate_count_)},
+                {"constant_lookup_count", std::to_string(
+                    last_texture_constant_lookup_count_)},
+                {"gpu_texture_path_us", std::to_string(
+                    gpu_converted_texture_count == 0u
+                        ? 0u
+                        : last_gpu_texture_conversion_us_)},
+                {"gpu_conversion_backend", json_string(
+                    options_.cpu_texture_conversion
+                        ? "cpu_forced"
+                        : queue_family_.supports_compute
+                            ? "compute"
+                            : "cpu_queue_fallback")},
                 {"render_target_feedback_textures", std::to_string(feedback_texture_count)},
                 {"render_target_feedback_required", std::to_string(feedback_specs.size())},
                 {"render_target_feedback_pruned", std::to_string(
                     last_render_target_feedback_pruned_count_)},
+                {"render_target_feedback_image_cache_hits", std::to_string(
+                    last_render_target_feedback_image_cache_hit_count_)},
+                {"render_target_feedback_image_cache_misses", std::to_string(
+                    last_render_target_feedback_image_cache_miss_count_)},
+                {"render_target_feedback_image_cache_stores", std::to_string(
+                    last_render_target_feedback_image_cache_store_count_)},
+                {"render_target_feedback_image_cache_evictions", std::to_string(
+                    last_render_target_feedback_image_cache_eviction_count_)},
+                {"render_target_feedback_image_cache_resident", std::to_string(
+                    render_target_feedback_image_cache_.size())},
+                {"render_target_feedback_image_cache_capacity", std::to_string(
+                    kRenderTargetFeedbackImageCacheCapacity)},
+                {"render_target_feedback_image_cache_hits_total", std::to_string(
+                    render_target_feedback_image_cache_hit_count_)},
+                {"render_target_feedback_image_cache_misses_total", std::to_string(
+                    render_target_feedback_image_cache_miss_count_)},
+                {"render_target_feedback_image_cache_stores_total", std::to_string(
+                    render_target_feedback_image_cache_store_count_)},
+                {"render_target_feedback_image_cache_evictions_total", std::to_string(
+                    render_target_feedback_image_cache_eviction_count_)},
             });
     }
 
-    std::vector<NativeVertex> prepare_presented_vertices() {
+    std::vector<NativeVertex> prepare_presented_vertices(
+        bool collect_diagnostics = true) {
         uploaded_vertex_base_ = 0;
         uploaded_vertex_count_ = 0;
         presented_vertex_program_transformed_count_ = 0;
@@ -6509,19 +10538,21 @@ private:
         presented_linear_texture_normalized_vertex_count_ = 0;
         presented_vertex_transform_diagnostics_ = {};
         presented_draw_transform_diagnostics_.clear();
+        presented_diagnostics_valid_ = false;
         last_vertex_transform_us_ = 0;
         const auto [presented_vertex_begin, presented_vertex_end] =
             presented_vertex_span(interpreted_stream_);
-        if (presented_vertex_begin >= presented_vertex_end) {
-            return {};
-        }
         const auto transform_begin = std::chrono::steady_clock::now();
-        std::vector<NativeVertex> vertices(
-            interpreted_stream_.vertices.begin()
-                + static_cast<std::ptrdiff_t>(presented_vertex_begin),
-            interpreted_stream_.vertices.begin()
-                + static_cast<std::ptrdiff_t>(presented_vertex_end));
-        uploaded_vertex_base_ = static_cast<uint32_t>(presented_vertex_begin);
+        std::vector<NativeVertex> vertices;
+        if (presented_vertex_begin < presented_vertex_end) {
+            vertices.assign(
+                interpreted_stream_.vertices.begin()
+                    + static_cast<std::ptrdiff_t>(presented_vertex_begin),
+                interpreted_stream_.vertices.begin()
+                    + static_cast<std::ptrdiff_t>(presented_vertex_end));
+            uploaded_vertex_base_ = static_cast<uint32_t>(
+                presented_vertex_begin);
+        }
         uploaded_vertex_count_ = static_cast<uint32_t>(vertices.size());
         const size_t first_draw = std::min<size_t>(
             interpreted_stream_.presented_draw_begin,
@@ -6529,7 +10560,7 @@ private:
         const size_t end_draw = std::min<size_t>(
             first_draw + interpreted_stream_.presented_draw_count,
             interpreted_stream_.draws.size());
-        const std::vector<RenderTargetFeedbackSpec> feedback_specs =
+        const std::vector<RenderTargetFeedbackSpec>& feedback_specs =
             presented_render_target_feedback_specs();
         for (size_t draw_index = first_draw; draw_index < end_draw; ++draw_index) {
             NativeDraw local_draw = interpreted_stream_.draws[draw_index];
@@ -6549,32 +10580,69 @@ private:
                 && offscreen_spec == feedback_specs.end()) {
                 continue;
             }
-            if ((local_draw.primitive != 5u && local_draw.primitive != 6u)
-                || local_draw.first_vertex < uploaded_vertex_base_) {
+            if (local_draw.primitive != 5u && local_draw.primitive != 6u) {
+                continue;
+            }
+            const bool use_gpu_vertex_program =
+                !options_.cpu_vertex_programs
+                && !options_.analyze_render_stream_only
+                && gpu_vertex_program_compatible(local_draw);
+            if (local_draw.gpu_raw_attribute_fetch) {
+                if (!use_gpu_vertex_program) {
+                    continue;
+                }
+                if (targets_presented) {
+                    presented_vertex_program_transformed_count_ +=
+                        local_draw.vertex_count;
+                } else {
+                    ++offscreen_render_target_draw_count_;
+                    offscreen_render_target_transformed_vertex_count_ +=
+                        local_draw.vertex_count;
+                }
+                continue;
+            }
+            if (local_draw.first_vertex < uploaded_vertex_base_) {
                 continue;
             }
             local_draw.first_vertex -= uploaded_vertex_base_;
-            if (local_draw.first_vertex + local_draw.vertex_count > vertices.size()) {
+            if (local_draw.first_vertex + local_draw.vertex_count
+                > vertices.size()) {
                 continue;
             }
             PresentedDrawTransformDiagnostics draw_diagnostics{};
-            draw_diagnostics.presented_index = static_cast<uint32_t>(
-                draw_index - first_draw);
-            draw_diagnostics.primitive = local_draw.primitive;
-            draw_diagnostics.vertex_count = local_draw.vertex_count;
-            draw_diagnostics.transform_execution_mode =
-                local_draw.transform_execution_mode;
-            draw_diagnostics.indexed_array = local_draw.indexed_array;
+            if (collect_diagnostics) {
+                draw_diagnostics.presented_index = static_cast<uint32_t>(
+                    draw_index - first_draw);
+                draw_diagnostics.primitive = local_draw.primitive;
+                draw_diagnostics.vertex_count = local_draw.vertex_count;
+                draw_diagnostics.transform_execution_mode =
+                    local_draw.transform_execution_mode;
+                draw_diagnostics.indexed_array = local_draw.indexed_array;
+            }
+            if (use_gpu_vertex_program) {
+                if (targets_presented) {
+                    presented_vertex_program_transformed_count_ +=
+                        local_draw.vertex_count;
+                } else {
+                    ++offscreen_render_target_draw_count_;
+                    offscreen_render_target_transformed_vertex_count_ +=
+                        local_draw.vertex_count;
+                }
+                // Keep decoded program inputs and original attributes intact.
+                // The Vulkan vertex shader performs the program, fog, linear
+                // texture normalization, and final viewport conversion.
+                continue;
+            }
             const uint32_t program_transformed =
                 execute_presented_vertex_program(
                     vertices,
                     local_draw,
-                    &draw_diagnostics.transform);
+                    collect_diagnostics ? &draw_diagnostics.transform : nullptr);
             const uint32_t fixed_transformed =
                 execute_presented_fixed_function_transform(
                     vertices,
                     local_draw,
-                    &draw_diagnostics.transform);
+                    collect_diagnostics ? &draw_diagnostics.transform : nullptr);
             const uint32_t linear_texture_normalized =
                 normalize_presented_linear_texture_coordinates(
                     vertices,
@@ -6586,8 +10654,10 @@ private:
                     fixed_transformed;
                 presented_linear_texture_normalized_vertex_count_ +=
                     linear_texture_normalized;
-                presented_vertex_transform_diagnostics_.merge(
-                    draw_diagnostics.transform);
+                if (collect_diagnostics) {
+                    presented_vertex_transform_diagnostics_.merge(
+                        draw_diagnostics.transform);
+                }
                 presented_half_quad_recovered_ |=
                     recover_presented_half_surface_quad(
                         vertices,
@@ -6684,7 +10754,7 @@ private:
                         });
                 }
             }
-            if (targets_presented) {
+            if (targets_presented && collect_diagnostics) {
             for (uint32_t vertex_index = 0;
                  vertex_index < local_draw.vertex_count;
                  ++vertex_index) {
@@ -6774,6 +10844,10 @@ private:
         last_vertex_transform_us_ = std::chrono::duration_cast<
             std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - transform_begin).count();
+        if (collect_diagnostics) {
+            presented_diagnostics_valid_ = true;
+            presented_diagnostics_generation_ = render_work_generation_;
+        }
         return vertices;
     }
 
@@ -6781,7 +10855,7 @@ private:
         const size_t first_draw = std::min<size_t>(
             interpreted_stream_.presented_draw_begin,
             interpreted_stream_.draws.size());
-        const std::vector<RenderTargetFeedbackSpec> host_feedback_specs =
+        const std::vector<RenderTargetFeedbackSpec>& host_feedback_specs =
             presented_render_target_feedback_specs();
         uint32_t program_draw_count = 0;
         uint32_t indexed_program_draw_count = 0;
@@ -6848,7 +10922,28 @@ private:
                 {"manifest_guest_steps", std::to_string(current_manifest_guest_steps_)},
                 {"launch_transform_program_count", std::to_string(interpreted_stream_.launch_transform_program_count)},
                 {"failed_launch_transform_program_count", std::to_string(interpreted_stream_.failed_launch_transform_program_count)},
+                {"execution_backend", json_string(
+                    options_.analyze_render_stream_only
+                            || options_.cpu_vertex_programs
+                        ? "cpu_reference"
+                        : "mixed_gpu_cpu")},
+                {"source_presented_draw_count", std::to_string(
+                    interpreted_stream_.presented_draw_count)},
                 {"presented_draw_count", std::to_string(presented_draw_transform_diagnostics_.size())},
+                {"gpu_vertex_program_draws", std::to_string(
+                    gpu_vertex_program_draw_count_)},
+                {"gpu_vertex_program_vertices", std::to_string(
+                    gpu_vertex_program_vertex_count_)},
+                {"gpu_raw_attribute_draws", std::to_string(
+                    gpu_raw_attribute_draw_count_)},
+                {"gpu_raw_attribute_vertices", std::to_string(
+                    gpu_raw_attribute_vertex_count_)},
+                {"cpu_vertex_program_fallback_draws", std::to_string(
+                    cpu_vertex_program_fallback_draw_count_)},
+                {"cpu_vertex_program_fallback_vertices", std::to_string(
+                    cpu_vertex_program_fallback_vertex_count_)},
+                {"gpu_output_diagnostics_deferred", json_bool(
+                    gpu_vertex_program_draw_count_ != 0u)},
                 {"program_draw_count", std::to_string(program_draw_count)},
                 {"indexed_program_draw_count", std::to_string(indexed_program_draw_count)},
                 {"indexed_program_vertex_count", std::to_string(indexed_program_vertex_count)},
@@ -7453,7 +11548,7 @@ private:
                         producer_exists ? 0u : 1u;
                     aliased_gpu_produced_texture_draw_count +=
                         producer_exists && !raw_producer_exists ? 1u : 0u;
-                    const std::vector<RenderTargetFeedbackSpec>
+                    const std::vector<RenderTargetFeedbackSpec>&
                         feedback_specs =
                             presented_render_target_feedback_specs();
                     offscreen_render_target_replay_draw_count +=
@@ -7492,7 +11587,7 @@ private:
             fixed_function_invalid_vertex_count +=
                 diagnostics.transform.invalid_fixed_function_vertex_count;
         }
-        const std::vector<RenderTargetFeedbackSpec> feedback_specs =
+        const std::vector<RenderTargetFeedbackSpec>& feedback_specs =
             presented_render_target_feedback_specs();
         std::ostringstream feedback_addresses;
         feedback_addresses << '[';
@@ -7506,7 +11601,13 @@ private:
         log_.emit(
             "nv2a_render_state_diagnostics",
             {
+                {"source_presented_draw_count", std::to_string(
+                    interpreted_stream_.presented_draw_count)},
                 {"presented_draw_count", std::to_string(presented_draw_transform_diagnostics_.size())},
+                {"gpu_vertex_program_draws", std::to_string(
+                    gpu_vertex_program_draw_count_)},
+                {"gpu_output_diagnostics_deferred", json_bool(
+                    gpu_vertex_program_draw_count_ != 0u)},
                 {"textured_presented_draw_count", std::to_string(textured_draw_count)},
                 {"texture_address_state_draw_count", std::to_string(texture_address_state_draw_count)},
                 {"out_of_unit_texture_coordinate_draw_count", std::to_string(out_of_unit_texture_coordinate_draw_count)},
@@ -7551,77 +11652,160 @@ private:
             });
     }
 
-    void create_native_render_resources(bool create_textures = true) {
-        unsupported_texture_resource_count_ = 0;
+    void create_native_render_resources(
+        bool create_textures = true,
+        bool reuse_offscreen_render_targets = false) {
+        const auto native_resource_begin = std::chrono::steady_clock::now();
+        last_vertex_resource_prepare_us_ = 0u;
+        last_state_resource_prepare_us_ = 0u;
+        last_texture_resource_prepare_us_ = 0u;
+        last_offscreen_resource_prepare_us_ = 0u;
+        last_resource_bookkeeping_us_ = 0u;
+        last_texture_refresh_us_ = 0u;
+        last_texture_indexed_lookup_count_ = 0u;
+        last_texture_indexed_lookup_candidate_count_ = 0u;
+        last_texture_constant_lookup_count_ = 0u;
+        last_render_target_feedback_image_cache_hit_count_ = 0u;
+        last_render_target_feedback_image_cache_miss_count_ = 0u;
+        last_render_target_feedback_image_cache_store_count_ = 0u;
+        last_render_target_feedback_image_cache_eviction_count_ = 0u;
+        if (create_textures) {
+            // This diagnostic belongs to the resident resource generation.
+            // Command-only reloads must not erase a failure from the texture
+            // payload that is still installed.
+            unsupported_texture_resource_count_ = 0;
+        }
         last_vertex_map_us_ = 0;
         last_vertex_copy_us_ = 0;
-        std::vector<NativeVertex> vertices = prepare_presented_vertices();
+        // Resource generations still run the lightweight validation below.
+        // Do not also force the per-draw, per-vertex, and transform-token event
+        // flood; sample that diagnostic detail at a fixed cadence instead.
+        const bool diagnostic_sample_due = log_.enabled()
+            && (!options_.live_render_stream
+                || (options_.strict_render_validation
+                    && (live_render_reload_count_ == 0u
+                        || live_render_reload_count_ % 120u == 0u)));
+        last_presented_diagnostics_sampled_ = diagnostic_sample_due;
+        last_render_validation_us_ = 0;
+        std::vector<NativeVertex> vertices = prepare_presented_vertices(
+            diagnostic_sample_due);
         frontend_text_rectangle_count_ = append_frontend_text_vertices(
             vertices, recovered_frontend_text_);
         uploaded_vertex_count_ = static_cast<uint32_t>(vertices.size());
-        if (!vertices.empty()) {
-            const VkDeviceSize required_size = vertices.size() * sizeof(NativeVertex);
-            if (vertex_buffer_ != VK_NULL_HANDLE
-                && required_size > vertex_buffer_size_) {
-                if (vertex_mapped_ != nullptr) {
-                    vkUnmapMemory(device_, vertex_memory_);
-                    vertex_mapped_ = nullptr;
-                }
-                vkDestroyBuffer(device_, vertex_buffer_, nullptr);
-                vkFreeMemory(device_, vertex_memory_, nullptr);
-                vertex_buffer_ = VK_NULL_HANDLE;
-                vertex_memory_ = VK_NULL_HANDLE;
-                vertex_buffer_size_ = 0u;
+        const VkDeviceSize uploaded_size =
+            vertices.size() * sizeof(NativeVertex);
+        const VkDeviceSize required_size = std::max<VkDeviceSize>(
+            uploaded_size,
+            sizeof(NativeVertex));
+        if (vertex_buffer_ != VK_NULL_HANDLE
+            && required_size > vertex_buffer_size_) {
+            destroy_host_texture_bindings();
+            if (vertex_mapped_ != nullptr) {
+                vkUnmapMemory(device_, vertex_memory_);
+                vertex_mapped_ = nullptr;
             }
-            if (vertex_buffer_ == VK_NULL_HANDLE) {
-                const VkDeviceSize allocation_size = options_.live_render_stream
-                    ? std::max<VkDeviceSize>(required_size, 1024u * 1024u)
-                    : required_size;
-                vertex_buffer_size_ = allocation_size;
-                create_buffer(
+            vkDestroyBuffer(device_, vertex_buffer_, nullptr);
+            vkFreeMemory(device_, vertex_memory_, nullptr);
+            vertex_buffer_ = VK_NULL_HANDLE;
+            vertex_memory_ = VK_NULL_HANDLE;
+            vertex_buffer_size_ = 0u;
+        }
+        if (vertex_buffer_ == VK_NULL_HANDLE) {
+            const VkDeviceSize allocation_size = options_.live_render_stream
+                ? std::max<VkDeviceSize>(required_size, 1024u * 1024u)
+                : required_size;
+            vertex_buffer_size_ = allocation_size;
+            create_buffer(
+                vertex_buffer_size_,
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
+                    | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                    | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                vertex_buffer_,
+                vertex_memory_);
+        }
+        if (!vertex_mapped_) {
+            const auto map_begin = std::chrono::steady_clock::now();
+            vk_check(
+                vkMapMemory(
+                    device_,
+                    vertex_memory_,
+                    0,
                     vertex_buffer_size_,
-                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                    vertex_buffer_,
-                    vertex_memory_);
-            }
-            if (!vertex_mapped_) {
-                const auto map_begin = std::chrono::steady_clock::now();
-                vk_check(
-                    vkMapMemory(
-                        device_,
-                        vertex_memory_,
-                        0,
-                        vertex_buffer_size_,
-                        0,
-                        &vertex_mapped_),
-                    "vkMapMemory(vertices)");
-                last_vertex_map_us_ = std::chrono::duration_cast<
-                    std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - map_begin).count();
-            }
+                    0,
+                    &vertex_mapped_),
+                "vkMapMemory(vertices)");
+            last_vertex_map_us_ = std::chrono::duration_cast<
+                std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - map_begin).count();
+        }
+        if (uploaded_size != 0u) {
             const auto copy_begin = std::chrono::steady_clock::now();
             std::memcpy(
                 vertex_mapped_,
                 vertices.data(),
-                static_cast<size_t>(required_size));
+                static_cast<size_t>(uploaded_size));
+            upload_bytes_ += static_cast<uint64_t>(uploaded_size);
             last_vertex_copy_us_ = std::chrono::duration_cast<
                 std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - copy_begin).count();
+        } else {
+            std::memset(vertex_mapped_, 0, sizeof(NativeVertex));
         }
 
+        last_vertex_resource_prepare_us_ = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                std::chrono::steady_clock::now()
+                - native_resource_begin).count();
+        const auto state_resource_begin = std::chrono::steady_clock::now();
+        refresh_raw_vertex_buffers();
+        refresh_vertex_program_states();
         refresh_fragment_states();
+        last_state_resource_prepare_us_ = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                std::chrono::steady_clock::now()
+                - state_resource_begin).count();
 
+        const auto texture_resource_begin = std::chrono::steady_clock::now();
         last_render_target_feedback_pruned_count_ = 0u;
         const bool feedback_refresh_required =
             render_target_feedback_refresh_required();
+        if (reuse_offscreen_render_targets
+            && !offscreen_render_targets_match_presented_specs()) {
+            throw std::runtime_error(
+                "cannot reuse offscreen targets with stale attachments");
+        }
         if (create_textures || feedback_refresh_required) {
             refresh_host_textures(!create_textures);
         } else {
             refresh_host_texture_bindings();
         }
-        create_offscreen_render_targets();
-        const std::vector<RenderTargetFeedbackSpec> feedback_specs =
+        if (reuse_offscreen_render_targets
+            && !offscreen_render_targets_match_presented_specs()) {
+            throw std::runtime_error(
+                "offscreen target backing texture changed during refresh");
+        }
+        last_texture_resource_prepare_us_ = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                std::chrono::steady_clock::now()
+                - texture_resource_begin).count();
+        const auto offscreen_resource_begin =
+            std::chrono::steady_clock::now();
+        last_offscreen_render_targets_reused_ = reuse_offscreen_render_targets;
+        if (!reuse_offscreen_render_targets) {
+            create_offscreen_render_targets();
+        } else {
+            log_.emit(
+                "nv2a_offscreen_render_targets_reused",
+                {{"count", std::to_string(offscreen_render_targets_.size())}});
+        }
+        last_offscreen_resource_prepare_us_ = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                std::chrono::steady_clock::now()
+                - offscreen_resource_begin).count();
+        const auto resource_bookkeeping_begin =
+            std::chrono::steady_clock::now();
+        const std::vector<RenderTargetFeedbackSpec>& feedback_specs =
             presented_render_target_feedback_specs();
         const uint32_t render_target_feedback_texture_count =
             static_cast<uint32_t>(std::count_if(
@@ -7702,11 +11886,27 @@ private:
                     stale_render_target_feedback_texture_count)},
                 {"render_target_feedback_pruned", std::to_string(
                     last_render_target_feedback_pruned_count_)},
+                {"render_target_feedback_image_cache_hits", std::to_string(
+                    last_render_target_feedback_image_cache_hit_count_)},
+                {"render_target_feedback_image_cache_misses", std::to_string(
+                    last_render_target_feedback_image_cache_miss_count_)},
+                {"render_target_feedback_image_cache_stores", std::to_string(
+                    last_render_target_feedback_image_cache_store_count_)},
+                {"render_target_feedback_image_cache_evictions", std::to_string(
+                    last_render_target_feedback_image_cache_eviction_count_)},
+                {"render_target_feedback_image_cache_resident", std::to_string(
+                    render_target_feedback_image_cache_.size())},
+                {"render_target_feedback_image_cache_capacity", std::to_string(
+                    kRenderTargetFeedbackImageCacheCapacity)},
                 {"render_target_feedback_required_addresses",
                     required_feedback_addresses.str()},
                 {"render_target_feedback_active_addresses",
                     active_feedback_addresses.str()},
                 {"render_target_feedback_refreshed", json_bool(feedback_refresh_required)},
+                {"offscreen_render_targets_reused", json_bool(
+                    last_offscreen_render_targets_reused_)},
+                {"presented_diagnostics_sampled", json_bool(
+                    last_presented_diagnostics_sampled_)},
                 {"presented_half_quad_recovered", json_bool(presented_half_quad_recovered_)},
                 {"presented_overscan_height_recovered", json_bool(presented_overscan_height_recovered_)},
                 {"presented_vertex_program_transformed_count", std::to_string(presented_vertex_program_transformed_count_)},
@@ -7721,9 +11921,38 @@ private:
                 {"materialized_indexed_vertices", std::to_string(interpreted_stream_.materialized_indexed_vertex_count)},
                 {"missing_indexed_resource_draws", std::to_string(interpreted_stream_.missing_indexed_resource_draw_count)},
                 {"vertex_transform_us", std::to_string(last_vertex_transform_us_)},
+                {"vertex_state_upload_us", std::to_string(
+                    last_vertex_state_upload_us_)},
+                {"raw_vertex_upload_us", std::to_string(
+                    last_raw_vertex_upload_us_)},
+                {"gpu_raw_attribute_draws", std::to_string(
+                    gpu_raw_attribute_draw_count_)},
+                {"gpu_raw_attribute_vertices", std::to_string(
+                    gpu_raw_attribute_vertex_count_)},
+                {"expanded_vertex_bytes_avoided", std::to_string(
+                    static_cast<uint64_t>(
+                        gpu_raw_attribute_vertex_count_)
+                        * sizeof(NativeVertex))},
+                {"gpu_vertex_program_draws", std::to_string(
+                    gpu_vertex_program_draw_count_)},
+                {"gpu_vertex_program_vertices", std::to_string(
+                    gpu_vertex_program_vertex_count_)},
+                {"cpu_vertex_program_fallback_draws", std::to_string(
+                    cpu_vertex_program_fallback_draw_count_)},
+                {"cpu_vertex_program_fallback_vertices", std::to_string(
+                    cpu_vertex_program_fallback_vertex_count_)},
                 {"vertex_map_us", std::to_string(last_vertex_map_us_)},
                 {"vertex_copy_us", std::to_string(last_vertex_copy_us_)},
             });
+        last_resource_bookkeeping_us_ = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                std::chrono::steady_clock::now()
+                - resource_bookkeeping_begin).count();
+        const auto render_validation_begin =
+            std::chrono::steady_clock::now();
+        if (!log_.enabled() && !options_.strict_render_validation) {
+            return;
+        }
         const size_t diagnostic_first_draw = std::min<size_t>(
             interpreted_stream_.presented_draw_begin,
             interpreted_stream_.draws.size());
@@ -7739,6 +11968,7 @@ private:
         uint32_t offscreen_render_target_draw_count = 0;
         uint32_t valid_geometry_draw_count = 0;
         uint32_t invalid_geometry_range_count = 0;
+        uint32_t gpu_raw_attribute_draw_count = 0;
         uint32_t non_finite_position_draw_count = 0;
         uint32_t collapsed_x_draw_count = 0;
         uint32_t collapsed_y_draw_count = 0;
@@ -7760,12 +11990,12 @@ private:
         float overall_max_x = 0.0f;
         float overall_min_y = 0.0f;
         float overall_max_y = 0.0f;
-        const bool emit_presented_details = !options_.live_render_stream
-            || create_textures
-            || live_render_reload_count_ == 0u
-            || live_render_reload_count_ % 120u == 0u;
-        emit_presented_vertex_transform_diagnostics(emit_presented_details);
-        emit_presented_render_state_diagnostics();
+        const bool emit_presented_details = presented_diagnostics_valid_
+            && presented_diagnostics_generation_ == render_work_generation_;
+        if (emit_presented_details) {
+            emit_presented_vertex_transform_diagnostics(true);
+            emit_presented_render_state_diagnostics();
+        }
         for (size_t draw_index = diagnostic_first_draw;
              draw_index < diagnostic_end_draw;
              ++draw_index) {
@@ -7798,7 +12028,11 @@ private:
                 filtered_fixed_function_indexed_draw_count +=
                     draw.indexed_array ? 1u : 0u;
             }
-            if (draw.vertex_count == 0u ||
+            if (draw.gpu_raw_attribute_fetch) {
+                ++valid_geometry_draw_count;
+                ++gpu_raw_attribute_draw_count;
+                presented_vertex_count += draw.vertex_count;
+            } else if (draw.vertex_count == 0u ||
                 draw.first_vertex + draw.vertex_count > interpreted_stream_.vertices.size()) {
                 ++invalid_geometry_range_count;
             } else {
@@ -7929,7 +12163,10 @@ private:
             "nv2a_presented_geometry_anomalies",
             {
                 {"reload", std::to_string(options_.live_render_stream ? live_render_reload_count_ + 1u : 0u)},
-                {"source_commands", std::to_string(recovered_source_.commands.size())},
+                {"source_commands", std::to_string(
+                    options_.live_render_stream
+                        ? interpreted_source_command_count_
+                        : recovered_source_.commands.size())},
                 {"guest_flips", std::to_string(interpreted_stream_.flip_count)},
                 {"manifest_guest_flip_count", std::to_string(current_manifest_guest_flip_count_)},
                 {"manifest_guest_steps", std::to_string(current_manifest_guest_steps_)},
@@ -7943,6 +12180,8 @@ private:
                 {"zero_alpha_presented_draw_count", std::to_string(zero_alpha_presented_draw_count)},
                 {"presented_texture_addresses", presented_texture_addresses_json.str()},
                 {"valid_geometry_draw_count", std::to_string(valid_geometry_draw_count)},
+                {"gpu_raw_attribute_draw_count", std::to_string(
+                    gpu_raw_attribute_draw_count)},
                 {"invalid_geometry_range_count", std::to_string(invalid_geometry_range_count)},
                 {"filtered_fixed_function_draw_count", std::to_string(filtered_fixed_function_draw_count)},
                 {"filtered_fixed_function_indexed_draw_count", std::to_string(filtered_fixed_function_indexed_draw_count)},
@@ -8254,6 +12493,10 @@ private:
                     });
             }
         }
+        last_render_validation_us_ =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now()
+                    - render_validation_begin).count();
     }
 
     VkDescriptorSet descriptor_for_draw(const NativeDraw& draw) const {
@@ -8330,6 +12573,7 @@ private:
         to_transfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         to_transfer.subresourceRange.levelCount = 1;
         to_transfer.subresourceRange.layerCount = 1;
+        ++recording_barrier_count_;
         vkCmdPipelineBarrier(
             command_buffer,
             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
@@ -8366,6 +12610,7 @@ private:
         to_shader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         to_shader.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         to_shader.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        ++recording_barrier_count_;
         vkCmdPipelineBarrier(
             command_buffer,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -8443,10 +12688,24 @@ private:
             vkCmdPushConstants(
                 command_buffer,
                 pipeline_layout_,
-                VK_SHADER_STAGE_FRAGMENT_BIT,
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                 0u,
                 sizeof(fragment_state),
                 &fragment_state);
+            const uint64_t triangle_count = draw.primitive == 5u
+                ? draw.vertex_count / 3u
+                : (draw.vertex_count >= 3u ? draw.vertex_count - 2u : 0u);
+            if (draw.gpu_raw_attribute_fetch) {
+                ++recording_draw_count_;
+                recording_triangle_count_ += triangle_count;
+                vkCmdDraw(
+                    command_buffer,
+                    draw.vertex_count,
+                    1,
+                    0,
+                    0);
+                continue;
+            }
             const uint64_t draw_first = draw.first_vertex;
             const uint64_t draw_end = draw_first + draw.vertex_count;
             const uint64_t upload_first = uploaded_vertex_base_;
@@ -8454,6 +12713,8 @@ private:
             if (draw_first < upload_first || draw_end > upload_end) {
                 continue;
             }
+            ++recording_draw_count_;
+            recording_triangle_count_ += triangle_count;
             vkCmdDraw(
                 command_buffer,
                 draw.vertex_count,
@@ -8527,6 +12788,7 @@ private:
             to_shader.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             to_shader.subresourceRange.levelCount = 1;
             to_shader.subresourceRange.layerCount = 1;
+            ++recording_barrier_count_;
             vkCmdPipelineBarrier(
                 command_buffer,
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -8859,10 +13121,12 @@ private:
         vkCmdPushConstants(
             command_buffer,
             pipeline_layout_,
-            VK_SHADER_STAGE_FRAGMENT_BIT,
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
             0u,
             sizeof(fragment_state),
             &fragment_state);
+        ++recording_draw_count_;
+        recording_triangle_count_ += frontend_text_vertex_count_ / 3u;
         vkCmdDraw(
             command_buffer,
             frontend_text_vertex_count_,
@@ -8876,18 +13140,37 @@ private:
         const std::vector<RecoveredD3DCommand>& recovered_d3d_stream =
             recovered_source_.commands;
         const InterpretedD3DStream& interpreted_stream = interpreted_stream_;
-        if (counted_recovered_command_count_ > recovered_d3d_stream.size()) {
+        if (options_.live_render_stream) {
+            if (counted_command_render_work_generation_
+                != render_work_generation_) {
+                if (last_command_cursor_reset_) {
+                    recovered_d3d_mmio_count_ = 0u;
+                }
+                recovered_d3d_mmio_count_ += last_live_command_mmio_count_;
+                counted_command_render_work_generation_ =
+                    render_work_generation_;
+            }
             counted_recovered_command_count_ = 0u;
-            recovered_d3d_mmio_count_ = 0u;
+            recovered_d3d_command_count_ = static_cast<uint32_t>(
+                std::min<size_t>(
+                    interpreted_source_command_count_,
+                    std::numeric_limits<uint32_t>::max()));
+        } else {
+            if (counted_recovered_command_count_ > recovered_d3d_stream.size()) {
+                counted_recovered_command_count_ = 0u;
+                recovered_d3d_mmio_count_ = 0u;
+            }
+            for (size_t index = counted_recovered_command_count_;
+                 index < recovered_d3d_stream.size();
+                 ++index) {
+                recovered_d3d_mmio_count_ += static_cast<uint32_t>(
+                    recovered_d3d_stream[index].kind
+                        == RecoveredD3DCommandKind::MmioWrite);
+            }
+            counted_recovered_command_count_ = recovered_d3d_stream.size();
+            recovered_d3d_command_count_ = static_cast<uint32_t>(
+                recovered_d3d_stream.size());
         }
-        for (size_t index = counted_recovered_command_count_;
-             index < recovered_d3d_stream.size();
-             ++index) {
-            recovered_d3d_mmio_count_ += static_cast<uint32_t>(
-                recovered_d3d_stream[index].kind == RecoveredD3DCommandKind::MmioWrite);
-        }
-        counted_recovered_command_count_ = recovered_d3d_stream.size();
-        recovered_d3d_command_count_ = static_cast<uint32_t>(recovered_d3d_stream.size());
         recovered_d3d_push_buffer_count_ =
             recovered_d3d_command_count_ - recovered_d3d_mmio_count_;
         interpreted_push_buffer_word_count_ = interpreted_stream.push_buffer_word_count;
@@ -8907,6 +13190,10 @@ private:
         allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         allocate_info.commandBufferCount = static_cast<uint32_t>(command_buffers_.size());
         vk_check(vkAllocateCommandBuffers(device_, &allocate_info, command_buffers_.data()), "vkAllocateCommandBuffers");
+        command_buffer_allocation_count_ += command_buffers_.size();
+        command_buffer_draw_counts_.assign(command_buffers_.size(), 0u);
+        command_buffer_triangle_counts_.assign(command_buffers_.size(), 0u);
+        command_buffer_barrier_counts_.assign(command_buffers_.size(), 0u);
 
         const bool record_frame_readback = readback_enabled()
             && (options_.flip_audit_ack.empty()
@@ -8915,9 +13202,22 @@ private:
         uint32_t recorded_render_target_feedback_copy_count = 0;
         uint32_t recorded_offscreen_render_target_pass_count = 0;
         for (size_t index = 0; index < command_buffers_.size(); ++index) {
+            recording_draw_count_ = 0u;
+            recording_triangle_count_ = 0u;
+            recording_barrier_count_ = 0u;
             VkCommandBufferBeginInfo begin_info{};
             begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             vk_check(vkBeginCommandBuffer(command_buffers_[index], &begin_info), "vkBeginCommandBuffer");
+            if (gpu_timing_query_pool_ != VK_NULL_HANDLE) {
+                const uint32_t first_query = static_cast<uint32_t>(index) * 2u;
+                vkCmdResetQueryPool(
+                    command_buffers_[index], gpu_timing_query_pool_, first_query, 2u);
+                vkCmdWriteTimestamp(
+                    command_buffers_[index],
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    gpu_timing_query_pool_,
+                    first_query);
+            }
 
             recorded_offscreen_render_target_pass_count +=
                 record_offscreen_render_targets(command_buffers_[index]);
@@ -8960,6 +13260,7 @@ private:
                 readback_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
                 readback_barrier.subresourceRange.levelCount = 1;
                 readback_barrier.subresourceRange.layerCount = 1;
+                ++recording_barrier_count_;
                 vkCmdPipelineBarrier(
                     command_buffers_[index],
                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
@@ -8999,6 +13300,7 @@ private:
                 present_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
                 present_barrier.subresourceRange.levelCount = 1;
                 present_barrier.subresourceRange.layerCount = 1;
+                ++recording_barrier_count_;
                 vkCmdPipelineBarrier(
                     command_buffers_[index],
                     VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -9025,6 +13327,7 @@ private:
                 present_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
                 present_barrier.subresourceRange.levelCount = 1;
                 present_barrier.subresourceRange.layerCount = 1;
+                ++recording_barrier_count_;
                 vkCmdPipelineBarrier(
                     command_buffers_[index],
                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
@@ -9038,8 +13341,21 @@ private:
                     1,
                     &present_barrier);
             }
+            if (gpu_timing_query_pool_ != VK_NULL_HANDLE) {
+                vkCmdWriteTimestamp(
+                    command_buffers_[index],
+                    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                    gpu_timing_query_pool_,
+                    static_cast<uint32_t>(index) * 2u + 1u);
+            }
             vk_check(vkEndCommandBuffer(command_buffers_[index]), "vkEndCommandBuffer");
+            command_buffer_draw_counts_[index] = recording_draw_count_;
+            command_buffer_triangle_counts_[index] = recording_triangle_count_;
+            command_buffer_barrier_counts_[index] = recording_barrier_count_;
         }
+        recording_draw_count_ = 0u;
+        recording_triangle_count_ = 0u;
+        recording_barrier_count_ = 0u;
         log_.emit(
             "recovered_d3d_command_stream_loaded",
             {
@@ -9059,8 +13375,26 @@ private:
                 {"push_buffer_words", std::to_string(interpreted_stream.push_buffer_word_count)},
                 {"method_packets", std::to_string(interpreted_stream.method_packet_count)},
                 {"interpreted_methods", std::to_string(interpreted_stream.interpreted_method_count)},
+                {"bulk_indexed_methods", std::to_string(
+                    interpreted_stream.bulk_indexed_method_count)},
+                {"bulk_inline_methods", std::to_string(
+                    interpreted_stream.bulk_inline_method_count)},
+                {"last_interpreted_methods", std::to_string(
+                    interpreted_stream.last_interpreted_method_count)},
+                {"last_bulk_indexed_methods", std::to_string(
+                    interpreted_stream.last_bulk_indexed_method_count)},
+                {"last_bulk_inline_methods", std::to_string(
+                    interpreted_stream.last_bulk_inline_method_count)},
+                {"push_buffer_collect_us", std::to_string(
+                    interpreted_stream.last_push_buffer_collect_us)},
+                {"method_apply_us", std::to_string(
+                    interpreted_stream.last_method_apply_us)},
+                {"method_finalize_us", std::to_string(
+                    interpreted_stream.last_method_finalize_us)},
+                {"state_seed_updates_required", json_bool(
+                    interpreted_stream.state_seed_updates_required)},
                 {"zero_count_method_words", std::to_string(interpreted_stream.zero_count_method_word_count)},
-                {"zero_count_indexed_array_packets", std::to_string(interpreted_stream.zero_count_indexed_array_packet_count)},
+                {"zero_count_indexed_array_noop_packets", std::to_string(interpreted_stream.zero_count_indexed_array_noop_packet_count)},
                 {"control_flow_packets", std::to_string(interpreted_stream.control_flow_packet_count)},
                 {"mmio_setup_writes", std::to_string(interpreted_stream.mmio_setup_write_count)},
                 {"submission_kicks", std::to_string(interpreted_stream.submission_kick_count)},
@@ -9080,6 +13414,14 @@ private:
                 {"surface_payload_dominant_count", std::to_string(interpreted_stream.surface_payload_dominant_count)},
                 {"surface_payload_color_valid", interpreted_stream.surface_payload_color_valid ? "true" : "false"},
                 {"surface_payload_argb", std::to_string(interpreted_stream.surface_payload_argb)},
+                {"surface_payload_scans_skipped", std::to_string(
+                    interpreted_stream.surface_payload_scan_skipped_count)},
+                {"ordered_push_buffer_appends", std::to_string(
+                    interpreted_stream.ordered_push_buffer_append_count)},
+                {"indexed_word_push_buffer_appends", std::to_string(
+                    interpreted_stream.indexed_word_push_buffer_append_count)},
+                {"reconstructed_push_buffer_appends", std::to_string(
+                    interpreted_stream.reconstructed_push_buffer_append_count)},
                 {
                     "diagnostic_clear_source",
                     json_string(
@@ -9111,11 +13453,11 @@ private:
             "translated_render_work_recorded",
             {
                 {"commands", std::to_string(translated_command_count_)},
-                {"source_commands", std::to_string(recovered_d3d_stream.size())},
+                {"source_commands", std::to_string(recovered_d3d_command_count_)},
                 {"method_packets", std::to_string(interpreted_stream.method_packet_count)},
                 {"interpreted_methods", std::to_string(interpreted_stream.interpreted_method_count)},
                 {"zero_count_method_words", std::to_string(interpreted_stream.zero_count_method_word_count)},
-                {"zero_count_indexed_array_packets", std::to_string(interpreted_stream.zero_count_indexed_array_packet_count)},
+                {"zero_count_indexed_array_noop_packets", std::to_string(interpreted_stream.zero_count_indexed_array_noop_packet_count)},
                 {"native_vertices", std::to_string(interpreted_stream.vertices.size())},
                 {"native_draws", std::to_string(interpreted_stream.draws.size())},
                 {"native_textures", std::to_string(host_textures_.size() - 1u)},
@@ -9179,11 +13521,11 @@ private:
         return options_.flip_audit_frame_directory / name.str();
     }
 
-    void acknowledge_current_presentation() {
+    bool acknowledge_current_presentation() {
         if (presentation_ack_path_.empty()
             || current_manifest_guest_flip_count_ == 0u
             || current_manifest_guest_flip_count_ <= acknowledged_presentation_flip_) {
-            return;
+            return false;
         }
         if (presentation_ack_path_.has_parent_path()) {
             std::filesystem::create_directories(
@@ -9236,6 +13578,7 @@ private:
         if (presentation_ack_event_) {
             SetEvent(presentation_ack_event_);
         }
+        return true;
     }
 
     void acknowledge_current_flip_audit(
@@ -9329,23 +13672,66 @@ private:
 
     void main_loop() {
         log_.emit("main_loop_enter");
+        poll_host_controller(false);
         write_controller_state();
         auto last_frame = std::chrono::steady_clock::now();
         auto next_frame_time = last_frame + kTargetFrameInterval;
         while (running_ && (options_.max_frames == 0u || frame_count_ < options_.max_frames)) {
             const auto frame_start = std::chrono::steady_clock::now();
+            active_frame_fence_wait_us_ = 0u;
+            last_window_message_pump_us_ = 0u;
+            last_controller_poll_us_ = 0u;
+            last_keyboard_latch_us_ = 0u;
+            last_reload_probe_us_ = 0u;
+            last_reload_dispatch_us_ = 0u;
+            last_pre_render_unattributed_us_ = 0u;
+            last_draw_fence_wait_us_ = 0u;
+            last_reload_fence_wait_us_ = 0u;
+            last_gpu_query_us_ = 0u;
+            last_fence_reset_us_ = 0u;
+            last_acquire_us_ = 0u;
+            last_submit_us_ = 0u;
+            last_readback_wait_us_ = 0u;
+            last_readback_process_us_ = 0u;
+            last_present_us_ = 0u;
+            last_audit_ack_us_ = 0u;
+            last_draw_unattributed_us_ = 0u;
+
+            auto stage_begin = std::chrono::steady_clock::now();
             pump_window_messages();
-            update_controller_button_latches();
+            last_window_message_pump_us_ = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - stage_begin).count());
+            stage_begin = std::chrono::steady_clock::now();
+            poll_host_controller();
+            last_controller_poll_us_ = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - stage_begin).count());
+            stage_begin = std::chrono::steady_clock::now();
+            update_keyboard_button_latches();
+            last_keyboard_latch_us_ = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - stage_begin).count());
             if (!running_) {
                 break;
             }
+            const auto reload_dispatch_begin = std::chrono::steady_clock::now();
             reload_live_render_work();
+            last_reload_dispatch_us_ = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now()
+                    - reload_dispatch_begin).count());
             if (options_.inject_input && !input_injected_) {
                 PostMessageW(hwnd_, WM_KEYDOWN, VK_SPACE, 0);
                 PostMessageW(hwnd_, WM_KEYUP, VK_SPACE, 0);
                 input_injected_ = true;
                 log_.emit("input_injected", {{"virtual_key", std::to_string(VK_SPACE)}});
+                const auto injected_pump_begin = std::chrono::steady_clock::now();
                 const uint32_t pumped_messages = pump_window_messages();
+                last_window_message_pump_us_ += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now()
+                        - injected_pump_begin).count());
                 log_.emit(
                     "input_injection_processed",
                     {
@@ -9357,7 +13743,43 @@ private:
                     break;
                 }
             }
+            const auto cpu_render_begin = std::chrono::steady_clock::now();
+            const uint64_t pre_render_us = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    cpu_render_begin - frame_start).count());
+            const uint64_t attributed_pre_render_us =
+                last_window_message_pump_us_
+                + last_controller_poll_us_
+                + last_keyboard_latch_us_
+                + last_reload_dispatch_us_;
+            last_pre_render_unattributed_us_ = pre_render_us
+                > attributed_pre_render_us
+                ? pre_render_us - attributed_pre_render_us
+                : 0u;
             draw_frame();
+            last_cpu_render_us_ = std::chrono::duration_cast<
+                std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - cpu_render_begin).count();
+            const uint64_t attributed_draw_us =
+                last_draw_fence_wait_us_
+                + last_gpu_query_us_
+                + last_fence_reset_us_
+                + last_acquire_us_
+                + last_submit_us_
+                + last_readback_wait_us_
+                + last_readback_process_us_
+                + last_present_us_
+                + last_audit_ack_us_;
+            last_draw_unattributed_us_ = last_cpu_render_us_
+                > attributed_draw_us
+                ? last_cpu_render_us_ - attributed_draw_us
+                : 0u;
+            const uint64_t draw_frame_fence_wait_us =
+                last_draw_fence_wait_us_ + last_readback_wait_us_;
+            last_reload_fence_wait_us_ = active_frame_fence_wait_us_
+                > draw_frame_fence_wait_us
+                ? active_frame_fence_wait_us_ - draw_frame_fence_wait_us
+                : 0u;
             ++frame_count_;
             const auto after_draw = std::chrono::steady_clock::now();
             const auto draw_us =
@@ -9371,17 +13793,49 @@ private:
             const auto now = std::chrono::steady_clock::now();
             const auto elapsed_us =
                 std::chrono::duration_cast<std::chrono::microseconds>(now - last_frame).count();
+            last_frame_elapsed_us_ = elapsed_us;
+            last_fence_wait_us_ = active_frame_fence_wait_us_;
             last_frame = now;
             next_frame_time += kTargetFrameInterval;
             if (next_frame_time <= now) {
                 next_frame_time = now + kTargetFrameInterval;
             }
+            update_fps_counter(now);
             log_.emit(
                 "frame_presented",
                 {
                     {"frame", std::to_string(frame_count_)},
                     {"elapsed_us", std::to_string(elapsed_us)},
                     {"draw_us", std::to_string(draw_us)},
+                    {"cpu_render_us", std::to_string(last_cpu_render_us_)},
+                    {"window_message_pump_us", std::to_string(
+                        last_window_message_pump_us_)},
+                    {"controller_poll_us", std::to_string(
+                        last_controller_poll_us_)},
+                    {"keyboard_latch_us", std::to_string(
+                        last_keyboard_latch_us_)},
+                    {"reload_probe_us", std::to_string(
+                        last_reload_probe_us_)},
+                    {"reload_dispatch_us", std::to_string(
+                        last_reload_dispatch_us_)},
+                    {"pre_render_unattributed_us", std::to_string(
+                        last_pre_render_unattributed_us_)},
+                    {"reload_fence_wait_us", std::to_string(
+                        last_reload_fence_wait_us_)},
+                    {"draw_fence_wait_us", std::to_string(
+                        last_draw_fence_wait_us_)},
+                    {"gpu_query_us", std::to_string(last_gpu_query_us_)},
+                    {"fence_reset_us", std::to_string(last_fence_reset_us_)},
+                    {"acquire_us", std::to_string(last_acquire_us_)},
+                    {"submit_us", std::to_string(last_submit_us_)},
+                    {"readback_wait_us", std::to_string(
+                        last_readback_wait_us_)},
+                    {"readback_process_us", std::to_string(
+                        last_readback_process_us_)},
+                    {"present_us", std::to_string(last_present_us_)},
+                    {"audit_ack_us", std::to_string(last_audit_ack_us_)},
+                    {"draw_unattributed_us", std::to_string(
+                        last_draw_unattributed_us_)},
                     {"target_frame_us", std::to_string(kTargetFrameUs)},
                     {"pacing_sleep_us", std::to_string(sleep_us)},
                     {"elapsed_ms", std::to_string(elapsed_us / 1000)},
@@ -9394,8 +13848,9 @@ private:
                     {"method_packets", std::to_string(interpreted_method_packet_count_)},
                     {"interpreted_methods", std::to_string(interpreted_method_count_)},
                     {"zero_count_method_words", std::to_string(interpreted_zero_count_method_word_count_)},
-                });
-        }
+        });
+    }
+
         log_.emit(
             "main_loop_exit",
             {
@@ -9403,6 +13858,67 @@ private:
                 {"input_events", std::to_string(input_events_)},
                 {"closed_by_user", json_bool(closed_by_user_)},
             });
+    }
+
+    void set_fps_counter_title(std::optional<double> fps) const {
+        if (hwnd_ == nullptr) {
+            return;
+        }
+        std::wostringstream title;
+        title << options_.title << L" | Game FPS: ";
+        if (fps.has_value()) {
+            title << std::fixed << std::setprecision(1) << *fps;
+        } else {
+            title << L"--";
+        }
+        SetWindowTextW(hwnd_, title.str().c_str());
+    }
+
+    void toggle_fps_counter() {
+        fps_counter_enabled_ = !fps_counter_enabled_;
+        fps_counter_sample_start_ = std::chrono::steady_clock::now();
+        fps_counter_last_guest_flip_count_ =
+            current_manifest_guest_flip_count_;
+        if (fps_counter_enabled_) {
+            set_fps_counter_title(std::nullopt);
+        } else if (hwnd_ != nullptr) {
+            SetWindowTextW(hwnd_, options_.title.c_str());
+        }
+        log_.emit(
+            "fps_counter_toggled",
+            {
+                {"enabled", json_bool(fps_counter_enabled_)},
+                {"source", json_string("completed_guest_flips")},
+                {"manifest_guest_flip_count", std::to_string(
+                    current_manifest_guest_flip_count_)},
+            });
+    }
+
+    void update_fps_counter(
+        std::chrono::steady_clock::time_point now) {
+        if (!fps_counter_enabled_) {
+            return;
+        }
+        const auto elapsed = now - fps_counter_sample_start_;
+        if (elapsed < kFpsCounterSampleInterval) {
+            return;
+        }
+        const uint64_t completed_flips =
+            current_manifest_guest_flip_count_
+                >= fps_counter_last_guest_flip_count_
+            ? current_manifest_guest_flip_count_
+                - fps_counter_last_guest_flip_count_
+            : 0u;
+        const double elapsed_seconds =
+            std::chrono::duration<double>(elapsed).count();
+        set_fps_counter_title(
+            elapsed_seconds > 0.0
+                ? std::optional<double>(
+                    static_cast<double>(completed_flips) / elapsed_seconds)
+                : std::optional<double>(0.0));
+        fps_counter_sample_start_ = now;
+        fps_counter_last_guest_flip_count_ =
+            current_manifest_guest_flip_count_;
     }
 
     void sleep_until_frame_deadline(
@@ -9518,13 +14034,68 @@ private:
         return pumped;
     }
 
+    uint64_t wait_for_in_flight_fence(const char* operation) {
+        const auto wait_begin = std::chrono::steady_clock::now();
+        const VkResult result = vkWaitForFences(
+            device_, 1, &in_flight_, VK_TRUE, UINT64_MAX);
+        const uint64_t wait_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - wait_begin).count());
+        active_frame_fence_wait_us_ += wait_us;
+        vk_check(result, operation);
+        return wait_us;
+    }
+
+    void update_gpu_frame_time() {
+        if (gpu_timing_query_pool_ == VK_NULL_HANDLE
+            || last_submitted_image_index_
+                == std::numeric_limits<uint32_t>::max()) {
+            return;
+        }
+        std::array<uint64_t, 2> timestamps{};
+        const VkResult result = vkGetQueryPoolResults(
+            device_,
+            gpu_timing_query_pool_,
+            last_submitted_image_index_ * 2u,
+            2u,
+            sizeof(timestamps),
+            timestamps.data(),
+            sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT);
+        if (result != VK_SUCCESS) {
+            return;
+        }
+        uint64_t tick_delta = timestamps[1] - timestamps[0];
+        if (gpu_timestamp_valid_bits_ < 64u) {
+            const uint64_t mask = (uint64_t{1} << gpu_timestamp_valid_bits_) - 1u;
+            tick_delta = (timestamps[1] - timestamps[0]) & mask;
+        }
+        last_gpu_frame_ms_ = static_cast<double>(tick_delta)
+            * static_cast<double>(gpu_timestamp_period_ns_) / 1'000'000.0;
+        gpu_frame_time_valid_ = true;
+    }
+
     void draw_frame() {
-        vk_check(vkWaitForFences(device_, 1, &in_flight_, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+        last_draw_fence_wait_us_ =
+            wait_for_in_flight_fence("vkWaitForFences");
+        const auto gpu_query_begin = std::chrono::steady_clock::now();
+        update_gpu_frame_time();
+        last_gpu_query_us_ = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - gpu_query_begin).count());
+        const auto fence_reset_begin = std::chrono::steady_clock::now();
         vk_check(vkResetFences(device_, 1, &in_flight_), "vkResetFences");
+        last_fence_reset_us_ = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - fence_reset_begin).count());
 
         uint32_t image_index = 0;
+        const auto acquire_begin = std::chrono::steady_clock::now();
         VkResult acquire = vkAcquireNextImageKHR(
             device_, swapchain_, UINT64_MAX, image_available_, VK_NULL_HANDLE, &image_index);
+        last_acquire_us_ = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - acquire_begin).count());
         if (acquire == VK_ERROR_OUT_OF_DATE_KHR) {
             running_ = false;
             log_.emit("swapchain_out_of_date");
@@ -9545,7 +14116,21 @@ private:
         submit_info.pCommandBuffers = &command_buffers_[image_index];
         submit_info.signalSemaphoreCount = 1;
         submit_info.pSignalSemaphores = signal_semaphores;
+        const auto submit_begin = std::chrono::steady_clock::now();
         vk_check(vkQueueSubmit(graphics_queue_, 1, &submit_info, in_flight_), "vkQueueSubmit");
+        last_submit_us_ = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - submit_begin).count());
+        ++queue_submission_count_;
+        if (image_index < command_buffer_draw_counts_.size()) {
+            draw_count_ += command_buffer_draw_counts_[image_index];
+            triangle_count_ += command_buffer_triangle_counts_[image_index];
+            barrier_count_ += command_buffer_barrier_counts_[image_index];
+        }
+        if (current_work_has_readback_) {
+            readback_bytes_ += static_cast<uint64_t>(readback_size_);
+        }
+        last_submitted_image_index_ = image_index;
 
         const bool capture_automatic =
             !options_.screenshot.empty() && !screenshot_captured_;
@@ -9561,7 +14146,10 @@ private:
         const bool capture_hotkey = hotkey_screenshot_pending_
             && current_work_has_readback_;
         if (capture_automatic || capture_hotkey || analyze_flip_health) {
-            vk_check(vkWaitForFences(device_, 1, &in_flight_, VK_TRUE, UINT64_MAX), "vkWaitForFences(readback)");
+            last_readback_wait_us_ =
+                wait_for_in_flight_fence("vkWaitForFences(readback)");
+            const auto readback_process_begin =
+                std::chrono::steady_clock::now();
             if (capture_automatic) {
                 capture_screenshot(options_.screenshot, "automatic");
                 screenshot_captured_ = true;
@@ -9582,6 +14170,10 @@ private:
                         "lossless_flip_audit_issue");
                 }
             }
+            last_readback_process_us_ = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now()
+                    - readback_process_begin).count());
         }
 
         VkPresentInfoKHR present_info{};
@@ -9591,7 +14183,11 @@ private:
         present_info.swapchainCount = 1;
         present_info.pSwapchains = &swapchain_;
         present_info.pImageIndices = &image_index;
+        const auto present_begin = std::chrono::steady_clock::now();
         const VkResult present = vkQueuePresentKHR(graphics_queue_, &present_info);
+        last_present_us_ = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - present_begin).count());
         if (present == VK_ERROR_OUT_OF_DATE_KHR || present == VK_SUBOPTIMAL_KHR) {
             running_ = false;
             log_.emit("swapchain_present_suboptimal", {{"result", std::to_string(present)}});
@@ -9599,10 +14195,15 @@ private:
         }
         vk_check(present, "vkQueuePresentKHR");
         if (capture_flip_audit) {
+            const auto audit_ack_begin = std::chrono::steady_clock::now();
             acknowledge_current_flip_audit(
                 flip_audit_readback ? &*flip_audit_readback : nullptr,
                 flip_audit_frame_path,
                 audit_health_reason);
+            last_audit_ack_us_ = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now()
+                    - audit_ack_begin).count());
         }
     }
 
@@ -9664,7 +14265,36 @@ private:
         uint64_t command_snapshot_source_record_count = 0u;
         uint64_t command_snapshot_trimmed_record_count = 0u;
         bool command_snapshot_exact_prefix = false;
-        if (command_copied) {
+        if (command_copied && current_manifest_bulk_span_commands_) {
+            constexpr uintmax_t header_size = 8u;
+            const uint64_t resident_command_byte_count =
+                current_manifest_presentable_command_byte_count_
+                - current_manifest_command_base_byte_count_;
+            std::array<char, 8> magic{};
+            std::ifstream copied(command_copy, std::ios::binary);
+            copied.read(magic.data(), static_cast<std::streamsize>(magic.size()));
+            std::error_code size_error;
+            const uintmax_t copied_size = std::filesystem::file_size(
+                command_copy,
+                size_error);
+            if (!copied
+                || std::string(magic.data(), magic.size()) != "B2SPAN01"
+                || size_error
+                || copied_size < header_size
+                || resident_command_byte_count > copied_size - header_size) {
+                command_error = std::make_error_code(std::errc::invalid_argument);
+                command_copied = false;
+            } else {
+                copied.close();
+                std::filesystem::resize_file(
+                    command_copy,
+                    header_size + resident_command_byte_count,
+                    command_error);
+                command_copied = !command_error;
+                command_snapshot_exact_prefix = command_copied;
+                command_snapshot_source_record_count = resident_command_count;
+            }
+        } else if (command_copied) {
             constexpr uintmax_t header_size = 8u;
             constexpr uintmax_t record_size = 16u;
             std::array<char, 8> magic{};
@@ -9783,6 +14413,19 @@ private:
                     << command_snapshot_trimmed_record_count
                     << ",\"command_snapshot_exact_prefix\":"
                     << json_bool(command_snapshot_exact_prefix)
+                    << ",\"command_transport_format\":"
+                    << json_string(
+                        current_manifest_bulk_span_commands_
+                            ? "bulk_span_v1" : "packed_record_v1")
+                    << ",\"published_command_byte_count\":"
+                    << current_manifest_presentable_command_byte_count_
+                    << ",\"presentable_command_byte_count\":"
+                    << current_manifest_presentable_command_byte_count_
+                    << ",\"command_snapshot_base_byte_count\":"
+                    << current_manifest_command_base_byte_count_
+                    << ",\"command_snapshot_byte_count\":"
+                    << (current_manifest_presentable_command_byte_count_
+                        - current_manifest_command_base_byte_count_)
                     << ",\"command_stream_generation\":"
                     << json_string(live_command_generation_)
                     << ",\"resource_stream_generation\":"
@@ -9861,6 +14504,115 @@ private:
         return retained_manifest_written
             ? retained_manifest
             : std::filesystem::path{};
+    }
+
+    std::filesystem::path next_metrics_report_path() {
+        SYSTEMTIME now{};
+        GetLocalTime(&now);
+        ++metrics_report_count_;
+        std::wostringstream name;
+        name << L"b2-recomp-metrics-"
+             << std::setfill(L'0')
+             << std::setw(4) << now.wYear
+             << std::setw(2) << now.wMonth
+             << std::setw(2) << now.wDay << L'-'
+             << std::setw(2) << now.wHour
+             << std::setw(2) << now.wMinute
+             << std::setw(2) << now.wSecond << L'-'
+             << std::setw(3) << now.wMilliseconds
+             << L"-frame-" << frame_count_
+             << L"-" << metrics_report_count_ << L".txt";
+        return options_.metrics_report_directory / name.str();
+    }
+
+    void write_metrics_report() {
+        const std::filesystem::path output_path = next_metrics_report_path();
+        std::filesystem::create_directories(output_path.parent_path());
+        std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
+        if (!output) {
+            throw std::runtime_error(
+                "unable to open metrics report: " + output_path.string());
+        }
+        const double bytes_per_mb = 1024.0 * 1024.0;
+        output << "B2 Recomp metrics snapshot\n"
+               << "frame: " << frame_count_ << '\n'
+               << "scope: counters are cumulative since presenter startup; "
+                  "FPS and timing values are from the latest completed frame\n"
+               << std::fixed << std::setprecision(3);
+        output << "FPS: ";
+        if (last_frame_elapsed_us_ > 0) {
+            output << 1'000'000.0 / static_cast<double>(last_frame_elapsed_us_);
+        } else {
+            output << "n/a";
+        }
+        output << '\n'
+               << "guest instructions: " << current_manifest_guest_steps_ << '\n'
+               << "compiled blocks / invalidations: "
+               << current_manifest_guest_compiled_blocks_ << " / "
+               << current_manifest_guest_invalidations_ << '\n'
+               << "push-buffer commands: " << interpreted_method_count_ << '\n'
+               << "draws: " << draw_count_ << '\n'
+               << "triangles: " << triangle_count_ << '\n'
+               << "pipeline creations: " << pipeline_creation_count_ << '\n'
+               << "pipeline cache misses: " << pipeline_cache_miss_count_ << '\n'
+               << "descriptor allocations: " << descriptor_allocation_count_ << '\n'
+               << "command buffers: " << command_buffer_allocation_count_ << '\n'
+               << "queue submissions: " << queue_submission_count_ << '\n'
+               << "barriers: " << barrier_count_ << '\n'
+               << "uploads MB: "
+               << static_cast<double>(upload_bytes_) / bytes_per_mb << '\n'
+               << "readbacks MB: "
+               << static_cast<double>(readback_bytes_) / bytes_per_mb << '\n'
+               << "CPU render ms: "
+               << static_cast<double>(last_cpu_render_us_) / 1000.0 << '\n'
+               << "window message pump ms: "
+               << static_cast<double>(last_window_message_pump_us_) / 1000.0
+               << '\n'
+               << "controller poll ms: "
+               << static_cast<double>(last_controller_poll_us_) / 1000.0
+               << '\n'
+               << "keyboard latch ms: "
+               << static_cast<double>(last_keyboard_latch_us_) / 1000.0
+               << '\n'
+               << "reload probe ms: "
+               << static_cast<double>(last_reload_probe_us_) / 1000.0 << '\n'
+               << "pre-render unattributed ms: "
+               << static_cast<double>(last_pre_render_unattributed_us_)
+                    / 1000.0
+               << '\n'
+               << "GPU frame ms: ";
+        if (gpu_frame_time_valid_) {
+            output << last_gpu_frame_ms_;
+        } else {
+            output << "n/a";
+        }
+        output << '\n'
+               << "fence-wait ms: "
+               << static_cast<double>(last_fence_wait_us_) / 1000.0 << '\n'
+               << "draw fence-wait ms: "
+               << static_cast<double>(last_draw_fence_wait_us_) / 1000.0 << '\n'
+               << "image acquire ms: "
+               << static_cast<double>(last_acquire_us_) / 1000.0 << '\n'
+               << "queue submit ms: "
+               << static_cast<double>(last_submit_us_) / 1000.0 << '\n'
+               << "readback wait ms: "
+               << static_cast<double>(last_readback_wait_us_) / 1000.0 << '\n'
+               << "queue present ms: "
+               << static_cast<double>(last_present_us_) / 1000.0 << '\n'
+               << "draw unattributed ms: "
+               << static_cast<double>(last_draw_unattributed_us_) / 1000.0
+               << '\n';
+        if (!output) {
+            throw std::runtime_error(
+                "failed while writing metrics report: " + output_path.string());
+        }
+        log_.emit(
+            "metrics_report_written",
+            {
+                {"output", json_string(output_path.string())},
+                {"frame", std::to_string(frame_count_)},
+                {"guest_steps", std::to_string(current_manifest_guest_steps_)},
+            });
     }
 
     std::filesystem::path next_hotkey_screenshot_path() {
@@ -10039,6 +14791,22 @@ private:
             running_ = false;
             PostQuitMessage(0);
         }
+        if (key == VK_F9) {
+            if (message == WM_KEYDOWN && !fps_counter_key_down_) {
+                toggle_fps_counter();
+            }
+            fps_counter_key_down_ = message == WM_KEYDOWN;
+            return;
+        }
+        if (key == VK_F11) {
+            if (message == WM_KEYDOWN
+                && !metrics_report_key_down_
+                && !options_.metrics_report_directory.empty()) {
+                write_metrics_report();
+            }
+            metrics_report_key_down_ = message == WM_KEYDOWN;
+            return;
+        }
         if (key == VK_F12) {
             if (message == WM_KEYDOWN
                 && !hotkey_screenshot_key_down_
@@ -10075,24 +14843,8 @@ private:
             const uint16_t previous_buttons = controller_buttons_;
             controller_key_down_[key_index] = message == WM_KEYDOWN;
             controller_buttons_ = controller_buttons_from_keys();
-            const uint16_t pressed_buttons = static_cast<uint16_t>(
-                controller_buttons_ & ~previous_buttons);
-            if (pressed_buttons != 0u) {
-                const auto now = std::chrono::steady_clock::now();
-                for (size_t bit_index = 0; bit_index < 16u; ++bit_index) {
-                    const uint16_t bit = static_cast<uint16_t>(1u << bit_index);
-                    if ((pressed_buttons & bit) == 0u) {
-                        continue;
-                    }
-                    controller_latched_buttons_ |= bit;
-                    controller_latch_deadlines_[bit_index] = now
-                        + std::chrono::milliseconds(kControllerMinimumPulseMs);
-                    controller_latch_max_deadlines_[bit_index] = now
-                        + std::chrono::milliseconds(kControllerMaximumPulseMs);
-                    controller_latch_guest_flip_counts_[bit_index] =
-                        current_manifest_guest_flip_count_;
-                }
-            }
+            latch_keyboard_button_presses(
+                previous_buttons, controller_buttons_);
             write_controller_state();
         }
     }
@@ -10126,31 +14878,227 @@ private:
         return buttons;
     }
 
-    uint16_t effective_controller_buttons() const {
-        return controller_buttons_ | controller_latched_buttons_;
+    void latch_keyboard_button_presses(
+        uint16_t previous_buttons,
+        uint16_t current_buttons) {
+        const uint16_t pressed_buttons = static_cast<uint16_t>(
+            current_buttons & ~previous_buttons);
+        if (pressed_buttons == 0u) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        for (size_t bit_index = 0; bit_index < 16u; ++bit_index) {
+            const uint16_t bit = static_cast<uint16_t>(1u << bit_index);
+            if ((pressed_buttons & bit) == 0u) {
+                continue;
+            }
+            keyboard_latched_buttons_ |= bit;
+            keyboard_latch_deadlines_[bit_index] = now
+                + std::chrono::milliseconds(kControllerMinimumPulseMs);
+            keyboard_latch_max_deadlines_[bit_index] = now
+                + std::chrono::milliseconds(kControllerMaximumPulseMs);
+            keyboard_latch_guest_flip_counts_[bit_index] =
+                current_manifest_guest_flip_count_;
+        }
     }
 
-    void update_controller_button_latches() {
-        if (controller_latched_buttons_ == 0u) {
+    void initialize_controller_backend() {
+        if (options_.controller_state_json.empty()) {
+            return;
+        }
+        SDL_SetMainReady();
+        if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
+            log_.emit(
+                "controller_backend_init_failed",
+                {
+                    {"backend", json_string("sdl3")},
+                    {"error", json_string(SDL_GetError())},
+                });
+            return;
+        }
+        controller_backend_initialized_ = true;
+        SDL_SetGamepadEventsEnabled(false);
+
+        int custom_mapping_count = 0;
+        std::filesystem::path custom_mapping_path;
+        std::array<wchar_t, 32768> executable_path{};
+        const DWORD executable_length = GetModuleFileNameW(
+            nullptr,
+            executable_path.data(),
+            static_cast<DWORD>(executable_path.size()));
+        if (executable_length > 0u
+            && executable_length < executable_path.size()) {
+            custom_mapping_path = std::filesystem::path(
+                executable_path.data()).parent_path() / L"gamecontrollerdb.txt";
+            if (std::filesystem::is_regular_file(custom_mapping_path)) {
+                custom_mapping_count = SDL_AddGamepadMappingsFromFile(
+                    narrow(custom_mapping_path.wstring()).c_str());
+                if (custom_mapping_count < 0) {
+                    log_.emit(
+                        "controller_mapping_load_failed",
+                        {
+                            {"backend", json_string("sdl3")},
+                            {"path", json_string(custom_mapping_path.string())},
+                            {"error", json_string(SDL_GetError())},
+                        });
+                    custom_mapping_count = 0;
+                }
+            }
+        }
+
+        const int version = SDL_GetVersion();
+        std::ostringstream version_text;
+        version_text << SDL_VERSIONNUM_MAJOR(version) << '.'
+                     << SDL_VERSIONNUM_MINOR(version) << '.'
+                     << SDL_VERSIONNUM_MICRO(version);
+        const char* revision = SDL_GetRevision();
+        log_.emit(
+            "controller_backend_initialized",
+            {
+                {"backend", json_string("sdl3")},
+                {"version", json_string(version_text.str())},
+                {"revision", json_string(revision ? revision : "")},
+                {"custom_mapping_count", std::to_string(custom_mapping_count)},
+                {"custom_mapping_path", custom_mapping_path.empty()
+                    ? "null"
+                    : json_string(custom_mapping_path.string())},
+            });
+    }
+
+    bool discover_host_controller() {
+        int gamepad_count = 0;
+        SDL_ClearError();
+        SDL_JoystickID* gamepad_ids = SDL_GetGamepads(&gamepad_count);
+        if (gamepad_ids == nullptr && SDL_GetError()[0] != '\0') {
+            log_.emit(
+                "controller_discovery_failed",
+                {
+                    {"backend", json_string("sdl3")},
+                    {"error", json_string(SDL_GetError())},
+                });
+        }
+        for (int index = 0; index < gamepad_count; ++index) {
+            SDL_Gamepad* candidate = SDL_OpenGamepad(gamepad_ids[index]);
+            if (candidate == nullptr) {
+                continue;
+            }
+            active_gamepad_ = candidate;
+            active_gamepad_id_ = gamepad_ids[index];
+            const char* name = SDL_GetGamepadName(candidate);
+            active_gamepad_name_ = name ? name : "Unknown gamepad";
+            const SDL_GamepadType gamepad_type = SDL_GetGamepadType(candidate);
+            const char* type_name = SDL_GetGamepadStringForType(gamepad_type);
+            active_gamepad_type_ = type_name ? type_name : "unknown";
+            active_gamepad_vendor_ = SDL_GetGamepadVendor(candidate);
+            active_gamepad_product_ = SDL_GetGamepadProduct(candidate);
+            active_gamepad_product_version_ =
+                SDL_GetGamepadProductVersion(candidate);
+            std::array<char, 33> guid{};
+            SDL_GUIDToString(
+                SDL_GetGamepadGUIDForID(active_gamepad_id_),
+                guid.data(),
+                static_cast<int>(guid.size()));
+            active_gamepad_guid_ = guid.data();
+            char* mapping = SDL_GetGamepadMapping(candidate);
+            active_gamepad_mapping_ = mapping ? mapping : "";
+            SDL_free(mapping);
+            log_.emit(
+                "host_controller_connected",
+                {
+                    {"backend", json_string("sdl3")},
+                    {"gamepad_id", std::to_string(active_gamepad_id_)},
+                    {"name", json_string(active_gamepad_name_)},
+                    {"type", json_string(active_gamepad_type_)},
+                    {"guid", json_string(active_gamepad_guid_)},
+                    {"vendor_id", std::to_string(active_gamepad_vendor_)},
+                    {"product_id", std::to_string(active_gamepad_product_)},
+                    {"product_version", std::to_string(
+                        active_gamepad_product_version_)},
+                    {"mapping", json_string(active_gamepad_mapping_)},
+                });
+            SDL_free(gamepad_ids);
+            return true;
+        }
+        SDL_free(gamepad_ids);
+        next_controller_discovery_ = std::chrono::steady_clock::now()
+            + kControllerDiscoveryInterval;
+        return false;
+    }
+
+    void disconnect_host_controller() {
+        log_.emit(
+            "host_controller_disconnected",
+            {
+                {"backend", json_string("sdl3")},
+                {"gamepad_id", std::to_string(active_gamepad_id_)},
+                {"name", json_string(active_gamepad_name_)},
+                {"guid", json_string(active_gamepad_guid_)},
+            });
+        if (active_gamepad_ != nullptr) {
+            SDL_CloseGamepad(active_gamepad_);
+            active_gamepad_ = nullptr;
+        }
+        active_gamepad_id_ = 0u;
+        active_gamepad_name_.clear();
+        active_gamepad_type_.clear();
+        active_gamepad_guid_.clear();
+        active_gamepad_mapping_.clear();
+        active_gamepad_vendor_ = 0u;
+        active_gamepad_product_ = 0u;
+        active_gamepad_product_version_ = 0u;
+        next_controller_discovery_ = std::chrono::steady_clock::now();
+    }
+
+    void poll_host_controller(bool publish = true) {
+        if (!controller_backend_initialized_) {
+            return;
+        }
+        SDL_UpdateGamepads();
+        if (active_gamepad_ != nullptr
+            && !SDL_GamepadConnected(active_gamepad_)) {
+            disconnect_host_controller();
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (active_gamepad_ == nullptr && now >= next_controller_discovery_) {
+            discover_host_controller();
+        }
+        const HostControllerState next_state =
+            map_sdl_gamepad_state(active_gamepad_);
+        if (controller_states_equivalent(host_controller_state_, next_state)) {
+            return;
+        }
+        host_controller_state_ = next_state;
+        if (publish) {
+            write_controller_state();
+        }
+    }
+
+    uint16_t effective_controller_buttons() const {
+        return controller_buttons_ | host_controller_state_.buttons
+            | keyboard_latched_buttons_;
+    }
+
+    void update_keyboard_button_latches() {
+        if (keyboard_latched_buttons_ == 0u) {
             return;
         }
         const uint16_t before = effective_controller_buttons();
         const auto now = std::chrono::steady_clock::now();
         for (size_t bit_index = 0; bit_index < 16u; ++bit_index) {
             const uint16_t bit = static_cast<uint16_t>(1u << bit_index);
-            if ((controller_latched_buttons_ & bit) == 0u
-                || now < controller_latch_deadlines_[bit_index]) {
+            if ((keyboard_latched_buttons_ & bit) == 0u
+                || now < keyboard_latch_deadlines_[bit_index]) {
                 continue;
             }
             const uint64_t latch_guest_flip_count =
-                controller_latch_guest_flip_counts_[bit_index];
+                keyboard_latch_guest_flip_counts_[bit_index];
             const uint64_t guest_flip_pulse =
                 current_manifest_guest_flip_count_ >= latch_guest_flip_count
                 ? current_manifest_guest_flip_count_ - latch_guest_flip_count
                 : 0u;
             if (guest_flip_pulse >= kControllerMinimumPulseGuestFlips
-                || now >= controller_latch_max_deadlines_[bit_index]) {
-                controller_latched_buttons_ &= static_cast<uint16_t>(~bit);
+                || now >= keyboard_latch_max_deadlines_[bit_index]) {
+                keyboard_latched_buttons_ &= static_cast<uint16_t>(~bit);
             }
         }
         if (effective_controller_buttons() != before) {
@@ -10162,6 +15110,7 @@ private:
         if (options_.controller_state_json.empty()) {
             return;
         }
+        const auto publish_begin = std::chrono::steady_clock::now();
         if (options_.controller_state_json.has_parent_path()) {
             std::filesystem::create_directories(options_.controller_state_json.parent_path());
         }
@@ -10174,27 +15123,63 @@ private:
             }
             output << "{\"ports\":{\"0\":{\"connected\":true,\"buttons\":"
                    << effective_controller_buttons()
-                   << ",\"left_trigger\":0,\"right_trigger\":0,"
-                      "\"thumb_lx\":0,\"thumb_ly\":0,\"thumb_rx\":0,\"thumb_ry\":0}}}\n";
+                   << ",\"left_trigger\":"
+                   << static_cast<uint32_t>(host_controller_state_.left_trigger)
+                   << ",\"right_trigger\":"
+                   << static_cast<uint32_t>(host_controller_state_.right_trigger)
+                   << ",\"thumb_lx\":" << host_controller_state_.thumb_lx
+                   << ",\"thumb_ly\":" << host_controller_state_.thumb_ly
+                   << ",\"thumb_rx\":" << host_controller_state_.thumb_rx
+                   << ",\"thumb_ry\":" << host_controller_state_.thumb_ry
+                   << "}},\"host_controller\":{\"connected\":"
+                   << json_bool(host_controller_state_.connected)
+                   << ",\"backend\":\"sdl3\",\"name\":"
+                   << json_string(active_gamepad_name_)
+                   << ",\"type\":" << json_string(active_gamepad_type_)
+                   << ",\"guid\":" << json_string(active_gamepad_guid_)
+                   << ",\"vendor_id\":" << active_gamepad_vendor_
+                   << ",\"product_id\":" << active_gamepad_product_
+                   << "}}\n";
         }
         const auto deadline = std::chrono::steady_clock::now()
             + std::chrono::seconds(10);
+        uint32_t replace_retry_count = 0u;
         while (!MoveFileExW(
             temporary.c_str(), options_.controller_state_json.c_str(),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
             if (std::chrono::steady_clock::now() >= deadline) {
                 throw std::runtime_error("cannot publish controller state JSON");
             }
+            ++replace_retry_count;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
+        const int64_t publish_us = std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - publish_begin).count();
         ++controller_publish_count_;
         log_.emit(
             "controller_state_published",
             {
                 {"publish", std::to_string(controller_publish_count_)},
                 {"buttons", std::to_string(effective_controller_buttons())},
-                {"physical_buttons", std::to_string(controller_buttons_)},
-                {"latched_buttons", std::to_string(controller_latched_buttons_)},
+                {"physical_buttons", std::to_string(
+                    controller_buttons_ | host_controller_state_.buttons)},
+                {"keyboard_buttons", std::to_string(controller_buttons_)},
+                {"gamepad_buttons", std::to_string(host_controller_state_.buttons)},
+                {"latched_buttons", std::to_string(keyboard_latched_buttons_)},
+                {"controller_backend", json_string("sdl3")},
+                {"host_controller_connected", json_bool(
+                    host_controller_state_.connected)},
+                {"left_trigger", std::to_string(
+                    host_controller_state_.left_trigger)},
+                {"right_trigger", std::to_string(
+                    host_controller_state_.right_trigger)},
+                {"thumb_lx", std::to_string(host_controller_state_.thumb_lx)},
+                {"thumb_ly", std::to_string(host_controller_state_.thumb_ly)},
+                {"thumb_rx", std::to_string(host_controller_state_.thumb_rx)},
+                {"thumb_ry", std::to_string(host_controller_state_.thumb_ry)},
+                {"publish_us", std::to_string(publish_us)},
+                {"replace_retry_count", std::to_string(replace_retry_count)},
                 {
                     "manifest_guest_flip_count",
                     std::to_string(current_manifest_guest_flip_count_),
@@ -10234,6 +15219,13 @@ private:
     }
 
     void cleanup() {
+        if (controller_backend_initialized_) {
+            if (active_gamepad_ != nullptr) {
+                disconnect_host_controller();
+            }
+            SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
+            controller_backend_initialized_ = false;
+        }
         if (publication_event_) {
             CloseHandle(publication_event_);
             publication_event_ = nullptr;
@@ -10255,6 +15247,7 @@ private:
             frame_pacing_timer_ = nullptr;
         }
         if (device_) {
+            persist_pipeline_cache();
             if (in_flight_) {
                 vkDestroyFence(device_, in_flight_, nullptr);
             }
@@ -10268,6 +15261,11 @@ private:
                 command_buffers_.clear();
                 vkDestroyCommandPool(device_, command_pool_, nullptr);
             }
+            if (gpu_timing_query_pool_) {
+                vkDestroyQueryPool(device_, gpu_timing_query_pool_, nullptr);
+                gpu_timing_query_pool_ = VK_NULL_HANDLE;
+            }
+            destroy_host_texture_bindings();
             if (vertex_mapped_) {
                 vkUnmapMemory(device_, vertex_memory_);
                 vertex_mapped_ = nullptr;
@@ -10279,7 +15277,6 @@ private:
                 vkFreeMemory(device_, vertex_memory_, nullptr);
             }
             destroy_offscreen_render_targets();
-            destroy_host_texture_bindings();
             if (fragment_state_mapped_) {
                 vkUnmapMemory(device_, fragment_state_memory_);
                 fragment_state_mapped_ = nullptr;
@@ -10290,15 +15287,56 @@ private:
             if (fragment_state_memory_) {
                 vkFreeMemory(device_, fragment_state_memory_, nullptr);
             }
+            if (vertex_program_state_mapped_) {
+                vkUnmapMemory(device_, vertex_program_state_memory_);
+                vertex_program_state_mapped_ = nullptr;
+            }
+            if (vertex_program_state_buffer_) {
+                vkDestroyBuffer(
+                    device_, vertex_program_state_buffer_, nullptr);
+            }
+            if (vertex_program_state_memory_) {
+                vkFreeMemory(
+                    device_, vertex_program_state_memory_, nullptr);
+            }
+            if (raw_vertex_resource_mapped_) {
+                vkUnmapMemory(device_, raw_vertex_resource_memory_);
+                raw_vertex_resource_mapped_ = nullptr;
+            }
+            if (raw_vertex_resource_buffer_) {
+                vkDestroyBuffer(
+                    device_, raw_vertex_resource_buffer_, nullptr);
+            }
+            if (raw_vertex_resource_memory_) {
+                vkFreeMemory(
+                    device_, raw_vertex_resource_memory_, nullptr);
+            }
             for (const HostTexture& texture : host_textures_) {
                 if (texture.view) vkDestroyImageView(device_, texture.view, nullptr);
                 if (texture.image) vkDestroyImage(device_, texture.image, nullptr);
                 if (texture.memory) vkFreeMemory(device_, texture.memory, nullptr);
             }
+            for (HostTexture& texture :
+                 render_target_feedback_image_cache_) {
+                destroy_host_texture(texture);
+            }
+            render_target_feedback_image_cache_.clear();
             for (const HostPipeline& host_pipeline : graphics_pipelines_) {
                 if (host_pipeline.pipeline) vkDestroyPipeline(device_, host_pipeline.pipeline, nullptr);
             }
             graphics_pipelines_.clear();
+            if (texture_convert_pipeline_) {
+                vkDestroyPipeline(
+                    device_, texture_convert_pipeline_, nullptr);
+            }
+            if (texture_convert_pipeline_layout_) {
+                vkDestroyPipelineLayout(
+                    device_, texture_convert_pipeline_layout_, nullptr);
+            }
+            if (texture_convert_descriptor_layout_) {
+                vkDestroyDescriptorSetLayout(
+                    device_, texture_convert_descriptor_layout_, nullptr);
+            }
             if (pipeline_layout_) {
                 vkDestroyPipelineLayout(device_, pipeline_layout_, nullptr);
             }
@@ -10332,6 +15370,10 @@ private:
             if (swapchain_) {
                 vkDestroySwapchainKHR(device_, swapchain_, nullptr);
             }
+            if (pipeline_cache_) {
+                vkDestroyPipelineCache(device_, pipeline_cache_, nullptr);
+                pipeline_cache_ = VK_NULL_HANDLE;
+            }
             vkDestroyDevice(device_, nullptr);
             device_ = VK_NULL_HANDLE;
         }
@@ -10360,12 +15402,24 @@ private:
     uint32_t input_events_ = 0;
     std::array<bool, 256> controller_key_down_{};
     uint16_t controller_buttons_ = 0;
-    uint16_t controller_latched_buttons_ = 0;
-    std::array<uint64_t, 16> controller_latch_guest_flip_counts_{};
+    HostControllerState host_controller_state_{};
+    bool controller_backend_initialized_ = false;
+    SDL_Gamepad* active_gamepad_ = nullptr;
+    SDL_JoystickID active_gamepad_id_ = 0u;
+    std::string active_gamepad_name_;
+    std::string active_gamepad_type_;
+    std::string active_gamepad_guid_;
+    std::string active_gamepad_mapping_;
+    uint16_t active_gamepad_vendor_ = 0u;
+    uint16_t active_gamepad_product_ = 0u;
+    uint16_t active_gamepad_product_version_ = 0u;
+    std::chrono::steady_clock::time_point next_controller_discovery_{};
+    uint16_t keyboard_latched_buttons_ = 0;
+    std::array<uint64_t, 16> keyboard_latch_guest_flip_counts_{};
     std::array<std::chrono::steady_clock::time_point, 16>
-        controller_latch_deadlines_{};
+        keyboard_latch_deadlines_{};
     std::array<std::chrono::steady_clock::time_point, 16>
-        controller_latch_max_deadlines_{};
+        keyboard_latch_max_deadlines_{};
     HANDLE frame_pacing_timer_ = nullptr;
     uint32_t controller_publish_count_ = 0;
     uint32_t live_render_reload_count_ = 0;
@@ -10374,19 +15428,56 @@ private:
     int64_t last_manifest_read_us_ = 0;
     int64_t last_manifest_parse_us_ = 0;
     int64_t last_source_load_us_ = 0;
+    int64_t last_command_file_open_us_ = 0;
+    int64_t last_command_file_read_us_ = 0;
+    int64_t last_command_record_validation_us_ = 0;
+    bool last_command_file_reused_ = false;
     int64_t last_interpret_us_ = 0;
+    int64_t last_method_interpret_us_ = 0;
+    int64_t last_indexed_materialize_us_ = 0;
+    int64_t last_render_validation_us_ = 0;
+    uint64_t last_resource_snapshot_reused_count_ = 0u;
+    uint64_t last_resource_snapshot_reused_bytes_ = 0u;
+    bool last_presented_diagnostics_sampled_ = false;
+    bool last_offscreen_render_targets_reused_ = false;
     size_t last_interpreted_command_delta_ = 0;
+    size_t last_native_command_read_count_ = 0;
+    size_t last_native_command_span_count_ = 0;
+    size_t last_command_read_bytes_ = 0;
+    uint64_t native_command_read_count_ = 0;
+    uint64_t native_command_span_read_count_ = 0;
+    uint32_t last_live_command_mmio_count_ = 0;
+    bool last_resource_generation_changed_ = false;
+    bool last_command_cursor_reset_ = false;
+    uint64_t render_work_generation_ = 0;
+    mutable uint64_t feedback_spec_cache_generation_ =
+        std::numeric_limits<uint64_t>::max();
+    mutable std::vector<RenderTargetFeedbackSpec> feedback_spec_cache_;
+    mutable uint64_t feedback_spec_cache_hit_count_ = 0;
+    mutable uint64_t feedback_spec_cache_build_count_ = 0;
+    mutable int64_t last_feedback_spec_build_us_ = 0;
+    uint64_t counted_command_render_work_generation_ =
+        std::numeric_limits<uint64_t>::max();
+    uint64_t presented_diagnostics_generation_ = 0;
+    bool presented_diagnostics_valid_ = false;
     uint64_t current_manifest_guest_flip_count_ = 0;
     uint64_t current_manifest_guest_steps_ = 0;
+    uint64_t current_manifest_guest_compiled_blocks_ = 0;
+    uint64_t current_manifest_guest_invalidations_ = 0;
     uint64_t current_manifest_presentable_command_count_ = 0;
     uint64_t current_manifest_command_base_count_ = 0;
+    bool current_manifest_bulk_span_commands_ = false;
+    uint64_t current_manifest_presentable_command_byte_count_ = 0;
+    uint64_t current_manifest_command_base_byte_count_ = 0;
     std::filesystem::file_time_type live_render_write_time_{};
     std::filesystem::file_time_type live_resource_write_time_{};
     std::string live_resource_generation_;
+    std::filesystem::path live_resource_source_;
     std::string live_command_generation_;
     std::string current_live_manifest_text_;
     std::ifstream live_command_file_;
     std::filesystem::path live_command_file_path_;
+    std::vector<uint8_t> live_command_delta_bytes_;
     std::filesystem::path current_live_command_snapshot_path_;
     std::filesystem::path current_live_resource_snapshot_path_;
     HANDLE live_manifest_file_ = INVALID_HANDLE_VALUE;
@@ -10396,10 +15487,12 @@ private:
     HANDLE presentation_ack_event_ = nullptr;
     std::string publication_event_name_;
     HANDLE publication_event_ = nullptr;
+    bool publication_retry_pending_ = false;
     uint64_t acknowledged_presentation_flip_ = 0;
     uint32_t recovered_d3d_command_count_ = 0;
     size_t counted_recovered_command_count_ = 0;
     size_t interpreted_source_command_count_ = 0;
+    uint64_t interpreted_source_command_byte_count_ = 0;
     bool continuation_analysis_bootstrap_ = false;
     uint32_t recovered_d3d_mmio_count_ = 0;
     uint32_t recovered_d3d_push_buffer_count_ = 0;
@@ -10416,6 +15509,7 @@ private:
     std::string recovered_frontend_text_;
     RecoveredD3DStreamSource recovered_source_;
     InterpretedD3DStream interpreted_stream_;
+    GpuRawVertexResourceCache gpu_raw_vertex_resource_cache_;
     bool presented_half_quad_recovered_ = false;
     bool presented_overscan_height_recovered_ = false;
     uint32_t presented_vertex_program_transformed_count_ = 0;
@@ -10427,6 +15521,12 @@ private:
     bool hotkey_screenshot_pending_ = false;
     bool hotkey_screenshot_key_down_ = false;
     uint32_t hotkey_screenshot_count_ = 0;
+    bool metrics_report_key_down_ = false;
+    uint32_t metrics_report_count_ = 0;
+    bool fps_counter_enabled_ = false;
+    bool fps_counter_key_down_ = false;
+    uint64_t fps_counter_last_guest_flip_count_ = 0u;
+    std::chrono::steady_clock::time_point fps_counter_sample_start_{};
     std::filesystem::path pending_hotkey_screenshot_path_;
     std::filesystem::path pending_hotkey_render_capture_manifest_;
     uint32_t unsupported_texture_resource_count_ = 0;
@@ -10449,6 +15549,10 @@ private:
     QueueFamilySelection queue_family_{};
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue graphics_queue_ = VK_NULL_HANDLE;
+    VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
+    size_t pipeline_cache_loaded_bytes_ = 0u;
+    size_t pipeline_cache_saved_bytes_ = 0u;
+    bool pipeline_cache_rejected_ = false;
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFormat swapchain_format_ = VK_FORMAT_UNDEFINED;
     VkExtent2D swapchain_extent_{};
@@ -10463,6 +15567,9 @@ private:
     VkDescriptorPool texture_descriptor_pool_ = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
     std::vector<HostPipeline> graphics_pipelines_;
+    VkDescriptorSetLayout texture_convert_descriptor_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout texture_convert_pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline texture_convert_pipeline_ = VK_NULL_HANDLE;
     VkBuffer vertex_buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory vertex_memory_ = VK_NULL_HANDLE;
     VkDeviceSize vertex_buffer_size_ = 0;
@@ -10472,9 +15579,45 @@ private:
     VkDeviceSize fragment_state_buffer_size_ = 0;
     void* fragment_state_mapped_ = nullptr;
     uint32_t fragment_state_count_ = 0;
+    VkBuffer vertex_program_state_buffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory vertex_program_state_memory_ = VK_NULL_HANDLE;
+    VkDeviceSize vertex_program_state_buffer_size_ = 0;
+    void* vertex_program_state_mapped_ = nullptr;
+    uint32_t vertex_program_state_count_ = 0;
+    VkBuffer raw_vertex_resource_buffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory raw_vertex_resource_memory_ = VK_NULL_HANDLE;
+    VkDeviceSize raw_vertex_resource_buffer_size_ = 0;
+    void* raw_vertex_resource_mapped_ = nullptr;
+    uint32_t gpu_vertex_program_draw_count_ = 0;
+    uint32_t gpu_vertex_program_vertex_count_ = 0;
+    uint32_t gpu_raw_attribute_draw_count_ = 0;
+    uint32_t gpu_raw_attribute_vertex_count_ = 0;
+    uint32_t cpu_vertex_program_fallback_draw_count_ = 0;
+    uint32_t cpu_vertex_program_fallback_vertex_count_ = 0;
+    uint64_t last_vertex_state_upload_us_ = 0;
+    uint64_t last_raw_vertex_upload_us_ = 0;
+    uint64_t raw_vertex_resource_upload_bytes_ = 0;
+    uint64_t raw_vertex_index_upload_bytes_ = 0;
+    uint64_t last_gpu_texture_conversion_us_ = 0;
+    uint64_t last_texture_refresh_us_ = 0u;
+    uint64_t last_texture_indexed_lookup_count_ = 0u;
+    uint64_t last_texture_indexed_lookup_candidate_count_ = 0u;
+    uint64_t last_texture_constant_lookup_count_ = 0u;
+    uint64_t gpu_texture_conversion_batch_count_ = 0;
+    uint64_t gpu_texture_conversion_texture_count_ = 0;
+    uint64_t gpu_texture_conversion_mip_count_ = 0;
+    uint64_t gpu_texture_conversion_input_bytes_ = 0;
+    uint64_t gpu_texture_conversion_output_bytes_ = 0;
+    uint64_t gpu_texture_conversion_rejected_batch_count_ = 0;
+    GpuTextureValidationCoverage gpu_texture_validation_coverage_{};
     uint64_t last_vertex_transform_us_ = 0;
     uint64_t last_vertex_map_us_ = 0;
     uint64_t last_vertex_copy_us_ = 0;
+    uint64_t last_vertex_resource_prepare_us_ = 0u;
+    uint64_t last_state_resource_prepare_us_ = 0u;
+    uint64_t last_texture_resource_prepare_us_ = 0u;
+    uint64_t last_offscreen_resource_prepare_us_ = 0u;
+    uint64_t last_resource_bookkeeping_us_ = 0u;
     uint32_t uploaded_vertex_base_ = 0;
     uint32_t uploaded_vertex_count_ = 0;
     uint32_t presented_surface_color_offset_ = 0;
@@ -10482,15 +15625,80 @@ private:
     uint32_t offscreen_render_target_draw_count_ = 0;
     uint32_t offscreen_render_target_transformed_vertex_count_ = 0;
     uint32_t last_render_target_feedback_pruned_count_ = 0;
+    uint32_t last_render_target_feedback_image_cache_hit_count_ = 0;
+    uint32_t last_render_target_feedback_image_cache_miss_count_ = 0;
+    uint32_t last_render_target_feedback_image_cache_store_count_ = 0;
+    uint32_t last_render_target_feedback_image_cache_eviction_count_ = 0;
+    uint64_t render_target_feedback_image_cache_hit_count_ = 0;
+    uint64_t render_target_feedback_image_cache_miss_count_ = 0;
+    uint64_t render_target_feedback_image_cache_store_count_ = 0;
+    uint64_t render_target_feedback_image_cache_eviction_count_ = 0;
     std::vector<HostTexture> host_textures_;
+    std::vector<HostTexture> render_target_feedback_image_cache_;
     std::vector<HostTextureBinding> host_texture_bindings_;
+    uint64_t texture_binding_set_reuse_count_ = 0u;
+    uint64_t texture_binding_set_rebuild_count_ = 0u;
+    uint64_t texture_binding_image_descriptor_update_count_ = 0u;
+    uint64_t texture_binding_descriptor_set_allocation_count_ = 0u;
+    uint64_t last_texture_binding_update_us_ = 0u;
+    uint32_t last_texture_binding_image_descriptor_update_count_ = 0u;
+    uint32_t last_texture_binding_descriptor_set_allocation_count_ = 0u;
+    bool last_texture_binding_set_reused_ = false;
     std::vector<OffscreenRenderTarget> offscreen_render_targets_;
     std::vector<VkFramebuffer> framebuffers_;
     VkCommandPool command_pool_ = VK_NULL_HANDLE;
+    VkQueryPool gpu_timing_query_pool_ = VK_NULL_HANDLE;
+    float gpu_timestamp_period_ns_ = 0.0f;
+    uint32_t gpu_timestamp_valid_bits_ = 0u;
+    uint32_t last_submitted_image_index_ =
+        std::numeric_limits<uint32_t>::max();
+    bool gpu_frame_time_valid_ = false;
+    double last_gpu_frame_ms_ = 0.0;
     VkBuffer readback_buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory readback_memory_ = VK_NULL_HANDLE;
     VkDeviceSize readback_size_ = 0;
     std::vector<VkCommandBuffer> command_buffers_;
+    std::vector<uint64_t> command_buffer_draw_counts_;
+    std::vector<uint64_t> command_buffer_triangle_counts_;
+    std::vector<uint64_t> command_buffer_barrier_counts_;
+    mutable uint64_t recording_draw_count_ = 0u;
+    mutable uint64_t recording_triangle_count_ = 0u;
+    mutable uint64_t recording_barrier_count_ = 0u;
+    uint64_t draw_count_ = 0u;
+    uint64_t triangle_count_ = 0u;
+    uint64_t pipeline_creation_count_ = 0u;
+    uint64_t pipeline_cache_miss_count_ = 0u;
+    uint64_t last_pipeline_state_discovery_us_ = 0u;
+    uint32_t last_pipeline_candidate_draw_count_ = 0u;
+    uint32_t last_pipeline_unique_state_count_ = 0u;
+    uint32_t last_pipeline_missing_state_count_ = 0u;
+    uint64_t descriptor_allocation_count_ = 0u;
+    uint64_t command_buffer_allocation_count_ = 0u;
+    uint64_t queue_submission_count_ = 0u;
+    uint64_t barrier_count_ = 0u;
+    uint64_t upload_bytes_ = 0u;
+    uint64_t readback_bytes_ = 0u;
+    uint64_t active_frame_fence_wait_us_ = 0u;
+    uint64_t last_fence_wait_us_ = 0u;
+    uint64_t last_window_message_pump_us_ = 0u;
+    uint64_t last_controller_poll_us_ = 0u;
+    uint64_t last_keyboard_latch_us_ = 0u;
+    uint64_t last_reload_probe_us_ = 0u;
+    uint64_t last_reload_dispatch_us_ = 0u;
+    uint64_t last_pre_render_unattributed_us_ = 0u;
+    uint64_t last_reload_fence_wait_us_ = 0u;
+    uint64_t last_draw_fence_wait_us_ = 0u;
+    uint64_t last_gpu_query_us_ = 0u;
+    uint64_t last_fence_reset_us_ = 0u;
+    uint64_t last_acquire_us_ = 0u;
+    uint64_t last_submit_us_ = 0u;
+    uint64_t last_readback_wait_us_ = 0u;
+    uint64_t last_readback_process_us_ = 0u;
+    uint64_t last_present_us_ = 0u;
+    uint64_t last_audit_ack_us_ = 0u;
+    uint64_t last_draw_unattributed_us_ = 0u;
+    int64_t last_frame_elapsed_us_ = 0;
+    uint64_t last_cpu_render_us_ = 0u;
     VkSemaphore image_available_ = VK_NULL_HANDLE;
     VkSemaphore render_finished_ = VK_NULL_HANDLE;
     VkFence in_flight_ = VK_NULL_HANDLE;
@@ -10545,6 +15753,10 @@ Options parse_options() {
             options.presented_draw_end = parse_u32(
                 require_value(L"--presented-draw-end"),
                 L"--presented-draw-end");
+        } else if (arg == L"--presentation-pipeline-depth") {
+            options.presentation_pipeline_depth = parse_u32(
+                require_value(L"--presentation-pipeline-depth"),
+                L"--presentation-pipeline-depth");
         } else if (arg == L"--debug-json") {
             options.debug_json = std::filesystem::path(require_value(L"--debug-json"));
         } else if (arg == L"--render-stream-json") {
@@ -10558,6 +15770,12 @@ Options parse_options() {
             options.strict_render_validation = true;
         } else if (arg == L"--analyze-render-stream") {
             options.analyze_render_stream_only = true;
+        } else if (arg == L"--cpu-vertex-programs") {
+            options.cpu_vertex_programs = true;
+        } else if (arg == L"--cpu-vertex-attributes") {
+            options.cpu_vertex_attributes = true;
+        } else if (arg == L"--cpu-texture-conversion") {
+            options.cpu_texture_conversion = true;
         } else if (arg == L"--flip-audit-ack") {
             options.flip_audit_ack = std::filesystem::path(
                 require_value(L"--flip-audit-ack"));
@@ -10577,10 +15795,19 @@ Options parse_options() {
         } else if (arg == L"--hotkey-screenshot-directory") {
             options.hotkey_screenshot_directory = std::filesystem::path(
                 require_value(L"--hotkey-screenshot-directory"));
+        } else if (arg == L"--metrics-report-directory") {
+            options.metrics_report_directory = std::filesystem::path(
+                require_value(L"--metrics-report-directory"));
         } else if (arg == L"--vertex-shader") {
             options.vertex_shader = std::filesystem::path(require_value(L"--vertex-shader"));
         } else if (arg == L"--fragment-shader") {
             options.fragment_shader = std::filesystem::path(require_value(L"--fragment-shader"));
+        } else if (arg == L"--texture-convert-shader") {
+            options.texture_convert_shader = std::filesystem::path(
+                require_value(L"--texture-convert-shader"));
+        } else if (arg == L"--pipeline-cache") {
+            options.pipeline_cache = std::filesystem::path(
+                require_value(L"--pipeline-cache"));
         } else if (arg == L"--title") {
             options.title = require_value(L"--title");
         } else if (arg == L"--inject-input") {
@@ -10592,16 +15819,23 @@ Options parse_options() {
                 << L"Usage: b2_first_frame.exe [--width N] [--height N] [--max-frames N]\n"
                 << L"  --max-frames 0 keeps the window open until it is closed or Escape is pressed.\n"
                 << L"                          [--presented-draw-begin N] [--presented-draw-end N]\n"
+                << L"                          [--presentation-pipeline-depth 1|2]\n"
                 << L"                          [--debug-json PATH] [--render-stream-json PATH]\n"
                 << L"                          [--live-render-stream-json PATH] [--controller-state-json PATH]\n"
                  << L"                          [--strict-render-validation]\n"
-                 << L"                          [--analyze-render-stream]\n"
+                 << L"                          [--analyze-render-stream] [--cpu-vertex-programs]\n"
+                 << L"                          [--cpu-vertex-attributes] [--cpu-texture-conversion]\n"
                 << L"                          [--flip-audit-ack PATH] [--flip-audit-frame-directory PATH]\n"
                 << L"                          [--flip-audit-max-flips N]\n"
                 << L"                          [--flip-audit-health-interval N]\n"
                 << L"                          [--screenshot PATH] [--hotkey-screenshot-directory PATH]\n"
+                << L"                          [--metrics-report-directory PATH]\n"
+                << L"  Press F9 to toggle the completed-guest-frame FPS counter.\n"
+                << L"  Press F11 to write a metrics snapshot in the metrics report directory.\n"
                 << L"  Press F12 to save the current frame in the hotkey screenshot directory.\n"
                 << L"                          [--vertex-shader PATH] [--fragment-shader PATH]\n"
+                << L"                          [--texture-convert-shader PATH]\n"
+                << L"                          [--pipeline-cache PATH]\n"
                 << L"                          [--inject-input]\n"
                 << L"                          [--list-adapters]\n";
             ExitProcess(0);
@@ -10613,9 +15847,25 @@ Options parse_options() {
         && (options.vertex_shader.empty() || options.fragment_shader.empty())) {
         throw std::runtime_error("--vertex-shader and --fragment-shader are required");
     }
+    if (!options.analyze_render_stream_only
+        && !options.cpu_texture_conversion
+        && options.texture_convert_shader.empty()) {
+        throw std::runtime_error(
+            "--texture-convert-shader is required for GPU texture conversion");
+    }
     if (options.presented_draw_begin > options.presented_draw_end) {
         throw std::runtime_error(
             "--presented-draw-begin must not exceed --presented-draw-end");
+    }
+    if (options.presentation_pipeline_depth < 1u
+        || options.presentation_pipeline_depth > 2u) {
+        throw std::runtime_error(
+            "--presentation-pipeline-depth must be 1 or 2");
+    }
+    if (options.presentation_pipeline_depth > 1u
+        && !options.live_render_stream) {
+        throw std::runtime_error(
+            "--presentation-pipeline-depth 2 requires a live render stream");
     }
     if (options.flip_audit_ack.empty()
         != options.flip_audit_frame_directory.empty()) {

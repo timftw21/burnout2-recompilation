@@ -366,7 +366,7 @@ def run_render_debug_suite(
             ) + 1
         diagnostic_findings.append(compact_finding)
     return {
-        "format": "b2-recomp-render-debug-suite-v10",
+        "format": "b2-recomp-render-debug-suite-v11",
         "render_manifest": str(render_manifest),
         "render_snapshot_integrity": snapshot_integrity,
         "analysis_events": str(analysis_events),
@@ -553,6 +553,12 @@ def run_render_debug_suite(
             "effective_steps_per_second": guest_performance.get(
                 "effective_steps_per_second"
             ),
+            "profiled_native_run_count": guest_performance.get(
+                "profiled_native_run_count"
+            ),
+            "native_module_calls_per_million_steps": guest_performance.get(
+                "native_module_calls_per_million_steps"
+            ),
             "page_cache_fills_per_million_steps": guest_performance.get(
                 "page_cache_fills_per_million_steps"
             ),
@@ -562,6 +568,12 @@ def run_render_debug_suite(
             "read_callback_sampling": guest_performance.get(
                 "read_callback_sampling"
             ),
+            "memory_callback_sampling": guest_performance.get(
+                "memory_callback_sampling"
+            ),
+            "native_dispatch_hot_targets": guest_performance.get(
+                "native_dispatch_hot_targets", []
+            )[:16],
             "dirty_sync_no_work_ratio": guest_performance.get(
                 "dirty_sync_no_work_ratio"
             ),
@@ -574,14 +586,29 @@ def run_render_debug_suite(
             "selective_dirty_sync_page_writeback_count": guest_counters.get(
                 "selective_dirty_sync_page_writeback_count"
             ),
+            "observer_drain_deferred_count": guest_counters.get(
+                "observer_drain_deferred_count"
+            ),
+            "average_observed_writes_per_batch": guest_performance.get(
+                "average_observed_writes_per_batch"
+            ),
+            "memory_callback_policy_cache_hit_ratio": guest_performance.get(
+                "memory_callback_policy_cache_hit_ratio"
+            ),
         },
         "presenter_performance": {
             "reload_busy_ratio": presenter_performance.get("reload_busy_ratio"),
+            "offscreen_target_lifecycle": presenter_performance.get(
+                "offscreen_target_lifecycle", {}
+            ),
             "redundant_same_flip_reload_count": presenter_performance.get(
                 "redundant_same_flip_reload_count"
             ),
             "skipped_redundant_reload_count": presenter_performance.get(
                 "skipped_redundant_reload_count"
+            ),
+            "gpu_texture_conversion": presenter_performance.get(
+                "gpu_texture_conversion", {}
             ),
         },
     }

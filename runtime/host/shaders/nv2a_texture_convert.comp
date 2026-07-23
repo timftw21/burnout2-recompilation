@@ -1,0 +1,170 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer RawTextureBytes {
+    uint raw_words[];
+};
+
+layout(set = 0, binding = 1, std430) buffer ConvertedTextureBytes {
+    uint rgba_words[];
+};
+
+layout(push_constant) uniform TextureConvertPushConstants {
+    uint input_byte_offset;
+    uint output_word_offset;
+    uint source_word_offset;
+    uint width;
+    uint height;
+    uint source_width;
+    uint source_height;
+    uint mode;
+} state;
+
+const uint MODE_DXT1 = 0u;
+const uint MODE_DXT5 = 1u;
+const uint MODE_DOWNSAMPLE = 2u;
+
+uint raw_u8(uint byte_offset) {
+    uint packed = raw_words[byte_offset >> 2u];
+    return (packed >> ((byte_offset & 3u) * 8u)) & 0xFFu;
+}
+
+uint raw_u16(uint byte_offset) {
+    return raw_u8(byte_offset) | (raw_u8(byte_offset + 1u) << 8u);
+}
+
+uint raw_u32(uint byte_offset) {
+    return raw_u8(byte_offset)
+        | (raw_u8(byte_offset + 1u) << 8u)
+        | (raw_u8(byte_offset + 2u) << 16u)
+        | (raw_u8(byte_offset + 3u) << 24u);
+}
+
+uvec3 expand_565(uint packed) {
+    return uvec3(
+        ((packed >> 11u) & 31u) * 255u / 31u,
+        ((packed >> 5u) & 63u) * 255u / 63u,
+        (packed & 31u) * 255u / 31u);
+}
+
+uint pack_rgba(uvec4 color) {
+    return color.r
+        | (color.g << 8u)
+        | (color.b << 16u)
+        | (color.a << 24u);
+}
+
+uvec4 unpack_rgba(uint packed) {
+    return uvec4(
+        packed & 0xFFu,
+        (packed >> 8u) & 0xFFu,
+        (packed >> 16u) & 0xFFu,
+        (packed >> 24u) & 0xFFu);
+}
+
+uvec4 decode_dxt1(uvec2 pixel) {
+    uint blocks_x = (state.width + 3u) / 4u;
+    uint block_index = (pixel.y / 4u) * blocks_x + pixel.x / 4u;
+    uint block_offset = state.input_byte_offset + block_index * 8u;
+    uint color0_raw = raw_u16(block_offset);
+    uint color1_raw = raw_u16(block_offset + 2u);
+    uvec3 color0 = expand_565(color0_raw);
+    uvec3 color1 = expand_565(color1_raw);
+    uint indices = raw_u32(block_offset + 4u);
+    uint local_index = (pixel.y & 3u) * 4u + (pixel.x & 3u);
+    uint selected = (indices >> (local_index * 2u)) & 3u;
+    if (selected == 0u) {
+        return uvec4(color0, 255u);
+    }
+    if (selected == 1u) {
+        return uvec4(color1, 255u);
+    }
+    if (color0_raw > color1_raw) {
+        return selected == 2u
+            ? uvec4((2u * color0 + color1) / 3u, 255u)
+            : uvec4((color0 + 2u * color1) / 3u, 255u);
+    }
+    return selected == 2u
+        ? uvec4((color0 + color1) / 2u, 255u)
+        : uvec4(0u);
+}
+
+uint decode_dxt5_alpha(uint block_offset, uint pixel_index) {
+    uint alpha0 = raw_u8(block_offset);
+    uint alpha1 = raw_u8(block_offset + 1u);
+    uint bit_offset = pixel_index * 3u;
+    uint byte_offset = bit_offset / 8u;
+    uint shift = bit_offset & 7u;
+    uint bits = raw_u8(block_offset + 2u + byte_offset)
+        | (raw_u8(block_offset + 3u + byte_offset) << 8u);
+    uint selected = (bits >> shift) & 7u;
+    if (selected == 0u) {
+        return alpha0;
+    }
+    if (selected == 1u) {
+        return alpha1;
+    }
+    if (alpha0 > alpha1) {
+        return ((8u - selected) * alpha0
+            + (selected - 1u) * alpha1) / 7u;
+    }
+    if (selected < 6u) {
+        return ((6u - selected) * alpha0
+            + (selected - 1u) * alpha1) / 5u;
+    }
+    return selected == 6u ? 0u : 255u;
+}
+
+uvec4 decode_dxt5(uvec2 pixel) {
+    uint blocks_x = (state.width + 3u) / 4u;
+    uint block_index = (pixel.y / 4u) * blocks_x + pixel.x / 4u;
+    uint block_offset = state.input_byte_offset + block_index * 16u;
+    uint color_offset = block_offset + 8u;
+    uvec3 color0 = expand_565(raw_u16(color_offset));
+    uvec3 color1 = expand_565(raw_u16(color_offset + 2u));
+    uint color_indices = raw_u32(color_offset + 4u);
+    uint pixel_index = (pixel.y & 3u) * 4u + (pixel.x & 3u);
+    uint selected = (color_indices >> (pixel_index * 2u)) & 3u;
+    uvec3 color = selected == 0u
+        ? color0
+        : selected == 1u
+            ? color1
+            : selected == 2u
+                ? (2u * color0 + color1) / 3u
+                : (color0 + 2u * color1) / 3u;
+    return uvec4(color, decode_dxt5_alpha(block_offset, pixel_index));
+}
+
+uvec4 downsample(uvec2 pixel) {
+    uvec4 sum = uvec4(0u);
+    uint count = 0u;
+    for (uint dy = 0u; dy < 2u; ++dy) {
+        for (uint dx = 0u; dx < 2u; ++dx) {
+            uvec2 source = pixel * 2u + uvec2(dx, dy);
+            if (source.x >= state.source_width
+                || source.y >= state.source_height) {
+                continue;
+            }
+            uint packed = rgba_words[state.source_word_offset
+                + source.y * state.source_width + source.x];
+            sum += unpack_rgba(packed);
+            ++count;
+        }
+    }
+    return sum / max(count, 1u);
+}
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= state.width || pixel.y >= state.height) {
+        return;
+    }
+    uvec4 color = state.mode == MODE_DXT1
+        ? decode_dxt1(pixel)
+        : state.mode == MODE_DXT5
+            ? decode_dxt5(pixel)
+            : downsample(pixel);
+    rgba_words[state.output_word_offset
+        + pixel.y * state.width + pixel.x] = pack_rgba(color);
+}

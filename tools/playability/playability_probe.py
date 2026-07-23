@@ -12,10 +12,13 @@ import itertools
 import json
 import math
 import os
+import sqlite3
 import struct
 import time
+import zlib
 from collections import Counter, deque
 from collections.abc import Callable, Iterable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -47,6 +50,7 @@ try:
         ExecutionTrace,
         ExecutionResult,
         LiftedFunction,
+        NativeFastPath,
         Operand,
         SparseMemory,
         X86Instruction,
@@ -93,6 +97,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
         ExecutionTrace,
         ExecutionResult,
         LiftedFunction,
+        NativeFastPath,
         Operand,
         SparseMemory,
         X86Instruction,
@@ -120,7 +125,19 @@ DEFAULT_MAX_DYNAMIC_BLOCKS = 65536
 DEFAULT_MAX_GUEST_ARGUMENTS = 16
 DEFAULT_MAX_GUEST_THREAD_EXECUTIONS = 8
 DEFAULT_RENDER_STREAM_MAX_WRITES = 65536
+DEFAULT_COMMAND_EPOCH_RECORD_LIMIT = 1 << 20
 DEFAULT_RUNTIME_ABI_HISTORY = 4096
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_DYNAMIC_BLOCK_STORE = (
+    REPOSITORY_ROOT / "build" / "native-guest-loop" / "decoded-blocks.sqlite3"
+)
+LEGACY_DYNAMIC_BLOCK_CACHE = (
+    REPOSITORY_ROOT
+    / "reports"
+    / "local"
+    / "playability"
+    / "dynamic-block-cache.json"
+)
 DEFAULT_STACK_BASE = 0x70000000
 DEFAULT_THREAD_STACK_BASE = 0x71000000
 DEFAULT_FS_BASE = 0x72000000
@@ -615,6 +632,7 @@ TITLE_D3D_PRESENT_OBSERVER_ADDRESSES = {
     0x00222290,  # immediate flip method header write, short path
     0x002223F4,  # queued flip method header write
 }
+TITLE_D3D_FLIP_METHOD_HEADER = (1 << 18) | 0x012C
 TITLE_D3D_CONTEXT_SYNTHETIC_ADDRESS = 0x21B70000
 TITLE_D3D_CONTEXT_DMA_STATE_ADDRESS = TITLE_D3D_CONTEXT_SYNTHETIC_ADDRESS + 0x2000
 TITLE_D3D_CONTEXT_GET_POINTER_ADDRESS = TITLE_D3D_CONTEXT_SYNTHETIC_ADDRESS + 0x3000
@@ -631,6 +649,67 @@ TITLE_DYNAMIC_U32_READ_ADDRESSES = frozenset(
         TITLE_GPU_SUBMISSION_LIMIT_ADDRESS,
         TITLE_D3D_CONTEXT_GLOBAL_ADDRESS,
         TITLE_D3D_CONTEXT_GET_POINTER_ADDRESS,
+    }
+)
+TITLE_CLEANUP_SENTINEL_U32_READ_ADDRESSES = frozenset(
+    {
+        TITLE_CLEANUP_LIST_SENTINEL_ADDRESS,
+        (TITLE_CLEANUP_LIST_SENTINEL_ADDRESS + 4) & 0xFFFFFFFF,
+    }
+)
+TITLE_REGISTRY_SENTINEL_U32_READ_ADDRESSES = frozenset(
+    {
+        TITLE_FRONTEND_REGISTRY_LIST_SENTINEL_ADDRESS,
+        (TITLE_FRONTEND_REGISTRY_LIST_SENTINEL_ADDRESS + 4) & 0xFFFFFFFF,
+    }
+)
+TITLE_SENTINEL_U32_READ_ADDRESSES = frozenset(
+    {
+        *TITLE_CLEANUP_SENTINEL_U32_READ_ADDRESSES,
+        TITLE_FRONTEND_RESOURCE_CACHE_SENTINEL_ADDRESS,
+        *TITLE_REGISTRY_SENTINEL_U32_READ_ADDRESSES,
+        TITLE_FRONTEND_INITIALIZER_LIST_SENTINEL_ADDRESS,
+    }
+)
+TITLE_EXACT_MEMORY_CALLBACK_ADDRESSES = frozenset(
+    {
+        TITLE_AUDIO_DSP_CONTROL_ADDRESS,
+        TITLE_AUDIO_DSP_STATUS_ADDRESS,
+        *TITLE_AUDIO_DSP_VOICE_COMMAND_ADDRESSES,
+        TITLE_MCPX_FRAME_COUNTER_ADDRESS,
+        TITLE_GPU_COMMAND_KICK_ADDRESS,
+        TITLE_GPU_PROGRESS_COUNTER_ADDRESS,
+        TITLE_GPU_SOFTWARE_COMPLETION_FLAG_ADDRESS,
+        TITLE_D3D_CONTEXT_GET_POINTER_ADDRESS,
+        TITLE_GPU_SUBMISSION_BASE_ADDRESS,
+        TITLE_GPU_SUBMISSION_LIMIT_ADDRESS,
+        TITLE_D3D_CONTEXT_GLOBAL_ADDRESS,
+        TITLE_CLEANUP_LIST_SENTINEL_ADDRESS,
+        TITLE_FRONTEND_RESOURCE_CACHE_SENTINEL_ADDRESS,
+        TITLE_FRONTEND_REGISTRY_LIST_SENTINEL_ADDRESS,
+        TITLE_FRONTEND_INITIALIZER_LIST_SENTINEL_ADDRESS,
+    }
+)
+TITLE_ZERO_GUARDED_U32_READ_CALLBACK_ADDRESSES = frozenset(
+    {
+        TITLE_D3D_CONTEXT_GLOBAL_ADDRESS,
+        TITLE_GPU_SUBMISSION_BASE_ADDRESS,
+        TITLE_GPU_SUBMISSION_LIMIT_ADDRESS,
+    }
+)
+TITLE_EXACT_MEMORY_WRITE_CALLBACK_ADDRESSES = frozenset(
+    TITLE_EXACT_MEMORY_CALLBACK_ADDRESSES
+    - TITLE_ZERO_GUARDED_U32_READ_CALLBACK_ADDRESSES
+)
+TITLE_OBSERVER_INDEPENDENT_EXACT_READ_ADDRESSES = frozenset(
+    {
+        TITLE_D3D_CONTEXT_GLOBAL_ADDRESS,
+        TITLE_GPU_SUBMISSION_BASE_ADDRESS,
+        TITLE_GPU_SUBMISSION_LIMIT_ADDRESS,
+        TITLE_CLEANUP_LIST_SENTINEL_ADDRESS,
+        TITLE_FRONTEND_RESOURCE_CACHE_SENTINEL_ADDRESS,
+        TITLE_FRONTEND_REGISTRY_LIST_SENTINEL_ADDRESS,
+        TITLE_FRONTEND_INITIALIZER_LIST_SENTINEL_ADDRESS,
     }
 )
 TITLE_D3D_CONTEXT_MARKER_QUEUE_ADDRESS = TITLE_D3D_CONTEXT_SYNTHETIC_ADDRESS + 0x4000
@@ -656,6 +735,11 @@ RENDER_PUSH_BUFFER_APERTURE_SIZE = 0x01000000
 RENDER_PUSH_BUFFER_APERTURE_END_ADDRESS = (
     TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS + RENDER_PUSH_BUFFER_APERTURE_SIZE
 )
+NATIVE_RESOURCE_BINDING_ADDRESS_EVENT_BASE = 0xFFF00000
+NATIVE_RESOURCE_BINDING_FORMAT_EVENT_BASE = 0xFFF00010
+NATIVE_RESOURCE_BINDING_RECT_EVENT_BASE = 0xFFF00020
+NATIVE_RESOURCE_RANGE_START_EVENT = 0xFFF00100
+NATIVE_RESOURCE_RANGE_END_EVENT = 0xFFF00104
 TITLE_D3D_FLUSH_ADDRESS = 0x0021AE80
 TITLE_D3D_PACKET_ALLOC_ADDRESS = 0x0021AFD0
 TITLE_D3D_PACKET_ALLOC_SIZE = 0x18
@@ -710,7 +794,14 @@ TITLE_WORLD_DRAW_CALLBACK_DIRECT_ROOT_RETURNS = {
     0x0009B105,
 }
 TITLE_D3D_INDEXED_DRAW_ADDRESS = 0x00219750
+TITLE_D3D_INDEXED_DRAW_CONTINUATION_ADDRESS = 0x0021976D
+TITLE_D3D_INDEXED_DRAW_WRAPPER_ADDRESS = 0x000EE140
 TITLE_D3D_INDEXED_DRAW_WRAPPER_RETURN_ADDRESS = 0x000EE159
+TITLE_D3D_INDEXED_STATE_PREPARE_ADDRESS = 0x0021F9C0
+TITLE_INDEXED_RESOURCE_DRAW_ADDRESS = 0x000C5550
+TITLE_SCENE_RECORD_DISTANCE_CULL_ADDRESS = 0x000C3A28
+TITLE_SCENE_RECORD_RESOURCE_DRAW_ADDRESS = 0x000C3C00
+TITLE_SCENE_RECORD_INDEXED_DRAW_ADDRESS = 0x000C3C30
 TITLE_SCENE_RECORD_ROOT_POINTER_ADDRESS = 0x004B85B8
 TITLE_SCENE_RECORD_DRAW_RETURN_ADDRESS = 0x000C3C4A
 TITLE_SCENE_RECORD_DRAW_CALL_RETURNS = {
@@ -728,10 +819,16 @@ TITLE_SCENE_RECORD_TABLE_SPECS = (
 TITLE_SCENE_RECORD_MAX_COUNT = 4096
 TITLE_SCENE_RECORD_SAMPLE_LIMIT = 256
 TITLE_IMMEDIATE_DRAW_ADDRESS = 0x000EE1B0
+TITLE_IMMEDIATE_DRAW_CORE_ADDRESS = 0x00219400
+TITLE_IMMEDIATE_DRAW_CONTINUATION_ADDRESS = 0x00219419
+TITLE_D3D_TEXTURE_STATE_ADDRESS = 0x0021E870
 TITLE_IMMEDIATE_DRAW_ARGUMENT_COUNT = 4
 TITLE_IMMEDIATE_DRAW_SAMPLE_LIMIT = 32
 TITLE_IMMEDIATE_DRAW_MAX_VERTICES = 0x4000
 TITLE_QUAD_BATCH_FLUSH_ADDRESS = 0x000C1B70
+TITLE_QUAD_BATCH_CONTINUATION_ADDRESS = 0x000C1BB0
+TITLE_QUAD_CLIP_INTERPOLATE_ADDRESS = 0x000C1DE0
+TITLE_VERTEX_APPEND_COMPACT_ADDRESS = 0x000C2020
 TITLE_QUAD_BATCH_MODE_OFFSET = 0x1C0C
 TITLE_QUAD_BATCH_TEXTURE_ADDRESS = 0x0057C058
 TITLE_QUAD_CLIP_UPDATE_ADDRESS = 0x000C2D70
@@ -756,6 +853,7 @@ TITLE_VERTEX_APPEND_COUNT_OFFSET = 0x1C00
 TITLE_VERTEX_APPEND_DEFAULT_Z_OFFSET = 0x1C04
 TITLE_VERTEX_APPEND_STACK_CLEANUP = 0x14
 TITLE_VERTEX_APPEND_STRIDE = 0x1C
+TITLE_MATRIX_MULTIPLY_ADDRESS = 0x00227BD9
 TITLE_VERTEX_APPEND_ANOMALY_SAMPLE_LIMIT = 64
 TITLE_VERTEX_APPEND_STACK_SCAN_WORDS = 32
 TITLE_VERTEX_APPEND_QUAD_PARENT_RETURN_STACK_OFFSET = 0x54
@@ -767,6 +865,1223 @@ TITLE_STARTUP_WORK_QUEUE_LOOP_BRANCH = 0x0010C112
 TITLE_STARTUP_WORK_QUEUE_LINK_PAYLOAD_BACK_OFFSET = 0x14
 SCHEDULER_LOOP_CONVERGENCE_ERROR = "scheduler loop convergence detected"
 SCHEDULER_LOOP_CONVERGENCE_REPETITIONS = 32
+
+
+def _native_fast_path_return(stack_argument_bytes: int) -> tuple[str, ...]:
+    return (
+        "const uint32_t b2r_return_address = b2r_read_u32(ctx, ctx->esp);",
+        f"ctx->esp += {stack_argument_bytes + 4}u;",
+        "eip = b2r_return_address;",
+        "pending_module_exit_reason = B2R_MODULE_EXIT_RETURN;",
+        "continue;",
+    )
+
+
+def _native_fast_path_frame_return(stack_argument_bytes: int) -> tuple[str, ...]:
+    """Return from a post-prologue fast path with three saved nonvolatile registers."""
+
+    return (
+        "const uint32_t b2r_saved_edi = b2r_read_u32(ctx, ctx->esp);",
+        "const uint32_t b2r_saved_esi = b2r_read_u32(ctx, ctx->esp + 0x4u);",
+        "const uint32_t b2r_saved_ebx = b2r_read_u32(ctx, ctx->esp + 0x8u);",
+        "const uint32_t b2r_frame = ctx->ebp;",
+        "const uint32_t b2r_saved_ebp = b2r_read_u32(ctx, b2r_frame);",
+        "const uint32_t b2r_return_address = b2r_read_u32(ctx, b2r_frame + 0x4u);",
+        "ctx->edi = b2r_saved_edi; ctx->esi = b2r_saved_esi;",
+        "ctx->ebx = b2r_saved_ebx; ctx->ebp = b2r_saved_ebp;",
+        f"ctx->esp = b2r_frame + {stack_argument_bytes + 8}u;",
+        "eip = b2r_return_address;",
+        "pending_module_exit_reason = B2R_MODULE_EXIT_RETURN;",
+        "continue;",
+    )
+
+
+def _title_native_fast_paths() -> dict[int, NativeFastPath]:
+    """Native guarded replacements for the measured title render hot paths."""
+
+    packet_alloc = NativeFastPath(
+        name="title_d3d_packet_alloc_shared",
+        guard="b2r_read_u32(ctx, 0x002256b8u) != 0u",
+        body=(
+            "const uint32_t b2r_context = b2r_read_u32(ctx, 0x002256b8u);",
+            "const uint32_t b2r_current = b2r_read_u32(ctx, b2r_context);",
+            "const uint32_t b2r_end = b2r_read_u32(ctx, b2r_context + 0x4u);",
+            "const uint32_t b2r_configured_ring = b2r_read_u32(ctx, b2r_context + 0x24u);",
+            "const uint32_t b2r_ring = b2r_configured_ring != 0u",
+            "    ? b2r_configured_ring : 0x80000000u;",
+            "uint32_t b2r_packet = b2r_current;",
+            "if (b2r_packet == 0u || b2r_end == 0u ||",
+            "    static_cast<uint64_t>(b2r_packet) + 0x18u > b2r_end) {",
+            "    b2r_packet = b2r_ring;",
+            "}",
+            "const uint64_t b2r_packet_end = static_cast<uint64_t>(b2r_packet) + 0x18u;",
+            "const bool b2r_packet_in_physical_aperture =",
+            "    b2r_packet < 0x80000000u && b2r_packet_end <= 0x80000000ull;",
+            "const bool b2r_packet_in_boot_aperture =",
+            "    b2r_packet >= 0x80000000u && b2r_packet_end <= 0x81000000ull;",
+            "if (b2r_packet_in_physical_aperture || b2r_packet_in_boot_aperture) {",
+            "    const uint32_t b2r_put = b2r_read_u32(ctx, b2r_context + 0x2cu);",
+            "    const uint32_t b2r_flags = b2r_read_u32(ctx, ctx->esp + 0x4u);",
+            "    b2r_record_native_fast_path(ctx, 0x0021afd0u);",
+            "    ctx->eip = 0x0021afd0u;",
+            "    b2r_write_push_u64(ctx, b2r_packet,",
+            "        0x00041d70ull | (static_cast<uint64_t>(b2r_put) << 32u));",
+            "    b2r_write_push_u64(ctx, b2r_packet + 0x8u, 0x00041d90ull);",
+            "    b2r_write_push_u64(ctx, b2r_packet + 0x10u, 0x00041d90ull);",
+            "    b2r_write_u32(ctx, b2r_context, b2r_packet + 0x18u);",
+            "    b2r_write_u32(ctx, b2r_context + 0x2cu, b2r_put + 2u);",
+            "    if ((b2r_flags & 0x2u) == 0u) {",
+            "        const uint32_t b2r_get = b2r_read_u32(ctx, b2r_context + 0x30u);",
+            "        if (b2r_get != 0u) { b2r_write_u32(ctx, b2r_get, b2r_put); }",
+            "        const uint32_t b2r_dma = b2r_read_u32(ctx, b2r_context + 0x17f4u);",
+            "        if (b2r_dma != 0u) {",
+            "            b2r_write_u32(ctx, b2r_dma + 0x40u, b2r_put & 0x0fffffffu);",
+            "        }",
+            "    }",
+            "    ctx->eax = b2r_put;",
+            *_native_fast_path_return(4),
+            "}",
+        ),
+    )
+
+    reserve = NativeFastPath(
+        name="title_d3d_reserve_shared",
+        guard="b2r_read_u32(ctx, 0x002256b8u) != 0u",
+        body=(
+            "const uint32_t b2r_context = b2r_read_u32(ctx, 0x002256b8u);",
+            "const uint32_t b2r_half_bytes = b2r_read_u32(ctx, ctx->esp + 0x4u);",
+            "const uint32_t b2r_full_bytes = b2r_read_u32(ctx, ctx->esp + 0x8u);",
+            "const uint32_t b2r_configured_ring = b2r_read_u32(ctx, b2r_context + 0x24u);",
+            "const uint32_t b2r_configured_end = b2r_read_u32(ctx, b2r_context + 0x28u);",
+            "const uint32_t b2r_ring = b2r_configured_ring != 0u",
+            "    ? b2r_configured_ring : 0x80000000u;",
+            "const uint32_t b2r_ring_end = b2r_configured_end != 0u",
+            "    ? b2r_configured_end : 0x80010000u;",
+            "const bool b2r_physical_ring = b2r_ring < 0x80000000u &&",
+            "    b2r_ring_end > b2r_ring && b2r_ring_end <= 0x80000000u;",
+            "const bool b2r_boot_ring = b2r_ring >= 0x80000000u &&",
+            "    b2r_ring_end > b2r_ring && b2r_ring_end <= 0x81000000u;",
+            "if ((b2r_physical_ring || b2r_boot_ring) &&",
+            "    b2r_half_bytes <= 0x01000000u && b2r_full_bytes <= 0x01000000u) {",
+            "    uint32_t b2r_start = b2r_read_u32(ctx, b2r_context);",
+            "    if (b2r_start == 0u) { b2r_start = b2r_ring; }",
+            "    if (b2r_start < b2r_ring || b2r_start >= b2r_ring_end) {",
+            "        b2r_start = b2r_ring;",
+            "    }",
+            "    uint32_t b2r_reserved_end = 0u;",
+            "    const uint64_t b2r_guarded_end = static_cast<uint64_t>(b2r_start) +",
+            "        b2r_full_bytes + 0x4000u;",
+            "    if (b2r_guarded_end > b2r_ring_end) {",
+            "        const uint64_t b2r_half_end = static_cast<uint64_t>(b2r_start) +",
+            "            b2r_half_bytes;",
+            "        if (b2r_half_end > b2r_ring_end) {",
+            "            b2r_start = b2r_ring;",
+            "            const uint64_t b2r_full_end = static_cast<uint64_t>(b2r_start) +",
+            "                b2r_full_bytes;",
+            "            b2r_reserved_end = b2r_full_end < b2r_ring_end",
+            "                ? static_cast<uint32_t>(b2r_full_end) : b2r_ring_end;",
+            "        } else {",
+            "            b2r_reserved_end = b2r_ring_end;",
+            "        }",
+            "    } else {",
+            "        const uint64_t b2r_full_end = static_cast<uint64_t>(b2r_start) +",
+            "            b2r_full_bytes;",
+            "        b2r_reserved_end = b2r_full_end < b2r_ring_end",
+            "            ? static_cast<uint32_t>(b2r_full_end) : b2r_ring_end;",
+            "    }",
+            "    uint32_t b2r_limit = b2r_reserved_end;",
+            "    if (b2r_limit > b2r_start + 0x204u) { b2r_limit -= 0x204u; }",
+            "    const uint32_t b2r_minimum_limit = b2r_start + 0x18u;",
+            "    if (b2r_limit < b2r_minimum_limit) {",
+            "        b2r_limit = b2r_minimum_limit < b2r_ring_end",
+            "            ? b2r_minimum_limit : b2r_ring_end;",
+            "    }",
+            "    const uint32_t b2r_put = b2r_read_u32(ctx, b2r_context + 0x2cu);",
+            "    const uint32_t b2r_get = b2r_read_u32(ctx, b2r_context + 0x30u);",
+            "    uint32_t b2r_packet = b2r_start;",
+            "    if (static_cast<uint64_t>(b2r_packet) + 0x18u > b2r_limit) {",
+            "        b2r_packet = b2r_ring;",
+            "    }",
+            "    if (static_cast<uint64_t>(b2r_packet) + 0x18u <= b2r_ring_end) {",
+            "        b2r_record_native_fast_path(ctx, 0x0021b1c0u);",
+            "        ctx->eip = 0x0021b1c0u;",
+            "        b2r_write_u32(ctx, b2r_context, b2r_start);",
+            "        b2r_write_u32(ctx, b2r_context + 0x4u, b2r_limit);",
+            "        if (b2r_get != 0u) { b2r_write_u32(ctx, b2r_get, b2r_put); }",
+            "        b2r_write_push_u64(ctx, b2r_packet,",
+            "            0x00041d70ull | (static_cast<uint64_t>(b2r_put) << 32u));",
+            "        b2r_write_push_u64(ctx, b2r_packet + 0x8u, 0x00041d90ull);",
+            "        b2r_write_push_u64(ctx, b2r_packet + 0x10u, 0x00041d90ull);",
+            "        const uint32_t b2r_return = b2r_packet + 0x18u;",
+            "        b2r_write_u32(ctx, b2r_context, b2r_return);",
+            "        b2r_write_u32(ctx, b2r_context + 0x2cu, b2r_put + 2u);",
+            "        b2r_write_u32(ctx, 0x002256c0u, b2r_return);",
+            "        b2r_write_u32(ctx, 0x002256c4u, b2r_limit);",
+            "        const uint32_t b2r_dma = b2r_read_u32(ctx, b2r_context + 0x17f4u);",
+            "        if (b2r_dma != 0u) {",
+            "            b2r_write_u32(ctx, b2r_dma + 0x40u,",
+            "                b2r_return & 0x0fffffffu);",
+            "        }",
+            "        ctx->eax = b2r_return;",
+            *_native_fast_path_return(8),
+            "    }",
+            "}",
+        ),
+    )
+
+    scene_record_distance_cull = NativeFastPath(
+        name="title_scene_record_distance_cull",
+        guard=(
+            "ctx->ebp != 0u && ctx->fpu_depth != 0u && "
+            "b2r_read_u32(ctx, ctx->ebp - 0x8u) != 0u && "
+            "ctx->fpu_stack[0] > b2r_read_f32(ctx, "
+            "    b2r_read_u32(ctx, ctx->ebp - 0x8u) + 0x14u)"
+        ),
+        body=(
+            "const uint32_t b2r_frame = ctx->ebp;",
+            "const uint32_t b2r_object = b2r_read_u32(ctx, b2r_frame - 0x8u);",
+            "const float b2r_distance = ctx->fpu_stack[0];",
+            "const float b2r_far_limit = b2r_read_f32(ctx, b2r_object + 0x14u);",
+            "b2r_record_native_fast_path(ctx, 0x000c3a28u);",
+            "ctx->eip = 0x000c3a28u;",
+            "b2r_write_f32(ctx, b2r_frame - 0x4u, b2r_distance);",
+            "b2r_write_u32(ctx, b2r_object + 0x24u, 0u);",
+            "ctx->fpu_status_word = b2r_fpu_compare_status(",
+            "    b2r_distance, b2r_far_limit, ctx->fpu_status_word);",
+            "ctx->eax = (ctx->eax & 0xffff0000u) |",
+            "    (ctx->fpu_status_word & 0xffffu);",
+            "ctx->ecx = b2r_object;",
+            "for (uint32_t b2r_index = 1u; b2r_index < ctx->fpu_depth; ++b2r_index) {",
+            "    ctx->fpu_stack[b2r_index - 1u] = ctx->fpu_stack[b2r_index];",
+            "}",
+            "--ctx->fpu_depth;",
+            "const uint32_t b2r_saved_ebp = b2r_read_u32(ctx, b2r_frame);",
+            "const uint32_t b2r_return_address = b2r_read_u32(ctx, b2r_frame + 0x4u);",
+            "ctx->ebp = b2r_saved_ebp; ctx->esp = b2r_frame + 0x10u;",
+            "eip = b2r_return_address;",
+            "pending_module_exit_reason = B2R_MODULE_EXIT_RETURN;",
+            "continue;",
+        ),
+    )
+
+    indexed_state_prepare = NativeFastPath(
+        name="title_d3d_indexed_state_prepare_bulk",
+        guard=(
+            "ctx->ecx != 0u && "
+            "(b2r_read_u32(ctx, 0x00225218u) & 0x3fffff8fu) == 0u"
+        ),
+        body=(
+            "const uint32_t b2r_context = ctx->ecx;",
+            "const uint32_t b2r_vertex_key = b2r_read_u32(ctx, ctx->esp + 0x4u);",
+            "const uint32_t b2r_state_flags = b2r_read_u32(ctx, 0x00225218u);",
+            "const uint32_t b2r_cleared_state_flags = b2r_state_flags & 0xffffffafu;",
+            "const bool b2r_update_vertex_state =",
+            "    (b2r_state_flags & 0x40000000u) == 0u &&",
+            "    ((b2r_state_flags & 0x40u) != 0u ||",
+            "     b2r_read_u32(ctx, b2r_context + 0x20u) != b2r_vertex_key);",
+            "uint32_t b2r_preflight_words = 0u;",
+            "uint32_t b2r_vertex_state = 0u;",
+            "uint32_t b2r_stream_map = 0u;",
+            "if (b2r_update_vertex_state) {",
+            "    b2r_vertex_state = b2r_read_u32(ctx, b2r_context + 0x37cu);",
+            "    b2r_stream_map = 0x003430b8u +",
+            "        (b2r_read_u32(ctx, b2r_vertex_state + 0x4u) & 0x10u);",
+            "    if ((b2r_state_flags & 0x10u) != 0u) { b2r_preflight_words += 17u; }",
+            "    for (uint32_t b2r_stream = 0u; b2r_stream < 16u; ++b2r_stream) {",
+            "        const uint32_t b2r_descriptor = b2r_vertex_state +",
+            "            static_cast<uint32_t>(b2r_read_u8(ctx, b2r_stream_map + b2r_stream)) * 16u;",
+            "        if (b2r_read_u32(ctx, b2r_descriptor + 0x1cu) == 2u) { continue; }",
+            "        const uint32_t b2r_format = b2r_read_u32(ctx, b2r_descriptor + 0x14u);",
+            "        if (b2r_read_u32(ctx, 0x002242f8u + b2r_format * 12u) != 0u) {",
+            "            b2r_preflight_words += 2u;",
+            "        }",
+            "    }",
+            "}",
+            "const uint32_t b2r_initial_push = b2r_read_u32(ctx, b2r_context);",
+            "const uint32_t b2r_push_limit = b2r_read_u32(ctx, b2r_context + 0x4u);",
+            "if (!b2r_update_vertex_state ||",
+            "    (b2r_initial_push != 0u && b2r_initial_push < b2r_push_limit &&",
+            "     static_cast<uint64_t>(b2r_initial_push) +",
+            "         static_cast<uint64_t>(b2r_preflight_words) * 4u <=",
+            "         static_cast<uint64_t>(b2r_push_limit) + 0x200u)) {",
+            "    b2r_record_native_fast_path(ctx, 0x0021f9c0u);",
+            "    ctx->eip = 0x0021f9c0u;",
+            "    b2r_write_u32(ctx, 0x00225218u, b2r_cleared_state_flags);",
+            "    uint32_t b2r_push = b2r_initial_push;",
+            "    if (b2r_update_vertex_state) {",
+            "        b2r_write_u32(ctx, b2r_context + 0x20u, b2r_vertex_key);",
+            "        if ((b2r_state_flags & 0x10u) != 0u) {",
+            "            b2r_write_u32(ctx, b2r_push, 0x00401760u);",
+            "            b2r_push += 4u;",
+            "            for (uint32_t b2r_stream = 0u; b2r_stream < 16u; ++b2r_stream) {",
+            "                const uint32_t b2r_descriptor = b2r_vertex_state +",
+            "                    static_cast<uint32_t>(b2r_read_u8(ctx, b2r_stream_map + b2r_stream)) * 16u;",
+            "                const uint32_t b2r_format = b2r_read_u32(ctx, b2r_descriptor + 0x14u);",
+            "                b2r_write_u32(ctx, b2r_push,",
+            "                    (b2r_read_u32(ctx, 0x002242f0u + b2r_format * 12u) << 8u) +",
+            "                    b2r_read_u32(ctx, b2r_descriptor + 0x1cu));",
+            "                b2r_push += 4u;",
+            "            }",
+            "        }",
+            "        for (uint32_t b2r_stream = 0u; b2r_stream < 16u; ++b2r_stream) {",
+            "            const uint32_t b2r_descriptor = b2r_vertex_state +",
+            "                static_cast<uint32_t>(b2r_read_u8(ctx, b2r_stream_map + b2r_stream)) * 16u;",
+            "            if (b2r_read_u32(ctx, b2r_descriptor + 0x1cu) == 2u) { continue; }",
+            "            const uint32_t b2r_format = b2r_read_u32(ctx, b2r_descriptor + 0x14u);",
+            "            const uint32_t b2r_format_record = 0x002242f0u + b2r_format * 12u;",
+            "            const uint32_t b2r_resource = b2r_read_u32(ctx, b2r_format_record + 0x8u);",
+            "            if (b2r_resource == 0u) { continue; }",
+            "            uint32_t b2r_address = b2r_read_u32(ctx, b2r_resource + 0x4u) +",
+            "                b2r_read_u32(ctx, b2r_descriptor + 0x18u) +",
+            "                b2r_read_u32(ctx, b2r_format_record + 0x4u);",
+            "            if (b2r_vertex_key != 0u) {",
+            "                b2r_address += b2r_read_u32(ctx, b2r_format_record) * b2r_vertex_key;",
+            "            }",
+            "            b2r_write_u32(ctx, b2r_push, 0x00041720u + b2r_stream * 4u);",
+            "            b2r_write_u32(ctx, b2r_push + 4u, b2r_address);",
+            "            b2r_push += 8u;",
+            "        }",
+            "        b2r_write_u32(ctx, b2r_context, b2r_push);",
+            "        ctx->eax = b2r_context; ctx->ecx = b2r_push;",
+            "    } else {",
+            "        ctx->eax = b2r_cleared_state_flags; ctx->ecx = b2r_context;",
+            "    }",
+            *_native_fast_path_return(4),
+            "}",
+        ),
+    )
+
+    indexed_draw = NativeFastPath(
+        name="title_d3d_indexed_draw_bulk",
+        guard=(
+            "b2r_read_u32(ctx, 0x002256B8u) != 0u && "
+            "(b2r_read_u32(ctx, 0x00225218u) & 0x3fffff8fu) == 0u"
+        ),
+        body=(
+            "const uint32_t b2r_context = b2r_read_u32(ctx, 0x002256B8u);",
+            "const uint32_t b2r_state_flags = b2r_read_u32(ctx, 0x00225218u);",
+            "const uint32_t b2r_context_flags = b2r_read_u32(ctx, b2r_context + 0x8u);",
+            "const uint32_t b2r_vertex_key = b2r_read_u32(ctx, b2r_context + 0x1cu);",
+            "const bool b2r_update_vertex_state =",
+            "    (b2r_state_flags & 0x40000000u) == 0u &&",
+            "    ((b2r_state_flags & 0x40u) != 0u ||",
+            "     b2r_read_u32(ctx, b2r_context + 0x20u) != b2r_vertex_key);",
+            "uint32_t b2r_preflight_words = 0u;",
+            "uint32_t b2r_vertex_state = 0u;",
+            "uint32_t b2r_stream_map = 0u;",
+            "if (b2r_update_vertex_state) {",
+            "    b2r_vertex_state = b2r_read_u32(ctx, b2r_context + 0x37cu);",
+            "    b2r_stream_map = 0x003430b8u +",
+            "        (b2r_read_u32(ctx, b2r_vertex_state + 0x4u) & 0x10u);",
+            "    if ((b2r_state_flags & 0x10u) != 0u) { b2r_preflight_words += 17u; }",
+            "    for (uint32_t b2r_stream = 0u; b2r_stream < 16u; ++b2r_stream) {",
+            "        const uint32_t b2r_descriptor = b2r_vertex_state +",
+            "            static_cast<uint32_t>(b2r_read_u8(ctx, b2r_stream_map + b2r_stream)) * 16u;",
+            "        if (b2r_read_u32(ctx, b2r_descriptor + 0x1cu) == 2u) { continue; }",
+            "        const uint32_t b2r_format = b2r_read_u32(ctx, b2r_descriptor + 0x14u);",
+            "        if (b2r_read_u32(ctx, 0x002242f8u + b2r_format * 12u) != 0u) {",
+            "            b2r_preflight_words += 2u;",
+            "        }",
+            "    }",
+            "}",
+            "const uint32_t b2r_index_count = b2r_read_u32(ctx, ctx->esp + 0x8u);",
+            "const uint32_t b2r_initial_push = b2r_read_u32(ctx, b2r_context);",
+            "const uint32_t b2r_push_limit = b2r_read_u32(ctx, b2r_context + 0x4u);",
+            "uint32_t b2r_dry_push = b2r_initial_push + b2r_preflight_words * 4u + 8u;",
+            "uint32_t b2r_dry_remaining = b2r_index_count;",
+            "uint64_t b2r_draw_words = 4u;",
+            "const uint32_t b2r_dry_alignment = (0u - (b2r_dry_push >> 2u)) & 7u;",
+            "const uint32_t b2r_dry_threshold = b2r_dry_alignment * 2u + 62u;",
+            "if (b2r_dry_remaining >= b2r_dry_threshold) {",
+            "    if (b2r_dry_alignment != 0u) {",
+            "        const uint32_t b2r_words = b2r_dry_alignment - 1u;",
+            "        b2r_draw_words += 1u + b2r_words;",
+            "        b2r_dry_remaining -= b2r_words * 2u;",
+            "    }",
+            "    do {",
+            "        const uint32_t b2r_remainder = b2r_dry_remaining % 0x3feu;",
+            "        const uint32_t b2r_words = b2r_remainder < 62u",
+            "            ? 0x1ffu",
+            "            : ((((b2r_remainder >> 1u) + 1u) & ~15u) - 1u);",
+            "        b2r_draw_words += 1u + b2r_words;",
+            "        b2r_dry_remaining -= b2r_words * 2u;",
+            "    } while (b2r_dry_remaining >= 0x3feu);",
+            "}",
+            "b2r_draw_words += 1u + (b2r_dry_remaining >> 1u);",
+            "if ((b2r_dry_remaining & 1u) != 0u) { b2r_draw_words += 2u; }",
+            "const uint64_t b2r_required_bytes =",
+            "    (static_cast<uint64_t>(b2r_preflight_words) + b2r_draw_words) * 4u;",
+            "const uint64_t b2r_available_end = static_cast<uint64_t>(b2r_push_limit) + 0x200u;",
+            "if ((b2r_context_flags & 0x1000u) == 0u &&",
+            "    b2r_initial_push != 0u &&",
+            "    static_cast<uint64_t>(b2r_initial_push) + b2r_required_bytes <= b2r_available_end) {",
+            "    b2r_record_native_fast_path(ctx, 0x00219750u);",
+            "    ctx->eip = 0x00219750u;",
+            "    b2r_write_u32(ctx, 0x00225218u, b2r_state_flags & 0xffffffafu);",
+            "    uint32_t b2r_push = b2r_initial_push;",
+            "    bool b2r_push_word_pending = false;",
+            "    uint32_t b2r_pending_push_word = 0u;",
+            "    auto b2r_emit_push_word = [&](uint32_t b2r_word) {",
+            "        if (!b2r_push_word_pending) {",
+            "            b2r_pending_push_word = b2r_word;",
+            "            b2r_push_word_pending = true;",
+            "        } else {",
+            "            b2r_write_push_u64(ctx, b2r_push - 4u,",
+            "                static_cast<uint64_t>(b2r_pending_push_word) |",
+            "                (static_cast<uint64_t>(b2r_word) << 32u));",
+            "            b2r_push_word_pending = false;",
+            "        }",
+            "        b2r_push += 4u;",
+            "    };",
+            "    if (b2r_update_vertex_state) {",
+            "        b2r_write_u32(ctx, b2r_context + 0x20u, b2r_vertex_key);",
+            "        if ((b2r_state_flags & 0x10u) != 0u) {",
+            "            b2r_emit_push_word(0x00401760u);",
+            "            for (uint32_t b2r_stream = 0u; b2r_stream < 16u; ++b2r_stream) {",
+            "                const uint32_t b2r_descriptor = b2r_vertex_state +",
+            "                    static_cast<uint32_t>(b2r_read_u8(ctx, b2r_stream_map + b2r_stream)) * 16u;",
+            "                const uint32_t b2r_format = b2r_read_u32(ctx, b2r_descriptor + 0x14u);",
+            "                const uint32_t b2r_word =",
+            "                    (b2r_read_u32(ctx, 0x002242f0u + b2r_format * 12u) << 8u) +",
+            "                    b2r_read_u32(ctx, b2r_descriptor + 0x1cu);",
+            "                b2r_emit_push_word(b2r_word);",
+            "            }",
+            "        }",
+            "        for (uint32_t b2r_stream = 0u; b2r_stream < 16u; ++b2r_stream) {",
+            "            const uint32_t b2r_descriptor = b2r_vertex_state +",
+            "                static_cast<uint32_t>(b2r_read_u8(ctx, b2r_stream_map + b2r_stream)) * 16u;",
+            "            if (b2r_read_u32(ctx, b2r_descriptor + 0x1cu) == 2u) { continue; }",
+            "            const uint32_t b2r_format = b2r_read_u32(ctx, b2r_descriptor + 0x14u);",
+            "            const uint32_t b2r_format_record = 0x002242f0u + b2r_format * 12u;",
+            "            const uint32_t b2r_resource = b2r_read_u32(ctx, b2r_format_record + 0x8u);",
+            "            if (b2r_resource == 0u) { continue; }",
+            "            uint32_t b2r_address = b2r_read_u32(ctx, b2r_resource + 0x4u) +",
+            "                b2r_read_u32(ctx, b2r_descriptor + 0x18u) +",
+            "                b2r_read_u32(ctx, b2r_format_record + 0x4u);",
+            "            if (b2r_vertex_key != 0u) {",
+            "                b2r_address += b2r_read_u32(ctx, b2r_format_record) * b2r_vertex_key;",
+            "            }",
+            "            b2r_emit_push_word(0x00041720u + b2r_stream * 4u);",
+            "            b2r_emit_push_word(b2r_address);",
+            "        }",
+            "    }",
+            "    const uint32_t b2r_primitive = b2r_read_u32(ctx, ctx->esp + 0x4u);",
+            "    uint32_t b2r_remaining = b2r_index_count;",
+            "    uint32_t b2r_source = b2r_read_u32(ctx, ctx->esp + 0xcu);",
+            "    const uint32_t b2r_draw_flags = b2r_context_flags | 0x800u;",
+            "    b2r_write_u32(ctx, b2r_context + 0x8u, b2r_draw_flags);",
+            "    b2r_emit_push_word(0x000417fcu);",
+            "    b2r_emit_push_word(b2r_primitive);",
+            "    const uint32_t b2r_alignment = (0u - (b2r_push >> 2u)) & 7u;",
+            "    const uint32_t b2r_threshold = b2r_alignment * 2u + 62u;",
+            "    if (b2r_remaining >= b2r_threshold) {",
+            "        if (b2r_alignment != 0u) {",
+            "            const uint32_t b2r_words = b2r_alignment - 1u;",
+            "            b2r_emit_push_word(0x40001800u + (b2r_words << 18u));",
+            "            for (uint32_t b2r_word = 0u; b2r_word < b2r_words; ++b2r_word) {",
+            "                b2r_emit_push_word(b2r_read_u32(ctx, b2r_source));",
+            "                b2r_source += 4u;",
+            "            }",
+            "            b2r_remaining -= b2r_words * 2u;",
+            "        }",
+            "        do {",
+            "            const uint32_t b2r_remainder = b2r_remaining % 0x3feu;",
+            "            const uint32_t b2r_words = b2r_remainder < 62u",
+            "                ? 0x1ffu",
+            "                : ((((b2r_remainder >> 1u) + 1u) & ~15u) - 1u);",
+            "            b2r_emit_push_word(0x40001800u + (b2r_words << 18u));",
+            "            for (uint32_t b2r_word = 0u; b2r_word < b2r_words; ++b2r_word) {",
+            "                b2r_emit_push_word(b2r_read_u32(ctx, b2r_source));",
+            "                b2r_source += 4u;",
+            "            }",
+            "            b2r_remaining -= b2r_words * 2u;",
+            "        } while (b2r_remaining >= 0x3feu);",
+            "    }",
+            "    const uint32_t b2r_tail_words = b2r_remaining >> 1u;",
+            "    b2r_emit_push_word(0x40001800u + (b2r_tail_words << 18u));",
+            "    for (uint32_t b2r_word = 0u; b2r_word < b2r_tail_words; ++b2r_word) {",
+            "        b2r_emit_push_word(b2r_read_u32(ctx, b2r_source));",
+            "        b2r_source += 4u;",
+            "    }",
+            "    if ((b2r_remaining & 1u) != 0u) {",
+            "        b2r_emit_push_word(0x00041808u);",
+            "        b2r_emit_push_word(b2r_read_u16(ctx, b2r_source));",
+            "    }",
+            "    b2r_emit_push_word(0x000417fcu);",
+            "    b2r_emit_push_word(0u);",
+            "    if (b2r_push_word_pending) {",
+            "        b2r_write_u32(ctx, b2r_push - 4u, b2r_pending_push_word);",
+            "    }",
+            "    const uint32_t b2r_cleared_flags = b2r_context_flags & 0xffffe7ffu;",
+            "    b2r_write_u32(ctx, b2r_context, b2r_push);",
+            "    b2r_write_u32(ctx, b2r_context + 0x8u, b2r_cleared_flags);",
+            "    ctx->eax = b2r_draw_flags; ctx->ecx = b2r_context; ctx->edx = b2r_cleared_flags;",
+            *_native_fast_path_return(12),
+            "}",
+        ),
+    )
+
+    immediate_draw = NativeFastPath(
+        name="title_d3d_immediate_draw_bulk",
+        guard=(
+            "b2r_read_u32(ctx, 0x002256B8u) != 0u && "
+            "(b2r_read_u32(ctx, 0x00225218u) & 0x3fffffafu) == 0u"
+        ),
+        body=(
+            "const uint32_t b2r_context = b2r_read_u32(ctx, 0x002256B8u);",
+            "const uint32_t b2r_context_flags = b2r_read_u32(ctx, b2r_context + 0x8u);",
+            "const uint32_t b2r_vertex_words = b2r_read_u32(ctx, b2r_context + 0x7a8u);",
+            "const uint32_t b2r_attribute_count = b2r_read_u32(ctx, b2r_context + 0x834u);",
+            "const uint32_t b2r_vertex_count = b2r_read_u32(ctx, ctx->esp + 0x8u);",
+            "const uint32_t b2r_initial_push = b2r_read_u32(ctx, b2r_context);",
+            "const uint32_t b2r_push_limit = b2r_read_u32(ctx, b2r_context + 0x4u);",
+            "uint32_t b2r_layout_words = 0u;",
+            "for (uint32_t b2r_attribute = 0u; b2r_attribute < b2r_attribute_count && b2r_attribute < 16u; ++b2r_attribute) {",
+            "    b2r_layout_words += b2r_read_u32(ctx, b2r_context + 0x7b4u + b2r_attribute * 8u);",
+            "}",
+            "if ((b2r_context_flags & 0x1000u) == 0u && b2r_vertex_words != 0u &&",
+            "    b2r_vertex_words <= 0x7ffu && b2r_attribute_count != 0u &&",
+            "    b2r_attribute_count <= 16u && b2r_vertex_count != 0u &&",
+            "    b2r_layout_words == b2r_vertex_words &&",
+            "    b2r_initial_push != 0u) {",
+            "    const uint32_t b2r_batch_limit = b2r_vertex_count < 16u",
+            "        ? 16u : (0x7ffu / b2r_vertex_words);",
+            "    uint32_t b2r_dry_vertices = b2r_vertex_count;",
+            "    uint64_t b2r_total_words = 4u;",
+            "    while (b2r_dry_vertices != 0u) {",
+            "        const uint32_t b2r_batch = b2r_dry_vertices < b2r_batch_limit",
+            "            ? b2r_dry_vertices : b2r_batch_limit;",
+            "        b2r_total_words += 1u + static_cast<uint64_t>(b2r_batch) * b2r_vertex_words;",
+            "        b2r_dry_vertices -= b2r_batch;",
+            "    }",
+            "    const uint64_t b2r_available_end = static_cast<uint64_t>(b2r_push_limit) + 0x200u;",
+            "    if (b2r_batch_limit != 0u &&",
+            "        static_cast<uint64_t>(b2r_initial_push) + b2r_total_words * 4u <= b2r_available_end) {",
+            "        b2r_record_native_fast_path(ctx, 0x00219400u);",
+            "        ctx->eip = 0x00219400u;",
+            "        uint32_t b2r_push = b2r_initial_push;",
+            "        bool b2r_push_word_pending = false;",
+            "        uint32_t b2r_pending_push_word = 0u;",
+            "        auto b2r_emit_push_word = [&](uint32_t b2r_word) {",
+            "            if (!b2r_push_word_pending) {",
+            "                b2r_pending_push_word = b2r_word;",
+            "                b2r_push_word_pending = true;",
+            "            } else {",
+            "                b2r_write_push_u64(ctx, b2r_push - 4u,",
+            "                    static_cast<uint64_t>(b2r_pending_push_word) |",
+            "                    (static_cast<uint64_t>(b2r_word) << 32u));",
+            "                b2r_push_word_pending = false;",
+            "            }",
+            "            b2r_push += 4u;",
+            "        };",
+            "        b2r_emit_push_word(0x000417fcu);",
+            "        b2r_emit_push_word(b2r_read_u32(ctx, ctx->esp + 0x4u));",
+            "        const uint32_t b2r_draw_flags = b2r_context_flags | 0x800u;",
+            "        b2r_write_u32(ctx, b2r_context + 0x8u, b2r_draw_flags);",
+            "        const uint32_t b2r_last_increment =",
+            "            b2r_read_u32(ctx, b2r_context + 0x7b0u) +",
+            "            b2r_read_u32(ctx, ctx->esp + 0x10u);",
+            "        b2r_write_u32(ctx, b2r_context + 0x7b4u + b2r_attribute_count * 8u - 4u, b2r_last_increment);",
+            "        uint32_t b2r_source = b2r_read_u32(ctx, ctx->esp + 0xcu) +",
+            "            b2r_read_u32(ctx, b2r_context + 0x7acu);",
+            "        uint32_t b2r_remaining = b2r_vertex_count;",
+            "        while (b2r_remaining != 0u) {",
+            "            const uint32_t b2r_batch = b2r_remaining < b2r_batch_limit",
+            "                ? b2r_remaining : b2r_batch_limit;",
+            "            const uint32_t b2r_payload_words = b2r_batch * b2r_vertex_words;",
+            "            b2r_emit_push_word(0x40001818u + (b2r_payload_words << 18u));",
+            "            for (uint32_t b2r_vertex = 0u; b2r_vertex < b2r_batch; ++b2r_vertex) {",
+            "                for (uint32_t b2r_attribute = 0u; b2r_attribute < b2r_attribute_count; ++b2r_attribute) {",
+            "                    const uint32_t b2r_pair = b2r_context + 0x7b4u + b2r_attribute * 8u;",
+            "                    const uint32_t b2r_copy_words = b2r_read_u32(ctx, b2r_pair);",
+            "                    for (uint32_t b2r_word = 0u; b2r_word < b2r_copy_words; ++b2r_word) {",
+            "                        b2r_emit_push_word(b2r_read_u32(ctx, b2r_source + b2r_word * 4u));",
+            "                    }",
+            "                    b2r_source += b2r_copy_words * 4u +",
+            "                        b2r_read_u32(ctx, b2r_pair + 4u);",
+            "                }",
+            "            }",
+            "            b2r_remaining -= b2r_batch;",
+            "        }",
+            "        b2r_emit_push_word(0x000417fcu);",
+            "        b2r_emit_push_word(0u);",
+            "        if (b2r_push_word_pending) {",
+            "            b2r_write_u32(ctx, b2r_push - 4u, b2r_pending_push_word);",
+            "        }",
+            "        const uint32_t b2r_cleared_flags = b2r_context_flags & 0xffffe7ffu;",
+            "        b2r_write_u32(ctx, b2r_context, b2r_push);",
+            "        b2r_write_u32(ctx, b2r_context + 0x8u, b2r_cleared_flags);",
+            "        ctx->eax = b2r_draw_flags; ctx->ecx = 0u; ctx->edx = b2r_cleared_flags;",
+            *_native_fast_path_return(16),
+            "    }",
+            "}",
+        ),
+    )
+
+    texture_state = NativeFastPath(
+        name="title_d3d_texture_state_bulk",
+        guard="b2r_read_u32(ctx, ctx->esp + 0x4u) != 0u",
+        body=(
+            "const uint32_t b2r_context = b2r_read_u32(ctx, ctx->esp + 0x4u);",
+            "const uint32_t b2r_dirty_flags = b2r_read_u32(ctx, ctx->esp + 0x8u) & 0xfu;",
+            "const uint32_t b2r_initial_push = b2r_read_u32(ctx, b2r_context);",
+            "const uint32_t b2r_push_limit = b2r_read_u32(ctx, b2r_context + 0x4u);",
+            "uint32_t b2r_dirty_count = 0u;",
+            "for (uint32_t b2r_flags = b2r_dirty_flags; b2r_flags != 0u; b2r_flags >>= 1u) {",
+            "    b2r_dirty_count += b2r_flags & 1u;",
+            "}",
+            "const uint64_t b2r_required_bytes = static_cast<uint64_t>(b2r_dirty_count) * 20u;",
+            "const uint64_t b2r_available_end = static_cast<uint64_t>(b2r_push_limit) + 0x200u;",
+            "if (b2r_dirty_count != 0u && b2r_initial_push != 0u &&",
+            "    b2r_initial_push < b2r_push_limit &&",
+            "    static_cast<uint64_t>(b2r_initial_push) + b2r_required_bytes <= b2r_available_end) {",
+            "    b2r_record_native_fast_path(ctx, 0x0021e870u);",
+            "    ctx->eip = 0x0021e870u;",
+            "    uint32_t b2r_push = b2r_initial_push;",
+            "    bool b2r_push_word_pending = false;",
+            "    uint32_t b2r_pending_push_word = 0u;",
+            "    auto b2r_emit_push_word = [&](uint32_t b2r_word) {",
+            "        if (!b2r_push_word_pending) {",
+            "            b2r_pending_push_word = b2r_word;",
+            "            b2r_push_word_pending = true;",
+            "        } else {",
+            "            b2r_write_push_u64(ctx, b2r_push - 4u,",
+            "                static_cast<uint64_t>(b2r_pending_push_word) |",
+            "                (static_cast<uint64_t>(b2r_word) << 32u));",
+            "            b2r_push_word_pending = false;",
+            "        }",
+            "        b2r_push += 4u;",
+            "    };",
+            "    uint32_t b2r_flags = b2r_dirty_flags;",
+            "    uint32_t b2r_source = 0x00225224u;",
+            "    uint32_t b2r_command = b2r_context + 0x35cu;",
+            "    uint32_t b2r_header = 0x00041b14u;",
+            "    for (uint32_t b2r_stage = 0u; b2r_stage < 4u; ++b2r_stage) {",
+            "        if ((b2r_flags & 1u) != 0u) {",
+            "            uint32_t b2r_format_word = b2r_read_u32(ctx, b2r_source + 0x4u);",
+            "            b2r_format_word = (b2r_format_word << 8u) | b2r_read_u32(ctx, b2r_source);",
+            "            b2r_format_word = (b2r_format_word << 8u) |",
+            "                b2r_read_u32(ctx, 0x002255a8u +",
+            "                    (b2r_read_u32(ctx, b2r_source + 0x6cu) & 0xffffu) * 4u);",
+            "            b2r_format_word |= b2r_read_u32(ctx, b2r_source - 0x4u);",
+            "            uint32_t b2r_control =",
+            "                (b2r_read_u32(ctx, b2r_source + 0x18u) << 26u) |",
+            "                b2r_read_u32(ctx, b2r_source + 0x28u) |",
+            "                b2r_read_u32(ctx, b2r_source + 0x20u) | 0x0003ffc0u;",
+            "            if (b2r_read_u32(ctx, b2r_command + 0x80cu) != 0u) {",
+            "                b2r_control |= 0x40000000u;",
+            "            }",
+            "            uint32_t b2r_u_mode = b2r_read_u32(ctx, b2r_source + 0xcu);",
+            "            uint32_t b2r_v_mode = b2r_read_u32(ctx, b2r_source + 0x8u);",
+            "            uint32_t b2r_mode_flags = 0x00002000u;",
+            "            if (b2r_u_mode <= 3u && b2r_v_mode <= 3u &&",
+            "                (b2r_u_mode == 3u || b2r_v_mode == 3u)) {",
+            "                const uint32_t b2r_dimension = b2r_read_u32(ctx, b2r_source + 0x1cu);",
+            "                b2r_u_mode = b2r_dimension != 0u ? 2u : 1u;",
+            "                b2r_v_mode = b2r_u_mode;",
+            "                if (b2r_dimension != 0u) { b2r_control |= (b2r_dimension - 1u) << 4u; }",
+            "            } else if (b2r_u_mode > 3u || b2r_v_mode > 3u) {",
+            "                if (b2r_u_mode == 5u || b2r_v_mode == 5u) {",
+            "                    b2r_mode_flags = 0x00004000u;",
+            "                }",
+            "                b2r_mode_flags |= 0x00070000u;",
+            "                b2r_u_mode = 2u; b2r_v_mode = 4u;",
+            "            }",
+            "            b2r_write_u32(ctx, b2r_command, b2r_control | 0x40000000u);",
+            "            volatile double b2r_lod =",
+            "                static_cast<double>(b2r_read_f32(ctx, b2r_source + 0x14u));",
+            "            b2r_lod += static_cast<double>(b2r_read_f32(ctx, b2r_context + 0x550u));",
+            "            b2r_lod *= static_cast<double>(b2r_read_f32(ctx, 0x002b8ee8u));",
+            "            b2r_lod += static_cast<double>(b2r_read_f32(ctx, 0x002943bcu));",
+            "            int32_t b2r_lod_bias = static_cast<int32_t>(",
+            "                b2r_cvttss2si(static_cast<float>(b2r_lod)));",
+            "            if (b2r_lod_bias < -4096) { b2r_lod_bias = -4096; }",
+            "            if (b2r_lod_bias > 4095) { b2r_lod_bias = 4095; }",
+            "            uint32_t b2r_border = 0xc0000000u;",
+            "            if (b2r_read_u32(ctx, b2r_source + 0x2cu) < 0x19u) {",
+            "                b2r_border = b2r_read_u32(ctx, b2r_source + 0x24u);",
+            "            }",
+            "            uint32_t b2r_filter = b2r_read_u32(ctx, 0x00223498u +",
+            "                (b2r_read_u32(ctx, b2r_source + 0x10u) + b2r_u_mode * 3u) * 4u);",
+            "            b2r_filter |= static_cast<uint32_t>(b2r_lod_bias) & 0x1fffu;",
+            "            b2r_filter |= b2r_v_mode << 24u;",
+            "            b2r_filter |= b2r_border | b2r_mode_flags;",
+            "            b2r_emit_push_word(b2r_header + 0x0003fff4u);",
+            "            b2r_emit_push_word(b2r_format_word);",
+            "            b2r_emit_push_word(b2r_control);",
+            "            b2r_emit_push_word(b2r_header);",
+            "            b2r_emit_push_word(b2r_filter);",
+            "        }",
+            "        b2r_flags >>= 1u; b2r_source += 0x80u;",
+            "        b2r_command += 0x4u; b2r_header += 0x40u;",
+            "    }",
+            "    if (b2r_push_word_pending) {",
+            "        b2r_write_u32(ctx, b2r_push - 4u, b2r_pending_push_word);",
+            "    }",
+            "    b2r_write_u32(ctx, b2r_context, b2r_push);",
+            "    ctx->eax = 0u; ctx->ecx = b2r_context + 0x36cu; ctx->edx = 0u;",
+            *_native_fast_path_return(8),
+            "}",
+        ),
+    )
+
+    def rewrite_body(
+        lines: Iterable[str], replacements: dict[str, str]
+    ) -> tuple[str, ...]:
+        rewritten = []
+        for line in lines:
+            for before, after in replacements.items():
+                line = line.replace(before, after)
+            rewritten.append(line)
+        return tuple(rewritten)
+
+    indexed_continuation = NativeFastPath(
+        name="title_d3d_indexed_draw_continuation_bulk",
+        guard="ctx->esi != 0u && ctx->ebp != 0u",
+        body=(
+            "const uint32_t b2r_context = ctx->esi;",
+            "const uint32_t b2r_context_flags = b2r_read_u32(ctx, b2r_context + 0x8u);",
+            "const uint32_t b2r_preflight_words = 0u;",
+            *rewrite_body(
+                (
+                    *indexed_draw.body[26:59],
+                    *indexed_draw.body[60:75],
+                    *indexed_draw.body[107:158],
+                ),
+                {
+                    "ctx->esp + 0x4u": "ctx->ebp + 0x8u",
+                    "ctx->esp + 0x8u": "ctx->ebp + 0xcu",
+                    "ctx->esp + 0xcu": "ctx->ebp + 0x10u",
+                    "0x00219750u": "0x0021976du",
+                },
+            ),
+            *_native_fast_path_frame_return(12),
+            "}",
+        ),
+    )
+
+    immediate_continuation = NativeFastPath(
+        name="title_d3d_immediate_draw_continuation_bulk",
+        guard="ctx->edi != 0u && ctx->ebp != 0u",
+        body=(
+            "const uint32_t b2r_context = ctx->edi;",
+            *rewrite_body(
+                immediate_draw.body[1:84],
+                {
+                    "ctx->esp + 0x4u": "ctx->ebp + 0x8u",
+                    "ctx->esp + 0x8u": "ctx->ebp + 0xcu",
+                    "ctx->esp + 0xcu": "ctx->ebp + 0x10u",
+                    "ctx->esp + 0x10u": "ctx->ebp + 0x14u",
+                    "0x00219400u": "0x00219419u",
+                },
+            ),
+            *_native_fast_path_frame_return(16),
+            *immediate_draw.body[89:91],
+        ),
+    )
+
+    quad_batch_continuation = NativeFastPath(
+        name="title_quad_batch_continuation_bulk",
+        guard="ctx->esi != 0u",
+        body=(
+            "const uint32_t b2r_object = ctx->esi;",
+            "const uint32_t b2r_quad_count = b2r_read_u32(ctx, b2r_object + 0x1c00u);",
+            "const uint32_t b2r_second_batch = b2r_read_u32(ctx, b2r_object + 0x1c08u);",
+            "if (b2r_second_batch == 0u) {",
+            "    const uint32_t b2r_saved_esi = b2r_read_u32(ctx, ctx->esp + 0x18u);",
+            "    const uint32_t b2r_return_address = b2r_read_u32(ctx, ctx->esp + 0x1cu);",
+            "    b2r_record_native_fast_path(ctx, 0x000c1bb0u);",
+            "    b2r_write_u32(ctx, b2r_object + 0x1c00u, 0u);",
+            "    ctx->eax = 0u; ctx->esi = b2r_saved_esi; ctx->esp += 0x20u;",
+            "    eip = b2r_return_address;",
+            "    pending_module_exit_reason = B2R_MODULE_EXIT_RETURN;",
+            "    continue;",
+            "}",
+            "const uint32_t b2r_context = b2r_read_u32(ctx, 0x002256b8u);",
+            "const bool b2r_texture_state_clean =",
+            "    b2r_read_u32(ctx, 0x005ad520u) == 0u &&",
+            "    b2r_read_u32(ctx, 0x005ad524u) == 0u &&",
+            "    b2r_read_u32(ctx, 0x005ad528u) == 0u &&",
+            "    b2r_read_u32(ctx, 0x005ad52cu) == 0u &&",
+            "    b2r_read_u32(ctx, 0x005ad750u) == b2r_read_u32(ctx, 0x005a6598u) &&",
+            "    b2r_read_u32(ctx, 0x005ad754u) == b2r_read_u32(ctx, 0x005a659cu) &&",
+            "    b2r_read_u32(ctx, 0x005ad758u) == b2r_read_u32(ctx, 0x005a65a0u) &&",
+            "    b2r_read_u32(ctx, 0x005ad75cu) == b2r_read_u32(ctx, 0x005a65a4u);",
+            "if (b2r_context == 0x002256c0u && b2r_quad_count != 0u &&",
+            "    b2r_read_u32(ctx, 0x005ad740u) == 0u && b2r_texture_state_clean &&",
+            "    (b2r_read_u32(ctx, 0x00225218u) & 0x3fffffafu) == 0u &&",
+            "    b2r_read_u32(ctx, 0x005ad858u) == 0u &&",
+            "    b2r_read_u32(ctx, 0x005ad85cu) == 0u &&",
+            "    b2r_read_u32(ctx, 0x005ad86cu) == 0u &&",
+            "    b2r_read_u32(ctx, 0x005ad888u) == 0u) {",
+            "    const uint32_t b2r_states[4] = { 0x43u, 0x3eu, 0x3fu, 0x4au };",
+            "    const uint32_t b2r_pre_values[4] = { 0x01000000u, 1u, 0u, 0x00008006u };",
+            "    uint32_t b2r_state_command_count = 0u;",
+            "    for (uint32_t b2r_index = 0u; b2r_index < 4u; ++b2r_index) {",
+            "        if (b2r_read_u32(ctx, 0x00225420u + b2r_states[b2r_index] * 4u) !=",
+            "            b2r_pre_values[b2r_index]) {",
+            "            ++b2r_state_command_count;",
+            "        }",
+            "    }",
+            "    const uint32_t b2r_state_command_start = b2r_read_u32(ctx, b2r_context);",
+            "    const uint32_t b2r_state_command_limit = b2r_read_u32(ctx, b2r_context + 0x4u);",
+            "    const uint64_t b2r_state_command_end64 =",
+            "        static_cast<uint64_t>(b2r_state_command_start) +",
+            "        static_cast<uint64_t>(b2r_state_command_count) * 8u;",
+            "    const bool b2r_state_capacity = b2r_state_command_count == 0u ||",
+            "        (b2r_state_command_start != 0u &&",
+            "         b2r_state_command_end64 < b2r_state_command_limit);",
+            "    if (b2r_state_capacity) {",
+            "        const uint32_t b2r_quad_initial_push =",
+            "            static_cast<uint32_t>(b2r_state_command_end64);",
+            *rewrite_body(
+                immediate_draw.body[1:29],
+                {
+                    "b2r_read_u32(ctx, ctx->esp + 0x4u)": "6u",
+                    "b2r_read_u32(ctx, ctx->esp + 0x8u)": "b2r_quad_count",
+                    "b2r_read_u32(ctx, ctx->esp + 0xcu)": "b2r_object",
+                    "b2r_read_u32(ctx, ctx->esp + 0x10u)": "0x1cu",
+                    "const uint32_t b2r_initial_push = b2r_read_u32(ctx, b2r_context);":
+                        "const uint32_t b2r_initial_push = b2r_quad_initial_push;",
+                },
+            ),
+            "        uint32_t b2r_state_push = b2r_state_command_start;",
+            "        for (uint32_t b2r_index = 0u; b2r_index < 4u; ++b2r_index) {",
+            "            const uint32_t b2r_state = b2r_states[b2r_index];",
+            "            const uint32_t b2r_value = b2r_pre_values[b2r_index];",
+            "            b2r_write_u32(ctx, 0x005ad080u + b2r_state * 4u, b2r_value);",
+            "            if (b2r_read_u32(ctx, 0x00225420u + b2r_state * 4u) != b2r_value) {",
+            "                const uint32_t b2r_method =",
+            "                    b2r_read_u32(ctx, 0x00293ff0u + b2r_state * 4u);",
+            "                b2r_write_push_u64(ctx, b2r_state_push,",
+            "                    static_cast<uint64_t>(b2r_method) |",
+            "                    (static_cast<uint64_t>(b2r_value) << 32u));",
+            "                b2r_state_push += 8u;",
+            "                b2r_write_u32(ctx, 0x00225420u + b2r_state * 4u, b2r_value);",
+            "            }",
+            "        }",
+            "        b2r_write_u32(ctx, b2r_context, b2r_state_push);",
+            *rewrite_body(
+                immediate_draw.body[29:84],
+                {
+                    "b2r_read_u32(ctx, ctx->esp + 0x4u)": "6u",
+                    "b2r_read_u32(ctx, ctx->esp + 0x8u)": "b2r_quad_count",
+                    "b2r_read_u32(ctx, ctx->esp + 0xcu)": "b2r_object",
+                    "b2r_read_u32(ctx, ctx->esp + 0x10u)": "0x1cu",
+                    "0x00219400u": "0x000c1bb0u",
+                },
+            ),
+            "        const uint32_t b2r_selected = b2r_read_u32(ctx, b2r_object + 0x1c84u);",
+            "        const uint32_t b2r_post_values[4] = {",
+            "            0x00010101u,",
+            "            b2r_read_u32(ctx, b2r_object + 0x1c14u + b2r_selected * 4u),",
+            "            b2r_read_u32(ctx, b2r_object + 0x1c34u + b2r_selected * 4u),",
+            "            b2r_read_u32(ctx, b2r_object + 0x1c54u + b2r_selected * 4u)",
+            "        };",
+            "        uint32_t b2r_deferred_count = 0u;",
+            "        for (uint32_t b2r_index = 0u; b2r_index < 4u; ++b2r_index) {",
+            "            const uint32_t b2r_state = b2r_states[b2r_index];",
+            "            const uint32_t b2r_value = b2r_post_values[b2r_index];",
+            "            if (b2r_read_u32(ctx, 0x005ad080u + b2r_state * 4u) == b2r_value) {",
+            "                continue;",
+            "            }",
+            "            b2r_write_u32(ctx, 0x005ada00u + b2r_deferred_count * 4u, b2r_state);",
+            "            ++b2r_deferred_count;",
+            "            b2r_write_u32(ctx, 0x005ad760u + b2r_state * 4u, 1u);",
+            "            b2r_write_u32(ctx, 0x005ad080u + b2r_state * 4u, b2r_value);",
+            "        }",
+            "        b2r_write_u32(ctx, 0x005ad740u, b2r_deferred_count);",
+            "        b2r_write_u32(ctx, b2r_object + 0x1c00u, 0u);",
+            "        const uint32_t b2r_saved_esi = b2r_read_u32(ctx, ctx->esp + 0x18u);",
+            "        const uint32_t b2r_return_address = b2r_read_u32(ctx, ctx->esp + 0x1cu);",
+            "        ctx->esi = b2r_saved_esi; ctx->esp += 0x20u;",
+            "        eip = b2r_return_address;",
+            "        pending_module_exit_reason = B2R_MODULE_EXIT_RETURN;",
+            "        continue;",
+            *immediate_draw.body[89:91],
+            "    }",
+            "}",
+        ),
+    )
+
+    compact_vertex_append = NativeFastPath(
+        name="title_quad_vertex_append_compact",
+        guard="ctx->ecx != 0u",
+        body=(
+            "const uint32_t b2r_object = ctx->ecx;",
+            "const uint32_t b2r_index = b2r_read_u32(ctx, b2r_object + 0x1c00u);",
+            "const uint32_t b2r_record = b2r_object + b2r_index * 0x1cu;",
+            "const uint32_t b2r_color = b2r_read_u32(ctx, ctx->esp + 0xcu);",
+            "const uint32_t b2r_a = b2r_cvttss2si(b2r_read_f32(ctx, b2r_color + 0xcu)) & 0xffu;",
+            "const uint32_t b2r_r = b2r_cvttss2si(b2r_read_f32(ctx, b2r_color)) & 0xffu;",
+            "const uint32_t b2r_g = b2r_cvttss2si(b2r_read_f32(ctx, b2r_color + 0x4u)) & 0xffu;",
+            "const uint32_t b2r_b = b2r_cvttss2si(b2r_read_f32(ctx, b2r_color + 0x8u)) & 0xffu;",
+            "b2r_record_native_fast_path(ctx, 0x000c2020u); ctx->eip = 0x000c2020u;",
+            "b2r_write_u32(ctx, b2r_record, b2r_read_u32(ctx, ctx->esp + 0x4u));",
+            "b2r_write_u32(ctx, b2r_record + 0x4u, b2r_read_u32(ctx, ctx->esp + 0x8u));",
+            "b2r_write_u32(ctx, b2r_record + 0x8u, b2r_read_u32(ctx, b2r_object + 0x1c04u));",
+            "b2r_write_u32(ctx, b2r_record + 0x10u, (((b2r_a << 8u) | b2r_r) << 16u) | (b2r_g << 8u) | b2r_b);",
+            "b2r_write_u32(ctx, b2r_object + 0x1c00u, b2r_index + 1u);",
+            "ctx->eax = b2r_object; ctx->ecx = (((b2r_a << 8u) | b2r_r) << 16u) |",
+            "    (b2r_g << 8u) | b2r_b; ctx->edx = 0u;",
+            *_native_fast_path_return(12),
+        ),
+    )
+
+    full_vertex_append = NativeFastPath(
+        name="title_quad_vertex_append_full",
+        guard="ctx->ecx != 0u",
+        body=(
+            "const uint32_t b2r_object = ctx->ecx;",
+            "const uint32_t b2r_index = b2r_read_u32(ctx, b2r_object + 0x1c00u);",
+            "const uint32_t b2r_record = b2r_object + b2r_index * 0x1cu;",
+            "const uint32_t b2r_color = b2r_read_u32(ctx, ctx->esp + 0xcu);",
+            "const uint32_t b2r_a = b2r_cvttss2si(b2r_read_f32(ctx, b2r_color + 0xcu)) & 0xffu;",
+            "const uint32_t b2r_r = b2r_cvttss2si(b2r_read_f32(ctx, b2r_color)) & 0xffu;",
+            "const uint32_t b2r_g = b2r_cvttss2si(b2r_read_f32(ctx, b2r_color + 0x4u)) & 0xffu;",
+            "const uint32_t b2r_b = b2r_cvttss2si(b2r_read_f32(ctx, b2r_color + 0x8u)) & 0xffu;",
+            "b2r_record_native_fast_path(ctx, 0x000c20e0u); ctx->eip = 0x000c20e0u;",
+            "b2r_write_u32(ctx, b2r_record, b2r_read_u32(ctx, ctx->esp + 0x4u));",
+            "b2r_write_u32(ctx, b2r_record + 0x4u, b2r_read_u32(ctx, ctx->esp + 0x8u));",
+            "b2r_write_u32(ctx, b2r_record + 0x8u, b2r_read_u32(ctx, b2r_object + 0x1c04u));",
+            "b2r_write_u32(ctx, b2r_record + 0x10u, (((b2r_a << 8u) | b2r_r) << 16u) | (b2r_g << 8u) | b2r_b);",
+            "b2r_write_u32(ctx, b2r_record + 0x14u, b2r_read_u32(ctx, ctx->esp + 0x10u));",
+            "b2r_write_u32(ctx, b2r_record + 0x18u, b2r_read_u32(ctx, ctx->esp + 0x14u));",
+            "b2r_write_u32(ctx, b2r_object + 0x1c00u, b2r_index + 1u);",
+            "ctx->eax = b2r_object; ctx->ecx = 0u; ctx->edx = 0u;",
+            *_native_fast_path_return(20),
+        ),
+    )
+
+    unclipped_quad = NativeFastPath(
+        name="title_quad_clip_noop",
+        guard=(
+            "std::isfinite(b2r_read_f32(ctx, b2r_read_u32(ctx, ctx->esp + 0x4u) + 0x10u)) && "
+            "std::isfinite(b2r_read_f32(ctx, b2r_read_u32(ctx, ctx->esp + 0x4u) + 0x14u)) && "
+            "std::isfinite(b2r_read_f32(ctx, b2r_read_u32(ctx, ctx->esp + 0x4u) + 0x18u)) && "
+            "std::isfinite(b2r_read_f32(ctx, b2r_read_u32(ctx, ctx->esp + 0x4u) + 0x1cu)) && "
+            "b2r_read_f32(ctx, b2r_read_u32(ctx, ctx->esp + 0x4u) + 0x10u) >= 0.0f && "
+            "b2r_read_f32(ctx, b2r_read_u32(ctx, ctx->esp + 0x4u) + 0x10u) <= 720.0f && "
+            "b2r_read_f32(ctx, b2r_read_u32(ctx, ctx->esp + 0x4u) + 0x18u) >= 0.0f && "
+            "b2r_read_f32(ctx, b2r_read_u32(ctx, ctx->esp + 0x4u) + 0x18u) <= 720.0f && "
+            "b2r_read_f32(ctx, b2r_read_u32(ctx, ctx->esp + 0x4u) + 0x14u) >= 0.0f && "
+            "b2r_read_f32(ctx, b2r_read_u32(ctx, ctx->esp + 0x4u) + 0x14u) <= 576.0f && "
+            "b2r_read_f32(ctx, b2r_read_u32(ctx, ctx->esp + 0x4u) + 0x1cu) >= 0.0f && "
+            "b2r_read_f32(ctx, b2r_read_u32(ctx, ctx->esp + 0x4u) + 0x1cu) <= 576.0f"
+        ),
+        body=(
+            "const uint32_t b2r_rectangle = b2r_read_u32(ctx, ctx->esp + 0x4u);",
+            "ctx->ecx = b2r_rectangle;",
+            "ctx->fpu_status_word = b2r_fpu_compare_status(",
+            "    b2r_read_f32(ctx, b2r_rectangle + 0x1cu), 576.0f,",
+            "    ctx->fpu_status_word);",
+            "ctx->eax = (ctx->eax & 0xffff0000u) | (ctx->fpu_status_word & 0xffffu);",
+            "b2r_record_native_fast_path(ctx, 0x000c1de0u);",
+            *_native_fast_path_return(4),
+        ),
+    )
+
+    matrix_multiply = NativeFastPath(
+        name="title_matrix_multiply_4x4",
+        guard="true",
+        body=(
+            "const uint32_t b2r_destination = b2r_read_u32(ctx, ctx->esp + 0x4u);",
+            "const uint32_t b2r_left_address = b2r_read_u32(ctx, ctx->esp + 0x8u);",
+            "const uint32_t b2r_right_address = b2r_read_u32(ctx, ctx->esp + 0xcu);",
+            "float b2r_left[16]; float b2r_right[16]; float b2r_output[16];",
+            "for (uint32_t b2r_index = 0u; b2r_index < 16u; ++b2r_index) {",
+            "    b2r_left[b2r_index] = b2r_read_f32(ctx, b2r_left_address + b2r_index * 4u);",
+            "    b2r_right[b2r_index] = b2r_read_f32(ctx, b2r_right_address + b2r_index * 4u);",
+            "}",
+            "for (uint32_t b2r_row = 0u; b2r_row < 4u; ++b2r_row) {",
+            "    for (uint32_t b2r_column = 0u; b2r_column < 4u; ++b2r_column) {",
+            "        volatile float b2r_p0 = b2r_left[b2r_row * 4u] * b2r_right[b2r_column];",
+            "        volatile float b2r_p1 = b2r_left[b2r_row * 4u + 1u] * b2r_right[4u + b2r_column];",
+            "        volatile float b2r_p2 = b2r_left[b2r_row * 4u + 2u] * b2r_right[8u + b2r_column];",
+            "        volatile float b2r_p3 = b2r_left[b2r_row * 4u + 3u] * b2r_right[12u + b2r_column];",
+            "        volatile float b2r_sum02 = b2r_p0 + b2r_p2;",
+            "        volatile float b2r_sum31 = b2r_p3 + b2r_p1;",
+            "        b2r_output[b2r_row * 4u + b2r_column] = b2r_sum02 + b2r_sum31;",
+            "    }",
+            "}",
+            "b2r_record_native_fast_path(ctx, 0x00227bd9u); ctx->eip = 0x00227bd9u;",
+            "for (uint32_t b2r_index = 0u; b2r_index < 16u; ++b2r_index) {",
+            "    b2r_write_f32(ctx, b2r_destination + b2r_index * 4u, b2r_output[b2r_index]);",
+            "}",
+            "ctx->eax = b2r_destination;",
+            "ctx->ecx = b2r_destination == b2r_right_address",
+            "    ? b2r_left_address : b2r_left_address + 0x40u;",
+            "ctx->edx = b2r_right_address;",
+            *_native_fast_path_return(12),
+        ),
+    )
+
+    deferred_texture_state_clean_guard = " && ".join(
+        (
+            *(f"b2r_read_u32(ctx, 0x{0x005AD520 + stage * 4:08x}u) == 0u" for stage in range(4)),
+            *(
+                f"b2r_read_u32(ctx, 0x{0x005AD750 + stage * 4:08x}u) == "
+                f"b2r_read_u32(ctx, 0x{0x005A6598 + stage * 4:08x}u)"
+                for stage in range(4)
+            ),
+        )
+    )
+    deferred_state_clean_guard = (
+        "b2r_read_u32(ctx, 0x005ad740u) == 0u && "
+        f"({deferred_texture_state_clean_guard})"
+    )
+
+    def draw_wrapper_body(
+        fast_path: NativeFastPath,
+        *,
+        inner_address: int,
+        wrapper_address: int,
+        inner_stack_cleanup: int,
+    ) -> tuple[str, ...]:
+        """Reuse a bulk draw body with the wrapper's caller-clean return ABI."""
+
+        body = list(fast_path.body)
+        inner_return = list(_native_fast_path_return(inner_stack_cleanup))
+        return_index = next(
+            index
+            for index in range(len(body) - len(inner_return) + 1)
+            if body[index : index + len(inner_return)] == inner_return
+        )
+        body[return_index : return_index + len(inner_return)] = (
+            _native_fast_path_return(0)
+        )
+        inner_literal = f"0x{inner_address:08x}u"
+        wrapper_literal = f"0x{wrapper_address:08x}u"
+        return tuple(line.replace(inner_literal, wrapper_literal) for line in body)
+
+    indexed_wrapper_bulk_body = draw_wrapper_body(
+        indexed_draw,
+        inner_address=TITLE_D3D_INDEXED_DRAW_ADDRESS,
+        wrapper_address=TITLE_D3D_INDEXED_DRAW_WRAPPER_ADDRESS,
+        inner_stack_cleanup=12,
+    )
+    indexed_draw_wrapper = NativeFastPath(
+        name="title_d3d_indexed_draw_wrapper_bulk",
+        guard=f"({indexed_draw.guard}) && ({deferred_texture_state_clean_guard})",
+        body=(
+            "const uint32_t b2r_wrapper_context = b2r_read_u32(ctx, 0x002256b8u);",
+            "const uint32_t b2r_wrapper_state_count = b2r_read_u32(ctx, 0x005ad740u);",
+            "uint32_t b2r_wrapper_command_count = 0u;",
+            "bool b2r_wrapper_supported = b2r_wrapper_state_count == 0u;",
+            "if (b2r_wrapper_state_count != 0u && b2r_wrapper_state_count <= 0x100u &&",
+            "    b2r_wrapper_context == 0x002256c0u) {",
+            "    b2r_wrapper_supported = true;",
+            "    uint64_t b2r_wrapper_seen_low = 0u;",
+            "    uint64_t b2r_wrapper_seen_high = 0u;",
+            "    for (uint32_t b2r_index = 0u; b2r_index < b2r_wrapper_state_count; ++b2r_index) {",
+            "        const uint32_t b2r_state = b2r_read_u32(ctx, 0x005ada00u + b2r_index * 4u);",
+            "        if (b2r_state >= 0x5cu) { b2r_wrapper_supported = false; break; }",
+            "        uint64_t* const b2r_seen = b2r_state < 64u ?",
+            "            &b2r_wrapper_seen_low : &b2r_wrapper_seen_high;",
+            "        const uint64_t b2r_seen_bit = 1ull << (b2r_state & 63u);",
+            "        if ((*b2r_seen & b2r_seen_bit) != 0u) {",
+            "            b2r_wrapper_supported = false;",
+            "            break;",
+            "        }",
+            "        *b2r_seen |= b2r_seen_bit;",
+            "        const uint32_t b2r_value = b2r_read_u32(ctx, 0x005ad080u + b2r_state * 4u);",
+            "        if (b2r_read_u32(ctx, 0x00225420u + b2r_state * 4u) != b2r_value) {",
+            "            ++b2r_wrapper_command_count;",
+            "        }",
+            "    }",
+            "}",
+            "const uint32_t b2r_wrapper_push = b2r_read_u32(ctx, b2r_wrapper_context);",
+            "const uint32_t b2r_wrapper_limit = b2r_read_u32(ctx, b2r_wrapper_context + 0x4u);",
+            "const uint64_t b2r_wrapper_initial_push64 =",
+            "    static_cast<uint64_t>(b2r_wrapper_push) +",
+            "    static_cast<uint64_t>(b2r_wrapper_command_count) * 8u;",
+            "if (b2r_wrapper_supported && b2r_wrapper_command_count != 0u &&",
+            "    (b2r_wrapper_push == 0u || b2r_wrapper_initial_push64 >= b2r_wrapper_limit)) {",
+            "    b2r_wrapper_supported = false;",
+            "}",
+            "if (b2r_wrapper_supported) {",
+            "    const uint32_t b2r_context = b2r_wrapper_context;",
+            "    const uint32_t b2r_wrapper_initial_push =",
+            "        static_cast<uint32_t>(b2r_wrapper_initial_push64);",
+            *rewrite_body(
+                indexed_wrapper_bulk_body[1:57],
+                {
+                    "const uint32_t b2r_initial_push = b2r_read_u32(ctx, b2r_context);":
+                        "const uint32_t b2r_initial_push = b2r_wrapper_initial_push;",
+                },
+            ),
+            "    uint32_t b2r_state_push = b2r_wrapper_push;",
+            "    for (uint32_t b2r_index = 0u; b2r_index < b2r_wrapper_state_count; ++b2r_index) {",
+            "        const uint32_t b2r_state = b2r_read_u32(ctx, 0x005ada00u + b2r_index * 4u);",
+            "        const uint32_t b2r_value = b2r_read_u32(ctx, 0x005ad080u + b2r_state * 4u);",
+            "        if (b2r_read_u32(ctx, 0x00225420u + b2r_state * 4u) != b2r_value) {",
+            "            const uint32_t b2r_method =",
+            "                b2r_read_u32(ctx, 0x00293ff0u + b2r_state * 4u);",
+            "            b2r_write_push_u64(ctx, b2r_state_push,",
+            "                static_cast<uint64_t>(b2r_method) |",
+            "                (static_cast<uint64_t>(b2r_value) << 32u));",
+            "            b2r_state_push += 8u;",
+            "            b2r_write_u32(ctx, 0x00225420u + b2r_state * 4u, b2r_value);",
+            "        }",
+            "        b2r_write_u32(ctx, 0x005ad760u + b2r_state * 4u, 0u);",
+            "    }",
+            "    b2r_write_u32(ctx, 0x005ad740u, 0u);",
+            "    b2r_write_u32(ctx, b2r_wrapper_context, b2r_state_push);",
+            *indexed_wrapper_bulk_body[57:],
+            "}",
+        ),
+    )
+
+    def indexed_wrapper_caller_body(
+        *,
+        caller_address: int,
+        replacements: dict[str, str],
+        stack_cleanup: int,
+    ) -> tuple[str, ...]:
+        """Retarget the public indexed wrapper body to a recovered caller ABI."""
+
+        body = list(rewrite_body(indexed_draw_wrapper.body, replacements))
+        wrapper_return = list(_native_fast_path_return(0))
+        return_index = next(
+            index
+            for index in range(len(body) - len(wrapper_return) + 1)
+            if body[index : index + len(wrapper_return)] == wrapper_return
+        )
+        body[return_index : return_index + len(wrapper_return)] = (
+            _native_fast_path_return(stack_cleanup)
+        )
+        wrapper_literal = f"0x{TITLE_D3D_INDEXED_DRAW_WRAPPER_ADDRESS:08x}u"
+        caller_literal = f"0x{caller_address:08x}u"
+        return tuple(line.replace(wrapper_literal, caller_literal) for line in body)
+
+    indexed_resource_draw = NativeFastPath(
+        name="title_indexed_resource_bind_draw_bulk",
+        guard=(
+            "ctx->ecx != 0u && "
+            "b2r_read_u32(ctx, ctx->esp + 0x4u) != 0u && "
+            f"({indexed_draw_wrapper.guard}) && "
+            "(b2r_read_u32(ctx, 0x00225218u) & 0x40000000u) != 0u && "
+            "b2r_read_u32(ctx, 0x005ad740u) == 0u && "
+            "(b2r_read_u32(ctx, b2r_read_u32(ctx, 0x002256b8u) + 0x8u) & "
+            "    0x1000u) == 0u && "
+            "b2r_read_u32(ctx, b2r_read_u32(ctx, 0x002256b8u)) != 0u && "
+            "static_cast<uint64_t>(b2r_read_u32(ctx, "
+            "    b2r_read_u32(ctx, 0x002256b8u))) + "
+            "    static_cast<uint64_t>(b2r_read_u32(ctx, "
+            "        b2r_read_u32(ctx, ctx->esp + 0x4u) + 0x10u)) * 4u + 64u <= "
+            "    static_cast<uint64_t>(b2r_read_u32(ctx, "
+            "        b2r_read_u32(ctx, 0x002256b8u) + 0x4u)) + 0x200u && "
+            "(b2r_read_u32(ctx, 0x002242f8u) == 0u || "
+            " ((b2r_read_u32(ctx, b2r_read_u32(ctx, 0x002242f8u)) + "
+            "   (b2r_read_u32(ctx, 0x002242f8u) == "
+            "        b2r_read_u32(ctx, ctx->esp + 0x4u) ? 0u : 0xfff80000u)) & "
+            "   0x0078ffffu) != 0u)"
+        ),
+        body=(
+            "const uint32_t b2r_resource_object = ctx->ecx;",
+            "const uint32_t b2r_resource_record = b2r_read_u32(ctx, ctx->esp + 0x4u);",
+            "const uint32_t b2r_bound_context = b2r_read_u32(ctx, 0x002256b8u);",
+            "const uint32_t b2r_old_resource = b2r_read_u32(ctx, 0x002242f8u);",
+            "const uint32_t b2r_old_format = b2r_read_u32(ctx, 0x002242f0u);",
+            "const uint32_t b2r_new_format = b2r_read_u32(ctx, b2r_resource_object + 0x8u);",
+            "b2r_write_u32(ctx, b2r_resource_record,",
+            "    b2r_read_u32(ctx, b2r_resource_record) + 0x00080000u);",
+            "if (b2r_old_resource != 0u) {",
+            "    b2r_write_u32(ctx, b2r_old_resource + 0x8u,",
+            "        b2r_read_u32(ctx, b2r_bound_context + 0x2cu));",
+            "    b2r_write_u32(ctx, b2r_old_resource,",
+            "        b2r_read_u32(ctx, b2r_old_resource) - 0x00080000u);",
+            "}",
+            "b2r_write_u32(ctx, 0x002242f0u, b2r_new_format);",
+            "b2r_write_u32(ctx, 0x002242f8u, b2r_resource_record);",
+            "b2r_write_u32(ctx, 0x00225218u,",
+            "    b2r_read_u32(ctx, 0x00225218u) |",
+            "    (b2r_old_format == b2r_new_format ? 0x40u : 0x70u));",
+            *indexed_wrapper_caller_body(
+                caller_address=TITLE_INDEXED_RESOURCE_DRAW_ADDRESS,
+                replacements={
+                    "b2r_read_u32(ctx, ctx->esp + 0x4u)": "6u",
+                    "b2r_read_u32(ctx, ctx->esp + 0x8u)":
+                        "b2r_read_u32(ctx, b2r_resource_record + 0x10u)",
+                    "b2r_read_u32(ctx, ctx->esp + 0xcu)":
+                        "b2r_read_u32(ctx, b2r_resource_record + 0xcu)",
+                },
+                stack_cleanup=4,
+            ),
+        ),
+    )
+
+    scene_record_resource_draw = NativeFastPath(
+        name="title_scene_record_resource_bind_draw_bulk",
+        guard=(
+            "ctx->ecx != 0u && b2r_read_u32(ctx, ctx->ecx + 0x24u) != 0u && "
+            f"({indexed_resource_draw.guard})"
+        ),
+        body=tuple(
+            line.replace(
+                f"0x{TITLE_INDEXED_RESOURCE_DRAW_ADDRESS:08x}u",
+                f"0x{TITLE_SCENE_RECORD_RESOURCE_DRAW_ADDRESS:08x}u",
+            )
+            for line in indexed_resource_draw.body
+        ),
+    )
+
+    scene_record_indexed_draw = NativeFastPath(
+        name="title_scene_record_indexed_draw_bulk",
+        guard=(
+            "ctx->ecx != 0u && "
+            "b2r_read_u32(ctx, ctx->esp + 0x4u) != 0u && "
+            "b2r_read_u32(ctx, ctx->ecx + 0x24u) != 0u && "
+            f"({indexed_draw_wrapper.guard})"
+        ),
+        body=(
+            "const uint32_t b2r_scene_record = b2r_read_u32(ctx, ctx->esp + 0x4u);",
+            *indexed_wrapper_caller_body(
+                caller_address=TITLE_SCENE_RECORD_INDEXED_DRAW_ADDRESS,
+                replacements={
+                    "b2r_read_u32(ctx, ctx->esp + 0x4u)": "6u",
+                    "b2r_read_u32(ctx, ctx->esp + 0x8u)":
+                        "b2r_read_u32(ctx, b2r_scene_record + 0x10u)",
+                    "b2r_read_u32(ctx, ctx->esp + 0xcu)":
+                        "b2r_read_u32(ctx, b2r_scene_record + 0xcu)",
+                },
+                stack_cleanup=4,
+            ),
+        ),
+    )
+
+    immediate_draw_wrapper = NativeFastPath(
+        name="title_d3d_immediate_draw_wrapper_bulk",
+        guard=f"({immediate_draw.guard}) && ({deferred_state_clean_guard})",
+        body=draw_wrapper_body(
+            immediate_draw,
+            inner_address=TITLE_IMMEDIATE_DRAW_CORE_ADDRESS,
+            wrapper_address=TITLE_IMMEDIATE_DRAW_ADDRESS,
+            inner_stack_cleanup=16,
+        ),
+    )
+
+    return {
+        TITLE_D3D_PACKET_ALLOC_ADDRESS: packet_alloc,
+        TITLE_D3D_RESERVE_ADDRESS: reserve,
+        TITLE_D3D_INDEXED_DRAW_ADDRESS: indexed_draw,
+        TITLE_D3D_INDEXED_DRAW_CONTINUATION_ADDRESS: indexed_continuation,
+        TITLE_D3D_INDEXED_DRAW_WRAPPER_ADDRESS: indexed_draw_wrapper,
+        TITLE_D3D_INDEXED_STATE_PREPARE_ADDRESS: indexed_state_prepare,
+        TITLE_INDEXED_RESOURCE_DRAW_ADDRESS: indexed_resource_draw,
+        TITLE_SCENE_RECORD_DISTANCE_CULL_ADDRESS: scene_record_distance_cull,
+        TITLE_SCENE_RECORD_RESOURCE_DRAW_ADDRESS: scene_record_resource_draw,
+        TITLE_SCENE_RECORD_INDEXED_DRAW_ADDRESS: scene_record_indexed_draw,
+        TITLE_IMMEDIATE_DRAW_CORE_ADDRESS: immediate_draw,
+        TITLE_IMMEDIATE_DRAW_CONTINUATION_ADDRESS: immediate_continuation,
+        TITLE_IMMEDIATE_DRAW_ADDRESS: immediate_draw_wrapper,
+        TITLE_D3D_TEXTURE_STATE_ADDRESS: texture_state,
+        TITLE_QUAD_BATCH_CONTINUATION_ADDRESS: quad_batch_continuation,
+        TITLE_QUAD_CLIP_INTERPOLATE_ADDRESS: unclipped_quad,
+        TITLE_VERTEX_APPEND_COMPACT_ADDRESS: compact_vertex_append,
+        TITLE_VERTEX_APPEND_ADDRESS: full_vertex_append,
+        TITLE_MATRIX_MULTIPLY_ADDRESS: matrix_multiply,
+    }
 TITLE_XGETDEVICES_ADDRESS = 0x0028D282
 TITLE_XINPUT_OPEN_ADDRESS = 0x0028CF40
 TITLE_XINPUT_GET_CAPABILITIES_ADDRESS = 0x0028CFA2
@@ -782,6 +2097,7 @@ TITLE_XINPUT_ERROR_DEVICE_NOT_CONNECTED = 0x48F
 GUEST_ARGUMENT_COUNT_OVERRIDES = {
     "AvSendTVEncoderOption": 4,
     "HalReadWritePCISpace": 6,
+    "KeDelayExecutionThread": 3,
     "KeQuerySystemTime": 1,
     "KfLowerIrql": 0,
     "NtAllocateVirtualMemory": 5,
@@ -1013,8 +2329,8 @@ class TitleXInputFastPath:
                 0xFF if state.buttons & 0x2000 else 0,
                 0xFF if state.buttons & 0x4000 else 0,
                 0xFF if state.buttons & 0x8000 else 0,
-                0,
-                0,
+                0xFF if state.buttons & 0x0100 else 0,
+                0xFF if state.buttons & 0x0200 else 0,
                 state.left_trigger,
                 state.right_trigger,
             )
@@ -8074,6 +9390,25 @@ class _FixedCommandRecordRing:
 class RenderWriteWatchpoint:
     """Capture D3D MMIO/push-buffer writes as memory-observer events."""
 
+    _TRACKED_RESOURCE_METHODS = tuple(
+        sorted(
+            {
+                0x012C,
+                0x17FC,
+                0x1800,
+                0x1808,
+                *(range(0x1720, 0x1760, 4)),
+                *(range(0x1760, 0x17A0, 4)),
+                *(
+                    0x1B00 + stage * 0x40 + register
+                    for stage in range(4)
+                    for register in (0, 4, 0x18)
+                ),
+            }
+        )
+    )
+    _TRACKED_RESOURCE_METHOD_SET = frozenset(_TRACKED_RESOURCE_METHODS)
+
     def __init__(
         self,
         *,
@@ -8116,12 +9451,144 @@ class RenderWriteWatchpoint:
         self.native_batch_write_count = 0
         self.native_batch_total_us = 0
         self.native_batch_max_us = 0
+        self.native_received_batch_count = 0
+        self.native_received_batch_write_count = 0
+        self.native_contiguous_batch_count = 0
+        self.native_general_batch_count = 0
+        self.native_direct_packed_general_batch_count = 0
+        self.native_texture_run_count = 0
+        self.native_texture_bulk_u32_run_count = 0
+        self.native_texture_scalar_run_count = 0
+        self.native_texture_packed_payload_run_count = 0
+        self.native_observe_fallback_batch_count = 0
+        self.resource_method_data_word_count = 0
+        self.resource_method_tracked_word_count = 0
+        self.resource_method_skipped_word_count = 0
+        self.resource_method_aggregated_index_word_count = 0
+        self.resource_method_native_scan_count = 0
+        self.resource_method_native_compacted_method_count = 0
+        self.resource_method_native_span_batch_count = 0
+        self.resource_method_native_span_finish_count = 0
+        self.resource_method_native_span_event_count = 0
+        self.resource_method_native_binding_count = 0
+        self.resource_method_native_range_count = 0
+        self.resource_method_payload_rescan_bypass_byte_count = 0
+        self.native_batch_phase_metrics: dict[str, dict[str, int]] = {}
+        self._direct_command_sink: Callable[[memoryview, int], None] | None = None
+        self._direct_command_span_sink: Callable[..., None] | None = None
+        self._native_resource_method_scanner: (
+            Callable[[bytearray, int], tuple[Any, Any, int, int, int, int, int]]
+            | None
+        ) = None
+        self._native_resource_span_scanner: Callable[..., tuple[Any, ...]] | None = (
+            None
+        )
+        self._native_resource_span_finisher: (
+            Callable[[], tuple[Any, ...]] | None
+        ) = None
+        self._native_resource_span_state_exporter: Callable[[], bytes] | None = (
+            None
+        )
+        self._native_resource_span_scan_active = False
+        self._native_resource_binding_pending: dict[int, list[int | None]] = {}
+        self._native_resource_range_start: int | None = None
+        self.direct_command_batch_count = 0
+        self.direct_command_write_count = 0
+
+    @property
+    def direct_command_transport_enabled(self) -> bool:
+        return (
+            self._direct_command_sink is not None
+            or self._direct_command_span_sink is not None
+        )
+
+    def set_direct_command_sink(
+        self,
+        sink: Callable[[memoryview, int], None],
+    ) -> None:
+        if self.retain_diagnostic_writes or self.stop_after is not None:
+            raise ValueError(
+                "direct command transport requires non-diagnostic live capture"
+            )
+        self._direct_command_sink = sink
+
+    def set_direct_command_span_sink(self, sink: Callable[..., None]) -> None:
+        if self.retain_diagnostic_writes or self.stop_after is not None:
+            raise ValueError(
+                "direct command transport requires non-diagnostic live capture"
+            )
+        self._direct_command_span_sink = sink
+
+    def _retain_or_forward_command_records(
+        self,
+        packed_records: Any,
+        count: int,
+        *,
+        eips: Any | None = None,
+        source_addresses: Any | None = None,
+        steps: Any | None = None,
+    ) -> None:
+        count = max(0, int(count))
+        if count == 0:
+            return
+        records = memoryview(packed_records).cast("B")[: count * 16]
+        if len(records) != count * 16:
+            raise ValueError("packed render command batch is truncated")
+        if self._direct_command_sink is not None:
+            self._direct_command_sink(records, count)
+            self.direct_command_batch_count += 1
+            self.direct_command_write_count += count
+            return
+        self.live_command_records.extend_packed(records)
+        if eips is None or source_addresses is None or steps is None:
+            raise ValueError("retained command records require provenance arrays")
+        self.live_command_eips.extend_packed(
+            memoryview(eips).cast("B")[: count * 4]
+        )
+        self.live_command_sources.extend_packed(
+            memoryview(source_addresses).cast("B")[: count * 4]
+        )
+        self.live_command_steps.extend_packed(
+            memoryview(steps).cast("B")[: count * 8]
+        )
 
     def set_push_buffer_range_provider(
         self,
         provider: Callable[[], tuple[int, int] | None],
     ) -> None:
         self._push_buffer_range_provider = provider
+
+    def set_native_resource_method_scanner(
+        self,
+        scanner: Callable[
+            [bytearray, int],
+            tuple[Any, Any, int, int, int, int, int],
+        ],
+    ) -> None:
+        self._native_resource_method_scanner = scanner
+
+    def set_native_resource_span_scanner(
+        self,
+        scanner: Callable[..., tuple[Any, ...]],
+        finisher: Callable[[], tuple[Any, ...]],
+        state_exporter: Callable[[], bytes] | None = None,
+        state_importer: Callable[[bytes], None] | None = None,
+    ) -> None:
+        if (
+            self._native_resource_span_state_exporter is not None
+            and state_importer is not None
+        ):
+            # Parser continuation is only one part of this state. Texture,
+            # vertex-array, and per-frame resource state must also survive a
+            # main/cooperative executor replacement after a completed flip.
+            state_importer(self._native_resource_span_state_exporter())
+        elif self._native_resource_span_scan_active:
+            self._finish_native_resource_span_scan(
+                boundary_write_count=self.write_count
+            )
+        self._native_resource_span_scanner = scanner
+        self._native_resource_span_finisher = finisher
+        self._native_resource_span_state_exporter = state_exporter
 
     def _normalize_dynamic_push_buffer_address(self, address: int) -> int | None:
         canonical = XbeBackedSparseMemory._canonical_address(address)
@@ -8245,26 +9712,28 @@ class RenderWriteWatchpoint:
         else:
             # The MMIO submission that closes the pending push-buffer run is
             # part of the audited flip and must be present in its replay.
-            self._flush_texture_writes(boundary_write_count=self.write_count)
-        self.live_command_records.append(
-            struct.pack(
-                "<BBHI8s",
-                0 if kind == "d3d_mmio" else 1,
-                len(payload),
-                0,
-                normalized_address,
-                payload[:8].ljust(8, b"\x00"),
+            self._finish_native_resource_span_scan(
+                boundary_write_count=self.write_count
             )
+            self._flush_texture_writes(boundary_write_count=self.write_count)
+        command_record = struct.pack(
+            "<BBHI8s",
+            0 if kind == "d3d_mmio" else 1,
+            len(payload),
+            0,
+            normalized_address,
+            payload[:8].ljust(8, b"\x00"),
         )
-        self.live_command_eips.append(
-            struct.pack("<I", _u32(instruction_address or 0))
-        )
-        self.live_command_sources.append(
-            struct.pack("<I", _u32(source_address or 0))
-        )
-        self.live_command_steps.append(
-            struct.pack("<Q", max(0, int(steps or 0)))
-        )
+        if self.direct_command_transport_enabled:
+            self._retain_or_forward_command_records(command_record, 1)
+        else:
+            self._retain_or_forward_command_records(
+                command_record,
+                1,
+                eips=struct.pack("<I", _u32(instruction_address or 0)),
+                source_addresses=struct.pack("<I", _u32(source_address or 0)),
+                steps=struct.pack("<Q", max(0, int(steps or 0))),
+            )
         if self.retain_diagnostic_writes:
             value = int.from_bytes(
                 payload[: min(len(payload), 4)],
@@ -8315,12 +9784,19 @@ class RenderWriteWatchpoint:
         count: int,
         observed_range_start: int | None = None,
         contiguous_u32: bool = False,
+        observed_range_end: int | None = None,
+        packed_texture_payload: Any | None = None,
+        packed_texture_runs: Any | None = None,
+        packed_texture_run_count: int = 0,
     ) -> None:
         """Consume the native low-memory push-buffer log without per-write calls."""
         count = max(0, int(count))
         if count == 0:
             return
+        self.native_received_batch_count += 1
+        self.native_received_batch_write_count += count
         if self.retain_diagnostic_writes or self.stop_after is not None:
+            self.native_observe_fallback_batch_count += 1
             for index in range(count):
                 size = int(sizes[index])
                 self.observe(
@@ -8331,17 +9807,25 @@ class RenderWriteWatchpoint:
                     steps=int(steps[index]),
                 )
             return
-        active_range = (
-            self._push_buffer_range_provider()
-            if self._push_buffer_range_provider is not None
-            else self._dynamic_push_buffer_range
+        reported_range = (
+            (int(observed_range_start), int(observed_range_end))
+            if observed_range_start is not None
+            and observed_range_end is not None
+            and int(observed_range_start) < int(observed_range_end)
+            and int(observed_range_end) - int(observed_range_start)
+            <= RENDER_PUSH_BUFFER_APERTURE_SIZE
+            else None
         )
+        active_range = reported_range or self._dynamic_push_buffer_range
+        if active_range is None and self._push_buffer_range_provider is not None:
+            active_range = self._push_buffer_range_provider()
         if (
             active_range is None
             or active_range[0] >= active_range[1]
             or active_range[1] - active_range[0]
             > RENDER_PUSH_BUFFER_APERTURE_SIZE
         ):
+            self.native_observe_fallback_batch_count += 1
             for index in range(count):
                 size = int(sizes[index])
                 self.observe(
@@ -8360,6 +9844,8 @@ class RenderWriteWatchpoint:
             and contiguous_u32
             and observed_range_start == active_range[0]
         ):
+            self.native_contiguous_batch_count += 1
+            texture_started_ns = time.perf_counter_ns()
             guest_address = int(addresses[0])
             normalized_address = TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS + (
                 guest_address - active_range[0]
@@ -8371,23 +9857,80 @@ class RenderWriteWatchpoint:
                 self._flush_texture_writes(
                     boundary_write_count=self.write_count
                 )
-            self._texture_pending.extend(
-                ctypes.string_at(ctypes.addressof(values), count * 4)
-            )
+            if packed_texture_payload is not None:
+                texture_payload = memoryview(packed_texture_payload).cast("B")[
+                    : count * 4
+                ]
+            else:
+                # Compatibility for direct watchpoint callers. NativeExecutor
+                # supplies the densely packed payload on the live hot path.
+                texture_payload = b"".join(
+                    struct.pack("<I", int(values[index]) & 0xFFFFFFFF)
+                    for index in range(count)
+                )
+            self._texture_pending.extend(texture_payload)
             self._texture_pending_end = normalized_address + count * 4
+            self.native_texture_run_count += 1
+            self.native_texture_bulk_u32_run_count += 1
             self.push_buffer_write_count += count
-            self.live_command_records.extend_packed(
-                ctypes.string_at(ctypes.addressof(packed_records), count * 16)
+            self._record_native_batch_phase("texture_update", texture_started_ns)
+            command_started_ns = time.perf_counter_ns()
+            self._retain_or_forward_command_records(
+                packed_records,
+                count,
+                eips=eips,
+                source_addresses=source_addresses,
+                steps=steps,
             )
-            self.live_command_eips.extend_packed(
-                ctypes.string_at(ctypes.addressof(eips), count * 4)
+            self._record_native_batch_phase("command_forward", command_started_ns)
+            elapsed_us = max(
+                0,
+                (time.perf_counter_ns() - started_ns) // 1_000,
             )
-            self.live_command_sources.extend_packed(
-                ctypes.string_at(ctypes.addressof(source_addresses), count * 4)
+            self.native_batch_count += 1
+            self.native_batch_write_count += count
+            self.native_batch_total_us += elapsed_us
+            self.native_batch_max_us = max(
+                self.native_batch_max_us,
+                elapsed_us,
             )
-            self.live_command_steps.extend_packed(
-                ctypes.string_at(ctypes.addressof(steps), count * 8)
+            return
+        self.native_general_batch_count += 1
+        if (
+            packed_records is not None
+            and observed_range_start == active_range[0]
+        ):
+            self.native_direct_packed_general_batch_count += 1
+            texture_started_ns = time.perf_counter_ns()
+            if (
+                packed_texture_payload is not None
+                and packed_texture_runs is not None
+                and packed_texture_run_count > 0
+            ):
+                self._observe_packed_native_texture_write_runs(
+                    packed_texture_payload,
+                    packed_texture_runs,
+                    packed_texture_run_count,
+                )
+            else:
+                self._observe_native_texture_write_runs(
+                    addresses,
+                    values,
+                    sizes,
+                    count,
+                    active_range,
+                )
+            self.push_buffer_write_count += count
+            self._record_native_batch_phase("texture_update", texture_started_ns)
+            command_started_ns = time.perf_counter_ns()
+            self._retain_or_forward_command_records(
+                packed_records,
+                count,
+                eips=eips,
+                source_addresses=source_addresses,
+                steps=steps,
             )
+            self._record_native_batch_phase("command_forward", command_started_ns)
             elapsed_us = max(
                 0,
                 (time.perf_counter_ns() - started_ns) // 1_000,
@@ -8445,23 +9988,337 @@ class RenderWriteWatchpoint:
             )
             struct.pack_into("<Q", step_records, record_count * 8, int(steps[index]))
             record_count += 1
-        self.live_command_records.extend_packed(
-            memoryview(records)[: record_count * 16]
-        )
-        self.live_command_eips.extend_packed(
-            memoryview(eip_records)[: record_count * 4]
-        )
-        self.live_command_sources.extend_packed(
-            memoryview(source_records)[: record_count * 4]
-        )
-        self.live_command_steps.extend_packed(
-            memoryview(step_records)[: record_count * 8]
+        self._retain_or_forward_command_records(
+            records,
+            record_count,
+            eips=eip_records,
+            source_addresses=source_records,
+            steps=step_records,
         )
         elapsed_us = max(0, (time.perf_counter_ns() - started_ns) // 1_000)
         self.native_batch_count += 1
         self.native_batch_write_count += record_count
         self.native_batch_total_us += elapsed_us
         self.native_batch_max_us = max(self.native_batch_max_us, elapsed_us)
+
+    def observe_native_write_span_batch(
+        self,
+        payload: Any,
+        payload_size: int,
+        addresses: Any,
+        payload_offsets: Any,
+        payload_sizes: Any,
+        write_counts: Any,
+        flags: Any,
+        span_count: int,
+        observed_range_start: int,
+        observed_range_end: int,
+        _normalized_base: int,
+    ) -> None:
+        """Consume native push writes as contiguous payload spans."""
+        span_count = max(0, int(span_count))
+        payload_size = max(0, int(payload_size))
+        if span_count == 0:
+            return
+        active_range = (int(observed_range_start), int(observed_range_end))
+        if (
+            active_range[0] >= active_range[1]
+            or active_range[1] - active_range[0]
+            > RENDER_PUSH_BUFFER_APERTURE_SIZE
+        ):
+            raise ValueError("native command spans have an invalid observed range")
+        payload_view = memoryview(payload).cast("B")[:payload_size]
+        if len(payload_view) != payload_size:
+            raise ValueError("native command span payload is truncated")
+
+        started_ns = time.perf_counter_ns()
+        batch_write_start = self.write_count
+        cumulative_write_count = 0
+        normalized_addresses: list[int] = []
+        previous_payload_end = 0
+        for span_index in range(span_count):
+            guest_address = int(addresses[span_index])
+            payload_offset = int(payload_offsets[span_index])
+            span_size = int(payload_sizes[span_index])
+            span_write_count = int(write_counts[span_index])
+            span_flags = int(flags[span_index])
+            if (
+                span_size <= 0
+                or span_write_count <= 0
+                or payload_offset != previous_payload_end
+                or payload_offset + span_size > payload_size
+                or guest_address < active_range[0]
+                or guest_address + span_size > active_range[1]
+                or span_flags & ~1
+            ):
+                raise ValueError("invalid native command span descriptor")
+            normalized_address = TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS + (
+                guest_address - active_range[0]
+            )
+            normalized_addresses.append(normalized_address)
+            cumulative_write_count += span_write_count
+            previous_payload_end = payload_offset + span_size
+            self.native_texture_run_count += 1
+            self.native_texture_packed_payload_run_count += 1
+        if previous_payload_end != payload_size:
+            raise ValueError("native command span payload contains trailing bytes")
+
+        if self._native_resource_span_scanner is not None:
+            if self._texture_pending:
+                self._flush_texture_writes(
+                    boundary_write_count=batch_write_start
+                )
+            (
+                methods,
+                values,
+                positions,
+                method_count,
+                data_word_count,
+                tracked_word_count,
+                skipped_word_count,
+                aggregated_index_word_count,
+            ) = self._native_resource_span_scanner(
+                payload,
+                payload_size,
+                addresses,
+                payload_offsets,
+                payload_sizes,
+                flags,
+                span_count,
+            )
+            method_index = 0
+            write_cursor = 0
+            for span_index in range(span_count):
+                before_position = span_index * 2
+                while (
+                    method_index < method_count
+                    and int(positions[method_index]) == before_position
+                ):
+                    self._observe_texture_method(
+                        int(methods[method_index]),
+                        int(values[method_index]),
+                        record_flips=False,
+                        boundary_write_count=batch_write_start + write_cursor,
+                    )
+                    method_index += 1
+                if (
+                    method_index < method_count
+                    and int(positions[method_index]) < before_position
+                ):
+                    raise ValueError("native resource span events are unordered")
+                write_cursor += int(write_counts[span_index])
+                after_position = before_position + 1
+                while (
+                    method_index < method_count
+                    and int(positions[method_index]) == after_position
+                ):
+                    self._observe_texture_method(
+                        int(methods[method_index]),
+                        int(values[method_index]),
+                        record_flips=False,
+                        boundary_write_count=batch_write_start + write_cursor,
+                    )
+                    method_index += 1
+                if (
+                    method_index < method_count
+                    and int(positions[method_index]) < after_position
+                ):
+                    raise ValueError("native resource span events are unordered")
+                if int(flags[span_index]) & 1:
+                    span_size = int(payload_sizes[span_index])
+                    payload_offset = int(payload_offsets[span_index])
+                    if span_size < 4:
+                        raise ValueError("native flip span has no complete value")
+                    flip_value = int.from_bytes(
+                        payload_view[
+                            payload_offset + span_size - 4 : payload_offset + span_size
+                        ],
+                        "little",
+                    )
+                    self._observe_texture_method(
+                        0x012C,
+                        flip_value,
+                        record_flips=True,
+                        boundary_write_count=batch_write_start + write_cursor,
+                    )
+            if method_index != method_count:
+                raise ValueError("native resource span event position is invalid")
+            self._account_native_resource_span_scan(
+                method_count=method_count,
+                data_word_count=data_word_count,
+                tracked_word_count=tracked_word_count,
+                skipped_word_count=skipped_word_count,
+                aggregated_index_word_count=aggregated_index_word_count,
+                payload_size=payload_size,
+                finish=False,
+            )
+            self._native_resource_span_scan_active = not bool(
+                int(flags[span_count - 1]) & 1
+            )
+        else:
+            legacy_write_cursor = 0
+            for span_index, normalized_address in enumerate(
+                normalized_addresses
+            ):
+                payload_offset = int(payload_offsets[span_index])
+                span_size = int(payload_sizes[span_index])
+                if (
+                    self._texture_pending
+                    and normalized_address != self._texture_pending_end
+                ):
+                    self._flush_texture_writes(
+                        boundary_write_count=(
+                            batch_write_start + legacy_write_cursor
+                        )
+                    )
+                self._texture_pending.extend(
+                    payload_view[payload_offset : payload_offset + span_size]
+                )
+                self._texture_pending_end = normalized_address + span_size
+                legacy_write_cursor += int(write_counts[span_index])
+                if int(flags[span_index]) & 1:
+                    self._flush_texture_writes(
+                        boundary_write_count=(
+                            batch_write_start + legacy_write_cursor
+                        )
+                    )
+
+        self._dynamic_push_buffer_range = active_range
+        self.push_buffer_write_count += cumulative_write_count
+        self.native_received_batch_count += 1
+        self.native_received_batch_write_count += cumulative_write_count
+        self.native_batch_count += 1
+        self.native_batch_write_count += cumulative_write_count
+        if self._direct_command_span_sink is None:
+            raise RuntimeError("native command spans have no live transport sink")
+        self._direct_command_span_sink(
+            payload_view,
+            normalized_addresses,
+            payload_offsets,
+            payload_sizes,
+            write_counts,
+            flags,
+            span_count,
+        )
+        self.direct_command_batch_count += 1
+        self.direct_command_write_count += cumulative_write_count
+        elapsed_us = max(0, (time.perf_counter_ns() - started_ns) // 1_000)
+        self.native_batch_total_us += elapsed_us
+        self.native_batch_max_us = max(self.native_batch_max_us, elapsed_us)
+
+    def _observe_native_texture_write_runs(
+        self,
+        addresses: Any,
+        values: Any,
+        sizes: Any,
+        count: int,
+        active_range: tuple[int, int],
+    ) -> None:
+        """Append general native writes as maximal contiguous texture runs."""
+        batch_write_start = self.write_count
+        value_bytes = memoryview(values).cast("B")
+        index = 0
+        while index < count:
+            run_start = index
+            guest_address = int(addresses[index])
+            size = int(sizes[index])
+            if (
+                size not in {1, 4}
+                or not active_range[0] <= guest_address < active_range[1]
+                or guest_address + size > active_range[1]
+            ):
+                raise ValueError(
+                    "native render-write batch escaped its observed push-buffer range"
+                )
+            run_end = guest_address + size
+            bulk_u32 = size == 4
+            index += 1
+            while index < count:
+                next_address = int(addresses[index])
+                next_size = int(sizes[index])
+                if (
+                    next_size not in {1, 4}
+                    or not active_range[0] <= next_address < active_range[1]
+                    or next_address + next_size > active_range[1]
+                ):
+                    raise ValueError(
+                        "native render-write batch escaped its observed push-buffer range"
+                    )
+                if next_address != run_end:
+                    break
+                run_end += next_size
+                bulk_u32 = bulk_u32 and next_size == 4
+                index += 1
+
+            normalized_address = TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS + (
+                guest_address - active_range[0]
+            )
+            if (
+                self._texture_pending
+                and normalized_address != self._texture_pending_end
+            ):
+                self._flush_texture_writes(
+                    boundary_write_count=batch_write_start + run_start
+                )
+            if bulk_u32:
+                self._texture_pending.extend(
+                    value_bytes[run_start * 4 : index * 4]
+                )
+                self.native_texture_bulk_u32_run_count += 1
+            else:
+                for record_index in range(run_start, index):
+                    record_size = int(sizes[record_index])
+                    value = int(values[record_index])
+                    self._texture_pending.extend(
+                        value.to_bytes(4, "little")[:record_size]
+                    )
+                self.native_texture_scalar_run_count += 1
+            self._texture_pending_end = normalized_address + (
+                run_end - guest_address
+            )
+            self.native_texture_run_count += 1
+
+    def _observe_packed_native_texture_write_runs(
+        self,
+        payload: Any,
+        runs: Any,
+        run_count: int,
+    ) -> None:
+        """Append native-compacted texture runs without scanning guest writes."""
+        batch_write_start = self.write_count
+        payload_view = memoryview(payload).cast("B")
+        previous_record_index = -1
+        for run_index in range(run_count):
+            descriptor_index = run_index * 4
+            normalized_address = int(runs[descriptor_index])
+            payload_offset = int(runs[descriptor_index + 1])
+            payload_size = int(runs[descriptor_index + 2])
+            record_index = int(runs[descriptor_index + 3])
+            if (
+                record_index <= previous_record_index
+                or payload_size <= 0
+                or payload_offset + payload_size > len(payload_view)
+                or not TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS
+                <= normalized_address
+                < RENDER_PUSH_BUFFER_APERTURE_END_ADDRESS
+                or normalized_address + payload_size
+                > RENDER_PUSH_BUFFER_APERTURE_END_ADDRESS
+            ):
+                raise ValueError("invalid packed native texture-write run")
+            if (
+                self._texture_pending
+                and normalized_address != self._texture_pending_end
+            ):
+                self._flush_texture_writes(
+                    boundary_write_count=batch_write_start + record_index
+                )
+            self._texture_pending.extend(
+                payload_view[payload_offset : payload_offset + payload_size]
+            )
+            self._texture_pending_end = normalized_address + payload_size
+            self.native_texture_run_count += 1
+            self.native_texture_packed_payload_run_count += 1
+            previous_record_index = record_index
 
     def to_stream(self) -> dict[str, Any]:
         return {
@@ -8519,13 +10376,19 @@ class RenderWriteWatchpoint:
         }
 
     def live_epoch_stream(self) -> dict[str, Any]:
+        captured_write_count = (
+            min(self.write_count, self.max_writes)
+            if self.direct_command_transport_enabled
+            else len(self.live_command_records)
+        )
         return {
             "write_count": self.write_count,
             "mmio_write_count": self.mmio_write_count,
             "push_buffer_write_count": self.push_buffer_write_count,
-            "captured_write_count": len(self.live_command_records),
+            "captured_write_count": captured_write_count,
             "diagnostic_write_retention": self.retain_diagnostic_writes,
-            "truncated": self.write_count > len(self.live_command_records),
+            "direct_command_transport": self.direct_command_transport_enabled,
+            "truncated": self.write_count > captured_write_count,
             "native_write_batch": self._native_write_batch_summary(),
             "writes": [],
         }
@@ -8534,6 +10397,79 @@ class RenderWriteWatchpoint:
         return {
             "batch_count": self.native_batch_count,
             "write_count": self.native_batch_write_count,
+            "received_batch_count": self.native_received_batch_count,
+            "received_write_count": self.native_received_batch_write_count,
+            "contiguous_batch_count": self.native_contiguous_batch_count,
+            "general_batch_count": self.native_general_batch_count,
+            "direct_packed_general_batch_count": (
+                self.native_direct_packed_general_batch_count
+            ),
+            "texture_run_count": self.native_texture_run_count,
+            "texture_bulk_u32_run_count": (
+                self.native_texture_bulk_u32_run_count
+            ),
+            "texture_scalar_run_count": self.native_texture_scalar_run_count,
+            "texture_packed_payload_run_count": (
+                self.native_texture_packed_payload_run_count
+            ),
+            "resource_method_data_word_count": (
+                self.resource_method_data_word_count
+            ),
+            "resource_method_tracked_word_count": (
+                self.resource_method_tracked_word_count
+            ),
+            "resource_method_skipped_word_count": (
+                self.resource_method_skipped_word_count
+            ),
+            "resource_method_aggregated_index_word_count": (
+                self.resource_method_aggregated_index_word_count
+            ),
+            "resource_method_native_scan_count": (
+                self.resource_method_native_scan_count
+            ),
+            "resource_method_native_compacted_method_count": (
+                self.resource_method_native_compacted_method_count
+            ),
+            "resource_method_native_span_batch_count": (
+                self.resource_method_native_span_batch_count
+            ),
+            "resource_method_native_span_finish_count": (
+                self.resource_method_native_span_finish_count
+            ),
+            "resource_method_native_span_event_count": (
+                self.resource_method_native_span_event_count
+            ),
+            "resource_method_native_binding_count": (
+                self.resource_method_native_binding_count
+            ),
+            "resource_method_native_range_count": (
+                self.resource_method_native_range_count
+            ),
+            "resource_method_payload_rescan_bypass_byte_count": (
+                self.resource_method_payload_rescan_bypass_byte_count
+            ),
+            "phase_timings": {
+                name: {
+                    **metric,
+                    "average_us": round(
+                        metric["total_us"] / max(1, metric["count"]),
+                        3,
+                    ),
+                }
+                for name, metric in sorted(
+                    self.native_batch_phase_metrics.items()
+                )
+            },
+            "average_texture_runs_per_batch": round(
+                self.native_texture_run_count / max(1, self.native_batch_count),
+                3,
+            ),
+            "observe_fallback_batch_count": (
+                self.native_observe_fallback_batch_count
+            ),
+            "direct_command_transport": self.direct_command_transport_enabled,
+            "direct_command_batch_count": self.direct_command_batch_count,
+            "direct_command_write_count": self.direct_command_write_count,
             "total_us": self.native_batch_total_us,
             "max_us": self.native_batch_max_us,
             "average_us": round(
@@ -8541,6 +10477,16 @@ class RenderWriteWatchpoint:
                 3,
             ),
         }
+
+    def _record_native_batch_phase(self, name: str, started_ns: int) -> None:
+        elapsed_us = max(0, (time.perf_counter_ns() - started_ns) // 1_000)
+        metric = self.native_batch_phase_metrics.setdefault(
+            name,
+            {"count": 0, "total_us": 0, "max_us": 0},
+        )
+        metric["count"] += 1
+        metric["total_us"] += elapsed_us
+        metric["max_us"] = max(metric["max_us"], elapsed_us)
 
     def _transform_constant_upload_provenance_summary(self) -> dict[str, Any]:
         retained_count = min(
@@ -8551,7 +10497,11 @@ class RenderWriteWatchpoint:
         )
         if retained_count == 0:
             return {
-                "status": "not_captured",
+                "status": (
+                    "disabled_for_direct_transport"
+                    if self.direct_command_transport_enabled
+                    else "not_captured"
+                ),
                 "retained_command_count": 0,
                 "matrix_upload_count": 0,
                 "near_zero_basis_matrix_upload_count": 0,
@@ -8765,7 +10715,74 @@ class RenderWriteWatchpoint:
         self._pending_flip_boundaries.clear()
         return boundaries
 
+    def _account_native_resource_span_scan(
+        self,
+        *,
+        method_count: int,
+        data_word_count: int,
+        tracked_word_count: int,
+        skipped_word_count: int,
+        aggregated_index_word_count: int,
+        payload_size: int,
+        finish: bool,
+    ) -> None:
+        self.resource_method_data_word_count += data_word_count
+        self.resource_method_tracked_word_count += tracked_word_count
+        self.resource_method_skipped_word_count += skipped_word_count
+        self.resource_method_aggregated_index_word_count += (
+            aggregated_index_word_count
+        )
+        self.resource_method_native_compacted_method_count += method_count
+        self.resource_method_native_span_event_count += method_count
+        self.resource_method_payload_rescan_bypass_byte_count += payload_size
+        if finish:
+            self.resource_method_native_span_finish_count += 1
+        else:
+            self.resource_method_native_span_batch_count += 1
+
+    def _finish_native_resource_span_scan(
+        self,
+        *,
+        boundary_write_count: int,
+    ) -> None:
+        if not self._native_resource_span_scan_active:
+            return
+        if self._native_resource_span_finisher is None:
+            raise RuntimeError("active native resource span scan has no finisher")
+        (
+            methods,
+            values,
+            positions,
+            method_count,
+            data_word_count,
+            tracked_word_count,
+            skipped_word_count,
+            aggregated_index_word_count,
+        ) = self._native_resource_span_finisher()
+        for method_index in range(method_count):
+            if int(positions[method_index]) != 0:
+                raise ValueError("native resource span finish has invalid position")
+            self._observe_texture_method(
+                int(methods[method_index]),
+                int(values[method_index]),
+                record_flips=False,
+                boundary_write_count=boundary_write_count,
+            )
+        self._account_native_resource_span_scan(
+            method_count=method_count,
+            data_word_count=data_word_count,
+            tracked_word_count=tracked_word_count,
+            skipped_word_count=skipped_word_count,
+            aggregated_index_word_count=aggregated_index_word_count,
+            payload_size=0,
+            finish=True,
+        )
+        self._native_resource_span_scan_active = False
+
     def _observe_texture_write(self, address: int, payload: bytes) -> None:
+        self._finish_native_resource_span_scan(
+            boundary_write_count=self.write_count - 1
+        )
         if self._texture_pending and address != self._texture_pending_end:
             self._flush_texture_writes(boundary_write_count=self.write_count - 1)
         self._texture_pending.extend(payload)
@@ -8779,6 +10796,56 @@ class RenderWriteWatchpoint:
         record_flips: bool,
         boundary_write_count: int,
     ) -> None:
+        if (
+            NATIVE_RESOURCE_BINDING_ADDRESS_EVENT_BASE
+            <= method
+            < NATIVE_RESOURCE_BINDING_ADDRESS_EVENT_BASE + 4
+        ):
+            stage = method - NATIVE_RESOURCE_BINDING_ADDRESS_EVENT_BASE
+            pending = self._native_resource_binding_pending.setdefault(
+                stage, [None, None]
+            )
+            pending[0] = data
+            return
+        if (
+            NATIVE_RESOURCE_BINDING_FORMAT_EVENT_BASE
+            <= method
+            < NATIVE_RESOURCE_BINDING_FORMAT_EVENT_BASE + 4
+        ):
+            stage = method - NATIVE_RESOURCE_BINDING_FORMAT_EVENT_BASE
+            pending = self._native_resource_binding_pending.setdefault(
+                stage, [None, None]
+            )
+            pending[1] = data
+            return
+        if (
+            NATIVE_RESOURCE_BINDING_RECT_EVENT_BASE
+            <= method
+            < NATIVE_RESOURCE_BINDING_RECT_EVENT_BASE + 4
+        ):
+            stage = method - NATIVE_RESOURCE_BINDING_RECT_EVENT_BASE
+            pending = self._native_resource_binding_pending.pop(stage, None)
+            if pending is None or pending[0] is None or pending[1] is None:
+                raise ValueError("native resource binding event is incomplete")
+            binding = (stage, int(pending[0]), int(pending[1]), data)
+            if binding not in self._texture_binding_seen:
+                self._texture_binding_seen.add(binding)
+                self._texture_bindings.append(binding)
+            self.resource_method_native_binding_count += 1
+            return
+        if method == NATIVE_RESOURCE_RANGE_START_EVENT:
+            self._native_resource_range_start = data
+            return
+        if method == NATIVE_RESOURCE_RANGE_END_EVENT:
+            if self._native_resource_range_start is None:
+                raise ValueError("native resource range event is incomplete")
+            self._retain_vertex_buffer_range(
+                self._native_resource_range_start,
+                data,
+            )
+            self._native_resource_range_start = None
+            self.resource_method_native_range_count += 1
+            return
         if method == 0x012C:
             self._retain_active_vertex_buffer_range()
             self._active_vertex_max_index = -1
@@ -8877,14 +10944,21 @@ class RenderWriteWatchpoint:
             ends.append(end)
         if not starts:
             return
+        for start, end in zip(starts, ends):
+            self._retain_vertex_buffer_range(start, end)
+
+    def _retain_vertex_buffer_range(self, start: int, end: int) -> None:
         merged: list[tuple[int, int]] = []
-        for start, end in sorted(
-            [*self._vertex_buffer_ranges, *zip(starts, ends)]
+        for candidate_start, candidate_end in sorted(
+            [*self._vertex_buffer_ranges, (start, end)]
         ):
-            if merged and start <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            if merged and candidate_start <= merged[-1][1]:
+                merged[-1] = (
+                    merged[-1][0],
+                    max(merged[-1][1], candidate_end),
+                )
             else:
-                merged.append((start, end))
+                merged.append((candidate_start, candidate_end))
         self._vertex_buffer_ranges = merged
 
     def _flush_texture_writes(
@@ -8896,6 +10970,38 @@ class RenderWriteWatchpoint:
         if boundary_write_count is None:
             boundary_write_count = self.write_count
         aligned_size = len(self._texture_pending) & ~3
+        if self._native_resource_method_scanner is not None and aligned_size:
+            (
+                methods,
+                values,
+                method_count,
+                data_word_count,
+                tracked_word_count,
+                skipped_word_count,
+                aggregated_index_word_count,
+            ) = self._native_resource_method_scanner(
+                self._texture_pending,
+                aligned_size,
+            )
+            for method_index in range(method_count):
+                self._observe_texture_method(
+                    int(methods[method_index]),
+                    int(values[method_index]),
+                    record_flips=clear,
+                    boundary_write_count=boundary_write_count,
+                )
+            if clear:
+                self.resource_method_data_word_count += data_word_count
+                self.resource_method_tracked_word_count += tracked_word_count
+                self.resource_method_skipped_word_count += skipped_word_count
+                self.resource_method_aggregated_index_word_count += (
+                    aggregated_index_word_count
+                )
+                self.resource_method_native_scan_count += 1
+                self.resource_method_native_compacted_method_count += method_count
+                self._texture_pending = bytearray()
+                self._texture_pending_end = None
+            return
         words = memoryview(self._texture_pending)[:aligned_size].cast("I")
         index = 0
         while index < len(words):
@@ -8920,18 +11026,164 @@ class RenderWriteWatchpoint:
             first_method = ((command >> 2) & 0x7FF) * 4
             data_start = index + header_words
             data_end = min(data_start + count, len(words))
-            for data_index in range(data_start, data_end):
-                method_offset = 0 if non_increasing else data_index - data_start
-                self._observe_texture_method(
-                    first_method + method_offset * 4,
-                    words[data_index],
-                    record_flips=clear,
-                    boundary_write_count=boundary_write_count,
+            data_word_count = data_end - data_start
+            tracked_word_count = 0
+            aggregated_index_word_count = 0
+            if non_increasing:
+                if first_method == 0x1800:
+                    tracked_word_count = data_word_count
+                    aggregated_index_word_count = data_word_count
+                    if self._active_vertex_primitive and data_word_count:
+                        self._active_vertex_max_index = max(
+                            self._active_vertex_max_index,
+                            max(
+                                memoryview(self._texture_pending)[
+                                    data_start * 4 : data_end * 4
+                                ].cast("H")
+                            ),
+                        )
+                elif first_method == 0x1808:
+                    tracked_word_count = data_word_count
+                    aggregated_index_word_count = data_word_count
+                    if self._active_vertex_primitive and data_word_count:
+                        self._active_vertex_max_index = max(
+                            self._active_vertex_max_index,
+                            max(words[data_start:data_end]),
+                        )
+                elif first_method in self._TRACKED_RESOURCE_METHOD_SET:
+                    tracked_word_count = data_word_count
+                    for data_index in range(data_start, data_end):
+                        self._observe_texture_method(
+                            first_method,
+                            words[data_index],
+                            record_flips=clear,
+                            boundary_write_count=boundary_write_count,
+                        )
+            elif data_word_count:
+                last_method = first_method + (data_word_count - 1) * 4
+                for method in self._TRACKED_RESOURCE_METHODS:
+                    if method < first_method:
+                        continue
+                    if method > last_method:
+                        break
+                    method_offset = method - first_method
+                    if method_offset % 4:
+                        continue
+                    data_index = data_start + method_offset // 4
+                    self._observe_texture_method(
+                        method,
+                        words[data_index],
+                        record_flips=clear,
+                        boundary_write_count=boundary_write_count,
+                    )
+                    tracked_word_count += 1
+            if clear:
+                self.resource_method_data_word_count += data_word_count
+                self.resource_method_tracked_word_count += tracked_word_count
+                self.resource_method_skipped_word_count += (
+                    data_word_count - tracked_word_count
+                )
+                self.resource_method_aggregated_index_word_count += (
+                    aggregated_index_word_count
                 )
             index = data_end
         if clear:
             self._texture_pending = bytearray()
             self._texture_pending_end = None
+
+
+_WINDOWS_SHARED_FILE_KERNEL: Any | None = None
+_WINDOWS_GENERIC_READ = 0x80000000
+_WINDOWS_FILE_SHARE_READ = 0x00000001
+_WINDOWS_FILE_SHARE_WRITE = 0x00000002
+_WINDOWS_FILE_SHARE_DELETE = 0x00000004
+_WINDOWS_OPEN_EXISTING = 3
+_WINDOWS_FILE_ATTRIBUTE_NORMAL = 0x00000080
+_WINDOWS_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+
+def _windows_shared_file_kernel() -> Any:
+    global _WINDOWS_SHARED_FILE_KERNEL
+    if _WINDOWS_SHARED_FILE_KERNEL is not None:
+        return _WINDOWS_SHARED_FILE_KERNEL
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    kernel.CreateFileW.restype = ctypes.c_void_p
+    kernel.GetFileSizeEx.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_longlong),
+    ]
+    kernel.GetFileSizeEx.restype = ctypes.c_int
+    kernel.ReadFile.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_void_p,
+    ]
+    kernel.ReadFile.restype = ctypes.c_int
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel.CloseHandle.restype = ctypes.c_int
+    _WINDOWS_SHARED_FILE_KERNEL = kernel
+    return kernel
+
+
+def _read_text_file_shared(path: Path) -> str:
+    if os.name != "nt":
+        return path.read_text(encoding="utf-8")
+    kernel = _windows_shared_file_kernel()
+    handle = kernel.CreateFileW(
+        str(path),
+        _WINDOWS_GENERIC_READ,
+        _WINDOWS_FILE_SHARE_READ
+        | _WINDOWS_FILE_SHARE_WRITE
+        | _WINDOWS_FILE_SHARE_DELETE,
+        None,
+        _WINDOWS_OPEN_EXISTING,
+        _WINDOWS_FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    if handle == _WINDOWS_INVALID_HANDLE_VALUE:
+        error = ctypes.get_last_error()
+        if error in (2, 3):
+            raise FileNotFoundError(error, os.strerror(error), str(path))
+        if error in (5, 32):
+            raise PermissionError(error, os.strerror(error), str(path))
+        raise OSError(error, os.strerror(error), str(path))
+    try:
+        file_size = ctypes.c_longlong()
+        if not kernel.GetFileSizeEx(handle, ctypes.byref(file_size)):
+            error = ctypes.get_last_error()
+            raise OSError(error, os.strerror(error), str(path))
+        if file_size.value < 0 or file_size.value > 1024 * 1024:
+            raise OSError(f"controller snapshot has invalid size: {file_size.value}")
+        payload = ctypes.create_string_buffer(max(1, file_size.value))
+        bytes_read = ctypes.c_uint32()
+        if file_size.value and not kernel.ReadFile(
+            handle,
+            payload,
+            file_size.value,
+            ctypes.byref(bytes_read),
+            None,
+        ):
+            error = ctypes.get_last_error()
+            raise OSError(error, os.strerror(error), str(path))
+        if bytes_read.value != file_size.value:
+            raise OSError(
+                f"controller snapshot read was truncated: "
+                f"{bytes_read.value}/{file_size.value}"
+            )
+        return payload.raw[: bytes_read.value].decode("utf-8")
+    finally:
+        kernel.CloseHandle(handle)
 
 
 class LiveHostBridge:
@@ -8959,6 +11211,8 @@ class LiveHostBridge:
             [int], str | dict[str, Any] | None
         ]
         | None = None,
+        guest_metrics_provider: Callable[[], dict[str, int]] | None = None,
+        command_epoch_record_limit: int = DEFAULT_COMMAND_EPOCH_RECORD_LIMIT,
     ) -> None:
         self.runtime = runtime
         self.render_watchpoint = render_watchpoint
@@ -8973,8 +11227,13 @@ class LiveHostBridge:
             + f".{self.command_stream_generation}.commands.bin"
         )
         self.command_snapshot_base_record_count = 0
+        self.command_snapshot_base_byte_count = 0
+        self.command_snapshot_base_span_count = 0
         self.command_epoch = 0
         self.command_epoch_rotation_count = 0
+        self.command_epoch_reuse_count = 0
+        self.command_epoch_record_limit = max(1, int(command_epoch_record_limit))
+        self.command_epoch_peak_resident_record_count = 0
         self.retired_snapshot_delete_count = 0
         self.retired_snapshot_delete_bytes = 0
         self._retired_command_paths: list[Path] = []
@@ -9037,6 +11296,7 @@ class LiveHostBridge:
         self.flip_audit_max_flips = max(0, int(flip_audit_max_flips))
         self.data_export_synchronizer = data_export_synchronizer
         self.frontend_text_provider = frontend_text_provider
+        self.guest_metrics_provider = guest_metrics_provider
         if self.flip_audit_ack_path is not None:
             self.render_command_path = (
                 self.flip_audit_ack_path.parent
@@ -9053,6 +11313,25 @@ class LiveHostBridge:
         )
         self.published_write_count = -1
         self.published_command_record_count = 0
+        self.published_command_byte_count = 0
+        self.published_command_span_count = 0
+        self.direct_command_transport_enabled = bool(
+            self.presentation_ack_path is not None
+            and self.flip_audit_ack_path is None
+            and not self.render_watchpoint.retain_diagnostic_writes
+            and self.render_watchpoint.stop_after is None
+        )
+        self._direct_pending_command_records = bytearray()
+        self.direct_command_receive_batch_count = 0
+        self.direct_command_receive_record_count = 0
+        self.direct_command_receive_span_count = 0
+        self.direct_command_receive_payload_byte_count = 0
+        self._direct_received_write_count = 0
+        self._direct_received_byte_count = 0
+        self._direct_received_span_count = 0
+        self._direct_command_boundaries: dict[int, tuple[int, int]] = {
+            0: (0, 0)
+        }
         self.resource_stream_generation = 0
         self.controller_mtime_ns = -1
         self.render_publish_count = 0
@@ -9092,6 +11371,31 @@ class LiveHostBridge:
         self.video_pacing_sleep_count = 0
         self.video_pacing_sleep_us = 0
         self.video_pacing_max_sleep_us = 0
+        if self.direct_command_transport_enabled:
+            existing_record_count = self.render_watchpoint.write_count
+            if existing_record_count != len(
+                self.render_watchpoint.live_command_records
+            ):
+                raise RuntimeError(
+                    "direct live command transport must start before command history truncates"
+                )
+            existing_records = self.render_watchpoint.live_command_records.to_bytes()
+            self._reset_live_command_spans_atomic(self.render_command_path, b"")
+            self.published_write_count = 0
+            self.published_command_record_count = 0
+            self._update_command_epoch_peak()
+            self.render_watchpoint.set_direct_command_sink(
+                self._receive_direct_command_records
+            )
+            self.render_watchpoint.set_direct_command_span_sink(
+                self._receive_direct_command_spans
+            )
+            if existing_records:
+                self._receive_direct_command_records(
+                    memoryview(existing_records),
+                    existing_record_count,
+                )
+                self._flush_render_commands(force=True)
         self.sample_controller()
         initial_state = self.runtime.input.poll_controller(0)
         if not initial_state.connected:
@@ -9203,6 +11507,25 @@ class LiveHostBridge:
                     raise
                 time.sleep(0.02)
 
+    @staticmethod
+    def _reset_live_command_spans_atomic(
+        path: Path,
+        spans: bytes,
+    ) -> None:
+        payload = b"B2SPAN01" + bytes(spans)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_bytes(payload)
+        deadline = time.monotonic() + 10.0
+        while True:
+            try:
+                temporary.replace(path)
+                return
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.02)
+
     def _append_live_commands(self, path: Path, records: bytes) -> None:
         if not records:
             return
@@ -9210,11 +11533,111 @@ class LiveHostBridge:
             self._render_command_file = path.open("ab", buffering=0)
         self._render_command_file.write(records)
 
+    def _receive_direct_command_records(
+        self,
+        records: memoryview,
+        record_count: int,
+    ) -> None:
+        record_count = max(0, int(record_count))
+        expected_size = record_count * 16
+        if len(records) != expected_size:
+            raise RuntimeError("direct live command batch has an invalid size")
+        record = struct.Struct("<BBHI8s")
+        for index in range(record_count):
+            kind, size, _reserved, address, value = record.unpack_from(
+                records,
+                index * record.size,
+            )
+            if kind not in {0, 1} or not 0 < size <= 8:
+                raise RuntimeError("direct live command record is invalid")
+            self._append_direct_command_span(
+                kind,
+                0,
+                address,
+                memoryview(value)[:size],
+                1,
+            )
+        self.direct_command_receive_batch_count += 1
+        self.direct_command_receive_record_count += record_count
+
+    def _append_direct_command_span(
+        self,
+        kind: int,
+        flags: int,
+        address: int,
+        payload: memoryview,
+        write_count: int,
+    ) -> None:
+        payload_size = len(payload)
+        if (
+            kind not in {0, 1}
+            or flags & ~1
+            or payload_size <= 0
+            or write_count <= 0
+        ):
+            raise RuntimeError("direct live command span is invalid")
+        self._direct_pending_command_records.extend(
+            struct.pack(
+                "<BBHIII",
+                kind,
+                flags,
+                0,
+                int(address) & 0xFFFFFFFF,
+                payload_size,
+                int(write_count),
+            )
+        )
+        self._direct_pending_command_records.extend(payload)
+        self._direct_received_write_count += int(write_count)
+        self._direct_received_byte_count += 16 + payload_size
+        self._direct_received_span_count += 1
+        self._direct_command_boundaries[self._direct_received_write_count] = (
+            self._direct_received_byte_count,
+            self._direct_received_span_count,
+        )
+        self.direct_command_receive_span_count += 1
+        self.direct_command_receive_payload_byte_count += payload_size
+
+    def _receive_direct_command_spans(
+        self,
+        payload: memoryview,
+        normalized_addresses: list[int],
+        payload_offsets: Any,
+        payload_sizes: Any,
+        write_counts: Any,
+        flags: Any,
+        span_count: int,
+    ) -> None:
+        payload_view = memoryview(payload).cast("B")
+        for span_index in range(max(0, int(span_count))):
+            offset = int(payload_offsets[span_index])
+            size = int(payload_sizes[span_index])
+            self._append_direct_command_span(
+                1,
+                int(flags[span_index]),
+                normalized_addresses[span_index],
+                payload_view[offset : offset + size],
+                int(write_counts[span_index]),
+            )
+        self.direct_command_receive_batch_count += 1
+        self.direct_command_receive_record_count = self._direct_received_write_count
+
     def _close_render_command_file(self) -> None:
         if self._render_command_file is None:
             return
         self._render_command_file.close()
         self._render_command_file = None
+
+    def _update_command_epoch_peak(self) -> None:
+        resident_record_count = max(
+            0,
+            self.published_command_record_count
+            - self.command_snapshot_base_record_count,
+        )
+        self.command_epoch_peak_resident_record_count = max(
+            self.command_epoch_peak_resident_record_count,
+            resident_record_count,
+        )
 
     def _delete_retired_snapshot(self, path: Path) -> bool:
         try:
@@ -9255,29 +11678,83 @@ class LiveHostBridge:
             raise RuntimeError(
                 "cannot rotate live command epoch beyond its published command tail"
             )
+        completed_epoch_record_count = (
+            completed_write_count - self.command_snapshot_base_record_count
+        )
+        if completed_epoch_record_count < 0:
+            raise RuntimeError("completed flip predates the live command epoch")
+        if completed_epoch_record_count < self.command_epoch_record_limit:
+            self.command_epoch_reuse_count += 1
+            return
         carried_record_count = (
             self.published_command_record_count - completed_write_count
         )
-        if carried_record_count > len(self.render_watchpoint.live_command_records):
+        if (
+            not self.direct_command_transport_enabled
+            and carried_record_count > len(self.render_watchpoint.live_command_records)
+        ):
             raise RuntimeError(
                 "live render command epoch carry overflowed retained command history"
             )
         self._close_render_command_file()
+        if self.direct_command_transport_enabled:
+            if self._direct_pending_command_records:
+                raise RuntimeError(
+                    "cannot rotate a direct command epoch with unflushed spans"
+                )
+            boundary = self._direct_command_boundaries.get(completed_write_count)
+            if boundary is None:
+                raise RuntimeError(
+                    "completed flip does not end at a direct command span boundary"
+                )
+            completed_byte_count, completed_span_count = boundary
+            byte_offset = (
+                completed_byte_count - self.command_snapshot_base_byte_count
+            )
+            carried_byte_count = (
+                self.published_command_byte_count - completed_byte_count
+            )
+            if byte_offset < 0 or carried_byte_count < 0:
+                raise RuntimeError("completed flip predates the live command epoch")
+            with self.render_command_path.open("rb") as command_input:
+                if command_input.read(8) != b"B2SPAN01":
+                    raise RuntimeError("live command sidecar header is invalid")
+                command_input.seek(8 + byte_offset)
+                carried_records = command_input.read(carried_byte_count)
+            if len(carried_records) != carried_byte_count:
+                raise RuntimeError("live command sidecar carry is truncated")
+        else:
+            carried_records = self.render_watchpoint.live_command_records.tail_bytes(
+                carried_record_count
+            )
         if self.render_command_path.is_file():
             self._retired_command_paths.append(self.render_command_path)
         self.command_snapshot_base_record_count = completed_write_count
+        if self.direct_command_transport_enabled:
+            self.command_snapshot_base_byte_count = completed_byte_count
+            self.command_snapshot_base_span_count = completed_span_count
         self.command_epoch += 1
         self.command_epoch_rotation_count += 1
         self.render_command_path = self.render_stream_path.with_name(
             self.render_stream_path.name
             + f".{self.command_stream_generation}.epoch-{completed_flip_index:08d}.commands.bin"
         )
-        self._reset_live_commands_atomic(
-            self.render_command_path,
-            self.render_watchpoint.live_command_records.tail_bytes(
-                carried_record_count
-            ),
-        )
+        if self.direct_command_transport_enabled:
+            self._reset_live_command_spans_atomic(
+                self.render_command_path,
+                carried_records,
+            )
+            self._direct_command_boundaries = {
+                write_count: value
+                for write_count, value in self._direct_command_boundaries.items()
+                if write_count >= completed_write_count
+            }
+        else:
+            self._reset_live_commands_atomic(
+                self.render_command_path,
+                carried_records,
+            )
+        self._update_command_epoch_peak()
 
     def _record_performance(self, name: str, started_ns: int) -> None:
         elapsed_us = max(0, (time.perf_counter_ns() - started_ns) // 1_000)
@@ -9334,6 +11811,33 @@ class LiveHostBridge:
         ):
             return False
         command_publish_started_ns = time.perf_counter_ns()
+        if self.direct_command_transport_enabled:
+            new_record_count = write_count - self.published_write_count
+            if (
+                new_record_count < 0
+                or write_count != self._direct_received_write_count
+            ):
+                raise RuntimeError(
+                    "direct live command transport lost synchronization with guest writes"
+                )
+            if not self.render_command_path.is_file():
+                raise RuntimeError("direct live command sidecar disappeared")
+            self._append_live_commands(
+                self.render_command_path,
+                self._direct_pending_command_records,
+            )
+            self._direct_pending_command_records.clear()
+            self.published_command_record_count = self._direct_received_write_count
+            self.published_command_byte_count = self._direct_received_byte_count
+            self.published_command_span_count = self._direct_received_span_count
+            self._update_command_epoch_peak()
+            self.published_write_count = write_count
+            self.last_command_flush_time = now
+            self._record_performance(
+                "render_command_publish",
+                command_publish_started_ns,
+            )
+            return True
         live_records = self.render_watchpoint.live_command_records
         if self.published_write_count < 0 or not self.render_command_path.is_file():
             epoch_record_count = write_count - self.command_snapshot_base_record_count
@@ -9360,6 +11864,7 @@ class LiveHostBridge:
             new_records = live_records.tail_bytes(new_record_count)
             self._append_live_commands(self.render_command_path, new_records)
             self.published_command_record_count += new_record_count
+        self._update_command_epoch_peak()
         self.published_write_count = write_count
         self.last_command_flush_time = now
         self._record_performance("render_command_publish", command_publish_started_ns)
@@ -9483,26 +11988,91 @@ class LiveHostBridge:
             raise RuntimeError(
                 "completed flip boundary exceeds flushed live command sidecar"
             )
+        presentable_command_byte_count = 0
+        presentable_command_span_count = 0
+        if self.direct_command_transport_enabled:
+            boundary = self._direct_command_boundaries.get(
+                presentable_command_record_count
+            )
+            if boundary is None:
+                raise RuntimeError(
+                    "completed flip is not aligned to a direct command span"
+                )
+            (
+                presentable_command_byte_count,
+                presentable_command_span_count,
+            ) = boundary
         manifest: dict[str, Any] = {
-                "format": "b2-recomp-live-render-manifest",
-                "write_count": stream["write_count"],
-                "captured_write_count": stream["captured_write_count"],
-                "published_command_record_count": self.published_command_record_count,
-                "presentable_command_record_count": presentable_command_record_count,
-                "command_snapshot_base_record_count": (
-                    self.command_snapshot_base_record_count
-                ),
-                "command_snapshot_record_count": (
-                    self.published_command_record_count
-                    - self.command_snapshot_base_record_count
-                ),
-                "command_stream_generation": self.command_stream_generation,
-                "resource_stream_generation": self.resource_stream_generation,
-                "guest_flip_count": manifest_guest_flip_count,
-                "guest_steps": int(guest_steps or 0),
-                "command_snapshot_path": str(self.render_command_path).replace("\\", "/"),
+            "format": "b2-recomp-live-render-manifest",
+            "write_count": stream["write_count"],
+            "captured_write_count": stream["captured_write_count"],
+            "published_command_record_count": self.published_command_record_count,
+            "presentable_command_record_count": presentable_command_record_count,
+            "command_snapshot_base_record_count": (
+                self.command_snapshot_base_record_count
+            ),
+            "command_snapshot_base_byte_count": (
+                self.command_snapshot_base_byte_count
+            ),
+            "command_snapshot_base_span_count": (
+                self.command_snapshot_base_span_count
+            ),
+            "command_snapshot_record_count": (
+                self.published_command_record_count
+                - self.command_snapshot_base_record_count
+            ),
+            "command_stream_generation": self.command_stream_generation,
+            "command_epoch": self.command_epoch,
+            "command_epoch_record_limit": self.command_epoch_record_limit,
+            "resource_stream_generation": self.resource_stream_generation,
+            "guest_flip_count": manifest_guest_flip_count,
+            "guest_steps": int(guest_steps or 0),
+            "command_snapshot_path": str(self.render_command_path).replace("\\", "/"),
             "resource_snapshot_path": str(self.current_render_resource_path).replace("\\", "/"),
         }
+        if self.direct_command_transport_enabled:
+            manifest.update(
+                {
+                    "command_transport_format": "bulk_span_v1",
+                    "published_command_byte_count": (
+                        self.published_command_byte_count
+                    ),
+                    "presentable_command_byte_count": (
+                        presentable_command_byte_count
+                    ),
+                    "command_snapshot_base_byte_count": (
+                        self.command_snapshot_base_byte_count
+                    ),
+                    "command_snapshot_byte_count": (
+                        self.published_command_byte_count
+                        - self.command_snapshot_base_byte_count
+                    ),
+                    "published_command_span_count": (
+                        self.published_command_span_count
+                    ),
+                    "presentable_command_span_count": (
+                        presentable_command_span_count
+                    ),
+                    "command_snapshot_base_span_count": (
+                        self.command_snapshot_base_span_count
+                    ),
+                    "command_snapshot_span_count": (
+                        self.published_command_span_count
+                        - self.command_snapshot_base_span_count
+                    ),
+                }
+            )
+        guest_metrics = (
+            self.guest_metrics_provider()
+            if self.guest_metrics_provider is not None
+            else {}
+        )
+        manifest["guest_compiled_blocks"] = max(
+            0, int(guest_metrics.get("compiled_blocks", 0))
+        )
+        manifest["guest_invalidations"] = max(
+            0, int(guest_metrics.get("invalidations", 0))
+        )
         if selected_flip is not None and self.frontend_text_provider is not None:
             frontend_text = self.frontend_text_provider(manifest_guest_flip_count)
             if isinstance(frontend_text, str) and frontend_text:
@@ -9760,18 +12330,14 @@ class LiveHostBridge:
         if stat.st_mtime_ns == self.controller_mtime_ns:
             return False
         try:
-            payload = json.loads(
-                self.controller_state_path.read_text(encoding="utf-8")
-            )
+            payload = json.loads(_read_text_file_shared(self.controller_state_path))
         except (
-            FileNotFoundError,
-            PermissionError,
+            OSError,
             UnicodeDecodeError,
             json.JSONDecodeError,
         ):
-            # MoveFileExW briefly denies readers while the presenter replaces
-            # the controller snapshot. Keep the last valid state and retry on
-            # the next native slice instead of terminating guest execution.
+            # Keep the last valid state and retry on the next native slice if
+            # publication was interrupted or the snapshot was incomplete.
             self.controller_read_defer_count += 1
             return False
         if bool(payload.get("stop", False)):
@@ -9973,6 +12539,16 @@ class LiveHostBridge:
             ),
             "command_epoch": self.command_epoch,
             "command_epoch_rotation_count": self.command_epoch_rotation_count,
+            "command_epoch_reuse_count": self.command_epoch_reuse_count,
+            "command_epoch_record_limit": self.command_epoch_record_limit,
+            "command_epoch_resident_record_count": max(
+                0,
+                self.published_command_record_count
+                - self.command_snapshot_base_record_count,
+            ),
+            "command_epoch_peak_resident_record_count": (
+                self.command_epoch_peak_resident_record_count
+            ),
             "retired_snapshot_delete_count": self.retired_snapshot_delete_count,
             "retired_snapshot_delete_bytes": self.retired_snapshot_delete_bytes,
             "controller_state_path": str(self.controller_state_path),
@@ -10019,6 +12595,21 @@ class LiveHostBridge:
             "audit_skipped_flip_count": self.audit_skipped_flip_count,
             "audit_ack_wait_count": self.audit_ack_wait_count,
             "published_write_count": max(0, self.published_write_count),
+            "direct_command_transport": self.direct_command_transport_enabled,
+            "direct_command_receive_batch_count": (
+                self.direct_command_receive_batch_count
+            ),
+            "direct_command_receive_record_count": (
+                self.direct_command_receive_record_count
+            ),
+            "direct_command_receive_span_count": (
+                self.direct_command_receive_span_count
+            ),
+            "direct_command_receive_payload_byte_count": (
+                self.direct_command_receive_payload_byte_count
+            ),
+            "published_command_byte_count": self.published_command_byte_count,
+            "published_command_span_count": self.published_command_span_count,
             "performance": self._performance_summary(),
         }
 
@@ -10336,6 +12927,76 @@ class RuntimeAbiInvocation:
         }
 
 
+def _cooperative_wait_plan(
+    invocation: RuntimeAbiInvocation,
+    *,
+    current_interrupt_time_100ns: int,
+) -> dict[str, Any] | None:
+    if invocation.shim_name == "KeDelayExecutionThread":
+        interval_100ns = (
+            int(invocation.handler_arguments[0])
+            if invocation.handler_arguments
+            else 0
+        )
+        return {
+            "kind": "deadline",
+            "shim_name": invocation.shim_name,
+            "interval_100ns": interval_100ns,
+            "wake_interrupt_time_100ns": (
+                current_interrupt_time_100ns + abs(interval_100ns)
+            ),
+        }
+    if (
+        invocation.shim_name == "NtWaitForSingleObjectEx"
+        and invocation.eax == XboxStatus.WAIT_TIMEOUT
+        and len(invocation.arguments) >= 4
+        and invocation.arguments[3] == 0
+    ):
+        return {
+            "kind": "runtime_handle",
+            "shim_name": invocation.shim_name,
+            "handle": invocation.arguments[0],
+        }
+    if (
+        invocation.shim_name == "NtWaitForSingleObject"
+        and invocation.eax == XboxStatus.WAIT_TIMEOUT
+        and len(invocation.arguments) >= 3
+        and invocation.arguments[2] == 0
+    ):
+        return {
+            "kind": "runtime_handle",
+            "shim_name": invocation.shim_name,
+            "handle": invocation.arguments[0],
+        }
+    return None
+
+
+def _resume_cooperative_wait(
+    session: dict[str, Any],
+    runtime: XboxRuntimeShims,
+) -> bool:
+    wait = session.get("wait")
+    if not isinstance(wait, dict):
+        return True
+    if wait.get("kind") == "deadline":
+        current_time = runtime.clock.snapshot()["interrupt_time_100ns"]
+        if current_time < int(wait.get("wake_interrupt_time_100ns", 0)):
+            return False
+        session["state"].set_register("eax", XboxStatus.SUCCESS)
+    elif wait.get("kind") == "runtime_handle":
+        status = runtime.sync.wait_for_single_object(
+            int(wait.get("handle", 0)),
+            timeout_100ns=0,
+        )
+        if status == XboxStatus.WAIT_TIMEOUT:
+            return False
+        session["state"].set_register("eax", status)
+    else:
+        return True
+    session.pop("wait", None)
+    return True
+
+
 @dataclass(frozen=True)
 class RuntimeAbiResult:
     invocation: RuntimeAbiInvocation
@@ -10356,6 +13017,7 @@ class RuntimeAbiBridge:
         max_invocation_history: int = DEFAULT_RUNTIME_ABI_HISTORY,
     ) -> None:
         self.runtime = runtime
+        self.defer_guest_thread_delays = False
         self.max_guest_arguments = max_guest_arguments
         self._by_target = {
             shim.target_address: shim for shim in runtime.registered_shims
@@ -10405,6 +13067,16 @@ class RuntimeAbiBridge:
 
     def has_target(self, target: int) -> bool:
         return target in self._by_target
+
+    def can_use_shared_memory_for_handler(self, target: int) -> bool:
+        """Keep runtime ABI calls on committed SparseMemory snapshots.
+
+        Title fast paths use the public memory view and can consume active
+        native pages directly. Runtime shims also depend on allocation and
+        page-generation metadata, so their boundary remains conservative.
+        """
+
+        return target not in self._by_target
 
     def call_handlers(
         self,
@@ -10530,6 +13202,24 @@ class RuntimeAbiBridge:
             handler_arguments = arguments
             returned_value = self._invoke_guest_hal_read_write_pci_space_api(
                 arguments, memory, trace
+            )
+        elif shim.name == "KeDelayExecutionThread":
+            interval_address = arguments[2] if len(arguments) >= 3 else 0
+            interval_bits = (
+                int.from_bytes(memory.read(interval_address, 8), "little")
+                if interval_address
+                else 0
+            )
+            interval_100ns = (
+                interval_bits - (1 << 64)
+                if interval_bits & (1 << 63)
+                else interval_bits
+            )
+            handler_arguments = (interval_100ns,)
+            returned_value = (
+                XboxStatus.SUCCESS
+                if self.defer_guest_thread_delays
+                else shim.handler(*handler_arguments)
             )
         elif shim.name == "KeQuerySystemTime":
             handler_arguments = ()
@@ -12082,6 +14772,8 @@ class RuntimeAbiBridge:
 
 
 class XbeBackedSparseMemory(SparseMemory):
+    native_memory_callback_policy_static = True
+
     """Sparse writable overlay that falls back to mapped XBE image bytes."""
 
     _FULL_PAGE_WRITTEN_MASK = b"\x01" * SparseMemory._PAGE_SIZE
@@ -12134,6 +14826,15 @@ class XbeBackedSparseMemory(SparseMemory):
             target = self._canonical_address(target)
             return start < target + 4 and target < end
 
+        if (
+            not is_write
+            and int(size) == 4
+            and start in TITLE_ZERO_GUARDED_U32_READ_CALLBACK_ADDRESSES
+        ):
+            # These words normally stay nonzero and read directly from the
+            # native cache. If the guest stores zero, commit that page before
+            # the fallback callback repairs it and refreshes the same cache.
+            return (start,)
         if not is_write and overlaps(TITLE_D3D_CONTEXT_GET_POINTER_ADDRESS):
             return (_u32(TITLE_D3D_CONTEXT_SYNTHETIC_ADDRESS + 0x2C),)
         if is_write and overlaps(TITLE_GPU_COMMAND_KICK_ADDRESS):
@@ -12144,31 +14845,50 @@ class XbeBackedSparseMemory(SparseMemory):
                 ),
             )
 
-        exact_callback_addresses = {
-            TITLE_AUDIO_DSP_CONTROL_ADDRESS,
-            TITLE_AUDIO_DSP_STATUS_ADDRESS,
-            *TITLE_AUDIO_DSP_VOICE_COMMAND_ADDRESSES,
-            TITLE_MCPX_FRAME_COUNTER_ADDRESS,
-            TITLE_GPU_COMMAND_KICK_ADDRESS,
-            TITLE_GPU_PROGRESS_COUNTER_ADDRESS,
-            TITLE_GPU_SOFTWARE_COMPLETION_FLAG_ADDRESS,
-            TITLE_D3D_CONTEXT_GET_POINTER_ADDRESS,
-            TITLE_GPU_SUBMISSION_BASE_ADDRESS,
-            TITLE_GPU_SUBMISSION_LIMIT_ADDRESS,
-            TITLE_D3D_CONTEXT_GLOBAL_ADDRESS,
-            TITLE_CLEANUP_LIST_SENTINEL_ADDRESS,
-            TITLE_FRONTEND_RESOURCE_CACHE_SENTINEL_ADDRESS,
-            TITLE_FRONTEND_REGISTRY_LIST_SENTINEL_ADDRESS,
-            TITLE_FRONTEND_INITIALIZER_LIST_SENTINEL_ADDRESS,
-        }
+        if int(size) == 4:
+            if start in self._native_observer_only_callback_addresses:
+                return ()
+            if start in TITLE_EXACT_MEMORY_CALLBACK_ADDRESSES:
+                return ()
+
         if any(
             overlaps(target)
             for target in self._native_observer_only_callback_addresses
         ):
             return ()
-        if any(overlaps(target) for target in exact_callback_addresses):
+        if any(overlaps(target) for target in TITLE_EXACT_MEMORY_CALLBACK_ADDRESSES):
             return ()
         return None
+
+    def native_memory_callback_requires_observer_drain(
+        self,
+        address: int,
+        size: int,
+        *,
+        is_write: bool,
+    ) -> bool:
+        """Say whether an exact callback consumes ordered native write events.
+
+        Stable D3D bookkeeping and sentinel reads only inspect guest memory.
+        Deferring the render observer log across those reads preserves the same
+        bytes and callback semantics while allowing the next real host boundary
+        to consume one larger, ordered batch.
+        """
+        if is_write:
+            return True
+        start = self._canonical_address(address)
+        if int(size) == 4:
+            return start not in TITLE_OBSERVER_INDEPENDENT_EXACT_READ_ADDRESSES
+        end = start + max(0, int(size))
+
+        def overlaps(target: int) -> bool:
+            target = self._canonical_address(target)
+            return start < target + 4 and target < end
+
+        return not any(
+            overlaps(target)
+            for target in TITLE_OBSERVER_INDEPENDENT_EXACT_READ_ADDRESSES
+        )
 
     def has_allocated_page(self, address: int) -> bool:
         return super().has_allocated_page(self._canonical_address(address))
@@ -12190,6 +14910,12 @@ class XbeBackedSparseMemory(SparseMemory):
             [write_observer] if write_observer is not None else []
         )
         self._native_writeback_active = False
+        self._native_page_buffers_view: dict[int, Any] | None = None
+        self._native_page_generations_view: dict[int, int] | None = None
+        self._native_page_commit_callback: Callable[[int], None] | None = None
+        self._native_page_view_bind_count = 0
+        self._native_page_view_read_count = 0
+        self._native_page_view_write_commit_count = 0
         self._title_sentinel_fallbacks_enabled = enable_title_sentinel_fallbacks
         self._nv2a_status_busy_clear_count = 0
         self._title_gpu_completion_poll_count = 0
@@ -12256,7 +14982,85 @@ class XbeBackedSparseMemory(SparseMemory):
         clone._changed_pages = self._changed_pages.copy()
         clone._changed_page_ranges = self._changed_page_ranges.copy()
         clone._write_observers = []
+        clone._native_page_buffers_view = None
+        clone._native_page_generations_view = None
+        clone._native_page_commit_callback = None
+        clone._native_page_view_bind_count = 0
+        clone._native_page_view_read_count = 0
+        clone._native_page_view_write_commit_count = 0
         return clone
+
+    def set_native_page_cache_view(
+        self,
+        page_buffers: dict[int, Any],
+        page_generations: dict[int, int],
+        commit_page: Callable[[int], None],
+    ) -> None:
+        """Expose the active native cache directly to host-side memory reads.
+
+        Native execution keeps ordinary RAM in stable 4 KiB buffers. Runtime
+        handlers used to copy every dirty buffer range back into SparseMemory
+        before they could inspect it. A bound view lets those handlers read the
+        current bytes in place. Host writes still commit the one overlapping
+        native page first, so they cannot discard unrelated native changes.
+        """
+
+        self._native_page_buffers_view = page_buffers
+        self._native_page_generations_view = page_generations
+        self._native_page_commit_callback = commit_page
+        self._native_page_view_bind_count += 1
+
+    def clear_native_page_cache_view(self) -> None:
+        self._native_page_buffers_view = None
+        self._native_page_generations_view = None
+        self._native_page_commit_callback = None
+
+    def has_native_page_cache_view(self, page_buffers: dict[int, Any]) -> bool:
+        return self._native_page_buffers_view is page_buffers
+
+    def _native_page_view_buffer(self, address: int) -> Any | None:
+        buffers = self._native_page_buffers_view
+        generations = self._native_page_generations_view
+        if buffers is None or generations is None:
+            return None
+        current = self._canonical_address(address)
+        page = current >> self._PAGE_BITS
+        buffer = buffers.get(page)
+        generation = generations.get(page)
+        if (
+            buffer is None
+            or generation is None
+            or self.page_generation(current) != generation
+        ):
+            return None
+        self._native_page_view_read_count += 1
+        return buffer
+
+    def _commit_native_page_view_for_host_write(
+        self,
+        address: int,
+        size: int,
+    ) -> None:
+        commit = self._native_page_commit_callback
+        if commit is None or size <= 0:
+            return
+        first = self._canonical_address(address) >> self._PAGE_BITS
+        last = self._canonical_address(address + size - 1) >> self._PAGE_BITS
+        for page in range(first, last + 1):
+            if (
+                self._native_page_buffers_view is not None
+                and page in self._native_page_buffers_view
+            ):
+                commit(page)
+                self._native_page_view_write_commit_count += 1
+
+    def native_page_cache_view_summary(self) -> dict[str, int | bool]:
+        return {
+            "enabled": self._native_page_buffers_view is not None,
+            "bind_count": self._native_page_view_bind_count,
+            "read_count": self._native_page_view_read_count,
+            "host_write_commit_count": self._native_page_view_write_commit_count,
+        }
 
     def add_write_observer(self, observer: Callable[[int, bytes], None]) -> None:
         self._write_observers.append(observer)
@@ -12299,6 +15103,10 @@ class XbeBackedSparseMemory(SparseMemory):
         payload = bytearray()
         for offset in range(size):
             current = self._canonical_address(address + offset)
+            native = self._native_page_view_buffer(current)
+            if native is not None:
+                payload.append(native[current & self._PAGE_MASK])
+                continue
             if self._has_byte(current):
                 payload.append(self._read_byte(current))
                 continue
@@ -12312,13 +15120,21 @@ class XbeBackedSparseMemory(SparseMemory):
         """Read a fully overlaid word directly when it has no dynamic semantics."""
         current = self._canonical_address(address)
         page_offset = current & self._PAGE_MASK
-        if (
-            not self._title_sentinel_fallbacks_enabled
-            and address not in TITLE_DYNAMIC_U32_READ_ADDRESSES
-            and current not in TITLE_DYNAMIC_U32_READ_ADDRESSES
-            and page_offset != TITLE_GPU_COMPLETION_DMA_STATUS_OFFSET
-            and page_offset <= self._PAGE_SIZE - 4
-        ):
+        dynamic_read = (
+            address in TITLE_DYNAMIC_U32_READ_ADDRESSES
+            or current in TITLE_DYNAMIC_U32_READ_ADDRESSES
+            or page_offset == TITLE_GPU_COMPLETION_DMA_STATUS_OFFSET
+        )
+        sentinel_read = (
+            self._title_sentinel_fallbacks_enabled
+            and current in TITLE_SENTINEL_U32_READ_ADDRESSES
+        )
+        if dynamic_read or sentinel_read:
+            self._apply_title_u32_read_semantics(address)
+        if page_offset <= self._PAGE_SIZE - 4:
+            native = self._native_page_view_buffer(current)
+            if native is not None:
+                return struct.unpack_from("<I", native, page_offset)[0]
             page_number = current >> self._PAGE_BITS
             page = self._pages.get(page_number)
             written = self._written_pages.get(page_number)
@@ -12331,11 +15147,55 @@ class XbeBackedSparseMemory(SparseMemory):
                 and written[page_offset + 3]
             ):
                 return struct.unpack_from("<I", page, page_offset)[0]
+            return self._read_overlay_or_image_u32(current)
         return struct.unpack("<I", self.read(address, 4))[0]
+
+    def _apply_title_u32_read_semantics(self, address: int) -> None:
+        """Dispatch aligned word reads without running every unrelated hook."""
+        current = self._canonical_address(address)
+        if self._title_sentinel_fallbacks_enabled:
+            if current in TITLE_CLEANUP_SENTINEL_U32_READ_ADDRESSES:
+                self._apply_title_cleanup_list_read(current, 4)
+            elif current == TITLE_FRONTEND_RESOURCE_CACHE_SENTINEL_ADDRESS:
+                self._apply_title_frontend_resource_cache_read(current, 4)
+            elif current in TITLE_REGISTRY_SENTINEL_U32_READ_ADDRESSES:
+                self._apply_title_frontend_registry_list_read(current, 4)
+            elif current == TITLE_FRONTEND_INITIALIZER_LIST_SENTINEL_ADDRESS:
+                self._apply_title_frontend_initializer_list_read(current, 4)
+        if current == TITLE_D3D_CONTEXT_GLOBAL_ADDRESS:
+            self._apply_title_d3d_context_read(current, 4)
+        elif current == TITLE_D3D_CONTEXT_GET_POINTER_ADDRESS:
+            self._apply_title_d3d_get_pointer_read(current, 4)
+        elif current in (
+            TITLE_GPU_SUBMISSION_BASE_ADDRESS,
+            TITLE_GPU_SUBMISSION_LIMIT_ADDRESS,
+        ):
+            self._apply_title_gpu_submission_window_read(current, 4)
+        elif (
+            current == TITLE_GPU_COMPLETION_REGISTER_ADDRESS
+            or current & self._PAGE_MASK == TITLE_GPU_COMPLETION_DMA_STATUS_OFFSET
+        ):
+            self._apply_title_gpu_completion_poll(current, 4)
+        elif current in (
+            TITLE_GPU_PFIFO_RUNOUT_STATUS_ADDRESS,
+            TITLE_GPU_PFIFO_CACHE1_STATUS_ADDRESS,
+        ):
+            self._apply_title_pfifo_idle_status_read(current, 4)
+        elif current == TITLE_GPU_PROGRESS_COUNTER_ADDRESS:
+            self._apply_title_gpu_progress_counter_read(current, 4)
+        elif current == TITLE_GPU_SOFTWARE_COMPLETION_FLAG_ADDRESS:
+            self._apply_title_gpu_software_completion_read(current, 4)
+        elif current == TITLE_MCPX_FRAME_COUNTER_ADDRESS:
+            self._apply_title_mcpx_frame_counter_read(current, 4)
+        elif current == TITLE_AUDIO_DSP_STATUS_ADDRESS:
+            self._apply_title_audio_dsp_status_read(current, 4)
 
     def native_page_snapshot(self, page_address: int) -> bytes:
         """Materialize one cache page without per-byte arena lookups."""
         page_address = self._canonical_address(page_address) & ~self._PAGE_MASK
+        native = self._native_page_view_buffer(page_address)
+        if native is not None:
+            return bytes(native)
         page_end = page_address + self._PAGE_SIZE
         payload = bytearray(self._PAGE_SIZE)
         for region in self._loaded.arena.regions:
@@ -12371,6 +15231,10 @@ class XbeBackedSparseMemory(SparseMemory):
             raise X86ExecutionError(
                 "native page range snapshot crossed a cache-page boundary"
             )
+        native = self._native_page_view_buffer(current)
+        if native is not None:
+            start = current & self._PAGE_MASK
+            return bytes(native[start : start + size])
         payload = bytearray(size)
         requested_end = current + size
         for region in self._loaded.arena.regions:
@@ -12395,6 +15259,7 @@ class XbeBackedSparseMemory(SparseMemory):
         return bytes(payload)
 
     def write(self, address: int, payload: bytes) -> None:
+        self._commit_native_page_view_for_host_write(address, len(payload))
         self._observe_write(address, payload)
         if self._apply_title_mmio_write(address, payload):
             return
@@ -12427,6 +15292,7 @@ class XbeBackedSparseMemory(SparseMemory):
 
     def write_u32(self, address: int, value: int) -> None:
         payload = struct.pack("<I", _u32(value))
+        self._commit_native_page_view_for_host_write(address, len(payload))
         self._observe_write(address, payload)
         if self._apply_title_mmio_write(address, payload):
             return
@@ -13142,21 +16008,35 @@ class XbeBackedSparseMemory(SparseMemory):
 
 
 class DynamicBlockCache:
-    """JSON-backed decoded dynamic-block cache for local probe iteration."""
+    """Lazy SQLite BLOB store for decoded dynamic guest blocks."""
 
-    VERSION = 2
-    LEGACY_VERSIONS = {1}
+    VERSION = 3
+    LEGACY_VERSIONS = {1, 2}
+    LEGACY_RECOVERY_MARKER = "legacy_recovery_complete_v2"
+    DEFAULT_MAX_RECORDS = 131072
+    DEFAULT_MAX_PAYLOAD_BYTES = 256 * 1024 * 1024
 
-    def __init__(self, path: Path | None) -> None:
+    def __init__(
+        self,
+        path: Path | None,
+        *,
+        max_records: int = DEFAULT_MAX_RECORDS,
+        max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,
+        legacy_json_path: Path | None = None,
+        preserve_legacy_source: bool = False,
+    ) -> None:
         self.path = path
-        self.records: dict[str, dict[str, Any]] = {}
+        self.max_records = max(1, int(max_records))
+        self.max_payload_bytes = max(1, int(max_payload_bytes))
         self.load_errors: list[str] = []
         self.loaded_version: int | None = None
+        self.legacy_source_version: int | None = None
         self.prepared_image_sha256: str | None = None
-        self.dirty = False
         self.hits = 0
         self.misses = 0
         self.stores = 0
+        self.pruned_records = 0
+        self.pruned_payload_bytes = 0
         self.migration_performed = False
         self.migration_validated_record_count = 0
         self.migration_decode_count = 0
@@ -13164,22 +16044,164 @@ class DynamicBlockCache:
         self.migration_rejected_record_count = 0
         self.migration_foreign_record_count = 0
         self.migration_samples: list[dict[str, Any]] = []
-        if path is not None and path.exists():
+        self.migration_source_path: Path | None = None
+        self.migration_backup_path: Path | None = None
+        self.migration_source_preserved = False
+        self._preserve_legacy_source = bool(preserve_legacy_source)
+        self._legacy_records: dict[str, dict[str, Any]] = {}
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            migration_source = path
+            if (
+                legacy_json_path is not None
+                and legacy_json_path.exists()
+            ):
+                migration_source = legacy_json_path
+            self._load_legacy_json(
+                migration_source,
+                move_immediately=migration_source == path,
+            )
+        self._connection = sqlite3.connect(
+            str(path) if path is not None else ":memory:"
+        )
+        self._connection.execute("PRAGMA synchronous=NORMAL")
+        if path is not None:
+            self._connection.execute("PRAGMA journal_mode=WAL")
+        self._connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS cache_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS decoded_blocks (
+                cache_key TEXT PRIMARY KEY,
+                image_sha256 TEXT NOT NULL,
+                target INTEGER NOT NULL,
+                entry_bytes INTEGER NOT NULL,
+                max_block_instructions INTEGER NOT NULL,
+                payload BLOB NOT NULL,
+                payload_bytes INTEGER NOT NULL,
+                last_used_ns INTEGER NOT NULL,
+                access_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS decoded_blocks_image_target
+                ON decoded_blocks(image_sha256, target);
+            CREATE INDEX IF NOT EXISTS decoded_blocks_last_used
+                ON decoded_blocks(last_used_ns);
+            """
+        )
+        row = self._connection.execute(
+            "SELECT value FROM cache_metadata WHERE key='version'"
+        ).fetchone()
+        if row is not None:
+            self.loaded_version = int(row[0])
+            if self.loaded_version != self.VERSION:
+                self.load_errors.append(
+                    f"unsupported decoded-block store version: {self.loaded_version}"
+                )
+        self._connection.execute(
+            "INSERT OR REPLACE INTO cache_metadata(key, value) VALUES('version', ?)",
+            (str(self.VERSION),),
+        )
+        self._connection.execute(
+            "INSERT OR REPLACE INTO cache_metadata(key, value) "
+            "VALUES('payload_format', 'zlib-json-blob')"
+        )
+        self.prune()
+        self._connection.commit()
+
+    @staticmethod
+    def metadata_value(path: Path, key: str) -> str | None:
+        if not path.is_file():
+            return None
+        try:
+            with path.open("rb") as source:
+                if not source.read(16).startswith(b"SQLite format 3"):
+                    return None
+            connection = sqlite3.connect(
+                f"file:{path.resolve().as_posix()}?mode=ro",
+                uri=True,
+            )
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                if data.get("format") == "b2-recomp-dynamic-block-cache":
-                    version = int(data.get("version", 1))
-                    self.loaded_version = version
-                    if version == self.VERSION or version in self.LEGACY_VERSIONS:
-                        records = data.get("records", {})
-                        if isinstance(records, dict):
-                            self.records = records
-                    else:
-                        self.load_errors.append(
-                            f"unsupported dynamic-block cache version: {version}"
-                        )
-            except (OSError, json.JSONDecodeError) as exc:
-                self.load_errors.append(str(exc))
+                row = connection.execute(
+                    "SELECT value FROM cache_metadata WHERE key=?",
+                    (key,),
+                ).fetchone()
+            finally:
+                connection.close()
+        except (OSError, sqlite3.Error):
+            return None
+        return str(row[0]) if row is not None else None
+
+    @staticmethod
+    def _move_aside(path: Path, label: str) -> Path:
+        backup = path.with_name(f"{path.name}.{label}")
+        suffix = 1
+        while backup.exists():
+            backup = path.with_name(f"{path.name}.{label}-{suffix}")
+            suffix += 1
+        path.replace(backup)
+        return backup
+
+    def _load_legacy_json(self, path: Path, *, move_immediately: bool) -> None:
+        if not path.exists():
+            return
+        try:
+            with path.open("rb") as source:
+                prefix = source.read(16)
+            if prefix.startswith(b"SQLite format 3"):
+                return
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(data, dict)
+                or data.get("format") != "b2-recomp-dynamic-block-cache"
+            ):
+                self.load_errors.append("unrecognized decoded-block cache format")
+                self._move_aside(path, "unsupported")
+                return
+            version = int(data.get("version", 1))
+            if version not in self.LEGACY_VERSIONS:
+                self.load_errors.append(
+                    f"unsupported dynamic-block cache version: {version}"
+                )
+                self._move_aside(path, f"unsupported-v{version}")
+                return
+            records = data.get("records", {})
+            if isinstance(records, dict):
+                self._legacy_records = records
+                self.loaded_version = version
+                self.legacy_source_version = version
+            self.migration_source_path = path
+            if move_immediately:
+                self.migration_backup_path = self._move_aside(
+                    path,
+                    f"legacy-v{version}.json",
+                )
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            self.load_errors.append(str(exc))
+            if path.exists():
+                try:
+                    self._move_aside(path, "invalid")
+                except OSError as move_exc:
+                    self.load_errors.append(str(move_exc))
+
+    @staticmethod
+    def _encode_record(record: dict[str, Any]) -> bytes:
+        return zlib.compress(
+            json.dumps(
+                record,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+            level=6,
+        )
+
+    @staticmethod
+    def _decode_record(payload: bytes) -> dict[str, Any]:
+        record = json.loads(zlib.decompress(payload).decode("utf-8"))
+        if not isinstance(record, dict):
+            raise ValueError("decoded block payload is not an object")
+        return record
 
     @staticmethod
     def _key_parts(key: str) -> tuple[int, str, str, str, str] | None:
@@ -13247,19 +16269,18 @@ class DynamicBlockCache:
         *,
         image_sha256: str,
     ) -> None:
-        """Refresh legacy decoded semantics while retaining warmed block coverage."""
+        """Migrate legacy JSON records for this image without scanning SQLite."""
 
         if self.prepared_image_sha256 == image_sha256:
             return
         self.prepared_image_sha256 = image_sha256
-        if not self.records:
+        if not self._legacy_records:
             return
 
-        source_version = self.loaded_version
-        needs_decoder_refresh = source_version in self.LEGACY_VERSIONS
+        source_version = self.legacy_source_version
+        needs_decoder_refresh = source_version == 1
         refreshed_by_range: dict[tuple[int, int, str], LiftedFunction] = {}
-        prepared_records: dict[str, dict[str, Any]] = {}
-        for key, record in self.records.items():
+        for key, record in self._legacy_records.items():
             parts = self._key_parts(key)
             if parts is None:
                 self.migration_rejected_record_count += 1
@@ -13273,7 +16294,7 @@ class DynamicBlockCache:
                 self.migration_rejected_record_count += 1
                 continue
             if not needs_decoder_refresh:
-                prepared_records[current_key] = record
+                self._store_record(current_key, record, replace=False)
                 continue
 
             self.migration_validated_record_count += 1
@@ -13323,13 +16344,32 @@ class DynamicBlockCache:
                             ),
                         }
                     )
-            prepared_records[current_key] = refreshed_record
+            self._store_record(current_key, refreshed_record, replace=False)
 
-        records_changed = prepared_records != self.records
-        self.records = prepared_records
-        self.migration_performed = needs_decoder_refresh
-        if records_changed or needs_decoder_refresh:
-            self.dirty = True
+        self._legacy_records.clear()
+        self.migration_performed = True
+        self._connection.commit()
+        if (
+            self.migration_source_path is not None
+            and self.migration_backup_path is None
+            and self.migration_source_path.exists()
+            and source_version is not None
+        ):
+            if self._preserve_legacy_source:
+                self.migration_source_preserved = True
+            else:
+                try:
+                    self.migration_backup_path = self._move_aside(
+                        self.migration_source_path,
+                        f"legacy-v{source_version}.json",
+                    )
+                except OSError as exc:
+                    self.load_errors.append(str(exc))
+        self._connection.execute(
+            "INSERT OR REPLACE INTO cache_metadata(key, value) VALUES(?, '1')",
+            (self.LEGACY_RECOVERY_MARKER,),
+        )
+        self._connection.commit()
 
     def key(
         self,
@@ -13350,56 +16390,166 @@ class DynamicBlockCache:
         )
 
     def get(self, key: str) -> LiftedFunction | None:
-        record = self.records.get(key)
-        if record is None:
+        row = self._connection.execute(
+            "SELECT payload FROM decoded_blocks WHERE cache_key=?",
+            (key,),
+        ).fetchone()
+        if row is None:
             self.misses += 1
             return None
         try:
+            record = self._decode_record(row[0])
             function = _lifted_function_from_cache_record(record)
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError, zlib.error, json.JSONDecodeError) as exc:
             self.load_errors.append(f"{key}: {exc}")
+            self._connection.execute(
+                "DELETE FROM decoded_blocks WHERE cache_key=?",
+                (key,),
+            )
             self.misses += 1
             return None
+        self._connection.execute(
+            """
+            UPDATE decoded_blocks
+            SET last_used_ns=?, access_count=access_count+1
+            WHERE cache_key=?
+            """,
+            (time.time_ns(), key),
+        )
         self.hits += 1
         return function
 
     def put(self, key: str, function: LiftedFunction) -> None:
-        if key in self.records:
-            return
-        self.records[key] = _lifted_function_to_cache_record(function)
-        self.stores += 1
-        self.dirty = True
+        self._store_record(
+            key,
+            _lifted_function_to_cache_record(function),
+            replace=False,
+        )
+
+    def _store_record(
+        self,
+        key: str,
+        record: dict[str, Any],
+        *,
+        replace: bool,
+    ) -> None:
+        parts = self._key_parts(key)
+        if parts is None:
+            raise ValueError("decoded block cache key is invalid")
+        _version, image_sha256, target_text, entry_text, limit_text = parts
+        payload = self._encode_record(record)
+        operation = "INSERT OR REPLACE" if replace else "INSERT OR IGNORE"
+        cursor = self._connection.execute(
+            f"""
+            {operation} INTO decoded_blocks(
+                cache_key, image_sha256, target, entry_bytes,
+                max_block_instructions, payload, payload_bytes,
+                last_used_ns, access_count
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                key,
+                image_sha256,
+                int(target_text, 0),
+                int(entry_text),
+                int(limit_text),
+                payload,
+                len(payload),
+                time.time_ns(),
+            ),
+        )
+        if cursor.rowcount > 0:
+            self.stores += 1
 
     def save(self) -> None:
-        if self.path is None or not self.dirty:
+        self.prune()
+        self._connection.commit()
+
+    def close(self) -> None:
+        connection = getattr(self, "_connection", None)
+        if connection is None:
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "format": "b2-recomp-dynamic-block-cache",
-            "public_safe": False,
-            "version": self.VERSION,
-            "records": self.records,
-        }
-        temporary_path = self.path.with_name(f"{self.path.name}.tmp")
-        temporary_path.write_text(
-            json.dumps(payload, sort_keys=True) + "\n",
-            encoding="utf-8",
-            newline="\n",
-        )
-        temporary_path.replace(self.path)
-        self.dirty = False
+        self.save()
+        connection.close()
+        self._connection = None
+
+    def __del__(self) -> None:
+        connection = getattr(self, "_connection", None)
+        if connection is not None:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
+
+    def prune(self) -> None:
+        count, payload_bytes = self._connection.execute(
+            "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM decoded_blocks"
+        ).fetchone()
+        excess_count = max(0, int(count) - self.max_records)
+        excess_bytes = max(0, int(payload_bytes) - self.max_payload_bytes)
+        if excess_count == 0 and excess_bytes == 0:
+            return
+        removed_count = 0
+        removed_bytes = 0
+        candidates = self._connection.execute(
+            """
+            SELECT cache_key, payload_bytes FROM decoded_blocks
+            ORDER BY last_used_ns ASC, cache_key ASC
+            """
+        ).fetchall()
+        for cache_key, byte_count in candidates:
+            if removed_count >= excess_count and removed_bytes >= excess_bytes:
+                break
+            self._connection.execute(
+                "DELETE FROM decoded_blocks WHERE cache_key=?",
+                (cache_key,),
+            )
+            removed_count += 1
+            removed_bytes += int(byte_count)
+        self.pruned_records += removed_count
+        self.pruned_payload_bytes += removed_bytes
 
     def summary(self) -> dict[str, Any]:
+        record_count, payload_bytes = self._connection.execute(
+            "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM decoded_blocks"
+        ).fetchone()
+        prepared_record_count = 0
+        if self.prepared_image_sha256 is not None:
+            prepared_record_count = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM decoded_blocks WHERE image_sha256=?",
+                    (self.prepared_image_sha256,),
+                ).fetchone()[0]
+            )
         return {
             "enabled": self.path is not None,
             "path": str(self.path) if self.path is not None else None,
+            "backend": "sqlite-zlib-json-blob",
             "version": self.VERSION,
             "loaded_version": self.loaded_version,
-            "record_count": len(self.records),
+            "legacy_source_version": self.legacy_source_version,
+            "record_count": int(record_count),
+            "prepared_image_record_count": prepared_record_count,
+            "payload_bytes": int(payload_bytes),
+            "max_records": self.max_records,
+            "max_payload_bytes": self.max_payload_bytes,
             "hits": self.hits,
             "misses": self.misses,
             "stores": self.stores,
+            "pruned_records": self.pruned_records,
+            "pruned_payload_bytes": self.pruned_payload_bytes,
             "migration_performed": self.migration_performed,
+            "migration_source_path": (
+                str(self.migration_source_path)
+                if self.migration_source_path is not None
+                else None
+            ),
+            "migration_backup_path": (
+                str(self.migration_backup_path)
+                if self.migration_backup_path is not None
+                else None
+            ),
+            "migration_source_preserved": self.migration_source_preserved,
             "migration_validated_record_count": (
                 self.migration_validated_record_count
             ),
@@ -13417,10 +16567,26 @@ class DynamicBlockCache:
 
     def lifted_functions(self) -> list[LiftedFunction]:
         functions: list[LiftedFunction] = []
-        for key, record in self.records.items():
+        if self.prepared_image_sha256 is None:
+            return functions
+        rows = self._connection.execute(
+            """
+            SELECT cache_key, payload FROM decoded_blocks
+            WHERE image_sha256=? ORDER BY target
+            """,
+            (self.prepared_image_sha256,),
+        )
+        for key, payload in rows:
             try:
+                record = self._decode_record(payload)
                 functions.append(_lifted_function_from_cache_record(record))
-            except (KeyError, TypeError, ValueError) as exc:
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+                zlib.error,
+                json.JSONDecodeError,
+            ) as exc:
                 self.load_errors.append(f"{key}: {exc}")
         return functions
 
@@ -13451,6 +16617,7 @@ def build_playability_probe_summary(
     live_flip_audit_health_interval: int = 30,
     live_flip_audit_max_flips: int = 0,
     native_slice_steps: int = 100000,
+    profile_hot_paths: bool = False,
     audit_title_main_loop_exit: bool = False,
     audit_world_matrices: bool = False,
     audit_world_matrix_address: int | None = None,
@@ -13478,7 +16645,33 @@ def build_playability_probe_summary(
     unresolved = [
         resolution for resolution in loaded.import_resolutions if not resolution.resolved
     ]
-    dynamic_block_cache = DynamicBlockCache(dynamic_block_cache_path)
+    legacy_dynamic_block_cache_path = None
+    preserve_legacy_dynamic_block_cache = False
+    if (
+        dynamic_block_cache_path is not None
+        and dynamic_block_cache_path.resolve() == DEFAULT_DYNAMIC_BLOCK_STORE
+    ):
+        if LEGACY_DYNAMIC_BLOCK_CACHE.exists():
+            legacy_dynamic_block_cache_path = LEGACY_DYNAMIC_BLOCK_CACHE
+        elif DynamicBlockCache.metadata_value(
+            dynamic_block_cache_path,
+            DynamicBlockCache.LEGACY_RECOVERY_MARKER,
+        ) is None:
+            legacy_backups = sorted(
+                LEGACY_DYNAMIC_BLOCK_CACHE.parent.glob(
+                    f"{LEGACY_DYNAMIC_BLOCK_CACHE.name}.legacy-v*.json"
+                ),
+                key=lambda candidate: candidate.stat().st_mtime_ns,
+                reverse=True,
+            )
+            if legacy_backups:
+                legacy_dynamic_block_cache_path = legacy_backups[0]
+                preserve_legacy_dynamic_block_cache = True
+    dynamic_block_cache = DynamicBlockCache(
+        dynamic_block_cache_path,
+        legacy_json_path=legacy_dynamic_block_cache_path,
+        preserve_legacy_source=preserve_legacy_dynamic_block_cache,
+    )
     dynamic_block_cache.prepare_for_image(
         loaded,
         image_sha256=image_sha256,
@@ -13512,6 +16705,7 @@ def build_playability_probe_summary(
         live_flip_audit_health_interval=live_flip_audit_health_interval,
         live_flip_audit_max_flips=live_flip_audit_max_flips,
         native_slice_steps=native_slice_steps,
+        profile_hot_paths=profile_hot_paths,
         audit_title_main_loop_exit=audit_title_main_loop_exit,
         audit_world_matrices=audit_world_matrices,
         audit_world_matrix_address=audit_world_matrix_address,
@@ -13643,6 +16837,7 @@ def _recover_entry_summary(
     live_flip_audit_health_interval: int,
     live_flip_audit_max_flips: int,
     native_slice_steps: int,
+    profile_hot_paths: bool,
     audit_title_main_loop_exit: bool,
     audit_world_matrices: bool,
     audit_world_matrix_address: int | None,
@@ -13731,6 +16926,7 @@ def _recover_entry_summary(
             live_flip_audit_health_interval=live_flip_audit_health_interval,
             live_flip_audit_max_flips=live_flip_audit_max_flips,
             native_slice_steps=native_slice_steps,
+            profile_hot_paths=profile_hot_paths,
             audit_title_main_loop_exit=audit_title_main_loop_exit,
             audit_world_matrices=audit_world_matrices,
             audit_world_matrix_address=audit_world_matrix_address,
@@ -14005,6 +17201,162 @@ def _append_native_frontier_module_batch(
     )
 
 
+class _NativeFrontierPromotion:
+    """Build and atomically adopt cumulative live frontier executors."""
+
+    _EVENT_LIMIT = 32
+
+    def __init__(
+        self,
+        builder: Callable[[tuple[LiftedFunction, ...]], Any],
+        *,
+        enabled: bool,
+        base_addresses: Iterable[int] = (),
+    ) -> None:
+        self._builder = builder
+        self.enabled = enabled
+        self._pool = (
+            ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="b2-frontier-promotion",
+            )
+            if enabled
+            else None
+        )
+        self._future: Future | None = None
+        self._latest_modules: tuple[LiftedFunction, ...] = ()
+        self._submitted_module_count = 0
+        self._closing = False
+        self.active_executor: Any | None = None
+        self._base_addresses = set(base_addresses)
+        self.active_addresses: set[int] = set()
+        self.active_module_count = 0
+        self.submission_count = 0
+        self.completion_count = 0
+        self.failure_count = 0
+        self.promoted_dispatch_count = 0
+        self.events: list[dict[str, Any]] = []
+
+    def request(self, modules: Iterable[LiftedFunction]) -> None:
+        if not self.enabled or self._closing:
+            return
+        self._latest_modules = tuple(modules)
+        if self._future is None:
+            self._start_latest()
+
+    def _start_latest(self) -> None:
+        if (
+            self._pool is None
+            or self._closing
+            or not self._latest_modules
+            or len(self._latest_modules) <= self._submitted_module_count
+        ):
+            return
+        snapshot = self._latest_modules
+        self._submitted_module_count = len(snapshot)
+        self.submission_count += 1
+        submitted_ns = time.perf_counter_ns()
+
+        def build() -> tuple[Any, tuple[LiftedFunction, ...], int]:
+            executor = self._builder(snapshot)
+            elapsed_us = max(
+                0,
+                (time.perf_counter_ns() - submitted_ns) // 1_000,
+            )
+            return executor, snapshot, elapsed_us
+
+        self._future = self._pool.submit(build)
+
+    def poll(self) -> Any | None:
+        future = self._future
+        if future is None or not future.done():
+            return self.active_executor
+        self._future = None
+        try:
+            executor, modules, elapsed_us = future.result()
+        except BaseException as exc:
+            self.failure_count += 1
+            self.events.append(
+                {
+                    "status": "failed",
+                    "module_count": self._submitted_module_count,
+                    "error": str(exc),
+                }
+            )
+        else:
+            addresses = {
+                instruction.address
+                for module in modules
+                for instruction in module.instructions
+            }
+            addresses.update(self._base_addresses)
+            cache = getattr(executor, "cache_summary", {})
+            self.active_executor = executor
+            self.active_addresses = addresses
+            self.active_module_count = len(modules)
+            self.completion_count += 1
+            self.events.append(
+                {
+                    "status": "completed",
+                    "module_count": len(modules),
+                    "instruction_count": sum(
+                        len(module.instructions) for module in modules
+                    ),
+                    "address_count": len(addresses),
+                    "elapsed_us": elapsed_us,
+                    "compile_wall_us": int(cache.get("compile_wall_us", 0)),
+                    "compiled_partition_count": int(
+                        cache.get("ahead_compiled_count", 0)
+                    ),
+                    "warm_hit_count": int(cache.get("warm_hit_count", 0)),
+                    "compile_worker_limit": int(
+                        cache.get("compile_worker_limit", 0)
+                    ),
+                    "low_priority_compilation": bool(
+                        cache.get("low_priority_compilation", False)
+                    ),
+                    "executor_instance_id": cache.get("executor_instance_id"),
+                }
+            )
+        self.events = self.events[-self._EVENT_LIMIT :]
+        self._start_latest()
+        return self.active_executor
+
+    def executor_for(self, address: int) -> Any | None:
+        self.poll()
+        if address not in self.active_addresses:
+            return None
+        self.promoted_dispatch_count += 1
+        return self.active_executor
+
+    def contains(self, address: int) -> bool:
+        self.poll()
+        return address in self.active_addresses
+
+    def shutdown(self) -> None:
+        if self._pool is None:
+            return
+        self._closing = True
+        self._pool.shutdown(wait=True, cancel_futures=True)
+        self.poll()
+        self._pool = None
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "submission_count": self.submission_count,
+            "completion_count": self.completion_count,
+            "failure_count": self.failure_count,
+            "pending": self._future is not None,
+            "requested_module_count": len(self._latest_modules),
+            "submitted_module_count": self._submitted_module_count,
+            "active_module_count": self.active_module_count,
+            "active_address_count": len(self.active_addresses),
+            "promoted_dispatch_count": self.promoted_dispatch_count,
+            "events": list(self.events),
+        }
+
+
 def _seed_guest_thread_fs_block(memory: SparseMemory, fs_base: int) -> None:
     memory.write_u32(_u32(fs_base + THREAD_FS_SELF_POINTER_OFFSET), fs_base)
     memory.write_u32(_u32(fs_base + THREAD_FS_CALLBACK_TABLE_OFFSET), 0)
@@ -14032,6 +17384,7 @@ def _execute_recovered_control_flow_frame(
     live_flip_audit_health_interval: int,
     live_flip_audit_max_flips: int,
     native_slice_steps: int,
+    profile_hot_paths: bool,
     audit_title_main_loop_exit: bool,
     audit_world_matrices: bool,
     audit_world_matrix_address: int | None,
@@ -14178,6 +17531,14 @@ def _execute_recovered_control_flow_frame(
         if native_guest_loop
         else title_vertex_append_fast_path.call_handlers()
     )
+    title_d3d_allocator_handlers = (
+        {}
+        if native_guest_loop
+        else {
+            **title_d3d_packet_alloc_fast_path.call_handlers(),
+            **title_d3d_reserve_fast_path.call_handlers(),
+        }
+    )
     handlers = {
         **bridge.call_handlers(),
         **spin_delay_fast_path.call_handlers(),
@@ -14193,8 +17554,7 @@ def _execute_recovered_control_flow_frame(
         **title_frontend_object_fast_path.call_handlers(),
         **title_fixed_width_compare_fast_path.call_handlers(),
         **title_d3d_flush_fast_path.call_handlers(),
-        **title_d3d_packet_alloc_fast_path.call_handlers(),
-        **title_d3d_reserve_fast_path.call_handlers(),
+        **title_d3d_allocator_handlers,
         **title_d3d_primitive_draw_fast_path.call_handlers(),
         **title_vertex_append_handlers,
         **title_text_draw_fast_path.call_handlers(),
@@ -14524,6 +17884,7 @@ def _execute_recovered_control_flow_frame(
                 live_flip_audit_health_interval=live_flip_audit_health_interval,
                 live_flip_audit_max_flips=live_flip_audit_max_flips,
                 native_slice_steps=native_slice_steps,
+                profile_hot_paths=profile_hot_paths,
                 audit_title_main_loop_exit=audit_title_main_loop_exit,
                 audit_world_matrices=audit_world_matrices,
                 audit_world_matrix_address=audit_world_matrix_address,
@@ -14809,6 +18170,7 @@ def _execute_guest_thread_start(
     live_flip_audit_health_interval: int = 30,
     live_flip_audit_max_flips: int = 0,
     native_slice_steps: int = 100000,
+    profile_hot_paths: bool = False,
     enable_title_repair_fallbacks: bool = False,
     audit_title_main_loop_exit: bool = False,
     audit_world_matrices: bool = False,
@@ -14829,6 +18191,7 @@ def _execute_guest_thread_start(
         "start_context2": thread["start_context2"],
         "start_context2_hex": thread["start_context2_hex"],
         "title_repair_fallbacks_enabled": enable_title_repair_fallbacks,
+        "hot_path_profiling_enabled": profile_hot_paths,
     }
     if thread["suspended"]:
         return {**summary, "status": "skipped_suspended"}
@@ -14864,6 +18227,9 @@ def _execute_guest_thread_start(
         base_address=start_address,
     )
     native_base_frame = frame
+    native_base_addresses = {
+        instruction.address for instruction in native_base_frame.instructions
+    }
     invocation_start = bridge.invocation_count
     scheduler_loop_detector = SchedulerLoopConvergenceDetector()
     subsystem_initializer_audit = TitleSubsystemInitializerAudit()
@@ -14902,6 +18268,20 @@ def _execute_guest_thread_start(
     native_run_summaries: list[dict[str, Any]] = []
     native_frontier_functions: list[LiftedFunction] = []
     native_frontier_modules: list[LiftedFunction] = []
+    native_frontier_module_by_address: dict[int, LiftedFunction] = {}
+    native_frontier_interpreter_invocation_count = 0
+    native_frontier_interpreter_steps = 0
+    native_frontier_interpreter_total_us = 0
+    native_frontier_interpreter_max_us = 0
+    native_frontier_interpreter_budget_yield_count = 0
+    native_frontier_interpreter_wall_yield_count = 0
+    native_frontier_interpreter_targets: dict[int, dict[str, int]] = {}
+    native_frontier_service_count = 0
+    native_frontier_service_coalesced_count = 0
+    native_frontier_promotion: _NativeFrontierPromotion | None = None
+    active_native_executor: Any | None = None
+    compiled_guest_block_count = 0
+    completed_guest_invalidation_count = 0
     title_main_loop_exit_initial_value = memory.read_u32(
         TITLE_MAIN_LOOP_EXIT_FLAG_ADDRESS
     )
@@ -14912,7 +18292,9 @@ def _execute_guest_thread_start(
     enable_hot_render_audits = (
         live_render_stream_path is None or audit_title_main_loop_exit
     )
+    title_native_fast_paths = _title_native_fast_paths() if native_guest_loop else {}
     summary["hot_render_audits_enabled"] = enable_hot_render_audits
+    summary["native_fast_path_count"] = len(title_native_fast_paths)
 
     def record_title_main_loop_exit_write(
         *,
@@ -15002,6 +18384,10 @@ def _execute_guest_thread_start(
         count: int,
         observed_range_start: int,
         contiguous_u32: bool,
+        observed_range_end: int,
+        packed_texture_payload: Any,
+        packed_texture_runs: Any,
+        packed_texture_run_count: int,
     ) -> None:
         render_watchpoint.observe_native_write_batch(
             packed_records,
@@ -15014,6 +18400,37 @@ def _execute_guest_thread_start(
             count,
             observed_range_start,
             contiguous_u32,
+            observed_range_end,
+            packed_texture_payload,
+            packed_texture_runs,
+            packed_texture_run_count,
+        )
+
+    def observe_native_memory_write_spans(
+        payload: Any,
+        payload_size: int,
+        addresses: Any,
+        payload_offsets: Any,
+        payload_sizes: Any,
+        write_counts: Any,
+        flags: Any,
+        span_count: int,
+        observed_range_start: int,
+        observed_range_end: int,
+        normalized_base: int,
+    ) -> None:
+        render_watchpoint.observe_native_write_span_batch(
+            payload,
+            payload_size,
+            addresses,
+            payload_offsets,
+            payload_sizes,
+            write_counts,
+            flags,
+            span_count,
+            observed_range_start,
+            observed_range_end,
+            normalized_base,
         )
 
     def observe_host_memory_write(write_address: int, payload: bytes) -> None:
@@ -15066,6 +18483,19 @@ def _execute_guest_thread_start(
             "control_event_count": len(title_main_loop_control_events),
             "control_events": title_main_loop_control_events[-1024:],
         }
+
+    def live_guest_metrics() -> dict[str, int]:
+        active_metrics = (
+            active_native_executor.current_run_metrics
+            if active_native_executor is not None
+            else None
+        )
+        return {
+            "compiled_blocks": compiled_guest_block_count,
+            "invalidations": completed_guest_invalidation_count
+            + int((active_metrics or {}).get("invalidated_page_count", 0)),
+        }
+
     live_host_bridge = (
         LiveHostBridge(
             bridge.runtime,
@@ -15089,6 +18519,7 @@ def _execute_guest_thread_start(
             frontend_text_provider=(
                 title_text_draw_fast_path.manifest_for_completed_flip
             ),
+            guest_metrics_provider=live_guest_metrics,
         )
         if live_render_stream_path is not None
         and live_controller_state_path is not None
@@ -15224,22 +18655,7 @@ def _execute_guest_thread_start(
                     else set()
                 ),
             }
-            native_memory_callback_addresses = {
-                TITLE_AUDIO_DSP_CONTROL_ADDRESS,
-                TITLE_AUDIO_DSP_STATUS_ADDRESS,
-                *TITLE_AUDIO_DSP_VOICE_COMMAND_ADDRESSES,
-                TITLE_MCPX_FRAME_COUNTER_ADDRESS,
-                TITLE_GPU_COMMAND_KICK_ADDRESS,
-                TITLE_GPU_PROGRESS_COUNTER_ADDRESS,
-                TITLE_GPU_SOFTWARE_COMPLETION_FLAG_ADDRESS,
-                TITLE_D3D_CONTEXT_GET_POINTER_ADDRESS,
-                TITLE_GPU_SUBMISSION_BASE_ADDRESS,
-                TITLE_GPU_SUBMISSION_LIMIT_ADDRESS,
-                TITLE_D3D_CONTEXT_GLOBAL_ADDRESS,
-                TITLE_CLEANUP_LIST_SENTINEL_ADDRESS,
-                TITLE_FRONTEND_RESOURCE_CACHE_SENTINEL_ADDRESS,
-                TITLE_FRONTEND_REGISTRY_LIST_SENTINEL_ADDRESS,
-                TITLE_FRONTEND_INITIALIZER_LIST_SENTINEL_ADDRESS,
+            audit_memory_callback_addresses = {
                 *(
                     {TITLE_MAIN_LOOP_EXIT_FLAG_ADDRESS}
                     if audit_title_main_loop_exit
@@ -15247,20 +18663,225 @@ def _execute_guest_thread_start(
                 ),
                 *title_world_matrix_audit.memory_callback_addresses,
             }
+            native_memory_read_callback_addresses = {
+                *TITLE_EXACT_MEMORY_CALLBACK_ADDRESSES,
+                *audit_memory_callback_addresses,
+            }
+            native_memory_write_callback_addresses = {
+                *TITLE_EXACT_MEMORY_WRITE_CALLBACK_ADDRESSES,
+                *audit_memory_callback_addresses,
+            }
 
             def create_native_executor(
                 active_frame: LiftedFunction,
                 module_functions: list[LiftedFunction],
+                incremental_module_functions: list[LiftedFunction] | None = None,
+                *,
+                install_render_scanners: bool = True,
+                compile_worker_limit: int | None = None,
+                low_priority_compilation: bool = False,
             ) -> NativeResumableExecutor:
-                return NativeResumableExecutor(
+                executor = NativeResumableExecutor(
                     active_frame,
                     build_dir=native_build_dir,
                     module_functions=module_functions,
+                    incremental_module_functions=incremental_module_functions,
                     observer_addresses=observer_addresses,
                     callback_addresses=handlers.keys(),
-                    memory_callback_addresses=native_memory_callback_addresses,
+                    memory_read_callback_addresses=(
+                        native_memory_read_callback_addresses
+                    ),
+                    memory_write_callback_addresses=(
+                        native_memory_write_callback_addresses
+                    ),
+                    memory_zero_read_callback_addresses=(
+                        TITLE_ZERO_GUARDED_U32_READ_CALLBACK_ADDRESSES
+                    ),
+                    native_fast_paths=title_native_fast_paths,
                     synchronize_eip_for_callbacks=audit_title_main_loop_exit,
+                    compile_worker_limit=compile_worker_limit,
+                    low_priority_compilation=low_priority_compilation,
                 )
+                if install_render_scanners:
+                    render_watchpoint.set_native_resource_method_scanner(
+                        executor.scan_resource_methods
+                    )
+                    render_watchpoint.set_native_resource_span_scanner(
+                        executor.scan_resource_method_spans,
+                        executor.finish_resource_method_spans,
+                        executor.export_resource_method_span_state,
+                        executor.import_resource_method_span_state,
+                    )
+                return executor
+
+            def build_promoted_frontier_executor(
+                modules: tuple[LiftedFunction, ...],
+            ) -> NativeResumableExecutor:
+                promoted_frame = _merge_lifted_functions(
+                    native_base_frame,
+                    modules,
+                    symbol=f"guest_thread_{thread_index:02d}_promoted_frontier",
+                    base_address=start_address,
+                )
+                return create_native_executor(
+                    promoted_frame,
+                    [native_base_frame],
+                    list(modules),
+                    install_render_scanners=False,
+                    compile_worker_limit=1,
+                    low_priority_compilation=True,
+                )
+
+            native_frontier_promotion = _NativeFrontierPromotion(
+                build_promoted_frontier_executor,
+                enabled=live_host_bridge is not None,
+                base_addresses=native_base_addresses,
+            )
+
+            def append_native_frontier_batch(
+                recovered_batch: list[LiftedFunction],
+                *,
+                symbol_prefix: str,
+            ) -> None:
+                prior_module_count = len(native_frontier_modules)
+                _append_native_frontier_module_batch(
+                    recovered_batch,
+                    frontier_functions=native_frontier_functions,
+                    frontier_modules=native_frontier_modules,
+                    symbol_prefix=symbol_prefix,
+                )
+                for module in native_frontier_modules[prior_module_count:]:
+                    for instruction in module.instructions:
+                        native_frontier_module_by_address[
+                            instruction.address
+                        ] = module
+                if native_frontier_promotion is not None:
+                    native_frontier_promotion.request(native_frontier_modules)
+
+            def interpret_live_native_frontier(
+                target: int,
+                *,
+                active_state: CpuState,
+                completed_steps: int,
+                remaining_steps: int,
+                call_handler_yield_predicate: Callable[[int], bool] | None = None,
+            ) -> tuple[ExecutionResult | None, bool]:
+                nonlocal native_frontier_interpreter_invocation_count
+                nonlocal native_frontier_interpreter_steps
+                nonlocal native_frontier_interpreter_total_us
+                nonlocal native_frontier_interpreter_max_us
+                nonlocal native_frontier_interpreter_budget_yield_count
+                nonlocal native_frontier_interpreter_wall_yield_count
+                if live_host_bridge is None:
+                    return None, False
+                module = native_frontier_module_by_address.get(target)
+                if module is None:
+                    return None, False
+                resumed_module = LiftedFunction(
+                    symbol=f"{module.symbol}_resume_{target:08X}",
+                    base_address=target,
+                    code_size=max(
+                        instruction.next_address
+                        for instruction in module.instructions
+                    )
+                    - target,
+                    instructions=module.instructions,
+                )
+                interpreter_budget = (
+                    min(100_000, remaining_steps)
+                    if remaining_steps > 0
+                    else 100_000
+                )
+                started_ns = time.perf_counter_ns()
+                interpreter_deadline_ns = started_ns + 8_000_000
+                wall_budget_yielded = False
+
+                def reached_interpreter_deadline(steps: int) -> bool:
+                    nonlocal wall_budget_yielded
+                    if (
+                        steps > 0
+                        and steps % 128 == 0
+                        and time.perf_counter_ns() >= interpreter_deadline_ns
+                    ):
+                        wall_budget_yielded = True
+                    return wall_budget_yielded
+
+                exhausted_budget = False
+                try:
+                    interpreted = execute_lifted_function(
+                        resumed_module,
+                        state=active_state,
+                        memory=memory,
+                        call_handlers=handlers,
+                        block_loader=lambda address: (
+                            native_frontier_module_by_address.get(address)
+                        ),
+                        step_observer=lambda cpu, observed_memory, trace, steps: (
+                            observe_guest_thread_step(
+                                cpu,
+                                observed_memory,
+                                trace,
+                                completed_steps + steps,
+                            )
+                        ),
+                        max_steps=interpreter_budget,
+                        record_instruction_trace=False,
+                        record_trace=False,
+                        return_on_missing_instruction=True,
+                        call_handler_yield_predicate=(
+                            call_handler_yield_predicate
+                        ),
+                        execution_yield_predicate=(
+                            reached_interpreter_deadline
+                        ),
+                    )
+                except X86ExecutionError as exc:
+                    if (
+                        str(exc) != "execution step limit reached"
+                        or exc.state is None
+                        or exc.trace is None
+                    ):
+                        raise
+                    exhausted_budget = True
+                    interpreted = ExecutionResult(
+                        exc.state,
+                        memory,
+                        exc.trace,
+                        return_address=exc.state.eip,
+                        steps=exc.steps,
+                    )
+                if wall_budget_yielded:
+                    exhausted_budget = True
+                    native_frontier_interpreter_wall_yield_count += 1
+                elapsed_us = max(
+                    0,
+                    (time.perf_counter_ns() - started_ns) // 1_000,
+                )
+                native_frontier_interpreter_invocation_count += 1
+                native_frontier_interpreter_steps += interpreted.steps
+                native_frontier_interpreter_total_us += elapsed_us
+                native_frontier_interpreter_max_us = max(
+                    native_frontier_interpreter_max_us,
+                    elapsed_us,
+                )
+                if exhausted_budget:
+                    native_frontier_interpreter_budget_yield_count += 1
+                target_metrics = native_frontier_interpreter_targets.setdefault(
+                    target,
+                    {
+                        "invocation_count": 0,
+                        "steps": 0,
+                        "total_us": 0,
+                        "maximum_us": 0,
+                    },
+                )
+                target_metrics["invocation_count"] += 1
+                target_metrics["steps"] += interpreted.steps
+                target_metrics["total_us"] += elapsed_us
+                target_metrics["maximum_us"] = max(
+                    target_metrics["maximum_us"], elapsed_us
+                )
+                return interpreted, exhausted_budget
 
             cooperative_sessions: dict[int, dict[str, Any]] = {}
             cooperative_executor: NativeResumableExecutor | None = None
@@ -15290,6 +18911,8 @@ def _execute_guest_thread_start(
             cooperative_service_max_us = 0
             cooperative_instruction_tick_count = 0
             cooperative_video_tick_count = 0
+            cooperative_wait_skip_count = 0
+            cooperative_wake_count = 0
             primary_handle = thread.get("handle")
             pre_first_flip_slice_steps = 0
 
@@ -15307,6 +18930,7 @@ def _execute_guest_thread_start(
 
             def service_cooperative_threads() -> None:
                 nonlocal cooperative_executor, cooperative_service_active
+                nonlocal cooperative_wait_skip_count, cooperative_wake_count
                 if thread_index != 0:
                     return
                 for candidate in _scheduled_guest_threads(bridge, loaded):
@@ -15335,11 +18959,16 @@ def _execute_guest_thread_start(
                         "steps": 0,
                         "last_run": None,
                     }
-                active_sessions = [
-                    session
-                    for session in cooperative_sessions.values()
-                    if session["status"] in {"ready", "running", "waiting"}
-                ]
+                active_sessions = []
+                for session in cooperative_sessions.values():
+                    if session["status"] == "waiting":
+                        if not _resume_cooperative_wait(session, bridge.runtime):
+                            cooperative_wait_skip_count += 1
+                            continue
+                        session["status"] = "running"
+                        cooperative_wake_count += 1
+                    if session["status"] in {"ready", "running"}:
+                        active_sessions.append(session)
                 if not active_sessions:
                     return
                 for session in active_sessions:
@@ -15358,13 +18987,39 @@ def _execute_guest_thread_start(
                         )
                         cooperative_executor = create_native_executor(
                             cooperative_frame,
-                            [
-                                native_base_frame,
-                                *native_frontier_modules,
-                            ],
+                            [native_base_frame],
+                            (
+                                []
+                                if live_host_bridge is not None
+                                else native_frontier_modules
+                            ),
                         )
                     changed_before = set(cooperative_changed_pages)
                     cooperative_service_active = True
+                    session.pop("pending_wait", None)
+
+                    def should_yield_blocking_call(target: int) -> bool:
+                        if target not in cooperative_blocking_targets:
+                            return False
+                        if not bridge.invocations:
+                            return False
+                        invocation = bridge.invocations[-1]
+                        if invocation.target_address != target:
+                            return False
+                        wait = _cooperative_wait_plan(
+                            invocation,
+                            current_interrupt_time_100ns=(
+                                bridge.runtime.clock.snapshot()[
+                                    "interrupt_time_100ns"
+                                ]
+                            ),
+                        )
+                        if wait is None:
+                            return False
+                        session["pending_wait"] = wait
+                        return True
+
+                    bridge.defer_guest_thread_delays = True
                     try:
                         returned = cooperative_executor.run(
                             session["state"],
@@ -15379,6 +19034,14 @@ def _execute_guest_thread_start(
                                 and not render_watchpoint.retain_diagnostic_writes
                                 else None
                             ),
+                            memory_write_span_observer=(
+                                observe_native_memory_write_spans
+                                if live_host_bridge is not None
+                                and live_host_bridge.direct_command_transport_enabled
+                                and not audit_title_main_loop_exit
+                                and not render_watchpoint.retain_diagnostic_writes
+                                else None
+                            ),
                             memory_write_batch_address_base=(
                                 TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS
                             ),
@@ -15386,15 +19049,30 @@ def _execute_guest_thread_start(
                                 memory_write_observer_ranges_provider
                             ),
                             call_handler_yield_predicate=(
-                                cooperative_blocking_targets.__contains__
+                                should_yield_blocking_call
+                            ),
+                            shared_memory_handler_predicate=(
+                                bridge.can_use_shared_memory_for_handler
                             ),
                             max_steps=cooperative_quantum,
+                            profile_hot_paths=profile_hot_paths,
+                            capture_observed_write_provenance=(
+                                live_host_bridge is None
+                                or not live_host_bridge.direct_command_transport_enabled
+                            ),
+                            direct_observed_write_transport=(
+                                live_host_bridge is not None
+                                and live_host_bridge.direct_command_transport_enabled
+                                and not audit_title_main_loop_exit
+                                and not render_watchpoint.retain_diagnostic_writes
+                            ),
                         )
                     except NativeExecutorError as exc:
                         session["status"] = "execution_failed"
                         session["error"] = str(exc)
                         returned = session["state"].eip
                     finally:
+                        bridge.defer_guest_thread_delays = False
                         cooperative_service_active = False
                     run = cooperative_executor.last_run_summary
                     if run is not None:
@@ -15412,52 +19090,107 @@ def _execute_guest_thread_start(
                             session["status"] = "running"
                         elif run.get("reason") == "call_handler_yield":
                             session["status"] = "waiting"
-                            session["last_blocking_shim"] = (
-                                bridge.invocations[-1].shim_name
-                                if bridge.invocations
-                                else None
-                            )
+                            wait = session.pop("pending_wait", None)
+                            if wait is None:
+                                session["status"] = "running"
+                            else:
+                                session["wait"] = wait
+                                session["last_blocking_shim"] = wait.get(
+                                    "shim_name"
+                                )
                         elif (
                             run.get("reason") == "unhandled_target"
                             and _is_executable_address(loaded, returned)
-                            and len(native_frontier_functions) < max_dynamic_blocks
+                            and (
+                                returned in native_frontier_module_by_address
+                                or len(native_frontier_functions) < max_dynamic_blocks
+                            )
                         ):
-                            recovered = block_loader(returned)
-                            if recovered is not None:
-                                known_native_addresses = {
-                                    instruction.address
-                                    for function in (
-                                        entry_function,
-                                        *frame_functions,
-                                        *native_branch_functions,
-                                        *native_frontier_functions,
+                            if returned not in native_frontier_module_by_address:
+                                recovered = block_loader(returned)
+                                if recovered is not None:
+                                    known_native_addresses = {
+                                        instruction.address
+                                        for function in (
+                                            entry_function,
+                                            *frame_functions,
+                                            *native_branch_functions,
+                                            *native_frontier_functions,
+                                        )
+                                        for instruction in function.instructions
+                                    }
+                                    recovered_batch = _recover_native_frontier_batch(
+                                        recovered,
+                                        block_loader=block_loader,
+                                        external_targets=set(handlers),
+                                        covered_addresses=known_native_addresses,
+                                        max_depth=DEFAULT_INTERNAL_DEPTH,
+                                        max_blocks=min(
+                                            DEFAULT_MAX_RECOVERED_BLOCKS,
+                                            max_dynamic_blocks
+                                            - len(native_frontier_functions),
+                                        ),
                                     )
-                                    for instruction in function.instructions
-                                }
-                                recovered_batch = _recover_native_frontier_batch(
-                                    recovered,
-                                    block_loader=block_loader,
-                                    external_targets=set(handlers),
-                                    covered_addresses=known_native_addresses,
-                                    max_depth=DEFAULT_INTERNAL_DEPTH,
-                                    max_blocks=min(
-                                        DEFAULT_MAX_RECOVERED_BLOCKS,
-                                        max_dynamic_blocks
-                                        - len(native_frontier_functions),
-                                    ),
-                                )
-                                _append_native_frontier_module_batch(
-                                    recovered_batch,
-                                    frontier_functions=native_frontier_functions,
-                                    frontier_modules=native_frontier_modules,
-                                    symbol_prefix=(
-                                        f"guest_thread_{thread_index:02d}_frontier"
-                                    ),
-                                )
+                                    append_native_frontier_batch(
+                                        recovered_batch,
+                                        symbol_prefix=(
+                                            f"guest_thread_{thread_index:02d}_frontier"
+                                        ),
+                                    )
+                            if live_host_bridge is None:
                                 cooperative_executor = None
-                                session["status"] = "running"
+                                session["status"] = (
+                                    "running"
+                                    if returned in native_frontier_module_by_address
+                                    else "blocked"
+                                )
                             else:
-                                session["status"] = "blocked"
+                                bridge.defer_guest_thread_delays = True
+                                try:
+                                    interpreted, exhausted_budget = (
+                                        interpret_live_native_frontier(
+                                            returned,
+                                            active_state=session["state"],
+                                            completed_steps=session["steps"],
+                                            remaining_steps=cooperative_quantum,
+                                            call_handler_yield_predicate=(
+                                                should_yield_blocking_call
+                                            ),
+                                        )
+                                    )
+                                finally:
+                                    bridge.defer_guest_thread_delays = False
+                                if interpreted is None:
+                                    session["status"] = "blocked"
+                                else:
+                                    session["steps"] += interpreted.steps
+                                    returned = interpreted.return_address
+                                    wait = session.pop("pending_wait", None)
+                                    session["last_run"] = {
+                                        "reason": (
+                                            "call_handler_yield"
+                                            if wait is not None
+                                            else "interpreted_frontier_budget"
+                                            if exhausted_budget
+                                            else "interpreted_frontier_exit"
+                                        ),
+                                        "target": returned,
+                                        "target_hex": _hex32(returned),
+                                        "steps": interpreted.steps,
+                                    }
+                                    if returned in {
+                                        0,
+                                        session["return_sentinel"],
+                                    }:
+                                        session["status"] = "completed"
+                                    elif wait is not None:
+                                        session["status"] = "waiting"
+                                        session["wait"] = wait
+                                        session["last_blocking_shim"] = wait.get(
+                                            "shim_name"
+                                        )
+                                    else:
+                                        session["status"] = "running"
                         elif session["status"] != "execution_failed":
                             session["status"] = "blocked"
                     newly_changed = cooperative_changed_pages - changed_before
@@ -15559,36 +19292,92 @@ def _execute_guest_thread_start(
             native_steps = 0
             returned_to = state.eip
             native_cache_donor: NativeResumableExecutor | None = None
+            live_base_native_executor: NativeResumableExecutor | None = None
+            reusable_native: NativeResumableExecutor | None = None
+            native_frontier_service_pending_steps = 0
+            native_frontier_service_last_ns = time.perf_counter_ns()
+            native_frontier_service_last_flip = render_watchpoint.flip_count
+            native_frontier_service_count = 0
+            native_frontier_service_coalesced_count = 0
             while max_steps == 0 or native_steps < max_steps:
                 if (
                     live_host_bridge is not None
                     and not live_host_bridge.should_continue_native_recovery()
                 ):
                     break
-                if native_frontier_functions:
-                    frame = _merge_lifted_functions(
-                        entry_function,
-                        [
+                promoted_native = (
+                    native_frontier_promotion.executor_for(returned_to)
+                    if native_frontier_promotion is not None
+                    else None
+                )
+                if promoted_native is not None:
+                    native = promoted_native
+                    native_was_reused = True
+                    native_executor_role = "promoted_frontier"
+                elif (
+                    live_host_bridge is not None
+                    and live_base_native_executor is not None
+                ):
+                    native = live_base_native_executor
+                    native_was_reused = True
+                    native_executor_role = "live_base"
+                elif reusable_native is not None:
+                    native = reusable_native
+                    reusable_native = None
+                    native_was_reused = True
+                    native_executor_role = "offline_reused"
+                else:
+                    native_was_reused = False
+                    native_executor_role = (
+                        "live_base"
+                        if live_host_bridge is not None
+                        else "offline_rebuilt"
+                    )
+                    if native_frontier_functions:
+                        frame = _merge_lifted_functions(
+                            entry_function,
+                            [
+                                *frame_functions,
+                                *native_branch_functions,
+                                *native_frontier_functions,
+                            ],
+                            symbol=(
+                                f"guest_thread_{thread_index:02d}_"
+                                f"{start_address:08X}"
+                            ),
+                            base_address=start_address,
+                        )
+                    native = create_native_executor(
+                        frame,
+                        [native_base_frame],
+                        # Offline probes compile recovered CFG batches as
+                        # independent, latency-oriented modules. A live first
+                        # encounter uses the interpreter below and leaves the
+                        # compilation for the next launch's ahead build.
+                        (
+                            []
+                            if live_host_bridge is not None
+                            else native_frontier_modules
+                        ),
+                    )
+                    if live_host_bridge is not None:
+                        live_base_native_executor = native
+                active_native_executor = native
+                compiled_guest_block_count = len(
+                    {
+                        function.base_address
+                        for function in (
+                            entry_function,
                             *frame_functions,
                             *native_branch_functions,
                             *native_frontier_functions,
-                        ],
-                        symbol=f"guest_thread_{thread_index:02d}_{start_address:08X}",
-                        base_address=start_address,
-                    )
-                native = create_native_executor(
-                    frame,
-                    [
-                        native_base_frame,
-                        # Keep every recovered CFG batch independent. Extending a
-                        # cumulative frontier frame changes its digest and forces
-                        # the whole dense address bucket to compile again.
-                        *native_frontier_modules,
-                    ],
+                        )
+                    }
                 )
-                if native_cache_donor is not None:
+                if native_cache_donor is not None and native_cache_donor is not native:
                     native.seed_page_cache_from(native_cache_donor, memory)
-                cooperative_executor = None
+                if not native_was_reused:
+                    cooperative_executor = None
                 try:
                     returned_to = native.run(
                         state,
@@ -15603,8 +19392,23 @@ def _execute_guest_thread_start(
                             and not render_watchpoint.retain_diagnostic_writes
                             else None
                         ),
+                        memory_write_span_observer=(
+                            observe_native_memory_write_spans
+                            if live_host_bridge is not None
+                            and live_host_bridge.direct_command_transport_enabled
+                            and not audit_title_main_loop_exit
+                            and not render_watchpoint.retain_diagnostic_writes
+                            else None
+                        ),
                         memory_write_batch_address_base=(
                             TITLE_D3D_PUSH_BUFFER_BASE_ADDRESS
+                        ),
+                        memory_write_observer_yield_header=(
+                            TITLE_D3D_FLIP_METHOD_HEADER
+                            if live_host_bridge is not None
+                            and not audit_title_main_loop_exit
+                            and not render_watchpoint.retain_diagnostic_writes
+                            else 0
                         ),
                         memory_write_observer_ranges_provider=(
                             memory_write_observer_ranges_provider
@@ -15625,14 +19429,56 @@ def _execute_guest_thread_start(
                             if live_host_bridge is not None
                             else None
                         ),
+                        shared_memory_handler_predicate=(
+                            bridge.can_use_shared_memory_for_handler
+                        ),
+                        profile_hot_paths=profile_hot_paths,
+                        capture_observed_write_provenance=(
+                            live_host_bridge is None
+                            or not live_host_bridge.direct_command_transport_enabled
+                        ),
+                        direct_observed_write_transport=(
+                            live_host_bridge is not None
+                            and live_host_bridge.direct_command_transport_enabled
+                            and not audit_title_main_loop_exit
+                            and not render_watchpoint.retain_diagnostic_writes
+                        ),
                     )
                 finally:
                     native_run_summary = native.last_run_summary
                 if native_run_summary is None:
                     break
-                native_run_summaries.append(native_run_summary)
+                completed_guest_invalidation_count += int(
+                    native_run_summary.get("performance", {}).get(
+                        "invalidated_page_count", 0
+                    )
+                )
+                active_native_executor = None
+                native_run_summaries.append(
+                    {
+                        **native_run_summary,
+                        "executor_role": native_executor_role,
+                    }
+                )
                 native_cache_donor = native
                 native_steps += int(native_run_summary["steps"])
+                if (
+                    live_host_bridge is not None
+                    and native_run_summary["reason"] == "unhandled_target"
+                    and _is_executable_address(loaded, returned_to)
+                ):
+                    if (
+                        native is not live_base_native_executor
+                        and returned_to in native_base_addresses
+                    ):
+                        continue
+                    if (
+                        native_frontier_promotion is not None
+                        and native_frontier_promotion.contains(returned_to)
+                        and native
+                        is not native_frontier_promotion.active_executor
+                    ):
+                        continue
                 if (
                     native_run_summary["reason"] != "unhandled_target"
                     or not _is_executable_address(loaded, returned_to)
@@ -15640,51 +19486,100 @@ def _execute_guest_thread_start(
                     # through well over 64 small recovered blocks. The old
                     # ceiling ended the guest runner at that boundary and
                     # left the presenter showing its last title frame.
-                    or len(native_frontier_functions) >= max_dynamic_blocks
+                    or (
+                        returned_to not in native_frontier_module_by_address
+                        and len(native_frontier_functions) >= max_dynamic_blocks
+                    )
                 ):
                     break
-                recovered = block_loader(returned_to)
-                if recovered is None:
-                    if any(
-                        returned_to
-                        in {
-                            instruction.address
-                            for instruction in recovered_function.instructions
-                        }
-                        for recovered_function in native_frontier_functions
-                    ):
-                        continue
-                    break
-                known_native_addresses = {
-                    instruction.address
-                    for function in (
-                        entry_function,
-                        *frame_functions,
-                        *native_branch_functions,
-                        *native_frontier_functions,
+                if returned_to not in native_frontier_module_by_address:
+                    recovered = block_loader(returned_to)
+                    if recovered is None:
+                        break
+                    known_native_addresses = {
+                        instruction.address
+                        for function in (
+                            entry_function,
+                            *frame_functions,
+                            *native_branch_functions,
+                            *native_frontier_functions,
+                        )
+                        for instruction in function.instructions
+                    }
+                    remaining_frontiers = max_dynamic_blocks - len(
+                        native_frontier_functions
                     )
-                    for instruction in function.instructions
-                }
-                remaining_frontiers = max_dynamic_blocks - len(
-                    native_frontier_functions
-                )
-                recovered_batch = _recover_native_frontier_batch(
-                    recovered,
-                    block_loader=block_loader,
-                    external_targets=set(handlers),
-                    covered_addresses=known_native_addresses,
-                    max_depth=DEFAULT_INTERNAL_DEPTH,
-                    max_blocks=min(
-                        DEFAULT_MAX_RECOVERED_BLOCKS,
-                        remaining_frontiers,
+                    recovered_batch = _recover_native_frontier_batch(
+                        recovered,
+                        block_loader=block_loader,
+                        external_targets=set(handlers),
+                        covered_addresses=known_native_addresses,
+                        max_depth=DEFAULT_INTERNAL_DEPTH,
+                        max_blocks=min(
+                            DEFAULT_MAX_RECOVERED_BLOCKS,
+                            remaining_frontiers,
+                        ),
+                    )
+                    append_native_frontier_batch(
+                        recovered_batch,
+                        symbol_prefix=(
+                            f"guest_thread_{thread_index:02d}_frontier"
+                        ),
+                    )
+                interpreted, exhausted_budget = interpret_live_native_frontier(
+                    returned_to,
+                    active_state=state,
+                    completed_steps=native_steps,
+                    remaining_steps=(
+                        max_steps - native_steps if max_steps else 0
                     ),
                 )
-                _append_native_frontier_module_batch(
-                    recovered_batch,
-                    frontier_functions=native_frontier_functions,
-                    frontier_modules=native_frontier_modules,
-                    symbol_prefix=f"guest_thread_{thread_index:02d}_frontier",
-                )
+                if interpreted is None and live_host_bridge is not None:
+                    break
+                if interpreted is not None:
+                    native_steps += interpreted.steps
+                    native_frontier_service_pending_steps += interpreted.steps
+                    returned_to = interpreted.return_address
+                    compiled_guest_block_count = len(
+                        {
+                            function.base_address
+                            for function in (
+                                entry_function,
+                                *frame_functions,
+                                *native_branch_functions,
+                                *native_frontier_functions,
+                            )
+                        }
+                    )
+                    service_now_ns = time.perf_counter_ns()
+                    should_service_frontier = (
+                        exhausted_budget
+                        or render_watchpoint.flip_count
+                        != native_frontier_service_last_flip
+                        or native_frontier_service_pending_steps
+                        >= max(1, native_slice_steps)
+                        or service_now_ns - native_frontier_service_last_ns
+                        >= 8_000_000
+                    )
+                    if should_service_frontier:
+                        if service_native_slice(
+                            state,
+                            memory,
+                            native_frontier_service_pending_steps,
+                        ) is False:
+                            break
+                        native_frontier_service_count += 1
+                        native_frontier_service_pending_steps = 0
+                        native_frontier_service_last_ns = service_now_ns
+                        native_frontier_service_last_flip = (
+                            render_watchpoint.flip_count
+                        )
+                    else:
+                        native_frontier_service_coalesced_count += 1
+                    # Even a budget-limited interpreter slice resumes through
+                    # the warm base executor. Live frontier compilation is
+                    # always deferred until the next launch's ahead build.
+                    reusable_native = native
             cooperative_scheduler_summary = {
                 "enabled": thread_index == 0,
                 "cadence": (
@@ -15696,6 +19591,8 @@ def _execute_guest_thread_start(
                 "service_count": cooperative_service_count,
                 "instruction_tick_count": cooperative_instruction_tick_count,
                 "video_tick_count": cooperative_video_tick_count,
+                "wait_skip_count": cooperative_wait_skip_count,
+                "wake_count": cooperative_wake_count,
                 "service_total_us": cooperative_service_total_us,
                 "service_max_us": cooperative_service_max_us,
                 "service_average_us": round(
@@ -15718,6 +19615,8 @@ def _execute_guest_thread_start(
                         "steps": session["steps"],
                         "state_eip_hex": _hex32(session["state"].eip),
                         "last_run": session["last_run"],
+                        "last_blocking_shim": session.get("last_blocking_shim"),
+                        "wait": _json_safe(session.get("wait")),
                         **(
                             {"error": session["error"]}
                             if "error" in session
@@ -15846,6 +19745,8 @@ def _execute_guest_thread_start(
             ),
         }
     except (X86ExecutionError, RuntimeAbiBridgeError, NativeExecutorError) as exc:
+        if native_frontier_promotion is not None:
+            native_frontier_promotion.shutdown()
         trace_events = exc.trace.to_list() if isinstance(exc, X86ExecutionError) and exc.trace is not None else []
         step_limit_boundary = None
         if _should_classify_execution_stop(exc):
@@ -15955,6 +19856,8 @@ def _execute_guest_thread_start(
             failure["steps"] = exc.steps
         return failure
 
+    if native_frontier_promotion is not None:
+        native_frontier_promotion.shutdown()
     trace_events = result.trace.to_list()
     returned_to_probe = result.return_address == return_sentinel
     completed = result.return_address == 0
@@ -16015,6 +19918,60 @@ def _execute_guest_thread_start(
                 _hex32(function.base_address) for function in native_frontier_functions
             ],
         },
+        "native_frontier_interpreter": {
+            "enabled": live_host_bridge is not None,
+            "invocation_count": native_frontier_interpreter_invocation_count,
+            "steps": native_frontier_interpreter_steps,
+            "total_us": native_frontier_interpreter_total_us,
+            "maximum_us": native_frontier_interpreter_max_us,
+            "average_us": round(
+                native_frontier_interpreter_total_us
+                / max(1, native_frontier_interpreter_invocation_count),
+                3,
+            ),
+            "compile_deferred_count": max(
+                0, native_frontier_interpreter_invocation_count
+            ),
+            "compile_fallback_count": 0,
+            "budget_yield_count": (
+                native_frontier_interpreter_budget_yield_count
+            ),
+            "wall_budget_yield_count": (
+                native_frontier_interpreter_wall_yield_count
+            ),
+            "wall_budget_us": 8_000,
+            "instruction_budget": 100_000,
+            "host_service_count": native_frontier_service_count,
+            "host_service_coalesced_count": (
+                native_frontier_service_coalesced_count
+            ),
+            "host_service_max_interval_us": 8_000,
+            "hot_targets": [
+                {
+                    "target": target,
+                    "target_hex": _hex32(target),
+                    **metrics,
+                    "average_us": round(
+                        metrics["total_us"]
+                        / max(1, metrics["invocation_count"]),
+                        3,
+                    ),
+                }
+                for target, metrics in sorted(
+                    native_frontier_interpreter_targets.items(),
+                    key=lambda item: (
+                        -item[1]["total_us"],
+                        -item[1]["invocation_count"],
+                        item[0],
+                    ),
+                )[:128]
+            ],
+        },
+        "native_frontier_promotion": (
+            native_frontier_promotion.summary()
+            if native_frontier_promotion is not None
+            else {"enabled": False}
+        ),
         "live_host_bridge": live_host_bridge.summary() if live_host_bridge is not None else None,
         "title_subsystem_initializer_audit": subsystem_initializer_audit.summary(),
         "title_frontend_registry_audit": frontend_registry_audit.summary(),
@@ -18419,7 +22376,7 @@ def main() -> int:
     parser.add_argument(
         "--dynamic-block-cache",
         type=Path,
-        help="Optional ignored JSON cache for dynamically decoded blocks.",
+        help="Optional SQLite BLOB store for dynamically decoded blocks.",
     )
     parser.add_argument(
         "--native-guest-loop",
@@ -18472,6 +22429,15 @@ def main() -> int:
         help=(
             "Guest instructions per input exchange; completed flips still "
             "yield immediately."
+        ),
+    )
+    parser.add_argument(
+        "--profile-hot-paths",
+        action="store_true",
+        help=(
+            "Enable exact native module-edge profiling, exclusive dispatcher "
+            "timing, and sampled callback latencies; normal live runs keep this "
+            "extra accounting disabled."
         ),
     )
     parser.add_argument(
@@ -18592,13 +22558,19 @@ def main() -> int:
         live_flip_audit_health_interval=args.live_flip_audit_health_interval,
         live_flip_audit_max_flips=args.live_flip_audit_max_flips,
         native_slice_steps=args.native_slice_steps,
+        profile_hot_paths=args.profile_hot_paths,
         audit_title_main_loop_exit=args.audit_title_main_loop_exit,
         audit_world_matrices=args.audit_world_matrices,
         audit_world_matrix_address=args.audit_world_matrix_address,
         audit_scene_records=args.audit_scene_records,
     )
-    output = summary_json(summary, pretty=args.pretty)
+    output = (
+        summary_json(summary, pretty=args.pretty)
+        if args.json_output is not None or not args.quiet
+        else None
+    )
     if args.json_output is not None:
+        assert output is not None
         args.json_output.parent.mkdir(parents=True, exist_ok=True)
         args.json_output.write_text(output + "\n", encoding="utf-8", newline="\n")
     if args.render_stream_output is not None:
@@ -18615,6 +22587,7 @@ def main() -> int:
             newline="\n",
         )
     if not args.quiet:
+        assert output is not None
         print(output)
     return 0
 

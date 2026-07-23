@@ -12,14 +12,14 @@ remain owned by their rights holders.
 
 ## Project Status
 
-Updated: July 19, 2026.
+Updated: July 22, 2026.
 
 The recovered boot path now runs through a resumable native guest loop, presents
 completed NV2A frames through Vulkan, plays frontend audio, and accepts
-keyboard-backed Xbox input. The presenter is paced at the console target of
-60 FPS without skipping completed flips or weakening render validation. Guest
-throughput is still under active optimization on the newly reached gameplay
-path.
+keyboard or native Windows gamepad input. The presenter is paced at the console
+target of 60 FPS without skipping completed flips or weakening render
+validation. Guest throughput is still under active optimization on the newly
+reached gameplay path.
 
 | Area | Status |
 | --- | --- |
@@ -28,7 +28,7 @@ path.
 | Runtime ABI shims | Implemented for the currently reached path |
 | IA-32 lifter and native executor | Running the recovered boot, frontend, and Lesson One path |
 | Vulkan presentation | Live completed-flip presentation with strict validation |
-| Audio and input | Live frontend audio and keyboard-backed controller state |
+| Audio and input | Live frontend audio plus keyboard and SDL3 gamepad state |
 | Gameplay | Lesson One renders the world, HUD, and player car at the correct chase-camera scale |
 
 The first playable 3D scene now renders its sky, road, foliage, walls, lights,
@@ -64,6 +64,9 @@ Developer-owned inputs and generated outputs stay ignored:
 | Dashboard/cache data | `data/local/dashboard-data/`, `data/local/cache-data/` |
 | Generated reports | `reports/local/` |
 | Native/host builds | `build/local/` |
+| Decoded-block store | `build/native-guest-loop/decoded-blocks.sqlite3` |
+| Native module manifest | `build/native-guest-loop/native-module-manifest.sqlite3` |
+| Vulkan pipeline cache | `build/local/first-frame/vulkan-pipeline-cache.bin` |
 | Local third-party tools | `data/local/tools/` |
 
 The current local extraction contains 667 files. Its `default.xbe` imports 142
@@ -73,7 +76,10 @@ section digests match; the local report records the `.text` mismatch.
 ## Quick Start
 
 The examples use PowerShell on Windows. The native presenter requires Python, a
-C++17 compiler, and a working Vulkan development/runtime environment.
+C++17 compiler, and a working Vulkan development/runtime environment. The
+current Vulkan SDK also supplies the SDL3 headers, import library, and runtime
+used by the gamepad-only input backend; the build copies `SDL3.dll` beside the
+presenter executable.
 
 Install the pinned local extraction tool:
 
@@ -100,10 +106,45 @@ Launch the normal live guest and Vulkan presenter:
 python .\tools\playability\live_test.py
 ```
 
+The presenter uses SDL3's gamepad API and supports hot-plugged Xbox,
+PlayStation, Nintendo, virtual, and third-party controllers recognized by SDL's
+mapping database. Face buttons map by position to Xbox A/B/X/Y; shoulders map
+to White/Black, and Start/Back, the D-pad, stick clicks, both sticks, and analog
+triggers are forwarded. DS4Windows is not required for a DualShock 4. Place an
+optional `gamecontrollerdb.txt` beside `b2_first_frame.exe` to extend or
+override SDL's built-in mappings. Keyboard input remains available alongside
+the controller.
+
 Close the window or press Escape to stop both processes. Use
 `--skip-host-build` when the presenter is already current. While its window is
-focused, F12 writes a uniquely named 32-bit BMP under
-`reports/local/screenshots/`.
+focused, F9 toggles a `Game FPS` counter in the window title, F11 writes a
+uniquely named text metrics snapshot directly under `reports/local/`, and F12
+writes a uniquely named 32-bit BMP under `reports/local/screenshots/`.
+
+The F9 counter measures completed guest flips rather than host presentation
+ticks, so repeated 60 Hz presentation does not hide slow gameplay. It samples
+once per second and updates only the window title; it adds no Vulkan overlay,
+readback, or per-frame diagnostic event.
+
+The F11 snapshot includes FPS, retired guest instructions, compiled guest
+blocks and page invalidations, interpreted push-buffer commands, draws,
+triangles, pipeline creations and host-cache misses, descriptor and command-
+buffer allocations, queue submissions, barriers, upload/readback volume, and
+CPU, GPU, and fence-wait frame times. Counters are cumulative from presenter
+startup; FPS and timing values describe the latest completed frame. GPU time is
+reported as `n/a` only when the selected Vulkan queue does not support timestamp
+queries.
+
+For a minimal-overhead manual run with no guest summary, presenter event log,
+screenshots, runner log, or post-run diagnostic reports:
+
+```powershell
+python .\tools\playability\live_test.py --no-diagnostics --skip-host-build
+```
+
+The live render manifest and controller-state files remain enabled because they
+are the guest/presenter IPC transport, not diagnostic artifacts. Existing
+diagnostic reports are left untouched by this mode.
 
 ## Core Workflows
 
@@ -160,7 +201,7 @@ python .\tools\recomp\recompile_range.py `
 ```powershell
 python .\tools\recomp\audit_x86_coverage.py `
   .\data\local\extracted\burnout_2_poi_usa\default.xbe `
-  --dynamic-block-cache .\reports\local\playability\dynamic-block-cache.json `
+  --dynamic-block-cache .\build\native-guest-loop\decoded-blocks.sqlite3 `
   --json-output .\reports\local\recomp\x86-coverage-audit.json `
   --pretty
 ```
@@ -175,7 +216,7 @@ support remains trace-driven.
 python .\tools\playability\playability_probe.py `
   .\data\local\extracted\burnout_2_poi_usa\default.xbe `
   --extracted-root .\data\local\extracted\burnout_2_poi_usa `
-  --dynamic-block-cache .\reports\local\playability\dynamic-block-cache.json `
+  --dynamic-block-cache .\build\native-guest-loop\decoded-blocks.sqlite3 `
   --native-guest-loop `
   --max-steps 1000000 `
   --json-output .\reports\local\playability\native-loop-1m.json
@@ -236,6 +277,40 @@ physical append-only record count and interpreter bootstrap before trusting a
 frozen replay; contaminated or non-standalone bundles produce a critical
 finding and a nonzero exit.
 
+### Use the performance-debug loop
+
+Normal live runs write
+`reports/local/playability/performance-debug-report.json`. The report measures
+guest flip rate, separates host waits from active guest time, ranks native,
+cache, callback, and presenter boundaries, and distinguishes initial,
+synchronous incremental, and background frontier compilation.
+
+Regenerate it from the latest retained summaries without rerunning the game:
+
+```powershell
+python .\tools\playability\performance_debug_report.py `
+  --probe-summary .\reports\local\playability\native-live.json `
+  --json-output .\reports\local\playability\performance-debug-report.json `
+  --pretty
+```
+
+When native dispatch or callback pressure is still ambiguous, collect the
+opt-in edge and callback attribution:
+
+```powershell
+python .\tools\playability\live_test.py `
+  --profile-hot-paths `
+  --skip-host-build
+```
+
+This mode records module-entry/exit edges, exit reasons, dispatcher self-time,
+and sampled callback latency. It has measurable overhead and is not enabled for
+representative runs.
+
+Normal live runs use presentation depth two. Use
+`--presentation-pipeline-depth 1` only for a focused lock-step handshake A/B;
+lossless flip audits always require depth one.
+
 ### Audit exact completed flips
 
 ```powershell
@@ -259,6 +334,7 @@ Normal live runs write:
 - `reports/local/playability/native-live.json`
 - `reports/local/playability/render-debug-events.jsonl`
 - `reports/local/playability/render-debug-report.json`
+- `reports/local/playability/performance-debug-report.json`
 
 Run the complete headless suite against the latest retained F12 capture:
 
@@ -324,10 +400,15 @@ The address option also enables the shader-input audit. It records the exact
 writer instruction and before/after singularity state without changing matrix
 contents. It also pairs the two Lesson One `RwMatrixRotate` calls with their
 actual axes, angle, generated sine and `1-cos`, x87 state, and complete
-input/output matrices. Normal runs do not install these callbacks. Dynamic-block
-cache v1 records are re-decoded once from the matching XBE and atomically
-rewritten as v2, so decoder fixes cannot leave stale lifted instructions in a
-warmed run.
+input/output matrices. Normal runs do not install these callbacks. Decoded
+blocks live as individually compressed BLOBs in a SQLite store, so a lookup
+decodes one requested block instead of loading a complete JSON document. Legacy
+v1 records are re-decoded from the matching XBE; v2 records are imported
+directly. When the new store is absent or lacks its completed-recovery marker,
+the launcher discovers either the old
+`reports/local/playability/dynamic-block-cache.json` or its versioned backup
+automatically. The backup is preserved after the SQLite transaction commits,
+so an interrupted or under-retained migration can be repaired once.
 
 ### Replay a recovered stream
 
@@ -339,7 +420,10 @@ python .\tools\host\first_frame_smoke.py `
 ```
 
 Set both `--max-frames 0` and `--timeout-seconds 0` for an unbounded manual
-replay. This replays captured state; it is not a live guest loop.
+replay. This replays captured state; it is not a live guest loop. Add
+`--cpu-vertex-programs` to force the reference interpreter when comparing GPU
+output or profiling the offload. Add `--cpu-vertex-attributes` to keep GPU
+program execution while restoring CPU indexed-attribute decoding.
 
 ## Live Runtime Model
 
@@ -350,19 +434,22 @@ The live path is intentionally split at explicit boundaries:
 2. Runtime shims handle observed Xbox ABI calls, including stack cleanup,
    out-parameters, handles, timing, input, files, and audio.
 3. Completed NV097 flips publish immutable command and texture generations.
-   Normal live mode places each acknowledged command interval in a bounded
-   epoch sidecar while preserving its absolute stream offset.
+   Normal live mode places acknowledged command intervals in bounded append-only
+   epoch sidecars while preserving their absolute stream offsets.
 4. The Vulkan presenter consumes each exact interval, carries split method
    packets and post-flip writes across epoch changes, retains unchanged
-   resources and pipelines, presents at 60 Hz, and acknowledges it.
+   resources and pipelines, reuses its driver pipeline cache across launches,
+   presents at 60 Hz, and acknowledges it.
 5. The launcher propagates presenter closure to the guest and performs bounded
    process-tree cleanup only if graceful shutdown fails.
 
 Normal live presentation does not skip guest flips, truncate render work, or
 substitute reduced-fidelity frames for performance. The guest and presenter
 overlap their work through a cross-process publication/acknowledgement handshake.
-After an acknowledgement, the producer rotates at that exact completed flip and
-deletes a retired command/resource generation only after its successor is safe.
+After an acknowledgement, the producer retains the current append-only command
+epoch until at least 1,048,576 completed records (16 MiB) can be retired, then
+rotates at that exact flip boundary. It deletes a retired command/resource
+generation only after its successor is safe.
 The manifest's `command_snapshot_base_record_count` and
 `command_snapshot_record_count` keep all diagnostics and continuation checks in
 absolute command space. Lossless-flip audit mode deliberately retains its
@@ -405,16 +492,16 @@ follows the guest's 0-to-1-to-0 RGBA ramp.
 ### Runtime coverage
 
 The resumable native executor reaches and runs Lesson One with frontend audio,
-keyboard-backed Xbox input, local storage, streamed track data, and cooperative
-guest workers. The dynamic-cache-seeded IA-32 audit covers 66,194 reachable
-blocks and 392,161 instructions with no remaining decoder gaps in the observed
-set. Native and interpreted regressions cover recovered x87, SSE/MMX, integer,
-string, atomic, flag, and system forms.
+keyboard and native gamepad input, local storage, streamed track data, and
+cooperative guest workers. The decoded-store-seeded IA-32 audit covers 66,194
+reachable blocks and 392,161 instructions with no remaining decoder gaps in the
+observed set. Native and interpreted regressions cover recovered x87, SSE/MMX,
+integer, string, atomic, flag, and system forms.
 
 Live publication uses immutable completed-flip generations and bounded epoch
 sidecars. Frozen F12 captures retain the exact command prefix, referenced
 resources, and interpreter bootstrap required for standalone replay. The
-current full unit suite contains 413 passing tests.
+current full unit suite contains 502 passing tests.
 
 ### Performance
 
@@ -427,14 +514,47 @@ The July 14 presenter regression remains the clean 60 FPS pacing proof:
 | Presenter steady-state FPS | 59.900 |
 | Frame p50 / p95 / p99 | 16.647 / 17.048 / 17.216 ms |
 | Reload p50 / p95 / p99 | 0.775 / 1.026 / 1.305 ms |
-| Command-load p50 / p99 | 0.109 / 0.288 ms |
 | Presenter reload busy time | 3.73% |
 | Shutdown | Guest, presenter, and launcher exited normally |
 
-A later audited gameplay run spent 5.58% of wall time in presenter reload work,
-with vertex transformation averaging 0.509 ms. Current optimization work is
-therefore focused on guest execution and simulation throughput rather than
-Vulkan presentation.
+Warm startup uses persistent decoded-block, native-module, and Vulkan pipeline
+caches. Native artifacts are keyed by compiler configuration and stable address
+partitions, exact generated-source matches can reuse a valid artifact after
+unrelated emitter metadata changes, and bounded cache pruning removes stale
+artifacts. Completed command intervals use append-only epoch sidecars; unchanged
+resource payloads, GPU allocations, pipelines, descriptors, and render targets
+are retained across reloads when their identities remain valid.
+
+The renderer executes compatible recovered vertex programs and indexed
+attribute decoding on the GPU, uses a compute path for supported Xbox texture
+formats and mip layouts, and keeps conservative CPU fallbacks for unsupported or
+audit-only cases. Normal live presentation uses pipeline depth two so the guest
+can prepare one future flip after immutable command and resource data are
+resident. Strict lossless audits remain lock-step.
+
+The July 22 diagnostics isolated two distinct costs when execution reaches new
+code. First, synchronous native frontier compilation rebuilt large call-fused
+partitions and caused 41-50 second frame stalls. Running newly recovered CFGs in
+the exact interpreter removed those stalls, but permanent interpretation then
+created 20,765 native/interpreter crossings, 38,590 host-service exchanges, and
+a 0.658 Hz guest flip rate. The apparent multi-million-second compiler total in
+that report was duplicated cache metadata; the run contained one 304.987-second
+cold initial build and no synchronous incremental compilation.
+
+Known frontier modules now stay within one interpreter dispatch across calls,
+jumps, and returns. Interpretation has an 8 ms wall-time deadline and coalesces
+host service until a flip, deadline, native slice budget, or service interval.
+At the same time, one below-normal-priority worker builds a cumulative
+base-plus-frontier executor from small independent partitions. The live thread
+adopts a completed executor only at a native execution boundary.
+
+A controlled 2,161-instruction frontier promoted off-thread in 3.505 seconds and
+then executed 2,162 base/frontier steps natively with the expected CPU state.
+Diagnostics distinguish initial, synchronous incremental, and background
+promotion compilation and report hot interpreted targets, budget yields,
+promotion failures, and coalesced host service. A normal un-audited gameplay run
+is still required to measure post-promotion guest FPS and foreground frame
+pacing.
 
 ### Known limitations
 
@@ -465,19 +585,19 @@ tools/
 tests/unit/      Unit and regression tests
 ```
 
-`data/local/`, `reports/local/`, `build/local/`, extracted game content,
-generated C++, dynamic-block caches, and recovered stream reports are ignored.
+`data/local/`, `reports/local/`, generated build/cache directories, extracted
+game content, generated C++, and recovered stream reports are ignored.
 
 ## Development Priorities
 
 1. Add the corrected complete-world frame and restored Load/Save frame to the
    strict preflight replay suite.
-2. Measure normal un-audited gameplay throughput and profile the remaining
-   guest simulation cost.
+2. Measure normal un-audited gameplay throughput after frontier promotion, then
+   optimize the remaining guest simulation cost without changing guest-visible
+   behavior.
 3. Design a versioned save state covering CPU state, sparse-memory changes,
    runtime objects, audio, and the live bridge.
-4. Compact or replace the large JSON dynamic-block cache to reduce startup cost.
-5. Measure longer-run input/audio behavior and replace remaining probe-only
+4. Measure longer-run input/audio behavior and replace remaining probe-only
    models with recovered semantics where evidence permits.
-6. Continue adding IA-32, NV2A, and Xbox ABI support only for observed paths,
+5. Continue adding IA-32, NV2A, and Xbox ABI support only for observed paths,
    with focused regressions for each new edge.
