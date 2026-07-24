@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: b2-quality-gate
+        name: b2_recomp Python and asset-free quality gate
+        entry: python tools/quality_gate.py
+        language: system
+        pass_filenames: false
+        always_run: true

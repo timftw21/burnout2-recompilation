@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "platform": "windows-x86_64",
+  "python_build_tools": {
+    "cmake": "4.4.0",
+    "ninja": "1.13.0"
+  },
+  "compiler": {
+    "family": "clang",
+    "version": "22.1.8",
+    "target": "x86_64-pc-windows-msvc",
+    "sha256": "986af49c2d1eefeac324f724ff54597753d1053927fa5d58a37a457f578e1cf8"
+  },
+  "vulkan_sdk": {
+    "version": "1.4.341.1",
+    "header_version": 341,
+    "artifacts": {
+      "Bin/glslc.exe": "6193189b7855666d1ef5104c4a759ca26d15fa85e2c1c5ea6c1e1b24a37c0e4b",
+      "Bin/SDL3.dll": "25473f9bdfd9cb2d87cc7af617272ef1e22cd2b56a056f36fa9c62b5d33bebc1",
+      "Include/SDL3/SDL_version.h": "e51b8114aecab6a7a7134e3682e45ec8123558bcb76d9e9737864176b069c6c1",
+      "Include/vulkan/vulkan_core.h": "dc340d0561e1eb333af35b4766d36f96445e451479839276f3412fb275f4623a",
+      "Lib/SDL3.lib": "31d5f4944f2f342c4e4d182ea896644e86ce7a4d56c5e5f79ec14dea8600d8db",
+      "Lib/vulkan-1.lib": "75793a45e02d5831594742e2e76a0a1b4e82fe4cced086925e2e15343a67fbef"
+    }
+  },
+  "sdl3": {
+    "version": "3.4.0"
+  }
+}

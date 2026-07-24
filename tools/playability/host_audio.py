@@ -1,10 +1,11 @@
-"""Minimal RenderWare PCM extraction and Windows host playback."""
+"""RenderWare PCM extraction, software mixing, and SDL3 host playback."""
 
 from __future__ import annotations
 
 import io
 import array
 import ctypes
+import os
 import queue
 import struct
 import sys
@@ -12,6 +13,7 @@ import threading
 import time
 import wave
 from dataclasses import dataclass
+from pathlib import Path
 
 
 RWS_FILE_ID = 0x809
@@ -24,6 +26,13 @@ RWS_PCM16_CODEC_UUID = 0xD01BD217
 RWS_STREAMED_FILE_ID = 0x80D
 RWS_STREAMED_HEADER_ID = 0x80E
 RWS_STREAMED_DATA_ID = 0x80F
+DEFAULT_AUDIO_LIBRARY = (
+    Path(__file__).resolve().parents[2]
+    / "build"
+    / "local"
+    / "first-frame"
+    / "b2_presenter.dll"
+)
 
 _IMA_INDEX_TABLE = (-1, -1, -1, -1, 2, 4, 6, 8) * 2
 _IMA_STEP_TABLE = (
@@ -56,154 +65,47 @@ class _QueuedPlayback:
     gain: float = 1.0
 
 
-class _WaveFormatEx(ctypes.Structure):
-    _pack_ = 2
-    _fields_ = (
-        ("wFormatTag", ctypes.c_uint16),
-        ("nChannels", ctypes.c_uint16),
-        ("nSamplesPerSec", ctypes.c_uint32),
-        ("nAvgBytesPerSec", ctypes.c_uint32),
-        ("nBlockAlign", ctypes.c_uint16),
-        ("wBitsPerSample", ctypes.c_uint16),
-        ("cbSize", ctypes.c_uint16),
-    )
+class _SdlAudioSink:
+    """Queue fixed-format mixed PCM through the presenter's SDL3 audio API."""
 
-
-class _WaveHeader(ctypes.Structure):
-    _fields_ = (
-        ("lpData", ctypes.c_void_p),
-        ("dwBufferLength", ctypes.c_uint32),
-        ("dwBytesRecorded", ctypes.c_uint32),
-        ("dwUser", ctypes.c_size_t),
-        ("dwFlags", ctypes.c_uint32),
-        ("dwLoops", ctypes.c_uint32),
-        ("lpNext", ctypes.c_void_p),
-        ("reserved", ctypes.c_size_t),
-    )
-
-
-class _WaveOutPcmSink:
-    """Keep several raw PCM buffers queued in WinMM to avoid boundary gaps."""
-
-    _WHDR_DONE = 0x00000001
-    _CALLBACK_NULL = 0
-    _WAVE_MAPPER = 0xFFFFFFFF
-
-    def __init__(self, *, buffer_count: int = 4) -> None:
-        self._winmm = ctypes.WinDLL("winmm")
-        self._handle = ctypes.c_void_p()
-        self._pending: list[tuple[ctypes.Array[ctypes.c_char], _WaveHeader]] = []
-        self._buffer_count = max(2, buffer_count)
-        self._configure_api()
-        format_info = _WaveFormatEx(
-            1,
-            2,
-            48000,
-            48000 * 2 * 2,
-            2 * 2,
-            16,
-            0,
-        )
-        self._check(
-            self._winmm.waveOutOpen(
-                ctypes.byref(self._handle),
-                self._WAVE_MAPPER,
-                ctypes.byref(format_info),
-                0,
-                0,
-                self._CALLBACK_NULL,
-            ),
-            "waveOutOpen",
-        )
-
-    def _configure_api(self) -> None:
-        header_pointer = ctypes.POINTER(_WaveHeader)
-        self._winmm.waveOutOpen.argtypes = (
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.c_uint,
-            ctypes.POINTER(_WaveFormatEx),
-            ctypes.c_size_t,
-            ctypes.c_size_t,
-            ctypes.c_uint32,
-        )
-        self._winmm.waveOutOpen.restype = ctypes.c_uint
-        for name in ("waveOutPrepareHeader", "waveOutWrite", "waveOutUnprepareHeader"):
-            function = getattr(self._winmm, name)
-            function.argtypes = (ctypes.c_void_p, header_pointer, ctypes.c_uint)
-            function.restype = ctypes.c_uint
-        for name in ("waveOutReset", "waveOutClose"):
-            function = getattr(self._winmm, name)
-            function.argtypes = (ctypes.c_void_p,)
-            function.restype = ctypes.c_uint
-
-    @staticmethod
-    def _check(result: int, operation: str) -> None:
-        if result:
-            raise RuntimeError(f"{operation} failed with WinMM status {result}")
-
-    def _release_completed(self) -> None:
-        retained: list[tuple[ctypes.Array[ctypes.c_char], _WaveHeader]] = []
-        for buffer, header in self._pending:
-            if header.dwFlags & self._WHDR_DONE:
-                self._check(
-                    self._winmm.waveOutUnprepareHeader(
-                        self._handle, ctypes.byref(header), ctypes.sizeof(header)
-                    ),
-                    "waveOutUnprepareHeader",
-                )
-            else:
-                retained.append((buffer, header))
-        self._pending = retained
+    def __init__(self, library: Path = DEFAULT_AUDIO_LIBRARY) -> None:
+        if sys.platform != "win32":
+            raise OSError("SDL3 audio output is currently built for Windows")
+        if not library.is_file():
+            raise OSError(f"SDL3 audio library is missing: {library}")
+        dll_directory = os.add_dll_directory(str(library.parent.resolve()))
+        try:
+            self._library = ctypes.CDLL(str(library.resolve()))
+        finally:
+            dll_directory.close()
+        self._open = self._library.b2r_audio_open
+        self._open.argtypes = []
+        self._open.restype = ctypes.c_int
+        self._queue = self._library.b2r_audio_queue
+        self._queue.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+        self._queue.restype = ctypes.c_int
+        self._clear = self._library.b2r_audio_clear
+        self._clear.argtypes = []
+        self._clear.restype = ctypes.c_int
+        self._queued_bytes = self._library.b2r_audio_queued_bytes
+        self._queued_bytes.argtypes = []
+        self._queued_bytes.restype = ctypes.c_uint64
+        if not self._open():
+            raise RuntimeError("SDL3 audio device initialization failed")
 
     def write(self, payload: bytes) -> None:
-        while len(self._pending) >= self._buffer_count:
-            self._release_completed()
-            if len(self._pending) >= self._buffer_count:
-                time.sleep(0.001)
-        buffer = ctypes.create_string_buffer(payload)
-        header = _WaveHeader(
-            ctypes.cast(buffer, ctypes.c_void_p),
-            len(payload),
-            0,
-            0,
-            0,
-            0,
-            None,
-            0,
-        )
-        self._check(
-            self._winmm.waveOutPrepareHeader(
-                self._handle, ctypes.byref(header), ctypes.sizeof(header)
-            ),
-            "waveOutPrepareHeader",
-        )
-        try:
-            self._check(
-                self._winmm.waveOutWrite(
-                    self._handle, ctypes.byref(header), ctypes.sizeof(header)
-                ),
-                "waveOutWrite",
-            )
-        except RuntimeError:
-            self._winmm.waveOutUnprepareHeader(
-                self._handle, ctypes.byref(header), ctypes.sizeof(header)
-            )
-            raise
-        self._pending.append((buffer, header))
-
-    def close(self) -> None:
-        if not self._handle:
+        if not payload:
             return
-        self.reset()
-        self._winmm.waveOutClose(self._handle)
-        self._handle = ctypes.c_void_p()
+        buffer = (ctypes.c_uint8 * len(payload)).from_buffer_copy(payload)
+        if not self._queue(buffer, len(payload)):
+            raise RuntimeError("SDL3 audio queue submission failed")
 
     def reset(self) -> None:
-        if not self._handle:
-            return
-        self._winmm.waveOutReset(self._handle)
-        self._release_completed()
-        self._pending.clear()
+        if not self._clear():
+            raise RuntimeError("SDL3 audio queue reset failed")
+
+    def queued_bytes(self) -> int:
+        return int(self._queued_bytes())
 
 
 def parse_rws_pcm(payload: bytes) -> list[PcmClip]:
@@ -396,10 +298,16 @@ def scale_pcm_volume(payload: bytes, *, bits_per_sample: int, gain: float) -> by
     return samples.tobytes()
 
 
-class WindowsPcmOutput:
-    """Queue PCM clips to the native Windows waveform output off the guest thread."""
+class SdlPcmOutput:
+    """Mix PCM clips off the guest thread and queue them to SDL3."""
 
-    def __init__(self, *, queue_depth: int = 16, master_volume: float = 0.5) -> None:
+    def __init__(
+        self,
+        *,
+        queue_depth: int = 16,
+        master_volume: float = 0.5,
+        library: Path = DEFAULT_AUDIO_LIBRARY,
+    ) -> None:
         self.available = sys.platform == "win32"
         self.master_volume = max(0.0, min(1.0, float(master_volume)))
         self.submitted_buffer_count = 0
@@ -407,11 +315,11 @@ class WindowsPcmOutput:
         self.error_count = 0
         self.looping = False
         self._queue: queue.Queue[_QueuedPlayback] = queue.Queue(maxsize=max(1, queue_depth))
-        self._sink: _WaveOutPcmSink | None = None
+        self._sink: _SdlAudioSink | None = None
         if not self.available:
             return
         try:
-            self._sink = _WaveOutPcmSink()
+            self._sink = _SdlAudioSink(library)
         except (OSError, RuntimeError):
             self.available = False
             self.error_count += 1
@@ -535,14 +443,16 @@ class WindowsPcmOutput:
                 time.sleep(0.05)
 
     def summary(self) -> dict[str, int | float | bool | str]:
+        sink = getattr(self, "_sink", None)
         return {
-            "backend": "winmm_waveout",
+            "backend": "sdl3_audio_stream",
             "available": self.available,
             "master_volume": self.master_volume,
             "submitted_buffer_count": self.submitted_buffer_count,
             "dropped_buffer_count": self.dropped_buffer_count,
             "error_count": self.error_count,
             "looping": self.looping,
+            "native_queued_bytes": sink.queued_bytes() if sink is not None else 0,
         }
 
 

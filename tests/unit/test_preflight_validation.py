@@ -11,6 +11,7 @@ from tools.playability.preflight_validation import (
     analyze_frame_sequence,
     analyze_probe_health,
     analyze_render_capabilities,
+    build_synthetic_preflight_report,
     inspect_frame_health,
     load_render_stream,
     run_replay_suite,
@@ -93,6 +94,18 @@ def _render_stream(
 
 
 class PreflightValidationTests(unittest.TestCase):
+    def test_synthetic_preflight_runs_without_game_assets_or_host_build(self) -> None:
+        report = build_synthetic_preflight_report()
+
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["fixture_mode"], "synthetic_ephemeral")
+        self.assertEqual(report["check_count"], 4)
+        self.assertEqual(report["failed_check_count"], 0)
+        self.assertTrue(report["asset_preflight"]["passed"])
+        self.assertTrue(report["render_capability_inventory"][0]["passed"])
+        self.assertTrue(report["probe_health"]["passed"])
+        self.assertTrue(report["frame_sequence_health"]["passed"])
+
     def test_asset_preflight_inventories_dictionary_texture_formats(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

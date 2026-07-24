@@ -1,0 +1,224 @@
+{
+  "schema_version": 1,
+  "tool_contract": {
+    "analysis_schema_version": 1,
+    "generated_code_abi_version": 1,
+    "runtime_compatibility_version": 1
+  },
+  "targets": [
+    {
+      "target_id": "burnout-2-poi-usa-v3-b5207c40",
+      "description": "Burnout 2: Point of Impact (USA), certificate version 3, audited local executable",
+      "file_size": 3448832,
+      "file_sha256": "B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF",
+      "normalized_image_sha256": "4082FE6475E8E1C0DF5A61E4A442FF117B226D2818E6228DD6E20F20C13FAB35",
+      "header": {
+        "base_address": 65536,
+        "image_size": 5984704,
+        "headers_size": 2936,
+        "section_count": 17,
+        "timestamp": 1050490572
+      },
+      "certificate": {
+        "title_id": "41430019",
+        "title_name": "Burnout 2",
+        "timestamp": 1050694364,
+        "game_region": 1,
+        "game_region_names": [
+          "NA"
+        ],
+        "disc_number": 0,
+        "version": 3
+      },
+      "sections": [
+        {
+          "index": 0,
+          "name": ".text",
+          "virtual_address": 69632,
+          "virtual_size": 2083648,
+          "raw_address": 4096,
+          "raw_size": 2083648,
+          "expected_sha1": "67D00DDA25E36BC8E4DC0EA8ED22508691496896",
+          "actual_sha1": "E79BE24DE3955F78856A2DCC7D9719B6029BF133",
+          "embedded_digest_matches": false
+        },
+        {
+          "index": 1,
+          "name": "XACTENG",
+          "virtual_address": 2153280,
+          "virtual_size": 27764,
+          "raw_address": 2088960,
+          "raw_size": 27764,
+          "expected_sha1": "D3BB589E98A068B318173305C7374973CE45600B",
+          "actual_sha1": "D3BB589E98A068B318173305C7374973CE45600B",
+          "embedded_digest_matches": true
+        },
+        {
+          "index": 2,
+          "name": "D3D",
+          "virtual_address": 2181056,
+          "virtual_size": 77760,
+          "raw_address": 2117632,
+          "raw_size": 64296,
+          "expected_sha1": "B9632308494C0BDE1CACE86ECEF0B086C2C8BE8C",
+          "actual_sha1": "B9632308494C0BDE1CACE86ECEF0B086C2C8BE8C",
+          "embedded_digest_matches": true
+        },
+        {
+          "index": 3,
+          "name": "D3DX",
+          "virtual_address": 2258816,
+          "virtual_size": 9872,
+          "raw_address": 2183168,
+          "raw_size": 9864,
+          "expected_sha1": "4AF2F4216689F0DDAD4CC5752F19A0379EE2E2CB",
+          "actual_sha1": "4AF2F4216689F0DDAD4CC5752F19A0379EE2E2CB",
+          "embedded_digest_matches": true
+        },
+        {
+          "index": 4,
+          "name": "XGRPH",
+          "virtual_address": 2268704,
+          "virtual_size": 8252,
+          "raw_address": 2195456,
+          "raw_size": 8252,
+          "expected_sha1": "06EA4373BF70554055832448ABAA8500396D6397",
+          "actual_sha1": "06EA4373BF70554055832448ABAA8500396D6397",
+          "embedded_digest_matches": true
+        },
+        {
+          "index": 5,
+          "name": "DSOUND",
+          "virtual_address": 2276960,
+          "virtual_size": 127036,
+          "raw_address": 2207744,
+          "raw_size": 126412,
+          "expected_sha1": "9F4B3CF7A81E2F1E0C4D0101FC5C091CCA60EE78",
+          "actual_sha1": "9F4B3CF7A81E2F1E0C4D0101FC5C091CCA60EE78",
+          "embedded_digest_matches": true
+        },
+        {
+          "index": 6,
+          "name": "WMADEC",
+          "virtual_address": 2404000,
+          "virtual_size": 105164,
+          "raw_address": 2334720,
+          "raw_size": 105164,
+          "expected_sha1": "24D635D529E217971DBD1CE10406442BA44A324A",
+          "actual_sha1": "24D635D529E217971DBD1CE10406442BA44A324A",
+          "embedded_digest_matches": true
+        },
+        {
+          "index": 7,
+          "name": "XONLINE",
+          "virtual_address": 2509184,
+          "virtual_size": 90936,
+          "raw_address": 2441216,
+          "raw_size": 90936,
+          "expected_sha1": "EA9EB5D3E6C64383B9B78EE7AA3DDEE13EEFC026",
+          "actual_sha1": "EA9EB5D3E6C64383B9B78EE7AA3DDEE13EEFC026",
+          "embedded_digest_matches": true
+        },
+        {
+          "index": 8,
+          "name": "XNET",
+          "virtual_address": 2600128,
+          "virtual_size": 70368,
+          "raw_address": 2535424,
+          "raw_size": 70368,
+          "expected_sha1": "AE4561F990F5C303CA0B955A318543213DFB4721",
+          "actual_sha1": "AE4561F990F5C303CA0B955A318543213DFB4721",
+          "embedded_digest_matches": true
+        },
+        {
+          "index": 9,
+          "name": "XPP",
+          "virtual_address": 2670496,
+          "virtual_size": 31980,
+          "raw_address": 2609152,
+          "raw_size": 31980,
+          "expected_sha1": "6D68151B0C85EEE49C7252D0A0CDF60286363811",
+          "actual_sha1": "6D68151B0C85EEE49C7252D0A0CDF60286363811",
+          "embedded_digest_matches": true
+        },
+        {
+          "index": 10,
+          "name": ".rdata",
+          "virtual_address": 2702496,
+          "virtual_size": 235968,
+          "raw_address": 2641920,
+          "raw_size": 235952,
+          "expected_sha1": "6EA5FD7EE246C468F23C7A9FCFD867CFB1AA0487",
+          "actual_sha1": "6EA5FD7EE246C468F23C7A9FCFD867CFB1AA0487",
+          "embedded_digest_matches": true
+        },
+        {
+          "index": 11,
+          "name": ".data",
+          "virtual_address": 2938464,
+          "virtual_size": 3062780,
+          "raw_address": 2879488,
+          "raw_size": 505416,
+          "expected_sha1": "003FA373E677A09B26831F2A3C4872E1FF31F692",
+          "actual_sha1": "003FA373E677A09B26831F2A3C4872E1FF31F692",
+          "embedded_digest_matches": true
+        },
+        {
+          "index": 12,
+          "name": "DOLBY",
+          "virtual_address": 6001248,
+          "virtual_size": 29056,
+          "raw_address": 3387392,
+          "raw_size": 29036,
+          "expected_sha1": "C8C9142DCCBD31BDCA9A2D94E0ACC47C2048D615",
+          "actual_sha1": "C8C9142DCCBD31BDCA9A2D94E0ACC47C2048D615",
+          "embedded_digest_matches": true
+        },
+        {
+          "index": 13,
+          "name": "XON_RD",
+          "virtual_address": 6030304,
+          "virtual_size": 4817,
+          "raw_address": 3420160,
+          "raw_size": 4816,
+          "expected_sha1": "0A5E1D551A500D5A0ED8C6CA76690F7AE1BD271E",
+          "actual_sha1": "0A5E1D551A500D5A0ED8C6CA76690F7AE1BD271E",
+          "embedded_digest_matches": true
+        },
+        {
+          "index": 14,
+          "name": "$$XTIMAGE",
+          "virtual_address": 6035136,
+          "virtual_size": 10240,
+          "raw_address": 3428352,
+          "raw_size": 10240,
+          "expected_sha1": "2385160319DC15639F049AF0807BF0470315D2D7",
+          "actual_sha1": "2385160319DC15639F049AF0807BF0470315D2D7",
+          "embedded_digest_matches": true
+        },
+        {
+          "index": 15,
+          "name": "$$XSIMAGE",
+          "virtual_address": 6045376,
+          "virtual_size": 4096,
+          "raw_address": 3440640,
+          "raw_size": 4096,
+          "expected_sha1": "A92779DE823CF1FD92F07CB0E0FB5375A72A3E8B",
+          "actual_sha1": "A92779DE823CF1FD92F07CB0E0FB5375A72A3E8B",
+          "embedded_digest_matches": true
+        },
+        {
+          "index": 16,
+          "name": ".XTLID",
+          "virtual_address": 6049472,
+          "virtual_size": 744,
+          "raw_address": 3444736,
+          "raw_size": 744,
+          "expected_sha1": "3100C30204411714A1A002E13F180CA43F182285",
+          "actual_sha1": "3100C30204411714A1A002E13F180CA43F182285",
+          "embedded_digest_matches": true
+        }
+      ]
+    }
+  ]
+}

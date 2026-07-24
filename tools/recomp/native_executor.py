@@ -28,6 +28,9 @@ from tools.recomp.x86_lifter import (
 
 NATIVE_MEMORY_CALLBACK_SAMPLE_INTERVAL = 1024
 NATIVE_MEMORY_CALLBACK_HOT_ADDRESS_LIMIT = 32
+NATIVE_MEMORY_CALLBACK_SAMPLE_KEY_LIMIT = 256
+NATIVE_DISPATCH_EDGE_CAPACITY_LIMIT = 1 << 16
+NATIVE_DISPATCH_EDGE_REPORT_LIMIT = 1024
 NATIVE_EMITTER_SOURCE_FILE = Path(emit_cpp.__code__.co_filename).resolve()
 
 
@@ -550,6 +553,7 @@ _NATIVE_DISPATCH_SOURCE = r"""
 #include <cstring>
 
 using B2RNativeEntry = uint32_t (__cdecl *)(void*);
+using B2RHostCall = uint32_t (__cdecl *)(void*, uint32_t, void*);
 using B2RDispatchClock = std::chrono::steady_clock;
 static constexpr uint32_t B2R_MODULE_EXIT_REASON_COUNT = 9u;
 
@@ -600,12 +604,437 @@ static void b2r_record_dispatch_edge(
     ++*edge_overflow_count;
 }
 
+struct B2RNativeHostServiceEntry {
+    uint32_t target;
+    uint32_t kind;
+    uint32_t stack_cleanup_bytes;
+    uint32_t value;
+};
+
+constexpr uint32_t B2R_WORKER_LIFECYCLE_CAPACITY = 64u;
+constexpr uint32_t B2R_WORKER_READY = 1u;
+constexpr uint32_t B2R_WORKER_RUNNING = 2u;
+constexpr uint32_t B2R_WORKER_WAITING = 3u;
+constexpr uint32_t B2R_WORKER_COMPLETED = 4u;
+constexpr uint32_t B2R_WORKER_BLOCKED = 5u;
+constexpr uint32_t B2R_WORKER_FAILED = 6u;
+constexpr uint32_t B2R_WORKER_SUSPENDED = 7u;
+
+struct B2RNativeWorkerLifecycleEntry {
+    uint32_t handle;
+    uint32_t start_address;
+    uint32_t start_context1;
+    uint32_t start_context2;
+    uint32_t status;
+    uint32_t generation;
+};
+
+struct B2RNativeWorkerLifecycleState {
+    B2RNativeWorkerLifecycleEntry entries[B2R_WORKER_LIFECYCLE_CAPACITY];
+    uint32_t entry_count;
+    uint32_t selection_cursor;
+    uint64_t transition_count;
+    uint64_t created_count;
+    uint64_t resumed_count;
+    uint64_t suspended_count;
+    uint64_t completed_count;
+    uint64_t overflow_count;
+};
+
+static B2RNativeWorkerLifecycleEntry* b2r_find_worker(
+    B2RNativeWorkerLifecycleState* state,
+    uint32_t handle
+) {
+    if (state == nullptr || handle == 0u) { return nullptr; }
+    for (uint32_t index = 0u; index < state->entry_count; ++index) {
+        if (state->entries[index].handle == handle) {
+            return &state->entries[index];
+        }
+    }
+    return nullptr;
+}
+
+static bool b2r_set_worker_status(
+    B2RNativeWorkerLifecycleState* state,
+    B2RNativeWorkerLifecycleEntry* worker,
+    uint32_t status
+) {
+    if (state == nullptr || worker == nullptr || worker->status == status) {
+        return worker != nullptr;
+    }
+    worker->status = status;
+    if (++worker->generation == 0u) { worker->generation = 1u; }
+    ++state->transition_count;
+    if (status == B2R_WORKER_READY) { ++state->resumed_count; }
+    if (status == B2R_WORKER_SUSPENDED) { ++state->suspended_count; }
+    if (status == B2R_WORKER_COMPLETED) { ++state->completed_count; }
+    return true;
+}
+
+static B2RNativeWorkerLifecycleEntry* b2r_upsert_worker(
+    B2RNativeWorkerLifecycleState* state,
+    uint32_t handle,
+    uint32_t start_address,
+    uint32_t start_context1,
+    uint32_t start_context2,
+    uint32_t status
+) {
+    B2RNativeWorkerLifecycleEntry* worker = b2r_find_worker(state, handle);
+    if (worker == nullptr) {
+        if (state == nullptr ||
+            state->entry_count >= B2R_WORKER_LIFECYCLE_CAPACITY) {
+            if (state != nullptr) { ++state->overflow_count; }
+            return nullptr;
+        }
+        worker = &state->entries[state->entry_count++];
+        worker->handle = handle;
+        worker->generation = 1u;
+        worker->status = status;
+        ++state->created_count;
+        ++state->transition_count;
+        if (status == B2R_WORKER_SUSPENDED) { ++state->suspended_count; }
+    } else {
+        b2r_set_worker_status(state, worker, status);
+    }
+    worker->start_address = start_address;
+    worker->start_context1 = start_context1;
+    worker->start_context2 = start_context2;
+    return worker;
+}
+
+struct B2RNativeControllerState {
+    uint16_t buttons;
+    uint8_t left_trigger;
+    uint8_t right_trigger;
+    int16_t thumb_lx;
+    int16_t thumb_ly;
+    int16_t thumb_rx;
+    int16_t thumb_ry;
+    uint8_t connected;
+    uint8_t reserved[3];
+    uint32_t generation;
+};
+
+struct B2RNativeHostServiceState {
+    B2RNativeHostServiceEntry* entries;
+    uint32_t entry_count;
+    uint32_t eax_offset;
+    uint32_t esp_offset;
+    uint32_t eip_offset;
+    uint64_t performance_counter;
+    uint64_t system_time_filetime;
+    B2RNativeControllerState controllers[4];
+    uint32_t controller_packets[4];
+    uint32_t controller_last_generations[4];
+    uint64_t service_call_counts[9];
+    uint64_t native_call_count;
+    uint32_t observed_button_mask;
+    uint32_t a_pressed_poll_count;
+    uint32_t successful_get_state_count;
+    uint32_t reserved_metrics;
+    B2RNativeWorkerLifecycleState* worker_lifecycle;
+    uint32_t current_worker_handle;
+    uint32_t yield_requested_offset;
+    B2RHostCall cold_call;
+    void* cold_user;
+    uint8_t** read_pages;
+    void* memory_user;
+    uint32_t (__cdecl *read_u32)(void*, uint32_t);
+    void (__cdecl *write_u32)(void*, uint32_t, uint32_t);
+    uint8_t (__cdecl *read_u8)(void*, uint32_t);
+    void (__cdecl *write_u8)(void*, uint32_t, uint8_t);
+    bool cache_physical_aliases;
+    uint8_t* dirty_pages;
+    uint32_t* dirty_page_generations;
+    uint32_t* dirty_page_indices;
+    uint16_t* dirty_page_min_offsets;
+    uint16_t* dirty_page_max_offsets;
+    uint32_t* dirty_page_count;
+    uint32_t dirty_page_capacity;
+};
+
+static uint32_t b2r_native_service_cache_address(
+    B2RNativeHostServiceState* state,
+    uint32_t address
+) {
+    if (state->cache_physical_aliases &&
+        address >= 0xa0000000u && address <= 0xbfffffffu) {
+        return address & 0x7fffffffu;
+    }
+    return address;
+}
+
+static uint32_t b2r_native_service_read_u32(
+    B2RNativeHostServiceState* state,
+    uint32_t address
+) {
+    const uint32_t cached = b2r_native_service_cache_address(state, address);
+    const uint32_t page = cached >> 12u;
+    if ((cached & 0xfffu) <= 0xffcu && state->read_pages != nullptr &&
+        state->read_pages[page] != nullptr) {
+        uint32_t value;
+        std::memcpy(&value, state->read_pages[page] + (cached & 0xfffu), 4u);
+        return value;
+    }
+    return state->read_u32(state->memory_user, address);
+}
+
+static void b2r_native_service_mark_dirty(
+    B2RNativeHostServiceState* state,
+    uint32_t page,
+    uint16_t offset,
+    uint16_t size
+) {
+    if (state->dirty_pages == nullptr) { return; }
+    if (state->dirty_page_generations != nullptr) {
+        if (++state->dirty_page_generations[page] == 0u) {
+            state->dirty_page_generations[page] = 1u;
+        }
+    }
+    const uint16_t end = static_cast<uint16_t>(offset + size);
+    if (state->dirty_pages[page] == 0u) {
+        state->dirty_pages[page] = 1u;
+        state->dirty_page_min_offsets[page] = offset;
+        state->dirty_page_max_offsets[page] = end;
+        if (state->dirty_page_indices != nullptr &&
+            *state->dirty_page_count < state->dirty_page_capacity) {
+            state->dirty_page_indices[(*state->dirty_page_count)++] = page;
+        }
+    } else {
+        if (offset < state->dirty_page_min_offsets[page]) {
+            state->dirty_page_min_offsets[page] = offset;
+        }
+        if (end > state->dirty_page_max_offsets[page]) {
+            state->dirty_page_max_offsets[page] = end;
+        }
+    }
+}
+
+static void b2r_native_service_write_u8(
+    B2RNativeHostServiceState* state,
+    uint32_t address,
+    uint8_t value
+) {
+    const uint32_t cached = b2r_native_service_cache_address(state, address);
+    const uint32_t page = cached >> 12u;
+    if (state->read_pages != nullptr && state->read_pages[page] != nullptr) {
+        state->read_pages[page][cached & 0xfffu] = value;
+        b2r_native_service_mark_dirty(
+            state, page, static_cast<uint16_t>(cached & 0xfffu), 1u);
+        return;
+    }
+    state->write_u8(state->memory_user, address, value);
+}
+
+static void b2r_native_service_write_u32(
+    B2RNativeHostServiceState* state,
+    uint32_t address,
+    uint32_t value
+) {
+    const uint32_t cached = b2r_native_service_cache_address(state, address);
+    const uint32_t page = cached >> 12u;
+    if ((cached & 0xfffu) <= 0xffcu && state->read_pages != nullptr &&
+        state->read_pages[page] != nullptr) {
+        std::memcpy(state->read_pages[page] + (cached & 0xfffu), &value, 4u);
+        b2r_native_service_mark_dirty(
+            state, page, static_cast<uint16_t>(cached & 0xfffu), 4u);
+        return;
+    }
+    state->write_u32(state->memory_user, address, value);
+}
+
+static bool b2r_try_native_host_service(
+    B2RNativeHostServiceState* state,
+    uint32_t target,
+    void* context,
+    uint32_t* next_target
+) {
+    if (state == nullptr || state->entries == nullptr) { return false; }
+    B2RNativeHostServiceEntry* service = nullptr;
+    for (uint32_t index = 0u; index < state->entry_count; ++index) {
+        if (state->entries[index].target == target) {
+            service = &state->entries[index];
+            break;
+        }
+    }
+    if (service == nullptr || service->kind == 0u || service->kind >= 9u) {
+        return false;
+    }
+    uint8_t* bytes = static_cast<uint8_t*>(context);
+    uint32_t& eax = *reinterpret_cast<uint32_t*>(bytes + state->eax_offset);
+    uint32_t& esp = *reinterpret_cast<uint32_t*>(bytes + state->esp_offset);
+    uint32_t& eip = *reinterpret_cast<uint32_t*>(bytes + state->eip_offset);
+    const uint32_t return_address = b2r_native_service_read_u32(state, esp);
+    auto argument = [&](uint32_t index) {
+        return b2r_native_service_read_u32(state, esp + 4u + index * 4u);
+    };
+    constexpr uint32_t kDisconnected = 0x48fu;
+    switch (service->kind) {
+    case 1u:
+        eax = service->value;
+        break;
+    case 2u:
+        eax = static_cast<uint32_t>(state->performance_counter);
+        break;
+    case 3u: {
+        const uint32_t output = argument(0u);
+        if (output != 0u) {
+            b2r_native_service_write_u32(
+                state, output, static_cast<uint32_t>(state->system_time_filetime));
+            b2r_native_service_write_u32(
+                state, output + 4u,
+                static_cast<uint32_t>(state->system_time_filetime >> 32u));
+        }
+        break;
+    }
+    case 4u: {
+        uint32_t mask = 0u;
+        for (uint32_t port = 0u; port < 4u; ++port) {
+            if (state->controllers[port].connected != 0u) { mask |= 1u << port; }
+        }
+        eax = mask;
+        break;
+    }
+    case 5u: {
+        const uint32_t port = argument(1u);
+        eax = port < 4u && state->controllers[port].connected != 0u
+            ? 0xb2401000u + port : 0u;
+        break;
+    }
+    case 6u: {
+        const uint32_t handle = argument(0u);
+        const uint32_t output = argument(1u);
+        const uint32_t port = handle - 0xb2401000u;
+        const bool connected =
+            port < 4u && state->controllers[port].connected != 0u;
+        if (connected && output != 0u) {
+            b2r_native_service_write_u8(state, output, 1u);
+            b2r_native_service_write_u8(state, output + 1u, 1u);
+            for (uint32_t offset = 2u; offset < 20u; ++offset) {
+                b2r_native_service_write_u8(state, output + offset, 0u);
+            }
+        }
+        eax = connected ? 0u : kDisconnected;
+        break;
+    }
+    case 7u: {
+        const uint32_t handle = argument(0u);
+        const uint32_t output = argument(1u);
+        const uint32_t port = handle - 0xb2401000u;
+        const bool connected =
+            port < 4u && state->controllers[port].connected != 0u;
+        if (connected && output != 0u) {
+            const B2RNativeControllerState& controller = state->controllers[port];
+            state->observed_button_mask |= controller.buttons;
+            if ((controller.buttons & 0x1000u) != 0u) {
+                ++state->a_pressed_poll_count;
+            }
+            ++state->successful_get_state_count;
+            if (state->controller_last_generations[port] != controller.generation) {
+                ++state->controller_packets[port];
+                state->controller_last_generations[port] = controller.generation;
+            }
+            b2r_native_service_write_u32(state, output, state->controller_packets[port]);
+            const uint16_t digital = controller.buttons & 0x00ffu;
+            b2r_native_service_write_u8(state, output + 4u, digital & 0xffu);
+            b2r_native_service_write_u8(state, output + 5u, digital >> 8u);
+            const uint16_t analog_masks[6] = {
+                0x1000u, 0x2000u, 0x4000u, 0x8000u, 0x0100u, 0x0200u};
+            for (uint32_t index = 0u; index < 6u; ++index) {
+                b2r_native_service_write_u8(
+                    state, output + 6u + index,
+                    (controller.buttons & analog_masks[index]) != 0u ? 0xffu : 0u);
+            }
+            b2r_native_service_write_u8(state, output + 12u, controller.left_trigger);
+            b2r_native_service_write_u8(state, output + 13u, controller.right_trigger);
+            const int16_t sticks[4] = {
+                controller.thumb_lx, controller.thumb_ly,
+                controller.thumb_rx, controller.thumb_ry};
+            for (uint32_t index = 0u; index < 4u; ++index) {
+                const uint16_t value = static_cast<uint16_t>(sticks[index]);
+                b2r_native_service_write_u8(state, output + 14u + index * 2u, value & 0xffu);
+                b2r_native_service_write_u8(state, output + 15u + index * 2u, value >> 8u);
+            }
+        }
+        eax = connected ? 0u : kDisconnected;
+        break;
+    }
+    case 8u: {
+        if (state->cold_call == nullptr) { return false; }
+        uint32_t cold_arguments[10] = {};
+        const uint32_t lifecycle_argument_count = service->value == 1u
+            ? 10u : service->value == 3u || service->value == 4u ? 1u : 0u;
+        for (uint32_t index = 0u; index < lifecycle_argument_count; ++index) {
+            cold_arguments[index] = argument(index);
+        }
+        state->cold_call(state->cold_user, target, context);
+        constexpr uint32_t kCreateWorker = 1u;
+        constexpr uint32_t kTerminateWorker = 2u;
+        constexpr uint32_t kSuspendWorker = 3u;
+        constexpr uint32_t kResumeWorker = 4u;
+        if (service->value == kCreateWorker && eax == 0u) {
+            const uint32_t handle_address = cold_arguments[0];
+            const uint32_t handle = handle_address != 0u
+                ? b2r_native_service_read_u32(state, handle_address) : 0u;
+            const uint32_t status = cold_arguments[7] != 0u
+                ? B2R_WORKER_SUSPENDED : B2R_WORKER_READY;
+            if (handle != 0u && cold_arguments[9] != 0u) {
+                b2r_upsert_worker(
+                    state->worker_lifecycle,
+                    handle,
+                    cold_arguments[9],
+                    cold_arguments[5],
+                    cold_arguments[6],
+                    status
+                );
+            }
+        } else if (service->value == kTerminateWorker &&
+                   state->current_worker_handle != 0u) {
+            B2RNativeWorkerLifecycleEntry* worker = b2r_find_worker(
+                state->worker_lifecycle, state->current_worker_handle);
+            if (b2r_set_worker_status(
+                    state->worker_lifecycle, worker, B2R_WORKER_COMPLETED)) {
+                *reinterpret_cast<bool*>(
+                    bytes + state->yield_requested_offset) = true;
+            }
+        } else if (service->value == kSuspendWorker && eax == 0u) {
+            b2r_set_worker_status(
+                state->worker_lifecycle,
+                b2r_find_worker(state->worker_lifecycle, cold_arguments[0]),
+                B2R_WORKER_SUSPENDED
+            );
+        } else if (service->value == kResumeWorker && eax == 0u) {
+            b2r_set_worker_status(
+                state->worker_lifecycle,
+                b2r_find_worker(state->worker_lifecycle, cold_arguments[0]),
+                B2R_WORKER_READY
+            );
+        }
+        break;
+    }
+    default:
+        return false;
+    }
+    esp += 4u + service->stack_cleanup_bytes;
+    eip = return_address;
+    *next_target = return_address;
+    ++state->service_call_counts[service->kind];
+    ++state->native_call_count;
+    return true;
+}
+
 extern "C" __declspec(dllexport) uint32_t b2r_native_dispatch(
     void* context,
     uint32_t target,
     const uint32_t* keys,
     B2RNativeEntry const* entries,
     uint32_t mask,
+    const uint32_t* host_call_keys,
+    uint32_t host_call_mask,
+    B2RNativeHostServiceState* native_host_services,
+    B2RHostCall host_call,
+    void* host_user,
+    uint64_t* host_call_count,
     const bool* yield_requested,
     const uint32_t* fault_code,
     const uint64_t* steps,
@@ -637,6 +1066,51 @@ extern "C" __declspec(dllexport) uint32_t b2r_native_dispatch(
         }
         const B2RNativeEntry entry = entries[slot];
         if (entry == nullptr) {
+            if (b2r_try_native_host_service(
+                    native_host_services, target, context, &target)) {
+                ++*host_call_count;
+                if (*yield_requested || *fault_code ||
+                    (*step_budget != 0u && *steps >= *step_budget)) {
+                    return target;
+                }
+                continue;
+            }
+            if (host_call_keys != nullptr && host_call != nullptr) {
+                uint32_t host_slot =
+                    (target * 2654435761u) & host_call_mask;
+                for (;;) {
+                    const uint32_t key = host_call_keys[host_slot];
+                    if (key == target) {
+                        if (profile_targets) {
+                            *dispatcher_self_time_ns +=
+                                b2r_dispatch_now_ns() - dispatcher_segment_started_ns;
+                        }
+                        target = host_call(host_user, target, context);
+                        ++*host_call_count;
+                        if (profile_targets) {
+                            dispatcher_segment_started_ns = b2r_dispatch_now_ns();
+                        }
+                        if (*yield_requested || *fault_code ||
+                            (*step_budget != 0u && *steps >= *step_budget)) {
+                            if (profile_targets) {
+                                *dispatcher_self_time_ns +=
+                                    b2r_dispatch_now_ns() - dispatcher_segment_started_ns;
+                            }
+                            return target;
+                        }
+                        break;
+                    }
+                    if (key == 0xffffffffu) {
+                        if (profile_targets) {
+                            *dispatcher_self_time_ns +=
+                                b2r_dispatch_now_ns() - dispatcher_segment_started_ns;
+                        }
+                        return target;
+                    }
+                    host_slot = (host_slot + 1u) & host_call_mask;
+                }
+                continue;
+            }
             if (profile_targets) {
                 *dispatcher_self_time_ns +=
                     b2r_dispatch_now_ns() - dispatcher_segment_started_ns;
@@ -689,6 +1163,131 @@ extern "C" __declspec(dllexport) uint32_t b2r_native_dispatch(
             return target;
         }
     }
+}
+
+struct B2RCooperativeSchedulerState {
+    uint64_t last_steps;
+    uint64_t pending_steps;
+    uint64_t last_serviced_flip;
+};
+
+extern "C" __declspec(dllexport) void b2r_update_cooperative_scheduler(
+    B2RCooperativeSchedulerState* state,
+    uint64_t steps,
+    uint64_t completed_flips,
+    uint64_t instruction_quantum,
+    bool force_instruction_tick,
+    uint64_t* instruction_ticks,
+    uint64_t* video_ticks
+) {
+    *instruction_ticks = 0u;
+    *video_ticks = 0u;
+    if (state == nullptr || instruction_quantum == 0u) {
+        return;
+    }
+    state->pending_steps +=
+        steps >= state->last_steps ? steps - state->last_steps : steps;
+    state->last_steps = steps;
+    if (completed_flips != 0u) {
+        if (completed_flips > state->last_serviced_flip) {
+            *video_ticks = completed_flips - state->last_serviced_flip;
+            state->last_serviced_flip = completed_flips;
+        }
+        state->pending_steps = 0u;
+        if (*video_ticks == 0u && force_instruction_tick) {
+            *instruction_ticks = 1u;
+        }
+        return;
+    }
+    *instruction_ticks = state->pending_steps / instruction_quantum;
+    state->pending_steps %= instruction_quantum;
+    if (*instruction_ticks == 0u && force_instruction_tick) {
+        *instruction_ticks = 1u;
+    }
+}
+
+extern "C" __declspec(dllexport) void b2r_sync_worker_lifecycle(
+    B2RNativeWorkerLifecycleState* state,
+    const B2RNativeWorkerLifecycleEntry* workers,
+    uint32_t worker_count,
+    uint32_t primary_handle
+) {
+    if (state == nullptr || workers == nullptr) { return; }
+    for (uint32_t index = 0u; index < worker_count; ++index) {
+        const B2RNativeWorkerLifecycleEntry& incoming = workers[index];
+        if (incoming.handle == 0u || incoming.handle == primary_handle ||
+            incoming.start_address == 0u) {
+            continue;
+        }
+        B2RNativeWorkerLifecycleEntry* worker = b2r_find_worker(
+            state, incoming.handle);
+        if (worker == nullptr) {
+            b2r_upsert_worker(
+                state,
+                incoming.handle,
+                incoming.start_address,
+                incoming.start_context1,
+                incoming.start_context2,
+                incoming.status == B2R_WORKER_SUSPENDED
+                    ? B2R_WORKER_SUSPENDED : B2R_WORKER_READY
+            );
+            continue;
+        }
+        worker->start_address = incoming.start_address;
+        worker->start_context1 = incoming.start_context1;
+        worker->start_context2 = incoming.start_context2;
+        if (worker->status == B2R_WORKER_COMPLETED ||
+            worker->status == B2R_WORKER_BLOCKED ||
+            worker->status == B2R_WORKER_FAILED) {
+            continue;
+        }
+        if (incoming.status == B2R_WORKER_SUSPENDED) {
+            b2r_set_worker_status(state, worker, B2R_WORKER_SUSPENDED);
+        } else if (worker->status == B2R_WORKER_SUSPENDED) {
+            b2r_set_worker_status(state, worker, B2R_WORKER_READY);
+        }
+    }
+}
+
+extern "C" __declspec(dllexport) bool b2r_set_worker_lifecycle_status(
+    B2RNativeWorkerLifecycleState* state,
+    uint32_t handle,
+    uint32_t status
+) {
+    if (status < B2R_WORKER_READY || status > B2R_WORKER_SUSPENDED) {
+        return false;
+    }
+    return b2r_set_worker_status(
+        state, b2r_find_worker(state, handle), status);
+}
+
+extern "C" __declspec(dllexport) uint32_t b2r_select_runnable_workers(
+    B2RNativeWorkerLifecycleState* state,
+    uint32_t* handles,
+    uint32_t handle_capacity
+) {
+    if (state == nullptr || handles == nullptr || handle_capacity == 0u ||
+        state->entry_count == 0u) {
+        return 0u;
+    }
+    const uint32_t start = state->selection_cursor % state->entry_count;
+    uint32_t selected = 0u;
+    for (uint32_t offset = 0u;
+         offset < state->entry_count && selected < handle_capacity;
+         ++offset) {
+        const uint32_t index = (start + offset) % state->entry_count;
+        B2RNativeWorkerLifecycleEntry* worker = &state->entries[index];
+        if (worker->status != B2R_WORKER_READY &&
+            worker->status != B2R_WORKER_RUNNING) {
+            continue;
+        }
+        if (worker->status == B2R_WORKER_READY) {
+            b2r_set_worker_status(state, worker, B2R_WORKER_RUNNING);
+        }
+        handles[selected++] = worker->handle;
+    }
+    state->selection_cursor = (start + 1u) % state->entry_count;
+    return selected;
 }
 
 extern "C" __declspec(dllexport) uint32_t b2r_pack_observed_write_records(
@@ -1414,12 +2013,214 @@ class _ResourceSpanScanState(ctypes.Structure):
     ]
 
 
+class NativeCooperativeSchedulerState(ctypes.Structure):
+    _fields_ = [
+        ("last_steps", ctypes.c_uint64),
+        ("pending_steps", ctypes.c_uint64),
+        ("last_serviced_flip", ctypes.c_uint64),
+    ]
+
+
 _ReadU32 = ctypes.CFUNCTYPE(ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32)
 _WriteU32 = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32)
 _ReadU8 = ctypes.CFUNCTYPE(ctypes.c_uint8, ctypes.c_void_p, ctypes.c_uint32)
 _WriteU8 = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint8)
 _Call = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(_Context))
+_HostCall = ctypes.CFUNCTYPE(
+    ctypes.c_uint32,
+    ctypes.c_void_p,
+    ctypes.c_uint32,
+    ctypes.POINTER(_Context),
+)
 _Observe = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_Context))
+
+NATIVE_HOST_SERVICE_RETURN_CONSTANT = 1
+NATIVE_HOST_SERVICE_PERFORMANCE_COUNTER = 2
+NATIVE_HOST_SERVICE_SYSTEM_TIME = 3
+NATIVE_HOST_SERVICE_XGETDEVICES = 4
+NATIVE_HOST_SERVICE_XINPUT_OPEN = 5
+NATIVE_HOST_SERVICE_XINPUT_CAPABILITIES = 6
+NATIVE_HOST_SERVICE_XINPUT_STATE = 7
+NATIVE_HOST_SERVICE_COLD_CALLBACK = 8
+
+NATIVE_HOST_SERVICE_LIFECYCLE_NONE = 0
+NATIVE_HOST_SERVICE_LIFECYCLE_CREATE_WORKER = 1
+NATIVE_HOST_SERVICE_LIFECYCLE_TERMINATE_WORKER = 2
+NATIVE_HOST_SERVICE_LIFECYCLE_SUSPEND_WORKER = 3
+NATIVE_HOST_SERVICE_LIFECYCLE_RESUME_WORKER = 4
+
+NATIVE_WORKER_READY = 1
+NATIVE_WORKER_RUNNING = 2
+NATIVE_WORKER_WAITING = 3
+NATIVE_WORKER_COMPLETED = 4
+NATIVE_WORKER_BLOCKED = 5
+NATIVE_WORKER_FAILED = 6
+NATIVE_WORKER_SUSPENDED = 7
+NATIVE_WORKER_LIFECYCLE_CAPACITY = 64
+
+
+class NativeHostServiceEntry(ctypes.Structure):
+    _fields_ = [
+        ("target", ctypes.c_uint32),
+        ("kind", ctypes.c_uint32),
+        ("stack_cleanup_bytes", ctypes.c_uint32),
+        ("value", ctypes.c_uint32),
+    ]
+
+
+class _NativeControllerState(ctypes.Structure):
+    _fields_ = [
+        ("buttons", ctypes.c_uint16),
+        ("left_trigger", ctypes.c_uint8),
+        ("right_trigger", ctypes.c_uint8),
+        ("thumb_lx", ctypes.c_int16),
+        ("thumb_ly", ctypes.c_int16),
+        ("thumb_rx", ctypes.c_int16),
+        ("thumb_ry", ctypes.c_int16),
+        ("connected", ctypes.c_uint8),
+        ("reserved", ctypes.c_uint8 * 3),
+        ("generation", ctypes.c_uint32),
+    ]
+
+
+class NativeWorkerLifecycleEntry(ctypes.Structure):
+    _fields_ = [
+        ("handle", ctypes.c_uint32),
+        ("start_address", ctypes.c_uint32),
+        ("start_context1", ctypes.c_uint32),
+        ("start_context2", ctypes.c_uint32),
+        ("status", ctypes.c_uint32),
+        ("generation", ctypes.c_uint32),
+    ]
+
+
+class NativeWorkerLifecycleState(ctypes.Structure):
+    _fields_ = [
+        (
+            "entries",
+            NativeWorkerLifecycleEntry * NATIVE_WORKER_LIFECYCLE_CAPACITY,
+        ),
+        ("entry_count", ctypes.c_uint32),
+        ("selection_cursor", ctypes.c_uint32),
+        ("transition_count", ctypes.c_uint64),
+        ("created_count", ctypes.c_uint64),
+        ("resumed_count", ctypes.c_uint64),
+        ("suspended_count", ctypes.c_uint64),
+        ("completed_count", ctypes.c_uint64),
+        ("overflow_count", ctypes.c_uint64),
+    ]
+
+    def entry_for_handle(self, handle: int) -> NativeWorkerLifecycleEntry | None:
+        for index in range(int(self.entry_count)):
+            entry = self.entries[index]
+            if int(entry.handle) == int(handle):
+                return entry
+        return None
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "backend": "native_dispatcher",
+            "entry_count": int(self.entry_count),
+            "transition_count": int(self.transition_count),
+            "created_count": int(self.created_count),
+            "resumed_count": int(self.resumed_count),
+            "suspended_count": int(self.suspended_count),
+            "completed_count": int(self.completed_count),
+            "overflow_count": int(self.overflow_count),
+        }
+
+
+class NativeHostServiceState(ctypes.Structure):
+    _fields_ = [
+        ("entries", ctypes.POINTER(NativeHostServiceEntry)),
+        ("entry_count", ctypes.c_uint32),
+        ("eax_offset", ctypes.c_uint32),
+        ("esp_offset", ctypes.c_uint32),
+        ("eip_offset", ctypes.c_uint32),
+        ("performance_counter", ctypes.c_uint64),
+        ("system_time_filetime", ctypes.c_uint64),
+        ("controllers", _NativeControllerState * 4),
+        ("controller_packets", ctypes.c_uint32 * 4),
+        ("controller_last_generations", ctypes.c_uint32 * 4),
+        ("service_call_counts", ctypes.c_uint64 * 9),
+        ("native_call_count", ctypes.c_uint64),
+        ("observed_button_mask", ctypes.c_uint32),
+        ("a_pressed_poll_count", ctypes.c_uint32),
+        ("successful_get_state_count", ctypes.c_uint32),
+        ("reserved_metrics", ctypes.c_uint32),
+        ("worker_lifecycle", ctypes.POINTER(NativeWorkerLifecycleState)),
+        ("current_worker_handle", ctypes.c_uint32),
+        ("yield_requested_offset", ctypes.c_uint32),
+        ("cold_call", ctypes.c_void_p),
+        ("cold_user", ctypes.c_void_p),
+        ("read_pages", ctypes.POINTER(ctypes.c_void_p)),
+        ("memory_user", ctypes.c_void_p),
+        ("read_u32", ctypes.c_void_p),
+        ("write_u32", ctypes.c_void_p),
+        ("read_u8", ctypes.c_void_p),
+        ("write_u8", ctypes.c_void_p),
+        ("cache_physical_aliases", ctypes.c_bool),
+        ("dirty_pages", ctypes.POINTER(ctypes.c_uint8)),
+        ("dirty_page_generations", ctypes.POINTER(ctypes.c_uint32)),
+        ("dirty_page_indices", ctypes.POINTER(ctypes.c_uint32)),
+        ("dirty_page_min_offsets", ctypes.POINTER(ctypes.c_uint16)),
+        ("dirty_page_max_offsets", ctypes.POINTER(ctypes.c_uint16)),
+        ("dirty_page_count", ctypes.POINTER(ctypes.c_uint32)),
+        ("dirty_page_capacity", ctypes.c_uint32),
+    ]
+
+    def __init__(self, entries: Iterable[NativeHostServiceEntry] = ()) -> None:
+        super().__init__()
+        active_entries = tuple(entries)
+        self._entry_storage = (NativeHostServiceEntry * len(active_entries))(
+            *active_entries
+        )
+        self.entries = self._entry_storage if active_entries else None
+        self.entry_count = len(active_entries)
+        self.eax_offset = _Context.eax.offset
+        self.esp_offset = _Context.esp.offset
+        self.eip_offset = _Context.eip.offset
+        self.yield_requested_offset = _Context.yield_requested.offset
+        self._controller_snapshots: list[tuple[int, ...] | None] = [None] * 4
+        self._worker_lifecycle: NativeWorkerLifecycleState | None = None
+
+    def attach_worker_lifecycle(
+        self, state: NativeWorkerLifecycleState | None
+    ) -> None:
+        self._worker_lifecycle = state
+        self.worker_lifecycle = ctypes.pointer(state) if state is not None else None
+
+    def update_clock(self, snapshot: dict[str, Any]) -> None:
+        self.performance_counter = int(snapshot.get("performance_counter", 0))
+        self.system_time_filetime = int(snapshot.get("system_time_filetime", 0))
+
+    def update_controllers(self, states: dict[int, Any]) -> None:
+        for port in range(4):
+            controller = states.get(port)
+            values = (
+                int(getattr(controller, "buttons", 0)),
+                int(getattr(controller, "left_trigger", 0)),
+                int(getattr(controller, "right_trigger", 0)),
+                int(getattr(controller, "thumb_lx", 0)),
+                int(getattr(controller, "thumb_ly", 0)),
+                int(getattr(controller, "thumb_rx", 0)),
+                int(getattr(controller, "thumb_ry", 0)),
+                int(bool(getattr(controller, "connected", False))),
+            )
+            target = self.controllers[port]
+            (
+                target.buttons,
+                target.left_trigger,
+                target.right_trigger,
+                target.thumb_lx,
+                target.thumb_ly,
+                target.thumb_rx,
+                target.thumb_ry,
+                target.connected,
+            ) = values
+            if values != self._controller_snapshots[port]:
+                target.generation = (target.generation + 1) & 0xFFFFFFFF or 1
+                self._controller_snapshots[port] = values
 
 _Context._fields_ = [
     *[
@@ -1475,6 +2276,7 @@ _Context._fields_ = [
     ("zero_read_callback_address_mask", ctypes.c_uint32),
     ("cache_physical_aliases", ctypes.c_bool),
     ("dirty_pages", ctypes.POINTER(ctypes.c_uint8)),
+    ("dirty_page_generations", ctypes.POINTER(ctypes.c_uint32)),
     ("dirty_page_indices", ctypes.POINTER(ctypes.c_uint32)),
     ("dirty_page_min_offsets", ctypes.POINTER(ctypes.c_uint16)),
     ("dirty_page_max_offsets", ctypes.POINTER(ctypes.c_uint16)),
@@ -1917,7 +2719,7 @@ class NativeResumableExecutor:
         manifest.close()
 
         dispatcher_digest = hashlib.sha256(
-            ("clang-cl-o2-native-module-dispatch-v4\n" + _NATIVE_DISPATCH_SOURCE).encode(
+            ("clang-cl-o2-native-module-dispatch-v5\n" + _NATIVE_DISPATCH_SOURCE).encode(
                 "utf-8"
             )
         ).hexdigest()[:16]
@@ -1955,6 +2757,7 @@ class NativeResumableExecutor:
         self.dll_path = modules[0]["dll_path"]
         self._base_address = function.base_address
         self._native_fast_paths = native_fast_paths
+        self._host_call_addresses = frozenset(callback_addresses)
         self._valid_addresses = {instruction.address for instruction in function.instructions}
         # Execution callback targets yield through generated control flow; they
         # do not make every data access sharing the target's 4 KiB code page
@@ -1999,6 +2802,12 @@ class NativeResumableExecutor:
             ctypes.POINTER(ctypes.c_uint32),
             ctypes.POINTER(ctypes.c_void_p),
             ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_uint32,
+            ctypes.POINTER(NativeHostServiceState),
+            _HostCall,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint64),
             ctypes.POINTER(ctypes.c_bool),
             ctypes.POINTER(ctypes.c_uint32),
             ctypes.POINTER(ctypes.c_uint64),
@@ -2022,6 +2831,51 @@ class NativeResumableExecutor:
             ctypes.POINTER(ctypes.c_uint64),
         ]
         self._dispatcher.restype = ctypes.c_uint32
+        self._cooperative_scheduler = getattr(
+            self._dispatcher_library,
+            "b2r_update_cooperative_scheduler",
+        )
+        self._cooperative_scheduler.argtypes = [
+            ctypes.POINTER(NativeCooperativeSchedulerState),
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_bool,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+        ]
+        self._cooperative_scheduler.restype = None
+        self._worker_lifecycle_sync = getattr(
+            self._dispatcher_library,
+            "b2r_sync_worker_lifecycle",
+        )
+        self._worker_lifecycle_sync.argtypes = [
+            ctypes.POINTER(NativeWorkerLifecycleState),
+            ctypes.POINTER(NativeWorkerLifecycleEntry),
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+        ]
+        self._worker_lifecycle_sync.restype = None
+        self._worker_lifecycle_set_status = getattr(
+            self._dispatcher_library,
+            "b2r_set_worker_lifecycle_status",
+        )
+        self._worker_lifecycle_set_status.argtypes = [
+            ctypes.POINTER(NativeWorkerLifecycleState),
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+        ]
+        self._worker_lifecycle_set_status.restype = ctypes.c_bool
+        self._worker_lifecycle_select = getattr(
+            self._dispatcher_library,
+            "b2r_select_runnable_workers",
+        )
+        self._worker_lifecycle_select.argtypes = [
+            ctypes.POINTER(NativeWorkerLifecycleState),
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_uint32,
+        ]
+        self._worker_lifecycle_select.restype = ctypes.c_uint32
         self._observed_write_packer = getattr(
             self._dispatcher_library,
             "b2r_pack_observed_write_records",
@@ -2104,7 +2958,10 @@ class NativeResumableExecutor:
         # Exact entry/exit/reason edges are much higher-cardinality than the
         # per-entry counters above. Allocate their lossless profiling table
         # lazily so representative non-profiled runs pay no memory cost.
-        self._dispatch_edge_capacity = table_capacity * 2
+        self._dispatch_edge_capacity = min(
+            table_capacity * 2,
+            NATIVE_DISPATCH_EDGE_CAPACITY_LIMIT,
+        )
         self._dispatch_edge_keys: Any | None = None
         self._dispatch_edge_reasons: Any | None = None
         self._dispatch_edge_counts: Any | None = None
@@ -2120,6 +2977,19 @@ class NativeResumableExecutor:
             self._dispatch_keys[slot] = address
             self._dispatch_entries[slot] = ctypes.cast(entry, ctypes.c_void_p).value
             self._dispatch_addresses_by_slot[slot] = address
+
+        host_call_capacity = 2
+        while host_call_capacity < max(1, len(self._host_call_addresses)) * 2:
+            host_call_capacity <<= 1
+        self._host_call_keys = (ctypes.c_uint32 * host_call_capacity)(
+            *([0xFFFFFFFF] * host_call_capacity)
+        )
+        self._host_call_mask = host_call_capacity - 1
+        for address in self._host_call_addresses:
+            slot = (address * 2654435761) & self._host_call_mask
+            while self._host_call_keys[slot] != 0xFFFFFFFF:
+                slot = (slot + 1) & self._host_call_mask
+            self._host_call_keys[slot] = address
 
         native_fast_path_capacity = 2
         while native_fast_path_capacity < max(1, len(native_fast_paths)) * 2:
@@ -2172,6 +3042,7 @@ class NativeResumableExecutor:
             self._zero_read_callback_address_mask,
         ) = build_callback_table(self._zero_read_callback_addresses)
         self._dirty_pages = (ctypes.c_uint8 * page_capacity)()
+        self._dirty_page_generations = (ctypes.c_uint32 * page_capacity)()
         self._dirty_page_indices = (ctypes.c_uint32 * page_capacity)()
         self._dirty_page_min_offsets = (ctypes.c_uint16 * page_capacity)()
         self._dirty_page_max_offsets = (ctypes.c_uint16 * page_capacity)()
@@ -2398,6 +3269,87 @@ class NativeResumableExecutor:
         self._cache_memory_identity = memory
         return len(self._page_buffers)
 
+    def update_cooperative_scheduler(
+        self,
+        state: NativeCooperativeSchedulerState,
+        *,
+        steps: int,
+        completed_flips: int,
+        instruction_quantum: int,
+        force_instruction_tick: bool = False,
+    ) -> tuple[int, int]:
+        instruction_ticks = ctypes.c_uint64()
+        video_ticks = ctypes.c_uint64()
+        self._cooperative_scheduler(
+            ctypes.byref(state),
+            max(0, int(steps)),
+            max(0, int(completed_flips)),
+            max(1, int(instruction_quantum)),
+            bool(force_instruction_tick),
+            ctypes.byref(instruction_ticks),
+            ctypes.byref(video_ticks),
+        )
+        return int(instruction_ticks.value), int(video_ticks.value)
+
+    def synchronize_worker_lifecycle(
+        self,
+        state: NativeWorkerLifecycleState,
+        workers: Iterable[dict[str, Any]],
+        *,
+        primary_handle: int = 0,
+    ) -> None:
+        descriptors = []
+        for worker in workers:
+            handle = worker.get("handle")
+            start_address = worker.get("start_address")
+            if not isinstance(handle, int) or not isinstance(start_address, int):
+                continue
+            descriptors.append(
+                NativeWorkerLifecycleEntry(
+                    handle,
+                    start_address,
+                    int(worker.get("start_context1") or 0),
+                    int(worker.get("start_context2") or 0),
+                    (
+                        NATIVE_WORKER_SUSPENDED
+                        if worker.get("suspended")
+                        else NATIVE_WORKER_READY
+                    ),
+                    0,
+                )
+            )
+        storage = (NativeWorkerLifecycleEntry * len(descriptors))(*descriptors)
+        self._worker_lifecycle_sync(
+            ctypes.byref(state),
+            storage if descriptors else None,
+            len(descriptors),
+            int(primary_handle),
+        )
+
+    def set_worker_lifecycle_status(
+        self,
+        state: NativeWorkerLifecycleState,
+        handle: int,
+        status: int,
+    ) -> bool:
+        return bool(
+            self._worker_lifecycle_set_status(
+                ctypes.byref(state), int(handle), int(status)
+            )
+        )
+
+    def select_runnable_workers(
+        self,
+        state: NativeWorkerLifecycleState,
+    ) -> tuple[int, ...]:
+        handles = (ctypes.c_uint32 * NATIVE_WORKER_LIFECYCLE_CAPACITY)()
+        count = int(
+            self._worker_lifecycle_select(
+                ctypes.byref(state), handles, len(handles)
+            )
+        )
+        return tuple(int(handles[index]) for index in range(count))
+
     def run(
         self,
         state: CpuState,
@@ -2437,6 +3389,7 @@ class NativeResumableExecutor:
         max_steps: int = 0,
         max_memory_pages: int = 65536,
         slice_steps: int = 0,
+        slice_steps_provider: Callable[[int], int] | None = None,
         yield_handler: Callable[[CpuState, SparseMemory, int], bool | None] | None = None,
         yield_predicate: Callable[[], bool] | None = None,
         call_handler_yield_predicate: Callable[[int], bool] | None = None,
@@ -2445,6 +3398,9 @@ class NativeResumableExecutor:
         capture_observed_write_provenance: bool = True,
         direct_observed_write_transport: bool = False,
         use_shared_memory_view: bool = True,
+        defer_dirty_sync_at_yield: bool = False,
+        dispatch_host_calls_in_native: bool = False,
+        native_host_services: NativeHostServiceState | None = None,
     ) -> int:
         """Run until the step budget, an unhandled target, or callback exception."""
         run_started_ns = time.perf_counter_ns()
@@ -2480,6 +3436,9 @@ class NativeResumableExecutor:
             "native_module_count": len(self._libraries),
             "native_dispatch_count": 0,
             "native_module_call_count": 0,
+            "native_host_call_dispatch_count": 0,
+            "native_host_service_call_count": 0,
+            "native_cold_host_call_count": 0,
             "handler_call_count": 0,
             "call_handler_yield_count": 0,
             "slice_yield_count": 0,
@@ -2534,11 +3493,16 @@ class NativeResumableExecutor:
             "shared_memory_handler_sync_bypass_count": 0,
             "shared_memory_handler_sync_fallback_count": 0,
             "shared_memory_observer_sync_bypass_count": 0,
+            "shared_memory_yield_sync_bypass_count": 0,
+            "slice_quantum_change_count": 0,
         }
         self.current_run_metrics = performance_counts
         performance_timings: dict[str, dict[str, int]] = {}
         handler_timings: dict[int, dict[str, Any]] = {}
         memory_callback_samples: dict[tuple[str, int], dict[str, int]] = {}
+        memory_callback_sample_count = 0
+        memory_callback_dropped_sample_count = 0
+        memory_callback_dropped_read_sample_count = 0
 
         def record_performance_duration(name: str, elapsed_ns: int) -> None:
             elapsed_us = max(0, int(elapsed_ns) // 1_000)
@@ -2608,10 +3572,23 @@ class NativeResumableExecutor:
         def finish_memory_callback_sample(
             sample: tuple[tuple[str, int], int] | None,
         ) -> None:
+            nonlocal memory_callback_sample_count
+            nonlocal memory_callback_dropped_sample_count
+            nonlocal memory_callback_dropped_read_sample_count
             if sample is None:
                 return
             key, started_ns = sample
             elapsed_ns = max(0, time.perf_counter_ns() - started_ns)
+            memory_callback_sample_count += 1
+            if (
+                key not in memory_callback_samples
+                and len(memory_callback_samples)
+                    >= NATIVE_MEMORY_CALLBACK_SAMPLE_KEY_LIMIT
+            ):
+                memory_callback_dropped_sample_count += 1
+                if key[0].startswith(("exact_", "page_miss_")):
+                    memory_callback_dropped_read_sample_count += 1
+                return
             metric = memory_callback_samples.setdefault(
                 key,
                 {"sample_count": 0, "total_ns": 0, "max_ns": 0},
@@ -2639,6 +3616,7 @@ class NativeResumableExecutor:
         write_callback_pages = self._write_callback_pages_table
         zero_read_callback_pages = self._zero_read_callback_pages_table
         dirty_pages = self._dirty_pages
+        dirty_page_generations = self._dirty_page_generations
         dirty_page_indices = self._dirty_page_indices
         dirty_page_min_offsets = self._dirty_page_min_offsets
         dirty_page_max_offsets = self._dirty_page_max_offsets
@@ -2994,6 +3972,7 @@ class NativeResumableExecutor:
                 if profile_hot_paths:
                     memory_commit_ns += time.perf_counter_ns() - phase_started_ns
                 dirty_pages[page] = 0
+                dirty_page_generations[page] = 0
                 dirty_page_min_offsets[page] = 0
                 dirty_page_max_offsets[page] = 0
                 page_generations[page] = memory.page_generation(page << 12)
@@ -3158,6 +4137,9 @@ class NativeResumableExecutor:
             context.observed_write_count = 0
 
         def mark_dirty_page(page: int, offset: int, size: int) -> None:
+            dirty_page_generations[page] = (
+                int(dirty_page_generations[page]) + 1
+            ) & 0xFFFFFFFF or 1
             end = offset + size
             if dirty_pages[page]:
                 dirty_page_min_offsets[page] = min(
@@ -3504,7 +4486,124 @@ class NativeResumableExecutor:
                 page_buffers,
                 page_generations,
                 commit_shared_page,
+                dirty_pages,
+                dirty_page_generations,
             )
+
+        deferred_yield_sync_enabled = bool(
+            defer_dirty_sync_at_yield and shared_memory_view_enabled
+        )
+        performance_counts["deferred_dirty_sync_at_yield"] = (
+            deferred_yield_sync_enabled
+        )
+
+        def sync_yield_boundary() -> None:
+            if deferred_yield_sync_enabled:
+                drain_native_write_log()
+                performance_counts[
+                    "shared_memory_yield_sync_bypass_count"
+                ] += 1
+                return
+            sync_dirty_pages()
+
+        def invoke_call_handler(
+            target: int,
+            active_context: _Context,
+        ) -> bool:
+            handler = handlers[target]
+            use_shared_handler_view = bool(
+                shared_memory_view_enabled
+                and (
+                    shared_memory_handler_predicate is None
+                    or shared_memory_handler_predicate(target)
+                )
+            )
+            if use_shared_handler_view:
+                drain_native_write_log()
+                performance_counts[
+                    "shared_memory_handler_sync_bypass_count"
+                ] += 1
+            else:
+                if shared_memory_view_enabled:
+                    performance_counts[
+                        "shared_memory_handler_sync_fallback_count"
+                    ] += 1
+                sync_dirty_pages()
+            _state_from_context(state, active_context)
+            performance_counts["handler_call_count"] += 1
+            handler_started_ns = time.perf_counter_ns()
+            try:
+                handler(state, memory, target, trace)
+            except BaseException:
+                bind_shared_memory_view()
+                sync_dirty_pages()
+                raise
+            finally:
+                record_handler_performance(target, handler, handler_started_ns)
+                record_performance("call_handler", handler_started_ns)
+                bind_shared_memory_view()
+            state.eip = memory.read_u32(state.get_register("esp"))
+            state.set_register("esp", state.get_register("esp") + 4)
+            _update_context(active_context, state)
+            invalidate_changed_pages()
+            return bool(
+                call_handler_yield_predicate is not None
+                and call_handler_yield_predicate(target)
+            )
+
+        native_host_call_yield_requested = [False]
+
+        def dispatch_host_call(
+            _user: int,
+            target: int,
+            context_pointer: ctypes.POINTER(_Context),
+        ) -> int:
+            active_context = context_pointer.contents
+            try:
+                if invoke_call_handler(int(target), active_context):
+                    performance_counts["call_handler_yield_count"] += 1
+                    native_host_call_yield_requested[0] = True
+                    active_context.yield_requested = True
+                return int(active_context.eip)
+            except BaseException as exc:
+                callback_error.append(exc)
+                active_context.yield_requested = True
+                return int(active_context.eip)
+
+        host_call_callback = _HostCall(dispatch_host_call)
+        null_host_call_callback = ctypes.cast(None, _HostCall)
+
+        def dispatch_cold_host_call(
+            _user: int,
+            target: int,
+            context_pointer: ctypes.POINTER(_Context),
+        ) -> int:
+            active_context = context_pointer.contents
+            original_esp = int(active_context.esp)
+            try:
+                if invoke_call_handler(int(target), active_context):
+                    performance_counts["call_handler_yield_count"] += 1
+                    native_host_call_yield_requested[0] = True
+                    active_context.yield_requested = True
+                performance_counts["native_cold_host_call_count"] += 1
+            except BaseException as exc:
+                callback_error.append(exc)
+                active_context.yield_requested = True
+            # RuntimeAbiBridge performs the stdcall argument adjustment and
+            # the generic handler path pops the return address. Restore the
+            # entry stack here so the native service table owns the complete
+            # ABI continuation for cold calls as it does for hot services.
+            active_context.esp = original_esp
+            active_context.eip = int(target)
+            return int(target)
+
+        cold_host_call_callback = _HostCall(dispatch_cold_host_call)
+        native_host_call_dispatch_enabled = bool(
+            dispatch_host_calls_in_native and handlers and self._host_call_addresses
+        )
+        performance_counts["native_host_call_dispatch_enabled"] = (
+            native_host_call_dispatch_enabled
+        )
 
         if shared_memory_view_enabled:
             bind_shared_memory_view()
@@ -3551,6 +4650,10 @@ class NativeResumableExecutor:
             direct_observed_write_transport
         )
         context.dirty_pages = ctypes.cast(dirty_pages, ctypes.POINTER(ctypes.c_uint8))
+        context.dirty_page_generations = ctypes.cast(
+            dirty_page_generations,
+            ctypes.POINTER(ctypes.c_uint32),
+        )
         context.dirty_page_indices = ctypes.cast(
             dirty_page_indices, ctypes.POINTER(ctypes.c_uint32)
         )
@@ -3562,6 +4665,59 @@ class NativeResumableExecutor:
         )
         context.dirty_page_count = 0
         context.dirty_page_capacity = len(dirty_page_indices)
+        native_host_services_enabled = bool(
+            dispatch_host_calls_in_native
+            and native_host_services is not None
+            and native_host_services.entry_count
+        )
+        native_host_service_start_count = (
+            int(native_host_services.native_call_count)
+            if native_host_services_enabled and native_host_services is not None
+            else 0
+        )
+        def bind_native_host_service_view() -> None:
+            if not native_host_services_enabled or native_host_services is None:
+                return
+            native_host_services.cold_call = ctypes.cast(
+                cold_host_call_callback, ctypes.c_void_p
+            ).value
+            native_host_services.cold_user = None
+            native_host_services.read_pages = context.read_pages
+            native_host_services.memory_user = context.user
+            native_host_services.read_u32 = ctypes.cast(
+                read_u32, ctypes.c_void_p
+            ).value
+            native_host_services.write_u32 = ctypes.cast(
+                write_u32, ctypes.c_void_p
+            ).value
+            native_host_services.read_u8 = ctypes.cast(
+                read_u8, ctypes.c_void_p
+            ).value
+            native_host_services.write_u8 = ctypes.cast(
+                write_u8, ctypes.c_void_p
+            ).value
+            native_host_services.cache_physical_aliases = (
+                physical_alias_cache_enabled
+            )
+            native_host_services.dirty_pages = context.dirty_pages
+            native_host_services.dirty_page_generations = (
+                context.dirty_page_generations
+            )
+            native_host_services.dirty_page_indices = context.dirty_page_indices
+            native_host_services.dirty_page_min_offsets = (
+                context.dirty_page_min_offsets
+            )
+            native_host_services.dirty_page_max_offsets = (
+                context.dirty_page_max_offsets
+            )
+            native_host_services.dirty_page_count = ctypes.cast(
+                ctypes.byref(context, _Context.dirty_page_count.offset),
+                ctypes.POINTER(ctypes.c_uint32),
+            )
+            native_host_services.dirty_page_capacity = (
+                context.dirty_page_capacity
+            )
+        bind_native_host_service_view()
         context.observed_write_eips = (
             ctypes.cast(observed_write_eips, ctypes.POINTER(ctypes.c_uint32))
             if observed_write_capacity and capture_observed_write_provenance
@@ -3675,7 +4831,22 @@ class NativeResumableExecutor:
             consume_changed_pages()
         if slice_steps < 0:
             raise NativeExecutorError("slice_steps must not be negative")
-        next_slice = slice_steps if slice_steps else 0
+
+        def requested_slice_steps() -> int:
+            requested = (
+                int(slice_steps_provider(int(context.steps)))
+                if slice_steps_provider is not None
+                else int(slice_steps)
+            )
+            if requested < 0:
+                raise NativeExecutorError(
+                    "slice_steps_provider must not return a negative value"
+                )
+            return requested
+
+        active_slice_steps = requested_slice_steps()
+        performance_counts["initial_slice_steps"] = active_slice_steps
+        next_slice = active_slice_steps if active_slice_steps else 0
         context.step_budget = (
             min(max_steps, next_slice) if max_steps and next_slice else max_steps or next_slice
         )
@@ -3700,10 +4871,12 @@ class NativeResumableExecutor:
             ctypes.POINTER(ctypes.c_uint64),
         )
         module_call_count = ctypes.c_uint64()
+        host_call_count = ctypes.c_uint64()
         dispatch_self_time_ns = ctypes.c_uint64()
         transitions: deque[dict[str, int]] = deque(maxlen=32)
 
         def finish(reason: str, target: int, dispatch_eip: int) -> int:
+            performance_counts["final_slice_steps"] = active_slice_steps
             _state_from_context(state, context)
             stack_pointer = int(context.esp)
             elapsed_ns = max(1, time.perf_counter_ns() - run_started_ns)
@@ -3814,6 +4987,13 @@ class NativeResumableExecutor:
             )
             edge_profiled_module_calls = sum(
                 item["module_calls"] for item in dispatch_edges
+            )
+            reported_dispatch_edges = dispatch_edges[
+                :NATIVE_DISPATCH_EDGE_REPORT_LIMIT
+            ]
+            dropped_dispatch_edge_count = max(
+                0,
+                len(dispatch_edges) - len(reported_dispatch_edges),
             )
             edge_unclassified_module_calls = max(
                 0,
@@ -3933,6 +5113,7 @@ class NativeResumableExecutor:
                             bool(profile_hot_paths)
                             and int(self._dispatch_edge_overflow_count.value) == 0
                             and edge_unclassified_module_calls == 0
+                            and dropped_dispatch_edge_count == 0
                         ),
                         "table_capacity": (
                             self._dispatch_edge_capacity
@@ -3945,6 +5126,9 @@ class NativeResumableExecutor:
                             else 0
                         ),
                         "unique_edge_count": len(dispatch_edges),
+                        "reported_edge_count": len(reported_dispatch_edges),
+                        "report_limit": NATIVE_DISPATCH_EDGE_REPORT_LIMIT,
+                        "dropped_edge_count": dropped_dispatch_edge_count,
                         "classified_module_calls": edge_profiled_module_calls,
                         "unclassified_module_calls": (
                             edge_unclassified_module_calls
@@ -3956,13 +5140,18 @@ class NativeResumableExecutor:
                             if profile_hot_paths
                             else 0
                         ),
-                        "edges": dispatch_edges,
+                        "edges": reported_dispatch_edges,
                     },
                     "read_callback_sampling": {
                         "interval": NATIVE_MEMORY_CALLBACK_SAMPLE_INTERVAL,
+                        "address_capacity": NATIVE_MEMORY_CALLBACK_SAMPLE_KEY_LIMIT,
+                        "tracked_address_count": len(memory_callback_samples),
                         "sample_count": sum(
                             metric["sample_count"]
                             for _address, metric in read_sample_metrics
+                        ),
+                        "dropped_new_address_sample_count": (
+                            memory_callback_dropped_read_sample_count
                         ),
                         "high_address_sample_count": sum(
                             metric["sample_count"]
@@ -3973,9 +5162,11 @@ class NativeResumableExecutor:
                     },
                     "memory_callback_sampling": {
                         "interval": NATIVE_MEMORY_CALLBACK_SAMPLE_INTERVAL,
-                        "sample_count": sum(
-                            metric["sample_count"]
-                            for metric in memory_callback_samples.values()
+                        "address_capacity": NATIVE_MEMORY_CALLBACK_SAMPLE_KEY_LIMIT,
+                        "tracked_address_count": len(memory_callback_samples),
+                        "sample_count": memory_callback_sample_count,
+                        "dropped_new_address_sample_count": (
+                            memory_callback_dropped_sample_count
                         ),
                         "hot_addresses": callback_sample_records(reads_only=False),
                     },
@@ -4053,7 +5244,12 @@ class NativeResumableExecutor:
             dispatch_eip = int(context.eip)
             dispatch_started_ns = time.perf_counter_ns()
             module_call_count.value = 0
+            host_call_count.value = 0
             dispatch_self_time_ns.value = 0
+            # Cooperative worker execution temporarily shares this service
+            # state with a nested executor. Restore this run's callback and
+            # page-cache view before every dispatcher residency.
+            bind_native_host_service_view()
             target = int(
                 self._dispatcher(
                     ctypes.byref(context),
@@ -4061,6 +5257,24 @@ class NativeResumableExecutor:
                     self._dispatch_keys,
                     self._dispatch_entries,
                     self._dispatch_mask,
+                    (
+                        self._host_call_keys
+                        if native_host_call_dispatch_enabled
+                        else None
+                    ),
+                    self._host_call_mask,
+                    (
+                        ctypes.byref(native_host_services)
+                        if native_host_services_enabled
+                        else None
+                    ),
+                    (
+                        host_call_callback
+                        if native_host_call_dispatch_enabled
+                        else null_host_call_callback
+                    ),
+                    None,
+                    ctypes.byref(host_call_count),
                     yield_requested_pointer,
                     fault_code_pointer,
                     steps_pointer,
@@ -4085,6 +5299,14 @@ class NativeResumableExecutor:
                 )
             )
             performance_counts["native_module_call_count"] += module_call_count.value
+            performance_counts["native_host_call_dispatch_count"] += (
+                host_call_count.value
+            )
+            if native_host_services_enabled and native_host_services is not None:
+                performance_counts["native_host_service_call_count"] = (
+                    int(native_host_services.native_call_count)
+                    - native_host_service_start_count
+                )
             record_performance("native_dispatch", dispatch_started_ns)
             if profile_hot_paths:
                 record_performance_duration(
@@ -4114,10 +5336,18 @@ class NativeResumableExecutor:
                 sync_dirty_pages()
                 _state_from_context(state, context)
                 raise callback_error[0]
+            if native_host_call_yield_requested[0]:
+                context.yield_requested = False
+                sync_dirty_pages()
+                return finish(
+                    "call_handler_yield",
+                    int(context.eip),
+                    dispatch_eip,
+                )
             handled_requested_yield = False
             if context.yield_requested:
                 performance_counts["predicate_yield_count"] += 1
-                sync_dirty_pages()
+                sync_yield_boundary()
                 _state_from_context(state, context)
                 context.yield_requested = False
                 if yield_handler is not None:
@@ -4126,18 +5356,36 @@ class NativeResumableExecutor:
                         stop_requested = yield_handler(
                             state, memory, int(context.steps)
                         ) is False
+                    except BaseException:
+                        sync_dirty_pages()
+                        raise
                     finally:
                         record_performance("yield_handler", yield_started_ns)
                         bind_shared_memory_view()
                     if stop_requested:
+                        sync_dirty_pages()
                         return finish("yield_handler_stop", int(context.eip), dispatch_eip)
                 performance_counts["slice_yield_count"] += 1
                 _update_context(context, state)
                 invalidate_changed_pages()
                 handled_requested_yield = True
+                requested = requested_slice_steps()
+                if requested != active_slice_steps:
+                    performance_counts["slice_quantum_change_count"] += 1
+                    active_slice_steps = requested
+                    next_slice = (
+                        int(context.steps) + active_slice_steps
+                        if active_slice_steps
+                        else 0
+                    )
+                    context.step_budget = (
+                        min(max_steps, next_slice)
+                        if max_steps and next_slice
+                        else max_steps or next_slice
+                    )
             if next_slice and context.steps >= next_slice:
                 if not handled_requested_yield:
-                    sync_dirty_pages()
+                    sync_yield_boundary()
                     _state_from_context(state, context)
                     if yield_handler is not None:
                         yield_started_ns = time.perf_counter_ns()
@@ -4145,19 +5393,35 @@ class NativeResumableExecutor:
                             stop_requested = yield_handler(
                                 state, memory, int(context.steps)
                             ) is False
+                        except BaseException:
+                            sync_dirty_pages()
+                            raise
                         finally:
                             record_performance("yield_handler", yield_started_ns)
                             bind_shared_memory_view()
                         if stop_requested:
+                            sync_dirty_pages()
                             return finish("yield_handler_stop", int(context.eip), dispatch_eip)
                     performance_counts["slice_yield_count"] += 1
                     _update_context(context, state)
                     invalidate_changed_pages()
                 if max_steps and context.steps >= max_steps:
+                    sync_dirty_pages()
                     return finish("step_budget", target, dispatch_eip)
-                while next_slice <= context.steps:
-                    next_slice += slice_steps
-                context.step_budget = min(max_steps, next_slice) if max_steps else next_slice
+                requested = requested_slice_steps()
+                if requested != active_slice_steps:
+                    performance_counts["slice_quantum_change_count"] += 1
+                active_slice_steps = requested
+                next_slice = (
+                    int(context.steps) + active_slice_steps
+                    if active_slice_steps
+                    else 0
+                )
+                context.step_budget = (
+                    min(max_steps, next_slice)
+                    if max_steps and next_slice
+                    else max_steps or next_slice
+                )
             if max_steps and context.steps >= max_steps:
                 sync_dirty_pages()
                 return finish("step_budget", target, dispatch_eip)
@@ -4167,45 +5431,12 @@ class NativeResumableExecutor:
                     continue
                 sync_dirty_pages()
                 return finish("unhandled_target", target, dispatch_eip)
-            use_shared_handler_view = bool(
-                shared_memory_view_enabled
-                and (
-                    shared_memory_handler_predicate is None
-                    or shared_memory_handler_predicate(target)
-                )
-            )
-            if use_shared_handler_view:
-                drain_native_write_log()
-                performance_counts[
-                    "shared_memory_handler_sync_bypass_count"
-                ] += 1
-            else:
-                if shared_memory_view_enabled:
-                    performance_counts[
-                        "shared_memory_handler_sync_fallback_count"
-                    ] += 1
-                sync_dirty_pages()
-            _state_from_context(state, context)
-            performance_counts["handler_call_count"] += 1
-            handler_started_ns = time.perf_counter_ns()
-            try:
-                handler(state, memory, target, trace)
-            except BaseException:
-                bind_shared_memory_view()
-                sync_dirty_pages()
-                raise
-            finally:
-                record_handler_performance(target, handler, handler_started_ns)
-                record_performance("call_handler", handler_started_ns)
-                bind_shared_memory_view()
-            state.eip = memory.read_u32(state.get_register("esp"))
-            state.set_register("esp", state.get_register("esp") + 4)
-            _update_context(context, state)
-            invalidate_changed_pages()
             if (
-                call_handler_yield_predicate is not None
-                and call_handler_yield_predicate(target)
+                native_host_call_dispatch_enabled
+                and target in self._host_call_addresses
             ):
+                continue
+            if invoke_call_handler(target, context):
                 performance_counts["call_handler_yield_count"] += 1
                 sync_dirty_pages()
                 return finish("call_handler_yield", int(context.eip), dispatch_eip)

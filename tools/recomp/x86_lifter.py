@@ -681,6 +681,10 @@ class SparseMemory:
     def page_generation(self, address: int) -> int:
         return self._page_generations.get(_u32(address) >> self._PAGE_BITS, 0)
 
+    def visible_page_generation(self, address: int) -> int:
+        """Return the generation visible to host-side snapshot consumers."""
+        return self.page_generation(address)
+
     def consume_changed_pages(self) -> set[int]:
         """Return and clear pages changed since the previous consumer boundary."""
         changed_pages = self._changed_pages
@@ -5598,6 +5602,7 @@ class CppEmitter:
             "    uint32_t zero_read_callback_address_mask;",
             "    bool cache_physical_aliases;",
             "    uint8_t* dirty_pages;",
+            "    uint32_t* dirty_page_generations;",
             "    uint32_t* dirty_page_indices;",
             "    uint16_t* dirty_page_min_offsets;",
             "    uint16_t* dirty_page_max_offsets;",
@@ -5806,6 +5811,12 @@ class CppEmitter:
             "static inline void b2r_mark_dirty_page(",
             "    B2RContext* ctx, uint32_t page, uint16_t offset, uint16_t size) {",
             "    if (ctx->dirty_pages == nullptr) { return; }",
+            "    if (ctx->dirty_page_generations != nullptr) {",
+            "        ++ctx->dirty_page_generations[page];",
+            "        if (ctx->dirty_page_generations[page] == 0u) {",
+            "            ctx->dirty_page_generations[page] = 1u;",
+            "        }",
+            "    }",
             "    const uint16_t end = static_cast<uint16_t>(offset + size);",
             "    if (ctx->dirty_pages[page] == 0u) {",
             "        ctx->dirty_pages[page] = 1u;",
@@ -6922,7 +6933,7 @@ class CppEmitter:
         if instruction.mnemonic == "fxch":
             index = self._x87_stack_index(instruction.operands[0])
             return [
-                f"const float value = ctx->fpu_stack[0];",
+                "const float value = ctx->fpu_stack[0];",
                 f"ctx->fpu_stack[0] = ctx->fpu_stack[{index}u];",
                 f"ctx->fpu_stack[{index}u] = value;",
                 f"eip = {next_eip};",
@@ -7331,7 +7342,7 @@ class CppEmitter:
             flag_helper = "b2r_add_flags" if instruction.mnemonic == "inc" else "b2r_sub_flags"
             bits = f"{instruction.operands[0].size}u"
             lines = [
-                f"const bool old_cf = ctx->flags.cf;",
+                "const bool old_cf = ctx->flags.cf;",
                 f"const uint32_t lhs = {self._operand_read(instruction.operands[0])};",
                 "const uint32_t rhs = 1u;",
                 f"const uint32_t result = lhs {op} rhs;",
@@ -7683,8 +7694,8 @@ class CppEmitter:
             ]
         if instruction.mnemonic == "idiv":
             return [
-                f"const int64_t high = static_cast<int64_t>(static_cast<int32_t>(ctx->edx));",
-                f"const int64_t dividend = (high * 0x100000000ll) + ctx->eax;",
+                "const int64_t high = static_cast<int64_t>(static_cast<int32_t>(ctx->edx));",
+                "const int64_t dividend = (high * 0x100000000ll) + ctx->eax;",
                 f"const int32_t divisor = static_cast<int32_t>({self._operand_read(instruction.operands[0])});",
                 f"if (divisor == 0) {{ ctx->fault_code = 1u; ctx->fault_eip = {_cpp_u32(instruction.address)}; ctx->eip = ctx->fault_eip; ctx->module_exit_reason = B2R_MODULE_EXIT_FAULT; return ctx->fault_eip; }}",
                 f"if (divisor == -1 && dividend == std::numeric_limits<int64_t>::min()) {{ ctx->fault_code = 2u; ctx->fault_eip = {_cpp_u32(instruction.address)}; ctx->eip = ctx->fault_eip; ctx->module_exit_reason = B2R_MODULE_EXIT_FAULT; return ctx->fault_eip; }}",

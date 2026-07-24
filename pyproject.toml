@@ -1,0 +1,50 @@
+[project]
+name = "b2-recomp-tools"
+version = "0.1.0"
+description = "Offline analysis, recompilation, validation, and runtime tools for b2_recomp"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "capstone==5.0.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "cmake==4.4.0",
+    "mypy==2.3.0",
+    "ninja==1.13.0",
+    "pre-commit==4.6.1",
+    "ruff==0.12.5",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+exclude = [
+    "build",
+    "data/local",
+    "reports/local",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+"tools/**/*.py" = ["E402"]
+"tests/**/*.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+follow_imports = "skip"
+show_error_codes = true
+warn_unreachable = true
+files = [
+    "tools/native_build.py",
+    "tools/native_toolchain.py",
+    "tools/project_identity.py",
+    "tools/project_maintenance.py",
+    "tools/profiling/system_profile.py",
+    "tools/quality_gate.py",
+    "tools/playability/live_transport.py",
+]

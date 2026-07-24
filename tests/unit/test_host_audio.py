@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import struct
 import queue
-import ctypes
 import unittest
+from pathlib import Path
 
 from tools.playability.host_audio import (
     PcmClip,
     RWS_PCM16_CODEC_UUID,
-    WindowsPcmOutput,
-    _WaveFormatEx,
+    SdlPcmOutput,
     _prepare_queued_playback,
     parse_rws_pcm,
     parse_rws_xbox_adpcm,
@@ -41,8 +40,20 @@ def _rws_pcm_fixture(pcm: bytes, *, sample_rate: int = 22050) -> bytes:
 
 
 class HostAudioTests(unittest.TestCase):
-    def test_waveout_pcm_format_matches_native_windows_layout(self) -> None:
-        self.assertEqual(ctypes.sizeof(_WaveFormatEx), 18)
+    def test_host_audio_uses_sdl3_bridge_instead_of_winmm(self) -> None:
+        host_source = Path("tools/playability/host_audio.py").read_text(
+            encoding="utf-8"
+        )
+        native_source = Path("runtime/platform/sdl/sdl_audio.cpp").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertNotIn("WinDLL", host_source)
+        self.assertNotIn("waveOut", host_source)
+        self.assertIn("b2r_audio_queue", host_source)
+        self.assertIn("SDL_OpenAudioDeviceStream", native_source)
+        self.assertIn("SDL_PutAudioStreamData", native_source)
+        self.assertIn("SDL_ClearAudioStream", native_source)
 
     def test_master_volume_scales_pcm_without_changing_system_volume(self) -> None:
         pcm = struct.pack("<hhhh", -32768, -1000, 1000, 32767)
@@ -86,8 +97,8 @@ class HostAudioTests(unittest.TestCase):
         self.assertEqual(clip.bits_per_sample, 16)
         self.assertEqual(clip.payload, bytes(64 * 2 * 2))
 
-    def test_windows_pcm_output_preserves_loop_request(self) -> None:
-        output = WindowsPcmOutput.__new__(WindowsPcmOutput)
+    def test_sdl_pcm_output_preserves_loop_request(self) -> None:
+        output = SdlPcmOutput.__new__(SdlPcmOutput)
         output.available = True
         output.submitted_buffer_count = 0
         output.dropped_buffer_count = 0
@@ -111,7 +122,7 @@ class HostAudioTests(unittest.TestCase):
             struct.unpack("<hhhh", _prepare_queued_playback(request)),
             (0, 0, 0, 0),
         )
-        self.assertEqual(output.summary()["backend"], "winmm_waveout")
+        self.assertEqual(output.summary()["backend"], "sdl3_audio_stream")
 
 
 if __name__ == "__main__":

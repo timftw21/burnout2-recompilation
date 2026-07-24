@@ -28,6 +28,9 @@ data/local/*
 *.map
 *.sym
 *.pdb
+*.etl
+*.rdc
+*.nsys-rep
 
 # Generated outputs
 build/
@@ -41,7 +44,9 @@ temp/
 
 # Tool caches
 .cache/
+.mypy_cache/
 .pytest_cache/
+.ruff_cache/
 __pycache__/
 *.py[cod]
 

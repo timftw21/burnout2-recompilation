@@ -8,6 +8,7 @@ import hashlib
 import json
 import struct
 import sys
+import tempfile
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -728,6 +729,131 @@ def build_preflight_report(
     }
 
 
+def _write_synthetic_bmp(path: Path) -> None:
+    colors = [
+        (index * 13, index * 7, 255 - index * 11, 255)
+        for index in range(16)
+    ]
+    pixels = b"".join(
+        bytes((blue, green, red, alpha))
+        for red, green, blue, alpha in colors
+    )
+    path.write_bytes(
+        struct.pack("<2sIHHI", b"BM", 54 + len(pixels), 0, 0, 54)
+        + struct.pack(
+            "<IiiHHIIiiII",
+            40,
+            len(colors),
+            -1,
+            1,
+            32,
+            0,
+            len(pixels),
+            2835,
+            2835,
+            0,
+            0,
+        )
+        + pixels
+    )
+
+
+def _synthetic_render_stream() -> dict[str, Any]:
+    address = 0x22001000
+    words = [
+        (4 << 18) | 0x1B00,
+        address,
+        (2 << 24) | (2 << 20) | (1 << 16) | (0x0C << 8) | (2 << 4),
+        0,
+        1 << 30,
+        (1 << 18) | 0x17FC,
+        6,
+        (1 << 18) | 0x17FC,
+        0,
+    ]
+    payload = struct.pack(f"<{len(words)}I", *words)
+    return {
+        "format": STREAM_FORMAT,
+        "write_count": 1,
+        "captured_write_count": 1,
+        "resource_snapshots": [
+            {
+                "address": address,
+                "format": "DXT1",
+                "width": 4,
+                "height": 4,
+                "bytes_hex": bytes(8).hex().upper(),
+            }
+        ],
+        "writes": [
+            {
+                "kind": "d3d_push_buffer",
+                "address": 0x80000000,
+                "size": len(payload),
+                "bytes_hex": payload.hex().upper(),
+            }
+        ],
+    }
+
+
+def build_synthetic_preflight_report() -> dict[str, Any]:
+    """Exercise every asset-free preflight boundary from a fresh clone."""
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        extracted = root / "extracted"
+        dictionary = extracted / "frontend" / "synthetic.dic"
+        dictionary.parent.mkdir(parents=True)
+        header = bytearray(20)
+        header[:4] = b"\x00\x05\x00\x00"
+        struct.pack_into("<HH", header, 8, 4, 4)
+        header[15] = 0x0C
+        struct.pack_into("<I", header, 16, 8)
+        dictionary.write_bytes(
+            b"synthetic_texture\0".ljust(64, b"\0") + header + bytes(8)
+        )
+
+        render_stream = root / "render.json"
+        render_stream.write_text(
+            json.dumps(_synthetic_render_stream()),
+            encoding="utf-8",
+            newline="\n",
+        )
+        probe_summary = root / "probe.json"
+        probe_summary.write_text(
+            json.dumps(
+                {
+                    "entry_recovery": {
+                        "execution": {
+                            "dynamic_frontier_count": 0,
+                            "guest_thread_executions": [
+                                {"steps": 1, "live_host_bridge": False}
+                            ],
+                            "title_music_mode_fast_path": {
+                                "invocation_count": 0,
+                                "decode_error_count": 0,
+                                "submitted_track_count": 0,
+                                "recent_invocations": [],
+                            },
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        frame = root / "frame.bmp"
+        _write_synthetic_bmp(frame)
+        report = build_preflight_report(
+            extracted_root=extracted,
+            render_streams=[render_stream],
+            probe_summary=probe_summary,
+            frame_paths=[frame],
+        )
+    report["fixture_mode"] = "synthetic_ephemeral"
+    return report
+
+
 def summarize_preflight_report(report: dict[str, Any]) -> dict[str, Any]:
     """Keep stdout scannable while the optional JSON artifact retains full evidence."""
 
@@ -780,7 +906,7 @@ def summarize_preflight_report(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run automated implementation and health gates before manual testing."
     )
@@ -807,11 +933,41 @@ def main() -> int:
     parser.add_argument("--json-output", type=Path)
     parser.add_argument("--pretty", action="store_true")
     parser.add_argument(
+        "--synthetic-fixtures",
+        action="store_true",
+        help=(
+            "Run asset-free synthetic asset/render/frame/guest gates; suitable "
+            "for a fresh clone and CI."
+        ),
+    )
+    parser.add_argument(
         "--full-stdout",
         action="store_true",
         help="Print the complete report instead of the concise summary.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    if args.synthetic_fixtures:
+        if any(
+            (
+                args.extracted_root,
+                args.render_stream,
+                args.probe_summary,
+                args.frame,
+                args.suite,
+                args.stage_override,
+                args.run_replays,
+            )
+        ):
+            parser.error("--synthetic-fixtures cannot be combined with external inputs")
+        report = build_synthetic_preflight_report()
+        output = json.dumps(report, indent=2 if args.pretty else None, sort_keys=True)
+        if args.json_output:
+            args.json_output.parent.mkdir(parents=True, exist_ok=True)
+            args.json_output.write_text(output + "\n", encoding="utf-8", newline="\n")
+        stdout_report = report if args.full_stdout else summarize_preflight_report(report)
+        print(json.dumps(stdout_report, indent=2 if args.pretty else None, sort_keys=True))
+        return 0 if report["passed"] else 1
 
     stages = load_replay_suite(args.suite) if args.suite else []
     for override in args.stage_override:

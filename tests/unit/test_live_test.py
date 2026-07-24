@@ -9,12 +9,16 @@ from unittest.mock import Mock, patch
 
 from tools.playability import live_test
 from tools.playability.live_test import (
+    _finalize_diagnostics,
     _finalize_lossless_flip_audit,
     _startup_wait_status,
     _wait_for_guest_shutdown,
+    _uses_embedded_runtime,
+    build_embedded_presenter_arguments,
     build_guest_command,
     build_lossless_flip_audit_report,
     build_presenter_command,
+    run_live_test,
 )
 
 
@@ -32,6 +36,7 @@ class LiveTestTests(unittest.TestCase):
             live_render_stream=Path("render.json"),
             live_controller_state=Path("controller.json"),
             json_output=Path("summary.json"),
+            runner_log=Path("runner.log"),
             render_debug_events=Path("render-debug-events.jsonl"),
             render_debug_report=Path("render-debug-report.json"),
             skip_host_build=True,
@@ -42,7 +47,80 @@ class LiveTestTests(unittest.TestCase):
             scene_record_audit_output=Path("scene-record-audit.json"),
             lossless_flip_audit=False,
             flip_audit_health_interval=30,
+            supported_targets=Path("supported-targets.json"),
+            allow_unsupported_xbe=False,
+            run_id="test-run-id",
+            run_manifest=Path("run-manifest.json"),
+            presenter_build_manifest=Path("presenter.build.json"),
+            allow_stale_artifacts=False,
+            presentation_pipeline_depth=None,
         )
+
+    def test_run_manifest_is_finalized_around_process_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            args = self._args()
+            args.run_manifest = root / "run-manifest.json"
+            args.dynamic_block_cache = root / "decoded-blocks.sqlite3"
+            build_validation = {
+                "status": "valid",
+                "valid": True,
+                "override_used": False,
+                "manifest": str(root / "presenter.build.json"),
+                "build_id": "BUILD-ID",
+                "problems": [],
+            }
+            target = {
+                "status": "supported",
+                "supported": True,
+                "override_used": False,
+                "target_id": "test-target",
+            }
+            with (
+                patch.object(live_test, "verify_supported_xbe", return_value=target),
+                patch.object(
+                    live_test,
+                    "validate_presenter_build_manifest",
+                    return_value=build_validation,
+                ),
+                patch.object(live_test, "_run_live_test_embedded", return_value=0),
+            ):
+                result = run_live_test(args)
+            manifest = json.loads(args.run_manifest.read_text(encoding="utf-8"))
+
+        self.assertEqual(result, 0)
+        self.assertEqual(manifest["status"], "completed")
+        self.assertEqual(manifest["returncode"], 0)
+        self.assertEqual(manifest["target"]["target_id"], "test-target")
+        self.assertEqual(manifest["presenter_build_after"]["build_id"], "BUILD-ID")
+        self.assertEqual(
+            manifest["configuration"]["runtime_process_model"],
+            "embedded_single_process",
+        )
+
+    def test_stale_presenter_is_rejected_before_process_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            args = self._args()
+            args.run_manifest = root / "run-manifest.json"
+            args.presenter_build_manifest = root / "missing.build.json"
+            args.dynamic_block_cache = root / "decoded-blocks.sqlite3"
+            target = {
+                "status": "supported",
+                "supported": True,
+                "override_used": False,
+                "target_id": "test-target",
+            }
+            with (
+                patch.object(live_test, "verify_supported_xbe", return_value=target),
+                patch.object(live_test, "_run_live_test_processes") as processes,
+            ):
+                result = run_live_test(args)
+            manifest = json.loads(args.run_manifest.read_text(encoding="utf-8"))
+
+        self.assertEqual(result, 2)
+        self.assertEqual(manifest["status"], "rejected_stale_presenter")
+        processes.assert_not_called()
 
     def test_guest_command_uses_unlimited_steps(self) -> None:
         command = build_guest_command(self._args())
@@ -58,12 +136,17 @@ class LiveTestTests(unittest.TestCase):
             command[command.index("--native-slice-steps") + 1],
             "20000",
         )
+        self.assertEqual(command[command.index("--run-id") + 1], "test-run-id")
+        self.assertEqual(
+            command[command.index("--supported-targets") + 1],
+            "supported-targets.json",
+        )
 
     def test_default_native_slice_cadence_targets_frame_rate(self) -> None:
         self.assertEqual(live_test.DEFAULT_NATIVE_SLICE_STEPS, 100_000)
 
     def test_startup_timeout_allows_one_time_cache_recovery(self) -> None:
-        self.assertEqual(live_test.DEFAULT_STARTUP_TIMEOUT_SECONDS, 600.0)
+        self.assertEqual(live_test.DEFAULT_STARTUP_TIMEOUT_SECONDS, 1800.0)
 
     def test_startup_wait_status_reports_cache_progress(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -82,6 +165,27 @@ class LiveTestTests(unittest.TestCase):
         self.assertNotIn("--profile-hot-paths", build_guest_command(args))
         args.profile_hot_paths = True
         self.assertIn("--profile-hot-paths", build_guest_command(args))
+
+    def test_live_control_transport_is_shared_by_guest_and_presenter(self) -> None:
+        args = self._args()
+
+        guest = build_guest_command(args)
+        presenter = build_presenter_command(args)
+        guest_name = guest[guest.index("--live-control-transport") + 1]
+        presenter_name = presenter[
+            presenter.index("--live-control-transport") + 1
+        ]
+
+        self.assertEqual(guest_name, presenter_name)
+        self.assertEqual(guest_name, "Local\\b2_recomp_live_testrunid")
+
+    def test_live_frontier_compilation_is_developer_only(self) -> None:
+        args = self._args()
+        self.assertNotIn("--developer-live-compile", build_guest_command(args))
+
+        args.developer_live_compile = True
+
+        self.assertIn("--developer-live-compile", build_guest_command(args))
 
     def test_world_matrix_audit_is_forwarded_to_guest(self) -> None:
         args = self._args()
@@ -124,6 +228,21 @@ class LiveTestTests(unittest.TestCase):
             command[command.index("--debug-json") + 1],
             "render-debug-events.jsonl",
         )
+        self.assertEqual(
+            command[command.index("--build-manifest") + 1],
+            "presenter.build.json",
+        )
+
+    def test_normal_gameplay_uses_embedded_presenter_arguments(self) -> None:
+        args = self._args()
+        with patch.object(live_test.os, "name", "nt"):
+            self.assertTrue(_uses_embedded_runtime(args))
+        command = build_embedded_presenter_arguments(args)
+
+        self.assertEqual(command[0], str(live_test.DEFAULT_DLL))
+        self.assertIn("--live-render-stream-json", command)
+        self.assertNotIn("--timeout-seconds", command)
+        self.assertNotIn("--inject-input", command)
 
     def test_no_diagnostics_omits_guest_and_presenter_artifacts(self) -> None:
         args = self._args()
@@ -136,6 +255,24 @@ class LiveTestTests(unittest.TestCase):
         self.assertIn("--quiet", guest)
         self.assertNotIn("--debug-json", presenter)
         self.assertIn("--no-diagnostics", presenter)
+
+    def test_post_run_reports_reject_a_summary_from_another_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = self._args()
+            args.json_output = Path(temp_dir) / "summary.json"
+            args.json_output.write_text(
+                json.dumps({"identity": {"run_id": "old-run"}}),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(live_test, "_finalize_render_diagnostics") as render,
+                patch.object(live_test, "_finalize_performance_diagnostics") as performance,
+            ):
+                _finalize_diagnostics(args)
+
+        self.assertTrue(args.stale_artifact_rejected)
+        render.assert_not_called()
+        performance.assert_not_called()
 
     def test_presenter_cpu_vertex_ab_flags_are_opt_in(self) -> None:
         args = self._args()

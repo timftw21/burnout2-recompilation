@@ -39,6 +39,31 @@ class PerformanceDebugReportTests(unittest.TestCase):
         self.assertEqual(summary["compile_wall_us"], 304_986_827)
         self.assertEqual(summary["incremental_compile_wall_us"], 0)
 
+    def test_native_compilation_reports_bounded_run_history(self) -> None:
+        execution = {
+            "guest_thread_executions": [
+                {
+                    "thread_index": 0,
+                    "native_runs": [
+                        {"target": index, "native_module_cache": {}}
+                        for index in range(4)
+                    ],
+                    "native_run_history": {
+                        "total_count": 20,
+                        "retained_count": 4,
+                        "dropped_count": 16,
+                    },
+                }
+            ]
+        }
+
+        summary = _summarize_native_compilation(execution)
+
+        self.assertEqual(summary["native_run_count"], 20)
+        self.assertEqual(summary["retained_native_run_count"], 4)
+        self.assertEqual(summary["dropped_native_run_count"], 16)
+        self.assertFalse(summary["history_complete"])
+
     def test_background_promotion_compile_is_not_a_synchronous_stall(self) -> None:
         execution = {
             "guest_thread_executions": [

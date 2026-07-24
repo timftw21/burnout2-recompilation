@@ -14,6 +14,7 @@ import math
 import os
 import sqlite3
 import struct
+import sys
 import time
 import zlib
 from collections import Counter, deque
@@ -40,9 +41,23 @@ try:
     )
     from tools.playability.host_audio import (
         PcmClip,
-        WindowsPcmOutput,
+        SdlPcmOutput,
         parse_rws_pcm,
         parse_rws_xbox_adpcm,
+    )
+    from tools.playability.live_transport import (
+        LIVE_CONTROL_SCHEMA_VERSION,
+        LiveCommandTransport,
+        LiveControlTransport,
+        LiveResourceTransport,
+    )
+    from tools.project_identity import (
+        DEFAULT_SUPPORTED_TARGETS,
+        ProjectIdentityError,
+        generated_code_identity,
+        git_identity,
+        new_run_id,
+        verify_supported_xbe,
     )
     from tools.recomp.native_executor import NativeExecutorError
     from tools.recomp.x86_lifter import (
@@ -87,9 +102,23 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
     )
     from tools.playability.host_audio import (
         PcmClip,
-        WindowsPcmOutput,
+        SdlPcmOutput,
         parse_rws_pcm,
         parse_rws_xbox_adpcm,
+    )
+    from tools.playability.live_transport import (
+        LIVE_CONTROL_SCHEMA_VERSION,
+        LiveCommandTransport,
+        LiveControlTransport,
+        LiveResourceTransport,
+    )
+    from tools.project_identity import (
+        DEFAULT_SUPPORTED_TARGETS,
+        ProjectIdentityError,
+        generated_code_identity,
+        git_identity,
+        new_run_id,
+        verify_supported_xbe,
     )
     from tools.recomp.native_executor import NativeExecutorError
     from tools.recomp.x86_lifter import (
@@ -126,6 +155,10 @@ DEFAULT_MAX_GUEST_ARGUMENTS = 16
 DEFAULT_MAX_GUEST_THREAD_EXECUTIONS = 8
 DEFAULT_RENDER_STREAM_MAX_WRITES = 65536
 DEFAULT_COMMAND_EPOCH_RECORD_LIMIT = 1 << 20
+DEFAULT_CONTROLLER_POLL_INTERVAL_SECONDS = 1.0 / 60.0
+DEFAULT_LIVE_NATIVE_STEADY_SLICE_STEPS = 1_000_000
+DEFAULT_DIAGNOSTIC_FIRST_NATIVE_RUNS = 8
+DEFAULT_DIAGNOSTIC_RECENT_NATIVE_RUNS = 56
 DEFAULT_RUNTIME_ABI_HISTORY = 4096
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DYNAMIC_BLOCK_STORE = (
@@ -138,6 +171,39 @@ LEGACY_DYNAMIC_BLOCK_CACHE = (
     / "playability"
     / "dynamic-block-cache.json"
 )
+
+
+class _BoundedDiagnosticHistory:
+    """Retain startup evidence and a recent tail without unbounded growth."""
+
+    def __init__(self, *, first_limit: int, recent_limit: int) -> None:
+        self.first_limit = max(0, int(first_limit))
+        self.recent_limit = max(0, int(recent_limit))
+        self.total_count = 0
+        self._first: list[dict[str, Any]] = []
+        self._recent: deque[dict[str, Any]] = deque(maxlen=self.recent_limit)
+
+    def append(self, record: dict[str, Any]) -> None:
+        self.total_count += 1
+        if len(self._first) < self.first_limit:
+            self._first.append(record)
+        elif self.recent_limit:
+            self._recent.append(record)
+
+    def records(self) -> list[dict[str, Any]]:
+        return [*self._first, *self._recent]
+
+    def summary(self) -> dict[str, int]:
+        retained_count = len(self._first) + len(self._recent)
+        return {
+            "total_count": self.total_count,
+            "retained_count": retained_count,
+            "dropped_count": max(0, self.total_count - retained_count),
+            "first_limit": self.first_limit,
+            "recent_limit": self.recent_limit,
+        }
+
+
 DEFAULT_STACK_BASE = 0x70000000
 DEFAULT_THREAD_STACK_BASE = 0x71000000
 DEFAULT_FS_BASE = 0x72000000
@@ -606,6 +672,8 @@ TITLE_GPU_COMPLETION_REGISTER_ADDRESS = 0x00800044
 TITLE_GPU_COMPLETION_MASK = 0x0FFFFFFF
 TITLE_GPU_COMMAND_KICK_ADDRESS = 0x80000000
 TITLE_GPU_COMPLETION_DMA_POINTER_OFFSET = 0x17F4
+TITLE_D3D_CONTEXT_NV2A_BASE_OFFSET = 0x17F8
+TITLE_NV2A_MMIO_BASE_ADDRESS = 0xFD000000
 TITLE_GPU_COMPLETION_DMA_STATUS_OFFSET = 0x44
 TITLE_GPU_INTERRUPT_STATUS_ADDRESS = 0xFD400100
 TITLE_GPU_PFIFO_INTERRUPT_STATUS_ADDRESS = 0xFD002100
@@ -897,7 +965,7 @@ def _native_fast_path_frame_return(stack_argument_bytes: int) -> tuple[str, ...]
 
 
 def _title_native_fast_paths() -> dict[int, NativeFastPath]:
-    """Native guarded replacements for the measured title render hot paths."""
+    """Native guarded replacements for the measured title hot paths."""
 
     packet_alloc = NativeFastPath(
         name="title_d3d_packet_alloc_shared",
@@ -3743,7 +3811,7 @@ class TitleFrontendSpecialAudioFastPath:
         self,
         runtime: XboxRuntimeShims,
         asset_streams: TitleAssetStreamOpenFastPath,
-        output: WindowsPcmOutput | None = None,
+        output: SdlPcmOutput | None = None,
         *,
         create_address: int = TITLE_FRONTEND_SPECIAL_AUDIO_CREATE_ADDRESS,
         handle_address: int = TITLE_FRONTEND_SYNTHETIC_AUDIO_HANDLE_ADDRESS,
@@ -3830,7 +3898,7 @@ class TitleMusicModeFastPath:
     def __init__(
         self,
         runtime: XboxRuntimeShims,
-        output: WindowsPcmOutput | None,
+        output: SdlPcmOutput | None,
         *,
         set_mode_address: int = TITLE_MUSIC_MODE_SET_ADDRESS,
         cache_dir: Path | None = None,
@@ -9434,6 +9502,7 @@ class RenderWriteWatchpoint:
         self._texture_image_rects: dict[int, int] = {}
         self._texture_bindings: list[tuple[int, int, int, int]] = []
         self._texture_binding_seen: set[tuple[int, int, int, int]] = set()
+        self.resource_binding_generation = 0
         self._texture_pending = bytearray()
         self._texture_pending_end: int | None = None
         self._vertex_array_offsets: dict[int, int] = {}
@@ -10831,6 +10900,7 @@ class RenderWriteWatchpoint:
             if binding not in self._texture_binding_seen:
                 self._texture_binding_seen.add(binding)
                 self._texture_bindings.append(binding)
+                self.resource_binding_generation += 1
             self.resource_method_native_binding_count += 1
             return
         if method == NATIVE_RESOURCE_RANGE_START_EVENT:
@@ -10876,6 +10946,7 @@ class RenderWriteWatchpoint:
                     if binding not in self._texture_binding_seen:
                         self._texture_binding_seen.add(binding)
                         self._texture_bindings.append(binding)
+                        self.resource_binding_generation += 1
             else:
                 self._retain_active_vertex_buffer_range()
                 self._active_vertex_primitive = 0
@@ -10948,6 +11019,7 @@ class RenderWriteWatchpoint:
             self._retain_vertex_buffer_range(start, end)
 
     def _retain_vertex_buffer_range(self, start: int, end: int) -> None:
+        previous = self._vertex_buffer_ranges
         merged: list[tuple[int, int]] = []
         for candidate_start, candidate_end in sorted(
             [*self._vertex_buffer_ranges, (start, end)]
@@ -10960,6 +11032,8 @@ class RenderWriteWatchpoint:
             else:
                 merged.append((candidate_start, candidate_end))
         self._vertex_buffer_ranges = merged
+        if merged != previous:
+            self.resource_binding_generation += 1
 
     def _flush_texture_writes(
         self,
@@ -11200,12 +11274,15 @@ class LiveHostBridge:
         render_publish_min_writes: int = 1,
         render_prefix_writes: int = 256,
         render_tail_writes: int = 256,
-        render_resource_scan_interval_seconds: float = 0.25,
+        controller_poll_interval_seconds: float = (
+            DEFAULT_CONTROLLER_POLL_INTERVAL_SECONDS
+        ),
         flip_audit_ack_path: Path | None = None,
         flip_audit_timeout_seconds: float = 120.0,
         flip_audit_health_interval: int = 30,
         flip_audit_max_flips: int = 0,
         presentation_ack_path: Path | None = None,
+        live_control_transport_name: str | None = None,
         data_export_synchronizer: Callable[[SparseMemory], None] | None = None,
         frontend_text_provider: Callable[
             [int], str | dict[str, Any] | None
@@ -11245,6 +11322,33 @@ class LiveHostBridge:
         )
         self.flip_audit_ack_path = flip_audit_ack_path
         self.presentation_ack_path = presentation_ack_path
+        self.live_control_transport_name = live_control_transport_name
+        self.live_control_transport = (
+            LiveControlTransport.open(live_control_transport_name)
+            if live_control_transport_name is not None
+            else None
+        )
+        self.live_command_transport = (
+            LiveCommandTransport.open(live_control_transport_name)
+            if live_control_transport_name is not None
+            and flip_audit_ack_path is None
+            else None
+        )
+        self.live_resource_transport = (
+            LiveResourceTransport.open(live_control_transport_name)
+            if live_control_transport_name is not None
+            and flip_audit_ack_path is None
+            else None
+        )
+        self.live_resource_transport_slot: int | None = None
+        self.live_resource_transport_size = 0
+        if self.live_command_transport is not None:
+            self.render_command_path = Path("shared-memory-command-spans")
+        if self.live_resource_transport is not None:
+            self.current_render_resource_path = Path(
+                "shared-memory-resource-slot"
+            )
+        self.live_controller_sequence = 0
         self._presentation_ack_file: BinaryIO | None = None
         self.presentation_event_name = (
             f"b2_recomp_presented_{self.command_stream_generation:016X}"
@@ -11308,8 +11412,8 @@ class LiveHostBridge:
         self.render_publish_min_writes = max(1, int(render_publish_min_writes))
         self.render_prefix_writes = max(0, int(render_prefix_writes))
         self.render_tail_writes = max(1, int(render_tail_writes))
-        self.render_resource_scan_interval_seconds = max(
-            0.0, float(render_resource_scan_interval_seconds)
+        self.controller_poll_interval_seconds = max(
+            0.0, float(controller_poll_interval_seconds)
         )
         self.published_write_count = -1
         self.published_command_record_count = 0
@@ -11334,11 +11438,16 @@ class LiveHostBridge:
         }
         self.resource_stream_generation = 0
         self.controller_mtime_ns = -1
+        self.next_controller_poll_time = 0.0
         self.render_publish_count = 0
         self.slice_exchange_count = 0
         self.render_resource_publish_count = 0
+        self.render_resource_reuse_count = 0
         self.render_resource_scan_count = 0
+        self.render_resource_dirty_check_count = 0
+        self.render_resource_dirty_count = 0
         self.last_render_resource_scan_time = 0.0
+        self.last_render_resource_binding_generation = -1
         self.last_render_resource_signatures: (
             tuple[tuple[int, int, int, str, str], ...] | None
         ) = None
@@ -11348,6 +11457,8 @@ class LiveHostBridge:
         self.published_manifest_write_count = 0
         self.controller_update_count = 0
         self.controller_read_defer_count = 0
+        self.controller_poll_count = 0
+        self.controller_poll_skip_count = 0
         self.clock_advanced_flip_count = 0
         self._clocked_flip_count = self.render_watchpoint.flip_count
         self.stop_requested = False
@@ -11380,7 +11491,8 @@ class LiveHostBridge:
                     "direct live command transport must start before command history truncates"
                 )
             existing_records = self.render_watchpoint.live_command_records.to_bytes()
-            self._reset_live_command_spans_atomic(self.render_command_path, b"")
+            if self.live_command_transport is None:
+                self._reset_live_command_spans_atomic(self.render_command_path, b"")
             self.published_write_count = 0
             self.published_command_record_count = 0
             self._update_command_epoch_peak()
@@ -11396,7 +11508,7 @@ class LiveHostBridge:
                     existing_record_count,
                 )
                 self._flush_render_commands(force=True)
-        self.sample_controller()
+        self.sample_controller(force=True)
         initial_state = self.runtime.input.poll_controller(0)
         if not initial_state.connected:
             # The Win32 presenter exposes one keyboard-backed controller as
@@ -11449,10 +11561,9 @@ class LiveHostBridge:
                 raise OSError(f"short live-manifest write to {path}")
 
     @staticmethod
-    def _write_texture_resources_binary(
-        path: Path,
+    def _encode_texture_resources_binary(
         resources: list[dict[str, Any]],
-    ) -> None:
+    ) -> bytes:
         payload = bytearray(b"B2TEX001")
         payload.extend(struct.pack("<I", len(resources)))
         for resource in resources:
@@ -11477,12 +11588,19 @@ class LiveHostBridge:
             )
             payload.extend(format_bytes)
             payload.extend(texture_bytes)
+        return bytes(payload)
+
+    @staticmethod
+    def _write_texture_resources_binary(
+        path: Path,
+        resources: list[dict[str, Any]],
+    ) -> None:
         # Normal live resource generations use unique immutable paths. Writing
         # the new file once avoids an expensive antivirus-observed rename while
         # the old manifest continues to reference a complete prior generation
         # until the new payload is fully closed.
         path.parent.mkdir(parents=True, exist_ok=True)
-        encoded = bytes(payload)
+        encoded = LiveHostBridge._encode_texture_resources_binary(resources)
         with path.open("xb", buffering=0) as output:
             if output.write(encoded) != len(encoded):
                 raise OSError(f"short live texture snapshot write to {path}")
@@ -11716,13 +11834,16 @@ class LiveHostBridge:
             )
             if byte_offset < 0 or carried_byte_count < 0:
                 raise RuntimeError("completed flip predates the live command epoch")
-            with self.render_command_path.open("rb") as command_input:
-                if command_input.read(8) != b"B2SPAN01":
-                    raise RuntimeError("live command sidecar header is invalid")
-                command_input.seek(8 + byte_offset)
-                carried_records = command_input.read(carried_byte_count)
-            if len(carried_records) != carried_byte_count:
-                raise RuntimeError("live command sidecar carry is truncated")
+            if self.live_command_transport is not None:
+                carried_records = b""
+            else:
+                with self.render_command_path.open("rb") as command_input:
+                    if command_input.read(8) != b"B2SPAN01":
+                        raise RuntimeError("live command sidecar header is invalid")
+                    command_input.seek(8 + byte_offset)
+                    carried_records = command_input.read(carried_byte_count)
+                if len(carried_records) != carried_byte_count:
+                    raise RuntimeError("live command sidecar carry is truncated")
         else:
             carried_records = self.render_watchpoint.live_command_records.tail_bytes(
                 carried_record_count
@@ -11735,15 +11856,17 @@ class LiveHostBridge:
             self.command_snapshot_base_span_count = completed_span_count
         self.command_epoch += 1
         self.command_epoch_rotation_count += 1
-        self.render_command_path = self.render_stream_path.with_name(
-            self.render_stream_path.name
-            + f".{self.command_stream_generation}.epoch-{completed_flip_index:08d}.commands.bin"
-        )
-        if self.direct_command_transport_enabled:
-            self._reset_live_command_spans_atomic(
-                self.render_command_path,
-                carried_records,
+        if self.live_command_transport is None:
+            self.render_command_path = self.render_stream_path.with_name(
+                self.render_stream_path.name
+                + f".{self.command_stream_generation}.epoch-{completed_flip_index:08d}.commands.bin"
             )
+        if self.direct_command_transport_enabled:
+            if self.live_command_transport is None:
+                self._reset_live_command_spans_atomic(
+                    self.render_command_path,
+                    carried_records,
+                )
             self._direct_command_boundaries = {
                 write_count: value
                 for write_count, value in self._direct_command_boundaries.items()
@@ -11820,12 +11943,21 @@ class LiveHostBridge:
                 raise RuntimeError(
                     "direct live command transport lost synchronization with guest writes"
                 )
-            if not self.render_command_path.is_file():
-                raise RuntimeError("direct live command sidecar disappeared")
-            self._append_live_commands(
-                self.render_command_path,
-                self._direct_pending_command_records,
-            )
+            if self.live_command_transport is not None:
+                transport_end = self.live_command_transport.write(
+                    self._direct_pending_command_records
+                )
+                if transport_end != self._direct_received_byte_count:
+                    raise RuntimeError(
+                        "shared command transport cursor lost synchronization"
+                    )
+            else:
+                if not self.render_command_path.is_file():
+                    raise RuntimeError("direct live command sidecar disappeared")
+                self._append_live_commands(
+                    self.render_command_path,
+                    self._direct_pending_command_records,
+                )
             self._direct_pending_command_records.clear()
             self.published_command_record_count = self._direct_received_write_count
             self.published_command_byte_count = self._direct_received_byte_count
@@ -11905,16 +12037,26 @@ class LiveHostBridge:
         # Live presentation needs the newest completed flip, not the bounded
         # probe's oldest retained prefix.
         stream_snapshot_started_ns = time.perf_counter_ns()
-        history = self.render_watchpoint.resource_binding_stream()
         stream = self.render_watchpoint.live_epoch_stream()
         self._record_performance("render_stream_snapshot", stream_snapshot_started_ns)
+        binding_generation = self.render_watchpoint.resource_binding_generation
+        binding_changed = (
+            binding_generation != self.last_render_resource_binding_generation
+        )
+        cached_resource_changed = False
+        if self.last_render_resource_signatures is not None and not binding_changed:
+            self.render_resource_dirty_check_count += 1
+            cached_resource_changed = self._cached_render_resource_changed(memory)
+            if cached_resource_changed:
+                self.render_resource_dirty_count += 1
+        resource_snapshot_changed = False
         if (
-            force
-            or self.last_render_resource_signatures is None
-            or now - self.last_render_resource_scan_time
-            >= self.render_resource_scan_interval_seconds
+            self.last_render_resource_signatures is None
+            or binding_changed
+            or cached_resource_changed
         ):
             resource_scan_started_ns = time.perf_counter_ns()
+            history = self.render_watchpoint.resource_binding_stream()
             stream = _snapshot_render_texture_resources(
                 stream,
                 history,
@@ -11932,27 +12074,29 @@ class LiveHostBridge:
                 for resource in stream["resource_snapshots"]
             )
             if resource_signatures != self.last_render_resource_signatures:
+                resource_snapshot_changed = True
                 self.resource_stream_generation = time.time_ns()
-                next_render_resource_path = (
-                    self.flip_audit_ack_path.parent
-                    / "resources"
-                    / f"resources.{self.resource_stream_generation}.json"
-                    if self.flip_audit_ack_path is not None
-                    else self.render_stream_path.with_name(
-                        self.render_stream_path.name
-                        + f".resources.{self.resource_stream_generation}.bin"
+                if self.live_resource_transport is not None:
+                    encoded_resources = self._encode_texture_resources_binary(
+                        stream["resource_snapshots"]
                     )
-                )
-                if (
-                    self.presentation_ack_path is not None
-                    and self.flip_audit_ack_path is None
-                    and self.current_render_resource_path.is_file()
-                ):
-                    self._retired_resource_paths.append(
-                        self.current_render_resource_path
+                    self.live_resource_transport_slot = (
+                        self.live_resource_transport.publish(
+                            encoded_resources,
+                            self.resource_stream_generation,
+                        )
                     )
-                self.current_render_resource_path = next_render_resource_path
-                if self.flip_audit_ack_path is not None:
+                    self.live_resource_transport_size = len(encoded_resources)
+                    self.current_render_resource_path = Path(
+                        f"shared-memory-resource-slot-"
+                        f"{self.live_resource_transport_slot}"
+                    )
+                elif self.flip_audit_ack_path is not None:
+                    self.current_render_resource_path = (
+                        self.flip_audit_ack_path.parent
+                        / "resources"
+                        / f"resources.{self.resource_stream_generation}.json"
+                    )
                     self._write_json_atomic(
                         self.current_render_resource_path,
                         {
@@ -11961,6 +12105,18 @@ class LiveHostBridge:
                         },
                     )
                 else:
+                    next_render_resource_path = self.render_stream_path.with_name(
+                        self.render_stream_path.name
+                        + f".resources.{self.resource_stream_generation}.bin"
+                    )
+                    if (
+                        self.presentation_ack_path is not None
+                        and self.current_render_resource_path.is_file()
+                    ):
+                        self._retired_resource_paths.append(
+                            self.current_render_resource_path
+                        )
+                    self.current_render_resource_path = next_render_resource_path
                     self._write_texture_resources_binary(
                         self.current_render_resource_path,
                         stream["resource_snapshots"],
@@ -11969,10 +12125,16 @@ class LiveHostBridge:
                 self.render_resource_publish_count += 1
             self.render_resource_scan_count += 1
             self.last_render_resource_scan_time = now
+            self.last_render_resource_binding_generation = binding_generation
             self._record_performance("render_resource_scan", resource_scan_started_ns)
         else:
             stream["resource_snapshots"] = []
             stream["resource_snapshot_count"] = 0
+        resource_snapshots_unchanged = bool(
+            self.resource_stream_generation and not resource_snapshot_changed
+        )
+        if resource_snapshots_unchanged:
+            self.render_resource_reuse_count += 1
         selected_flip = audit_flip if audit_flip is not None else completed_flip
         presentable_command_record_count = (
             int(selected_flip["write_count"])
@@ -12025,6 +12187,7 @@ class LiveHostBridge:
             "command_epoch": self.command_epoch,
             "command_epoch_record_limit": self.command_epoch_record_limit,
             "resource_stream_generation": self.resource_stream_generation,
+            "resource_snapshots_unchanged": resource_snapshots_unchanged,
             "guest_flip_count": manifest_guest_flip_count,
             "guest_steps": int(guest_steps or 0),
             "command_snapshot_path": str(self.render_command_path).replace("\\", "/"),
@@ -12033,7 +12196,11 @@ class LiveHostBridge:
         if self.direct_command_transport_enabled:
             manifest.update(
                 {
-                    "command_transport_format": "bulk_span_v1",
+                    "command_transport_format": (
+                        "shared_memory_span_v1"
+                        if self.live_command_transport is not None
+                        else "bulk_span_v1"
+                    ),
                     "published_command_byte_count": (
                         self.published_command_byte_count
                     ),
@@ -12060,6 +12227,14 @@ class LiveHostBridge:
                         self.published_command_span_count
                         - self.command_snapshot_base_span_count
                     ),
+                }
+            )
+        if self.live_resource_transport_slot is not None:
+            manifest.update(
+                {
+                    "resource_transport_format": "shared_memory_slot_v1",
+                    "resource_transport_slot": self.live_resource_transport_slot,
+                    "resource_transport_size": self.live_resource_transport_size,
                 }
             )
         guest_metrics = (
@@ -12095,6 +12270,12 @@ class LiveHostBridge:
             ).replace("\\", "/")
             manifest["presentation_event_name"] = self.presentation_event_name
             manifest["publication_event_name"] = self.publication_event_name
+        if self.live_control_transport_name is not None:
+            manifest["live_control_transport"] = {
+                "format": "b2-recomp-live-control",
+                "schema_version": LIVE_CONTROL_SCHEMA_VERSION,
+                "name": self.live_control_transport_name,
+            }
         if audit_flip is not None:
             manifest.update(
                 {
@@ -12112,7 +12293,12 @@ class LiveHostBridge:
                 }
             )
         manifest_publish_started_ns = time.perf_counter_ns()
-        if self.flip_audit_ack_path is not None or self.render_publish_count == 0:
+        if (
+            self.live_control_transport is not None
+            and self.flip_audit_ack_path is None
+        ):
+            self.live_control_transport.publish_manifest(manifest)
+        elif self.flip_audit_ack_path is not None or self.render_publish_count == 0:
             self._write_json_atomic(self.render_stream_path, manifest)
         else:
             self._write_json_shared(self.render_stream_path, manifest)
@@ -12216,21 +12402,34 @@ class LiveHostBridge:
             self.sample_controller()
             if self.stop_requested:
                 return False
-            try:
-                if (
-                    self._presentation_ack_file is None
-                    or self._presentation_ack_file.closed
-                ):
-                    self._presentation_ack_file = self.presentation_ack_path.open(
-                        "rb", buffering=0
-                    )
-                self._presentation_ack_file.seek(0)
-                payload = self._presentation_ack_file.read(24)
-            except (FileNotFoundError, PermissionError, OSError):
-                if self._presentation_ack_file is not None:
-                    self._presentation_ack_file.close()
-                    self._presentation_ack_file = None
+            if self.live_control_transport is not None:
+                acknowledgement = (
+                    self.live_control_transport.read_presentation_ack()
+                )
+                if acknowledgement is not None:
+                    generation, acknowledged_flip = acknowledgement
+                    if (
+                        generation == self.command_stream_generation
+                        and acknowledged_flip >= flip_index
+                    ):
+                        return True
                 payload = b""
+            else:
+                try:
+                    if (
+                        self._presentation_ack_file is None
+                        or self._presentation_ack_file.closed
+                    ):
+                        self._presentation_ack_file = self.presentation_ack_path.open(
+                            "rb", buffering=0
+                        )
+                    self._presentation_ack_file.seek(0)
+                    payload = self._presentation_ack_file.read(24)
+                except (FileNotFoundError, PermissionError, OSError):
+                    if self._presentation_ack_file is not None:
+                        self._presentation_ack_file.close()
+                        self._presentation_ack_file = None
+                    payload = b""
             if len(payload) >= 24 and payload[:8] == b"B2PRS001":
                 generation, acknowledged_flip = struct.unpack_from("<QQ", payload, 8)
                 if (
@@ -12269,7 +12468,7 @@ class LiveHostBridge:
         if len(self._flip_audit_ledger_buffer) >= 120:
             self._flush_flip_audit_ledger()
 
-    def _cached_audit_resource_changed(self, memory: SparseMemory) -> bool:
+    def _cached_render_resource_changed(self, memory: SparseMemory) -> bool:
         for (_stage, address, _format_raw, _image_rect), (
             generations,
             resource,
@@ -12281,7 +12480,7 @@ class LiveHostBridge:
             first_page = source_address & ~memory._PAGE_MASK
             last_page = (source_address + byte_count - 1) & ~memory._PAGE_MASK
             current = tuple(
-                memory.page_generation(page_address)
+                memory.visible_page_generation(page_address)
                 for page_address in range(
                     first_page,
                     last_page + 1,
@@ -12308,7 +12507,7 @@ class LiveHostBridge:
             reason = "command_shape_changed"
         elif self._last_audit_flip_value is not None and flip_value != self._last_audit_flip_value:
             reason = "flip_value_changed"
-        elif self._cached_audit_resource_changed(memory):
+        elif self._cached_render_resource_changed(memory):
             reason = "resource_changed"
         elif (
             self.flip_audit_health_interval > 0
@@ -12322,7 +12521,37 @@ class LiveHostBridge:
         self._last_audit_flip_value = flip_value
         return reason
 
-    def sample_controller(self) -> bool:
+    def sample_controller(self, *, force: bool = False) -> bool:
+        now = time.monotonic()
+        if not force and now < self.next_controller_poll_time:
+            self.controller_poll_skip_count += 1
+            return False
+        self.next_controller_poll_time = now + self.controller_poll_interval_seconds
+        self.controller_poll_count += 1
+        if self.live_control_transport is not None:
+            if self.live_control_transport.stop_requested():
+                self.stop_requested = True
+            snapshot = self.live_control_transport.read_controller(
+                self.live_controller_sequence
+            )
+            if snapshot is None:
+                return False
+            self.runtime.input.set_controller_state(
+                0,
+                ControllerState(
+                    connected=snapshot.connected,
+                    buttons=snapshot.buttons,
+                    left_trigger=snapshot.left_trigger,
+                    right_trigger=snapshot.right_trigger,
+                    thumb_lx=snapshot.thumb_lx,
+                    thumb_ly=snapshot.thumb_ly,
+                    thumb_rx=snapshot.thumb_rx,
+                    thumb_ry=snapshot.thumb_ry,
+                ),
+            )
+            self.live_controller_sequence = snapshot.sequence
+            self.controller_update_count += 1
+            return True
         try:
             stat = self.controller_state_path.stat()
         except FileNotFoundError:
@@ -12502,9 +12731,23 @@ class LiveHostBridge:
 
     def summary(self) -> dict[str, Any]:
         self._close_render_command_file()
+        command_transport_cursors = (
+            self.live_command_transport.cursors()
+            if self.live_command_transport is not None
+            else None
+        )
         if self._presentation_ack_file is not None:
             self._presentation_ack_file.close()
             self._presentation_ack_file = None
+        if self.live_resource_transport is not None:
+            self.live_resource_transport.close()
+            self.live_resource_transport = None
+        if self.live_command_transport is not None:
+            self.live_command_transport.close()
+            self.live_command_transport = None
+        if self.live_control_transport is not None:
+            self.live_control_transport.close()
+            self.live_control_transport = None
         if (
             self._presentation_event_handle is not None
             and self._presentation_event_kernel is not None
@@ -12553,6 +12796,15 @@ class LiveHostBridge:
             "retired_snapshot_delete_bytes": self.retired_snapshot_delete_bytes,
             "controller_state_path": str(self.controller_state_path),
             "controller_consumed_path": str(self.controller_consumed_path),
+            "live_control_transport": (
+                {
+                    "format": "b2-recomp-live-control",
+                    "schema_version": LIVE_CONTROL_SCHEMA_VERSION,
+                    "name": self.live_control_transport_name,
+                }
+                if self.live_control_transport_name is not None
+                else None
+            ),
             "stop_requested": self.stop_requested,
             "render_publish_count": self.render_publish_count,
             "recent_guest_flip_sample_count": len(self._publish_cadence_samples),
@@ -12563,9 +12815,19 @@ class LiveHostBridge:
             ),
             "slice_exchange_count": self.slice_exchange_count,
             "render_resource_publish_count": self.render_resource_publish_count,
+            "render_resource_reuse_count": self.render_resource_reuse_count,
             "render_resource_scan_count": self.render_resource_scan_count,
+            "render_resource_dirty_check_count": (
+                self.render_resource_dirty_check_count
+            ),
+            "render_resource_dirty_count": self.render_resource_dirty_count,
             "controller_update_count": self.controller_update_count,
             "controller_read_defer_count": self.controller_read_defer_count,
+            "controller_poll_interval_seconds": (
+                self.controller_poll_interval_seconds
+            ),
+            "controller_poll_count": self.controller_poll_count,
+            "controller_poll_skip_count": self.controller_poll_skip_count,
             "clock_advanced_flip_count": self.clock_advanced_flip_count,
             "video_pacing_target_hz": 60,
             "video_pacing_sleep_count": self.video_pacing_sleep_count,
@@ -12596,6 +12858,23 @@ class LiveHostBridge:
             "audit_ack_wait_count": self.audit_ack_wait_count,
             "published_write_count": max(0, self.published_write_count),
             "direct_command_transport": self.direct_command_transport_enabled,
+            "shared_command_transport": (
+                {
+                    "write_cursor": command_transport_cursors[0],
+                    "read_cursor": command_transport_cursors[1],
+                }
+                if command_transport_cursors is not None
+                else None
+            ),
+            "shared_resource_transport": (
+                {
+                    "slot": self.live_resource_transport_slot,
+                    "size": self.live_resource_transport_size,
+                }
+                if self.live_control_transport_name is not None
+                and self.flip_audit_ack_path is None
+                else None
+            ),
             "direct_command_receive_batch_count": (
                 self.direct_command_receive_batch_count
             ),
@@ -12702,7 +12981,7 @@ def _snapshot_render_texture_resources(
         first_page = source_address & ~memory._PAGE_MASK
         last_page = (source_address + byte_count - 1) & ~memory._PAGE_MASK
         page_generations = tuple(
-            memory.page_generation(page_address)
+            memory.visible_page_generation(page_address)
             for page_address in range(first_page, last_page + 1, memory._PAGE_SIZE)
         )
         cached = cache.get(cache_key) if cache is not None else None
@@ -12742,7 +13021,7 @@ def _snapshot_render_texture_resources(
         first_page = source_address & ~memory._PAGE_MASK
         last_page = (source_address + byte_count - 1) & ~memory._PAGE_MASK
         page_generations = tuple(
-            memory.page_generation(page_address)
+            memory.visible_page_generation(page_address)
             for page_address in range(first_page, last_page + 1, memory._PAGE_SIZE)
         )
         cached = cache.get(cache_key) if cache is not None else None
@@ -13052,6 +13331,7 @@ class RuntimeAbiBridge:
         self._failed_caller_counts: Counter[tuple[str, int]] = Counter()
         self._materialized_data_exports: dict[int, tuple[str, int]] = {}
         self._data_export_update_count = 0
+        self._thread_lifecycle_generation = 0
 
     @property
     def invocations(self) -> tuple[RuntimeAbiInvocation, ...]:
@@ -13062,21 +13342,35 @@ class RuntimeAbiBridge:
         return self._invocation_count
 
     @property
+    def thread_lifecycle_generation(self) -> int:
+        return self._thread_lifecycle_generation
+
+    @property
     def shim_targets(self) -> frozenset[int]:
         return frozenset(self._by_target)
 
     def has_target(self, target: int) -> bool:
         return target in self._by_target
 
-    def can_use_shared_memory_for_handler(self, target: int) -> bool:
-        """Keep runtime ABI calls on committed SparseMemory snapshots.
+    def guest_stack_cleanup_bytes(self, target: int) -> int:
+        shim = self._by_target.get(target)
+        if shim is None:
+            raise RuntimeAbiBridgeError(
+                f"no registered runtime shim at {_hex32(target)}"
+            )
+        return self._guest_argument_count_for(shim) * 4
 
-        Title fast paths use the public memory view and can consume active
-        native pages directly. Runtime shims also depend on allocation and
-        page-generation metadata, so their boundary remains conservative.
+    def can_use_shared_memory_for_handler(self, target: int) -> bool:
+        """Return whether a handler can consume the bound native memory view.
+
+        The live memory model exposes native-resident reads, commits an
+        overlapping dirty page before a host write, and includes dirty native
+        pages in allocation and visible-generation queries. Runtime ABI shims
+        can therefore stay on the shared view; callers still choose whether a
+        particular execution mode enables that path.
         """
 
-        return target not in self._by_target
+        return True
 
     def call_handlers(
         self,
@@ -13281,6 +13575,13 @@ class RuntimeAbiBridge:
         memory_writes = self._apply_guest_side_effects(
             shim, arguments, returned_value, memory, trace
         )
+        if shim.name in {
+            "PsCreateSystemThreadEx",
+            "PsTerminateSystemThread",
+            "NtSuspendThread",
+            "NtResumeThread",
+        }:
+            self._thread_lifecycle_generation += 1
         # Waits and other runtime services can advance the deterministic clock.
         # Keep volatile kernel data coherent before returning to guest code.
         self.synchronize_data_exports(memory, volatile_only=True)
@@ -14891,10 +15192,31 @@ class XbeBackedSparseMemory(SparseMemory):
         )
 
     def has_allocated_page(self, address: int) -> bool:
-        return super().has_allocated_page(self._canonical_address(address))
+        current = self._canonical_address(address)
+        page = current >> self._PAGE_BITS
+        return super().has_allocated_page(current) or bool(
+            self._native_page_buffers_view is not None
+            and page in self._native_page_buffers_view
+            and self._native_dirty_pages_view is not None
+            and self._native_dirty_pages_view[page]
+        )
 
     def page_generation(self, address: int) -> int:
         return super().page_generation(self._canonical_address(address))
+
+    def visible_page_generation(self, address: int) -> int:
+        """Include native-resident writes not yet committed to sparse storage."""
+        current = self._canonical_address(address)
+        base_generation = super().page_generation(current)
+        page = current >> self._PAGE_BITS
+        native_generation = (
+            int(self._native_dirty_page_generations_view[page])
+            if self._native_dirty_page_generations_view is not None
+            and self._native_page_buffers_view is not None
+            and page in self._native_page_buffers_view
+            else 0
+        )
+        return (base_generation << 32) | native_generation
 
     def __init__(
         self,
@@ -14912,6 +15234,8 @@ class XbeBackedSparseMemory(SparseMemory):
         self._native_writeback_active = False
         self._native_page_buffers_view: dict[int, Any] | None = None
         self._native_page_generations_view: dict[int, int] | None = None
+        self._native_dirty_pages_view: Any | None = None
+        self._native_dirty_page_generations_view: Any | None = None
         self._native_page_commit_callback: Callable[[int], None] | None = None
         self._native_page_view_bind_count = 0
         self._native_page_view_read_count = 0
@@ -14984,6 +15308,8 @@ class XbeBackedSparseMemory(SparseMemory):
         clone._write_observers = []
         clone._native_page_buffers_view = None
         clone._native_page_generations_view = None
+        clone._native_dirty_pages_view = None
+        clone._native_dirty_page_generations_view = None
         clone._native_page_commit_callback = None
         clone._native_page_view_bind_count = 0
         clone._native_page_view_read_count = 0
@@ -14995,6 +15321,8 @@ class XbeBackedSparseMemory(SparseMemory):
         page_buffers: dict[int, Any],
         page_generations: dict[int, int],
         commit_page: Callable[[int], None],
+        dirty_pages: Any,
+        dirty_page_generations: Any,
     ) -> None:
         """Expose the active native cache directly to host-side memory reads.
 
@@ -15007,12 +15335,16 @@ class XbeBackedSparseMemory(SparseMemory):
 
         self._native_page_buffers_view = page_buffers
         self._native_page_generations_view = page_generations
+        self._native_dirty_pages_view = dirty_pages
+        self._native_dirty_page_generations_view = dirty_page_generations
         self._native_page_commit_callback = commit_page
         self._native_page_view_bind_count += 1
 
     def clear_native_page_cache_view(self) -> None:
         self._native_page_buffers_view = None
         self._native_page_generations_view = None
+        self._native_dirty_pages_view = None
+        self._native_dirty_page_generations_view = None
         self._native_page_commit_callback = None
 
     def has_native_page_cache_view(self, page_buffers: dict[int, Any]) -> bool:
@@ -15577,8 +15909,10 @@ class XbeBackedSparseMemory(SparseMemory):
             TITLE_D3D_CONTEXT_LIST_COUNT_OFFSET: TITLE_D3D_CONTEXT_LIST_SEEDED_COUNT,
             TITLE_D3D_CONTEXT_LIST_FIRST_OFFSET: TITLE_D3D_CONTEXT_LIST_NODE0_ADDRESS,
             TITLE_D3D_CONTEXT_LIST_SECOND_OFFSET: TITLE_D3D_CONTEXT_LIST_NODE1_ADDRESS,
-            0x17F4: TITLE_D3D_CONTEXT_DMA_STATE_ADDRESS,
-            0x17F8: 0,
+            TITLE_GPU_COMPLETION_DMA_POINTER_OFFSET: (
+                TITLE_D3D_CONTEXT_DMA_STATE_ADDRESS
+            ),
+            TITLE_D3D_CONTEXT_NV2A_BASE_OFFSET: TITLE_NV2A_MMIO_BASE_ADDRESS,
             0x19A0: 0,
         }
         self._write_overlay_u32(TITLE_D3D_CONTEXT_GLOBAL_ADDRESS, context)
@@ -16613,11 +16947,13 @@ def build_playability_probe_summary(
     native_build_dir: Path = Path("build/native-guest-loop"),
     live_render_stream_path: Path | None = None,
     live_controller_state_path: Path | None = None,
+    live_control_transport_name: str | None = None,
     live_flip_audit_ack_path: Path | None = None,
     live_flip_audit_health_interval: int = 30,
     live_flip_audit_max_flips: int = 0,
     native_slice_steps: int = 100000,
     profile_hot_paths: bool = False,
+    developer_live_compile: bool = False,
     audit_title_main_loop_exit: bool = False,
     audit_world_matrices: bool = False,
     audit_world_matrix_address: int | None = None,
@@ -16701,11 +17037,13 @@ def build_playability_probe_summary(
         native_build_dir=native_build_dir,
         live_render_stream_path=live_render_stream_path,
         live_controller_state_path=live_controller_state_path,
+        live_control_transport_name=live_control_transport_name,
         live_flip_audit_ack_path=live_flip_audit_ack_path,
         live_flip_audit_health_interval=live_flip_audit_health_interval,
         live_flip_audit_max_flips=live_flip_audit_max_flips,
         native_slice_steps=native_slice_steps,
         profile_hot_paths=profile_hot_paths,
+        developer_live_compile=developer_live_compile,
         audit_title_main_loop_exit=audit_title_main_loop_exit,
         audit_world_matrices=audit_world_matrices,
         audit_world_matrix_address=audit_world_matrix_address,
@@ -16833,11 +17171,13 @@ def _recover_entry_summary(
     native_build_dir: Path,
     live_render_stream_path: Path | None,
     live_controller_state_path: Path | None,
+    live_control_transport_name: str | None,
     live_flip_audit_ack_path: Path | None,
     live_flip_audit_health_interval: int,
     live_flip_audit_max_flips: int,
     native_slice_steps: int,
     profile_hot_paths: bool,
+    developer_live_compile: bool,
     audit_title_main_loop_exit: bool,
     audit_world_matrices: bool,
     audit_world_matrix_address: int | None,
@@ -16922,11 +17262,13 @@ def _recover_entry_summary(
             native_build_dir=native_build_dir,
             live_render_stream_path=live_render_stream_path,
             live_controller_state_path=live_controller_state_path,
+            live_control_transport_name=live_control_transport_name,
             live_flip_audit_ack_path=live_flip_audit_ack_path,
             live_flip_audit_health_interval=live_flip_audit_health_interval,
             live_flip_audit_max_flips=live_flip_audit_max_flips,
             native_slice_steps=native_slice_steps,
             profile_hot_paths=profile_hot_paths,
+            developer_live_compile=developer_live_compile,
             audit_title_main_loop_exit=audit_title_main_loop_exit,
             audit_world_matrices=audit_world_matrices,
             audit_world_matrix_address=audit_world_matrix_address,
@@ -17380,11 +17722,13 @@ def _execute_recovered_control_flow_frame(
     native_build_dir: Path,
     live_render_stream_path: Path | None,
     live_controller_state_path: Path | None,
+    live_control_transport_name: str | None,
     live_flip_audit_ack_path: Path | None,
     live_flip_audit_health_interval: int,
     live_flip_audit_max_flips: int,
     native_slice_steps: int,
     profile_hot_paths: bool,
+    developer_live_compile: bool,
     audit_title_main_loop_exit: bool,
     audit_world_matrices: bool,
     audit_world_matrix_address: int | None,
@@ -17489,7 +17833,7 @@ def _execute_recovered_control_flow_frame(
     title_frontend_asset_init_fast_path = TitleFrontendAssetInitFastPath()
     title_asset_stream_open_fast_path = TitleAssetStreamOpenFastPath(bridge.runtime)
     host_audio_output = (
-        WindowsPcmOutput(master_volume=0.5)
+        SdlPcmOutput(master_volume=0.5)
         if live_render_stream_path is not None
         else None
     )
@@ -17871,11 +18215,16 @@ def _execute_recovered_control_flow_frame(
                     if not thread_executions
                     else None
                 ),
-                live_controller_state_path=(
-                    live_controller_state_path
-                    if not thread_executions
-                    else None
-                ),
+            live_controller_state_path=(
+                live_controller_state_path
+                if not thread_executions
+                else None
+            ),
+            live_control_transport_name=(
+                live_control_transport_name
+                if not thread_executions
+                else None
+            ),
                 live_flip_audit_ack_path=(
                     live_flip_audit_ack_path
                     if not thread_executions
@@ -17884,7 +18233,8 @@ def _execute_recovered_control_flow_frame(
                 live_flip_audit_health_interval=live_flip_audit_health_interval,
                 live_flip_audit_max_flips=live_flip_audit_max_flips,
                 native_slice_steps=native_slice_steps,
-                profile_hot_paths=profile_hot_paths,
+            profile_hot_paths=profile_hot_paths,
+            developer_live_compile=developer_live_compile,
                 audit_title_main_loop_exit=audit_title_main_loop_exit,
                 audit_world_matrices=audit_world_matrices,
                 audit_world_matrix_address=audit_world_matrix_address,
@@ -17908,6 +18258,35 @@ def _execute_recovered_control_flow_frame(
             if _guest_thread_requested_live_stop(thread_execution):
                 break
     scheduled_threads = _scheduled_guest_threads(bridge, loaded)
+    title_xinput_summary = title_xinput_fast_path.summary(memory)
+    for thread_execution in thread_executions:
+        native_services = thread_execution.get("native_host_services")
+        if not isinstance(native_services, dict):
+            continue
+        service_counts = native_services.get("service_call_counts")
+        if not isinstance(service_counts, dict):
+            continue
+        for summary_key, service_key in (
+            ("get_devices_count", "xgetdevices"),
+            ("open_count", "xinput_open"),
+            ("capabilities_count", "xinput_capabilities"),
+            ("get_state_count", "xinput_state"),
+            ("successful_get_state_count", "successful_get_state_count"),
+            ("a_pressed_poll_count", "a_pressed_poll_count"),
+        ):
+            source = (
+                native_services
+                if service_key in native_services
+                else service_counts
+            )
+            title_xinput_summary[summary_key] += int(source.get(service_key, 0))
+        title_xinput_summary["observed_button_mask_hex"] = _hex32(
+            int(title_xinput_summary["observed_button_mask_hex"], 16)
+            | int(native_services.get("observed_button_mask", 0))
+        )
+        packets = native_services.get("controller_packets")
+        if isinstance(packets, list) and len(packets) == 4:
+            title_xinput_summary["packets"] = [int(value) for value in packets]
     return {
         "status": "returned" if returned_to_probe else "returned_to_guest",
         "return_address": result.return_address,
@@ -17932,7 +18311,7 @@ def _execute_recovered_control_flow_frame(
             _guest_thread_requested_live_stop(execution)
             for execution in thread_executions
         ),
-        "title_xinput_fast_path": title_xinput_fast_path.summary(memory),
+        "title_xinput_fast_path": title_xinput_summary,
         **_dynamic_recovery_summary(
             dynamic_functions,
             dynamic_summaries,
@@ -18166,11 +18545,13 @@ def _execute_guest_thread_start(
     cached_functions: list[LiftedFunction] | None = None,
     live_render_stream_path: Path | None = None,
     live_controller_state_path: Path | None = None,
+    live_control_transport_name: str | None = None,
     live_flip_audit_ack_path: Path | None = None,
     live_flip_audit_health_interval: int = 30,
     live_flip_audit_max_flips: int = 0,
     native_slice_steps: int = 100000,
     profile_hot_paths: bool = False,
+    developer_live_compile: bool = False,
     enable_title_repair_fallbacks: bool = False,
     audit_title_main_loop_exit: bool = False,
     audit_world_matrices: bool = False,
@@ -18192,6 +18573,7 @@ def _execute_guest_thread_start(
         "start_context2_hex": thread["start_context2_hex"],
         "title_repair_fallbacks_enabled": enable_title_repair_fallbacks,
         "hot_path_profiling_enabled": profile_hot_paths,
+        "developer_live_compilation_enabled": developer_live_compile,
     }
     if thread["suspended"]:
         return {**summary, "status": "skipped_suspended"}
@@ -18263,9 +18645,12 @@ def _execute_guest_thread_start(
     if isinstance(memory, XbeBackedSparseMemory):
         memory.add_native_observer_only_callback_addresses(
             title_world_matrix_audit.memory_callback_addresses
-        )
+    )
     native_run_summary: dict[str, Any] | None = None
-    native_run_summaries: list[dict[str, Any]] = []
+    native_run_history = _BoundedDiagnosticHistory(
+        first_limit=DEFAULT_DIAGNOSTIC_FIRST_NATIVE_RUNS,
+        recent_limit=DEFAULT_DIAGNOSTIC_RECENT_NATIVE_RUNS,
+    )
     native_frontier_functions: list[LiftedFunction] = []
     native_frontier_modules: list[LiftedFunction] = []
     native_frontier_module_by_address: dict[int, LiftedFunction] = {}
@@ -18289,6 +18674,7 @@ def _execute_guest_thread_start(
     title_main_loop_control_events: list[dict[str, Any]] = []
     pending_native_write_observations: list[tuple[int, bytes]] = []
     cooperative_scheduler_summary: dict[str, Any] | None = None
+    native_host_services_summary: dict[str, Any] | None = None
     enable_hot_render_audits = (
         live_render_stream_path is None or audit_title_main_loop_exit
     )
@@ -18512,6 +18898,7 @@ def _execute_guest_thread_start(
                 if live_flip_audit_ack_path is None
                 else None
             ),
+            live_control_transport_name=live_control_transport_name,
             data_export_synchronizer=lambda memory: bridge.synchronize_data_exports(
                 memory,
                 volatile_only=True,
@@ -18613,7 +19000,132 @@ def _execute_guest_thread_start(
 
     try:
         if native_guest_loop:
-            from tools.recomp.native_executor import NativeResumableExecutor
+            from tools.recomp.native_executor import (
+                NATIVE_HOST_SERVICE_COLD_CALLBACK,
+                NATIVE_HOST_SERVICE_LIFECYCLE_CREATE_WORKER,
+                NATIVE_HOST_SERVICE_LIFECYCLE_NONE,
+                NATIVE_HOST_SERVICE_LIFECYCLE_RESUME_WORKER,
+                NATIVE_HOST_SERVICE_LIFECYCLE_SUSPEND_WORKER,
+                NATIVE_HOST_SERVICE_LIFECYCLE_TERMINATE_WORKER,
+                NATIVE_HOST_SERVICE_PERFORMANCE_COUNTER,
+                NATIVE_HOST_SERVICE_RETURN_CONSTANT,
+                NATIVE_HOST_SERVICE_SYSTEM_TIME,
+                NATIVE_HOST_SERVICE_XGETDEVICES,
+                NATIVE_HOST_SERVICE_XINPUT_CAPABILITIES,
+                NATIVE_HOST_SERVICE_XINPUT_OPEN,
+                NATIVE_HOST_SERVICE_XINPUT_STATE,
+                NATIVE_WORKER_BLOCKED,
+                NATIVE_WORKER_COMPLETED,
+                NATIVE_WORKER_FAILED,
+                NATIVE_WORKER_RUNNING,
+                NATIVE_WORKER_WAITING,
+                NativeCooperativeSchedulerState,
+                NativeHostServiceEntry,
+                NativeHostServiceState,
+                NativeResumableExecutor,
+                NativeWorkerLifecycleState,
+            )
+
+            runtime_targets = {
+                shim.name: shim.target_address
+                for shim in bridge.runtime.registered_shims
+            }
+            clock_snapshot = bridge.runtime.clock.snapshot()
+            native_host_service_entries = [
+                NativeHostServiceEntry(
+                    runtime_targets["KeQueryPerformanceFrequency"],
+                    NATIVE_HOST_SERVICE_RETURN_CONSTANT,
+                    0,
+                    int(clock_snapshot["performance_frequency"]),
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["KeQueryPerformanceCounter"],
+                    NATIVE_HOST_SERVICE_PERFORMANCE_COUNTER,
+                    0,
+                    0,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["KeQuerySystemTime"],
+                    NATIVE_HOST_SERVICE_SYSTEM_TIME,
+                    4,
+                    0,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["NtYieldExecution"],
+                    NATIVE_HOST_SERVICE_RETURN_CONSTANT,
+                    0,
+                    int(XboxStatus.SUCCESS),
+                ),
+                NativeHostServiceEntry(
+                    TITLE_XGETDEVICES_ADDRESS,
+                    NATIVE_HOST_SERVICE_XGETDEVICES,
+                    4,
+                    0,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_XINPUT_OPEN_ADDRESS,
+                    NATIVE_HOST_SERVICE_XINPUT_OPEN,
+                    16,
+                    0,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_XINPUT_GET_CAPABILITIES_ADDRESS,
+                    NATIVE_HOST_SERVICE_XINPUT_CAPABILITIES,
+                    8,
+                    0,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_XINPUT_GET_STATE_ADDRESS,
+                    NATIVE_HOST_SERVICE_XINPUT_STATE,
+                    8,
+                    0,
+                ),
+            ]
+            native_lifecycle_actions = {
+                "PsCreateSystemThreadEx": (
+                    NATIVE_HOST_SERVICE_LIFECYCLE_CREATE_WORKER
+                ),
+                "PsTerminateSystemThread": (
+                    NATIVE_HOST_SERVICE_LIFECYCLE_TERMINATE_WORKER
+                ),
+                "NtSuspendThread": NATIVE_HOST_SERVICE_LIFECYCLE_SUSPEND_WORKER,
+                "NtResumeThread": NATIVE_HOST_SERVICE_LIFECYCLE_RESUME_WORKER,
+            }
+            native_service_targets = {
+                int(entry.target) for entry in native_host_service_entries
+            }
+            for shim in bridge.runtime.registered_shims:
+                if (
+                    shim.behavior == "data"
+                    or shim.target_address in native_service_targets
+                ):
+                    continue
+                native_host_service_entries.append(
+                    NativeHostServiceEntry(
+                        shim.target_address,
+                        NATIVE_HOST_SERVICE_COLD_CALLBACK,
+                        bridge.guest_stack_cleanup_bytes(shim.target_address),
+                        native_lifecycle_actions.get(
+                            shim.name,
+                            NATIVE_HOST_SERVICE_LIFECYCLE_NONE,
+                        ),
+                    )
+                )
+            native_host_services = NativeHostServiceState(
+                native_host_service_entries
+            )
+            native_worker_lifecycle = NativeWorkerLifecycleState()
+            native_host_services.attach_worker_lifecycle(
+                native_worker_lifecycle
+            )
+
+            def synchronize_native_host_services() -> None:
+                native_host_services.update_clock(bridge.runtime.clock.snapshot())
+                native_host_services.update_controllers(
+                    bridge.runtime.input.poll_all()
+                )
+
+            synchronize_native_host_services()
 
             observer_addresses = {
                 *subsystem_initializer_audit.observer_addresses,
@@ -18671,6 +19183,26 @@ def _execute_guest_thread_start(
                 *TITLE_EXACT_MEMORY_WRITE_CALLBACK_ADDRESSES,
                 *audit_memory_callback_addresses,
             }
+            native_resident_hot_path_enabled = bool(
+                live_host_bridge is not None
+                and not audit_title_main_loop_exit
+                and not render_watchpoint.retain_diagnostic_writes
+            )
+
+            def live_native_slice_steps(_steps: int) -> int:
+                if render_watchpoint.flip_count == 0:
+                    return native_slice_steps
+                return max(
+                    native_slice_steps,
+                    DEFAULT_LIVE_NATIVE_STEADY_SLICE_STEPS,
+                )
+
+            def can_use_shared_memory_for_handler(target: int) -> bool:
+                return (
+                    not bridge.has_target(target)
+                    or native_resident_hot_path_enabled
+                    and bridge.can_use_shared_memory_for_handler(target)
+                )
 
             def create_native_executor(
                 active_frame: LiftedFunction,
@@ -18734,7 +19266,9 @@ def _execute_guest_thread_start(
 
             native_frontier_promotion = _NativeFrontierPromotion(
                 build_promoted_frontier_executor,
-                enabled=live_host_bridge is not None,
+                enabled=(
+                    developer_live_compile and live_host_bridge is not None
+                ),
                 base_addresses=native_base_addresses,
             )
 
@@ -18903,9 +19437,7 @@ def _execute_guest_thread_start(
                     "NtWaitForSingleObjectEx",
                 }
             }
-            cooperative_pending_main_steps = 0
-            cooperative_last_slice_steps = 0
-            cooperative_last_serviced_flip = 0
+            cooperative_scheduler = NativeCooperativeSchedulerState()
             cooperative_service_count = 0
             cooperative_service_total_us = 0
             cooperative_service_max_us = 0
@@ -18913,7 +19445,12 @@ def _execute_guest_thread_start(
             cooperative_video_tick_count = 0
             cooperative_wait_skip_count = 0
             cooperative_wake_count = 0
+            cooperative_yield_count = 0
             primary_handle = thread.get("handle")
+            native_host_services.current_worker_handle = (
+                primary_handle if isinstance(primary_handle, int) else 0
+            )
+            native_worker_lifecycle_generation = -1
             pre_first_flip_slice_steps = 0
 
             def observe_cooperative_write(address: int, payload: bytes) -> None:
@@ -18931,47 +19468,92 @@ def _execute_guest_thread_start(
             def service_cooperative_threads() -> None:
                 nonlocal cooperative_executor, cooperative_service_active
                 nonlocal cooperative_wait_skip_count, cooperative_wake_count
-                if thread_index != 0:
+                nonlocal cooperative_yield_count
+                nonlocal native_worker_lifecycle_generation
+                if thread_index != 0 or active_native_executor is None:
                     return
-                for candidate in _scheduled_guest_threads(bridge, loaded):
-                    handle = candidate.get("handle")
-                    if (
-                        not isinstance(handle, int)
-                        or handle == primary_handle
-                        or handle in cooperative_sessions
-                        or candidate["suspended"]
-                        or not candidate["executable"]
-                    ):
-                        continue
-                    worker_index = thread_index + 1 + len(cooperative_sessions)
-                    worker_state, worker_return = _initialize_guest_thread_state(
-                        candidate,
-                        thread_index=worker_index,
-                        memory=memory,
+                if (
+                    native_worker_lifecycle_generation
+                    != bridge.thread_lifecycle_generation
+                ):
+                    active_native_executor.synchronize_worker_lifecycle(
+                        native_worker_lifecycle,
+                        _scheduled_guest_threads(bridge, loaded),
+                        primary_handle=(
+                            primary_handle if isinstance(primary_handle, int) else 0
+                        ),
                     )
-                    cooperative_sessions[handle] = {
-                        "thread": candidate,
-                        "thread_index": worker_index,
-                        "state": worker_state,
-                        "return_sentinel": worker_return,
-                        "status": "ready",
-                        "run_count": 0,
-                        "steps": 0,
-                        "last_run": None,
-                    }
-                active_sessions = []
-                for session in cooperative_sessions.values():
+                    native_worker_lifecycle_generation = (
+                        bridge.thread_lifecycle_generation
+                    )
+                for handle, session in cooperative_sessions.items():
                     if session["status"] == "waiting":
                         if not _resume_cooperative_wait(session, bridge.runtime):
                             cooperative_wait_skip_count += 1
                             continue
                         session["status"] = "running"
+                        active_native_executor.set_worker_lifecycle_status(
+                            native_worker_lifecycle,
+                            handle,
+                            NATIVE_WORKER_RUNNING,
+                        )
                         cooperative_wake_count += 1
-                    if session["status"] in {"ready", "running"}:
-                        active_sessions.append(session)
+                active_sessions = []
+                for handle in active_native_executor.select_runnable_workers(
+                    native_worker_lifecycle
+                ):
+                    session = cooperative_sessions.get(handle)
+                    if session is None:
+                        lifecycle_entry = native_worker_lifecycle.entry_for_handle(
+                            handle
+                        )
+                        if lifecycle_entry is None:
+                            continue
+                        candidate = {
+                            "handle": handle,
+                            "handle_hex": _hex32(handle),
+                            "start_address": int(lifecycle_entry.start_address),
+                            "start_address_hex": _hex32(
+                                int(lifecycle_entry.start_address)
+                            ),
+                            "start_context1": int(lifecycle_entry.start_context1),
+                            "start_context1_hex": _hex32(
+                                int(lifecycle_entry.start_context1)
+                            ),
+                            "start_context2": int(lifecycle_entry.start_context2),
+                            "start_context2_hex": _hex32(
+                                int(lifecycle_entry.start_context2)
+                            ),
+                            "suspended": False,
+                            "executable": True,
+                        }
+                        worker_index = (
+                            thread_index + 1 + len(cooperative_sessions)
+                        )
+                        worker_state, worker_return = (
+                            _initialize_guest_thread_state(
+                                candidate,
+                                thread_index=worker_index,
+                                memory=memory,
+                            )
+                        )
+                        session = {
+                            "handle": handle,
+                            "thread": candidate,
+                            "thread_index": worker_index,
+                            "state": worker_state,
+                            "return_sentinel": worker_return,
+                            "status": "running",
+                            "run_count": 0,
+                            "steps": 0,
+                            "last_run": None,
+                        }
+                        cooperative_sessions[handle] = session
+                    active_sessions.append(session)
                 if not active_sessions:
                     return
                 for session in active_sessions:
+                    active_worker_handle = int(session["handle"])
                     if cooperative_executor is None:
                         cooperative_frame = _merge_lifted_functions(
                             entry_function,
@@ -19020,6 +19602,14 @@ def _execute_guest_thread_start(
                         return True
 
                     bridge.defer_guest_thread_delays = True
+                    native_host_services.current_worker_handle = (
+                        active_worker_handle
+                    )
+                    previous_runtime_thread = (
+                        bridge.runtime.sync.activate_thread(
+                            active_worker_handle
+                        )
+                    )
                     try:
                         returned = cooperative_executor.run(
                             session["state"],
@@ -19051,6 +19641,12 @@ def _execute_guest_thread_start(
                             call_handler_yield_predicate=(
                                 should_yield_blocking_call
                             ),
+                            # Resumable native operations and the title GPU
+                            # idle pump request a yield when this worker should
+                            # return to the cooperative scheduler.
+                            yield_handler=(
+                                lambda _state, _memory, _steps: False
+                            ),
                             shared_memory_handler_predicate=(
                                 bridge.can_use_shared_memory_for_handler
                             ),
@@ -19066,6 +19662,10 @@ def _execute_guest_thread_start(
                                 and not audit_title_main_loop_exit
                                 and not render_watchpoint.retain_diagnostic_writes
                             ),
+                            dispatch_host_calls_in_native=(
+                                native_resident_hot_path_enabled
+                            ),
+                            native_host_services=native_host_services,
                         )
                     except NativeExecutorError as exc:
                         session["status"] = "execution_failed"
@@ -19074,6 +19674,14 @@ def _execute_guest_thread_start(
                     finally:
                         bridge.defer_guest_thread_delays = False
                         cooperative_service_active = False
+                        native_host_services.current_worker_handle = (
+                            primary_handle
+                            if isinstance(primary_handle, int)
+                            else 0
+                        )
+                        bridge.runtime.sync.activate_thread(
+                            previous_runtime_thread
+                        )
                     run = cooperative_executor.last_run_summary
                     if run is not None:
                         session["run_count"] += 1
@@ -19084,10 +19692,26 @@ def _execute_guest_thread_start(
                             "target_hex": run.get("target_hex"),
                             "steps": run.get("steps"),
                         }
-                        if returned in {0, session["return_sentinel"]}:
+                        lifecycle_entry = (
+                            native_worker_lifecycle.entry_for_handle(
+                                active_worker_handle
+                            )
+                        )
+                        if (
+                            lifecycle_entry is not None
+                            and int(lifecycle_entry.status)
+                            == NATIVE_WORKER_COMPLETED
+                        ):
                             session["status"] = "completed"
-                        elif run.get("reason") == "step_budget":
+                        elif returned in {0, session["return_sentinel"]}:
+                            session["status"] = "completed"
+                        elif run.get("reason") in {
+                            "step_budget",
+                            "yield_handler_stop",
+                        }:
                             session["status"] = "running"
+                            if run.get("reason") == "yield_handler_stop":
+                                cooperative_yield_count += 1
                         elif run.get("reason") == "call_handler_yield":
                             session["status"] = "waiting"
                             wait = session.pop("pending_wait", None)
@@ -19193,6 +19817,20 @@ def _execute_guest_thread_start(
                                         session["status"] = "running"
                         elif session["status"] != "execution_failed":
                             session["status"] = "blocked"
+                    lifecycle_status = {
+                        "ready": NATIVE_WORKER_RUNNING,
+                        "running": NATIVE_WORKER_RUNNING,
+                        "waiting": NATIVE_WORKER_WAITING,
+                        "completed": NATIVE_WORKER_COMPLETED,
+                        "blocked": NATIVE_WORKER_BLOCKED,
+                        "execution_failed": NATIVE_WORKER_FAILED,
+                    }.get(session["status"])
+                    if lifecycle_status is not None:
+                        active_native_executor.set_worker_lifecycle_status(
+                            native_worker_lifecycle,
+                            active_worker_handle,
+                            lifecycle_status,
+                        )
                     newly_changed = cooperative_changed_pages - changed_before
                     if newly_changed:
                         memory.mark_changed_pages(newly_changed)
@@ -19231,9 +19869,6 @@ def _execute_guest_thread_start(
                 steps: int,
             ) -> bool | None:
                 nonlocal pre_first_flip_slice_steps
-                nonlocal cooperative_pending_main_steps
-                nonlocal cooperative_last_slice_steps
-                nonlocal cooperative_last_serviced_flip
                 if title_scene_record_audit.complete:
                     return False
                 title_heap_large_bin_integrity_repair.service_native_slice(
@@ -19262,13 +19897,6 @@ def _execute_guest_thread_start(
                             volatile_only=True,
                         )
                     pre_first_flip_slice_steps = steps
-                cooperative_delta_steps = (
-                    steps - cooperative_last_slice_steps
-                    if steps >= cooperative_last_slice_steps
-                    else steps
-                )
-                cooperative_last_slice_steps = steps
-                cooperative_pending_main_steps += cooperative_delta_steps
                 if live_host_bridge is not None:
                     continue_running = live_host_bridge.on_slice(
                         cpu,
@@ -19277,17 +19905,22 @@ def _execute_guest_thread_start(
                     )
                     if continue_running is False:
                         return False
-                    completed_flips = render_watchpoint.flip_count
-                    if completed_flips > 0:
-                        while cooperative_last_serviced_flip < completed_flips:
-                            run_cooperative_service(video_tick=True)
-                            cooperative_last_serviced_flip += 1
-                        cooperative_pending_main_steps = 0
-                        return continue_running
-                while cooperative_pending_main_steps >= cooperative_quantum:
+                    synchronize_native_host_services()
+                if active_native_executor is None:
+                    return None
+                instruction_ticks, video_ticks = (
+                    active_native_executor.update_cooperative_scheduler(
+                        cooperative_scheduler,
+                        steps=steps,
+                        completed_flips=render_watchpoint.flip_count,
+                        instruction_quantum=cooperative_quantum,
+                    )
+                )
+                for _ in range(video_ticks):
+                    run_cooperative_service(video_tick=True)
+                for _ in range(instruction_ticks):
                     run_cooperative_service(video_tick=False)
-                    cooperative_pending_main_steps -= cooperative_quantum
-                return None
+                return continue_running if live_host_bridge is not None else None
 
             native_steps = 0
             returned_to = state.eip
@@ -19419,6 +20052,11 @@ def _execute_guest_thread_start(
                             if live_host_bridge is not None or thread_index == 0
                             else 0
                         ),
+                        slice_steps_provider=(
+                            live_native_slice_steps
+                            if native_resident_hot_path_enabled
+                            else None
+                        ),
                         yield_handler=(
                             service_native_slice
                             if live_host_bridge is not None or thread_index == 0
@@ -19430,7 +20068,7 @@ def _execute_guest_thread_start(
                             else None
                         ),
                         shared_memory_handler_predicate=(
-                            bridge.can_use_shared_memory_for_handler
+                            can_use_shared_memory_for_handler
                         ),
                         profile_hot_paths=profile_hot_paths,
                         capture_observed_write_provenance=(
@@ -19443,6 +20081,13 @@ def _execute_guest_thread_start(
                             and not audit_title_main_loop_exit
                             and not render_watchpoint.retain_diagnostic_writes
                         ),
+                        defer_dirty_sync_at_yield=(
+                            native_resident_hot_path_enabled
+                        ),
+                        dispatch_host_calls_in_native=(
+                            native_resident_hot_path_enabled
+                        ),
+                        native_host_services=native_host_services,
                     )
                 finally:
                     native_run_summary = native.last_run_summary
@@ -19454,7 +20099,7 @@ def _execute_guest_thread_start(
                     )
                 )
                 active_native_executor = None
-                native_run_summaries.append(
+                native_run_history.append(
                     {
                         **native_run_summary,
                         "executor_role": native_executor_role,
@@ -19593,6 +20238,7 @@ def _execute_guest_thread_start(
                 "video_tick_count": cooperative_video_tick_count,
                 "wait_skip_count": cooperative_wait_skip_count,
                 "wake_count": cooperative_wake_count,
+                "yield_count": cooperative_yield_count,
                 "service_total_us": cooperative_service_total_us,
                 "service_max_us": cooperative_service_max_us,
                 "service_average_us": round(
@@ -19602,6 +20248,7 @@ def _execute_guest_thread_start(
                 ),
                 "session_count": len(cooperative_sessions),
                 "worker_write_page_count": len(cooperative_changed_pages),
+                "lifecycle": native_worker_lifecycle.summary(),
                 "sessions": [
                     {
                         "handle": handle,
@@ -19625,6 +20272,64 @@ def _execute_guest_thread_start(
                     }
                     for handle, session in sorted(cooperative_sessions.items())
                 ],
+            }
+            native_host_services_summary = {
+                "backend": "native_dispatcher",
+                "call_count": int(native_host_services.native_call_count),
+                "service_call_counts": {
+                    "return_constant": int(
+                        native_host_services.service_call_counts[
+                            NATIVE_HOST_SERVICE_RETURN_CONSTANT
+                        ]
+                    ),
+                    "performance_counter": int(
+                        native_host_services.service_call_counts[
+                            NATIVE_HOST_SERVICE_PERFORMANCE_COUNTER
+                        ]
+                    ),
+                    "system_time": int(
+                        native_host_services.service_call_counts[
+                            NATIVE_HOST_SERVICE_SYSTEM_TIME
+                        ]
+                    ),
+                    "xgetdevices": int(
+                        native_host_services.service_call_counts[
+                            NATIVE_HOST_SERVICE_XGETDEVICES
+                        ]
+                    ),
+                    "xinput_open": int(
+                        native_host_services.service_call_counts[
+                            NATIVE_HOST_SERVICE_XINPUT_OPEN
+                        ]
+                    ),
+                    "xinput_capabilities": int(
+                        native_host_services.service_call_counts[
+                            NATIVE_HOST_SERVICE_XINPUT_CAPABILITIES
+                        ]
+                    ),
+                    "xinput_state": int(
+                        native_host_services.service_call_counts[
+                            NATIVE_HOST_SERVICE_XINPUT_STATE
+                        ]
+                    ),
+                    "cold_callback": int(
+                        native_host_services.service_call_counts[
+                            NATIVE_HOST_SERVICE_COLD_CALLBACK
+                        ]
+                    ),
+                },
+                "controller_packets": list(
+                    native_host_services.controller_packets
+                ),
+                "successful_get_state_count": int(
+                    native_host_services.successful_get_state_count
+                ),
+                "observed_button_mask": int(
+                    native_host_services.observed_button_mask
+                ),
+                "a_pressed_poll_count": int(
+                    native_host_services.a_pressed_poll_count
+                ),
             }
             if live_host_bridge is not None:
                 live_host_bridge.on_slice(state, memory, native_steps, True)
@@ -19707,8 +20412,10 @@ def _execute_guest_thread_start(
                 ]
             ],
             "native_run": native_run_summary,
-            "native_runs": native_run_summaries,
+            "native_runs": native_run_history.records(),
+            "native_run_history": native_run_history.summary(),
             "cooperative_guest_thread_scheduler": cooperative_scheduler_summary,
+            "native_host_services": native_host_services_summary,
             "native_frontier_recovery": {
                 "recovered_block_count": len(native_frontier_functions),
                 "recovered_module_count": len(native_frontier_modules),
@@ -19825,7 +20532,8 @@ def _execute_guest_thread_start(
             "title_world_matrix_audit": title_world_matrix_audit.summary(),
             "title_scene_record_audit": title_scene_record_audit.summary(),
             "native_run": native_run_summary,
-            "native_runs": native_run_summaries,
+            "native_runs": native_run_history.records(),
+            "native_run_history": native_run_history.summary(),
         }
         if isinstance(exc, NativeExecutorError):
             failure["state"] = state.to_dict()
@@ -19906,8 +20614,10 @@ def _execute_guest_thread_start(
             ],
         },
         "native_run": native_run_summary,
-        "native_runs": native_run_summaries,
+        "native_runs": native_run_history.records(),
+        "native_run_history": native_run_history.summary(),
         "cooperative_guest_thread_scheduler": cooperative_scheduler_summary,
+        "native_host_services": native_host_services_summary,
         "native_frontier_recovery": {
             "recovered_block_count": len(native_frontier_functions),
             "recovered_module_count": len(native_frontier_modules),
@@ -22306,11 +23016,34 @@ def _parse_int(value: str) -> int:
     return int(value, 0)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Probe recovered boot/control-flow against runtime shim ABI bindings."
     )
     parser.add_argument("xbe", type=Path, help="Path to the local XBE file to probe.")
+    parser.add_argument(
+        "--supported-targets",
+        type=Path,
+        default=DEFAULT_SUPPORTED_TARGETS,
+        help="Checked-in manifest of exact XBE identities supported by this runtime.",
+    )
+    parser.add_argument(
+        "--allow-unsupported-xbe",
+        action="store_true",
+        help=(
+            "Developer-only override for an unknown XBE; marks the output as "
+            "unsupported and unsuitable for compatibility or performance claims."
+        ),
+    )
+    parser.add_argument(
+        "--run-id",
+        help="Run identifier supplied by an orchestrating launcher.",
+    )
+    parser.add_argument(
+        "--run-manifest",
+        type=Path,
+        help="Run manifest associated with --run-id.",
+    )
     parser.add_argument(
         "--extracted-root",
         type=Path,
@@ -22400,6 +23133,13 @@ def main() -> int:
         help="Read controller snapshots published by the live Vulkan presenter.",
     )
     parser.add_argument(
+        "--live-control-transport",
+        help=(
+            "Open this versioned named shared-memory mapping for live controller "
+            "state, stop requests, and presentation acknowledgements."
+        ),
+    )
+    parser.add_argument(
         "--live-flip-audit-ack",
         type=Path,
         help=(
@@ -22438,6 +23178,14 @@ def main() -> int:
             "Enable exact native module-edge profiling, exclusive dispatcher "
             "timing, and sampled callback latencies; normal live runs keep this "
             "extra accounting disabled."
+        ),
+    )
+    parser.add_argument(
+        "--developer-live-compile",
+        action="store_true",
+        help=(
+            "Developer-only: compile and adopt newly discovered native frontier "
+            "blocks during the run; discoveries are always persisted for AOT."
         ),
     )
     parser.add_argument(
@@ -22513,9 +23261,11 @@ def main() -> int:
         action="store_true",
         help="Write requested artifacts without duplicating the full summary to stdout.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if (args.live_render_stream is None) != (args.live_controller_state is None):
         parser.error("--live-render-stream and --live-controller-state must be used together")
+    if args.live_control_transport is not None and args.live_render_stream is None:
+        parser.error("--live-control-transport requires the live render/controller pair")
     if args.live_flip_audit_ack is not None and args.live_render_stream is None:
         parser.error("--live-flip-audit-ack requires the live render/controller pair")
     if args.max_steps < 0:
@@ -22532,6 +23282,22 @@ def main() -> int:
         parser.error("--audit-world-matrix-address must fit a 64-byte 32-bit range")
     if args.scene_record_audit_output is not None and not args.audit_scene_records:
         parser.error("--scene-record-audit-output requires --audit-scene-records")
+
+    try:
+        target_verification = verify_supported_xbe(
+            args.xbe,
+            manifest_path=args.supported_targets,
+            allow_unsupported=args.allow_unsupported_xbe,
+        )
+    except ProjectIdentityError as exc:
+        print(f"Target identity rejected: {exc}", file=sys.stderr)
+        return 2
+    if target_verification["override_used"]:
+        print(
+            "WARNING: unsupported XBE override is active; this run is not valid "
+            "for compatibility or performance claims.",
+            file=sys.stderr,
+        )
 
     summary = build_playability_probe_summary(
         args.xbe,
@@ -22554,16 +23320,28 @@ def main() -> int:
         native_build_dir=args.native_build_dir,
         live_render_stream_path=args.live_render_stream,
         live_controller_state_path=args.live_controller_state,
+        live_control_transport_name=args.live_control_transport,
         live_flip_audit_ack_path=args.live_flip_audit_ack,
         live_flip_audit_health_interval=args.live_flip_audit_health_interval,
         live_flip_audit_max_flips=args.live_flip_audit_max_flips,
         native_slice_steps=args.native_slice_steps,
         profile_hot_paths=args.profile_hot_paths,
+        developer_live_compile=args.developer_live_compile,
         audit_title_main_loop_exit=args.audit_title_main_loop_exit,
         audit_world_matrices=args.audit_world_matrices,
         audit_world_matrix_address=args.audit_world_matrix_address,
         audit_scene_records=args.audit_scene_records,
     )
+    summary["identity"] = {
+        "run_id": args.run_id or new_run_id(),
+        "run_manifest": (
+            str(args.run_manifest.resolve()) if args.run_manifest is not None else None
+        ),
+        "repository": git_identity(REPOSITORY_ROOT),
+        "generated_code": generated_code_identity(),
+        "target": target_verification,
+        "supported_run": bool(target_verification["supported"]),
+    }
     output = (
         summary_json(summary, pretty=args.pretty)
         if args.json_output is not None or not args.quiet

@@ -8,6 +8,9 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from tools.host.first_frame_smoke import (
+    DEFAULT_PRESENTER_MODULES,
+    DEFAULT_SOURCE,
+    FirstFrameSmokeError,
     Toolchain,
     build_command,
     compile_shaders,
@@ -15,10 +18,117 @@ from tools.host.first_frame_smoke import (
     read_debug_events,
     run_first_frame,
     summarize_smoke,
+    validate_presenter_build_manifest,
+    write_presenter_build_manifest,
 )
 
 
+PRESENTER_SOURCE_PATHS = (
+    Path("runtime/host/nv2a_command_processor.cpp"),
+    Path("runtime/host/vulkan_presenter.cpp"),
+    Path("runtime/host/vulkan_renderer.cpp"),
+    Path("runtime/host/vulkan_resources.cpp"),
+    Path("runtime/host/presenter_diagnostics.cpp"),
+    Path("runtime/host/vulkan_presenter_internal.h"),
+    Path("runtime/host/vulkan_presenter_runtime.h"),
+    Path("runtime/host/vulkan_first_frame.cpp"),
+    Path("runtime/host/live_presenter_transport.cpp"),
+    Path("runtime/host/presenter_debug_log.cpp"),
+    Path("runtime/host/presenter_metrics.cpp"),
+    Path("runtime/host/presenter_options.cpp"),
+    Path("runtime/host/presenter_options.h"),
+    Path("runtime/platform/sdl/sdl_audio.cpp"),
+    Path("runtime/platform/sdl/sdl_audio_c_api.cpp"),
+    Path("runtime/platform/sdl/sdl_platform.cpp"),
+)
+
+
+def presenter_source_text() -> str:
+    source = "\n".join(
+        path.read_text(encoding="utf-8") for path in PRESENTER_SOURCE_PATHS
+    )
+    # Source-contract tests predate the out-of-class presenter method split.
+    # Normalize the class qualifier so their function-boundary probes continue
+    # to inspect implementations instead of matching later declarations.
+    return source.replace("VulkanPresenter::", "")
+
+
 class FirstFrameSmokeTests(unittest.TestCase):
+    def test_default_presenter_build_compiles_every_native_module(self) -> None:
+        toolchain = Toolchain(
+            clangxx=Path("clang++.exe"),
+            vulkan_sdk=Path("C:/VulkanSDK/test"),
+        )
+
+        command = build_command(
+            source=DEFAULT_SOURCE,
+            output=Path("build/local/first-frame/b2_first_frame.exe"),
+            toolchain=toolchain,
+        )
+
+        for source in (DEFAULT_SOURCE, *DEFAULT_PRESENTER_MODULES):
+            self.assertIn(str(source), command)
+
+    def test_build_manifest_rejects_changed_presenter_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            sdk = root / "sdk"
+            source = root / "presenter.cpp"
+            executable = root / "presenter.exe"
+            clangxx = root / "clang++.exe"
+            manifest = root / "presenter.build.json"
+            source.write_text("int main() { return 0; }\n", encoding="utf-8")
+            executable.write_bytes(b"MZ-presenter")
+            clangxx.write_bytes(b"clang")
+            for path in (
+                sdk / "Lib" / "SDL3.lib",
+                sdk / "Lib" / "vulkan-1.lib",
+                sdk / "Bin" / "SDL3.dll",
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(path.name.encode("ascii"))
+            (root / "SDL3.dll").write_bytes(b"SDL3.dll")
+            toolchain = Toolchain(clangxx=clangxx, vulkan_sdk=sdk)
+            with patch(
+                "tools.host.first_frame_smoke._command_version",
+                return_value="test compiler 1.0",
+            ):
+                write_presenter_build_manifest(
+                    path=manifest,
+                    source=source,
+                    output=executable,
+                    toolchain=toolchain,
+                    include_shaders=False,
+                )
+
+            valid = validate_presenter_build_manifest(
+                manifest,
+                executable=executable,
+                source=source,
+                require_shaders=False,
+            )
+            source.write_text("int main() { return 1; }\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(FirstFrameSmokeError, "source SHA-256 changed"):
+                validate_presenter_build_manifest(
+                    manifest,
+                    executable=executable,
+                    source=source,
+                    require_shaders=False,
+                )
+            overridden = validate_presenter_build_manifest(
+                manifest,
+                executable=executable,
+                source=source,
+                require_shaders=False,
+                allow_stale=True,
+            )
+
+        self.assertTrue(valid["valid"])
+        self.assertFalse(overridden["valid"])
+        self.assertTrue(overridden["override_used"])
+        self.assertEqual(overridden["status"], "stale_override")
+
     def test_shader_compilation_skips_current_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -110,33 +220,63 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertEqual(result["debug_json"], None)
         self.assertEqual(result["events"], [])
 
+    def test_presenter_run_forwards_live_control_transport(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executable = Path(temp_dir) / "presenter.exe"
+            executable.touch()
+            completed = Mock(returncode=0, stdout="", stderr="")
+            with patch(
+                "tools.host.first_frame_smoke.subprocess.run",
+                return_value=completed,
+            ) as run:
+                run_first_frame(
+                    executable=executable,
+                    debug_json=None,
+                    max_frames=0,
+                    timeout_seconds=0,
+                    screenshot=None,
+                    hotkey_screenshot_directory=None,
+                    live_control_transport="Local\\b2_recomp_live_test",
+                )
+
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[command.index("--live-control-transport") + 1],
+            "Local\\b2_recomp_live_test",
+        )
+
     def test_live_presenter_hot_reloads_render_and_publishes_controller_state(self) -> None:
-        host_source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        host_source = presenter_source_text()
         runner_source = Path("tools/host/first_frame_smoke.py").read_text(encoding="utf-8")
         self.assertIn("--live-render-stream-json", host_source)
         self.assertIn("live_render_stream_reloaded", host_source)
         self.assertIn("--controller-state-json", host_source)
         self.assertIn("controller_state_published", host_source)
+        self.assertIn("kLiveControlMagic", host_source)
+        self.assertIn("kLiveManifestMagic", host_source)
+        self.assertIn("kLiveCommandMagic", host_source)
+        self.assertIn("kLiveResourceMagic", host_source)
+        self.assertIn("shared_memory_v1", host_source)
+        self.assertIn("live_command_capture_bytes_", host_source)
+        self.assertIn("current_live_resource_snapshot_bytes_", host_source)
         self.assertIn("if live_render_stream or analyze_render_stream", runner_source)
         self.assertIn("debug_json=None if args.no_diagnostics", runner_source)
         self.assertIn("if (!enabled_)", host_source)
 
     def test_vulkan_pipeline_cache_is_persistent_and_used_for_all_pipelines(self) -> None:
-        host_source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        host_source = presenter_source_text()
 
         self.assertIn("--pipeline-cache", host_source)
         self.assertIn("vkCreatePipelineCache", host_source)
         self.assertIn("vkGetPipelineCacheData", host_source)
         self.assertIn("MoveFileExW", host_source)
         self.assertIn(
-            "vkCreateComputePipelines(\n            device_,\n            pipeline_cache_",
+            "vkCreateComputePipelines(\n        device_,\n        pipeline_cache_",
             host_source,
         )
         self.assertIn(
-            "vkCreateGraphicsPipelines(\n            device_,\n"
-            "            pipeline_cache_",
+            "vkCreateGraphicsPipelines(\n        device_,\n"
+            "        pipeline_cache_",
             host_source,
         )
         self.assertIn(
@@ -203,9 +343,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
             )
 
     def test_depth_two_acknowledges_after_source_residency(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        source = presenter_source_text()
         load_block = source.split(
             "bool load_recovered_render_work", 1
         )[1].split("void destroy_native_render_resources", 1)[0]
@@ -263,9 +401,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertTrue(summary["run"]["pipeline_cache"]["written"])
 
     def test_headless_render_stream_analysis_reports_transform_coverage(self) -> None:
-        host_source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        host_source = presenter_source_text()
         runner_source = Path("tools/host/first_frame_smoke.py").read_text(
             encoding="utf-8"
         )
@@ -285,9 +421,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("render_stream_analysis_completed", runner_source)
 
     def test_program_vertices_reconstruct_homogeneous_clip_positions(self) -> None:
-        host_source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        host_source = presenter_source_text()
         shader_source = Path("runtime/host/shaders/nv2a_inline.vert").read_text(
             encoding="utf-8"
         )
@@ -314,9 +448,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("ilu_opcode != 0u && temporary_index == 1u", vertex_program_source)
 
     def test_indexed_vertex_programs_execute_in_the_vulkan_vertex_shader(self) -> None:
-        host_source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        host_source = presenter_source_text()
         shader_source = Path("runtime/host/shaders/nv2a_inline.vert").read_text(
             encoding="utf-8"
         )
@@ -347,13 +479,14 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("position.xyz *= position.w", shader_source)
 
     def test_indexed_attributes_fetch_from_raw_gpu_resources(self) -> None:
-        host_source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        host_source = presenter_source_text()
         shader_source = Path("runtime/host/shaders/nv2a_inline.vert").read_text(
             encoding="utf-8"
         )
         runner_source = Path("tools/host/first_frame_smoke.py").read_text(
+            encoding="utf-8"
+        )
+        dirty_range_source = Path("runtime/host/dirty_ranges.h").read_text(
             encoding="utf-8"
         )
 
@@ -363,7 +496,8 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("refresh_raw_vertex_buffers", host_source)
         self.assertIn("GpuRawVertexResourceCache", host_source)
         self.assertIn("refresh_gpu_raw_vertex_resource_cache", host_source)
-        self.assertIn("append_gpu_raw_vertex_dirty_range", host_source)
+        self.assertIn("append_dirty_range", host_source)
+        self.assertIn("inline void append_dirty_range", dirty_range_source)
         self.assertIn("std::minmax_element", host_source)
         self.assertIn("kCompareChunkBytes = 64u", host_source)
         self.assertIn("resource_upload_ranges", host_source)
@@ -384,9 +518,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("float(signed_value) / 32767.0", shader_source)
 
     def test_texture_conversion_runs_in_a_batched_compute_shader(self) -> None:
-        host_source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        host_source = presenter_source_text()
         compute_source = Path(
             "runtime/host/shaders/nv2a_texture_convert.comp"
         ).read_text(encoding="utf-8")
@@ -478,7 +610,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertEqual(feedback_cache["capacity"], 8)
 
     def test_live_reload_waits_only_for_in_flight_frame_and_reuses_pipelines(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
         self.assertIn('"vkWaitForFences(live reload)"', source)
         self.assertNotIn('"vkDeviceWaitIdle(live reload)"', source)
@@ -488,7 +620,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("already_presented_without_command_or_resource_delta", source)
 
     def test_live_reload_cost_does_not_scale_with_complete_command_history(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
         self.assertIn("interpret_recovered_d3d_append", source)
         self.assertIn("last_interpreted_command_delta_", source)
@@ -516,12 +648,11 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertNotIn("std::vector<uint8_t> payload;", command_struct)
         # Only one-shot replay reserves complete history. Live presentation
         # allocates and interprets the newly published absolute interval.
-        self.assertEqual(source.count("commands.reserve(record_count);"), 1)
+        self.assertEqual(source.count("commands.reserve(count);"), 1)
+        self.assertNotIn("commands.reserve(record_count);", source)
 
     def test_packed_interpreter_uses_ordered_word_fast_path_with_fallback(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        source = presenter_source_text()
         interpreter = source.split(
             "push_buffer_words_from_recovered_commands", 1
         )[1].split("struct SurfacePayloadCandidate", 1)[0]
@@ -537,9 +668,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("surface_payload_scan_skipped_count", source)
 
     def test_method_interpreter_batches_hot_index_and_inline_packets(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        source = presenter_source_text()
         interpreter = source.split(
             "void interpret_push_buffer_method_packet", 1
         )[1].split("void interpret_long_non_increasing_packet", 1)[0]
@@ -557,9 +686,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("state_seed_updates_required", source)
 
     def test_feedback_specs_are_indexed_and_cached_per_render_generation(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        source = presenter_source_text()
         feedback = source.split(
             "presented_render_target_feedback_specs() const", 1
         )[1].split("render_target_feedback_texture_matches_spec", 1)[0]
@@ -571,9 +698,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn('"feedback_spec_cache_hits"', source)
 
     def test_texture_refresh_reuses_stable_sampler_descriptor_sets(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        source = presenter_source_text()
         binding_refresh = source.split(
             "void refresh_host_texture_bindings()", 1
         )[1].split("void refresh_host_textures", 1)[0]
@@ -596,9 +721,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn('"texture_binding_descriptor_sets_allocated"', source)
 
     def test_resource_refresh_indexes_texture_matches_and_pipeline_states(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        source = presenter_source_text()
         texture_refresh = source.split(
             "void refresh_host_textures", 1
         )[1].split("std::vector<NativeVertex> prepare_presented_vertices", 1)[0]
@@ -645,11 +768,11 @@ class FirstFrameSmokeTests(unittest.TestCase):
             self.assertIn(field, source)
 
     def test_live_reload_batches_reads_reuses_texture_content_and_paces_at_60_hz(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
         self.assertIn("live_command_delta_bytes_.resize", source)
         self.assertIn("read_live_render_manifest", source)
-        self.assertIn("read_text_handle_shared(live_manifest_file_)", source)
+        self.assertIn("transport_.read_manifest_file(", source)
         self.assertIn('"B2PRS001"', source)
         self.assertIn("acknowledge_current_presentation();", source)
         self.assertIn("OpenEventW", source)
@@ -670,7 +793,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn('"target_frame_us"', source)
 
     def test_live_reload_retries_incomplete_shared_manifest(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
         self.assertIn("load_initial_recovered_render_work", source)
         self.assertIn("live_render_startup_manifest_retried", source)
@@ -683,14 +806,14 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("publication_retry_pending_", source)
         event_probe = source.index("WaitForSingleObject(publication_event_, 0u)")
         timestamp_probe = source.index(
-            "std::filesystem::last_write_time(\n                options_.render_stream_json",
+            "std::filesystem::last_write_time(\n            options_.render_stream_json",
             event_probe,
         )
         self.assertLess(event_probe, timestamp_probe)
         self.assertNotIn("command-sidecar-only fast path", source)
 
     def test_normal_live_reload_defers_expensive_presented_geometry_diagnostics(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
         sampling_begin = source.index("const bool diagnostic_sample_due")
         sampling_end = source.index(
             "last_presented_diagnostics_sampled_ = diagnostic_sample_due",
@@ -725,7 +848,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("presented_texture_addresses", source)
 
     def test_live_resource_generation_is_transactional_and_owns_diagnostics(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
         load_begin = source.index("bool load_recovered_render_work(")
         load_end = source.index("void destroy_native_render_resources", load_begin)
@@ -741,7 +864,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("unsupported_texture_resource_count_ = 0", source)
 
     def test_frame_readback_reports_low_information_coverage(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
         self.assertIn("bright_count", source)
         self.assertIn("dark_count", source)
@@ -749,33 +872,30 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("low_information", source)
 
     def test_keyboard_controller_pulses_survive_guest_polling_interval(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
-        self.assertIn("kControllerMinimumPulseMs = 150", source)
-        self.assertIn("kControllerMaximumPulseMs = 2000", source)
-        self.assertIn("kControllerMinimumPulseGuestFlips = 2u", source)
-        self.assertIn("controller_key_down_[key_index]", source)
-        self.assertIn("controller_buttons_from_keys()", source)
-        self.assertIn("latch_keyboard_button_presses(", source)
-        self.assertIn("keyboard_latched_buttons_ |= bit", source)
-        self.assertIn("keyboard_latch_guest_flip_counts_[bit_index]", source)
-        self.assertIn("keyboard_latch_max_deadlines_[bit_index]", source)
-        self.assertIn("guest_flip_pulse >= kControllerMinimumPulseGuestFlips", source)
-        self.assertIn("update_keyboard_button_latches();", source)
-        self.assertIn("case VK_RETURN: return 0x1000u", source)
-        self.assertNotIn("case VK_RETURN: return 0x1010u", source)
-        self.assertIn("case VK_SPACE: return 0x1000u", source)
-        self.assertIn("effective_controller_buttons()", source)
+        self.assertIn("kMinimumPulseMs = 150", source)
+        self.assertIn("kMaximumPulseMs = 2000", source)
+        self.assertIn("kMinimumPulseGuestFlips = 2u", source)
+        self.assertIn("key_down[static_cast<size_t>(key.scancode)]", source)
+        self.assertIn("buttons_from_keys()", source)
+        self.assertIn("latch_pressed_buttons(", source)
+        self.assertIn("latched_buttons |= bit", source)
+        self.assertIn("latch_guest_flip_counts[bit_index]", source)
+        self.assertIn("latch_max_deadlines[bit_index]", source)
+        self.assertIn("flip_pulse >= kMinimumPulseGuestFlips", source)
+        self.assertIn("impl_->update_latches(guest_flip_count)", source)
+        self.assertIn("case SDLK_RETURN: return kA", source)
+        self.assertIn("case SDLK_SPACE:", source)
+        self.assertIn("state.buttons = state.keyboard_buttons", source)
 
     def test_sdl3_gamepad_input_maps_complete_xbox_controller_state(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        source = presenter_source_text()
 
         self.assertIn("#include <SDL3/SDL.h>", source)
         self.assertIn("SDL_InitSubSystem(SDL_INIT_GAMEPAD)", source)
-        self.assertIn("SDL_GetGamepads(&gamepad_count)", source)
-        self.assertIn("SDL_OpenGamepad(gamepad_ids[index])", source)
+        self.assertIn("SDL_GetGamepads(&count)", source)
+        self.assertIn("SDL_OpenGamepad(id)", source)
         self.assertIn("SDL_UpdateGamepads();", source)
         self.assertIn("SDL_GAMEPAD_BUTTON_SOUTH", source)
         self.assertIn("SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER", source)
@@ -783,27 +903,25 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("SDL_GAMEPAD_AXIS_LEFT_TRIGGER", source)
         self.assertIn("SDL_GAMEPAD_AXIS_RIGHTY", source)
         self.assertIn("SDL_GetGamepadMapping(candidate)", source)
-        self.assertIn("SDL_GetGamepadGUIDForID(active_gamepad_id_)", source)
-        self.assertIn("controller_backend_initialized", source)
+        self.assertIn("SDL_GetGamepadGUIDForID(gamepad_id)", source)
+        self.assertIn("status.gamepad_initialized", source)
         self.assertIn("host_controller_connected", source)
         self.assertNotIn("joyGetPosEx", source)
         self.assertNotIn("latch_controller_button_presses", source)
-        poll_source = source.split("void poll_host_controller(", 1)[1].split(
-            "uint16_t effective_controller_buttons()", 1
+        poll_source = source.split("PlatformPollResult SdlPlatform::poll(", 1)[1].split(
+            "PlatformPollResult SdlPlatform::inject_confirm", 1
         )[0]
-        self.assertNotIn("latch_keyboard_button_presses", poll_source)
+        self.assertNotIn("latch_pressed_buttons", poll_source)
         self.assertIn("controller_states_equivalent", source)
-        self.assertIn("kControllerStickPublishHysteresis = 256", source)
-        self.assertIn("kControllerTriggerPublishHysteresis = 8", source)
-        self.assertIn("host_controller_state_.left_trigger", source)
-        self.assertIn("host_controller_state_.thumb_lx", source)
-        self.assertIn("controller_buttons_ | host_controller_state_.buttons", source)
+        self.assertIn("kStickPublishHysteresis = 256", source)
+        self.assertIn("kTriggerPublishHysteresis = 8", source)
+        self.assertIn("controller.left_trigger", source)
+        self.assertIn("controller.thumb_lx", source)
+        self.assertIn("state.keyboard_buttons | state.latched_buttons", source)
         self.assertIn('"replace_retry_count"', source)
 
     def test_frame_events_attribute_blocking_vulkan_boundaries(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        source = presenter_source_text()
 
         self.assertIn('"draw_fence_wait_us"', source)
         self.assertIn('"window_message_pump_us"', source)
@@ -821,14 +939,14 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("const auto present_begin", source)
 
     def test_native_dxt1_decoder_uses_linear_block_order(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
         self.assertIn("block_index % blocks_x", source)
         self.assertIn("block_index / blocks_x", source)
         self.assertNotIn("block_index >> (bit * 2u)", source)
 
     def test_native_dxt5_decoder_uploads_title_alpha_textures(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
         self.assertIn("decompress_dxt5", source)
         self.assertIn('resource.format == "DXT5"', source)
@@ -837,7 +955,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("alphas[7] = 255u", source)
 
     def test_native_texture_lookup_disambiguates_reused_guest_addresses(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
         self.assertIn("host_texture_matches_draw", source)
         self.assertIn("texture.width == width", source)
@@ -850,7 +968,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertNotIn("descriptor_for_texture(uint32_t guest_address)", source)
 
     def test_native_replay_converts_quad_lists_to_triangle_strips(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
         self.assertIn(
             "quad_strip_order{0u, 1u, 3u, 2u}",
@@ -861,9 +979,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("discarded_quad_vertex_count", source)
 
     def test_native_replay_materializes_indexed_vertex_arrays(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        source = presenter_source_text()
 
         self.assertIn("method == 0x1800u", source)
         self.assertIn("method == 0x1808u", source)
@@ -882,9 +998,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
     def test_native_replay_preserves_current_attributes_for_disabled_arrays(
         self,
     ) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        source = presenter_source_text()
 
         self.assertIn("Nv2aVertexAttributes current_vertex_attributes", source)
         self.assertIn("method >= 0x1940u && method <= 0x197Cu", source)
@@ -901,9 +1015,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
     def test_native_replay_distinguishes_widget_scissors_from_offscreen_targets(
         self,
     ) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        source = presenter_source_text()
 
         self.assertIn("presented_surface_color_offset", source)
         self.assertIn("draw_targets_presented_surface", source)
@@ -921,7 +1033,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("draw.primitive != 5u && draw.primitive != 6u", source)
 
     def test_native_replay_retains_linear_render_target_feedback(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
         self.assertIn("texture_image_rects", source)
         self.assertIn("nv2a_texture_extent", source)
@@ -943,9 +1055,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("VK_IMAGE_USAGE_TRANSFER_SRC_BIT", source)
 
     def test_native_replay_resolves_aliased_offscreen_shadow_targets(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        source = presenter_source_text()
 
         self.assertIn("nv2a_canonical_resource_address", source)
         self.assertIn("offscreen_produced", source)
@@ -960,9 +1070,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn('"shares_presented_depth", json_bool(false)', source)
 
     def test_live_reload_reuses_only_exact_offscreen_attachments(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        source = presenter_source_text()
         preserve_begin = source.index(
             "const bool preserve_offscreen_render_targets ="
         )
@@ -995,9 +1103,12 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn('"offscreen_render_target_count"', source)
 
     def test_native_pipeline_preserves_captured_nv2a_blend_state(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
+        pipeline_header = Path("runtime/host/native_pipeline_state.h").read_text(
+            encoding="utf-8"
+        )
 
-        pipeline_state = source.split("struct NativePipelineState", 1)[1].split(
+        pipeline_state = pipeline_header.split("struct NativePipelineState", 1)[1].split(
             "};",
             1,
         )[0]
@@ -1013,7 +1124,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
             source,
         )
         self.assertIn(
-            "state.blend_source_factor,\n                VK_BLEND_FACTOR_ONE",
+            "state.blend_source_factor,\n            VK_BLEND_FACTOR_ONE",
             source,
         )
         self.assertIn("nv2a_blend_op(state.blend_equation)", source)
@@ -1023,9 +1134,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         )
 
     def test_native_front_face_preserves_guest_screen_winding(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        source = presenter_source_text()
         front_face = source.split("VkFrontFace nv2a_front_face", 1)[1].split(
             "}", 1
         )[0]
@@ -1035,9 +1144,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn(": VK_FRONT_FACE_COUNTER_CLOCKWISE", front_face)
 
     def test_native_swapchain_preserves_nv2a_combiner_byte_values(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        source = presenter_source_text()
         choose_format = source.split("choose_surface_format", 1)[1].split(
             "VkExtent2D choose_extent", 1
         )[0]
@@ -1049,7 +1156,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("xbox_combiner_unorm_output", source)
 
     def test_strict_render_validation_rejects_white_fallback_textures(self) -> None:
-        host_source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        host_source = presenter_source_text()
         runner_source = Path("tools/host/first_frame_smoke.py").read_text(encoding="utf-8")
 
         self.assertIn("--strict-render-validation", host_source)
@@ -1058,7 +1165,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("--strict-render-validation", runner_source)
 
     def test_lossless_flip_ack_uses_share_friendly_binary_token(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
         self.assertIn("cannot publish lossless flip audit acknowledgement", source)
         self.assertIn('std::memcpy(ack.data(), "B2ACK001", 8)', source)
@@ -1066,9 +1173,9 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn('ack_transport", json_string("binary")', source)
 
     def test_lossless_flip_health_checks_are_sampled_and_candidate_triggered(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
-        self.assertIn("flip_audit_health_interval = 30", source)
+        self.assertIn("flip_audit_health_interval = 30u", source)
         self.assertIn('return "resource_changed"', source)
         self.assertIn('return "command_shape_changed"', source)
         self.assertIn('return "periodic_sample"', source)
@@ -1076,7 +1183,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn('health_check_reason", json_string', source)
 
     def test_native_replay_maps_top_left_guest_y_to_negative_ndc(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
         self.assertIn(
             "static_cast<float>(target_height) - 1.0f",
@@ -1088,7 +1195,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         )
 
     def test_native_replay_recovers_persistent_half_surface_splash_quad(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
         self.assertIn("recover_presented_half_surface_quad", source)
         self.assertIn("vertex.x *= 2.0f", source)
@@ -1096,7 +1203,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("presented_half_quad_recovered", source)
 
     def test_native_replay_expands_observed_448_line_present_quad(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
         self.assertIn("output_height == 480u", source)
         self.assertIn("nearly_equal(max_y, 448.0f)", source)
@@ -1104,7 +1211,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("presented_overscan_height_recovered", source)
 
     def test_native_manual_mode_accepts_zero_as_unlimited_frames(self) -> None:
-        host_source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        host_source = presenter_source_text()
         runner_source = Path("tools/host/first_frame_smoke.py").read_text(encoding="utf-8")
 
         self.assertIn("options_.max_frames == 0u || frame_count_ < options_.max_frames", host_source)
@@ -1112,10 +1219,10 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("timeout=timeout_seconds if timeout_seconds > 0 else None", runner_source)
 
     def test_f12_captures_unique_current_frame_screenshots(self) -> None:
-        host_source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        host_source = presenter_source_text()
         runner_source = Path("tools/host/first_frame_smoke.py").read_text(encoding="utf-8")
 
-        self.assertIn("key == VK_F12", host_source)
+        self.assertIn("key.key == SDLK_F12", host_source)
         self.assertIn("hotkey_screenshot_pending_ = true", host_source)
         self.assertIn("next_hotkey_screenshot_path()", host_source)
         self.assertIn("retain_hotkey_render_capture", host_source)
@@ -1126,21 +1233,23 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("DEFAULT_HOTKEY_SCREENSHOT_DIR", runner_source)
 
     def test_f11_writes_complete_metrics_snapshot(self) -> None:
-        host_source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        host_source = presenter_source_text()
         runner_source = Path("tools/host/first_frame_smoke.py").read_text(
             encoding="utf-8"
         )
 
-        self.assertIn("key == VK_F11", host_source)
+        self.assertIn("key.key == SDLK_F11", host_source)
         self.assertIn("write_metrics_report()", host_source)
         self.assertIn("--metrics-report-directory", host_source)
         self.assertIn("DEFAULT_METRICS_REPORT_DIR", runner_source)
         self.assertIn("vkCmdWriteTimestamp", host_source)
         self.assertIn("vkGetQueryPoolResults", host_source)
         for label in (
-            "FPS:",
+            "guest FPS:",
+            "guest FPS sample flips:",
+            "guest FPS sample seconds:",
+            "guest completed flips:",
+            "presenter FPS:",
             "guest instructions:",
             "compiled blocks / invalidations:",
             "push-buffer commands:",
@@ -1166,17 +1275,20 @@ class FirstFrameSmokeTests(unittest.TestCase):
             self.assertIn(label, host_source)
 
     def test_f9_toggles_completed_guest_frame_fps_counter(self) -> None:
-        host_source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        host_source = presenter_source_text()
+        metrics_source = Path("runtime/host/frame_metrics.h").read_text(encoding="utf-8")
 
-        self.assertIn("key == VK_F9", host_source)
-        self.assertNotIn("key == VK_F10", host_source)
+        self.assertIn("key.key == SDLK_F9", host_source)
+        self.assertNotIn("key.key == SDLK_F10", host_source)
         self.assertIn("fps_counter_enabled_ = !fps_counter_enabled_", host_source)
-        self.assertIn("kFpsCounterSampleInterval", host_source)
+        self.assertIn("CompletedFlipFpsSampler", host_source)
+        self.assertIn("std::chrono::seconds(1)", metrics_source)
         self.assertIn("current_manifest_guest_flip_count_", host_source)
-        self.assertIn('L" | Game FPS: "', host_source)
-        self.assertIn("SetWindowTextW", host_source)
+        self.assertIn("update_guest_fps_sample(now)", host_source)
+        self.assertIn("guest_fps_sample_valid_", host_source)
+        self.assertNotIn("if (!fps_counter_enabled_)", host_source)
+        self.assertIn('" | Game FPS: "', host_source)
+        self.assertIn("SDL_SetWindowTitle", host_source)
         self.assertIn('"fps_counter_toggled"', host_source)
         self.assertIn('json_string("completed_guest_flips")', host_source)
 
@@ -1208,9 +1320,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
             )
 
     def test_f12_retains_only_the_completed_flip_command_prefix(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        source = presenter_source_text()
 
         self.assertIn("command_snapshot_source_record_count", source)
         self.assertIn("command_snapshot_trimmed_record_count", source)
@@ -1226,14 +1336,14 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("load_interpreter_bootstrap_state", source)
 
     def test_native_replay_uses_latest_completed_guest_flip(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
         self.assertIn("if (method == 0x012Cu)", source)
         self.assertIn("presented_draw_begin = interpreted.frame_draw_begin", source)
         self.assertIn("draw_index < end_draw", source)
 
     def test_live_replay_accepts_acknowledged_command_continuation_epochs(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
         self.assertIn("command_snapshot_base_record_count", source)
         self.assertIn("command_read_begin = interpreted_source_command_count_", source)
@@ -1257,9 +1367,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         )
 
     def test_renderer_translates_texture_alpha_and_fixed_function_state(self) -> None:
-        host_source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        host_source = presenter_source_text()
         vertex_shader = Path(
             "runtime/host/shaders/nv2a_inline.vert"
         ).read_text(encoding="utf-8")
@@ -1300,9 +1408,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("discard", fragment_shader)
 
     def test_native_alpha_kill_requires_an_active_texture_stage(self) -> None:
-        host_source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        host_source = presenter_source_text()
         fragment_shader = Path(
             "runtime/host/shaders/nv2a_inline.frag"
         ).read_text(encoding="utf-8")
@@ -1322,9 +1428,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         )
 
     def test_native_replay_overlays_recovered_text_on_rendered_frames(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        source = presenter_source_text()
 
         self.assertIn(
             "frontend_text_rectangle_count_ = append_frontend_text_vertices(",
@@ -1332,7 +1436,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         )
         self.assertNotIn("if (interpreted_stream_.draws.empty())", source)
         self.assertIn("frontend_text_pipeline_state()", source)
-        self.assertIn("vkCmdDraw(\n            command_buffer,\n            frontend_text_vertex_count_", source)
+        self.assertIn("vkCmdDraw(\n        command_buffer,\n        frontend_text_vertex_count_", source)
         self.assertNotIn("vkCmdClearAttachments", source)
         self.assertIn("rasterize_frontend_text", source)
         self.assertIn('L"Impact"', source)
@@ -1343,7 +1447,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("json_string(recovered_frontend_text_)", source)
 
     def test_native_push_buffer_packets_carry_only_across_contiguous_appends(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
         self.assertIn("uint32_t run_id = 0", source)
         self.assertIn("push_buffer_word_starts_run(words, index)", source)
@@ -1361,7 +1465,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         )
 
     def test_native_replay_retains_full_dynamic_push_buffer_aperture(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(encoding="utf-8")
+        source = presenter_source_text()
 
         self.assertIn(
             "kRecoveredPushBufferApertureSize = 0x01000000u",
@@ -1371,9 +1475,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertNotIn("std::array<uint8_t, 0x10000> pending_bytes", source)
 
     def test_live_vertex_upload_reuses_mapping_and_compacts_presented_span(self) -> None:
-        source = Path("runtime/host/vulkan_first_frame.cpp").read_text(
-            encoding="utf-8"
-        )
+        source = presenter_source_text()
 
         self.assertIn("void* vertex_mapped_ = nullptr", source)
         self.assertIn("if (!vertex_mapped_)", source)

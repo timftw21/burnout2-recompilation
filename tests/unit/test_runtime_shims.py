@@ -19,6 +19,24 @@ from runtime.xbox.shims import (
 
 
 class RuntimeShimTests(unittest.TestCase):
+    def test_active_worker_owns_current_thread_termination(self) -> None:
+        runtime = XboxRuntimeShims()
+        primary = runtime.ke_get_current_thread()
+        worker = runtime.ps_create_system_thread(start_address=0x00108D50)
+
+        previous = runtime.sync.activate_thread(worker)
+        status = runtime.ps_terminate_system_thread(0x1234)
+        runtime.sync.activate_thread(previous)
+
+        snapshots = {
+            thread["handle"]: thread for thread in runtime.sync.thread_snapshot()
+        }
+        self.assertEqual(previous, primary)
+        self.assertEqual(status, 0x1234)
+        self.assertTrue(snapshots[worker]["suspended"])
+        self.assertFalse(snapshots[primary]["suspended"])
+        self.assertEqual(runtime.ke_get_current_thread(), primary)
+
     def test_registers_kernel_shims_with_loader_import_resolver(self) -> None:
         blob, layout = _synthetic_xbe()
         resolver = ImportResolver()

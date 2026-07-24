@@ -31,6 +31,7 @@ from tools.playability.playability_probe import (
     TitleSubsystemInitializerAudit,
     TITLE_XINPUT_HANDLE_BASE,
     _cooperative_wait_plan,
+    _BoundedDiagnosticHistory,
     _read_text_file_shared,
     _read_dynamic_block_window,
     _resume_cooperative_wait,
@@ -58,6 +59,7 @@ from tools.playability.playability_probe import (
     TITLE_D3D_CONTEXT_LIST_SECOND_OFFSET,
     TITLE_D3D_CONTEXT_LIST_SEEDED_COUNT,
     TITLE_D3D_CONTEXT_MARKER_QUEUE_ADDRESS,
+    TITLE_D3D_CONTEXT_NV2A_BASE_OFFSET,
     TITLE_D3D_CONTEXT_SURFACE_STATE_ADDRESS,
     TITLE_D3D_CONTEXT_SYNTHETIC_ADDRESS,
     TITLE_D3D_FLUSH_ADDRESS,
@@ -211,10 +213,9 @@ from tools.playability.playability_probe import (
     TITLE_GPU_SUBMISSION_LIMIT_ADDRESS,
     TITLE_MCPX_FRAME_COUNTER_ADDRESS,
     TITLE_MCPX_FRAME_COUNTER_INCREMENT,
+    TITLE_NV2A_MMIO_BASE_ADDRESS,
     TITLE_SPIN_DELAY_ADDRESS,
     TITLE_SPIN_DELAY_ITERATIONS,
-    TITLE_STARTUP_WORK_QUEUE_LINK_PAYLOAD_BACK_OFFSET,
-    TITLE_STARTUP_WORK_QUEUE_LOOP_BRANCH,
     TITLE_STARTUP_WORK_QUEUE_LOOP_ENTRY,
     SCHEDULER_LOOP_CONVERGENCE_ERROR,
     SchedulerLoopConvergenceDetector,
@@ -829,7 +830,6 @@ class PlayabilityProbeTests(unittest.TestCase):
         range_start = 0x21B80000
         range_end = range_start + 0x40000
         vertex_address = 0x22010000
-        vertex_format = (12 << 8) | (3 << 4) | 2
         texture_address = 0x01234000
         texture_format = 0x022F0600
         texture_rect = (64 << 16) | 32
@@ -1714,11 +1714,16 @@ class PlayabilityProbeTests(unittest.TestCase):
             observed_memory.write_u32(address + 4, 0xAABBCCDD)
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-            executor = NativeResumableExecutor(function, build_dir=Path(temp_dir))
+            executor = NativeResumableExecutor(
+                function,
+                build_dir=Path(temp_dir),
+                callback_addresses={handler_target},
+            )
             returned_to = executor.run(
                 CpuState.with_registers(esp=0x8000),
                 memory,
                 call_handlers={handler_target: handler},
+                dispatch_host_calls_in_native=True,
                 max_steps=8,
             )
             shared_performance = executor.last_run_summary["performance"]
@@ -1742,6 +1747,11 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(memory.read_u32(address + 4), 0xAABBCCDD)
         self.assertEqual(fallback_memory.read_u32(address), 0x12345678)
         self.assertTrue(shared_performance["shared_memory_view_enabled"])
+        self.assertTrue(shared_performance["native_host_call_dispatch_enabled"])
+        self.assertEqual(
+            shared_performance["native_host_call_dispatch_count"],
+            1,
+        )
         self.assertEqual(
             shared_performance["shared_memory_handler_sync_bypass_count"],
             1,
@@ -1758,6 +1768,69 @@ class PlayabilityProbeTests(unittest.TestCase):
             memory.native_page_cache_view_summary()["host_write_commit_count"],
             1,
         )
+
+    def test_native_slice_yields_keep_dirty_memory_resident_until_exit(self) -> None:
+        address = 0x22080080
+        base_address = 0x1000
+        code = bytearray(b"\xA3" + struct.pack("<I", address))
+        code.extend(b"\x40\xEB\xF8")  # inc eax; repeat the store
+        function = lift_x86_function(
+            bytes(code),
+            base_address=base_address,
+            symbol="native_resident_dirty_slices",
+        )
+        memory = XbeBackedSparseMemory(
+            load_xbe_bytes(_synthetic_xbe()[0]),
+            initial={0x8000: 0},
+        )
+        observed: list[tuple[int, int, int]] = []
+
+        def on_slice(
+            _state: CpuState,
+            observed_memory: SparseMemory,
+            steps: int,
+        ) -> None:
+            observed.append(
+                (
+                    steps,
+                    observed_memory.read_u32(address),
+                    observed_memory.visible_page_generation(address),
+                )
+            )
+            self.assertEqual(observed_memory.page_generation(address), 0)
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            executor = NativeResumableExecutor(function, build_dir=Path(temp_dir))
+            executor.run(
+                CpuState.with_registers(eax=1, esp=0x8000),
+                memory,
+                max_steps=12,
+                slice_steps=4,
+                yield_handler=on_slice,
+                defer_dirty_sync_at_yield=True,
+            )
+
+        self.assertEqual([record[0] for record in observed], [4, 8, 12])
+        self.assertEqual([record[1] for record in observed], [2, 3, 4])
+        visible_generations = [record[2] for record in observed]
+        self.assertTrue(
+            all(
+                earlier < later
+                for earlier, later in zip(
+                    visible_generations,
+                    visible_generations[1:],
+                )
+            )
+        )
+        self.assertEqual(memory.read_u32(address), 4)
+        self.assertEqual(memory.page_generation(address), 1)
+        performance = executor.last_run_summary["performance"]
+        self.assertTrue(performance["deferred_dirty_sync_at_yield"])
+        self.assertEqual(
+            performance["shared_memory_yield_sync_bypass_count"],
+            3,
+        )
+        self.assertEqual(performance["dirty_page_writeback_count"], 1)
 
     def test_title_frontend_special_audio_fast_path_returns_opaque_handle(self) -> None:
         runtime = XboxRuntimeShims()
@@ -3012,6 +3085,13 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(
             memory.read_u32(TITLE_D3D_CONTEXT_SYNTHETIC_ADDRESS + 0x17F4),
             TITLE_D3D_CONTEXT_DMA_STATE_ADDRESS,
+        )
+        self.assertEqual(
+            memory.read_u32(
+                TITLE_D3D_CONTEXT_SYNTHETIC_ADDRESS
+                + TITLE_D3D_CONTEXT_NV2A_BASE_OFFSET
+            ),
+            TITLE_NV2A_MMIO_BASE_ADDRESS,
         )
         self.assertEqual(
             memory.read_u32(
@@ -6864,6 +6944,69 @@ class PlayabilityProbeTests(unittest.TestCase):
             "0x00000000",
         )
 
+    def test_native_gpu_idle_pump_uses_seeded_nv2a_base_and_returns(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex(
+                "56578BF98B37"
+                "F68614320000107412"
+                "F68600240000107409"
+                "F6862032000010742C"
+                "8BCFE83EF9FFFF"
+                "83BE00014000007407"
+                "8BCFE87EF8FFFF"
+                "F786000100000000000174C2"
+                "8BCFE85BF2FFFFEBB9"
+                "8B54240C8D86203200008B085F890AC700000000005E"
+                "F6001075FBC20400"
+            ),
+            base_address=0x0021DD78,
+            symbol="gpu_idle_pump_seeded_nv2a_base",
+        )
+        context_address = TITLE_D3D_CONTEXT_SYNTHETIC_ADDRESS
+        gpu_service_address = (
+            context_address + TITLE_D3D_CONTEXT_NV2A_BASE_OFFSET
+        )
+        output_address = 0x9000
+
+        memory = XbeBackedSparseMemory(load_xbe_bytes(_synthetic_xbe()[0]))
+        self.assertEqual(
+            memory.read_u32(TITLE_D3D_CONTEXT_GLOBAL_ADDRESS),
+            context_address,
+        )
+        memory.write_u32(0x8000, 0)
+        memory.write_u32(0x8004, output_address)
+        state = CpuState.with_registers(
+            ecx=gpu_service_address,
+            esi=0x11223344,
+            edi=0x55667788,
+            esp=0x8000,
+        )
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            executor = NativeResumableExecutor(
+                function,
+                build_dir=Path(temp_dir),
+            )
+            returned_to = executor.run(state, memory, max_steps=64)
+
+        self.assertEqual(returned_to, 0)
+        self.assertEqual(memory.read_u32(output_address), 0)
+        self.assertEqual(state.get_register("esi"), 0x11223344)
+        self.assertEqual(state.get_register("edi"), 0x55667788)
+        hardware = memory.title_hardware_completion_summary()
+        self.assertEqual(hardware["pfifo_cache1_status_read_count"], 1)
+        self.assertEqual(hardware["pfifo_runout_status_read_count"], 1)
+        self.assertEqual(
+            memory.read_u32(gpu_service_address),
+            TITLE_NV2A_MMIO_BASE_ADDRESS,
+        )
+
+    def test_gpu_idle_pump_uses_normal_native_slice_cadence(self) -> None:
+        self.assertNotIn(
+            TITLE_GPU_IDLE_PUMP_LOOP_BRANCH,
+            _title_native_fast_paths(),
+        )
+
     def test_frontend_resource_boundary_classifies_null_dictionary_list(self) -> None:
         state = CpuState.with_registers(
             ebx=0x00000008,
@@ -9548,7 +9691,6 @@ class PlayabilityProbeTests(unittest.TestCase):
         blob, layout = _synthetic_xbe()
         data = bytearray(blob)
         text_raw = 0x1000
-        entry_va = layout["text_va"] + 0x20
         pointer_va = layout["text_va"] + 0x140
         dynamic_va = layout["text_va"] + 0x180
         entry_raw = text_raw + 0x20
@@ -9585,7 +9727,6 @@ class PlayabilityProbeTests(unittest.TestCase):
         blob, layout = _synthetic_xbe()
         data = bytearray(blob)
         text_raw = 0x1000
-        entry_va = layout["text_va"] + 0x20
         pointer_va = layout["text_va"] + 0x140
         dynamic_va = layout["text_va"] + 0x180
         entry_raw = text_raw + 0x20
@@ -10106,15 +10247,21 @@ class PlayabilityProbeTests(unittest.TestCase):
                 "tools.playability.playability_probe._read_text_file_shared",
                 side_effect=PermissionError("controller snapshot is being replaced"),
             ):
-                self.assertFalse(bridge.sample_controller())
+                self.assertFalse(bridge.sample_controller(force=True))
             self.assertEqual(runtime.input.poll_controller(0).buttons, 0x1000)
             self.assertEqual(bridge.summary()["controller_read_defer_count"], 1)
-            self.assertTrue(bridge.sample_controller())
+            self.assertTrue(bridge.sample_controller(force=True))
             self.assertEqual(runtime.input.poll_controller(0).buttons, 0x2000)
             self.assertEqual(bridge.summary()["controller_update_count"], 2)
 
+            polls_before = bridge.summary()["controller_poll_count"]
+            self.assertFalse(bridge.sample_controller())
+            self.assertEqual(bridge.summary()["controller_poll_count"], polls_before)
+            self.assertGreater(bridge.summary()["controller_poll_skip_count"], 0)
+
             controller_path.write_text('{"stop":true}', encoding="utf-8")
             bridge.controller_mtime_ns = -1
+            bridge.next_controller_poll_time = 0.0
             self.assertFalse(bridge.on_slice(CpuState(), memory, 200))
             self.assertTrue(bridge.summary()["stop_requested"])
 
@@ -10211,6 +10358,61 @@ class PlayabilityProbeTests(unittest.TestCase):
             self.assertEqual(second["published_command_record_count"], 7)
             self.assertNotIn("frontend_text", second)
             self.assertEqual(bridge.summary()["render_publish_count"], 2)
+            self.assertEqual(
+                second["resource_stream_generation"],
+                first["resource_stream_generation"],
+            )
+            self.assertEqual(
+                second["resource_snapshot_path"],
+                first["resource_snapshot_path"],
+            )
+            self.assertTrue(second["resource_snapshots_unchanged"])
+            self.assertEqual(bridge.summary()["render_resource_scan_count"], 1)
+
+    def test_live_host_bridge_scans_only_changed_resource_pages(self) -> None:
+        runtime = XboxRuntimeShims()
+        watchpoint = RenderWriteWatchpoint()
+        source_address = 0x80004000
+        memory = SparseMemory({source_address: b"\x01\x02"})
+        binding = (0, 0x00004000, 0x00000500, 0)
+        watchpoint._texture_bindings.append(binding)
+        watchpoint._texture_binding_seen.add(binding)
+        watchpoint.resource_binding_generation += 1
+        watchpoint.observe(0xFED00000, bytes.fromhex("01000000"))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            render_path = root / "render.json"
+            bridge = LiveHostBridge(
+                runtime,
+                watchpoint,
+                render_stream_path=render_path,
+                controller_state_path=root / "controller.json",
+            )
+
+            self.assertTrue(bridge.publish_render(memory, force=True))
+            first = json.loads(render_path.read_text(encoding="utf-8"))
+            self.assertTrue(bridge.publish_render(memory, force=True))
+            unchanged = json.loads(render_path.read_text(encoding="utf-8"))
+            self.assertEqual(bridge.summary()["render_resource_scan_count"], 1)
+            self.assertEqual(
+                unchanged["resource_stream_generation"],
+                first["resource_stream_generation"],
+            )
+            self.assertTrue(unchanged["resource_snapshots_unchanged"])
+
+            memory.write(source_address, b"\x03\x04")
+            self.assertTrue(bridge.publish_render(memory, force=True))
+            changed = json.loads(render_path.read_text(encoding="utf-8"))
+
+            summary = bridge.summary()
+            self.assertEqual(summary["render_resource_scan_count"], 2)
+            self.assertEqual(summary["render_resource_dirty_check_count"], 2)
+            self.assertEqual(summary["render_resource_dirty_count"], 1)
+            self.assertNotEqual(
+                changed["resource_stream_generation"],
+                first["resource_stream_generation"],
+            )
 
     def test_live_host_bridge_detects_cached_resource_page_changes(self) -> None:
         runtime = XboxRuntimeShims()
@@ -10240,9 +10442,29 @@ class PlayabilityProbeTests(unittest.TestCase):
                 },
             )
 
-            self.assertFalse(bridge._cached_audit_resource_changed(memory))
+            self.assertFalse(bridge._cached_render_resource_changed(memory))
             memory.write(source_address, b"texture")
-            self.assertTrue(bridge._cached_audit_resource_changed(memory))
+            self.assertTrue(bridge._cached_render_resource_changed(memory))
+
+    def test_diagnostic_history_retains_startup_and_recent_tail(self) -> None:
+        history = _BoundedDiagnosticHistory(first_limit=2, recent_limit=3)
+        for index in range(10):
+            history.append({"run": index})
+
+        self.assertEqual(
+            [record["run"] for record in history.records()],
+            [0, 1, 7, 8, 9],
+        )
+        self.assertEqual(
+            history.summary(),
+            {
+                "total_count": 10,
+                "retained_count": 5,
+                "dropped_count": 5,
+                "first_limit": 2,
+                "recent_limit": 3,
+            },
+        )
 
     def test_live_host_bridge_rotates_acknowledged_command_epochs(self) -> None:
         runtime = XboxRuntimeShims()

@@ -8,8 +8,10 @@ import contextlib
 import ctypes
 import datetime as dt
 import json
+import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -17,7 +19,28 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools.host.first_frame_smoke import read_debug_events
+from tools.host.first_frame_smoke import (
+    DEFAULT_BUILD_MANIFEST,
+    DEFAULT_DLL,
+    DEFAULT_EXE,
+    DEFAULT_FRAGMENT_SPV,
+    DEFAULT_HOTKEY_SCREENSHOT_DIR,
+    DEFAULT_METRICS_REPORT_DIR,
+    DEFAULT_PIPELINE_CACHE,
+    DEFAULT_SOURCE,
+    DEFAULT_TEXTURE_CONVERT_SPV,
+    DEFAULT_VERTEX_SPV,
+    FirstFrameSmokeError,
+    build_presenter_arguments,
+    compile_first_frame,
+    compile_presenter_library,
+    compile_shaders,
+    discover_toolchain,
+    read_debug_events,
+    run_embedded_presenter,
+    validate_presenter_build_manifest,
+    write_presenter_build_manifest,
+)
 from tools.playability.render_debug_report import (
     build_render_debug_report,
     write_render_debug_report,
@@ -25,6 +48,28 @@ from tools.playability.render_debug_report import (
 from tools.playability.performance_debug_report import (
     build_performance_debug_report,
     write_performance_debug_report,
+)
+from tools.playability.live_transport import (
+    LIVE_COMMAND_SIZE,
+    LIVE_CONTROL_SCHEMA_VERSION,
+    LIVE_RESOURCE_SIZE,
+    LiveCommandTransport,
+    LiveControlTransport,
+    LiveResourceTransport,
+    live_control_transport_name,
+)
+from tools.project_identity import (
+    DEFAULT_SUPPORTED_TARGETS,
+    ProjectIdentityError,
+    RUN_MANIFEST_SCHEMA_VERSION,
+    file_identity,
+    generated_code_identity,
+    git_identity,
+    machine_identity,
+    new_run_id,
+    utc_now,
+    verify_supported_xbe,
+    write_json_atomic,
 )
 
 DEFAULT_XBE = REPO_ROOT / "data" / "local" / "extracted" / "burnout_2_poi_usa" / "default.xbe"
@@ -46,13 +91,24 @@ DEFAULT_RENDER_DEBUG_REPORT = (
 DEFAULT_PERFORMANCE_DEBUG_REPORT = (
     REPO_ROOT / "reports" / "local" / "playability" / "performance-debug-report.json"
 )
+DEFAULT_RUN_MANIFEST = (
+    REPO_ROOT / "reports" / "local" / "playability" / "run-manifest.json"
+)
 DEFAULT_SCENE_RECORD_AUDIT_REPORT = (
     REPO_ROOT / "reports" / "local" / "playability" / "scene-record-audit.json"
 )
 DEFAULT_AUDIT_ROOT = REPO_ROOT / "reports" / "local" / "flip-audit"
 DEFAULT_NATIVE_SLICE_STEPS = 100_000
-DEFAULT_STARTUP_TIMEOUT_SECONDS = 600.0
+DEFAULT_STARTUP_TIMEOUT_SECONDS = 1800.0
 DEFAULT_PRESENTATION_PIPELINE_DEPTH = 2
+
+
+def _live_transport_name(args: argparse.Namespace) -> str | None:
+    explicit = getattr(args, "live_transport_name", None)
+    if explicit:
+        return str(explicit)
+    run_id = getattr(args, "run_id", None)
+    return live_control_transport_name(str(run_id)) if run_id else None
 
 
 def build_guest_command(args: argparse.Namespace) -> list[str]:
@@ -72,7 +128,20 @@ def build_guest_command(args: argparse.Namespace) -> list[str]:
         "--live-render-stream", str(args.live_render_stream),
         "--live-controller-state", str(args.live_controller_state),
         "--quiet",
+        "--supported-targets",
+        str(getattr(args, "supported_targets", DEFAULT_SUPPORTED_TARGETS)),
     ]
+    run_id = getattr(args, "run_id", None)
+    run_manifest = getattr(args, "run_manifest", None)
+    if run_id:
+        command.extend(["--run-id", str(run_id)])
+    if run_manifest is not None:
+        command.extend(["--run-manifest", str(run_manifest)])
+    transport_name = _live_transport_name(args)
+    if transport_name is not None:
+        command.extend(["--live-control-transport", transport_name])
+    if getattr(args, "allow_unsupported_xbe", False):
+        command.append("--allow-unsupported-xbe")
     if not getattr(args, "no_diagnostics", False):
         command.extend(["--json-output", str(args.json_output)])
     if getattr(args, "lossless_flip_audit", False):
@@ -88,6 +157,8 @@ def build_guest_command(args: argparse.Namespace) -> list[str]:
         )
     if getattr(args, "profile_hot_paths", False):
         command.append("--profile-hot-paths")
+    if getattr(args, "developer_live_compile", False):
+        command.append("--developer-live-compile")
     audit_world_matrix_address = getattr(args, "audit_world_matrix_address", None)
     if getattr(args, "audit_world_matrices", False) or audit_world_matrix_address is not None:
         command.append("--audit-world-matrices")
@@ -118,10 +189,21 @@ def build_presenter_command(args: argparse.Namespace) -> list[str]:
         "--no-inject-input",
         "--pretty",
     ]
+    transport_name = _live_transport_name(args)
+    if transport_name is not None:
+        command.extend(["--live-control-transport", transport_name])
     if getattr(args, "no_diagnostics", False):
         command.append("--no-diagnostics")
     if args.skip_host_build:
         command.append("--skip-build")
+    command.extend(
+        [
+            "--build-manifest",
+            str(getattr(args, "presenter_build_manifest", DEFAULT_BUILD_MANIFEST)),
+        ]
+    )
+    if getattr(args, "allow_stale_artifacts", False):
+        command.append("--allow-stale-artifacts")
     if getattr(args, "cpu_vertex_programs", False):
         command.append("--cpu-vertex-programs")
     if getattr(args, "cpu_vertex_attributes", False):
@@ -162,6 +244,107 @@ def build_presenter_command(args: argparse.Namespace) -> list[str]:
             ]
         )
     return command
+
+
+def build_embedded_presenter_arguments(args: argparse.Namespace) -> list[str]:
+    requested_pipeline_depth = getattr(args, "presentation_pipeline_depth", None)
+    presentation_pipeline_depth = (
+        requested_pipeline_depth or DEFAULT_PRESENTATION_PIPELINE_DEPTH
+    )
+    return build_presenter_arguments(
+        program=DEFAULT_DLL,
+        debug_json=(
+            None
+            if getattr(args, "no_diagnostics", False)
+            else getattr(args, "render_debug_events", DEFAULT_RENDER_DEBUG_EVENTS)
+        ),
+        max_frames=0,
+        inject_input=False,
+        render_stream_json=args.live_render_stream,
+        live_render_stream=True,
+        controller_state_json=args.live_controller_state,
+        live_control_transport=_live_transport_name(args),
+        screenshot=None,
+        hotkey_screenshot_directory=(
+            None
+            if getattr(args, "no_diagnostics", False)
+            else DEFAULT_HOTKEY_SCREENSHOT_DIR
+        ),
+        metrics_report_directory=DEFAULT_METRICS_REPORT_DIR,
+        vertex_shader=DEFAULT_VERTEX_SPV,
+        fragment_shader=DEFAULT_FRAGMENT_SPV,
+        texture_convert_shader=DEFAULT_TEXTURE_CONVERT_SPV,
+        pipeline_cache=DEFAULT_PIPELINE_CACHE,
+        cpu_vertex_programs=getattr(args, "cpu_vertex_programs", False),
+        cpu_vertex_attributes=getattr(args, "cpu_vertex_attributes", False),
+        cpu_texture_conversion=getattr(args, "cpu_texture_conversion", False),
+        presentation_pipeline_depth=presentation_pipeline_depth,
+    )
+
+
+def _uses_embedded_runtime(args: argparse.Namespace) -> bool:
+    """Keep exact/bounded audit tools isolated; normal gameplay is one process."""
+    return bool(
+        os.name == "nt"
+        and getattr(args, "max_steps", 0) == 0
+        and not getattr(args, "lossless_flip_audit", False)
+        and not getattr(args, "audit_scene_records", False)
+    )
+
+
+def _set_current_windows_thread_description(name: str) -> None:
+    if os.name != "nt":
+        return
+    try:
+        set_thread_description = ctypes.WinDLL(
+            "kernel32", use_last_error=True
+        ).SetThreadDescription
+        set_thread_description.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p)
+        set_thread_description.restype = ctypes.c_long
+        current_thread = ctypes.WinDLL(
+            "kernel32", use_last_error=True
+        ).GetCurrentThread
+        current_thread.argtypes = ()
+        current_thread.restype = ctypes.c_void_p
+        set_thread_description(current_thread(), name)
+    except (AttributeError, OSError):
+        return
+
+
+class _InProcessGuest:
+    def __init__(self, arguments: list[str]) -> None:
+        self._arguments = arguments
+        self._returncode: int | None = None
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="b2-guest-runtime",
+            daemon=True,
+        )
+
+    def _run(self) -> None:
+        _set_current_windows_thread_description("b2-guest-runtime")
+        try:
+            from tools.playability.playability_probe import main as guest_main
+
+            self._returncode = int(guest_main(self._arguments))
+        except BaseException as exc:
+            self._error = exc
+            self._returncode = 1
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def poll(self) -> int | None:
+        return self._returncode if not self._thread.is_alive() else None
+
+    def wait(self, timeout: float | None = None) -> int:
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            raise subprocess.TimeoutExpired("embedded guest", timeout)
+        if self._error is not None:
+            raise RuntimeError("embedded guest failed") from self._error
+        return int(self._returncode or 0)
 
 
 def _read_json_lines(path: Path) -> list[dict[str, object]]:
@@ -539,6 +722,18 @@ def _finalize_performance_diagnostics(args: argparse.Namespace) -> None:
 def _finalize_diagnostics(args: argparse.Namespace) -> None:
     if getattr(args, "no_diagnostics", False):
         return
+    try:
+        summary = json.loads(args.json_output.read_text(encoding="utf-8"))
+        actual_run_id = summary.get("identity", {}).get("run_id")
+        if actual_run_id != getattr(args, "run_id", None):
+            raise ProjectIdentityError(
+                f"probe summary run_id is {actual_run_id!r}; "
+                f"active run_id is {getattr(args, 'run_id', None)!r}"
+            )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError, ProjectIdentityError) as exc:
+        args.stale_artifact_rejected = True
+        print(f"Rejected stale probe summary; post-run reports were not generated: {exc}")
+        return
     _finalize_render_diagnostics(args)
     _finalize_performance_diagnostics(args)
 
@@ -572,7 +767,154 @@ def _startup_wait_status(cache_path: Path, elapsed_seconds: float) -> str:
     )
 
 
-def run_live_test(args: argparse.Namespace) -> int:
+def _request_current_process_window_close() -> bool:
+    if sys.platform != "win32":
+        return False
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(
+        ctypes.c_bool,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    )
+    user32.EnumWindows.argtypes = [callback_type, ctypes.c_void_p]
+    user32.GetWindowThreadProcessId.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_ulong),
+    ]
+    user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+    user32.PostMessageW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    current_process_id = int(kernel32.GetCurrentProcessId())
+    window_handles: list[int] = []
+
+    @callback_type
+    def find_window(hwnd: int, _parameter: int) -> bool:
+        process_id = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+        if process_id.value == current_process_id and user32.IsWindowVisible(hwnd):
+            window_handles.append(int(hwnd or 0))
+        return True
+
+    user32.EnumWindows(find_window, 0)
+    return any(
+        bool(user32.PostMessageW(hwnd, 0x0010, 0, 0))
+        for hwnd in window_handles
+    )
+
+
+def _run_live_test_embedded(args: argparse.Namespace) -> int:
+    """Run normal gameplay as one process with a guest thread and presenter DLL."""
+    run_started = time.monotonic()
+    diagnostics_enabled = not getattr(args, "no_diagnostics", False)
+    for path in (
+        args.live_render_stream,
+        args.live_controller_state,
+        *(
+            (
+                args.json_output,
+                args.render_debug_events,
+                args.render_debug_report,
+                args.performance_debug_report,
+            )
+            if diagnostics_enabled
+            else ()
+        ),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            path.unlink()
+    for directory in (
+        args.save_data_root,
+        args.dashboard_root,
+        args.cache_root,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    live_transport = LiveControlTransport.create(args.live_transport_name)
+    live_command_transport = LiveCommandTransport.create(args.live_transport_name)
+    live_resource_transport = LiveResourceTransport.create(args.live_transport_name)
+    guest = _InProcessGuest(build_guest_command(args)[3:])
+    monitor_stop = threading.Event()
+
+    def monitor_guest() -> None:
+        while not monitor_stop.wait(0.05):
+            if guest.poll() is None:
+                continue
+            while not monitor_stop.wait(0.05):
+                if _request_current_process_window_close():
+                    return
+
+    monitor = threading.Thread(
+        target=monitor_guest,
+        name="b2-presenter-stop-monitor",
+        daemon=True,
+    )
+    try:
+        print("Starting embedded native guest loop...")
+        guest.start()
+        deadline = time.monotonic() + args.startup_timeout_seconds
+        next_startup_status = time.monotonic() + 30.0
+        while not live_transport.manifest_available():
+            returncode = guest.poll()
+            if returncode is not None:
+                try:
+                    return guest.wait()
+                except RuntimeError as exc:
+                    print(f"Guest runner exited before publishing a frame: {exc}")
+                    return 1
+            if time.monotonic() >= deadline:
+                live_transport.request_stop()
+                print("Timed out waiting for the first embedded guest frame.")
+                return 1
+            if time.monotonic() >= next_startup_status:
+                print(
+                    _startup_wait_status(
+                        args.dynamic_block_cache,
+                        time.monotonic() - run_started,
+                    )
+                )
+                next_startup_status = time.monotonic() + 30.0
+            time.sleep(0.05)
+
+        print("Starting embedded Vulkan presenter. Close the window or press Escape to stop.")
+        monitor.start()
+        presenter_returncode = run_embedded_presenter(
+            build_embedded_presenter_arguments(args),
+            library=DEFAULT_DLL,
+        )
+        monitor_stop.set()
+        live_transport.request_stop()
+        try:
+            guest_returncode = guest.wait(timeout=30.0)
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            print(f"Embedded guest did not stop cleanly: {exc}")
+            guest_returncode = 1
+        result = guest_returncode or presenter_returncode
+        if guest_returncode != 0:
+            print(f"Embedded guest exited with code {guest_returncode}.")
+        _finalize_diagnostics(args)
+        _summarize_scene_record_audit(args)
+        return int(result)
+    except KeyboardInterrupt:
+        live_transport.request_stop()
+        print("Stopping live test...")
+        return 130
+    finally:
+        monitor_stop.set()
+        live_transport.request_stop()
+        live_resource_transport.close()
+        live_command_transport.close()
+        live_transport.close()
+        if args.live_controller_state.exists():
+            args.live_controller_state.unlink()
+
+
+def _run_live_test_processes(args: argparse.Namespace) -> int:
     run_started = time.monotonic()
     diagnostics_enabled = not getattr(args, "no_diagnostics", False)
     if diagnostics_enabled:
@@ -631,6 +973,13 @@ def run_live_test(args: argparse.Namespace) -> int:
     guest: subprocess.Popen[bytes] | None = None
     presenter: subprocess.Popen[bytes] | None = None
     presenter_started: float | None = None
+    live_transport = LiveControlTransport.create(args.live_transport_name)
+    live_command_transport = LiveCommandTransport.create(
+        args.live_transport_name
+    )
+    live_resource_transport = LiveResourceTransport.create(
+        args.live_transport_name
+    )
     runner_output = (
         args.runner_log.open("wb")
         if diagnostics_enabled
@@ -647,7 +996,11 @@ def run_live_test(args: argparse.Namespace) -> int:
             )
             deadline = time.monotonic() + args.startup_timeout_seconds
             next_startup_status = time.monotonic() + 30.0
-            while not args.live_render_stream.is_file():
+            while not (
+                args.live_render_stream.is_file()
+                if args.lossless_flip_audit
+                else live_transport.manifest_available()
+            ):
                 returncode = guest.poll()
                 if returncode is not None:
                     print(f"Guest runner exited before publishing a frame (code {returncode}).")
@@ -692,10 +1045,7 @@ def run_live_test(args: argparse.Namespace) -> int:
                         presenter_returncode = 1
                 else:
                     presenter_returncode = presenter.returncode
-                    args.live_controller_state.write_text(
-                        json.dumps({"stop": True}, separators=(",", ":")) + "\n",
-                        encoding="utf-8",
-                    )
+                    live_transport.request_stop()
                     guest_returncode, forced_guest_stop = _wait_for_guest_shutdown(guest)
                     if forced_guest_stop:
                         _finalize_diagnostics(args)
@@ -718,10 +1068,7 @@ def run_live_test(args: argparse.Namespace) -> int:
                     presenter_returncode = 1
             else:
                 presenter_returncode = presenter.wait()
-                args.live_controller_state.write_text(
-                    json.dumps({"stop": True}, separators=(",", ":")) + "\n",
-                    encoding="utf-8",
-                )
+                live_transport.request_stop()
                 guest_returncode, forced_guest_stop = _wait_for_guest_shutdown(guest)
                 if forced_guest_stop:
                     _finalize_diagnostics(args)
@@ -756,8 +1103,249 @@ def run_live_test(args: argparse.Namespace) -> int:
         finally:
             _stop_process(presenter)
             _stop_process(guest)
+            live_resource_transport.close()
+            live_command_transport.close()
+            live_transport.close()
             if args.live_controller_state.exists():
                 args.live_controller_state.unlink()
+
+
+def _native_cache_state(args: argparse.Namespace) -> dict[str, object]:
+    native_build_dir = args.dynamic_block_cache.parent
+    native_dlls = sorted(native_build_dir.glob("native-loop-*.dll"))
+    pipeline_cache = REPO_ROOT / "build" / "local" / "first-frame" / "vulkan-pipeline-cache.bin"
+    presenter = REPO_ROOT / "build" / "local" / "first-frame" / "b2_first_frame.exe"
+    presenter_library = DEFAULT_DLL
+    return {
+        "decoded_blocks": file_identity(args.dynamic_block_cache),
+        "native_module_manifest": file_identity(
+            native_build_dir / "native-module-manifest.sqlite3"
+        ),
+        "native_module_count": len(native_dlls),
+        "native_module_bytes": sum(path.stat().st_size for path in native_dlls),
+        "presenter": file_identity(presenter),
+        "presenter_library": file_identity(presenter_library),
+        "vulkan_pipeline_cache": file_identity(pipeline_cache),
+        "warm": bool(
+            args.dynamic_block_cache.is_file()
+            and native_dlls
+            and presenter.is_file()
+            and presenter_library.is_file()
+            and pipeline_cache.is_file()
+        ),
+    }
+
+
+def _live_run_manifest(
+    args: argparse.Namespace,
+    target_verification: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "format": "b2-recomp-live-run-manifest",
+        "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+        "public_safe": False,
+        "run_id": args.run_id,
+        "started_utc": utc_now(),
+        "finished_utc": None,
+        "status": "starting",
+        "returncode": None,
+        "elapsed_seconds": None,
+        "repository": git_identity(REPO_ROOT),
+        "target": target_verification,
+        "generated_code": generated_code_identity(),
+        "machine": machine_identity(),
+        "cache": _native_cache_state(args),
+        "presenter_build": getattr(args, "presenter_build_validation", None),
+        "configuration": {
+            "runtime_process_model": (
+                "embedded_single_process"
+                if _uses_embedded_runtime(args)
+                else "isolated_diagnostic_processes"
+            ),
+            "diagnostics_enabled": not getattr(args, "no_diagnostics", False),
+            "hot_path_profiling_enabled": getattr(args, "profile_hot_paths", False),
+            "developer_live_compilation_enabled": getattr(
+                args, "developer_live_compile", False
+            ),
+            "live_control_transport": {
+                "format": "b2-recomp-live-control",
+                "schema_version": LIVE_CONTROL_SCHEMA_VERSION,
+                "name": getattr(args, "live_transport_name", None),
+                "command_mapping_bytes": LIVE_COMMAND_SIZE,
+                "resource_mapping_bytes": LIVE_RESOURCE_SIZE,
+            },
+            "lossless_flip_audit": getattr(args, "lossless_flip_audit", False),
+            "world_matrix_audit": getattr(args, "audit_world_matrices", False),
+            "scene_record_audit": getattr(args, "audit_scene_records", False),
+            "skip_host_build": bool(args.skip_host_build),
+            "native_slice_steps": args.native_slice_steps,
+            "max_steps": args.max_steps,
+            "presentation_pipeline_depth": args.presentation_pipeline_depth,
+            "cpu_vertex_programs": getattr(args, "cpu_vertex_programs", False),
+            "cpu_vertex_attributes": getattr(args, "cpu_vertex_attributes", False),
+            "cpu_texture_conversion": getattr(args, "cpu_texture_conversion", False),
+            "unsupported_xbe_override": bool(
+                getattr(args, "allow_unsupported_xbe", False)
+            ),
+            "stale_artifact_override": bool(
+                getattr(args, "allow_stale_artifacts", False)
+            ),
+        },
+        "outputs": {
+            "probe_summary": (
+                str(args.json_output.resolve())
+                if not getattr(args, "no_diagnostics", False)
+                else None
+            ),
+            "runner_log": (
+                str(args.runner_log.resolve())
+                if not getattr(args, "no_diagnostics", False)
+                and not _uses_embedded_runtime(args)
+                else None
+            ),
+        },
+    }
+
+
+def run_live_test(args: argparse.Namespace) -> int:
+    started = time.monotonic()
+    try:
+        target_verification = verify_supported_xbe(
+            args.xbe,
+            manifest_path=getattr(args, "supported_targets", DEFAULT_SUPPORTED_TARGETS),
+            allow_unsupported=getattr(args, "allow_unsupported_xbe", False),
+        )
+    except ProjectIdentityError as exc:
+        print(f"Target identity rejected: {exc}", file=sys.stderr)
+        return 2
+    if target_verification["override_used"]:
+        print(
+            "WARNING: unsupported XBE override is active; this run is not valid "
+            "for compatibility or performance claims.",
+            file=sys.stderr,
+        )
+    args.run_id = getattr(args, "run_id", None) or new_run_id()
+    args.live_transport_name = _live_transport_name(args)
+    args.run_manifest = getattr(args, "run_manifest", None) or DEFAULT_RUN_MANIFEST
+    args.presenter_build_manifest = (
+        getattr(args, "presenter_build_manifest", None) or DEFAULT_BUILD_MANIFEST
+    )
+    embedded_runtime = _uses_embedded_runtime(args)
+    if not args.skip_host_build and embedded_runtime:
+        toolchain = discover_toolchain()
+        compile_first_frame(toolchain=toolchain)
+        compile_presenter_library(toolchain=toolchain)
+        compile_shaders(toolchain=toolchain)
+        write_presenter_build_manifest(
+            path=args.presenter_build_manifest,
+            source=DEFAULT_SOURCE,
+            output=DEFAULT_EXE,
+            library=DEFAULT_DLL,
+            toolchain=toolchain,
+            include_shaders=True,
+        )
+        args.presenter_build_validation = validate_presenter_build_manifest(
+            args.presenter_build_manifest,
+            executable=DEFAULT_EXE,
+            library=DEFAULT_DLL,
+            source=DEFAULT_SOURCE,
+            require_shaders=True,
+        )
+    elif args.skip_host_build:
+        try:
+            args.presenter_build_validation = validate_presenter_build_manifest(
+                args.presenter_build_manifest,
+                executable=DEFAULT_EXE,
+                library=DEFAULT_DLL,
+                source=DEFAULT_SOURCE,
+                require_shaders=True,
+                allow_stale=getattr(args, "allow_stale_artifacts", False),
+            )
+        except FirstFrameSmokeError as exc:
+            args.presenter_build_validation = {
+                "status": "rejected",
+                "valid": False,
+                "override_used": False,
+                "manifest": str(args.presenter_build_manifest.resolve()),
+                "problems": [str(exc)],
+            }
+            manifest = _live_run_manifest(args, target_verification)
+            manifest.update(
+                {
+                    "status": "rejected_stale_presenter",
+                    "returncode": 2,
+                    "finished_utc": utc_now(),
+                    "elapsed_seconds": round(time.monotonic() - started, 6),
+                }
+            )
+            write_json_atomic(args.run_manifest, manifest)
+            print(f"Presenter identity rejected: {exc}", file=sys.stderr)
+            print(f"Run manifest: {args.run_manifest}")
+            return 2
+        if args.presenter_build_validation["override_used"]:
+            print(
+                "WARNING: stale presenter artifact override is active; this run "
+                "is not valid for compatibility or performance claims.",
+                file=sys.stderr,
+            )
+    else:
+        args.presenter_build_validation = {
+            "status": "scheduled_rebuild",
+            "valid": None,
+            "override_used": False,
+            "manifest": str(args.presenter_build_manifest.resolve()),
+        }
+    manifest = _live_run_manifest(args, target_verification)
+    write_json_atomic(args.run_manifest, manifest)
+    try:
+        result = (
+            _run_live_test_embedded(args)
+            if embedded_runtime
+            else _run_live_test_processes(args)
+        )
+    except Exception as exc:
+        manifest.update(
+            {
+                "status": "failed_exception",
+                "finished_utc": utc_now(),
+                "elapsed_seconds": round(time.monotonic() - started, 6),
+                "error": f"{type(exc).__name__}: {exc}",
+                "cache_after": _native_cache_state(args),
+            }
+        )
+        write_json_atomic(args.run_manifest, manifest)
+        raise
+    if getattr(args, "stale_artifact_rejected", False) and result == 0:
+        result = 1
+    manifest.update(
+        {
+            "status": "completed" if result == 0 else "failed",
+            "returncode": result,
+            "finished_utc": utc_now(),
+            "elapsed_seconds": round(time.monotonic() - started, 6),
+            "cache_after": _native_cache_state(args),
+            "stale_artifact_rejected": bool(
+                getattr(args, "stale_artifact_rejected", False)
+            ),
+        }
+    )
+    try:
+        manifest["presenter_build_after"] = validate_presenter_build_manifest(
+            args.presenter_build_manifest,
+            executable=DEFAULT_EXE,
+            library=DEFAULT_DLL,
+            source=DEFAULT_SOURCE,
+            require_shaders=True,
+            allow_stale=True,
+        )
+    except FirstFrameSmokeError as exc:  # pragma: no cover - allow_stale avoids this
+        manifest["presenter_build_after"] = {
+            "status": "unavailable",
+            "problems": [str(exc)],
+        }
+    write_json_atomic(args.run_manifest, manifest)
+    print(f"Run manifest: {args.run_manifest}")
+    return result
 
 
 def main() -> int:
@@ -765,6 +1353,40 @@ def main() -> int:
         description="Run the native guest and live Vulkan presenter together."
     )
     parser.add_argument("--xbe", type=Path, default=DEFAULT_XBE)
+    parser.add_argument(
+        "--supported-targets",
+        type=Path,
+        default=DEFAULT_SUPPORTED_TARGETS,
+        help="Checked-in exact XBE identity manifest.",
+    )
+    parser.add_argument(
+        "--allow-unsupported-xbe",
+        action="store_true",
+        help=(
+            "Developer-only override for an unknown XBE; marks all output as "
+            "unsupported and unsuitable for compatibility or performance claims."
+        ),
+    )
+    parser.add_argument(
+        "--run-manifest",
+        type=Path,
+        default=DEFAULT_RUN_MANIFEST,
+        help="Self-identifying manifest written for every live run.",
+    )
+    parser.add_argument(
+        "--presenter-build-manifest",
+        type=Path,
+        default=DEFAULT_BUILD_MANIFEST,
+        help="Content-addressed presenter build identity manifest.",
+    )
+    parser.add_argument(
+        "--allow-stale-artifacts",
+        action="store_true",
+        help=(
+            "Developer-only override for stale presenter artifacts; marks the "
+            "run as unsupported."
+        ),
+    )
     parser.add_argument("--extracted-root", type=Path, default=DEFAULT_EXTRACTED_ROOT)
     parser.add_argument("--save-data-root", type=Path, default=DEFAULT_SAVE_DATA_ROOT)
     parser.add_argument("--dashboard-root", type=Path, default=DEFAULT_DASHBOARD_ROOT)
@@ -814,6 +1436,14 @@ def main() -> int:
             "Enable sampled callback latency, exact native module edges, and "
             "exclusive dispatcher timing; use only for profiling runs because "
             "it adds diagnostic accounting."
+        ),
+    )
+    parser.add_argument(
+        "--developer-live-compile",
+        action="store_true",
+        help=(
+            "Developer-only: compile and adopt newly discovered frontier blocks "
+            "during play. Normal runs persist discoveries for the next AOT build."
         ),
     )
     parser.add_argument(

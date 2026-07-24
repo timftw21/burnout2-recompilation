@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
 import shutil
 import struct
 import subprocess
+import sys
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -19,9 +21,55 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools.project_identity import (
+    file_identity,
+    git_identity,
+    sha256_bytes,
+    utc_now,
+    write_json_atomic,
+)
+from tools.native_toolchain import toolchain_validation_errors, validate_native_toolchain
+
+
 DEFAULT_SOURCE = REPO_ROOT / "runtime" / "host" / "vulkan_first_frame.cpp"
+DEFAULT_PRESENTER_MODULES = (
+    REPO_ROOT / "runtime" / "host" / "nv2a_command_processor.cpp",
+    REPO_ROOT / "runtime" / "host" / "vulkan_presenter.cpp",
+    REPO_ROOT / "runtime" / "host" / "vulkan_renderer.cpp",
+    REPO_ROOT / "runtime" / "host" / "vulkan_resources.cpp",
+    REPO_ROOT / "runtime" / "host" / "presenter_diagnostics.cpp",
+    REPO_ROOT / "runtime" / "host" / "live_presenter_transport.cpp",
+    REPO_ROOT / "runtime" / "host" / "presenter_debug_log.cpp",
+    REPO_ROOT / "runtime" / "host" / "presenter_metrics.cpp",
+    REPO_ROOT / "runtime" / "host" / "presenter_options.cpp",
+    REPO_ROOT / "runtime" / "platform" / "sdl" / "sdl_audio.cpp",
+    REPO_ROOT / "runtime" / "platform" / "sdl" / "sdl_audio_c_api.cpp",
+    REPO_ROOT / "runtime" / "platform" / "sdl" / "sdl_platform.cpp",
+)
+DEFAULT_PRESENTER_HEADERS = (
+    REPO_ROOT / "runtime" / "host" / "dirty_ranges.h",
+    REPO_ROOT / "runtime" / "host" / "frame_metrics.h",
+    REPO_ROOT / "runtime" / "host" / "live_presenter_transport.h",
+    REPO_ROOT / "runtime" / "host" / "live_transport_layout.h",
+    REPO_ROOT / "runtime" / "host" / "native_pipeline_state.h",
+    REPO_ROOT / "runtime" / "host" / "nv2a_vertex_program.h",
+    REPO_ROOT / "runtime" / "host" / "presenter_debug_log.h",
+    REPO_ROOT / "runtime" / "host" / "presenter_metrics.h",
+    REPO_ROOT / "runtime" / "host" / "presenter_options.h",
+    REPO_ROOT / "runtime" / "host" / "vulkan_presenter.h",
+    REPO_ROOT / "runtime" / "host" / "vulkan_presenter_internal.h",
+    REPO_ROOT / "runtime" / "host" / "vulkan_presenter_runtime.h",
+    REPO_ROOT / "runtime" / "nv2a" / "texture_layout.h",
+    REPO_ROOT / "runtime" / "platform" / "sdl" / "sdl_audio.h",
+    REPO_ROOT / "runtime" / "platform" / "sdl" / "sdl_audio_c_api.h",
+    REPO_ROOT / "runtime" / "platform" / "sdl" / "sdl_platform.h",
+)
 DEFAULT_BUILD_DIR = REPO_ROOT / "build" / "local" / "first-frame"
 DEFAULT_EXE = DEFAULT_BUILD_DIR / "b2_first_frame.exe"
+DEFAULT_DLL = DEFAULT_BUILD_DIR / "b2_presenter.dll"
 DEFAULT_DEBUG_JSON = REPO_ROOT / "reports" / "local" / "first-frame" / "events.jsonl"
 DEFAULT_SUMMARY_JSON = REPO_ROOT / "reports" / "local" / "first-frame" / "summary.json"
 DEFAULT_SCREENSHOT = REPO_ROOT / "reports" / "local" / "first-frame" / "frame.bmp"
@@ -37,8 +85,10 @@ DEFAULT_VERTEX_SPV = DEFAULT_BUILD_DIR / "nv2a_inline.vert.spv"
 DEFAULT_FRAGMENT_SPV = DEFAULT_BUILD_DIR / "nv2a_inline.frag.spv"
 DEFAULT_TEXTURE_CONVERT_SPV = DEFAULT_BUILD_DIR / "nv2a_texture_convert.comp.spv"
 DEFAULT_PIPELINE_CACHE = DEFAULT_BUILD_DIR / "vulkan-pipeline-cache.bin"
+DEFAULT_BUILD_MANIFEST = DEFAULT_EXE.with_suffix(".build.json")
 DEFAULT_VULKAN_SDK = Path("C:/VulkanSDK/1.4.341.1")
 DEFAULT_LLVM_BIN = Path("C:/Program Files/LLVM/bin")
+BUILD_MANIFEST_SCHEMA_VERSION = 2
 
 
 class FirstFrameSmokeError(RuntimeError):
@@ -90,6 +140,15 @@ def discover_toolchain(
         raise FirstFrameSmokeError(f"SDL3 import library not found under {sdk_candidate}")
     if not (sdk_candidate / "Bin" / "SDL3.dll").exists():
         raise FirstFrameSmokeError(f"SDL3 runtime not found under {sdk_candidate}")
+    validation = validate_native_toolchain(
+        clangxx=clang_candidate,
+        vulkan_sdk=sdk_candidate,
+        include_build_tools=False,
+        include_presenter_tools=True,
+    )
+    if not validation["passed"]:
+        errors = toolchain_validation_errors(validation)
+        raise FirstFrameSmokeError("native toolchain lock rejected: " + "; ".join(errors))
     return Toolchain(clang_candidate, sdk_candidate)
 
 
@@ -98,15 +157,23 @@ def build_command(
     source: Path,
     output: Path,
     toolchain: Toolchain,
+    shared_library: bool = False,
 ) -> list[str]:
-    return [
+    command = [
         str(toolchain.clangxx),
         "-std=c++17",
         "-O2",
         "-DUNICODE",
         "-D_UNICODE",
+    ]
+    if shared_library:
+        command.append("-shared")
+    sources = [source]
+    if source.resolve() == DEFAULT_SOURCE.resolve():
+        sources.extend(DEFAULT_PRESENTER_MODULES)
+    command.extend([
         f"-I{toolchain.include_dir}",
-        str(source),
+        *(str(path) for path in sources),
         f"-L{toolchain.lib_dir}",
         "-lvulkan-1",
         "-lSDL3",
@@ -115,7 +182,8 @@ def build_command(
         "-lshell32",
         "-o",
         str(output),
-    ]
+    ])
+    return command
 
 
 def compile_first_frame(
@@ -137,6 +205,46 @@ def compile_first_frame(
     if completed.returncode != 0:
         raise FirstFrameSmokeError(
             "first-frame compile failed\n"
+            f"command: {' '.join(command)}\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
+    sdl3_runtime = output.parent / "SDL3.dll"
+    shutil.copy2(active_toolchain.sdl3_dll, sdl3_runtime)
+    return {
+        "command": command,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+        "output": str(output),
+        "sdl3_runtime": str(sdl3_runtime),
+    }
+
+
+def compile_presenter_library(
+    *,
+    source: Path = DEFAULT_SOURCE,
+    output: Path = DEFAULT_DLL,
+    toolchain: Toolchain | None = None,
+) -> dict[str, Any]:
+    active_toolchain = toolchain or discover_toolchain()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    command = build_command(
+        source=source,
+        output=output,
+        toolchain=active_toolchain,
+        shared_library=True,
+    )
+    completed = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise FirstFrameSmokeError(
+            "embedded presenter compile failed\n"
             f"command: {' '.join(command)}\n"
             f"stdout:\n{completed.stdout}\n"
             f"stderr:\n{completed.stderr}"
@@ -231,15 +339,232 @@ def compile_shaders(
     }
 
 
-def run_first_frame(
+def _command_version(executable: Path) -> str | None:
+    completed = subprocess.run(
+        [str(executable), "--version"],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    output = completed.stdout.strip() or completed.stderr.strip()
+    return output or None
+
+
+def _build_manifest_id(basis: dict[str, Any]) -> str:
+    encoded = json.dumps(basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return sha256_bytes(encoded)
+
+
+def write_presenter_build_manifest(
+    *,
+    path: Path,
+    source: Path,
+    output: Path,
+    library: Path | None = None,
+    toolchain: Toolchain,
+    include_shaders: bool,
+    vertex_source: Path = DEFAULT_VERTEX_SHADER,
+    fragment_source: Path = DEFAULT_FRAGMENT_SHADER,
+    texture_convert_source: Path = DEFAULT_TEXTURE_CONVERT_SHADER,
+    vertex_output: Path = DEFAULT_VERTEX_SPV,
+    fragment_output: Path = DEFAULT_FRAGMENT_SPV,
+    texture_convert_output: Path = DEFAULT_TEXTURE_CONVERT_SPV,
+) -> dict[str, Any]:
+    glslc = toolchain.vulkan_sdk / "Bin" / "glslc.exe"
+    inputs = {
+        "build_driver": file_identity(Path(__file__)),
+        "presenter_source": file_identity(source),
+        "clangxx": {
+            **file_identity(toolchain.clangxx),
+            "version": _command_version(toolchain.clangxx),
+        },
+        "sdl3_import_library": file_identity(toolchain.sdl3_lib),
+        "sdl3_runtime_source": file_identity(toolchain.sdl3_dll),
+        "vulkan_import_library": file_identity(toolchain.vulkan_lib),
+    }
+    if source.resolve() == DEFAULT_SOURCE.resolve():
+        inputs.update(
+            {
+                f"presenter_input_{index:02d}_{path.stem}": file_identity(path)
+                for index, path in enumerate(
+                    (*DEFAULT_PRESENTER_MODULES, *DEFAULT_PRESENTER_HEADERS)
+                )
+            }
+        )
+    artifacts = {
+        "presenter_executable": file_identity(output),
+        "sdl3_runtime": file_identity(output.parent / "SDL3.dll"),
+    }
+    if library is not None:
+        artifacts["presenter_library"] = file_identity(library)
+    if include_shaders:
+        inputs.update(
+            {
+                "glslc": {
+                    **file_identity(glslc),
+                    "version": _command_version(glslc),
+                },
+                "vertex_shader_source": file_identity(vertex_source),
+                "fragment_shader_source": file_identity(fragment_source),
+                "texture_convert_shader_source": file_identity(texture_convert_source),
+            }
+        )
+        artifacts.update(
+            {
+                "vertex_shader": file_identity(vertex_output),
+                "fragment_shader": file_identity(fragment_output),
+                "texture_convert_shader": file_identity(texture_convert_output),
+            }
+        )
+    basis = {
+        "schema_version": BUILD_MANIFEST_SCHEMA_VERSION,
+        "profile": "full" if include_shaders else "analysis_only",
+        "build_command": build_command(
+            source=source,
+            output=output,
+            toolchain=toolchain,
+        ),
+        "library_build_command": (
+            build_command(
+                source=source,
+                output=library,
+                toolchain=toolchain,
+                shared_library=True,
+            )
+            if library is not None
+            else None
+        ),
+        "shader_commands": (
+            [
+                [str(glslc), str(shader_source), "-o", str(shader_output)]
+                for shader_source, shader_output in (
+                    (vertex_source, vertex_output),
+                    (fragment_source, fragment_output),
+                    (texture_convert_source, texture_convert_output),
+                )
+            ]
+            if include_shaders
+            else []
+        ),
+        "inputs": inputs,
+    }
+    manifest = {
+        "format": "b2-recomp-presenter-build-manifest",
+        "schema_version": BUILD_MANIFEST_SCHEMA_VERSION,
+        "built_utc": utc_now(),
+        "build_id": _build_manifest_id(basis),
+        "profile": basis["profile"],
+        "repository": git_identity(REPO_ROOT),
+        "build_command": basis["build_command"],
+        "library_build_command": basis["library_build_command"],
+        "shader_commands": basis["shader_commands"],
+        "inputs": inputs,
+        "artifacts": artifacts,
+    }
+    write_json_atomic(path, manifest)
+    return manifest
+
+
+def validate_presenter_build_manifest(
+    path: Path,
     *,
     executable: Path = DEFAULT_EXE,
+    library: Path | None = None,
+    source: Path = DEFAULT_SOURCE,
+    require_shaders: bool = True,
+    allow_stale: bool = False,
+) -> dict[str, Any]:
+    problems: list[str] = []
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        manifest = None
+        problems.append(f"cannot read build manifest {path}: {exc}")
+    if manifest is not None and not isinstance(manifest, dict):
+        problems.append("build manifest root must be an object")
+        manifest = None
+    if manifest is not None:
+        if manifest.get("schema_version") != BUILD_MANIFEST_SCHEMA_VERSION:
+            problems.append(
+                f"build manifest schema is {manifest.get('schema_version')!r}; "
+                f"expected {BUILD_MANIFEST_SCHEMA_VERSION}"
+            )
+        if require_shaders and manifest.get("profile") != "full":
+            problems.append("build manifest is analysis-only; a full presenter build is required")
+        inputs = manifest.get("inputs")
+        artifacts = manifest.get("artifacts")
+        if not isinstance(inputs, dict) or not isinstance(artifacts, dict):
+            problems.append("build manifest inputs/artifacts are malformed")
+            inputs = {}
+            artifacts = {}
+        expected_source = inputs.get("presenter_source", {}).get("path")
+        if expected_source != str(source.resolve()):
+            problems.append(
+                f"presenter source path is {expected_source!r}; expected {str(source.resolve())!r}"
+            )
+        expected_executable = artifacts.get("presenter_executable", {}).get("path")
+        if expected_executable != str(executable.resolve()):
+            problems.append(
+                "presenter executable path is "
+                f"{expected_executable!r}; expected {str(executable.resolve())!r}"
+            )
+        if library is not None:
+            expected_library = artifacts.get("presenter_library", {}).get("path")
+            if expected_library != str(library.resolve()):
+                problems.append(
+                    "presenter library path is "
+                    f"{expected_library!r}; expected {str(library.resolve())!r}"
+                )
+        for group_name, records in (("input", inputs), ("artifact", artifacts)):
+            for role, recorded in records.items():
+                if not isinstance(recorded, dict) or not recorded.get("path"):
+                    problems.append(f"{group_name} {role} has no recorded path")
+                    continue
+                current = file_identity(Path(recorded["path"]))
+                if not current["exists"]:
+                    problems.append(f"{group_name} {role} is missing: {current['path']}")
+                    continue
+                if current["size"] != recorded.get("size"):
+                    problems.append(f"{group_name} {role} size changed")
+                if current["sha256"] != recorded.get("sha256"):
+                    problems.append(f"{group_name} {role} SHA-256 changed")
+        basis = {
+            "schema_version": manifest.get("schema_version"),
+            "profile": manifest.get("profile"),
+            "build_command": manifest.get("build_command"),
+            "library_build_command": manifest.get("library_build_command"),
+            "shader_commands": manifest.get("shader_commands", []),
+            "inputs": inputs,
+        }
+        if manifest.get("build_id") != _build_manifest_id(basis):
+            problems.append("build manifest ID does not match its recorded inputs")
+    result = {
+        "status": (
+            "valid" if not problems else "stale_override" if allow_stale else "stale"
+        ),
+        "valid": not problems,
+        "override_used": bool(problems and allow_stale),
+        "manifest": str(path.resolve()),
+        "build_id": manifest.get("build_id") if manifest else None,
+        "profile": manifest.get("profile") if manifest else None,
+        "problems": problems,
+    }
+    if problems and not allow_stale:
+        raise FirstFrameSmokeError(
+            "stale or unidentified presenter build rejected: " + "; ".join(problems)
+        )
+    return result
+
+
+def build_presenter_arguments(
+    *,
+    program: Path = DEFAULT_EXE,
     debug_json: Path | None = DEFAULT_DEBUG_JSON,
     width: int = 640,
     height: int = 480,
     max_frames: int = 3,
     inject_input: bool = True,
-    timeout_seconds: int = 30,
     render_stream_json: Path | None = None,
     screenshot: Path | None = None,
     hotkey_screenshot_directory: Path | None = DEFAULT_HOTKEY_SCREENSHOT_DIR,
@@ -250,6 +575,7 @@ def run_first_frame(
     pipeline_cache: Path | None = DEFAULT_PIPELINE_CACHE,
     live_render_stream: bool = False,
     controller_state_json: Path | None = None,
+    live_control_transport: str | None = None,
     strict_render_validation: bool = False,
     flip_audit_ack: Path | None = None,
     flip_audit_frame_directory: Path | None = None,
@@ -260,15 +586,13 @@ def run_first_frame(
     cpu_vertex_attributes: bool = False,
     cpu_texture_conversion: bool = False,
     presentation_pipeline_depth: int = 1,
-) -> dict[str, Any]:
-    if not executable.exists():
-        raise FirstFrameSmokeError(f"first-frame executable is missing: {executable}")
+) -> list[str]:
     if debug_json is not None:
         debug_json.parent.mkdir(parents=True, exist_ok=True)
         if debug_json.exists():
             debug_json.unlink()
     command = [
-        str(executable),
+        str(program),
         "--width",
         str(width),
         "--height",
@@ -310,6 +634,8 @@ def run_first_frame(
     if controller_state_json is not None and not analyze_render_stream:
         controller_state_json.parent.mkdir(parents=True, exist_ok=True)
         command.extend(["--controller-state-json", str(controller_state_json)])
+    if live_control_transport is not None and not analyze_render_stream:
+        command.extend(["--live-control-transport", live_control_transport])
     if strict_render_validation and not analyze_render_stream:
         command.append("--strict-render-validation")
     if (flip_audit_ack is None) != (flip_audit_frame_directory is None):
@@ -359,6 +685,71 @@ def run_first_frame(
             command.extend(
                 ["--texture-convert-shader", str(texture_convert_shader)]
             )
+    return command
+
+
+def run_first_frame(
+    *,
+    executable: Path = DEFAULT_EXE,
+    debug_json: Path | None = DEFAULT_DEBUG_JSON,
+    width: int = 640,
+    height: int = 480,
+    max_frames: int = 3,
+    inject_input: bool = True,
+    timeout_seconds: int = 30,
+    render_stream_json: Path | None = None,
+    screenshot: Path | None = None,
+    hotkey_screenshot_directory: Path | None = DEFAULT_HOTKEY_SCREENSHOT_DIR,
+    metrics_report_directory: Path | None = DEFAULT_METRICS_REPORT_DIR,
+    vertex_shader: Path = DEFAULT_VERTEX_SPV,
+    fragment_shader: Path = DEFAULT_FRAGMENT_SPV,
+    texture_convert_shader: Path = DEFAULT_TEXTURE_CONVERT_SPV,
+    pipeline_cache: Path | None = DEFAULT_PIPELINE_CACHE,
+    live_render_stream: bool = False,
+    controller_state_json: Path | None = None,
+    live_control_transport: str | None = None,
+    strict_render_validation: bool = False,
+    flip_audit_ack: Path | None = None,
+    flip_audit_frame_directory: Path | None = None,
+    flip_audit_max_flips: int = 0,
+    flip_audit_health_interval: int = 30,
+    analyze_render_stream: bool = False,
+    cpu_vertex_programs: bool = False,
+    cpu_vertex_attributes: bool = False,
+    cpu_texture_conversion: bool = False,
+    presentation_pipeline_depth: int = 1,
+) -> dict[str, Any]:
+    if not executable.exists():
+        raise FirstFrameSmokeError(f"first-frame executable is missing: {executable}")
+    command = build_presenter_arguments(
+        program=executable,
+        debug_json=debug_json,
+        width=width,
+        height=height,
+        max_frames=max_frames,
+        inject_input=inject_input,
+        render_stream_json=render_stream_json,
+        screenshot=screenshot,
+        hotkey_screenshot_directory=hotkey_screenshot_directory,
+        metrics_report_directory=metrics_report_directory,
+        vertex_shader=vertex_shader,
+        fragment_shader=fragment_shader,
+        texture_convert_shader=texture_convert_shader,
+        pipeline_cache=pipeline_cache,
+        live_render_stream=live_render_stream,
+        controller_state_json=controller_state_json,
+        live_control_transport=live_control_transport,
+        strict_render_validation=strict_render_validation,
+        flip_audit_ack=flip_audit_ack,
+        flip_audit_frame_directory=flip_audit_frame_directory,
+        flip_audit_max_flips=flip_audit_max_flips,
+        flip_audit_health_interval=flip_audit_health_interval,
+        analyze_render_stream=analyze_render_stream,
+        cpu_vertex_programs=cpu_vertex_programs,
+        cpu_vertex_attributes=cpu_vertex_attributes,
+        cpu_texture_conversion=cpu_texture_conversion,
+        presentation_pipeline_depth=presentation_pipeline_depth,
+    )
 
     env = os.environ.copy()
     llvm_bin = str(DEFAULT_LLVM_BIN)
@@ -395,6 +786,36 @@ def run_first_frame(
         "analyze_render_stream": analyze_render_stream,
         "events": events,
     }
+
+
+def run_embedded_presenter(
+    arguments: list[str],
+    *,
+    library: Path = DEFAULT_DLL,
+) -> int:
+    """Run the presenter DLL on the calling thread for the shipping live path."""
+    if not library.is_file():
+        raise FirstFrameSmokeError(f"embedded presenter library is missing: {library}")
+    if not arguments:
+        arguments = [str(library)]
+    dll_directory = (
+        os.add_dll_directory(str(library.parent.resolve()))
+        if os.name == "nt"
+        else None
+    )
+    try:
+        presenter = ctypes.CDLL(str(library.resolve()))
+        entry = presenter.b2r_presenter_main
+        entry.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_wchar_p),
+        ]
+        entry.restype = ctypes.c_int
+        argv = (ctypes.c_wchar_p * len(arguments))(*arguments)
+        return int(entry(len(arguments), argv))
+    finally:
+        if dll_directory is not None:
+            dll_directory.close()
 
 
 def read_debug_events(path: Path) -> list[dict[str, Any]]:
@@ -441,6 +862,7 @@ def summarize_smoke(
     compile_result: dict[str, Any] | None,
     run_result: dict[str, Any],
     summary_output: Path | None = None,
+    build_validation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     events = run_result["events"]
     counts = Counter(event.get("event") for event in events)
@@ -568,6 +990,7 @@ def summarize_smoke(
             "compiled": compile_result is not None,
             "returncode": compile_result["returncode"] if compile_result else None,
             "output": compile_result["output"] if compile_result else str(DEFAULT_EXE),
+            "identity": build_validation,
         },
         "run": {
             "returncode": run_result["returncode"],
@@ -1075,6 +1498,7 @@ def main() -> int:
     )
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--exe", type=Path, default=DEFAULT_EXE)
+    parser.add_argument("--dll", type=Path, default=DEFAULT_DLL)
     parser.add_argument("--debug-json", type=Path, default=DEFAULT_DEBUG_JSON)
     parser.add_argument("--summary-output", type=Path, default=DEFAULT_SUMMARY_JSON)
     parser.add_argument("--screenshot-output", type=Path, default=DEFAULT_SCREENSHOT)
@@ -1162,7 +1586,27 @@ def main() -> int:
         type=Path,
         help="Publish keyboard-mapped Xbox controller state for the resumable runner.",
     )
+    parser.add_argument(
+        "--live-control-transport",
+        help=(
+            "Named versioned shared-memory mapping for live controller state "
+            "and presentation acknowledgements."
+        ),
+    )
     parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument(
+        "--build-manifest",
+        type=Path,
+        help="Presenter build identity manifest; defaults beside --exe.",
+    )
+    parser.add_argument(
+        "--allow-stale-artifacts",
+        action="store_true",
+        help=(
+            "Developer-only override for missing or stale build identity; marks "
+            "the run as unsupported."
+        ),
+    )
     parser.add_argument(
         "--no-diagnostics",
         action="store_true",
@@ -1203,9 +1647,11 @@ def main() -> int:
         parser.error("--flip-audit-max-flips must not be negative")
     if args.flip_audit_health_interval < 0:
         parser.error("--flip-audit-health-interval must not be negative")
+    build_manifest_path = args.build_manifest or args.exe.with_suffix(".build.json")
 
     compile_result = None
     shader_result = None
+    build_validation = None
     if not args.skip_build:
         toolchain = discover_toolchain(
             clangxx=args.clangxx,
@@ -1217,8 +1663,43 @@ def main() -> int:
             toolchain=toolchain,
         )
         if not args.analyze_render_stream:
+            compile_result["embedded_presenter"] = compile_presenter_library(
+                source=args.source,
+                output=args.dll,
+                toolchain=toolchain,
+            )
             shader_result = compile_shaders(toolchain=toolchain)
             compile_result["shaders"] = shader_result
+        write_presenter_build_manifest(
+            path=build_manifest_path,
+            source=args.source,
+            output=args.exe,
+            library=None if args.analyze_render_stream else args.dll,
+            toolchain=toolchain,
+            include_shaders=not args.analyze_render_stream,
+        )
+        build_validation = validate_presenter_build_manifest(
+            build_manifest_path,
+            executable=args.exe,
+            library=None if args.analyze_render_stream else args.dll,
+            source=args.source,
+            require_shaders=not args.analyze_render_stream,
+        )
+    else:
+        build_validation = validate_presenter_build_manifest(
+            build_manifest_path,
+            executable=args.exe,
+            library=None if args.analyze_render_stream else args.dll,
+            source=args.source,
+            require_shaders=not args.analyze_render_stream,
+            allow_stale=args.allow_stale_artifacts,
+        )
+        if build_validation["override_used"]:
+            print(
+                "WARNING: stale presenter artifact override is active; this run "
+                "is not valid for compatibility or performance claims.",
+                file=sys.stderr,
+            )
 
     run_result = run_first_frame(
         executable=args.exe,
@@ -1231,6 +1712,7 @@ def main() -> int:
         render_stream_json=args.render_stream_json,
         live_render_stream=args.live_render_stream,
         controller_state_json=args.controller_state_json,
+        live_control_transport=args.live_control_transport,
         strict_render_validation=args.strict_render_validation,
         flip_audit_ack=args.flip_audit_ack,
         flip_audit_frame_directory=args.flip_audit_frame_directory,
@@ -1264,6 +1746,7 @@ def main() -> int:
         compile_result=compile_result,
         run_result=run_result,
         summary_output=args.summary_output,
+        build_validation=build_validation,
     )
     print(json.dumps(summary, indent=2 if args.pretty else None, sort_keys=True))
     return 0 if run_result["returncode"] == 0 else run_result["returncode"]

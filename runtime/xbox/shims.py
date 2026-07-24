@@ -1687,6 +1687,13 @@ class XboxSynchronizationShim:
     def current_thread(self) -> int:
         return self._current_thread
 
+    def activate_thread(self, handle: int) -> int:
+        if handle not in self._threads:
+            raise XboxRuntimeError(f"invalid thread handle: {_hex32(handle)}")
+        previous = self._current_thread
+        self._current_thread = handle
+        return previous
+
     def create_event(self, *, manual_reset: bool = True, initial_state: bool = False) -> int:
         handle = self._handles.allocate("event", EventObject(manual_reset, initial_state))
         self._trace.add(

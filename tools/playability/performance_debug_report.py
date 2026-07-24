@@ -47,6 +47,7 @@ def _metric_total(metrics: dict[str, Any], *names: str) -> int:
 def _summarize_native_compilation(execution: dict[str, Any]) -> dict[str, Any]:
     compilations: list[dict[str, Any]] = []
     native_run_count = 0
+    retained_native_run_count = 0
     for thread in execution.get("guest_thread_executions", []):
         if not isinstance(thread, dict):
             continue
@@ -54,12 +55,22 @@ def _summarize_native_compilation(execution: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(runs, list):
             run = thread.get("native_run")
             runs = [run] if isinstance(run, dict) else []
+        retained_thread_run_count = sum(
+            1 for run in runs if isinstance(run, dict)
+        )
+        history = thread.get("native_run_history")
+        native_run_count += max(
+            retained_thread_run_count,
+            _as_int(history.get("total_count"))
+            if isinstance(history, dict)
+            else retained_thread_run_count,
+        )
+        retained_native_run_count += retained_thread_run_count
         previous_target: int | None = None
         seen_executor_keys: set[str] = set()
         for run_index, run in enumerate(runs):
             if not isinstance(run, dict):
                 continue
-            native_run_count += 1
             cache = run.get("native_module_cache") or {}
             executor_instance_id = cache.get("executor_instance_id")
             executor_key = (
@@ -140,6 +151,11 @@ def _summarize_native_compilation(execution: dict[str, Any]) -> dict[str, Any]:
     ]
     return {
         "native_run_count": native_run_count,
+        "retained_native_run_count": retained_native_run_count,
+        "dropped_native_run_count": max(
+            0, native_run_count - retained_native_run_count
+        ),
+        "history_complete": native_run_count == retained_native_run_count,
         "compile_event_count": len(compilations),
         "compiled_module_count": sum(
             item["compiled_module_count"] for item in compilations
@@ -352,6 +368,26 @@ def _findings(
     native_frontier_promotion: dict[str, Any],
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
+    dropped_native_runs = _as_int(
+        native_compilation.get("dropped_native_run_count")
+    )
+    if dropped_native_runs:
+        findings.append(
+            {
+                "id": "native_run_history_is_bounded",
+                "severity": "info",
+                "evidence": {
+                    "native_run_count": _as_int(
+                        native_compilation.get("native_run_count")
+                    ),
+                    "retained_native_run_count": _as_int(
+                        native_compilation.get("retained_native_run_count")
+                    ),
+                    "dropped_native_run_count": dropped_native_runs,
+                    "compilation_totals_complete": False,
+                },
+            }
+        )
     maximum_incremental_compile_us = _as_int(
         native_compilation.get("maximum_synchronous_incremental_compile_wall_us")
     )

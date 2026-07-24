@@ -9,14 +9,28 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tools.recomp.native_executor import (
+    NATIVE_HOST_SERVICE_COLD_CALLBACK,
+    NATIVE_HOST_SERVICE_LIFECYCLE_CREATE_WORKER,
+    NATIVE_HOST_SERVICE_RETURN_CONSTANT,
+    NATIVE_HOST_SERVICE_SYSTEM_TIME,
+    NATIVE_WORKER_COMPLETED,
+    NATIVE_WORKER_READY,
+    NATIVE_WORKER_RUNNING,
+    NATIVE_DISPATCH_EDGE_CAPACITY_LIMIT,
+    NATIVE_DISPATCH_EDGE_REPORT_LIMIT,
+    NativeCooperativeSchedulerState,
     NativeExecutorError,
+    NativeHostServiceEntry,
+    NativeHostServiceState,
     NativeModuleManifest,
     NativeResumableExecutor,
+    NativeWorkerLifecycleState,
     _partition_instructions_by_address,
     _partition_instructions_for_call_fusion,
 )
 from tools.recomp.x86_lifter import (
     CpuState,
+    ExecutionTrace,
     LiftedFunction,
     NativeFastPath,
     RESUMABLE_REPEAT_CHUNK_ITERATIONS,
@@ -884,6 +898,13 @@ class NativeResumableExecutorTests(unittest.TestCase):
         edge_profile = performance["native_module_edge_profile"]
         self.assertTrue(edge_profile["exact"])
         self.assertEqual(edge_profile["unique_edge_count"], 3)
+        self.assertEqual(edge_profile["reported_edge_count"], 3)
+        self.assertEqual(edge_profile["dropped_edge_count"], 0)
+        self.assertEqual(edge_profile["report_limit"], NATIVE_DISPATCH_EDGE_REPORT_LIMIT)
+        self.assertLessEqual(
+            edge_profile["table_capacity"],
+            NATIVE_DISPATCH_EDGE_CAPACITY_LIMIT,
+        )
         self.assertEqual(edge_profile["classified_module_calls"], 3)
         self.assertEqual(edge_profile["unclassified_module_calls"], 0)
         self.assertEqual(edge_profile["overflow_module_calls"], 0)
@@ -1759,6 +1780,7 @@ class NativeResumableExecutorTests(unittest.TestCase):
                 memory,
                 call_handlers={0x2000: handler},
                 call_handler_yield_predicate=lambda target: target == 0x2000,
+                dispatch_host_calls_in_native=True,
                 max_steps=20,
             )
 
@@ -2337,6 +2359,377 @@ class NativeResumableExecutorTests(unittest.TestCase):
         self.assertEqual(
             performance["hot_paths"][0]["total_us"],
             max(metric["total_us"] for metric in performance["timings"].values()),
+        )
+
+    def test_live_slice_provider_expands_native_dispatch_quantum(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex("40EBFD"),  # inc eax; jmp 0x1000
+            base_address=0x1000,
+            symbol="adaptive_sliced_loop",
+        )
+        state = CpuState.with_registers(eax=0, esp=0x8000)
+        yields: list[int] = []
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            executor = NativeResumableExecutor(function, build_dir=Path(temp_dir))
+            executor.run(
+                state,
+                SparseMemory(),
+                max_steps=200,
+                slice_steps=25,
+                slice_steps_provider=lambda steps: 25 if steps < 25 else 75,
+                yield_handler=lambda _state, _memory, steps: yields.append(steps),
+            )
+
+        self.assertEqual(yields, [25, 100, 175])
+        performance = executor.last_run_summary["performance"]
+        self.assertEqual(performance["initial_slice_steps"], 25)
+        self.assertEqual(performance["final_slice_steps"], 75)
+        self.assertEqual(performance["slice_quantum_change_count"], 1)
+
+    def test_native_dispatch_keeps_multiple_host_calls_in_one_session(self) -> None:
+        base_address = 0x1000
+        handler_target = 0x2000
+        code = bytearray()
+        for _ in range(2):
+            instruction_address = base_address + len(code)
+            code.extend(b"\xE8")
+            code.extend(
+                struct.pack(
+                    "<i",
+                    handler_target - (instruction_address + 5),
+                )
+            )
+        code.extend(b"\xC3")
+        function = lift_x86_function(
+            bytes(code),
+            base_address=base_address,
+            symbol="native_host_call_session",
+        )
+        calls: list[int] = []
+
+        def handler(
+            state: CpuState,
+            _memory: SparseMemory,
+            target: int,
+            _trace: ExecutionTrace,
+        ) -> None:
+            calls.append(target)
+            state.set_register("eax", state.get_register("eax") + 1)
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            executor = NativeResumableExecutor(
+                function,
+                build_dir=Path(temp_dir),
+                callback_addresses={handler_target},
+            )
+            state = CpuState.with_registers(eax=0, esp=0x8000)
+            returned_to = executor.run(
+                state,
+                SparseMemory({0x8000: 0}),
+                call_handlers={handler_target: handler},
+                dispatch_host_calls_in_native=True,
+                max_steps=16,
+            )
+
+        self.assertEqual(returned_to, 0)
+        self.assertEqual(calls, [handler_target, handler_target])
+        self.assertEqual(state.get_register("eax"), 2)
+        performance = executor.last_run_summary["performance"]
+        self.assertTrue(performance["native_host_call_dispatch_enabled"])
+        self.assertEqual(performance["native_host_call_dispatch_count"], 2)
+        self.assertEqual(performance["native_dispatch_count"], 1)
+
+    def test_native_host_service_bypasses_python_handler(self) -> None:
+        base_address = 0x1000
+        handler_target = 0x2000
+        relative = handler_target - (base_address + 5)
+        function = lift_x86_function(
+            b"\xE8" + struct.pack("<i", relative) + b"\xC3",
+            base_address=base_address,
+            symbol="native_constant_host_service",
+        )
+        services = NativeHostServiceState(
+            [
+                NativeHostServiceEntry(
+                    handler_target,
+                    NATIVE_HOST_SERVICE_RETURN_CONSTANT,
+                    0,
+                    0x12345678,
+                )
+            ]
+        )
+
+        def unexpected_handler(*_args: object) -> None:
+            self.fail("native host service crossed into Python")
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            executor = NativeResumableExecutor(
+                function,
+                build_dir=Path(temp_dir),
+                callback_addresses={handler_target},
+            )
+            state = CpuState.with_registers(esp=0x8000)
+            returned_to = executor.run(
+                state,
+                SparseMemory({0x8000: 0}),
+                call_handlers={handler_target: unexpected_handler},
+                dispatch_host_calls_in_native=True,
+                native_host_services=services,
+                max_steps=8,
+            )
+
+        self.assertEqual(returned_to, 0)
+        self.assertEqual(state.get_register("eax"), 0x12345678)
+        performance = executor.last_run_summary["performance"]
+        self.assertEqual(performance["native_host_service_call_count"], 1)
+        self.assertEqual(performance["handler_call_count"], 0)
+
+    def test_native_cold_service_owns_unwind_and_registers_worker(self) -> None:
+        base_address = 0x1000
+        handler_target = 0x2000
+        handle_address = 0x3000
+        arguments = (
+            handle_address,
+            0x20,
+            0x4000,
+            0x80,
+            0x3010,
+            0xAABBCCDD,
+            0x11223344,
+            0,
+            0,
+            0x5000,
+        )
+        code = bytearray()
+        for argument in reversed(arguments):
+            code.extend(b"\x68" + struct.pack("<I", argument))
+        call_address = base_address + len(code)
+        code.extend(
+            b"\xE8" + struct.pack("<i", handler_target - (call_address + 5))
+        )
+        code.extend(b"\xC3")
+        function = lift_x86_function(
+            bytes(code),
+            base_address=base_address,
+            symbol="native_cold_worker_create",
+        )
+        services = NativeHostServiceState(
+            [
+                NativeHostServiceEntry(
+                    handler_target,
+                    NATIVE_HOST_SERVICE_COLD_CALLBACK,
+                    40,
+                    NATIVE_HOST_SERVICE_LIFECYCLE_CREATE_WORKER,
+                )
+            ]
+        )
+        lifecycle = NativeWorkerLifecycleState()
+        services.attach_worker_lifecycle(lifecycle)
+        memory = SparseMemory({0x8000: 0})
+        observed_arguments: list[tuple[int, ...]] = []
+
+        def create_worker_handler(
+            state: CpuState,
+            active_memory: SparseMemory,
+            _target: int,
+            _trace: ExecutionTrace,
+        ) -> None:
+            esp = state.get_register("esp")
+            observed_arguments.append(
+                tuple(active_memory.read_u32(esp + 4 + index * 4) for index in range(10))
+            )
+            return_address = active_memory.read_u32(esp)
+            active_memory.write_u32(handle_address, 0x104)
+            active_memory.write_u32(esp + 40, return_address)
+            state.set_register("esp", esp + 40)
+            state.set_register("eax", 0)
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            executor = NativeResumableExecutor(
+                function,
+                build_dir=Path(temp_dir),
+                callback_addresses={handler_target},
+            )
+            state = CpuState.with_registers(esp=0x8000)
+            returned_to = executor.run(
+                state,
+                memory,
+                call_handlers={handler_target: create_worker_handler},
+                dispatch_host_calls_in_native=True,
+                native_host_services=services,
+                max_steps=32,
+            )
+
+        self.assertEqual(returned_to, 0)
+        self.assertEqual(observed_arguments, [arguments])
+        self.assertEqual(state.get_register("esp"), 0x8004)
+        worker = lifecycle.entry_for_handle(0x104)
+        self.assertIsNotNone(worker)
+        assert worker is not None
+        self.assertEqual(worker.start_address, 0x5000)
+        self.assertEqual(worker.start_context1, 0xAABBCCDD)
+        self.assertEqual(worker.start_context2, 0x11223344)
+        self.assertEqual(worker.status, NATIVE_WORKER_READY)
+        performance = executor.last_run_summary["performance"]
+        self.assertEqual(performance["native_cold_host_call_count"], 1)
+        self.assertEqual(performance["native_host_service_call_count"], 1)
+        self.assertEqual(performance["native_dispatch_count"], 1)
+
+    def test_native_worker_lifecycle_selects_and_transitions_workers(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex("C3"),
+            base_address=0x1000,
+            symbol="native_worker_lifecycle",
+        )
+        workers = [
+            {
+                "handle": 0x104,
+                "start_address": 0x2000,
+                "start_context1": 1,
+                "start_context2": 2,
+                "suspended": False,
+            },
+            {
+                "handle": 0x108,
+                "start_address": 0x3000,
+                "start_context1": 3,
+                "start_context2": 4,
+                "suspended": True,
+            },
+        ]
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            executor = NativeResumableExecutor(function, build_dir=Path(temp_dir))
+            lifecycle = NativeWorkerLifecycleState()
+            executor.synchronize_worker_lifecycle(
+                lifecycle,
+                workers,
+                primary_handle=0x100,
+            )
+            first = executor.select_runnable_workers(lifecycle)
+            executor.set_worker_lifecycle_status(
+                lifecycle, 0x104, NATIVE_WORKER_COMPLETED
+            )
+            executor.set_worker_lifecycle_status(
+                lifecycle, 0x108, NATIVE_WORKER_READY
+            )
+            second = executor.select_runnable_workers(lifecycle)
+
+        self.assertEqual(first, (0x104,))
+        self.assertEqual(second, (0x108,))
+        self.assertEqual(
+            lifecycle.entry_for_handle(0x104).status,
+            NATIVE_WORKER_COMPLETED,
+        )
+        self.assertEqual(
+            lifecycle.entry_for_handle(0x108).status,
+            NATIVE_WORKER_RUNNING,
+        )
+        self.assertEqual(lifecycle.entry_count, 2)
+        self.assertEqual(lifecycle.created_count, 2)
+        self.assertGreaterEqual(lifecycle.transition_count, 5)
+
+    def test_cooperative_scheduler_policy_runs_in_native_dispatcher(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex("C3"),
+            base_address=0x1000,
+            symbol="native_cooperative_scheduler",
+        )
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            executor = NativeResumableExecutor(function, build_dir=Path(temp_dir))
+            state = NativeCooperativeSchedulerState()
+            first = executor.update_cooperative_scheduler(
+                state,
+                steps=250,
+                completed_flips=0,
+                instruction_quantum=100,
+            )
+            video = executor.update_cooperative_scheduler(
+                state,
+                steps=275,
+                completed_flips=3,
+                instruction_quantum=100,
+            )
+            resumed = executor.update_cooperative_scheduler(
+                state,
+                steps=425,
+                completed_flips=3,
+                instruction_quantum=100,
+            )
+            forced_after_video = executor.update_cooperative_scheduler(
+                state,
+                steps=450,
+                completed_flips=3,
+                instruction_quantum=100,
+                force_instruction_tick=True,
+            )
+            forced_state = NativeCooperativeSchedulerState()
+            forced_before_video = executor.update_cooperative_scheduler(
+                forced_state,
+                steps=25,
+                completed_flips=0,
+                instruction_quantum=100,
+                force_instruction_tick=True,
+            )
+            retained_cadence = executor.update_cooperative_scheduler(
+                forced_state,
+                steps=100,
+                completed_flips=0,
+                instruction_quantum=100,
+            )
+
+        self.assertEqual(first, (2, 0))
+        self.assertEqual(video, (0, 3))
+        self.assertEqual(resumed, (0, 0))
+        self.assertEqual(forced_after_video, (1, 0))
+        self.assertEqual(forced_before_video, (1, 0))
+        self.assertEqual(retained_cadence, (1, 0))
+
+    def test_native_system_time_service_writes_guest_memory(self) -> None:
+        base_address = 0x1000
+        handler_target = 0x2000
+        output_address = 0x3000
+        call_address = base_address + 5
+        function = lift_x86_function(
+            b"\x68" + struct.pack("<I", output_address)
+            + b"\xE8" + struct.pack("<i", handler_target - (call_address + 5))
+            + b"\xC3",
+            base_address=base_address,
+            symbol="native_system_time_service",
+        )
+        services = NativeHostServiceState(
+            [
+                NativeHostServiceEntry(
+                    handler_target,
+                    NATIVE_HOST_SERVICE_SYSTEM_TIME,
+                    4,
+                    0,
+                )
+            ]
+        )
+        services.system_time_filetime = 0x1122334455667788
+        memory = SparseMemory({0x8000: 0})
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            executor = NativeResumableExecutor(
+                function,
+                build_dir=Path(temp_dir),
+                callback_addresses={handler_target},
+            )
+            state = CpuState.with_registers(eax=0xAABBCCDD, esp=0x8000)
+            returned_to = executor.run(
+                state,
+                memory,
+                call_handlers={handler_target: lambda *_args: None},
+                dispatch_host_calls_in_native=True,
+                native_host_services=services,
+                max_steps=8,
+            )
+
+        self.assertEqual(returned_to, 0)
+        self.assertEqual(state.get_register("eax"), 0xAABBCCDD)
+        self.assertEqual(
+            int.from_bytes(memory.read(output_address, 8), "little"),
+            0x1122334455667788,
         )
 
     def test_memory_predicate_yields_immediately_after_observed_write(self) -> None:
