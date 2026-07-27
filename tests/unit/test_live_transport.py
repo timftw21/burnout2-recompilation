@@ -18,31 +18,20 @@ class LiveControlTransportTests(unittest.TestCase):
                 owner.request_stop()
                 self.assertTrue(guest.stop_requested())
 
-                struct.pack_into(
-                    "<HBBhhhhBBH",
-                    owner._mapping,
-                    live_transport._CONTROLLER_PAYLOAD_OFFSET,
-                    0x1010,
-                    17,
-                    29,
-                    -123,
-                    456,
-                    -789,
-                    1024,
-                    1,
-                    1,
-                    0,
-                )
-                struct.pack_into(
-                    "<I",
-                    owner._mapping,
-                    live_transport._CONTROLLER_SEQUENCE_OFFSET,
-                    2,
+                published_sequence = owner.publish_controller(
+                    buttons=0x1010,
+                    left_trigger=17,
+                    right_trigger=29,
+                    thumb_lx=-123,
+                    thumb_ly=456,
+                    thumb_rx=-789,
+                    thumb_ry=1024,
                 )
                 controller = guest.read_controller(0)
 
                 self.assertIsNotNone(controller)
                 assert controller is not None
+                self.assertEqual(controller.sequence, published_sequence)
                 self.assertEqual(controller.buttons, 0x1010)
                 self.assertEqual(controller.thumb_lx, -123)
                 self.assertEqual(controller.thumb_ry, 1024)
@@ -68,6 +57,19 @@ class LiveControlTransportTests(unittest.TestCase):
                     (123456789, 42),
                 )
 
+                for offset, value in zip(
+                    (236, 240, 244, 248, 252),
+                    (3, 0x5000, 0x6000, 0x7000, 48000),
+                    strict=True,
+                ):
+                    struct.pack_into("<I", owner._mapping, offset, value)
+                diagnostic = guest.diagnostic_state()
+                self.assertEqual(diagnostic["audio_buffer_play_stage"], 3)
+                self.assertEqual(diagnostic["audio_last_buffer"], 0x5000)
+                self.assertEqual(diagnostic["audio_last_data"], 0x6000)
+                self.assertEqual(diagnostic["audio_last_size"], 0x7000)
+                self.assertEqual(diagnostic["audio_last_sample_rate"], 48000)
+
                 self.assertFalse(guest.manifest_available())
                 owner.publish_manifest(
                     {
@@ -77,6 +79,14 @@ class LiveControlTransportTests(unittest.TestCase):
                     }
                 )
                 self.assertTrue(guest.manifest_available())
+                self.assertEqual(
+                    guest.read_manifest(),
+                    {
+                        "resource_snapshots_unchanged": True,
+                        "command_snapshot_path": "commands.bin",
+                        "guest_flip_count": 42,
+                    },
+                )
                 payload_size = struct.unpack_from(
                     "<I",
                     owner._mapping,

@@ -373,7 +373,7 @@ than the previous 10-minute cutoff.
 4. [x] Replace high-frequency JSON/filesystem IPC with a versioned shared-memory command ring, resource slots, fixed control records, and named events.
 5. [x] Keep resources, decoded state, and pipeline state resident; send deltas rather than reload generations.
 6. [x] Bound traces with fixed retention, counters, sampling, and opt-in payload capture.
-7. [x] Move the guest scheduler, ABI dispatch, memory synchronization, and host-service control into native code; converge toward one native process. Normal play now uses one OS process with native multi-call dispatch, resident dirty generations, native cooperative cadence, native measured clock/yield/XInput services, native-owned cold-call ABI continuation, a persistent native worker-lifecycle registry, and an embedded presenter DLL. Python remains the implementation host for cold handles/files, title-specific audio decoding/mix policy, and the tooling oracle, without owning guest return or rebuilding worker state every cadence. SDL3 owns host audio-device and stream management through the embedded presenter library. The synthetic D3D context supplies the GPU service's real NV2A MMIO base, so its idle routine follows modeled PFIFO state under the normal coarse native cadence rather than crossing into Python on every poll. Exact audit tools retain process isolation.
+7. [x] Move the normal-play guest scheduler, ABI dispatch, memory synchronization, reached host services, audio path, and render publication into native code. The migration-acceptance runs record zero Python runtime callbacks and zero frontier-interpreter work through sustained presenter-acknowledged completed flips; see the checkpoint below.
 8. [x] Remove normal-play compilation and retain frontier discoveries for deterministic AOT builds.
 9. [x] Profile with ETW/WPA or Tracy for CPU scheduling/boundaries and RenderDoc or Nsight for Vulkan work. Use custom probes only for questions those tools cannot answer.
    - [x] Add a first-class, contamination-resistant capture workflow. It
@@ -441,6 +441,457 @@ Python is a poor fit for:
 
 Do not rewrite everything at once. Define stable versioned boundaries, then use a strangler migration: native implementations replace individual hot responsibilities while Python remains the oracle/tooling layer until parity tests prove the replacement.
 
+### Python runtime migration checkpoint (2026-07-24)
+
+| Poor-fit path | Status | Evidence / remaining work |
+| --- | --- | --- |
+| Per-slice scheduler and guest loop | Complete for normal play | The resident native coordinator owns the primary context, worker selection/lifecycle, wait/yield transitions, cadence, and stop handling. Warm bounded runs through 91 million guest instructions report zero Python slice yields. |
+| ABI and call dispatch | Complete for normal play | Registered services unwind and return inside the native dispatcher. Warm bounded runs report zero handler calls, zero native cold-host calls, and zero Python runtime ABI invocations. |
+| Dirty-memory synchronization | Complete for normal play | Native page views, dirty lists, byte ranges, generations, and resource ownership stay resident for guest execution. Read/write callback counts are zero; one final dirty writeback is retained only for post-run diagnostic materialization after the guest stops. |
+| Hot Xbox kernel/service paths | Complete for the currently reached normal-play path | Allocation, persistence, AV, worker/semaphore, timing, input, filesystem, offline PHY, and title services reached by the bounded path execute natively. The July 25 title-to-Load/Save path also executes `NtQueryDirectoryFile` natively with deterministic wildcard ordering and a per-handle cursor. The 20-million-instruction run dispatched 16,779 native services with zero Python handlers or memory callbacks. Later address-taken guest targets remain AOT coverage work, not service fallbacks. |
+| Audio callback/data movement | Complete for normal play | Native code owns RWS PCM/ADPCM decode, looping/gain policy, mixing, bounded buffering, and submission to the SDL3 presenter ABI. By 20 million instructions it decoded one music track and two special clips with zero failures and mixed/submitted 12 buffers (115,200 bytes) without Python callbacks. |
+| Runtime native compilation and DLL promotion | Complete for normal play | Live compilation and promotion are disabled in normal execution. Frontier discoveries are diagnostic inputs to the decoded block store and the next AOT build. |
+| High-frequency render transport | Complete for normal play | Native code owns completed-flip detection, command-span publication, every live texture binding required by a completed frame, immutable resource scanning/slots, native frontend-text metadata, named-event wakeups, presentation waits, and the shared control record. Bounded run `e0884dd7-5a27-403f-88c6-a4be1263df12` published and acknowledged 53 exact command/resource generations. The presenter performed 52 incremental reloads, interpreted 9,894 NV2A methods with zero unknown or truncated packets, matched the centered textured draw, and passed render validation on every generation. The July 25 title regression repair added multi-binding resource publication and the `Loading - please wait` binary manifest fields; focused native tests cover both without Python callbacks. |
+
+The former `sample.xsb`/XACT blocker is cleared. Warm normal runs now pass the
+old 8.355-million-instruction semaphore boundary, remain native-clean through
+20 million instructions, and reach roughly 91 million instructions while
+decoding/mixing frontend audio. The primary-thread semaphore wait no longer
+mutates a resumable-worker lifecycle entry. Static AOT closure now includes
+direct calls, direct branches, conditional fallthroughs, and bounded absolute
+IA-32 jump tables; the complete CRT `memcpy` jump-table family has been added to
+the decoded block store.
+
+The `0x00073150` handoff target and the subsequently reached `0x00055970`
+target are now persisted in the decoded block store and consumed by the AOT
+cache. The initial July 25 warm acceptance run had 96 native cache hits, zero
+misses, zero stores, and no compilation. The later render-transport acceptance
+run `e0884dd7-5a27-403f-88c6-a4be1263df12` completed 2 million instructions
+and 53 presentation waits with normal-runtime failure code zero. Python runtime
+ABI, handler, memory read/write, observer, and slice-yield callbacks were all
+zero; the frontier interpreter recorded zero invocations and zero steps, native
+promotion was disabled, and developer live compilation was disabled.
+This closes the Python runtime migration checkpoint for the currently reached
+normal-play path. Later unknown executable targets remain deterministic AOT
+coverage gaps, not permission to restore a runtime fallback.
+
+### Title/render regression checkpoint (2026-07-25)
+
+The manual captures
+`b2-recomp-20260725-121422-615-frame-31-1.bmp` and
+`b2-recomp-20260725-121433-525-frame-662-2.bmp` exposed two transport omissions
+that the previous report incorrectly classified as healthy:
+
+- the native `0x000BF6F0` text-draw service consumed the loading label without
+  publishing its text, placement, size, or color; and
+- live resource publication retained only the last stage-zero texture binding,
+  so the title font survived while the background and Burnout 2 logo resources
+  were absent and sampled white.
+
+The native title service now publishes `Loading - please wait` through fields
+4--8 of the binary manifest, and the resource publisher collects and
+deduplicates every binding referenced by the completed command generation.
+The render-debug report now treats a textured presented draw with no matching
+resource as a critical `presented_texture_resources_missing` translation
+mismatch. A real title generation after the repair contained four draws and
+four texture resources, with no unmatched presented texture draw. This closes
+the source-level render transport regression for normal play.
+
+The first post-title stall was a separate native ABI gap. The scheduler stopped
+at import target `0xE0000510`, ordinal 207, because `NtQueryDirectoryFile` was
+not registered in the native normal service table. Its native implementation
+now owns mask decoding, deterministic case-insensitive wildcard ordering,
+per-handle enumeration position, Xbox `FileDirectoryInformation` records, and
+status/IO-block writes. The focused native test enumerates a file and directory,
+returns `NO_MORE_FILES`, and records zero Python handler calls. Manual execution
+then advanced from the title into Load/Save.
+
+Two later manual boundaries exposed independent native service-lifetime gaps.
+Repeated Load/Save volume probes exhausted the 128-entry native file table
+because `NtClose` marked slots inactive but registration only advanced the
+high-water count. `NtOpenFile("U:\\")` then returned invalid parameter, the
+volume-allocation helper returned zero, and guest `idiv` at `0x000D9496`
+faulted. Closed slots are now reused before the high-water mark advances; a
+focused test performs 140 open/close volume probes with one resident slot,
+zero overflow, and zero Python handlers.
+
+After that repair, manual play advanced through Load/Save and stopped while
+entering the main menu. The fixed live scheduler header captured phase 41 at
+`0xE0000630`, ordinal 253, `PhyInitialize`. The offline PHY shims were still
+generic cold callbacks, which are intentionally unavailable in native normal
+play, so the network worker failed and the frontend waited indefinitely.
+`PhyInitialize` and `PhyGetLinkState` now use native success-result services
+with their existing ABI stack cleanup. Native coverage failures also retain
+their real target and code instead of being replaced by a pending render-span
+observer error. Focused unit coverage passes, and the next manual run confirmed
+the repaired main-menu transition. These service failures do not reopen the
+completed render transport boundary.
+
+That manual run (`41b28351-0200-4b33-a442-5a96dad024ea`) then exposed a level
+loading hang rather than a crash. It retired 1.598 billion guest instructions,
+published 8,460 native render generations, and stopped only when the user
+closed the window. Normal-runtime failure code, worker failures, Python runtime
+callbacks, and title-asset open failures were all zero; 22 title assets totaling
+50,296,036 bytes opened successfully. The regression was in the native asset
+reader introduced by the runtime migration: the older diagnostic path
+validated Track PSS files and published their prelinked image at the absolute
+guest base encoded in the file, while the native service copied bytes only to
+the caller's temporary buffer. Scene and stream descriptor pointers therefore
+continued to reference an unpopulated `0x8381C000` image and the title never
+completed level loading.
+
+The native title-asset service now recognizes source Track PSS paths, validates
+both stream-descriptor tables and all three scene-record tables, allocates the
+encoded guest image range, and publishes the exact file bytes there during the
+first read. Bounded counters and per-stream flags report candidates,
+publication attempts, validation failures, byte counts, descriptor counts,
+scene-record counts, and the encoded image base. The native executor module's
+88 tests pass, including a no-Python Track PSS publication regression, and all
+30 extracted Track PSS files pass the same structural validation.
+
+Manual run `c2607c60-4d55-4560-a305-8cc228b5a01c` advanced beyond the former
+infinite load and then stopped with native transport code 9 at `0x00111040`
+after 146,052,791 guest instructions. Static disassembly identifies that target
+as a valid address-taken callback installed by `0x00111060` and invoked by the
+list walker at `0x00110CE2`; it was absent from the decoded block store, so the
+normal native dispatcher correctly rejected it as an AOT coverage gap. The
+callback is now stored under the supported XBE's exact image identity for the
+next static build. Native code-9 exits also decode and persist an executable
+failure target after execution has stopped, record the result under
+`native_normal_runtime_coverage_gap`, and never interpret, compile, or continue
+that block in the active normal run. Failure reports now retain the Track PSS
+publication counters and per-stream flags as well. Focused coverage and decoded
+block-store tests pass; entering the first level awaits another manual run.
+
+Manual run `17e6fef4-d8b6-462c-8765-762681fd9b2c` then progressed further and
+stopped at address-taken callback `0x00116DD0` after 207,854,878 guest
+instructions. The code-9 post-run path worked as designed: it decoded the
+11-instruction callback for the next AOT build and reported
+`decoded_for_next_aot`. The same failure report proves that two Track PSS
+images totaling 9,568,256 bytes were published with zero validation failures.
+Static inspection found `0x00116DD0` in the callback family rooted at data table
+`0x00347100`; relying on serial runtime discovery would expose the remaining
+members one launch at a time. All 11 exact table targets are now recovered
+during deterministic pre-run artifact preparation, and the local supported-XBE
+store contains every member. Normal execution still performs no live decode,
+interpretation, compilation, or promotion.
+
+Three earlier isolated-process runs also remained visible after their launchers
+had exited. Windows reported all three processes as exited with one retained
+console-wait thread, so normal process termination could not remove them. The
+orphan console and exact retained threads were cleared, and the process list now
+contains no b2_recomp playability process. Isolated/bounded launches now assign
+the guest and presenter to a Windows job with `KILL_ON_JOB_CLOSE`; graceful
+shutdown remains first, while launcher loss closes the job and terminates its
+children. A real disposable-child check verified the kernel behavior. Another
+manual first-level entry remains the acceptance check.
+
+Manual run `93ca18d9-8b28-4d7b-8995-30f670f297c4` progressed to the next
+address-taken level callback, `0x00116C30`, after 146,566,558 guest
+instructions. The post-run coverage recorder persisted that block as
+`decoded_for_next_aot`. Static inspection found that `0x00116D00` installs
+`0x00116C30` into a callback slot and that the adjacent level constructor
+installs the paired callback `0x00116D80`; both targets are now members of the
+deterministic pre-run callback set, and the second block is present in the
+supported-XBE decoded block store. This closes the constructor-installed pair
+without live interpretation or compilation.
+
+The same run exposed a different lifetime bug in embedded normal play. A
+terminal native-runtime failure raised from `NativeResumableExecutor.run`
+before the caller reached `shutdown_normal_runtime`, leaving the native audio
+worker and its loaded presenter audio library alive after the run manifest was
+finalized. That worker kept both the real Python process and the Windows Python
+launcher resident. Terminal native-runtime failures now shut down that state
+before raising while preserving the original failure code, target, and run
+summary. The two retained `live_test.py --skip-host-build` processes from the
+manual run were stopped, and no recomp or playability process remains. Focused
+native failure, callback recovery, launcher, lint, and syntax checks pass; a
+manual first-level entry remains the acceptance check.
+
+Manual run `0c95ccea-a43c-4790-a9ad-6f7ce9b1feba` reached another member of
+the same constructor-installed pattern, `0x001162C0`, after 112,735,050 guest
+instructions. Rather than add its `0x00116270` pair and continue serial
+discovery, pre-run AOT preparation now batches statically stored title-code
+pointers. It scans decoded `.text` instructions for immediate code addresses
+written to memory, rejects targets outside file-backed title code or inside an
+already decoded instruction, validates standalone function boundaries from
+returns/alignment padding, and admits non-aligned entries only from initializer
+tables containing at least three absolute callback slots. Recovery repeats
+after direct-branch and jump-table closure until no new stored callback remains.
+
+The supported-XBE audit found 78 initially uncovered values. It accepted 75
+callback entries and rejected the packed numeric values `0x00020000`,
+`0x00020003`, and `0x00020007`. Their recovered CFG exposed one further stored
+callback, `0x00114310`, in block `0x00114937`. Offline preparation completed in
+two rounds: 76 callback roots plus 3,353 direct-branch/jump-table blocks, all
+3,429 selected blocks decoded and stored successfully. The local decoded block
+store now contains 75,779 records, and a warm rescan finds no remaining
+validated stored-code target. The complete 224-test playability-probe suite,
+the native terminal-failure regression, all 25 launcher tests, Ruff, and syntax
+checks pass. Manual first-level entry remains the acceptance check.
+
+Manual run `398070fe-bc3f-4263-8caf-b65d47d4cdbb` passed the loading screen,
+rendered 1,633 frames, and then stopped with native transport code 9 at
+`0x0023557A` after 129,650,823 guest instructions. The retained stack and
+registers identify the source exactly: DirectSound code at `0x00231195` calls
+vtable slot `+0x20`, the vtable begins at `.rdata` address `0x002C95A4`, and
+that slot contains `0x0023557A`. This is a static DirectSound COM-style method
+table, not another title initializer store.
+
+Pre-run AOT preparation now scans file-backed `.rdata` and `.data` for
+contiguous code-pointer tables. A run must contain at least three entries, at
+least two raw return/alignment-proven function boundaries, and boundary proof
+for at least half of its unique targets; once proven, the whole method family
+is retained so nonstandard thunks are not discovered one crash at a time.
+Static data sections are no longer accepted as code targets by indirect
+jump-table closure merely because their XBE flags include execute, and the
+IA-32 coverage auditor applies the same file-backed code-section boundary.
+
+Offline materialization reached a fixed point with no remaining validated
+stored-code target, static-table member, direct branch, conditional
+fallthrough, or bounded jump-table target. The exact supported-XBE store now
+contains 84,762 records under its single uppercase image hash, includes
+`0x0023557A` and the complete proven DirectSound table families, and passes
+SQLite integrity validation. The complete 226-test playability-probe suite and
+all 25 launcher tests pass, as do Ruff, syntax compilation, and diff checks.
+The uncapped 131,072-block IA-32 audit completed 92,686 code blocks with no
+pending work or traversal cap; its remaining 124 opcode findings are confined
+to XGRPH, XONLINE, and XNET, with no DirectSound finding. No recomp process is
+running. Manual first-level play remains the acceptance check.
+
+Manual run `d73a861b-2387-42e1-8080-881a766beebe` did not reach the
+30-minute startup timeout. The native guest stopped after 476.9 seconds and
+460,446 instructions with transport code 9 at `0x0028C180`; the launcher then
+misreported the terminated guest as "still preparing" and recorded return code
+zero. The failing target is XPP callback slot `+0x04` in the descriptor at
+`0x0028BFE8`, reached by the indirect call at `0x0028C571`. XPP interleaves
+that descriptor family with code in its executable section, so the prior
+`.rdata`/`.data`-only pointer-table scan could not see it.
+
+Static pointer-table recovery now scans every file-backed XBE section while
+still accepting targets only in file-backed executable code; headers and
+zero-fill tails remain excluded. The existing raw return/alignment and family
+density proof admitted 65 uncovered callbacks across the supported image,
+including all nine observed XPP family entries, and their direct branch,
+conditional fallthrough, call, and bounded jump-table closure added 1,377
+blocks. The expanded traversal exposed the CL-count `SHLD` form at
+`0x001206AA`; decoder, diagnostic executor, and native emitter support now
+cover it, adding its final block without exposing another title-code gap.
+
+Offline preparation reached a fixed point after two rounds. The exact-XBE
+decoded block store contains 86,215 records under one uppercase image hash,
+contains `0x0028C180` and all eight previously uncovered XPP siblings, and
+passes SQLite integrity validation. The uncapped audit now visits 94,038 blocks
+and 572,792 instructions with no pending work or traversal cap; its 124
+remaining findings are again confined to XGRPH, XONLINE, and XNET. The probe
+now returns failure for fatal entry/thread execution, and both embedded and
+process launchers describe a pre-first-frame exit as an exit and coerce a
+zero-code/no-frame termination to failure. All 255 playability-probe and
+launcher tests plus all 63 IA-32 recomp tests pass, along with Ruff, syntax,
+and diff checks. No gameplay process was launched during this repair; manual
+first-level entry remains the acceptance check.
+
+Manual run `8e494bc6-ae4f-40f8-a15a-401f7c3d9d1f` correctly reported a
+pre-first-frame failure after 280.0 seconds and 466,281 guest instructions:
+native transport code 9 at XPP target `0x0028D945`. The retained XBE bytes show
+the complete source edge. XPP code at `0x0028C2C4` pushes `0x0028D945` as stack
+argument 3 to the CRT vector-constructor helper at `0x000134D0`; that helper
+loads the argument and invokes it through `call ebx`. The target is an element
+constructor beginning immediately after a sized return. It is neither an
+aligned static table entry nor a `mov`-installed callback, so neither existing
+address-taken recovery path could seed it.
+
+AOT preparation now models the proven CRT helper ABI directly. For each direct
+call to a declared stack-callback consumer, it traces a bounded same-block push
+sequence without crossing a stack mutation or control transfer, selects the
+declared callback argument, requires an immediate file-backed executable
+target and a raw function boundary, then includes that target in the same
+callback/CFG fixed point as stored pointers and static tables. Removing
+`0x0028D945` from the known-function set makes this analysis recover exactly
+`0x0028D945`; with the block present, the warm rescan has zero stored, table,
+or stack-callback candidates.
+
+A deliberately broader push-immediate experiment was rejected: executable Xbox
+library sections also contain strings and packed data passed to APIs, so a raw
+boundary-looking value alone is insufficient. Its 6,268 generated records were
+removed from the local store after an SQLite backup, preserving only the
+user-run `0x0028D945` capture. The exact-XBE store now contains 86,216 records
+under one uppercase hash and passes integrity validation. The uncapped audit
+visits 94,039 blocks and 572,798 instructions with no pending work or traversal
+cap; the same 124 findings remain confined to XGRPH, XONLINE, and XNET. All 320
+combined probe, launcher, IA-32, and compiled-native regressions pass, along
+with Ruff, syntax, and diff checks. No recomp process is running. Manual
+first-level entry remains the acceptance check.
+
+Manual run `d3a7cfcb-c4ab-4385-a33e-a1f57ee0032e` advanced preparation into
+the embedded presenter, then stopped after 65.5 seconds and 2,398,950 guest
+instructions with native transport code 9 at `0x000AE2B0`. The run correctly
+persisted that exact nine-instruction block for the next static build. The
+retained title code identifies a broader source family: the call at
+`0x000AE2FA` passes `0x000AE2B0` as stack argument 1 to `0x000FD810`, whose
+body loads argument 1 and invokes it indirectly as a visitor callback.
+
+The decoded title contains exactly three direct calls to that linked-list
+iterator. Their complete callback family is `0x000AE2B0`, `0x000AE310`, and
+`0x000FDC40`. AOT preparation now declares the proven `0x000FD810` argument-1
+callback ABI alongside the existing CRT vector-constructor contract. The same
+strict proven-consumer, stack-safe push-trace, immediate executable target, and
+raw-boundary checks therefore recover every visitor before native execution;
+no generic immediate or runtime compilation fallback was added.
+
+Offline materialization added the two unobserved sibling callbacks and seven
+direct branch/fallthrough blocks in their CFG closure. The exact-XBE store now
+contains 86,226 records under one uppercase image hash, has SHA-256
+`2CDDE6C1656C966E8FD79352DADC9D8D0C2E025811E233DB699623582C288C46`,
+and passes SQLite integrity validation. A warm analysis has zero stored,
+static-table, or stack-callback candidates. The uncapped 131,072-block audit
+visits 94,049 blocks and 572,863 instructions with no pending work or traversal
+cap; its unchanged 124 findings remain confined to XGRPH, XONLINE, and XNET.
+All 320 combined regressions pass, along with Ruff and syntax checks. No recomp
+process was launched or left running. Manual first-level entry remains the
+acceptance check.
+
+Manual run `a74436af-56dc-43b5-844f-5c6f2a4b65a3` passed the frontend and
+level loading path, then stopped after 98.8 seconds and 110,258,745 guest
+instructions with native transport code 9 at `0x000B2370`. The user's reported
+two-run sequence is consistent with the retained evidence: after the prior
+86,226-record checkpoint, the failed runs persisted 39 exact and dependent
+blocks, so the second preparation emitted additional native DLLs and advanced
+past the first run's main-menu boundary. This is correct static persistence,
+but it exposed that address-taken family recovery was still incomplete.
+
+The exact source edge at `0x000B261B` passes `0x000B2370` as explicit stack
+argument 2 to the spatial-query consumer at `0x0008F3D0`. That consumer invokes
+argument 2 through `call [ebp+0x10]` at `0x0008FAE5`. Its callers interleave
+floating-point and register work between argument pushes, so the earlier
+contiguous-push requirement could not identify them. All six raw direct
+callsites resolve to the five-member visitor family `0x00078B90`, `0x00083470`,
+`0x00092EE0`, `0x0009B180`, and `0x000B2370`; the middle two were entirely
+absent from AOT coverage.
+
+Declared-consumer recovery now permits intervening instructions only while
+walking the same linear block and preserving the CPU stack. It stops at calls,
+branches, returns, stack-pointer writes or exchanges, pops, and non-argument
+push forms, and remains bounded to 64 instructions. This admits the proven
+spatial-query ABI without accepting generic code-looking immediates. Offline
+materialization added both missing siblings plus seven branch/fallthrough
+blocks in their CFG closure. The warm stored-pointer, static-table, and declared
+stack-callback scans are all empty.
+
+The exact-XBE store now contains 86,274 records under one uppercase image hash,
+has SHA-256
+`3AE02F5F93ECB9E904711A92E11D0476B9B01AF240D9C9297AC4D4AC5CBDADF2`,
+and passes SQLite integrity validation. The uncapped 131,072-block audit visits
+94,105 blocks and 574,012 instructions with no pending work or traversal cap;
+its unchanged 124 findings remain confined to XGRPH, XONLINE, and XNET. The
+321-test combined probe, launcher, IA-32, and compiled-native suite passes,
+including positive interleaved-push recovery and stack-mutation rejection
+regressions. Ruff, syntax, and diff checks also pass. No recomp process was
+launched or left running. Manual first-level play remains the acceptance check.
+
+Manual run `70eae22e-991e-4449-81c8-b1a57ec848b9` advanced to 291,386,955
+guest instructions before native transport code 9 at `0x000B22A0`. The source
+edge at `0x000B283B` passes that target as explicit stack argument 2 to the
+spatial-collision consumer at `0x00090420`; the consumer invokes argument 2 at
+`0x0009059E`. All 13 raw direct callsites resolve to the four-member visitor
+family `0x00056EA0`, `0x0005EBE0`, `0x000A3FB0`, and `0x000B22A0`.
+`0x000A3FB0` was the uncompiled sibling, while the failed run had persisted
+only the exact `0x000B22A0` entry.
+
+AOT preparation now declares the proven `0x00090420` argument-2 ABI and feeds
+its complete family through the existing stack-safe callback/CFG fixed point.
+Offline materialization added `0x000A3FB0` plus eleven dependent blocks,
+including the complete branch/fallthrough closure of the persisted
+`0x000B22A0` entry. Warm stored-pointer, static-table, and declared
+stack-callback scans are all empty; no interpreter or live-compilation fallback
+was added.
+
+The same run confirmed the reported frame-rate error. The presenter produced
+1,293 host frames over 21.549 seconds at an average 16.666 ms per frame, but
+performed 2,435 live reloads. It consumed one publication at the top of the
+60 Hz loop and a second while waiting for the frame deadline, acknowledging and
+releasing almost two guest flips for every displayed frame. The deadline wait
+now only sleeps; publication ingestion and acknowledgement occur once at the
+next 16.667 ms loop boundary. Normal guest simulation/output is therefore
+capped at 60 FPS without changing Vulkan FIFO presentation or diagnostic audit
+semantics.
+
+The exact-XBE store now contains 86,287 records under one uppercase image hash,
+has SHA-256
+`3E1786C553A84B853FEAE597B8BEDCC575DE8288B08EF7A5F944D3CD0E473275`,
+and passes SQLite integrity validation. The uncapped 131,072-block audit visits
+94,118 blocks and 574,142 instructions with no pending work or traversal cap;
+its unchanged 124 findings remain confined to XGRPH, XONLINE, and XNET. All
+391 relevant Python regressions and all 10 release native tests pass. The local
+presenter executable/library were rebuilt without launching gameplay, and
+manifest build
+`6CB8464743FBA5A81E7E7ADF55F3F9F15E3943218482F969CB5B5EC118352E6F`
+validates. Manual first-level play and the observed FPS counter remain the
+acceptance checks.
+
+Manual run `fc0243ad-2d48-4288-8b02-b3192a859d8d` reached the first level's
+How to Play card and remained there until the window was closed. The run
+published 1,539 guest flips, retained a healthy exact F12 render snapshot, and
+stopped through `native_runtime_stop` with failure code zero. Controller input
+also continued to reach the guest. The frozen render-debug suite reported no
+geometry, command, resource, or presentation finding, so the retained card was
+not a render-transport regression.
+
+The native scheduler evidence instead showed 2,728,218 worker resumes and
+4,593,130,040 worker instructions without a completion. Static stack unwind
+placed the active worker in the `Sleep(0)` poll reached from the DirectSound
+failure-cleanup callsite at `0x001079DB`; the retained status word was still
+`1`, or playing. The recovered stop path submits an MCPX voice command, can
+mark the voice pending with bit `0x8000`, and expects the hardware completion
+path to clear pending/playing state. The native runtime never delivered that
+transition. The recovered status method reports playing for either active low
+state `0x0003` or pending/allocated mask `0x8001`; the first report did not
+retain the dynamic voice word needed to distinguish them.
+
+The AOT native fast-path table now models that missing audio-hardware boundary
+at the actual loop header `0x00107080`. It activates only after a stop was
+submitted for a valid DirectSound voice satisfying either exact playing
+predicate, clears only the 16-bit pending (`0x8000`) and playing (`0x0002`)
+bits, and resumes at `0x00107086`. The guest still executes its own `Sleep(0)`,
+status query, branch, and finalizer through `0x001070AA`; the generic
+DirectSound status method is not replaced.
+
+Manual run `84b2268a-9f6a-40af-98d5-3243c59cf15c` proved why the initial
+active-state-only guard was insufficient. It rebuilt three AOT modules, listed
+the `0x00107080` fast path in native diagnostics, but recorded zero invocations
+while the same worker stack retained status `1`. Because the same valid voice
+had failed the active-state predicate, the recovered GetStatus logic uniquely
+selects its other playing case, pending/allocated mask `0x8001`. The run
+published 1,910 flips and stopped cleanly only on the user's close after
+925,376,739 primary and 10,385,716,473 worker instructions; there were zero
+worker failures and normal-runtime failure code zero.
+
+The guard now mirrors both recovered GetStatus predicates. Focused native
+coverage verifies `0x8003` active/pending and `0x8001` pending-only voices both
+transition to stopped state `0x0001`, preserves adjacent bytes, and leaves an
+already stopped voice untouched. The combined native-executor and playability
+probe suite passes all 321 tests. No gameplay process was launched during the
+repair; passing the How to Play boundary remains the manual acceptance check.
+
+The later retained snapshot at public `IDirectSoundBuffer::Play` wrapper
+`0x0022D896` exposed a separate ownership error: the native audio observer
+mirrored the request and then forwarded into the original Xbox SDK hardware
+body. Static recovery proves the wrapper's full ABI. It subtracts `0x1C` from
+the public interface pointer, the internal method at `0x0022C90E` loads the
+voice from object offset `0x20` (public offset `+4`), the voice core at
+`0x00235136` establishes allocated/playing state at voice offset `0x12`, and
+the wrapper returns with `ret 0x10`.
+
+Normal play now terminates `Play` in the native service dispatcher. The service
+updates that exact 16-bit guest voice state while preserving adjacent bytes,
+clears the pending MCPX bit because no guest hardware transaction remains,
+returns `S_OK`, performs the existing 16-byte cleanup, and never makes the
+original body dispatchable. Null objects return `E_FAIL`; host decode or SDL
+output failures remain diagnostics rather than guest ABI failures. Focused
+compiled regressions prove the SDK sentinel result is unreachable, and all 103
+native-executor tests pass. Manual first-level progression beyond run
+`aadc8980-d227-4793-a39b-2d7df3515a86` remains the acceptance check.
+
 ## Should SDL3 do more than controllers?
 
 **Yes, selectively.** SDL3 should own the ordinary platform layer after the presenter is modularized:
@@ -463,9 +914,10 @@ creation/lifecycle, the event pump, keyboard and gamepad state/hot-plugging,
 presenter hotkeys, Vulkan extension discovery, and surface creation. Direct
 Vulkan intentionally continues to own the renderer. SDL3 now also owns the
 default playback device, audio stream, bounded native queue, reset, and
-shutdown through exported presenter-library functions. Python retains the
-title-specific RenderWare PCM/ADPCM decoding, application gain, looping, and
-software mix policy; the former `ctypes` WinMM sink has been removed.
+shutdown through exported presenter-library functions. The native normal
+runtime now owns title-specific RenderWare PCM/ADPCM decoding, application
+gain, looping, software mixing, and PCM submission; the former Python
+`ctypes` WinMM sink and Python mix path have been removed from normal play.
 
 Relevant SDL documentation:
 
@@ -673,29 +1125,29 @@ Title-specific code should live behind explicit hooks with names, evidence, supp
   captures deliberately materialize standalone files.
 - [x] Converge the shipping runtime toward one native process. Normal unbounded
   gameplay uses one OS process; bounded and exact audit tools retain isolation.
-- [x] Move scheduler, dispatch, memory synchronization, and hot host services out
-  of Python.
-  - [x] Keep normal guest/ABI continuation in one native dispatch session,
-    retain dirty pages across safe boundaries with native write generations,
-    and reduce steady Python scheduling to exact flip yields plus a coarse
-    safety heartbeat.
-  - [x] Move measured clock/yield/title-XInput service bodies and cooperative
-    cadence into the native dispatcher; fold the presenter into the normal
-    gameplay process.
-  - [x] Route cold runtime calls through the native service table with
-    native-owned ABI continuation, and move worker discovery, runnable
-    selection, and lifecycle transitions into a persistent native registry.
-    Python retains cold host implementations and executes selected worker
-    bodies without rebuilding lifecycle state every cadence.
+- [x] Move the normal scheduler, dispatch, memory synchronization, and reached
+  host-service path out of Python.
+  - [x] Keep normal guest/ABI continuation in one native dispatch session and
+    retain dirty pages and generations across native service/presentation
+    boundaries. Python only prepares and validates artifacts and materializes
+    post-run diagnostics.
+  - [x] Own measured clock/yield/title-XInput service bodies, cooperative
+    cadence, and the presenter in the normal native gameplay process. Bounded
+    and exact audit tools deliberately retain isolated diagnostic processes.
+  - [x] Route reached cold runtime calls through the native service table with
+    native ABI continuation, persistent worker discovery/selection/lifecycle,
+    and zero normal-run Python callbacks. A later unknown target remains an AOT
+    coverage gap; a later missing service requires another native body.
   - [x] Seed the synthetic D3D context's NV2A service pointer with the title's
     `0xFD000000` MMIO base. The real native idle routine now observes modeled
     PFIFO status and returns under normal slice cadence; the temporary per-poll
     yield and forced worker tick were removed after bounded live sampling showed
     they amplified the bad zero pointer instead of scheduling useful work.
 - [x] Make live compilation developer-only and persist discoveries for AOT.
-  Normal runs interpret newly decoded frontiers and retain them in the SQLite
-  decoded-block store for the next native build; background DLL promotion now
-  requires `--developer-live-compile`.
+  Normal runs require ahead-of-time decoded coverage and do not interpret or
+  promote unknown blocks. Explicit diagnostic discovery may record a frontier
+  in the SQLite decoded block store for the next deterministic native build;
+  DLL promotion requires `--developer-live-compile`.
 
 ### P3: professionalize the project
 

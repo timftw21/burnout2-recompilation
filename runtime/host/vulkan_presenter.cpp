@@ -34,6 +34,8 @@ int VulkanPresenter::run() {
                 options_.cpu_texture_conversion ? "cpu" : "gpu")},
             {"presentation_pipeline_depth", std::to_string(
                 options_.presentation_pipeline_depth)},
+            {"guest_frame_rate_limit_hz", std::to_string(
+                kTargetGuestFrameRateHz)},
         });
 
     if (options_.analyze_render_stream_only) {
@@ -1964,66 +1966,59 @@ void VulkanPresenter::sleep_until_frame_deadline(
 
 void VulkanPresenter::wait_for_frame_deadline(
     std::chrono::steady_clock::time_point deadline) {
-    if (!options_.live_render_stream
-        || (presentation_ack_path_.empty() && !transport_.active())) {
+    const auto now = std::chrono::steady_clock::now();
+    if (deadline <= now
+        || !publication_event_
+        || options_.presentation_pipeline_depth != 2u) {
         sleep_until_frame_deadline(deadline);
         return;
     }
-    if (publication_event_) {
-        const auto now = std::chrono::steady_clock::now();
-        if (deadline <= now) {
-            return;
-        }
-        if (!frame_pacing_timer_) {
-            frame_pacing_timer_ = CreateWaitableTimerExW(
-                nullptr,
-                nullptr,
-                kHighResolutionWaitableTimerFlag,
-                TIMER_ALL_ACCESS);
-        }
-        if (frame_pacing_timer_) {
-            const int64_t remaining_ns = std::chrono::duration_cast<
-                std::chrono::nanoseconds>(deadline - now).count();
-            LARGE_INTEGER due_time{};
-            due_time.QuadPart = -std::max<int64_t>(
-                1,
-                (remaining_ns + 99) / 100);
-            if (SetWaitableTimerEx(
-                    frame_pacing_timer_,
-                    &due_time,
-                    0,
-                    nullptr,
-                    nullptr,
-                    nullptr,
-                    0)) {
-                const HANDLE waits[] = {
-                    frame_pacing_timer_,
-                    publication_event_,
-                };
-                const DWORD result = WaitForMultipleObjects(
-                    2, waits, FALSE, INFINITE);
-                if (result == WAIT_OBJECT_0 + 1u) {
-                    reload_live_render_work(true);
-                    sleep_until_frame_deadline(deadline);
-                }
-                if (result == WAIT_OBJECT_0 || result == WAIT_OBJECT_0 + 1u) {
-                    return;
-                }
-            }
-        }
+    if (!frame_pacing_timer_) {
+        frame_pacing_timer_ = CreateWaitableTimerExW(
+            nullptr,
+            nullptr,
+            kHighResolutionWaitableTimerFlag,
+            TIMER_ALL_ACCESS);
     }
-    // A normal live guest waits for acknowledgement of every exact flip.
-    // Poll the tiny manifest while this frame is otherwise idle so command
-    // ingestion overlaps presentation rather than serializing an entire
-    // 16.7 ms host interval ahead of the guest's next frame computation.
-    constexpr auto poll_interval = std::chrono::milliseconds(1);
-    while (running_) {
-        reload_live_render_work();
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) {
-            return;
-        }
-        sleep_until_frame_deadline(std::min(deadline, now + poll_interval));
+    if (!frame_pacing_timer_) {
+        sleep_until_frame_deadline(deadline);
+        return;
+    }
+    const int64_t remaining_ns = std::chrono::duration_cast<
+        std::chrono::nanoseconds>(deadline - now).count();
+    LARGE_INTEGER due_time{};
+    due_time.QuadPart = -std::max<int64_t>(
+        1,
+        (remaining_ns + 99) / 100);
+    if (!SetWaitableTimerEx(
+            frame_pacing_timer_,
+            &due_time,
+            0,
+            nullptr,
+            nullptr,
+            nullptr,
+            0)) {
+        sleep_until_frame_deadline(deadline);
+        return;
+    }
+    const std::array<HANDLE, 2> waits{
+        publication_event_,
+        frame_pacing_timer_,
+    };
+    const DWORD result = WaitForMultipleObjects(
+        static_cast<DWORD>(waits.size()),
+        waits.data(),
+        FALSE,
+        INFINITE);
+    if (result == WAIT_OBJECT_0) {
+        // The native producer has its own 60 Hz deadline pacer. Consuming one
+        // completed publication while this frame is idle removes the
+        // one-missed-probe penalty without allowing a second guest flip in
+        // the same displayed-frame interval.
+        reload_live_render_work(true);
+        sleep_until_frame_deadline(deadline);
+    } else if (result != WAIT_OBJECT_0 + 1u) {
+        sleep_until_frame_deadline(deadline);
     }
 }
 

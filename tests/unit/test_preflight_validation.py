@@ -55,7 +55,7 @@ def _render_stream(
     if linear:
         words.extend(
             (
-                (1 << 18) | 0x1B18,
+                (1 << 18) | 0x1B1C,
                 (resource_width << 16) | resource_height,
             )
         )

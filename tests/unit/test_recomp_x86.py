@@ -125,6 +125,29 @@ class X86RecompPrototypeTests(unittest.TestCase):
         self.assertIn("const uint32_t source = ctx->edx;", generated)
         self.assertIn("ctx->flags.cf", generated)
 
+    def test_shld_cl_form_executes_observed_address_taken_path(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex("0FA5C2C3"),
+            base_address=0x001206AA,
+            symbol="shld_cl_observed",
+        )
+
+        self.assertEqual(function.instructions[0].text(), "shld edx, eax, cl")
+        result = execute_lifted_function(
+            function,
+            state=CpuState.with_registers(
+                eax=0x80000000,
+                ecx=2,
+                edx=0x40000000,
+                esp=0x8000,
+            ),
+            memory=SparseMemory({0x8000: 0xDEADC0DE}),
+        )
+
+        self.assertEqual(result.state.get_register("edx"), 2)
+        self.assertTrue(result.state.flags.cf)
+        self.assertIn("ctx->ecx & 0xffu", emit_cpp(function))
+
     def test_byte_one_operand_imul_writes_ax_and_overflow_flags(self) -> None:
         function = lift_x86_function(
             bytes.fromhex("F6EBC3"),

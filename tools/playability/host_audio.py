@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import io
+import atexit
 import array
 import ctypes
+import io
 import os
 import queue
 import struct
@@ -87,9 +88,13 @@ class _SdlAudioSink:
         self._clear = self._library.b2r_audio_clear
         self._clear.argtypes = []
         self._clear.restype = ctypes.c_int
+        self._close_audio = self._library.b2r_audio_close
+        self._close_audio.argtypes = []
+        self._close_audio.restype = None
         self._queued_bytes = self._library.b2r_audio_queued_bytes
         self._queued_bytes.argtypes = []
         self._queued_bytes.restype = ctypes.c_uint64
+        self._closed = False
         if not self._open():
             raise RuntimeError("SDL3 audio device initialization failed")
 
@@ -105,7 +110,15 @@ class _SdlAudioSink:
             raise RuntimeError("SDL3 audio queue reset failed")
 
     def queued_bytes(self) -> int:
+        if self._closed:
+            return 0
         return int(self._queued_bytes())
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._close_audio()
 
 
 def parse_rws_pcm(payload: bytes) -> list[PcmClip]:
@@ -154,7 +167,12 @@ def parse_rws_pcm(payload: bytes) -> list[PcmClip]:
     return clips
 
 
-def parse_rws_xbox_adpcm(payload: bytes, *, channels: int = 2) -> PcmClip:
+def parse_rws_xbox_adpcm(
+    payload: bytes,
+    *,
+    channels: int = 2,
+    substream_index: int = 0,
+) -> PcmClip:
     """Decode a RenderWare 0x80D streamed Xbox IMA-ADPCM track to PCM16."""
 
     if channels <= 0:
@@ -176,8 +194,11 @@ def parse_rws_xbox_adpcm(payload: bytes, *, channels: int = 2) -> PcmClip:
         raise ValueError("invalid streamed RWS data chunk")
 
     sample_rate = _find_streamed_sample_rate(payload[header_offset:data_offset])
-    encoded = _strip_stream_packet_headers(
-        payload[data_offset + 12:data_offset + 12 + data_size]
+    encoded = _extract_streamed_substream(
+        payload,
+        data_offset=data_offset,
+        data_size=data_size,
+        substream_index=substream_index,
     )
     block_align = 36 * channels
     if len(encoded) % block_align:
@@ -209,25 +230,64 @@ def parse_rws_xbox_adpcm(payload: bytes, *, channels: int = 2) -> PcmClip:
     return PcmClip(sample_rate, channels, 16, bytes(output))
 
 
-def _strip_stream_packet_headers(payload: bytes) -> bytes:
-    """Remove the observed 48-byte headers between 0x10800-byte RWS packets."""
+def _extract_streamed_substream(
+    payload: bytes,
+    *,
+    data_offset: int,
+    data_size: int,
+    substream_index: int,
+) -> bytes:
+    """Extract one substream using the packet layout declared by the RWS header."""
 
-    first_audio_size = 0x10818
-    packet_header_size = 0x30
-    later_audio_size = 0x107D0
-    if len(payload) <= first_audio_size:
-        return payload
-    output = bytearray(payload[:first_audio_size])
-    offset = first_audio_size
-    while offset < len(payload):
-        offset += packet_header_size
-        if offset >= len(payload):
+    def u32(offset: int) -> int:
+        if offset < 0 or offset + 4 > data_offset:
+            raise ValueError("truncated streamed RWS packet layout")
+        return struct.unpack_from("<I", payload, offset)[0]
+
+    if data_offset < 0x9C:
+        raise ValueError("streamed RWS packet layout is missing")
+    substream_count = u32(0x40)
+    packet_size = u32(0x4C)
+    if not 1 <= substream_count <= 8 or packet_size == 0:
+        raise ValueError("invalid streamed RWS packet layout")
+    if not 0 <= substream_index < substream_count:
+        raise ValueError("streamed RWS substream index is out of range")
+
+    descriptors: list[tuple[int, int, int]] = []
+    for offset in range(0x80, data_offset - 0x1C + 1, 4):
+        flags, span, _, format_flags, _, audio_size, packet_offset = (
+            struct.unpack_from("<7I", payload, offset)
+        )
+        if (
+            flags == 7
+            and format_flags == 0x00040004
+            and 0 < span <= packet_size
+            and 0 < audio_size <= span
+            and packet_offset < packet_size
+            and packet_offset + span <= packet_size
+        ):
+            descriptors.append((packet_offset, span, audio_size))
+    descriptors.sort()
+    if len(descriptors) != substream_count:
+        raise ValueError("streamed RWS substream descriptors are invalid")
+
+    packet_offset, _, audio_size = descriptors[substream_index]
+    declared_size = u32(0x98 + substream_index * 4)
+    data = payload[data_offset + 12:data_offset + 12 + data_size]
+    output = bytearray()
+    for packet_start in range(0, len(data), packet_size):
+        audio_start = packet_start + packet_offset
+        if audio_start >= len(data):
             break
-        audio_end = min(len(payload), offset + later_audio_size)
-        output.extend(payload[offset:audio_end])
-        offset = audio_end
-    # A terminal packet header can leave no audio or a partial ADPCM block.
-    return bytes(output[:len(output) - (len(output) % 72)])
+        audio_end = min(len(data), audio_start + audio_size)
+        output.extend(data[audio_start:audio_end])
+        if len(output) >= declared_size:
+            del output[declared_size:]
+            break
+
+    if not output:
+        raise ValueError("streamed RWS substream contains no complete ADPCM blocks")
+    return bytes(output)
 
 
 def _find_streamed_sample_rate(header: bytes) -> int:
@@ -316,6 +376,10 @@ class SdlPcmOutput:
         self.looping = False
         self._queue: queue.Queue[_QueuedPlayback] = queue.Queue(maxsize=max(1, queue_depth))
         self._sink: _SdlAudioSink | None = None
+        self._shutdown = threading.Event()
+        self._worker_thread: threading.Thread | None = None
+        self._atexit_registered = False
+        self._closed = False
         if not self.available:
             return
         try:
@@ -324,11 +388,14 @@ class SdlPcmOutput:
             self.available = False
             self.error_count += 1
             return
-        threading.Thread(
+        self._worker_thread = threading.Thread(
             target=self._worker,
             name="b2-recomp-audio",
             daemon=True,
-        ).start()
+        )
+        self._worker_thread.start()
+        atexit.register(self.close)
+        self._atexit_registered = True
 
     def submit_pcm(
         self,
@@ -368,14 +435,39 @@ class SdlPcmOutput:
     def stop(self) -> None:
         if not self.available:
             return
+        self._enqueue_control(_QueuedPlayback(b"", False))
+
+    def close(self) -> None:
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        if getattr(self, "_atexit_registered", False):
+            atexit.unregister(self.close)
+            self._atexit_registered = False
+        shutdown = getattr(self, "_shutdown", None)
+        if shutdown is not None:
+            shutdown.set()
+        if getattr(self, "available", False):
+            self._enqueue_control(_QueuedPlayback(b"", False))
+        worker = getattr(self, "_worker_thread", None)
+        if worker is not None and worker is not threading.current_thread():
+            worker.join()
+        sink = getattr(self, "_sink", None)
+        if sink is not None:
+            sink.close()
+            self._sink = None
+        self.available = False
+        self.looping = False
+
+    def _enqueue_control(self, request: _QueuedPlayback) -> None:
         try:
-            self._queue.put_nowait(_QueuedPlayback(b"", False))
+            self._queue.put_nowait(request)
         except queue.Full:
             try:
                 self._queue.get_nowait()
             except queue.Empty:
                 pass
-            self._queue.put_nowait(_QueuedPlayback(b"", False))
+            self._queue.put_nowait(request)
 
     def _worker(self) -> None:
         loop_payload = b""
@@ -383,8 +475,12 @@ class SdlPcmOutput:
         one_shots: list[tuple[bytes, int]] = []
         chunk_samples = 2400 * 2  # 50 ms at 48 kHz stereo.
         while True:
+            if self._shutdown.is_set():
+                return
             if not loop_payload and not one_shots:
                 request = self._queue.get()
+                if self._shutdown.is_set():
+                    return
                 prepared_payload = _prepare_queued_playback(request)
                 if request.loop:
                     loop_payload = prepared_payload
@@ -412,6 +508,9 @@ class SdlPcmOutput:
                     loop_cursor = 0
                 else:
                     one_shots.append((_prepare_queued_playback(request), 0))
+
+            if self._shutdown.is_set():
+                return
 
             mixed = [0] * chunk_samples
             if loop_payload:

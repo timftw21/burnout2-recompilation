@@ -678,6 +678,15 @@ class SparseMemory:
         """Return the address used to key native page-cache entries."""
         return _u32(address)
 
+    def native_resident_page_indices(self) -> tuple[int, ...]:
+        """Return materialized pages that native execution must inherit."""
+        return tuple(self._pages)
+
+    def native_page_snapshot(self, page_address: int) -> bytes:
+        """Materialize one native cache page without invoking read hooks."""
+        page = self._pages.get(_u32(page_address) >> self._PAGE_BITS)
+        return bytes(page) if page is not None else bytes(self._PAGE_SIZE)
+
     def page_generation(self, address: int) -> int:
         return self._page_generations.get(_u32(address) >> self._PAGE_BITS, 0)
 
@@ -1806,7 +1815,7 @@ class X86Decoder:
                         rm_operand,
                     ),
                 )
-            if second in {0xA4, 0xAC, 0xAD}:
+            if second in {0xA4, 0xA5, 0xAC, 0xAD}:
                 if operand_size != 32:
                     raise X86DecodeError(
                         f"unsupported 0F {second:02X} operand size at {_hex32(address)}"
@@ -1816,14 +1825,14 @@ class X86Decoder:
                     offset,
                     operand_size=operand_size,
                 )
-                if second == 0xAD:
+                if second in {0xA5, 0xAD}:
                     count_operand = Operand.register("cl", size=8)
                 else:
                     count = self._read_u8(code, offset)
                     offset += 1
                     count_operand = Operand.immediate_u32(count)
                 return inst(
-                    "shld" if second == 0xA4 else "shrd",
+                    "shld" if second in {0xA4, 0xA5} else "shrd",
                     (
                         rm_operand,
                         Operand.register(
@@ -5504,12 +5513,20 @@ class CppEmitter:
         resumable: bool = False,
         observer_addresses: Iterable[int] = (),
         callback_addresses: Iterable[int] = (),
+        forwarded_callback_addresses: Iterable[int] = (),
         native_fast_paths: Mapping[int, NativeFastPath] | None = None,
         synchronize_eip_for_callbacks: bool = False,
     ) -> str:
         self._resumable = resumable
         self._observer_addresses = {_u32(address) for address in observer_addresses}
         self._callback_addresses = {_u32(address) for address in callback_addresses}
+        self._forwarded_callback_addresses = {
+            _u32(address) for address in forwarded_callback_addresses
+        }
+        if not self._forwarded_callback_addresses <= self._callback_addresses:
+            raise ValueError(
+                "forwarded callback addresses must also be callback addresses"
+            )
         self._native_fast_paths = {
             _u32(address): fast_path
             for address, fast_path in (native_fast_paths or {}).items()
@@ -5579,6 +5596,7 @@ class CppEmitter:
             "    uint32_t fault_code;",
             "    uint32_t fault_eip;",
             "    uint32_t module_exit_reason;",
+            "    uint32_t callback_bypass_target;",
             "    uint64_t steps;",
             "    uint64_t step_budget;",
             "    bool yield_requested;",
@@ -5588,6 +5606,11 @@ class CppEmitter:
             "    void (*write_u32)(void*, uint32_t, uint32_t);",
             "    uint8_t (*read_u8)(void*, uint32_t);",
             "    void (*write_u8)(void*, uint32_t, uint8_t);",
+            "    void* native_memory_user;",
+            "    bool (*native_read_u32)(void*, uint32_t, uint32_t*);",
+            "    bool (*native_write_u32)(void*, uint32_t, uint32_t);",
+            "    bool (*native_read_u8)(void*, uint32_t, uint8_t*);",
+            "    bool (*native_write_u8)(void*, uint32_t, uint8_t);",
             "    void (*call)(void*, uint32_t, B2RContext*);",
             "    void (*observe)(void*, B2RContext*);",
             "    uint8_t** read_pages;",
@@ -5780,10 +5803,21 @@ class CppEmitter:
             "static inline uint8_t b2r_read_u8(B2RContext* ctx, uint32_t address) {",
             "    const uint32_t cache_address = b2r_cache_address(ctx, address);",
             "    const uint32_t page = cache_address >> 12u;",
+            "    const bool requires_callback =",
+            "        b2r_requires_read_memory_callback(ctx, address, 1u);",
             "    if (ctx->read_pages != nullptr &&",
             "        ctx->read_pages[page] != nullptr &&",
-            "        !b2r_requires_read_memory_callback(ctx, address, 1u)) {",
+            "        !requires_callback) {",
             "        return ctx->read_pages[page][cache_address & 0xfffu];",
+            "    }",
+            "    uint8_t native_value = 0u;",
+            "    const bool page_miss = ctx->read_pages == nullptr ||",
+            "        ctx->read_pages[page] == nullptr;",
+            "    if ((requires_callback || page_miss) &&",
+            "        ctx->native_read_u8 != nullptr &&",
+            "        (ctx->native_read_u8)(",
+            "            ctx->native_memory_user, address, &native_value)) {",
+            "        return native_value;",
             "    }",
             "    return (ctx->read_u8)(ctx->user, address);",
             "}",
@@ -5791,19 +5825,28 @@ class CppEmitter:
             "static inline uint32_t b2r_read_u32(B2RContext* ctx, uint32_t address) {",
             "    const uint32_t cache_address = b2r_cache_address(ctx, address);",
             "    const uint32_t page = cache_address >> 12u;",
+            "    const bool requires_callback =",
+            "        b2r_requires_read_memory_callback(ctx, address, 4u);",
             "    if ((cache_address & 0xfffu) <= 0xffcu &&",
             "        ctx->read_pages != nullptr &&",
             "        ctx->read_pages[page] != nullptr) {",
             "        uint32_t value;",
             "        std::memcpy(&value, ctx->read_pages[page] + (cache_address & 0xfffu), sizeof(value));",
-            "        const bool requires_callback =",
-            "            b2r_requires_read_memory_callback(ctx, address, 4u);",
             "        if (!requires_callback) { return value; }",
             "        if (value != 0u &&",
             "            b2r_is_zero_guarded_read_callback(ctx, address)) {",
             "            ++ctx->zero_read_callback_bypass_count;",
             "            return value;",
             "        }",
+            "    }",
+            "    uint32_t native_value = 0u;",
+            "    const bool page_miss = (cache_address & 0xfffu) > 0xffcu ||",
+            "        ctx->read_pages == nullptr || ctx->read_pages[page] == nullptr;",
+            "    if ((requires_callback || page_miss) &&",
+            "        ctx->native_read_u32 != nullptr &&",
+            "        (ctx->native_read_u32)(",
+            "            ctx->native_memory_user, address, &native_value)) {",
+            "        return native_value;",
             "    }",
             "    return (ctx->read_u32)(ctx->user, address);",
             "}",
@@ -5961,19 +6004,29 @@ class CppEmitter:
             "static inline void b2r_write_u8(B2RContext* ctx, uint32_t address, uint8_t value) {",
             "    const uint32_t cache_address = b2r_cache_address(ctx, address);",
             "    const uint32_t page = cache_address >> 12u;",
+            "    const bool requires_callback =",
+            "        b2r_requires_write_memory_callback(ctx, address, 1u);",
+            "    const bool page_miss = ctx->read_pages == nullptr ||",
+            "        ctx->read_pages[page] == nullptr;",
+            "    if ((requires_callback || page_miss) &&",
+            "        ctx->native_write_u8 != nullptr &&",
+            "        (ctx->native_write_u8)(ctx->native_memory_user, address, value)) {",
+            "        b2r_record_observed_write(ctx, cache_address, 1u, value);",
+            "        return;",
+            "    }",
             "    if (ctx->direct_observed_write_transport &&",
             "        ctx->observed_write_range_start < ctx->observed_write_range_end &&",
             "        ctx->observed_write_range_end - ctx->observed_write_range_start >= 1u &&",
             "        cache_address >= ctx->observed_write_range_start &&",
             "        cache_address < ctx->observed_write_range_end &&",
-            "        !b2r_requires_write_memory_callback(ctx, address, 1u) &&",
+            "        !requires_callback &&",
             "        b2r_record_direct_observed_write(",
             "            ctx, cache_address, 1u, value)) {",
             "        return;",
             "    }",
             "    if (ctx->read_pages != nullptr &&",
             "        ctx->read_pages[page] != nullptr &&",
-            "        !b2r_requires_write_memory_callback(ctx, address, 1u)) {",
+            "        !requires_callback) {",
             "        b2r_record_observed_write(ctx, cache_address, 1u, value);",
             "        ctx->read_pages[page][cache_address & 0xfffu] = value;",
             "        b2r_mark_dirty_page(ctx, page, static_cast<uint16_t>(cache_address & 0xfffu), 1u);",
@@ -5985,12 +6038,22 @@ class CppEmitter:
             "static inline void b2r_write_u32(B2RContext* ctx, uint32_t address, uint32_t value) {",
             "    const uint32_t cache_address = b2r_cache_address(ctx, address);",
             "    const uint32_t page = cache_address >> 12u;",
+            "    const bool requires_callback =",
+            "        b2r_requires_write_memory_callback(ctx, address, 4u);",
+            "    const bool page_miss = (cache_address & 0xfffu) > 0xffcu ||",
+            "        ctx->read_pages == nullptr || ctx->read_pages[page] == nullptr;",
+            "    if ((requires_callback || page_miss) &&",
+            "        ctx->native_write_u32 != nullptr &&",
+            "        (ctx->native_write_u32)(ctx->native_memory_user, address, value)) {",
+            "        b2r_record_observed_write(ctx, cache_address, 4u, value);",
+            "        return;",
+            "    }",
             "    if (ctx->direct_observed_write_transport &&",
             "        ctx->observed_write_range_start < ctx->observed_write_range_end &&",
             "        ctx->observed_write_range_end - ctx->observed_write_range_start >= 4u &&",
             "        cache_address >= ctx->observed_write_range_start &&",
             "        cache_address <= ctx->observed_write_range_end - 4u &&",
-            "        !b2r_requires_write_memory_callback(ctx, address, 4u) &&",
+            "        !requires_callback &&",
             "        b2r_record_direct_observed_write(",
             "            ctx, cache_address, 4u, value)) {",
             "        return;",
@@ -5998,7 +6061,7 @@ class CppEmitter:
             "    if ((cache_address & 0xfffu) <= 0xffcu &&",
             "        ctx->read_pages != nullptr &&",
             "        ctx->read_pages[page] != nullptr &&",
-            "        !b2r_requires_write_memory_callback(ctx, address, 4u)) {",
+            "        !requires_callback) {",
             "        b2r_record_observed_write(ctx, cache_address, 4u, value);",
             "        std::memcpy(ctx->read_pages[page] + (cache_address & 0xfffu), &value, sizeof(value));",
             "        b2r_mark_dirty_page(ctx, page, static_cast<uint16_t>(cache_address & 0xfffu), 4u);",
@@ -6431,9 +6494,13 @@ class CppEmitter:
                 lines.extend(
                     [
                         f"        if ({callback_condition}) {{",
-                        "            ctx->eip = eip;",
-                        "            ctx->module_exit_reason = B2R_MODULE_EXIT_CALLBACK;",
-                        "            return eip;",
+                        "            if (ctx->callback_bypass_target == eip) {",
+                        "                ctx->callback_bypass_target = 0u;",
+                        "            } else {",
+                        "                ctx->eip = eip;",
+                        "                ctx->module_exit_reason = B2R_MODULE_EXIT_CALLBACK;",
+                        "                return eip;",
+                        "            }",
                         "        }",
                     ]
                 )
@@ -8027,6 +8094,7 @@ def emit_cpp(
     resumable: bool = False,
     observer_addresses: Iterable[int] = (),
     callback_addresses: Iterable[int] = (),
+    forwarded_callback_addresses: Iterable[int] = (),
     native_fast_paths: Mapping[int, NativeFastPath] | None = None,
     synchronize_eip_for_callbacks: bool = False,
 ) -> str:
@@ -8036,6 +8104,7 @@ def emit_cpp(
         resumable=resumable,
         observer_addresses=observer_addresses,
         callback_addresses=callback_addresses,
+        forwarded_callback_addresses=forwarded_callback_addresses,
         native_fast_paths=native_fast_paths,
         synchronize_eip_for_callbacks=synchronize_eip_for_callbacks,
     )

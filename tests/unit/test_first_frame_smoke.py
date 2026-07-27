@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from tools.host import first_frame_smoke
 from tools.host.first_frame_smoke import (
     DEFAULT_PRESENTER_MODULES,
     DEFAULT_SOURCE,
@@ -54,6 +55,46 @@ def presenter_source_text() -> str:
 
 
 class FirstFrameSmokeTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "explicit FreeLibrary is Windows-only")
+    def test_embedded_presenter_unloads_library_before_return(self) -> None:
+        events: list[str] = []
+        presenter = Mock()
+        presenter._handle = 0x1234
+        presenter.b2r_presenter_main.side_effect = (
+            lambda *_args: events.append("entry") or 7
+        )
+        dll_directory = Mock()
+        dll_directory.close.side_effect = lambda: events.append("directory_close")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            library = Path(temp_dir) / "b2_presenter.dll"
+            library.write_bytes(b"test")
+            with (
+                patch.object(
+                    first_frame_smoke.os,
+                    "add_dll_directory",
+                    return_value=dll_directory,
+                ),
+                patch.object(
+                    first_frame_smoke.ctypes,
+                    "CDLL",
+                    return_value=presenter,
+                ),
+                patch.object(
+                    first_frame_smoke._ctypes,
+                    "FreeLibrary",
+                    side_effect=lambda _handle: events.append("free"),
+                ) as free_library,
+            ):
+                result = first_frame_smoke.run_embedded_presenter(
+                    [str(library)],
+                    library=library,
+                )
+
+        self.assertEqual(result, 7)
+        free_library.assert_called_once_with(0x1234)
+        self.assertEqual(events, ["entry", "free", "directory_close"])
+
     def test_default_presenter_build_compiles_every_native_module(self) -> None:
         toolchain = Toolchain(
             clangxx=Path("clang++.exe"),
@@ -427,10 +468,16 @@ class FirstFrameSmokeTests(unittest.TestCase):
         )
 
         self.assertIn("program_position_valid", host_source)
+        self.assertIn("(result.output_masks[0] & 14u) == 14u", host_source)
+        self.assertIn("position_w_usable", host_source)
+        self.assertIn("vertex.w = 1.0f;", host_source)
         self.assertIn("vertex.x *= vertex.w", host_source)
         self.assertIn("vertex.z *= vertex.w", host_source)
         self.assertIn("VK_FORMAT_R32G32B32A32_SFLOAT", host_source)
         self.assertIn("layout(location = 0) in vec4 in_position", shader_source)
+        self.assertIn("(output_masks[0] & 14u) == 14u", shader_source)
+        self.assertIn("position_w_usable", shader_source)
+        self.assertIn("position.w = 1.0;", shader_source)
         self.assertIn("gl_Position = in_position", shader_source)
         self.assertIn("create_depth_resources();", host_source)
         self.assertIn("nv2a_depth_compare_op", host_source)
@@ -767,7 +814,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         ):
             self.assertIn(field, source)
 
-    def test_live_reload_batches_reads_reuses_texture_content_and_paces_at_60_hz(self) -> None:
+    def test_live_reload_batches_reads_reuses_texture_content_and_caps_guest_at_60_hz(self) -> None:
         source = presenter_source_text()
 
         self.assertIn("live_command_delta_bytes_.resize", source)
@@ -777,7 +824,6 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("acknowledge_current_presentation();", source)
         self.assertIn("OpenEventW", source)
         self.assertIn("SetEvent(presentation_ack_event_)", source)
-        self.assertIn("WaitForMultipleObjects", source)
         self.assertIn("publication_event_", source)
         self.assertIn('"B2TEX001"', source)
         self.assertIn("reusable_by_address", source)
@@ -789,7 +835,18 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("CreateWaitableTimerExW", source)
         self.assertIn("kHighResolutionWaitableTimerFlag", source)
         self.assertIn("wait_for_frame_deadline(next_frame_time)", source)
-        self.assertIn("constexpr auto poll_interval = std::chrono::milliseconds(1)", source)
+        wait_begin = source.index("void wait_for_frame_deadline(")
+        wait_end = source.index(
+            "void queue_hotkey_screenshot()",
+            wait_begin,
+        )
+        wait_source = source[wait_begin:wait_end]
+        self.assertIn("sleep_until_frame_deadline(deadline)", wait_source)
+        self.assertIn("WaitForMultipleObjects", wait_source)
+        self.assertIn("reload_live_render_work(true)", wait_source)
+        self.assertIn("options_.presentation_pipeline_depth != 2u", wait_source)
+        self.assertIn('"guest_frame_rate_limit_hz"', source)
+        self.assertIn("kTargetGuestFrameRateHz = 60u", source)
         self.assertIn('"target_frame_us"', source)
 
     def test_live_reload_retries_incomplete_shared_manifest(self) -> None:
@@ -1021,6 +1078,11 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("draw_targets_presented_surface", source)
         self.assertIn("draw_surface_clip_is_subsurface_viewport", source)
         self.assertIn("kViewportBias = 0.53125f", source)
+        self.assertIn(
+            "clip_width >= swapchain_extent_.width\n"
+            "        || clip_height >= swapchain_extent_.height",
+            source,
+        )
         self.assertIn("viewport_scale_x - half_width", source)
         self.assertIn("viewport_scale_y + half_height", source)
         self.assertIn("clip_x != 0u || clip_y != 0u", source)
@@ -1396,6 +1458,12 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("method >= 0x0680u && method <= 0x06BCu", host_source)
         self.assertIn("execute_presented_fixed_function_transform", host_source)
         self.assertIn("fixed_function_transformed_draw_count", host_source)
+        self.assertIn(
+            "default_fixed_function_texture_combiner_recovery_required",
+            host_source,
+        )
+        self.assertIn("state.combiner_color_inputs[0] = 0x08040000u", host_source)
+        self.assertIn("state.combiner_alpha_inputs[0] = 0x18140000u", host_source)
         self.assertIn("vkCmdPushConstants", host_source)
         self.assertIn("layout(location = 2) in vec4 in_uv", vertex_shader)
         self.assertIn("textureProj(texture0, frag_uv.xyw)", fragment_shader)

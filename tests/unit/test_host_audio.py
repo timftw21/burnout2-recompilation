@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-import struct
 import queue
+import struct
+import threading
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
+from tools.playability import host_audio
 from tools.playability.host_audio import (
     PcmClip,
     RWS_PCM16_CODEC_UUID,
@@ -80,13 +83,30 @@ class HostAudioTests(unittest.TestCase):
         self.assertIn(pcm, payload)
 
     def test_parse_renderware_80d_streamed_xbox_adpcm(self) -> None:
-        header_payload = bytearray(0x20)
-        struct.pack_into("<I", header_payload, 0x10, 48000)
+        header_payload = bytearray(0xE8)
+        struct.pack_into("<I", header_payload, 0x40 - 0x18, 1)
+        struct.pack_into("<I", header_payload, 0x4C - 0x18, 0xA0)
+        struct.pack_into("<I", header_payload, 0x90 - 0x18, 0x140)
+        struct.pack_into("<I", header_payload, 0x98 - 0x18, 72 * 2)
+        struct.pack_into(
+            "<7I",
+            header_payload,
+            0xC8 - 0x18,
+            7,
+            0xA0,
+            0,
+            0x00040004,
+            0,
+            72,
+            0,
+        )
+        struct.pack_into("<I", header_payload, 0xE4 - 0x18, 48000)
         header = struct.pack("<III", 0x80E, len(header_payload), 0x1003FFFF)
         header += header_payload
         channel_header = struct.pack("<hBB", 0, 0, 0)
         encoded = channel_header * 2 + bytes(64)
-        data = struct.pack("<III", 0x80F, len(encoded), 0x1003FFFF) + encoded
+        packets = (encoded + bytes(0xA0 - len(encoded))) * 2
+        data = struct.pack("<III", 0x80F, len(packets), 0x1003FFFF) + packets
         body = header + data
         payload = struct.pack("<III", 0x80D, len(body), 0x1003FFFF) + body
 
@@ -95,7 +115,7 @@ class HostAudioTests(unittest.TestCase):
         self.assertEqual(clip.sample_rate, 48000)
         self.assertEqual(clip.channels, 2)
         self.assertEqual(clip.bits_per_sample, 16)
-        self.assertEqual(clip.payload, bytes(64 * 2 * 2))
+        self.assertEqual(clip.payload, bytes(64 * 2 * 2 * 2))
 
     def test_sdl_pcm_output_preserves_loop_request(self) -> None:
         output = SdlPcmOutput.__new__(SdlPcmOutput)
@@ -123,6 +143,44 @@ class HostAudioTests(unittest.TestCase):
             (0, 0, 0, 0),
         )
         self.assertEqual(output.summary()["backend"], "sdl3_audio_stream")
+
+    def test_sdl_pcm_output_closes_worker_before_native_audio(self) -> None:
+        output = SdlPcmOutput.__new__(SdlPcmOutput)
+        output.available = True
+        output.looping = True
+        output._closed = False
+        output._atexit_registered = True
+        output._shutdown = threading.Event()
+        output._queue = queue.Queue(maxsize=1)
+        lifecycle: list[str] = []
+        worker = Mock()
+        worker.join.side_effect = lambda: lifecycle.append("worker")
+        sink = Mock()
+        sink.close.side_effect = lambda: lifecycle.append("sink")
+        output._worker_thread = worker
+        output._sink = sink
+
+        with patch.object(host_audio.atexit, "unregister") as unregister:
+            output.close()
+
+        self.assertTrue(output._shutdown.is_set())
+        worker.join.assert_called_once_with()
+        sink.close.assert_called_once_with()
+        self.assertEqual(lifecycle, ["worker", "sink"])
+        self.assertIsNone(output._sink)
+        unregister.assert_called_once()
+        self.assertFalse(output.available)
+        self.assertFalse(output.looping)
+
+    def test_sdl_audio_sink_close_is_idempotent(self) -> None:
+        sink = host_audio._SdlAudioSink.__new__(host_audio._SdlAudioSink)
+        sink._closed = False
+        sink._close_audio = Mock()
+
+        sink.close()
+        sink.close()
+
+        sink._close_audio.assert_called_once_with()
 
 
 if __name__ == "__main__":

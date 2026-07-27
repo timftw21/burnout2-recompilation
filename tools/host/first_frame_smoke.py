@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import _ctypes
 import ctypes
 import hashlib
 import json
@@ -803,6 +804,8 @@ def run_embedded_presenter(
         if os.name == "nt"
         else None
     )
+    presenter: ctypes.CDLL | None = None
+    entry = None
     try:
         presenter = ctypes.CDLL(str(library.resolve()))
         entry = presenter.b2r_presenter_main
@@ -814,6 +817,17 @@ def run_embedded_presenter(
         argv = (ctypes.c_wchar_p * len(arguments))(*arguments)
         return int(entry(len(arguments), argv))
     finally:
+        entry = None
+        if presenter is not None:
+            handle = presenter._handle
+            presenter = None
+            if os.name == "nt":
+                # Leaving SDL and the presenter loaded until ExitProcess runs
+                # their detach handlers under the loader lock can deadlock.
+                # Unload while Python is still fully operational instead.
+                _ctypes.FreeLibrary(handle)
+            else:
+                _ctypes.dlclose(handle)
         if dll_directory is not None:
             dll_directory.close()
 

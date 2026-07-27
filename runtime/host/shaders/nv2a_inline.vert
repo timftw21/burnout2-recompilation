@@ -519,6 +519,11 @@ void main() {
     float fog = raw_attribute_fetch ? 1.0 : in_fog;
     bool program_position_valid = false;
     if (program_valid) {
+        bool position_xyz_written = (output_masks[0] & 14u) == 14u;
+        bool position_w_written = (output_masks[0] & 1u) != 0u;
+        bool position_w_usable = position_w_written
+            && finite_value(outputs[0].w)
+            && abs(outputs[0].w) > 0.000001;
         if ((output_masks[0] & 12u) == 12u
             && finite_value(outputs[0].x)
             && finite_value(outputs[0].y)) {
@@ -533,10 +538,15 @@ void main() {
                     ? outputs[0].z / depth_scale
                     : outputs[0].z;
             }
-            if ((output_masks[0] & 1u) != 0u) {
+            if (position_w_usable) {
                 position.w = outputs[0].w;
+            } else if (position_xyz_written) {
+                // A missing, non-finite, or zero homogeneous component does
+                // not invalidate otherwise complete screen-space oPos.xyz.
+                // Default it instead of taking the z=0 fallback.
+                position.w = 1.0;
             }
-            program_position_valid = (output_masks[0] & 15u) == 15u
+            program_position_valid = position_xyz_written
                 && finite_value(position.z)
                 && finite_value(position.w);
         }

@@ -77,7 +77,9 @@ DEFAULT_EXTRACTED_ROOT = DEFAULT_XBE.parent
 DEFAULT_SAVE_DATA_ROOT = REPO_ROOT / "data" / "local" / "save-data"
 DEFAULT_DASHBOARD_ROOT = REPO_ROOT / "data" / "local" / "dashboard-data"
 DEFAULT_CACHE_ROOT = REPO_ROOT / "data" / "local" / "cache-data"
-DEFAULT_BLOCK_CACHE = REPO_ROOT / "build" / "native-guest-loop" / "decoded-blocks.sqlite3"
+DEFAULT_DECODED_BLOCK_STORE = (
+    REPO_ROOT / "build" / "native-guest-loop" / "decoded-blocks.sqlite3"
+)
 DEFAULT_RENDER_STREAM = REPO_ROOT / "reports" / "local" / "live" / "render.json"
 DEFAULT_CONTROLLER_STATE = REPO_ROOT / "reports" / "local" / "live" / "controller.json"
 DEFAULT_PROBE_SUMMARY = REPO_ROOT / "reports" / "local" / "playability" / "native-live.json"
@@ -121,7 +123,7 @@ def build_guest_command(args: argparse.Namespace) -> list[str]:
         "--save-data-root", str(args.save_data_root),
         "--dashboard-root", str(args.dashboard_root),
         "--cache-root", str(args.cache_root),
-        "--dynamic-block-cache", str(args.dynamic_block_cache),
+        "--decoded-block-store", str(args.decoded_block_store),
         "--native-guest-loop",
         "--native-slice-steps", str(args.native_slice_steps),
         "--max-steps", str(args.max_steps),
@@ -162,6 +164,8 @@ def build_guest_command(args: argparse.Namespace) -> list[str]:
     audit_world_matrix_address = getattr(args, "audit_world_matrix_address", None)
     if getattr(args, "audit_world_matrices", False) or audit_world_matrix_address is not None:
         command.append("--audit-world-matrices")
+    if getattr(args, "audit_traffic_meshes", False):
+        command.append("--audit-traffic-meshes")
     if audit_world_matrix_address is not None:
         command.extend(
             ["--audit-world-matrix-address", f"0x{audit_world_matrix_address:08X}"]
@@ -292,6 +296,60 @@ def _uses_embedded_runtime(args: argparse.Namespace) -> bool:
     )
 
 
+def _start_confirm_injector(
+    args: argparse.Namespace,
+    transport: LiveControlTransport,
+    stop: threading.Event,
+) -> threading.Thread | None:
+    target_flip = getattr(args, "inject_confirm_after_flip", None)
+    if target_flip is None:
+        return None
+
+    def inject_confirm() -> None:
+        while not stop.wait(0.002):
+            manifest = transport.read_manifest()
+            if manifest is None:
+                continue
+            guest_flip = int(manifest.get("guest_flip_count", 0) or 0)
+            if guest_flip < target_flip:
+                continue
+            transport.publish_controller(buttons=0x1000)
+            print(
+                "Injected diagnostic confirm input at guest flip "
+                f"{guest_flip}."
+            )
+            stop.wait(0.15)
+            transport.publish_controller(buttons=0)
+            last_flip = guest_flip
+            last_progress = time.monotonic()
+            while not stop.wait(0.01):
+                next_manifest = transport.read_manifest()
+                next_flip = int(
+                    (next_manifest or {}).get("guest_flip_count", last_flip)
+                    or last_flip
+                )
+                if next_flip != last_flip:
+                    last_flip = next_flip
+                    last_progress = time.monotonic()
+                    continue
+                if time.monotonic() - last_progress >= 0.5:
+                    state = transport.diagnostic_state()
+                    print(
+                        "Guest publication stalled after diagnostic confirm: "
+                        + json.dumps(state, sort_keys=True)
+                    )
+                    return
+            return
+
+    thread = threading.Thread(
+        target=inject_confirm,
+        name="b2-diagnostic-confirm-injector",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 def _set_current_windows_thread_description(name: str) -> None:
     if os.name != "nt":
         return
@@ -343,7 +401,10 @@ class _InProcessGuest:
         if self._thread.is_alive():
             raise subprocess.TimeoutExpired("embedded guest", timeout)
         if self._error is not None:
-            raise RuntimeError("embedded guest failed") from self._error
+            raise RuntimeError(
+                "embedded guest failed: "
+                f"{type(self._error).__name__}: {self._error}"
+            ) from self._error
         return int(self._returncode or 0)
 
 
@@ -525,6 +586,106 @@ def _stop_process(process: subprocess.Popen[bytes] | None) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait()
+
+
+class _JobObjectBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("per_process_user_time_limit", ctypes.c_int64),
+        ("per_job_user_time_limit", ctypes.c_int64),
+        ("limit_flags", ctypes.c_uint32),
+        ("minimum_working_set_size", ctypes.c_size_t),
+        ("maximum_working_set_size", ctypes.c_size_t),
+        ("active_process_limit", ctypes.c_uint32),
+        ("affinity", ctypes.c_size_t),
+        ("priority_class", ctypes.c_uint32),
+        ("scheduling_class", ctypes.c_uint32),
+    ]
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [
+        ("read_operation_count", ctypes.c_uint64),
+        ("write_operation_count", ctypes.c_uint64),
+        ("other_operation_count", ctypes.c_uint64),
+        ("read_transfer_count", ctypes.c_uint64),
+        ("write_transfer_count", ctypes.c_uint64),
+        ("other_transfer_count", ctypes.c_uint64),
+    ]
+
+
+class _JobObjectExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("basic_limit_information", _JobObjectBasicLimitInformation),
+        ("io_info", _IoCounters),
+        ("process_memory_limit", ctypes.c_size_t),
+        ("job_memory_limit", ctypes.c_size_t),
+        ("peak_process_memory_used", ctypes.c_size_t),
+        ("peak_job_memory_used", ctypes.c_size_t),
+    ]
+
+
+class _WindowsKillOnCloseJob:
+    """Own child processes even if the Python launcher exits abruptly."""
+
+    _EXTENDED_LIMIT_INFORMATION_CLASS = 9
+    _LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+    def __init__(self) -> None:
+        if sys.platform != "win32":
+            raise RuntimeError("Windows process jobs are available only on Windows")
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._kernel32.CreateJobObjectW.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+        )
+        self._kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+        self._kernel32.SetInformationJobObject.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        )
+        self._kernel32.SetInformationJobObject.restype = ctypes.c_bool
+        self._kernel32.AssignProcessToJobObject.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        )
+        self._kernel32.AssignProcessToJobObject.restype = ctypes.c_bool
+        self._kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        self._kernel32.CloseHandle.restype = ctypes.c_bool
+        handle = self._kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        self._handle: int | None = int(handle)
+        limits = _JobObjectExtendedLimitInformation()
+        limits.basic_limit_information.limit_flags = self._LIMIT_KILL_ON_JOB_CLOSE
+        if not self._kernel32.SetInformationJobObject(
+            ctypes.c_void_p(self._handle),
+            self._EXTENDED_LIMIT_INFORMATION_CLASS,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+        ):
+            error = ctypes.get_last_error()
+            self.close()
+            raise ctypes.WinError(error)
+
+    def assign(self, process: subprocess.Popen[bytes]) -> None:
+        if self._handle is None:
+            raise RuntimeError("Windows process job is already closed")
+        process_handle = getattr(process, "_handle", None)
+        if process_handle is None:
+            raise RuntimeError("child process does not expose a Windows handle")
+        if not self._kernel32.AssignProcessToJobObject(
+            ctypes.c_void_p(self._handle),
+            ctypes.c_void_p(int(process_handle)),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def close(self) -> None:
+        handle = getattr(self, "_handle", None)
+        self._handle = None
+        if handle is not None:
+            self._kernel32.CloseHandle(ctypes.c_void_p(handle))
 
 
 def _wait_for_guest_shutdown(
@@ -757,13 +918,57 @@ def _summarize_scene_record_audit(args: argparse.Namespace) -> None:
         print(f"Could not summarize scene-record audit: {exc}")
 
 
-def _startup_wait_status(cache_path: Path, elapsed_seconds: float) -> str:
+def _startup_wait_status(
+    cache_path: Path,
+    elapsed_seconds: float,
+    *,
+    guest_active: bool = True,
+    live_transport: LiveControlTransport | None = None,
+    command_transport: LiveCommandTransport | None = None,
+    resource_transport: LiveResourceTransport | None = None,
+) -> str:
     cache_bytes = cache_path.stat().st_size if cache_path.is_file() else 0
     native_dll_count = sum(1 for _ in cache_path.parent.glob("native-loop-*.dll"))
+    transport_status = ""
+    if (
+        live_transport is not None
+        and command_transport is not None
+        and resource_transport is not None
+    ):
+        control = live_transport.diagnostic_state()
+        write_cursor, read_cursor = command_transport.cursors()
+        slots = resource_transport.slot_metadata()
+        transport_status = (
+            f", manifest={control['manifest_sequence']}"
+            f"/{control['manifest_size']}, commands={write_cursor}/{read_cursor}, "
+            f"resources={slots[0][2]}/{slots[1][2]}, "
+            f"scheduler={control['scheduler_phase']}:"
+            f"0x{control['scheduler_worker_handle']:08X}/"
+            f"0x{control['scheduler_eip']:08X}@"
+            f"{control['scheduler_main_steps']}/"
+            f"{control['scheduler_worker_steps']}, sync="
+            f"{control['semaphore_count']}/"
+            f"{control['worker_lifecycle_count']}:"
+            f"0x{control['wait_handle']:08X}/"
+            f"0x{control['current_worker_handle']:08X}, regs="
+            f"eax:{control['scheduler_eax']:08X}/"
+            f"ecx:{control['scheduler_ecx']:08X}/"
+            f"edx:{control['scheduler_edx']:08X}/"
+            f"ebx:{control['scheduler_ebx']:08X}/"
+            f"esp:{control['scheduler_esp']:08X}/"
+            f"ebp:{control['scheduler_ebp']:08X}/"
+            f"esi:{control['scheduler_esi']:08X}/"
+            f"edi:{control['scheduler_edi']:08X}"
+        )
+    state = (
+        "Guest is still preparing"
+        if guest_active
+        else "Guest preparation ended without publishing a frame"
+    )
     return (
-        f"Guest is still preparing after {elapsed_seconds:.0f}s "
+        f"{state} after {elapsed_seconds:.0f}s "
         f"(decoded store {cache_bytes / (1024 * 1024):.1f} MiB, "
-        f"native DLLs {native_dll_count})."
+        f"native DLLs {native_dll_count}{transport_status})."
     )
 
 
@@ -840,6 +1045,7 @@ def _run_live_test_embedded(args: argparse.Namespace) -> int:
     live_resource_transport = LiveResourceTransport.create(args.live_transport_name)
     guest = _InProcessGuest(build_guest_command(args)[3:])
     monitor_stop = threading.Event()
+    input_injector: threading.Thread | None = None
 
     def monitor_guest() -> None:
         while not monitor_stop.wait(0.05):
@@ -863,10 +1069,22 @@ def _run_live_test_embedded(args: argparse.Namespace) -> int:
             returncode = guest.poll()
             if returncode is not None:
                 try:
-                    return guest.wait()
+                    returncode = guest.wait()
                 except RuntimeError as exc:
                     print(f"Guest runner exited before publishing a frame: {exc}")
                     return 1
+                print(
+                    _startup_wait_status(
+                        args.decoded_block_store,
+                        time.monotonic() - run_started,
+                        guest_active=False,
+                        live_transport=live_transport,
+                        command_transport=live_command_transport,
+                        resource_transport=live_resource_transport,
+                    )
+                )
+                print(f"Embedded guest exit code: {returncode}.")
+                return returncode or 1
             if time.monotonic() >= deadline:
                 live_transport.request_stop()
                 print("Timed out waiting for the first embedded guest frame.")
@@ -874,8 +1092,11 @@ def _run_live_test_embedded(args: argparse.Namespace) -> int:
             if time.monotonic() >= next_startup_status:
                 print(
                     _startup_wait_status(
-                        args.dynamic_block_cache,
+                        args.decoded_block_store,
                         time.monotonic() - run_started,
+                        live_transport=live_transport,
+                        command_transport=live_command_transport,
+                        resource_transport=live_resource_transport,
                     )
                 )
                 next_startup_status = time.monotonic() + 30.0
@@ -883,6 +1104,9 @@ def _run_live_test_embedded(args: argparse.Namespace) -> int:
 
         print("Starting embedded Vulkan presenter. Close the window or press Escape to stop.")
         monitor.start()
+        input_injector = _start_confirm_injector(
+            args, live_transport, monitor_stop
+        )
         presenter_returncode = run_embedded_presenter(
             build_embedded_presenter_arguments(args),
             library=DEFAULT_DLL,
@@ -906,6 +1130,8 @@ def _run_live_test_embedded(args: argparse.Namespace) -> int:
         return 130
     finally:
         monitor_stop.set()
+        if input_injector is not None:
+            input_injector.join(timeout=1.0)
         live_transport.request_stop()
         live_resource_transport.close()
         live_command_transport.close()
@@ -972,6 +1198,7 @@ def _run_live_test_processes(args: argparse.Namespace) -> int:
 
     guest: subprocess.Popen[bytes] | None = None
     presenter: subprocess.Popen[bytes] | None = None
+    process_job: _WindowsKillOnCloseJob | None = None
     presenter_started: float | None = None
     live_transport = LiveControlTransport.create(args.live_transport_name)
     live_command_transport = LiveCommandTransport.create(
@@ -980,6 +1207,8 @@ def _run_live_test_processes(args: argparse.Namespace) -> int:
     live_resource_transport = LiveResourceTransport.create(
         args.live_transport_name
     )
+    input_injector_stop = threading.Event()
+    input_injector: threading.Thread | None = None
     runner_output = (
         args.runner_log.open("wb")
         if diagnostics_enabled
@@ -988,12 +1217,16 @@ def _run_live_test_processes(args: argparse.Namespace) -> int:
     with runner_output as runner_log:
         try:
             print("Starting native guest loop...")
+            if sys.platform == "win32":
+                process_job = _WindowsKillOnCloseJob()
             guest = subprocess.Popen(
                 build_guest_command(args),
                 cwd=REPO_ROOT,
                 stdout=runner_log,
                 stderr=subprocess.STDOUT,
             )
+            if process_job is not None:
+                process_job.assign(guest)
             deadline = time.monotonic() + args.startup_timeout_seconds
             next_startup_status = time.monotonic() + 30.0
             while not (
@@ -1004,6 +1237,16 @@ def _run_live_test_processes(args: argparse.Namespace) -> int:
                 returncode = guest.poll()
                 if returncode is not None:
                     print(f"Guest runner exited before publishing a frame (code {returncode}).")
+                    print(
+                        _startup_wait_status(
+                            args.decoded_block_store,
+                            time.monotonic() - run_started,
+                            guest_active=False,
+                            live_transport=live_transport,
+                            command_transport=live_command_transport,
+                            resource_transport=live_resource_transport,
+                        )
+                    )
                     print(f"See {args.runner_log}")
                     return returncode or 1
                 if time.monotonic() >= deadline:
@@ -1012,8 +1255,11 @@ def _run_live_test_processes(args: argparse.Namespace) -> int:
                 if time.monotonic() >= next_startup_status:
                     print(
                         _startup_wait_status(
-                            args.dynamic_block_cache,
+                            args.decoded_block_store,
                             time.monotonic() - run_started,
+                            live_transport=live_transport,
+                            command_transport=live_command_transport,
+                            resource_transport=live_resource_transport,
                         )
                     )
                     next_startup_status = time.monotonic() + 30.0
@@ -1026,6 +1272,11 @@ def _run_live_test_processes(args: argparse.Namespace) -> int:
                 cwd=REPO_ROOT,
                 stdout=runner_log,
                 stderr=subprocess.STDOUT,
+            )
+            if process_job is not None:
+                process_job.assign(presenter)
+            input_injector = _start_confirm_injector(
+                args, live_transport, input_injector_stop
             )
             scene_audit_run = getattr(args, "audit_scene_records", False)
             bounded_guest_run = args.max_steps > 0 or (
@@ -1101,8 +1352,13 @@ def _run_live_test_processes(args: argparse.Namespace) -> int:
             print("Stopping live test...")
             return 130
         finally:
+            input_injector_stop.set()
+            if input_injector is not None:
+                input_injector.join(timeout=1.0)
             _stop_process(presenter)
             _stop_process(guest)
+            if process_job is not None:
+                process_job.close()
             live_resource_transport.close()
             live_command_transport.close()
             live_transport.close()
@@ -1111,13 +1367,13 @@ def _run_live_test_processes(args: argparse.Namespace) -> int:
 
 
 def _native_cache_state(args: argparse.Namespace) -> dict[str, object]:
-    native_build_dir = args.dynamic_block_cache.parent
+    native_build_dir = args.decoded_block_store.parent
     native_dlls = sorted(native_build_dir.glob("native-loop-*.dll"))
     pipeline_cache = REPO_ROOT / "build" / "local" / "first-frame" / "vulkan-pipeline-cache.bin"
     presenter = REPO_ROOT / "build" / "local" / "first-frame" / "b2_first_frame.exe"
     presenter_library = DEFAULT_DLL
     return {
-        "decoded_blocks": file_identity(args.dynamic_block_cache),
+        "decoded_blocks": file_identity(args.decoded_block_store),
         "native_module_manifest": file_identity(
             native_build_dir / "native-module-manifest.sqlite3"
         ),
@@ -1127,7 +1383,7 @@ def _native_cache_state(args: argparse.Namespace) -> dict[str, object]:
         "presenter_library": file_identity(presenter_library),
         "vulkan_pipeline_cache": file_identity(pipeline_cache),
         "warm": bool(
-            args.dynamic_block_cache.is_file()
+            args.decoded_block_store.is_file()
             and native_dlls
             and presenter.is_file()
             and presenter_library.is_file()
@@ -1176,6 +1432,7 @@ def _live_run_manifest(
             },
             "lossless_flip_audit": getattr(args, "lossless_flip_audit", False),
             "world_matrix_audit": getattr(args, "audit_world_matrices", False),
+            "traffic_mesh_audit": getattr(args, "audit_traffic_meshes", False),
             "scene_record_audit": getattr(args, "audit_scene_records", False),
             "skip_host_build": bool(args.skip_host_build),
             "native_slice_steps": args.native_slice_steps,
@@ -1391,7 +1648,18 @@ def main() -> int:
     parser.add_argument("--save-data-root", type=Path, default=DEFAULT_SAVE_DATA_ROOT)
     parser.add_argument("--dashboard-root", type=Path, default=DEFAULT_DASHBOARD_ROOT)
     parser.add_argument("--cache-root", type=Path, default=DEFAULT_CACHE_ROOT)
-    parser.add_argument("--dynamic-block-cache", type=Path, default=DEFAULT_BLOCK_CACHE)
+    parser.add_argument(
+        "--decoded-block-store",
+        type=Path,
+        default=DEFAULT_DECODED_BLOCK_STORE,
+    )
+    parser.add_argument(
+        "--dynamic-block-cache",
+        dest="decoded_block_store",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--live-render-stream", type=Path, default=DEFAULT_RENDER_STREAM)
     parser.add_argument("--live-controller-state", type=Path, default=DEFAULT_CONTROLLER_STATE)
     parser.add_argument("--json-output", type=Path, default=DEFAULT_PROBE_SUMMARY)
@@ -1430,6 +1698,14 @@ def main() -> int:
         help="Maximum guest instructions; 0 (the default) runs until the presenter closes.",
     )
     parser.add_argument(
+        "--inject-confirm-after-flip",
+        type=int,
+        help=(
+            "Developer diagnostic: inject one A/confirm pulse after the named "
+            "guest flip."
+        ),
+    )
+    parser.add_argument(
         "--profile-hot-paths",
         action="store_true",
         help=(
@@ -1460,6 +1736,14 @@ def main() -> int:
         help=(
             "Capture exact writes to one 64-byte RenderWare matrix and include "
             "the transitions in the render debug report."
+        ),
+    )
+    parser.add_argument(
+        "--audit-traffic-meshes",
+        action="store_true",
+        help=(
+            "Capture traffic/world mesh index submissions in the native "
+            "observer without leaving the normal renderer path."
         ),
     )
     parser.add_argument(
@@ -1580,6 +1864,7 @@ def main() -> int:
         args.profile_hot_paths
         or args.audit_world_matrices
         or args.audit_world_matrix_address is not None
+        or args.audit_traffic_meshes
         or args.audit_scene_records
         or args.lossless_flip_audit
     ):

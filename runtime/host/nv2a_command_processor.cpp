@@ -225,6 +225,22 @@ NativePipelineState frontend_text_pipeline_state() {
 }
 
 
+bool default_fixed_function_texture_combiner_recovery_required(
+    const NativeDraw& draw) {
+    if (!draw.texture_enabled || draw.texture_stage != 0u
+        || (draw.shader_stage_program & 0x1Fu) == 0u
+        || draw.combiner_control != 1u) {
+        return false;
+    }
+    return draw.combiner_color_inputs[0] == 0x04200000u
+        && draw.combiner_color_outputs[0] == 0x00000C00u
+        && draw.combiner_alpha_inputs[0] == 0x14200000u
+        && draw.combiner_alpha_outputs[0] == 0x00000C00u
+        && draw.final_combiner_inputs0 == 0x0000000Cu
+        && draw.final_combiner_inputs1 == 0x00001C80u;
+}
+
+
 NativeFragmentState fragment_state_for_draw(const NativeDraw& draw) {
     const uint32_t texture_stage = std::min<uint32_t>(
         draw.texture_stage, 3u);
@@ -258,6 +274,14 @@ NativeFragmentState fragment_state_for_draw(const NativeDraw& draw) {
     state.final_combiner_inputs1 = draw.final_combiner_inputs1;
     state.final_combiner_factor0 = draw.final_combiner_factors[0];
     state.final_combiner_factor1 = draw.final_combiner_factors[1];
+    if (default_fixed_function_texture_combiner_recovery_required(draw)) {
+        // The title leaves the canonical diffuse-only NV2A defaults active
+        // for its fixed-function D3D texture draws. Recover the equivalent
+        // stage-zero MODULATE operation so the sampled texture and its alpha
+        // mask are combined with the vertex color/fade alpha.
+        state.combiner_color_inputs[0] = 0x08040000u;
+        state.combiner_alpha_inputs[0] = 0x18140000u;
+    }
     state.fog_color = draw.fog_color;
     state.fog_enable = draw.fog_enable;
     return state;
@@ -604,6 +628,14 @@ uint32_t execute_presented_vertex_program(
         }
         ++local.valid_program_vertex_count;
         const auto& position = result.outputs[0];
+        local.position_output_mask_union |= result.output_masks[0];
+        const bool position_xyz_written =
+            (result.output_masks[0] & 14u) == 14u;
+        const bool position_w_written =
+            (result.output_masks[0] & 1u) != 0u;
+        const bool position_w_usable = position_w_written
+            && std::isfinite(position[3])
+            && std::abs(position[3]) > 0.000001f;
         if ((result.output_masks[0] & 12u) == 12u
             && std::isfinite(position[0]) && std::isfinite(position[1])) {
             ++local.position_output_vertex_count;
@@ -611,11 +643,13 @@ uint32_t execute_presented_vertex_program(
             if ((result.output_masks[0] & 2u) != 0u) {
                 local.program_output_z_bounds.include(position[2]);
             }
-            if ((result.output_masks[0] & 1u) != 0u) {
+            if (position_w_written) {
                 local.program_output_w_bounds.include(position[3]);
+                if (!std::isfinite(position[3])) {
+                    ++local.non_finite_position_w_vertex_count;
+                }
             }
-            if ((result.output_masks[0] & 1u) != 0u
-                && std::isfinite(position[3])) {
+            if (position_w_written && std::isfinite(position[3])) {
                 ++local.homogeneous_position_vertex_count;
                 if (std::abs(position[3]) <= 0.000001f) {
                     ++local.near_zero_w_vertex_count;
@@ -640,9 +674,23 @@ uint32_t execute_presented_vertex_program(
                     ? position[2] / viewport_depth_scale
                     : position[2];
             }
-            if ((result.output_masks[0] & 1u) != 0u) vertex.w = position[3];
+            if (position_w_usable) {
+                vertex.w = position[3];
+            } else if (position_xyz_written) {
+                // NV2A programs used by the title can emit screen-space
+                // oPos.xyz with an absent or unusable oPos.w. Complete the
+                // homogeneous component instead of rejecting the valid xyz
+                // output and forcing the fallback near depth.
+                vertex.w = 1.0f;
+                ++local.defaulted_position_w_vertex_count;
+                if (position_w_written) {
+                    ++local.invalid_position_w_vertex_count;
+                } else {
+                    ++local.implicit_position_w_vertex_count;
+                }
+            }
             vertex.program_position_valid =
-                (result.output_masks[0] & 15u) == 15u
+                position_xyz_written
                 && std::isfinite(vertex.z)
                 && std::isfinite(vertex.w);
         } else if ((result.output_masks[0] & 12u) != 0u) {
@@ -2161,7 +2209,7 @@ void interpret_nv2a_method(
                 interpreted.texture_addresses[stage] = data;
             } else if (register_offset == 0x0Cu) {
                 interpreted.texture_controls[stage] = data;
-            } else if (register_offset == 0x18u) {
+            } else if (register_offset == 0x1Cu) {
                 interpreted.texture_image_rects[stage] = data;
             } else if (register_offset == 0x14u) {
                 interpreted.texture_filters[stage] = data;
@@ -2209,7 +2257,7 @@ std::vector<Nv2aBootstrapMethod> native_draw_interpreter_bootstrap_methods(
         append(base + 0x08u, draw.texture_addresses[stage]);
         append(base + 0x0Cu, draw.texture_controls[stage]);
         append(base + 0x14u, draw.texture_filters[stage]);
-        append(base + 0x18u, draw.texture_image_rects[stage]);
+        append(base + 0x1Cu, draw.texture_image_rects[stage]);
     }
     append(0x0304u, draw.blend_enable);
     append(0x0300u, draw.alpha_test_enable);

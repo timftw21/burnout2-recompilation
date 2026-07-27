@@ -19,6 +19,35 @@ from runtime.xbox.shims import (
 
 
 class RuntimeShimTests(unittest.TestCase):
+    def test_reports_three_xbox_cache_partitions(self) -> None:
+        runtime = XboxRuntimeShims()
+
+        self.assertEqual(runtime.hal_disk_cache_partition_count(), 3)
+
+    def test_kernel_key_exports_use_stable_validated_key_material(self) -> None:
+        signature_key = bytes(range(16))
+        runtime = XboxRuntimeShims(
+            XboxRuntimeConfig(xbox_signature_key=signature_key)
+        )
+
+        self.assertNotEqual(runtime.kernel_variable("XboxHDKey"), b"\x00" * 16)
+        self.assertEqual(runtime.kernel_variable("XboxSignatureKey"), signature_key)
+
+        with self.assertRaisesRegex(XboxRuntimeError, "exactly 16 bytes"):
+            XboxRuntimeShims(XboxRuntimeConfig(xbox_hd_key=b"short"))
+
+    def test_nt_status_collision_maps_to_already_exists(self) -> None:
+        runtime = XboxRuntimeShims()
+
+        self.assertEqual(
+            runtime.rtl_nt_status_to_dos_error(XboxStatus.OBJECT_NAME_COLLISION),
+            183,
+        )
+        self.assertEqual(
+            runtime.rtl_nt_status_to_dos_error(XboxStatus.OBJECT_NAME_NOT_FOUND),
+            2,
+        )
+
     def test_active_worker_owns_current_thread_termination(self) -> None:
         runtime = XboxRuntimeShims()
         primary = runtime.ke_get_current_thread()
@@ -94,6 +123,35 @@ class RuntimeShimTests(unittest.TestCase):
         with self.assertRaisesRegex(XboxRuntimeError, "page range"):
             runtime.mm_lock_unlock_buffer_pages(address + 0x1000, 0x1000, True)
 
+    def test_contiguous_allocation_honors_fixed_physical_range(self) -> None:
+        runtime = XboxRuntimeShims()
+        size = 0x5D000
+        lowest_physical = 0x02877000
+
+        address = runtime.mm_allocate_contiguous_memory_ex(
+            size,
+            lowest_acceptable_address=lowest_physical,
+            highest_acceptable_address=lowest_physical + size - 1,
+        )
+
+        self.assertEqual(address, 0x82877000)
+        self.assertEqual(runtime.mm_get_physical_address(address), lowest_physical)
+
+    def test_contiguous_allocation_finds_space_in_broad_physical_range(self) -> None:
+        runtime = XboxRuntimeShims()
+
+        first = runtime.mm_allocate_contiguous_memory_ex(
+            0x1800,
+            highest_acceptable_address=0x003FFFFF,
+        )
+        second = runtime.mm_allocate_contiguous_memory_ex(
+            0x1000,
+            highest_acceptable_address=0x003FFFFF,
+        )
+
+        self.assertEqual(first, 0x80000000)
+        self.assertEqual(second, 0x80002000)
+
     def test_filesystem_resolves_guest_paths_inside_extracted_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -136,6 +194,19 @@ class RuntimeShimTests(unittest.TestCase):
                 resolved_dash,
                 dashboard_root / "XODash" / "xonlinedash.xbe",
             )
+            raw_partition_path = "\\Device\\Harddisk0\\partition0"
+            self.assertEqual(
+                runtime.filesystem.resolve_guest_path(raw_partition_path),
+                cache_root / "partition0.bin",
+            )
+            raw_partition = runtime.filesystem.open_file(
+                raw_partition_path,
+                "ab",
+                create_disposition=1,
+            )
+            self.assertEqual(raw_partition["status"], XboxStatus.SUCCESS)
+            self.assertEqual(raw_partition["root_kind"], "cache")
+            self.assertEqual((cache_root / "partition0.bin").stat().st_size, 0xA00)
             self.assertEqual(
                 runtime.filesystem.resolve_guest_path("U:\\"),
                 save_root / "UDATA" / "41430019",
@@ -405,10 +476,14 @@ class RuntimeShimTests(unittest.TestCase):
         class RecordingAudioOutput:
             def __init__(self) -> None:
                 self.calls: list[dict[str, object]] = []
+                self.closed = False
 
             def submit_pcm(self, payload: bytes, **format_fields: object) -> bool:
                 self.calls.append({"payload": payload, **format_fields})
                 return True
+
+            def close(self) -> None:
+                self.closed = True
 
         output = RecordingAudioOutput()
         runtime.audio.set_output_backend(output)
@@ -438,6 +513,8 @@ class RuntimeShimTests(unittest.TestCase):
         self.assertGreater(playback["consumed_bytes"], 0)
         summary = runtime.summary()
         self.assertTrue(summary["audio_initialized"])
+        runtime.audio.close_output_backend()
+        self.assertTrue(output.closed)
         self.assertEqual(summary["input"]["ports"]["0"]["poll_count"], 1)
         self.assertEqual(summary["input"]["ports"]["0"]["last_latency_samples"], 1)
         self.assertEqual(summary["audio_streams"][0]["submitted_buffer_count"], 1)

@@ -19,11 +19,11 @@ from runtime.xbox.shims import (
 )
 from tests.unit.test_xbe_info import _synthetic_xbe
 from tools.loader.xbe_loader import ImportResolver, load_xbe_bytes
-from tools.playability.host_audio import PcmClip
+from tools.playability import playability_probe
 from tools.playability.playability_probe import (
     DEFAULT_MAX_BLOCK_INSTRUCTIONS,
     GUEST_ARGUMENT_COUNT_OVERRIDES,
-    DynamicBlockCache,
+    DecodedBlockStore,
     RuntimeAbiBridge,
     RenderWriteWatchpoint,
     LiveHostBridge,
@@ -32,6 +32,15 @@ from tools.playability.playability_probe import (
     TITLE_XINPUT_HANDLE_BASE,
     _cooperative_wait_plan,
     _BoundedDiagnosticHistory,
+    _native_normal_runtime_return_constant,
+    _record_native_normal_runtime_coverage_gap,
+    _register_stack_argument_code_pointer_targets,
+    _recover_required_aot_callbacks,
+    _file_backed_pointer_table_ranges,
+    _probe_execution_failure,
+    _static_code_pointer_table_targets,
+    _stack_argument_code_pointer_targets,
+    _stored_code_pointer_targets,
     _read_text_file_shared,
     _read_dynamic_block_window,
     _resume_cooperative_wait,
@@ -99,6 +108,10 @@ from tools.playability.playability_probe import (
     TITLE_WORLD_MATRIX_ROTATION_BUILD_ADDRESS,
     TITLE_WORLD_MATRIX_ROTATION_BUILD_RETURN_ADDRESS,
     TITLE_DIRECTSOUND_BUFFER_SYNC_ADDRESS,
+    TITLE_DIRECTSOUND_VOICE_FLAGS_OFFSET,
+    TITLE_DIRECTSOUND_VOICE_OBJECT_OFFSET,
+    TITLE_DIRECTSOUND_VOICE_WAIT_LOOP_ADDRESS,
+    TITLE_DIRECTSOUND_VOICE_WAIT_RESUME_ADDRESS,
     TITLE_GLOBAL_LIST_HEAD_ADDRESS,
     TITLE_GLOBAL_LIST_OWNER_FLAG,
     TITLE_GLOBAL_LIST_ACTIVE_FLAG,
@@ -143,6 +156,8 @@ from tools.playability.playability_probe import (
     TITLE_RUNTIME_OBJECT_CONSTRUCTOR_SPECS,
     TITLE_RUNTIME_OBJECT_TABLE_USE_ADDRESS,
     TITLE_RUNTIME_CALLBACK_DISPATCH_ADDRESSES,
+    TITLE_LEVEL_ADDRESS_TAKEN_CALLBACK_TARGETS,
+    TITLE_STACK_CALLBACK_ARGUMENT_INDICES,
     TITLE_RUNTIME_CALLBACK_GLOBAL_OBJECT_ADDRESS,
     TITLE_RUNTIME_CALLBACK_LIST_OFFSET,
     TITLE_FRONTEND_SYNTHETIC_CHILD_DESCRIPTOR_BASE_ADDRESS,
@@ -203,6 +218,7 @@ from tools.playability.playability_probe import (
     TITLE_VERTEX_APPEND_STACK_CLEANUP,
     TITLE_VERTEX_APPEND_STRIDE,
     TITLE_GPU_PFIFO_CACHE1_STATUS_ADDRESS,
+    TITLE_EXACT_MEMORY_CALLBACK_ADDRESSES,
     TITLE_GPU_PFIFO_IDLE_BIT,
     TITLE_GPU_PFIFO_INTERRUPT_STATUS_ADDRESS,
     TITLE_GPU_PFIFO_RUNOUT_STATUS_ADDRESS,
@@ -261,6 +277,7 @@ from tools.playability.playability_probe import (
     _load_title_scene_record_sources,
     build_title_scene_record_audit_report,
     _heap_free_list_boundary_from_step_limit,
+    _absolute_indirect_jump_table_targets,
     _recover_missing_branch_targets,
     _playability_gaps,
     _recovered_render_command_stream,
@@ -270,7 +287,10 @@ from tools.playability.playability_probe import (
     _title_render_loop_boundary_from_step_limit,
     build_playability_probe_summary,
 )
-from tools.recomp.audit_x86_coverage import _dynamic_block_cache_seed_addresses
+from tools.recomp.audit_x86_coverage import (
+    _decoded_block_store_seed_addresses,
+    _file_backed_code_ranges,
+)
 from tools.recomp.x86_lifter import (
     CpuState,
     ExecutionTrace,
@@ -304,6 +324,494 @@ def _call_relative_bytes(base_address: int, target_address: int) -> bytes:
 
 
 class PlayabilityProbeTests(unittest.TestCase):
+    def test_pointer_table_ranges_include_file_backed_executable_data_islands(
+        self,
+    ) -> None:
+        loaded = load_xbe_bytes(_synthetic_xbe()[0])
+        expected = tuple(
+            (
+                region.virtual_address,
+                region.virtual_address + region.file_backed_size,
+            )
+            for region in loaded.arena.regions
+            if region.kind == "section" and region.file_backed_size > 0
+        )
+
+        self.assertEqual(_file_backed_pointer_table_ranges(loaded), expected)
+        self.assertEqual(
+            [
+                region.name
+                for region in loaded.arena.regions
+                if region.kind == "section" and region.file_backed_size > 0
+            ],
+            [".text", ".data"],
+        )
+
+    def test_coverage_audit_uses_file_backed_code_sections_only(self) -> None:
+        ranges = _file_backed_code_ranges(
+            {
+                "sections": [
+                    {
+                        "name": ".text",
+                        "virtual_address": 0x1000,
+                        "raw_size": 0x200,
+                        "flag_names": ["EXECUTABLE"],
+                    },
+                    {
+                        "name": ".rdata",
+                        "virtual_address": 0x2000,
+                        "raw_size": 0x100,
+                        "flag_names": ["EXECUTABLE"],
+                    },
+                    {
+                        "name": ".data",
+                        "virtual_address": 0x3000,
+                        "raw_size": 0x100,
+                        "flag_names": ["EXECUTABLE"],
+                    },
+                    {
+                        "name": "DSOUND",
+                        "virtual_address": 0x4000,
+                        "raw_size": 0x80,
+                        "flag_names": ["EXECUTABLE", "WRITABLE"],
+                    },
+                    {
+                        "name": "$$XTIMAGE",
+                        "virtual_address": 0x5000,
+                        "raw_size": 0x40,
+                        "flag_names": ["READABLE"],
+                    },
+                ]
+            }
+        )
+
+        self.assertEqual(ranges, [(0x1000, 0x1200), (0x4000, 0x4080)])
+
+    def test_static_code_pointer_tables_filter_packed_data_and_known_code(
+        self,
+    ) -> None:
+        known = lift_x86_function(
+            bytes.fromhex("40C3"),
+            base_address=0x2000,
+            symbol="known_table_method",
+        )
+        table_words = {
+            0x5000: 0x2000,
+            0x5004: 0x2103,
+            0x5008: 0x2205,
+            0x500C: 0x2307,
+            0x5010: 0x2409,
+            0x5014: 0,
+            0x5018: 0x3000,
+            0x501C: 0x3100,
+            0x5020: 0x3200,
+            0x5024: 0x3300,
+        }
+        prefixes = {
+            0x20F3: b"\x01" * 15 + b"\xC3",
+            0x21F5: b"\x01" * 13 + b"\xC2\x04\x00",
+            0x22F7: b"\x01" * 13 + b"\xC2\x04\x00",
+            0x2FF0: b"\x01" * 14 + b"\x90\x90",
+            0x30F0: b"\x01" * 16,
+            0x31F0: b"\x01" * 16,
+            0x32F0: b"\x01" * 16,
+        }
+
+        targets = _static_code_pointer_table_targets(
+            [known],
+            read_bytes=lambda address, _size: prefixes[address],
+            read_u32=lambda address: table_words.get(address, 0),
+            is_code=lambda address: 0x2000 <= address < 0x4000,
+            table_ranges=((0x5000, 0x5028),),
+        )
+
+        self.assertEqual(targets, (0x2103, 0x2205, 0x2307, 0x2409))
+
+    def test_static_code_pointer_tables_recover_strided_descriptor_callbacks(
+        self,
+    ) -> None:
+        words = {
+            0x5000: 0x6000,
+            0x5004: 0,
+            0x5008: 0,
+            0x500C: 0x6010,
+            0x5010: 1,
+            0x5014: 0x2103,
+            0x5018: 0x6020,
+            0x501C: 0,
+            0x5020: 0,
+            0x5024: 0x6030,
+            0x5028: 1,
+            0x502C: 0x2205,
+            0x5030: 0x6040,
+            0x5034: 0,
+            0x5038: 0,
+            0x503C: 0x6050,
+            0x5040: 1,
+            0x5044: 0x2307,
+        }
+        prefixes = {
+            0x20F3: b"\x01" * 15 + b"\xC3",
+            0x21F5: b"\x01" * 13 + b"\xC2\x04\x00",
+            0x22F7: b"\x01" * 13 + b"\xC2\x04\x00",
+        }
+        table_data = bytearray(0x80)
+        for address, value in words.items():
+            struct.pack_into("<I", table_data, address - 0x5000, value)
+
+        def read_bytes(address: int, size: int) -> bytes:
+            if 0x5000 <= address and address + size <= 0x5080:
+                return bytes(table_data[address - 0x5000 : address - 0x5000 + size])
+            if 0x6000 <= address and address + size <= 0x6080:
+                return bytes(size)
+            return prefixes[address]
+
+        targets = _static_code_pointer_table_targets(
+            [],
+            read_bytes=read_bytes,
+            read_u32=lambda address: words.get(address, 0),
+            is_code=lambda address: 0x2000 <= address < 0x3000,
+            table_ranges=((0x5000, 0x5080), (0x6000, 0x6080)),
+        )
+
+        self.assertEqual(targets, (0x2103, 0x2205, 0x2307))
+
+    def test_stored_code_pointer_batch_filters_values_and_accepts_tables(self) -> None:
+        def store_immediate(target: int) -> bytes:
+            return b"\xC7\x00" + struct.pack("<I", target)
+
+        def store_absolute(destination: int, target: int) -> bytes:
+            return (
+                b"\xC7\x05"
+                + struct.pack("<I", destination)
+                + struct.pack("<I", target)
+            )
+
+        singleton_stores = lift_x86_function(
+            b"".join(
+                (
+                    store_immediate(0x2000),
+                    store_immediate(0x3000),
+                    store_immediate(0x1001),
+                    b"\xC3",
+                )
+            ),
+            base_address=0x1000,
+            symbol="singleton_stores",
+        )
+        initializer_stores = lift_x86_function(
+            b"".join(
+                (
+                    store_absolute(0x5000, 0x2103),
+                    store_absolute(0x5004, 0x2205),
+                    store_absolute(0x5008, 0x2307),
+                    b"\xC3",
+                )
+            ),
+            base_address=0x1100,
+            symbol="initializer_stores",
+        )
+        prefixes = {
+            0x1FF0: b"\x01" * 14 + b"\x90\x90",
+            0x20F3: b"\x01" * 15 + b"\xC3",
+            0x21F5: b"\x01" * 16,
+            0x22F7: b"\x01" * 16,
+            0x2FF0: b"\x01" * 16,
+        }
+
+        targets = _stored_code_pointer_targets(
+            [singleton_stores, initializer_stores],
+            read_bytes=lambda address, _size: prefixes[address],
+            is_code=lambda address: 0x1000 <= address < 0x4000,
+        )
+
+        self.assertEqual(targets, (0x2000, 0x2103, 0x2205, 0x2307))
+
+    def test_stack_callback_recovery_uses_proven_consumer_argument(self) -> None:
+        constructor_callback = 0x2409
+        constructor_call_address = 0x1209
+        constructor_caller = lift_x86_function(
+            b"".join(
+                (
+                    b"\x68" + struct.pack("<I", constructor_callback),
+                    b"\x57\x6A\x20\x50",
+                    _call_relative_bytes(constructor_call_address, 0x134D0),
+                    b"\xC3",
+                )
+            ),
+            base_address=0x1200,
+            symbol="vector_constructor_caller",
+        )
+        iterator_callback = 0x260D
+        iterator_call_address = 0x1308
+        iterator_caller = lift_x86_function(
+            b"".join(
+                (
+                    b"\x6A\x00",
+                    b"\x68" + struct.pack("<I", iterator_callback),
+                    b"\x50",
+                    _call_relative_bytes(iterator_call_address, 0xFD810),
+                    b"\xC3",
+                )
+            ),
+            base_address=0x1300,
+            symbol="linked_list_iterator_caller",
+        )
+        spatial_callback = 0x280D
+        spatial_call_address = 0x1413
+        spatial_caller = lift_x86_function(
+            b"".join(
+                (
+                    b"\x6A\x00",
+                    b"\x68" + struct.pack("<I", spatial_callback),
+                    b"\x8D\x54\x24\x08\x8B\xCE\x52",
+                    b"\x8B\xC0\x57\x8B\xCE",
+                    _call_relative_bytes(spatial_call_address, 0x8F3D0),
+                    b"\xC3",
+                )
+            ),
+            base_address=0x1400,
+            symbol="spatial_query_caller",
+        )
+        collision_callback = 0x2A0D
+        collision_call_address = 0x1613
+        collision_caller = lift_x86_function(
+            b"".join(
+                (
+                    b"\x6A\x00",
+                    b"\x68" + struct.pack("<I", collision_callback),
+                    b"\x8D\x54\x24\x08\x8B\xCE\x52",
+                    b"\x8B\xC0\x57\x8B\xCE",
+                    _call_relative_bytes(collision_call_address, 0x90420),
+                    b"\xC3",
+                )
+            ),
+            base_address=0x1600,
+            symbol="spatial_collision_caller",
+        )
+        frontend_callback = 0x2C0D
+        frontend_setup = bytearray()
+        frontend_setup.extend(b"\x6A\x01\x52")
+        frontend_setup.extend(b"\x68" + struct.pack("<I", frontend_callback))
+        frontend_setup.extend(b"\x55\x55")
+        frontend_call_address = 0x1700 + len(frontend_setup)
+        frontend_setup.extend(
+            _call_relative_bytes(
+                frontend_call_address,
+                TITLE_FRONTEND_COMPARE_SEARCH_ADDRESS,
+            )
+        )
+        frontend_setup.extend(b"\xC3")
+        frontend_caller = lift_x86_function(
+            bytes(frontend_setup),
+            base_address=0x1700,
+            symbol="frontend_compare_search_caller",
+        )
+
+        targets = _stack_argument_code_pointer_targets(
+            [
+                constructor_caller,
+                iterator_caller,
+                spatial_caller,
+                collision_caller,
+                frontend_caller,
+            ],
+            read_bytes=lambda address, _size: {
+                constructor_callback - 16: b"\x01" * 15 + b"\xC3",
+                iterator_callback - 16: b"\x01" * 15 + b"\xC3",
+                spatial_callback - 16: b"\x01" * 15 + b"\xC3",
+                collision_callback - 16: b"\x01" * 15 + b"\xC3",
+                frontend_callback - 16: b"\x01" * 15 + b"\xC3",
+            }[address],
+            is_code=lambda address: 0x1000 <= address < 0x14000,
+            callback_argument_indices=TITLE_STACK_CALLBACK_ARGUMENT_INDICES,
+        )
+
+        self.assertEqual(
+            targets,
+            (
+                constructor_callback,
+                iterator_callback,
+                spatial_callback,
+                collision_callback,
+                frontend_callback,
+            ),
+        )
+
+    def test_stack_callback_recovery_stops_at_stack_mutation(self) -> None:
+        callback = 0x2A0D
+        call_address = 0x150D
+        function = lift_x86_function(
+            b"".join(
+                (
+                    b"\x68" + struct.pack("<I", callback),
+                    b"\x53\x50\x83\xC4\x04\x51\x8B\xCE",
+                    _call_relative_bytes(call_address, 0x8F3D0),
+                    b"\xC3",
+                )
+            ),
+            base_address=0x1500,
+            symbol="stack_mutating_caller",
+        )
+
+        targets = _stack_argument_code_pointer_targets(
+            [function],
+            read_bytes=lambda address, _size: {
+                callback - 16: b"\x01" * 15 + b"\xC3"
+            }[address],
+            is_code=lambda address: 0x1000 <= address < 0x14000,
+            callback_argument_indices={0x8F3D0: 2},
+        )
+
+        self.assertEqual(targets, ())
+
+    def test_register_callback_recovery_covers_frontend_branch_family(self) -> None:
+        first_callback = 0x2409
+        second_callback = 0x2511
+        first_definition = lift_x86_function(
+            b"\xBF" + struct.pack("<I", first_callback) + b"\xC3",
+            base_address=0x1000,
+            symbol="frontend_callback_first",
+        )
+        second_definition = lift_x86_function(
+            b"\xBF" + struct.pack("<I", second_callback) + b"\xC3",
+            base_address=0x1080,
+            symbol="frontend_callback_second",
+        )
+        setup = bytearray()
+        setup.extend(b"\x57\x6A\x00\x83\xEC\x08")
+        setup.extend(b"\x6A\x00" * 4)
+        call_address = 0x1100 + len(setup)
+        setup.extend(_call_relative_bytes(call_address, 0x1D180))
+        setup.extend(b"\xC3")
+        caller = lift_x86_function(
+            bytes(setup),
+            base_address=0x1100,
+            symbol="frontend_card_constructor_caller",
+        )
+        prefixes = {
+            first_callback - 16: b"\x01" * 15 + b"\xC3",
+            second_callback - 16: b"\x01" * 15 + b"\xC3",
+        }
+
+        targets = _register_stack_argument_code_pointer_targets(
+            [first_definition, second_definition, caller],
+            read_bytes=lambda address, _size: prefixes[address],
+            is_code=lambda address: 0x1000 <= address < 0x3000,
+            callback_argument_indices={0x1D180: 7},
+        )
+
+        self.assertEqual(targets, (first_callback, second_callback))
+
+    def test_level_address_taken_callback_family_is_recovered_for_aot(self) -> None:
+        known = lift_x86_function(
+            bytes.fromhex("40C3"),
+            base_address=0x00116580,
+            symbol="known_callback",
+        )
+        loaded_targets: list[int] = []
+
+        def load_block(target: int) -> LiftedFunction:
+            loaded_targets.append(target)
+            return lift_x86_function(
+                bytes.fromhex("48C3"),
+                base_address=target,
+                symbol=f"callback_{target:08X}",
+            )
+
+        recovered = _recover_required_aot_callbacks(
+            [known],
+            targets=(0x00116580, 0x00116DD0, 0x00116E50),
+            block_loader=load_block,
+        )
+
+        self.assertEqual(loaded_targets, [0x00116DD0, 0x00116E50])
+        self.assertEqual(
+            [function.base_address for function in recovered],
+            [0x00116DD0, 0x00116E50],
+        )
+        self.assertTrue(
+            {
+                0x00116580,
+                0x00116C30,
+                0x00116D80,
+                0x00116DD0,
+                0x00116E50,
+                0x0011B640,
+            }.issubset(TITLE_LEVEL_ADDRESS_TAKEN_CALLBACK_TARGETS)
+        )
+
+    def test_native_runtime_unknown_target_is_decoded_for_next_aot(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex("40C3"),
+            base_address=0x00111040,
+            symbol="dynamic_block_00111040",
+        )
+        loaded_targets: list[int] = []
+
+        def load_block(target: int) -> LiftedFunction:
+            loaded_targets.append(target)
+            return function
+
+        result = _record_native_normal_runtime_coverage_gap(
+            {
+                "reason": "native_runtime_failure",
+                "target": 0x00111040,
+            },
+            failure_code=9,
+            failure_target=0x00111040,
+            is_executable=lambda target: target == 0x00111040,
+            block_loader=load_block,
+        )
+
+        self.assertEqual(loaded_targets, [0x00111040])
+        self.assertEqual(
+            result,
+            {
+                "failure_code": 9,
+                "target": 0x00111040,
+                "target_hex": "0x00111040",
+                "static_rebuild_required": True,
+                "status": "decoded_for_next_aot",
+                "symbol": "dynamic_block_00111040",
+                "instruction_count": 2,
+            },
+        )
+
+    def test_native_runtime_noncoverage_failure_is_not_decoded(self) -> None:
+        loaded_targets: list[int] = []
+
+        result = _record_native_normal_runtime_coverage_gap(
+            {
+                "reason": "native_runtime_failure",
+                "target": 0x00111040,
+            },
+            failure_code=8,
+            failure_target=0x00111040,
+            is_executable=lambda _target: True,
+            block_loader=lambda target: loaded_targets.append(target),
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(loaded_targets, [])
+
+    def test_native_runtime_nonexecutable_target_is_not_decoded(self) -> None:
+        loaded_targets: list[int] = []
+
+        result = _record_native_normal_runtime_coverage_gap(
+            {
+                "reason": "native_runtime_failure",
+                "target": 0x8381C000,
+            },
+            failure_code=9,
+            failure_target=0x8381C000,
+            is_executable=lambda _target: False,
+            block_loader=lambda target: loaded_targets.append(target),
+        )
+
+        self.assertEqual(result["status"], "non_executable_target")
+        self.assertEqual(loaded_targets, [])
+
     def test_native_frontier_batches_keep_prior_module_stable(self) -> None:
         first = lift_x86_function(
             bytes.fromhex("40C3"),
@@ -559,6 +1067,12 @@ class PlayabilityProbeTests(unittest.TestCase):
 
     def test_device_io_control_uses_observed_ten_argument_guest_contract(self) -> None:
         self.assertEqual(GUEST_ARGUMENT_COUNT_OVERRIDES["NtDeviceIoControlFile"], 10)
+
+    def test_fs_control_uses_observed_ten_argument_guest_contract(self) -> None:
+        self.assertEqual(GUEST_ARGUMENT_COUNT_OVERRIDES["NtFsControlFile"], 10)
+
+    def test_nt_create_file_uses_observed_nine_argument_xbox_contract(self) -> None:
+        self.assertEqual(GUEST_ARGUMENT_COUNT_OVERRIDES["NtCreateFile"], 9)
 
     def test_render_watchpoint_retains_delayed_capture_window(self) -> None:
         watchpoint = RenderWriteWatchpoint(max_writes=4, stop_after=5, capture_after=2)
@@ -1528,7 +2042,7 @@ class PlayabilityProbeTests(unittest.TestCase):
             (2 << 18) | 0x1B00,
             texture_address,
             texture_format,
-            (1 << 18) | 0x1B18,
+            (1 << 18) | 0x1B1C,
             image_rect,
             (1 << 18) | 0x17FC,
             8,
@@ -1570,8 +2084,8 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertTrue(memory.native_cache_physical_aliases)
         self.assertEqual(memory.native_cache_address(cpu_alias), physical_address)
         self.assertTrue(memory.native_cacheable_address(0x83380000))
-        self.assertFalse(memory.native_cacheable_address(0x80000000))
-        self.assertFalse(memory.native_cacheable_address(0x84000000))
+        self.assertTrue(memory.native_cacheable_address(0x80000000))
+        self.assertTrue(memory.native_cacheable_address(0x84000000))
 
         function = lift_x86_function(
             b"\xA1" + struct.pack("<I", cpu_alias) + b"\xC3",
@@ -1876,7 +2390,7 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(fast_path.summary()["submitted_clip_count"], 0)
         self.assertFalse(fast_path.invocations[0]["playback_started"])
 
-    def test_title_frontend_special_audio_fast_path_submits_requested_clip(self) -> None:
+    def test_title_frontend_special_audio_fast_path_does_not_play_on_create(self) -> None:
         class RecordingOutput:
             def __init__(self) -> None:
                 self.submissions: list[tuple[bytes, dict[str, int]]] = []
@@ -1898,30 +2412,19 @@ class PlayabilityProbeTests(unittest.TestCase):
         )
         cpu = CpuState.with_registers(ecx=0x003D6870, esp=0x8000)
         memory = SparseMemory({0x8004: 1, 0x8000: 0xFEEDFACE})
-        clips = [
-            PcmClip(44100, 1, 16, b"first"),
-            PcmClip(22050, 1, 16, b"second"),
-        ]
-
-        with patch(
-            "tools.playability.playability_probe.parse_rws_pcm",
-            return_value=clips,
-        ):
-            fast_path.create_handler(
-                cpu,
-                memory,
-                TITLE_FRONTEND_SPECIAL_AUDIO_CREATE_ADDRESS,
-                ExecutionTrace(),
-            )
-
-        self.assertEqual(
-            output.submissions,
-            [(b"second", {"sample_rate": 22050, "channels": 1, "bits_per_sample": 16})],
+        fast_path.create_handler(
+            cpu,
+            memory,
+            TITLE_FRONTEND_SPECIAL_AUDIO_CREATE_ADDRESS,
+            ExecutionTrace(),
         )
-        self.assertEqual(fast_path.summary()["submitted_clip_count"], 1)
-        self.assertTrue(fast_path.invocations[0]["playback_started"])
 
-    def test_title_music_mode_fast_path_submits_menu_track_on_transition(self) -> None:
+        self.assertEqual(output.submissions, [])
+        self.assertEqual(fast_path.summary()["submitted_clip_count"], 0)
+        self.assertFalse(fast_path.invocations[0]["playback_started"])
+        self.assertTrue(fast_path.invocations[0]["playback_suppressed"])
+
+    def test_title_music_mode_fast_path_only_tracks_diagnostic_state(self) -> None:
         class RecordingOutput:
             def __init__(self) -> None:
                 self.submissions: list[tuple[bytes, dict[str, int | bool]]] = []
@@ -1952,19 +2455,13 @@ class PlayabilityProbeTests(unittest.TestCase):
             object_holder_address = 0x9400
             state = CpuState.with_registers(ecx=object_holder_address, esp=0x8000)
             memory = SparseMemory({0x8000: 0xFEEDFACE})
-            clip = PcmClip(48000, 2, 16, b"\x01\x02\x03\x04")
-
-            with patch(
-                "tools.playability.playability_probe.parse_rws_xbox_adpcm",
-                return_value=clip,
-            ):
-                result = execute_lifted_function(
-                    function,
-                    state=state,
-                    memory=memory,
-                    call_handlers=fast_path.call_handlers(),
-                    max_steps=5,
-                )
+            result = execute_lifted_function(
+                function,
+                state=state,
+                memory=memory,
+                call_handlers=fast_path.call_handlers(),
+                max_steps=5,
+            )
 
             self.assertEqual(result.return_address, 0xFEEDFACE)
             self.assertEqual(
@@ -1975,51 +2472,19 @@ class PlayabilityProbeTests(unittest.TestCase):
                 memory.read_u32(TITLE_MUSIC_SYNTHETIC_MANAGER_ADDRESS + 0x38),
                 2,
             )
-            self.assertEqual(
-                output.submissions,
-                [
-                    (
-                        clip.payload,
-                        {
-                            "sample_rate": 48000,
-                            "channels": 2,
-                            "bits_per_sample": 16,
-                            "loop": True,
-                        },
-                    )
-                ],
-            )
-            self.assertEqual(fast_path.summary()["decoded_track_count"], 1)
-            self.assertEqual(fast_path.summary()["submitted_track_count"], 1)
-            self.assertTrue(fast_path.summary()["recent_invocations"][0]["playback_started"])
+            self.assertEqual(output.submissions, [])
+            self.assertEqual(fast_path.summary()["decoded_track_count"], 0)
+            self.assertEqual(fast_path.summary()["submitted_track_count"], 0)
+            invocation = fast_path.summary()["recent_invocations"][0]
+            self.assertFalse(invocation["playback_started"])
+            self.assertTrue(invocation["playback_suppressed"])
 
-    def test_title_music_mode_fast_path_reuses_validated_pcm_cache(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            track = root / "music0" / "trk07menust.rws"
-            track.parent.mkdir(parents=True)
-            track.write_bytes(b"stable-streamed-menu-track")
-            cache_dir = root / "cache"
-            runtime = XboxRuntimeShims(XboxRuntimeConfig(extracted_disc_root=root))
-            clip = PcmClip(48000, 2, 16, b"\x01\x02\x03\x04")
-            first = TitleMusicModeFastPath(runtime, None, cache_dir=cache_dir)
+    def test_title_music_mode_fast_path_has_no_hardcoded_pcm_loader(self) -> None:
+        fast_path = TitleMusicModeFastPath(XboxRuntimeShims(), None)
 
-            with patch(
-                "tools.playability.playability_probe.parse_rws_xbox_adpcm",
-                return_value=clip,
-            ):
-                self.assertEqual(first._load_menu_clip(), clip)
-
-            second = TitleMusicModeFastPath(runtime, None, cache_dir=cache_dir)
-            with patch(
-                "tools.playability.playability_probe.parse_rws_xbox_adpcm",
-                side_effect=AssertionError("valid cache should bypass the decoder"),
-            ):
-                self.assertEqual(second._load_menu_clip(), clip)
-
-            self.assertEqual(first.summary()["cache_miss_count"], 1)
-            self.assertEqual(second.summary()["cache_hit_count"], 1)
-            self.assertEqual(second.summary()["decoded_track_count"], 1)
+        self.assertFalse(hasattr(fast_path, "_load_menu_clip"))
+        self.assertEqual(fast_path.summary()["cache_miss_count"], 0)
+        self.assertEqual(fast_path.summary()["cache_hit_count"], 0)
 
     def test_title_asset_stream_open_fast_path_uses_configured_disc_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2495,6 +2960,13 @@ class PlayabilityProbeTests(unittest.TestCase):
             TITLE_FRONTEND_REGISTRY_LIST_SENTINEL_ADDRESS,
             TITLE_FRONTEND_REGISTRY_LIST_SENTINEL_ADDRESS + 4,
             TITLE_FRONTEND_INITIALIZER_LIST_SENTINEL_ADDRESS,
+        )
+
+        self.assertTrue(
+            {
+                TITLE_GPU_PFIFO_RUNOUT_STATUS_ADDRESS,
+                TITLE_GPU_PFIFO_CACHE1_STATUS_ADDRESS,
+            }.issubset(TITLE_EXACT_MEMORY_CALLBACK_ADDRESSES)
         )
 
         for address in addresses:
@@ -4855,6 +5327,101 @@ class PlayabilityProbeTests(unittest.TestCase):
         )
         self.assertEqual(matrix_path["invocation_count"], 1)
 
+    def test_title_native_directsound_wait_delivers_voice_completion(self) -> None:
+        function = lift_x86_function(
+            b"\xC3",
+            base_address=TITLE_DIRECTSOUND_VOICE_WAIT_LOOP_ADDRESS,
+            symbol="title_native_directsound_voice_wait",
+        )
+        interface_address = 0x400000
+        voice_address = 0x410000
+        flags_address = voice_address + TITLE_DIRECTSOUND_VOICE_FLAGS_OFFSET
+        state = CpuState.with_registers(esi=interface_address, esp=0x800000)
+        state.eip = TITLE_DIRECTSOUND_VOICE_WAIT_LOOP_ADDRESS
+        memory = SparseMemory(
+            {
+                interface_address + TITLE_DIRECTSOUND_VOICE_OBJECT_OFFSET: voice_address,
+                flags_address - 1: b"\xA5\x03\x80\x5A",
+            }
+        )
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            executor = NativeResumableExecutor(
+                function,
+                build_dir=Path(temp_dir),
+                native_fast_paths=_title_native_fast_paths(),
+            )
+            returned_to = executor.run(state, memory, max_steps=1)
+            performance = executor.last_run_summary["performance"]
+
+            pending_state = CpuState.with_registers(
+                esi=interface_address,
+                esp=0x800000,
+            )
+            pending_state.eip = TITLE_DIRECTSOUND_VOICE_WAIT_LOOP_ADDRESS
+            pending_memory = SparseMemory(
+                {
+                    interface_address
+                    + TITLE_DIRECTSOUND_VOICE_OBJECT_OFFSET: voice_address,
+                    flags_address: 0x8001,
+                }
+            )
+            pending_returned_to = executor.run(
+                pending_state,
+                pending_memory,
+                max_steps=1,
+            )
+            pending_performance = executor.last_run_summary["performance"]
+
+            completed_state = CpuState.with_registers(
+                esi=interface_address,
+                esp=0x800000,
+            )
+            completed_state.eip = TITLE_DIRECTSOUND_VOICE_WAIT_LOOP_ADDRESS
+            completed_memory = SparseMemory(
+                {
+                    interface_address
+                    + TITLE_DIRECTSOUND_VOICE_OBJECT_OFFSET: voice_address,
+                    flags_address: 1,
+                    0x800000: 0,
+                }
+            )
+            self.assertEqual(
+                executor.run(completed_state, completed_memory, max_steps=1),
+                0,
+            )
+            completed_performance = executor.last_run_summary["performance"]
+
+        self.assertEqual(returned_to, TITLE_DIRECTSOUND_VOICE_WAIT_RESUME_ADDRESS)
+        self.assertEqual(
+            memory.read(flags_address - 1, 4),
+            b"\xA5\x01\x00\x5A",
+        )
+        self.assertEqual(performance["native_fast_path_invocation_count"], 1)
+        completion_path = next(
+            item
+            for item in performance["native_fast_paths"]
+            if item["address"] == TITLE_DIRECTSOUND_VOICE_WAIT_LOOP_ADDRESS
+        )
+        self.assertEqual(completion_path["invocation_count"], 1)
+        self.assertEqual(
+            pending_returned_to,
+            TITLE_DIRECTSOUND_VOICE_WAIT_RESUME_ADDRESS,
+        )
+        self.assertEqual(pending_memory.read_u32(flags_address), 1)
+        self.assertEqual(
+            pending_performance["native_fast_path_invocation_count"],
+            1,
+        )
+        self.assertEqual(
+            completed_memory.read_u32(flags_address),
+            1,
+        )
+        self.assertEqual(
+            completed_performance["native_fast_path_invocation_count"],
+            0,
+        )
+
     def test_title_vertex_append_fast_path_captures_malformed_vertex_provenance(
         self,
     ) -> None:
@@ -7157,6 +7724,78 @@ class PlayabilityProbeTests(unittest.TestCase):
         )
         self.assertEqual(memory.read_u32(tick_shim.target_address), 0)
 
+    def test_runtime_abi_bridge_uses_xbox_crypto_stack_contracts(self) -> None:
+        resolver = ImportResolver()
+        runtime = XboxRuntimeShims()
+        runtime.register_kernel_imports(
+            resolver,
+            imported_ordinals=[335, 336, 337, 338, 339, 340],
+        )
+        bridge = RuntimeAbiBridge(runtime)
+
+        self.assertEqual(
+            {
+                shim.name: bridge.guest_stack_cleanup_bytes(
+                    shim.target_address
+                )
+                for shim in runtime.registered_shims
+            },
+            {
+                "XcSHAInit": 4,
+                "XcSHAUpdate": 12,
+                "XcSHAFinal": 8,
+                "XcRC4Key": 12,
+                "XcRC4Crypt": 12,
+                "XcHMAC": 28,
+            },
+        )
+
+    def test_runtime_abi_bridge_uses_xbox_time_stack_contracts(self) -> None:
+        resolver = ImportResolver()
+        runtime = XboxRuntimeShims()
+        runtime.register_kernel_imports(
+            resolver,
+            imported_ordinals=[304, 305],
+        )
+        bridge = RuntimeAbiBridge(runtime)
+
+        self.assertEqual(
+            {
+                shim.name: bridge.guest_stack_cleanup_bytes(
+                    shim.target_address
+                )
+                for shim in runtime.registered_shims
+            },
+            {
+                "RtlTimeFieldsToTime": 8,
+                "RtlTimeToTimeFields": 8,
+            },
+        )
+
+    def test_runtime_abi_bridge_uses_xbox_counted_string_stack_contracts(
+        self,
+    ) -> None:
+        resolver = ImportResolver()
+        runtime = XboxRuntimeShims()
+        runtime.register_kernel_imports(
+            resolver,
+            imported_ordinals=[260, 308],
+        )
+        bridge = RuntimeAbiBridge(runtime)
+
+        self.assertEqual(
+            {
+                shim.name: bridge.guest_stack_cleanup_bytes(
+                    shim.target_address
+                )
+                for shim in runtime.registered_shims
+            },
+            {
+                "RtlAnsiStringToUnicodeString": 12,
+                "RtlUnicodeStringToAnsiString": 12,
+            },
+        )
+
     def test_runtime_abi_bridge_cleans_both_shutdown_notification_arguments(self) -> None:
         resolver = ImportResolver()
         runtime = XboxRuntimeShims()
@@ -7321,6 +7960,49 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(result.return_address, 0xDEADC0DE)
         self.assertEqual(result.state.get_register("eax"), 12)
         self.assertEqual(memory.read_u32(tick_shim.target_address), 12)
+
+    def test_runtime_abi_bridge_materializes_xbox_cache_partition_count(self) -> None:
+        resolver = ImportResolver()
+        runtime = XboxRuntimeShims()
+        runtime.register_kernel_imports(resolver, imported_ordinals=[40])
+        bridge = RuntimeAbiBridge(runtime)
+        partition_count_shim = runtime.registered_shims[0]
+        memory = SparseMemory()
+
+        bridge.synchronize_data_exports(memory)
+
+        self.assertEqual(partition_count_shim.name, "HalDiskCachePartitionCount")
+        self.assertEqual(partition_count_shim.behavior, "data")
+        self.assertEqual(memory.read_u32(partition_count_shim.target_address), 3)
+
+    def test_runtime_abi_bridge_materializes_fixed_size_xbox_keys(self) -> None:
+        resolver = ImportResolver()
+        hd_key = bytes(range(16))
+        signature_key = bytes(range(16, 32))
+        runtime = XboxRuntimeShims(
+            XboxRuntimeConfig(
+                xbox_hd_key=hd_key,
+                xbox_signature_key=signature_key,
+            )
+        )
+        runtime.register_kernel_imports(resolver, imported_ordinals=[323, 325])
+        bridge = RuntimeAbiBridge(runtime)
+        memory = SparseMemory()
+
+        bridge.synchronize_data_exports(memory)
+
+        targets = {
+            shim.name: shim.target_address for shim in runtime.registered_shims
+        }
+        self.assertEqual(memory.read(targets["XboxHDKey"], 16), hd_key)
+        self.assertEqual(
+            memory.read(targets["XboxSignatureKey"], 16), signature_key
+        )
+        summaries = {
+            item["name"]: item for item in bridge.summary()["materialized_data_exports"]
+        }
+        self.assertEqual(summaries["XboxHDKey"]["byte_count"], 16)
+        self.assertNotIn("value", summaries["XboxHDKey"])
 
     def test_runtime_abi_bridge_cleans_observed_tv_encoder_guest_arguments(self) -> None:
         resolver = ImportResolver()
@@ -7824,7 +8506,7 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(invocation.handler_arguments, arguments)
         self.assertEqual(invocation.stack_cleanup_bytes, 20)
         self.assertEqual(invocation.return_kind, "int")
-        self.assertEqual(state.get_register("eax"), 0x20000000)
+        self.assertEqual(state.get_register("eax"), 0x80000000)
         self.assertEqual(memory.read_u32(0x8000 + 20), 0xDEADC0DE)
 
     def test_runtime_abi_bridge_returns_null_for_zero_contiguous_memory_ex(self) -> None:
@@ -8006,6 +8688,19 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(state.get_register("eax"), XboxStatus.SUCCESS)
         self.assertEqual(state.get_register("esp"), 0x8008)
         self.assertEqual(memory.read_u32(0x8008), return_address)
+
+    def test_native_normal_runtime_owns_phy_success_services(self) -> None:
+        self.assertEqual(
+            _native_normal_runtime_return_constant("PhyInitialize"),
+            XboxStatus.SUCCESS,
+        )
+        self.assertEqual(
+            _native_normal_runtime_return_constant("PhyGetLinkState"),
+            XboxStatus.SUCCESS,
+        )
+        self.assertIsNone(
+            _native_normal_runtime_return_constant("PsCreateSystemThreadEx")
+        )
 
     def test_runtime_abi_bridge_cleans_phy_get_link_state_argument(self) -> None:
         resolver = ImportResolver()
@@ -8476,7 +9171,7 @@ class PlayabilityProbeTests(unittest.TestCase):
             ["candidate_header_size", "next_free_link"],
         )
 
-    def test_dynamic_block_cache_round_trips_decoded_metadata(self) -> None:
+    def test_decoded_block_store_round_trips_decoded_metadata(self) -> None:
         function = LiftedFunction(
             symbol="dynamic_block_00001000",
             base_address=0x1000,
@@ -8492,7 +9187,7 @@ class PlayabilityProbeTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "decoded-blocks.sqlite3"
-            cache = DynamicBlockCache(path)
+            cache = DecodedBlockStore(path)
             key = cache.key(
                 image_sha256="ABCDEF",
                 target=0x1000,
@@ -8504,11 +9199,11 @@ class PlayabilityProbeTests(unittest.TestCase):
             cache.save()
             cache.close()
 
-            loaded_cache = DynamicBlockCache(path)
+            loaded_cache = DecodedBlockStore(path)
             cached = loaded_cache.get(key)
             backend = loaded_cache.summary()["backend"]
             loaded_cache.close()
-            audit_record_count, audit_seeds = _dynamic_block_cache_seed_addresses(path)
+            audit_record_count, audit_seeds = _decoded_block_store_seed_addresses(path)
 
         self.assertIsNotNone(cached)
         assert cached is not None
@@ -8519,7 +9214,7 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(audit_record_count, 1)
         self.assertEqual(audit_seeds, {0x1000})
 
-    def test_dynamic_block_cache_refreshes_legacy_decoder_semantics(self) -> None:
+    def test_decoded_block_store_refreshes_legacy_decoder_semantics(self) -> None:
         legacy_function = LiftedFunction(
             symbol="dynamic_block_00001000",
             base_address=0x1000,
@@ -8544,7 +9239,7 @@ class PlayabilityProbeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "decoded-blocks.sqlite3"
             legacy_path = Path(temp_dir) / "dynamic-block-cache.json"
-            empty_store = DynamicBlockCache(path)
+            empty_store = DecodedBlockStore(path)
             empty_store.close()
             legacy_path.write_text(
                 json.dumps(
@@ -8566,7 +9261,7 @@ class PlayabilityProbeTests(unittest.TestCase):
                 (),
                 {"arena": SparseMemory({0x1000: bytes.fromhex("D9FED9FFC3")})},
             )()
-            cache = DynamicBlockCache(path, legacy_json_path=legacy_path)
+            cache = DecodedBlockStore(path, legacy_json_path=legacy_path)
 
             cache.prepare_for_image(loaded, image_sha256="ABCDEF")
             current_key = cache.key(
@@ -8610,14 +9305,14 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(summary["migration_source_path"], str(legacy_path))
         self.assertEqual(summary["migration_backup_path"], str(legacy_backups[0]))
 
-    def test_dynamic_block_cache_prunes_least_recently_used_records(self) -> None:
+    def test_decoded_block_store_prunes_least_recently_used_records(self) -> None:
         function = lift_x86_function(
             bytes.fromhex("C3"),
             base_address=0x1000,
             symbol="pruned_dynamic_block",
         )
         with tempfile.TemporaryDirectory() as temp_dir:
-            cache = DynamicBlockCache(
+            cache = DecodedBlockStore(
                 Path(temp_dir) / "decoded-blocks.sqlite3",
                 max_records=1,
             )
@@ -8644,7 +9339,7 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(summary["pruned_records"], 1)
         self.assertEqual(sum(item is not None for item in remaining), 1)
 
-    def test_dynamic_block_cache_recovers_from_preserved_legacy_backup_once(self) -> None:
+    def test_decoded_block_store_recovers_from_preserved_legacy_backup_once(self) -> None:
         function = lift_x86_function(
             bytes.fromhex("40C3"),
             base_address=0x2000,
@@ -8655,7 +9350,7 @@ class PlayabilityProbeTests(unittest.TestCase):
             root = Path(temp_dir)
             path = root / "decoded-blocks.sqlite3"
             backup = root / "dynamic-block-cache.json.legacy-v2.json"
-            empty_store = DynamicBlockCache(path)
+            empty_store = DecodedBlockStore(path)
             empty_store.close()
             backup.write_text(
                 json.dumps(
@@ -8667,7 +9362,7 @@ class PlayabilityProbeTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            cache = DynamicBlockCache(
+            cache = DecodedBlockStore(
                 path,
                 legacy_json_path=backup,
                 preserve_legacy_source=True,
@@ -8682,9 +9377,9 @@ class PlayabilityProbeTests(unittest.TestCase):
             recovered = cache.get(current_key)
             summary = cache.summary()
             cache.close()
-            marker = DynamicBlockCache.metadata_value(
+            marker = DecodedBlockStore.metadata_value(
                 path,
-                DynamicBlockCache.LEGACY_RECOVERY_MARKER,
+                DecodedBlockStore.LEGACY_RECOVERY_MARKER,
             )
             backup_preserved = backup.exists()
 
@@ -9475,8 +10170,6 @@ class PlayabilityProbeTests(unittest.TestCase):
                     0x801C: 0,
                     0x8020: 3,
                     0x8024: 0,
-                    0x8028: 0,
-                    0x802C: 0,
                 }
             )
 
@@ -9487,6 +10180,7 @@ class PlayabilityProbeTests(unittest.TestCase):
 
         invocation = bridge.invocations[0]
         self.assertEqual(invocation.shim_name, "NtCreateFile")
+        self.assertEqual(invocation.stack_cleanup_bytes, 36)
         self.assertEqual(invocation.eax, XboxStatus.SUCCESS)
         self.assertEqual(invocation.result["mode"], "ab")
         self.assertEqual(memory.read_u32(0x6200), invocation.result["handle"])
@@ -9528,8 +10222,6 @@ class PlayabilityProbeTests(unittest.TestCase):
                     0x801C: 3,
                     0x8020: 3,
                     0x8024: 0x00004021,
-                    0x8028: 0,
-                    0x802C: 0,
                 }
             )
 
@@ -9539,6 +10231,7 @@ class PlayabilityProbeTests(unittest.TestCase):
 
         invocation = bridge.invocations[0]
         self.assertEqual(invocation.shim_name, "NtCreateFile")
+        self.assertEqual(invocation.stack_cleanup_bytes, 36)
         self.assertEqual(invocation.eax, XboxStatus.SUCCESS)
         self.assertTrue(invocation.result["is_directory"])
         self.assertFalse(invocation.result["created"])
@@ -9911,6 +10604,76 @@ class PlayabilityProbeTests(unittest.TestCase):
 
         self.assertEqual(gaps, [])
 
+    def test_probe_execution_failure_reports_fatal_guest_thread_only(self) -> None:
+        failed = {
+            "entry_recovery": {
+                "execution": {
+                    "status": "returned",
+                    "guest_thread_executions": [
+                        {
+                            "status": "execution_failed",
+                            "error": "native transport code 9 at 0x0028C180",
+                        }
+                    ],
+                }
+            }
+        }
+        stopped = {
+            "entry_recovery": {
+                "execution": {
+                    "status": "returned",
+                    "guest_thread_executions": [{"status": "live_stop"}],
+                }
+            }
+        }
+
+        self.assertEqual(
+            _probe_execution_failure(failed),
+            "native transport code 9 at 0x0028C180",
+        )
+        self.assertIsNone(_probe_execution_failure(stopped))
+
+    def test_probe_main_returns_failure_for_guest_execution_failure(self) -> None:
+        summary = {
+            "entry_recovery": {
+                "execution": {
+                    "status": "returned",
+                    "guest_thread_executions": [
+                        {"status": "execution_failed", "error": "transport code 9"}
+                    ],
+                }
+            }
+        }
+        target = {
+            "supported": True,
+            "override_used": False,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "probe.json"
+            with (
+                patch.object(
+                    playability_probe,
+                    "verify_supported_xbe",
+                    return_value=target,
+                ),
+                patch.object(
+                    playability_probe,
+                    "build_playability_probe_summary",
+                    return_value=summary,
+                ),
+                patch.object(playability_probe, "git_identity", return_value={}),
+                patch.object(
+                    playability_probe,
+                    "generated_code_identity",
+                    return_value={},
+                ),
+            ):
+                result = playability_probe.main(
+                    ["missing.xbe", "--json-output", str(output), "--quiet"]
+                )
+
+        self.assertEqual(result, 1)
+
     def test_playability_gaps_ignore_bounded_guest_thread(self) -> None:
         gaps = _playability_gaps(
             {
@@ -10130,9 +10893,9 @@ class PlayabilityProbeTests(unittest.TestCase):
             [f"0x{handoff_va:08X}"],
         )
 
-    def test_native_branch_recovery_closes_bounded_direct_branch_gap(self) -> None:
+    def test_native_branch_recovery_closes_static_control_flow_gaps(self) -> None:
         entry = lift_x86_block(
-            b"\x76\x02",
+            b"\x76\x0B",
             base_address=0x1000,
             symbol="entry",
         )
@@ -10140,12 +10903,24 @@ class PlayabilityProbeTests(unittest.TestCase):
 
         def load_block(target: int) -> LiftedFunction | None:
             requested.append(target)
-            if target != 0x1004:
+            if target == 0x1002:
+                return lift_x86_block(
+                    b"\xE8\x04\x00\x00\x00\xC3",
+                    base_address=target,
+                    symbol="fallthrough",
+                )
+            if target == 0x100D:
+                return lift_x86_block(
+                    b"\x31\xC0\xC3",
+                    base_address=target,
+                    symbol="branch",
+                )
+            if target != 0x100B:
                 return None
             return lift_x86_block(
                 b"\x31\xC0\xC3",
                 base_address=target,
-                symbol="recovered",
+                symbol="direct_call",
             )
 
         recovered = _recover_missing_branch_targets(
@@ -10155,8 +10930,52 @@ class PlayabilityProbeTests(unittest.TestCase):
             end_address=0x1010,
         )
 
-        self.assertEqual(requested, [0x1004])
-        self.assertEqual([function.base_address for function in recovered], [0x1004])
+        self.assertEqual(requested, [0x100D, 0x1002, 0x100B])
+        self.assertEqual(
+            [function.base_address for function in recovered],
+            [0x100D, 0x1002, 0x100B],
+        )
+
+    def test_native_branch_recovery_closes_absolute_jump_table_targets(self) -> None:
+        entry = lift_x86_block(
+            bytes.fromhex("FF248D00300000"),
+            base_address=0x1000,
+            symbol="jump_table_entry",
+        )
+        table = {
+            0x2FFC: 0x1300,
+            0x3000: 0x1100,
+            0x3004: 0x1200,
+        }
+        requested: list[int] = []
+
+        def load_block(target: int) -> LiftedFunction | None:
+            requested.append(target)
+            return lift_x86_block(
+                b"\xC3",
+                base_address=target,
+                symbol=f"jump_table_target_{target:08X}",
+            )
+
+        recovered = _recover_missing_branch_targets(
+            [entry],
+            load_block,
+            start_address=0x1000,
+            end_address=0x2000,
+            indirect_target_resolver=lambda function: (
+                _absolute_indirect_jump_table_targets(
+                    function,
+                    read_u32=lambda address: table.get(address, 0),
+                    is_executable=lambda address: 0x1000 <= address < 0x2000,
+                )
+            ),
+        )
+
+        self.assertEqual(requested, [0x1100, 0x1200, 0x1300])
+        self.assertEqual(
+            [function.base_address for function in recovered],
+            [0x1100, 0x1200, 0x1300],
+        )
 
 
     def test_live_host_bridge_publishes_render_and_forwards_controller_state(self) -> None:
@@ -10724,6 +11543,35 @@ class PlayabilityProbeTests(unittest.TestCase):
                 runtime_bridge.summary()["materialized_data_exports"][0]["name"],
                 "KeTickCount",
             )
+
+    def test_live_host_bridge_synchronizes_clock_to_elapsed_time(self) -> None:
+        runtime = XboxRuntimeShims()
+        watchpoint = RenderWriteWatchpoint()
+        flip_header = (1 << 18) | 0x012C
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bridge = LiveHostBridge(
+                runtime,
+                watchpoint,
+                render_stream_path=root / "render.json",
+                controller_state_path=root / "controller.json",
+            )
+            start = runtime.clock.query_interrupt_time()
+            watchpoint.observe(0x80000000, flip_header.to_bytes(4, "little"))
+            watchpoint.observe(0x80000004, (1).to_bytes(4, "little"))
+            watchpoint.observe(0xFED00000, (1).to_bytes(4, "little"))
+
+            bridge._synchronize_live_clock(1_000_000_000)
+            bridge._synchronize_live_clock(1_050_000_000)
+
+            self.assertEqual(
+                runtime.clock.query_interrupt_time() - start,
+                666_667,
+            )
+            self.assertEqual(bridge.clock_wall_sync_ticks_100ns, 500_000)
+            runtime.clock.advance_100ns(1_000_000)
+            bridge._synchronize_live_clock(1_100_000_000)
+            self.assertEqual(bridge.clock_wall_sync_ticks_100ns, 500_000)
 
     def test_render_watchpoint_reports_each_submitted_flip_boundary(self) -> None:
         watchpoint = RenderWriteWatchpoint()

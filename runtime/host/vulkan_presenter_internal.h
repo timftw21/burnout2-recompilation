@@ -73,6 +73,7 @@ using b2r::nv2a::nv2a_unswizzle_texture_2d;
 
 constexpr int64_t kTargetFrameUs = 16667;
 constexpr auto kTargetFrameInterval = std::chrono::nanoseconds(16666667);
+constexpr uint32_t kTargetGuestFrameRateHz = 60u;
 constexpr DWORD kHighResolutionWaitableTimerFlag = 0x00000002u;
 constexpr uint32_t kRecoveredPushBufferBase = 0x80000000u;
 constexpr uint32_t kRecoveredPushBufferApertureSize = 0x01000000u;
@@ -356,6 +357,11 @@ struct PresentedVertexTransformDiagnostics {
     uint64_t invalid_fixed_function_vertex_count = 0;
     uint64_t position_output_vertex_count = 0;
     uint64_t homogeneous_position_vertex_count = 0;
+    uint64_t implicit_position_w_vertex_count = 0;
+    uint64_t invalid_position_w_vertex_count = 0;
+    uint64_t non_finite_position_w_vertex_count = 0;
+    uint64_t defaulted_position_w_vertex_count = 0;
+    uint32_t position_output_mask_union = 0;
     uint64_t screen_space_position_vertex_count = 0;
     uint64_t viewport_mapped_vertex_count = 0;
     uint64_t raw_position_fallback_vertex_count = 0;
@@ -417,6 +423,15 @@ struct PresentedVertexTransformDiagnostics {
             other.invalid_fixed_function_vertex_count;
         position_output_vertex_count += other.position_output_vertex_count;
         homogeneous_position_vertex_count += other.homogeneous_position_vertex_count;
+        implicit_position_w_vertex_count +=
+            other.implicit_position_w_vertex_count;
+        invalid_position_w_vertex_count +=
+            other.invalid_position_w_vertex_count;
+        non_finite_position_w_vertex_count +=
+            other.non_finite_position_w_vertex_count;
+        defaulted_position_w_vertex_count +=
+            other.defaulted_position_w_vertex_count;
+        position_output_mask_union |= other.position_output_mask_union;
         screen_space_position_vertex_count += other.screen_space_position_vertex_count;
         viewport_mapped_vertex_count += other.viewport_mapped_vertex_count;
         raw_position_fallback_vertex_count += other.raw_position_fallback_vertex_count;
@@ -681,6 +696,9 @@ NativePipelineState pipeline_state_for_draw(const NativeDraw& draw);
 NativePipelineState frontend_text_pipeline_state();
 
 NativeFragmentState fragment_state_for_draw(const NativeDraw& draw);
+
+bool default_fixed_function_texture_combiner_recovery_required(
+    const NativeDraw& draw);
 
 NativeFragmentState frontend_text_fragment_state();
 

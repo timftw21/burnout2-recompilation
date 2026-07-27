@@ -18,7 +18,7 @@ import sys
 import time
 import zlib
 from collections import Counter, deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
@@ -32,6 +32,7 @@ try:
         XboxRuntimeError,
         XboxRuntimeShims,
         XboxStatus,
+        XBOX_KEY_DATA_SIZE,
     )
     from tools.loader.xbe_loader import (
         ImportResolver,
@@ -40,10 +41,8 @@ try:
         load_xbe_file,
     )
     from tools.playability.host_audio import (
-        PcmClip,
+        DEFAULT_AUDIO_LIBRARY,
         SdlPcmOutput,
-        parse_rws_pcm,
-        parse_rws_xbox_adpcm,
     )
     from tools.playability.live_transport import (
         LIVE_CONTROL_SCHEMA_VERSION,
@@ -79,7 +78,6 @@ try:
         extract_render_streams_from_probe_summary,
         write_json,
     )
-    from tools.xbe.xbe_info import parse_xbe_file
 except ModuleNotFoundError:  # pragma: no cover - direct script execution fallback
     import sys
 
@@ -93,6 +91,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
         XboxRuntimeError,
         XboxRuntimeShims,
         XboxStatus,
+        XBOX_KEY_DATA_SIZE,
     )
     from tools.loader.xbe_loader import (
         ImportResolver,
@@ -101,10 +100,8 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
         load_xbe_file,
     )
     from tools.playability.host_audio import (
-        PcmClip,
+        DEFAULT_AUDIO_LIBRARY,
         SdlPcmOutput,
-        parse_rws_pcm,
-        parse_rws_xbox_adpcm,
     )
     from tools.playability.live_transport import (
         LIVE_CONTROL_SCHEMA_VERSION,
@@ -140,7 +137,6 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
         extract_render_streams_from_probe_summary,
         write_json,
     )
-    from tools.xbe.xbe_info import parse_xbe_file
 
 
 DEFAULT_ENTRY_BYTES = 0x200
@@ -160,8 +156,12 @@ DEFAULT_LIVE_NATIVE_STEADY_SLICE_STEPS = 1_000_000
 DEFAULT_DIAGNOSTIC_FIRST_NATIVE_RUNS = 8
 DEFAULT_DIAGNOSTIC_RECENT_NATIVE_RUNS = 56
 DEFAULT_RUNTIME_ABI_HISTORY = 4096
+XBE_CERTIFICATE_LAN_KEY_OFFSET = 0xB0
+XBE_CERTIFICATE_SIGNATURE_KEY_OFFSET = 0xC0
+XBE_CERTIFICATE_ALTERNATE_SIGNATURE_KEYS_OFFSET = 0xD0
+XBE_CERTIFICATE_ALTERNATE_SIGNATURE_KEY_COUNT = 16
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DYNAMIC_BLOCK_STORE = (
+DEFAULT_DECODED_BLOCK_STORE = (
     REPOSITORY_ROOT / "build" / "native-guest-loop" / "decoded-blocks.sqlite3"
 )
 LEGACY_DYNAMIC_BLOCK_CACHE = (
@@ -322,6 +322,7 @@ TITLE_ASSET_STREAM_SYNTHETIC_STATUS_TARGET_ADDRESS = 0x31F10300
 TITLE_ASSET_STREAM_SYNTHETIC_READ_TARGET_ADDRESS = 0x31F10700
 TITLE_ASSET_STREAM_SYNTHETIC_SEEK_TARGET_ADDRESS = 0x31F10800
 TITLE_ASSET_STREAM_SYNTHETIC_OBJECT_STRIDE = 0x1000
+TITLE_ASSET_STREAM_NATIVE_PAYLOAD_BASE_ADDRESS = 0x32000000
 TITLE_TRACK_PSS_HEADER_SIZE = 0x68
 TITLE_TRACK_PSS_IMAGE_ANCHOR_POINTER_OFFSET = 0x14
 TITLE_TRACK_PSS_IMAGE_ANCHOR_OFFSET = 0x1C0
@@ -612,8 +613,38 @@ TITLE_CRT_CONSTRUCTOR_TABLE_START_ADDRESS = 0x002CD670
 TITLE_CRT_CONSTRUCTOR_TABLE_END_ADDRESS = 0x002E98F4
 TITLE_FRONTEND_CRT_VTABLE_INITIALIZER_ADDRESS = 0x001392B0
 TITLE_FRONTEND_CRT_VTABLE_INITIALIZER_TABLE_ENTRY_ADDRESS = 0x002CF664
+TITLE_CRT_VECTOR_CONSTRUCTOR_ADDRESS = 0x000134D0
+TITLE_LINKED_LIST_CALLBACK_ITERATOR_ADDRESS = 0x000FD810
+TITLE_SPATIAL_QUERY_VISITOR_CONSUMER_ADDRESS = 0x0008F3D0
+TITLE_SPATIAL_COLLISION_VISITOR_CONSUMER_ADDRESS = 0x00090420
+TITLE_FRONTEND_CARD_CONSTRUCTOR_ADDRESS = 0x0001D180
+TITLE_STACK_CALLBACK_ARGUMENT_INDICES = {
+    TITLE_CRT_VECTOR_CONSTRUCTOR_ADDRESS: 3,
+    TITLE_LINKED_LIST_CALLBACK_ITERATOR_ADDRESS: 1,
+    TITLE_SPATIAL_QUERY_VISITOR_CONSUMER_ADDRESS: 2,
+    TITLE_SPATIAL_COLLISION_VISITOR_CONSUMER_ADDRESS: 2,
+    TITLE_FRONTEND_COMPARE_SEARCH_ADDRESS: 2,
+}
+TITLE_REGISTER_CALLBACK_ARGUMENT_INDICES = {
+    TITLE_FRONTEND_CARD_CONSTRUCTOR_ADDRESS: 7,
+}
 TITLE_RUNTIME_OBJECT_TABLE_USE_ADDRESS = 0x0003F660
 TITLE_RUNTIME_CALLBACK_DISPATCH_ADDRESSES = (0x00109AD0, 0x00109B40)
+TITLE_LEVEL_ADDRESS_TAKEN_CALLBACK_TARGETS = (
+    0x00116580,
+    0x001165C0,
+    0x001165E0,
+    0x00116620,
+    0x00116C30,
+    0x00116D80,
+    0x00116DD0,
+    0x00116DF0,
+    0x00116E10,
+    0x00116E30,
+    0x00116E50,
+    0x0011B590,
+    0x0011B640,
+)
 TITLE_RUNTIME_CALLBACK_CALL_SITES = {
     0x00109AEB: ("owner_2c", "eax", "esi"),
     0x00109B20: ("list_2c", "edx", "ecx"),
@@ -746,6 +777,8 @@ TITLE_EXACT_MEMORY_CALLBACK_ADDRESSES = frozenset(
         *TITLE_AUDIO_DSP_VOICE_COMMAND_ADDRESSES,
         TITLE_MCPX_FRAME_COUNTER_ADDRESS,
         TITLE_GPU_COMMAND_KICK_ADDRESS,
+        TITLE_GPU_PFIFO_RUNOUT_STATUS_ADDRESS,
+        TITLE_GPU_PFIFO_CACHE1_STATUS_ADDRESS,
         TITLE_GPU_PROGRESS_COUNTER_ADDRESS,
         TITLE_GPU_SOFTWARE_COMPLETION_FLAG_ADDRESS,
         TITLE_D3D_CONTEXT_GET_POINTER_ADDRESS,
@@ -766,8 +799,15 @@ TITLE_ZERO_GUARDED_U32_READ_CALLBACK_ADDRESSES = frozenset(
     }
 )
 TITLE_EXACT_MEMORY_WRITE_CALLBACK_ADDRESSES = frozenset(
-    TITLE_EXACT_MEMORY_CALLBACK_ADDRESSES
-    - TITLE_ZERO_GUARDED_U32_READ_CALLBACK_ADDRESSES
+    {
+        *(
+            TITLE_EXACT_MEMORY_CALLBACK_ADDRESSES
+            - TITLE_ZERO_GUARDED_U32_READ_CALLBACK_ADDRESSES
+        ),
+        NV2A_STATUS_POLL_ADDRESS,
+        TITLE_GPU_INTERRUPT_STATUS_ADDRESS,
+        TITLE_GPU_PFIFO_INTERRUPT_STATUS_ADDRESS,
+    }
 )
 TITLE_OBSERVER_INDEPENDENT_EXACT_READ_ADDRESSES = frozenset(
     {
@@ -912,7 +952,31 @@ TITLE_TEXT_DRAW_STACK_CLEANUP = 0x14
 TITLE_TEXT_DRAW_MAX_SAMPLE_BYTES = 128
 TITLE_DIRECTSOUND_BUFFER_SYNC_ADDRESS = 0x00230850
 TITLE_DIRECTSOUND_EFFECT_IMAGE_ADDRESS = 0x00230ABD
+TITLE_DIRECTSOUND_BUFFER_CREATE_ADDRESS = 0x0022F8EA
+TITLE_DIRECTSOUND_BUFFER_PLAY_ADDRESS = 0x0022D896
+TITLE_DIRECTSOUND_BUFFER_STOP_ADDRESS = 0x0022D8BA
+TITLE_DIRECTSOUND_BUFFER_STOP_EX_ADDRESS = 0x0022D8D2
+TITLE_DIRECTSOUND_BUFFER_SET_VOLUME_ADDRESS = 0x0022D7D2
+TITLE_DIRECTSOUND_BUFFER_SET_FREQUENCY_ADDRESS = 0x0022E738
+TITLE_DIRECTSOUND_BUFFER_GET_POSITION_ADDRESS = 0x0022D932
+TITLE_DIRECTSOUND_BUFFER_SET_POSITION_ADDRESS = 0x0022D952
+TITLE_DIRECTSOUND_BUFFER_SET_DATA_ADDRESS = 0x0022EF4B
+TITLE_DIRECTSOUND_BUFFER_SET_FORMAT_ADDRESS = 0x0022EF2F
+TITLE_DIRECTSOUND_STREAM_CREATE_ADDRESS = 0x0022F90E
+TITLE_DIRECTSOUND_STREAM_PROCESS_ADDRESS = 0x0022CDA9
+TITLE_DIRECTSOUND_STREAM_FLUSH_ADDRESS = 0x0022CD0D
+TITLE_DIRECTSOUND_STREAM_SET_FORMAT_ADDRESS = 0x0022EF6B
 TITLE_DIRECTSOUND_SYNTHETIC_WORKSPACE_ADDRESS = 0x31FF0000
+TITLE_DIRECTSOUND_VOICE_WAIT_LOOP_ADDRESS = 0x00107080
+TITLE_DIRECTSOUND_VOICE_WAIT_RESUME_ADDRESS = 0x00107086
+TITLE_DIRECTSOUND_VOICE_WAIT_COMPLETE_ADDRESS = 0x001070AA
+TITLE_DIRECTSOUND_VOICE_OBJECT_OFFSET = 0x04
+TITLE_DIRECTSOUND_VOICE_FLAGS_OFFSET = 0x12
+TITLE_DIRECTSOUND_VOICE_STATE_MASK = 0x0003
+TITLE_DIRECTSOUND_VOICE_ACTIVE_STATE = 0x0003
+TITLE_DIRECTSOUND_VOICE_ALLOCATED_BIT = 0x0001
+TITLE_DIRECTSOUND_VOICE_PLAYING_BIT = 0x0002
+TITLE_DIRECTSOUND_VOICE_PENDING_BIT = 0x8000
 TITLE_QUAD_SUBMIT_ADDRESS = 0x000C2280
 TITLE_QUAD_SUBMIT_END_ADDRESS = 0x000C23ED
 TITLE_VERTEX_APPEND_ADDRESS = 0x000C20E0
@@ -2129,6 +2193,40 @@ def _title_native_fast_paths() -> dict[int, NativeFastPath]:
         ),
     )
 
+    directsound_voice_stop_completion = NativeFastPath(
+        name="title_directsound_voice_stop_completion",
+        guard=(
+            "ctx->esi != 0u && "
+            f"b2r_read_u32(ctx, ctx->esi + 0x{TITLE_DIRECTSOUND_VOICE_OBJECT_OFFSET:x}u) != 0u && "
+            "((b2r_read_u16(ctx, b2r_read_u32(ctx, ctx->esi + "
+            f"0x{TITLE_DIRECTSOUND_VOICE_OBJECT_OFFSET:x}u) + "
+            f"0x{TITLE_DIRECTSOUND_VOICE_FLAGS_OFFSET:x}u) & "
+            f"0x{TITLE_DIRECTSOUND_VOICE_STATE_MASK:04x}u) == "
+            f"0x{TITLE_DIRECTSOUND_VOICE_ACTIVE_STATE:04x}u || "
+            "(b2r_read_u16(ctx, b2r_read_u32(ctx, ctx->esi + "
+            f"0x{TITLE_DIRECTSOUND_VOICE_OBJECT_OFFSET:x}u) + "
+            f"0x{TITLE_DIRECTSOUND_VOICE_FLAGS_OFFSET:x}u) & "
+            f"0x{TITLE_DIRECTSOUND_VOICE_PENDING_BIT | TITLE_DIRECTSOUND_VOICE_ALLOCATED_BIT:04x}u) == "
+            f"0x{TITLE_DIRECTSOUND_VOICE_PENDING_BIT | TITLE_DIRECTSOUND_VOICE_ALLOCATED_BIT:04x}u)"
+        ),
+        body=(
+            "const uint32_t b2r_voice = b2r_read_u32(ctx, ctx->esi + "
+            f"0x{TITLE_DIRECTSOUND_VOICE_OBJECT_OFFSET:x}u);",
+            "const uint32_t b2r_voice_flags_address = b2r_voice + "
+            f"0x{TITLE_DIRECTSOUND_VOICE_FLAGS_OFFSET:x}u;",
+            "const uint16_t b2r_voice_flags = "
+            "b2r_read_u16(ctx, b2r_voice_flags_address);",
+            f"b2r_record_native_fast_path(ctx, 0x{TITLE_DIRECTSOUND_VOICE_WAIT_LOOP_ADDRESS:08x}u);",
+            f"ctx->eip = 0x{TITLE_DIRECTSOUND_VOICE_WAIT_LOOP_ADDRESS:08x}u;",
+            "b2r_write_u16(ctx, b2r_voice_flags_address, "
+            "static_cast<uint16_t>(b2r_voice_flags & ~"
+            f"0x{TITLE_DIRECTSOUND_VOICE_PENDING_BIT | TITLE_DIRECTSOUND_VOICE_PLAYING_BIT:04x}u));",
+            f"eip = 0x{TITLE_DIRECTSOUND_VOICE_WAIT_RESUME_ADDRESS:08x}u;",
+            "pending_module_exit_reason = B2R_MODULE_EXIT_BRANCH;",
+            "continue;",
+        ),
+    )
+
     return {
         TITLE_D3D_PACKET_ALLOC_ADDRESS: packet_alloc,
         TITLE_D3D_RESERVE_ADDRESS: reserve,
@@ -2149,6 +2247,7 @@ def _title_native_fast_paths() -> dict[int, NativeFastPath]:
         TITLE_VERTEX_APPEND_COMPACT_ADDRESS: compact_vertex_append,
         TITLE_VERTEX_APPEND_ADDRESS: full_vertex_append,
         TITLE_MATRIX_MULTIPLY_ADDRESS: matrix_multiply,
+        TITLE_DIRECTSOUND_VOICE_WAIT_LOOP_ADDRESS: directsound_voice_stop_completion,
     }
 TITLE_XGETDEVICES_ADDRESS = 0x0028D282
 TITLE_XINPUT_OPEN_ADDRESS = 0x0028CF40
@@ -2162,6 +2261,499 @@ TITLE_INPUT_A_VALUE_OFFSET = 0x7C
 TITLE_XINPUT_HANDLE_BASE = 0xB2401000
 TITLE_XINPUT_ERROR_DEVICE_NOT_CONNECTED = 0x48F
 
+NATIVE_NORMAL_RUNTIME_SUCCESS_SHIMS = frozenset(
+    {
+        "PhyGetLinkState",
+        "PhyInitialize",
+    }
+)
+
+
+def _native_normal_runtime_return_constant(shim_name: str) -> int | None:
+    return 0 if shim_name in NATIVE_NORMAL_RUNTIME_SUCCESS_SHIMS else None
+
+
+def _record_native_normal_runtime_coverage_gap(
+    native_run_summary: dict[str, Any] | None,
+    *,
+    failure_code: int,
+    failure_target: int,
+    is_executable: Callable[[int], bool],
+    block_loader: Callable[[int], LiftedFunction | None],
+) -> dict[str, Any] | None:
+    """Persist an unknown native target for the next ahead-of-time build."""
+
+    if (
+        native_run_summary is None
+        or native_run_summary.get("reason") != "native_runtime_failure"
+        or failure_code != 9
+    ):
+        return None
+    target = int(failure_target or native_run_summary.get("target") or 0)
+    result: dict[str, Any] = {
+        "failure_code": int(failure_code),
+        "target": target,
+        "target_hex": _hex32(target),
+        "static_rebuild_required": True,
+    }
+    if target == 0:
+        result["status"] = "missing_target"
+        return result
+    if not is_executable(target):
+        result["status"] = "non_executable_target"
+        return result
+    try:
+        recovered = block_loader(target)
+    except Exception as exc:  # Preserve the original native failure report.
+        result.update(
+            {
+                "status": "recording_failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        return result
+    if recovered is None:
+        result["status"] = "not_recorded"
+        return result
+    result.update(
+        {
+            "status": "decoded_for_next_aot",
+            "symbol": recovered.symbol,
+            "instruction_count": len(recovered.instructions),
+        }
+    )
+    return result
+
+
+def _recover_required_aot_callbacks(
+    known_functions: Iterable[LiftedFunction],
+    *,
+    targets: Iterable[int],
+    block_loader: Callable[[int], LiftedFunction | None],
+) -> list[LiftedFunction]:
+    """Recover exact address-taken callbacks before native execution starts."""
+
+    known_addresses = {function.base_address for function in known_functions}
+    recovered_functions: list[LiftedFunction] = []
+    for target in targets:
+        if target in known_addresses:
+            continue
+        recovered = block_loader(target)
+        if recovered is None:
+            continue
+        recovered_functions.append(recovered)
+        known_addresses.add(recovered.base_address)
+    return recovered_functions
+
+
+def _has_static_code_boundary(
+    target: int,
+    *,
+    read_bytes: Callable[[int, int], bytes],
+    terminator_end_addresses: set[int],
+) -> bool:
+    """Return whether a static pointer lands at a credible code boundary."""
+
+    try:
+        prefix = read_bytes(target - 16, 16)
+    except (KeyError, ValueError, XbeMemoryAccessError):
+        return False
+    if len(prefix) != 16:
+        return False
+    trailing_padding = 0
+    for value in reversed(prefix):
+        if value not in {0x90, 0xCC}:
+            break
+        trailing_padding += 1
+    before_padding = prefix[:-trailing_padding] if trailing_padding else prefix
+    follows_return = bool(before_padding) and before_padding[-1] in {0xC3, 0xCB}
+    follows_sized_return = (
+        len(before_padding) >= 3 and before_padding[-3] in {0xC2, 0xCA}
+    )
+    follows_alignment_sled = target % 16 == 0 and trailing_padding >= 2
+    return (
+        follows_return
+        or follows_sized_return
+        or follows_alignment_sled
+        or target in terminator_end_addresses
+    )
+
+
+def _stored_code_pointer_targets(
+    known_functions: Iterable[LiftedFunction],
+    *,
+    read_bytes: Callable[[int, int], bytes],
+    is_code: Callable[[int], bool],
+    initializer_source_window: int = 0x100,
+    minimum_initializer_targets: int = 3,
+) -> tuple[int, ...]:
+    """Find validated code pointers stored by already decoded guest code."""
+
+    functions = tuple(known_functions)
+    known_instruction_bytes = {
+        address
+        for function in functions
+        for instruction in function.instructions
+        for address in range(instruction.address, instruction.next_address)
+    }
+    terminator_end_addresses = {
+        instruction.next_address
+        for function in functions
+        for instruction in function.instructions
+        if instruction.mnemonic in {"jmp", "ret"}
+    }
+    candidate_sources: dict[int, set[tuple[int, int | None]]] = {}
+    for function in functions:
+        for instruction in function.instructions:
+            if (
+                not is_code(instruction.address)
+                or instruction.mnemonic != "mov"
+                or len(instruction.operands) != 2
+            ):
+                continue
+            destination, source = instruction.operands
+            if (
+                destination.kind != "mem"
+                or source.kind != "imm"
+                or source.immediate is None
+            ):
+                continue
+            target = source.immediate & 0xFFFFFFFF
+            if not is_code(target) or target in known_instruction_bytes:
+                continue
+            candidate_sources.setdefault(target, set()).add(
+                (instruction.address, destination.absolute)
+            )
+
+    boundary_targets = {
+        target
+        for target in candidate_sources
+        if _has_static_code_boundary(
+            target,
+            read_bytes=read_bytes,
+            terminator_end_addresses=terminator_end_addresses,
+        )
+    }
+    candidate_sites = sorted(
+        (source, target)
+        for target, sites in candidate_sources.items()
+        for source, destination in sites
+        if destination is not None
+    )
+    initializer_targets: set[int] = set()
+    for source, target in candidate_sites:
+        neighboring_targets = {
+            neighbor_target
+            for neighbor_source, neighbor_target in candidate_sites
+            if abs(neighbor_source - source) <= initializer_source_window
+        }
+        if (
+            len(neighboring_targets) >= minimum_initializer_targets
+            and neighboring_targets & boundary_targets
+        ):
+            initializer_targets.add(target)
+    return tuple(sorted(boundary_targets | initializer_targets))
+
+
+def _stack_argument_code_pointer_targets(
+    known_functions: Iterable[LiftedFunction],
+    *,
+    read_bytes: Callable[[int, int], bytes],
+    is_code: Callable[[int], bool],
+    callback_argument_indices: Mapping[int, int],
+) -> tuple[int, ...]:
+    """Recover immediate callbacks passed to proven stack-callback consumers."""
+
+    functions = tuple(known_functions)
+    known_instruction_bytes = {
+        address
+        for function in functions
+        for instruction in function.instructions
+        for address in range(instruction.address, instruction.next_address)
+    }
+    targets: set[int] = set()
+    for function in functions:
+        instructions = function.instructions
+        for index, instruction in enumerate(instructions):
+            if instruction.mnemonic != "call" or instruction.target is None:
+                continue
+            argument_index = callback_argument_indices.get(instruction.target)
+            if argument_index is None or not is_code(instruction.address):
+                continue
+            push = None
+            remaining_pushes = argument_index
+            for candidate in reversed(instructions[max(0, index - 64) : index]):
+                if candidate.mnemonic == "push":
+                    if remaining_pushes == 0:
+                        push = candidate
+                        break
+                    remaining_pushes -= 1
+                    continue
+                writes_stack_pointer = (
+                    candidate.mnemonic
+                    not in {"cmp", "test"}
+                    and bool(candidate.operands)
+                    and candidate.operands[0].kind == "reg"
+                    and candidate.operands[0].reg == "esp"
+                )
+                exchanges_stack_pointer = (
+                    candidate.mnemonic == "xchg"
+                    and any(
+                        operand.kind == "reg" and operand.reg == "esp"
+                        for operand in candidate.operands
+                    )
+                )
+                if (
+                    candidate.mnemonic
+                    in {
+                        "call",
+                        "enter",
+                        "int",
+                        "iret",
+                        "jcc",
+                        "jmp",
+                        "leave",
+                        "ret",
+                    }
+                    or candidate.mnemonic.startswith("pop")
+                    or candidate.mnemonic.startswith("push")
+                    or writes_stack_pointer
+                    or exchanges_stack_pointer
+                ):
+                    break
+            if push is None:
+                continue
+            if len(push.operands) != 1:
+                continue
+            operand = push.operands[0]
+            if operand.kind != "imm" or operand.immediate is None:
+                continue
+            target = operand.immediate & 0xFFFFFFFF
+            if (
+                target in known_instruction_bytes
+                or not is_code(target)
+                or not _has_static_code_boundary(
+                    target,
+                    read_bytes=read_bytes,
+                    terminator_end_addresses=set(),
+                )
+            ):
+                continue
+            targets.add(target)
+    return tuple(sorted(targets))
+
+
+def _register_stack_argument_code_pointer_targets(
+    known_functions: Iterable[LiftedFunction],
+    *,
+    read_bytes: Callable[[int, int], bytes],
+    is_code: Callable[[int], bool],
+    callback_argument_indices: Mapping[int, int],
+    definition_window: int = 0x200,
+) -> tuple[int, ...]:
+    """Recover register-held callbacks for declared stack-callback ABIs."""
+
+    functions = tuple(known_functions)
+    instructions = sorted(
+        {
+            instruction.address: instruction
+            for function in functions
+            for instruction in function.instructions
+        }.values(),
+        key=lambda instruction: instruction.address,
+    )
+    known_instruction_bytes = {
+        address
+        for instruction in instructions
+        for address in range(instruction.address, instruction.next_address)
+    }
+    targets: set[int] = set()
+    for index, instruction in enumerate(instructions):
+        if instruction.mnemonic != "call" or instruction.target is None:
+            continue
+        argument_index = callback_argument_indices.get(instruction.target)
+        if argument_index is None or not is_code(instruction.address):
+            continue
+        push = None
+        remaining_slots = argument_index
+        for candidate in reversed(instructions[max(0, index - 64) : index]):
+            if candidate.mnemonic == "push":
+                if remaining_slots == 0:
+                    push = candidate
+                    break
+                remaining_slots -= 1
+                continue
+            if (
+                candidate.mnemonic == "sub"
+                and len(candidate.operands) == 2
+                and candidate.operands[0].kind == "reg"
+                and candidate.operands[0].reg == "esp"
+                and candidate.operands[1].kind == "imm"
+                and candidate.operands[1].immediate is not None
+                and candidate.operands[1].immediate > 0
+                and candidate.operands[1].immediate % 4 == 0
+            ):
+                reserved_slots = candidate.operands[1].immediate // 4
+                if reserved_slots > remaining_slots:
+                    break
+                remaining_slots -= reserved_slots
+                continue
+            writes_stack_pointer = (
+                candidate.mnemonic not in {"cmp", "test"}
+                and bool(candidate.operands)
+                and candidate.operands[0].kind == "reg"
+                and candidate.operands[0].reg == "esp"
+            )
+            exchanges_stack_pointer = (
+                candidate.mnemonic == "xchg"
+                and any(
+                    operand.kind == "reg" and operand.reg == "esp"
+                    for operand in candidate.operands
+                )
+            )
+            if (
+                candidate.mnemonic
+                in {"call", "enter", "int", "iret", "jcc", "jmp", "leave", "ret"}
+                or candidate.mnemonic.startswith("pop")
+                or writes_stack_pointer
+                or exchanges_stack_pointer
+            ):
+                break
+        if push is None or len(push.operands) != 1:
+            continue
+        pushed = push.operands[0]
+        if pushed.kind != "reg" or pushed.reg is None:
+            continue
+        for candidate in instructions:
+            if not push.address - definition_window <= candidate.address < push.address:
+                continue
+            if (
+                candidate.mnemonic != "mov"
+                or len(candidate.operands) != 2
+                or candidate.operands[0].kind != "reg"
+                or candidate.operands[0].reg != pushed.reg
+                or candidate.operands[1].kind != "imm"
+                or candidate.operands[1].immediate is None
+            ):
+                continue
+            target = candidate.operands[1].immediate & 0xFFFFFFFF
+            if (
+                target in known_instruction_bytes
+                or not is_code(target)
+                or not _has_static_code_boundary(
+                    target,
+                    read_bytes=read_bytes,
+                    terminator_end_addresses=set(),
+                )
+            ):
+                continue
+            targets.add(target)
+    return tuple(sorted(targets))
+
+
+def _static_code_pointer_table_targets(
+    known_functions: Iterable[LiftedFunction],
+    *,
+    read_bytes: Callable[[int, int], bytes],
+    read_u32: Callable[[int], int],
+    is_code: Callable[[int], bool],
+    table_ranges: Iterable[tuple[int, int]],
+    minimum_table_entries: int = 3,
+    minimum_boundary_targets: int = 2,
+) -> tuple[int, ...]:
+    """Find function entries in credible static callback and vtable runs."""
+
+    functions = tuple(known_functions)
+    table_ranges = tuple(table_ranges)
+    known_instruction_bytes = {
+        address
+        for function in functions
+        for instruction in function.instructions
+        for address in range(instruction.address, instruction.next_address)
+    }
+    targets: set[int] = set()
+
+    def retain_run(run: list[int]) -> None:
+        if len(run) < minimum_table_entries:
+            return
+        unique_targets = set(run)
+        boundary_targets = {
+            target
+            for target in unique_targets
+            if _has_static_code_boundary(
+                target,
+                read_bytes=read_bytes,
+                # Table confidence must remain independent of previously
+                # decoded targets. Raw return/alignment bytes cannot cascade
+                # packed numeric data into a false code-table family.
+                terminator_end_addresses=set(),
+            )
+        }
+        if (
+            len(boundary_targets) < minimum_boundary_targets
+            or len(boundary_targets) * 2 < len(unique_targets)
+        ):
+            return
+        # Once the run itself is proven to be a code-pointer table, retain the
+        # whole family. Some valid COM-style thunks begin immediately after
+        # non-return control flow and therefore lack an independent boundary.
+        targets.update(unique_targets - known_instruction_bytes)
+
+    for start_address, end_address in table_ranges:
+        run: list[int] = []
+        aligned_start = (start_address + 3) & ~3
+        for entry_address in range(aligned_start, end_address - 3, 4):
+            try:
+                target = int(read_u32(entry_address)) & 0xFFFFFFFF
+            except (KeyError, ValueError, XbeMemoryAccessError):
+                target = 0
+            if is_code(target):
+                run.append(target)
+                continue
+            retain_run(run)
+            run = []
+        retain_run(run)
+
+    # Xbox library registration tables also store callbacks at the end of a
+    # repeated six-DWORD descriptor record instead of as a contiguous vtable.
+    # Require the two static descriptor pointers, exact zero/one sentinels, a
+    # run of records, and the same independent code-boundary proof used above.
+    def is_static_pointer(address: int) -> bool:
+        return any(start <= address < end for start, end in table_ranges)
+
+    for start_address, end_address in table_ranges:
+        run = []
+        aligned_start = (start_address + 3) & ~3
+        try:
+            table_data = read_bytes(aligned_start, end_address - aligned_start)
+        except (KeyError, ValueError, XbeMemoryAccessError):
+            continue
+        offset = 0
+        while offset + 24 <= len(table_data):
+            try:
+                words = struct.unpack_from("<6I", table_data, offset)
+            except struct.error:
+                words = (0, 0, 0, 0, 0, 0)
+            if (
+                is_static_pointer(words[0])
+                and not is_code(words[0])
+                and words[1] == 0
+                and words[2] == 0
+                and is_static_pointer(words[3])
+                and not is_code(words[3])
+                and words[4] == 1
+                and is_code(words[5])
+            ):
+                run.append(words[5])
+                offset += 24
+                continue
+            retain_run(run)
+            run = []
+            offset += 4
+        retain_run(run)
+    return tuple(sorted(targets))
+
+
 GUEST_ARGUMENT_COUNT_OVERRIDES = {
     "AvSendTVEncoderOption": 4,
     "HalReadWritePCISpace": 6,
@@ -2170,8 +2762,12 @@ GUEST_ARGUMENT_COUNT_OVERRIDES = {
     "KfLowerIrql": 0,
     "NtAllocateVirtualMemory": 5,
     "NtCreateSemaphore": 4,
-    "NtCreateFile": 11,
+    # The Xbox kernel ABI omits the Windows EA buffer/length tail. Retail
+    # XAPI callers push nine arguments and the kernel thunk returns with
+    # ``ret 0x24``.
+    "NtCreateFile": 9,
     "NtDeviceIoControlFile": 10,
+    "NtFsControlFile": 10,
     "NtOpenFile": 6,
     "NtOpenSymbolicLinkObject": 2,
     "NtQueryInformationFile": 5,
@@ -2187,7 +2783,17 @@ GUEST_ARGUMENT_COUNT_OVERRIDES = {
     "PhyGetLinkState": 1,
     "PhyInitialize": 2,
     "PsCreateSystemThreadEx": 10,
+    "RtlAnsiStringToUnicodeString": 3,
     "RtlCompareMemoryUlong": 3,
+    "RtlTimeFieldsToTime": 2,
+    "RtlTimeToTimeFields": 2,
+    "RtlUnicodeStringToAnsiString": 3,
+    "XcHMAC": 7,
+    "XcRC4Crypt": 3,
+    "XcRC4Key": 3,
+    "XcSHAFinal": 2,
+    "XcSHAInit": 1,
+    "XcSHAUpdate": 3,
 }
 
 FILE_APPEND_DATA = 0x00000004
@@ -3183,6 +3789,9 @@ class TitleAssetStreamOpenFastPath:
         self.track_scene_record_entry_count = 0
         self.recent_track_descriptor_publications: list[dict[str, Any]] = []
         self._states: dict[int, dict[str, Any]] = {}
+        self._next_native_payload_address = (
+            TITLE_ASSET_STREAM_NATIVE_PAYLOAD_BASE_ADDRESS
+        )
 
     def _publish_ready(
         self,
@@ -3526,12 +4135,23 @@ class TitleAssetStreamOpenFastPath:
                 "track_descriptor_publication_attempted": False,
                 "track_descriptor_tables_published": False,
             }
+            native_payload_address = _align_up_u32(
+                self._next_native_payload_address, 0x1000
+            )
+            self._next_native_payload_address = _align_up_u32(
+                native_payload_address + len(payload), 0x1000
+            )
+            if payload:
+                memory.write(native_payload_address, payload)
             memory.write_u32(result_address, self.vtable_address)
             memory.write_u32(_u32(result_address + 0x10), size)
             memory.write_u32(_u32(result_address + 0x14), 0)
             memory.write_u32(_u32(result_address + 0x18), 0)
             memory.write_u32(_u32(result_address + 0x1C), 0)
             memory.write_u32(_u32(result_address + 0x2C), 2)
+            memory.write_u32(_u32(result_address + 0x30), native_payload_address)
+            memory.write_u32(_u32(result_address + 0x34), len(payload))
+            memory.write_u32(_u32(result_address + 0x38), 0)
             memory.write_u32(_u32(self.vtable_address + 4), self.activate_target)
             memory.write_u32(_u32(self.vtable_address + 8), self.read_target)
             memory.write_u32(_u32(self.vtable_address + 0x10), self.seek_target)
@@ -3805,7 +4425,7 @@ class TitleAssetStreamOpenFastPath:
 
 
 class TitleFrontendSpecialAudioFastPath:
-    """Create the frontend sound-bank handle and submit its requested SFX."""
+    """Create the diagnostic frontend sound-bank handle without playing it."""
 
     def __init__(
         self,
@@ -3841,25 +4461,6 @@ class TitleFrontendSpecialAudioFastPath:
         esp = cpu.get_register("esp")
         sample_index = memory.read_u32(_u32(esp + 4))
         frontend_audio_object = cpu.get_register("ecx")
-        decoded_clip_count = 0
-        playback_started = False
-        payload = self.asset_streams.payload_for_title("audio/special.rws")
-        if payload:
-            try:
-                clips = parse_rws_pcm(payload)
-                decoded_clip_count = len(clips)
-                if self.output is not None and clips:
-                    clip = clips[sample_index % len(clips)]
-                    playback_started = self.output.submit_pcm(
-                        clip.payload,
-                        sample_rate=clip.sample_rate,
-                        channels=clip.channels,
-                        bits_per_sample=clip.bits_per_sample,
-                    )
-                    if playback_started:
-                        self.submitted_clip_count += 1
-            except ValueError:
-                self.decode_error_count += 1
         memory.write_u32(self.handle_address, 1)
         list_sentinel = _u32(self.handle_address + 0x0C)
         memory.write_u32(_u32(self.handle_address + 0x10), list_sentinel)
@@ -3871,8 +4472,9 @@ class TitleFrontendSpecialAudioFastPath:
             "sample_index": sample_index,
             "handle_address_hex": _hex32(self.handle_address),
             "list_sentinel_hex": _hex32(list_sentinel),
-            "decoded_clip_count": decoded_clip_count,
-            "playback_started": playback_started,
+            "decoded_clip_count": 0,
+            "playback_started": False,
+            "playback_suppressed": True,
         }
         self.invocations.append(invocation)
         trace.add(target, "title_frontend_special_audio_fast_path", **invocation)
@@ -3890,10 +4492,7 @@ class TitleFrontendSpecialAudioFastPath:
 
 
 class TitleMusicModeFastPath:
-    """Model the title music-mode transition and submit its streamed menu track."""
-
-    _PCM_CACHE_MAGIC = b"B2RPCM1\0"
-    _PCM_CACHE_HEADER = struct.Struct("<8sIHHQ32s")
+    """Model diagnostic music-mode state without synthesizing playback."""
 
     def __init__(
         self,
@@ -3940,29 +4539,6 @@ class TitleMusicModeFastPath:
         if object_address:
             memory.write_u32(_u32(object_address + 0x38), mode)
 
-        decoded_bytes = 0
-        playback_started = False
-        if mode == TITLE_MUSIC_MENU_MODE and previous_mode != mode:
-            try:
-                clip = self._load_menu_clip()
-                decoded_bytes = len(clip.payload)
-                if self.output is not None:
-                    playback_started = self.output.submit_pcm(
-                        clip.payload,
-                        sample_rate=clip.sample_rate,
-                        channels=clip.channels,
-                        bits_per_sample=clip.bits_per_sample,
-                        loop=True,
-                    )
-                    if playback_started:
-                        self.submitted_track_count += 1
-            except (OSError, ValueError):
-                self.decode_error_count += 1
-        elif previous_mode == TITLE_MUSIC_MENU_MODE and mode != previous_mode:
-            stop = getattr(self.output, "stop", None)
-            if callable(stop):
-                stop()
-
         cpu.set_register("eax", 1)
         _prepare_stdcall_return(cpu, memory, 4)
         invocation = {
@@ -3971,76 +4547,18 @@ class TitleMusicModeFastPath:
             "object_address_hex": _hex32(object_address),
             "previous_mode": previous_mode,
             "mode": mode,
-            "menu_track": TITLE_MUSIC_MENU_PATH.as_posix(),
-            "decoded_bytes": decoded_bytes,
-            "playback_started": playback_started,
+            "decoded_bytes": 0,
+            "playback_started": False,
+            "playback_suppressed": True,
         }
         self.invocations.append(invocation)
         trace.add(target, "title_music_mode_fast_path", **invocation)
-
-    def _load_menu_clip(self):
-        if self._menu_clip is None:
-            disc_root = self.runtime.config.extracted_disc_root
-            if disc_root is None:
-                raise OSError("no extracted disc root configured")
-            encoded = (disc_root / TITLE_MUSIC_MENU_PATH).read_bytes()
-            cache_path = self._menu_cache_path(encoded)
-            self._menu_clip = self._read_cached_menu_clip(cache_path)
-            if self._menu_clip is None:
-                self.cache_miss_count += 1
-                self._menu_clip = parse_rws_xbox_adpcm(encoded)
-                self._write_cached_menu_clip(cache_path, self._menu_clip)
-            else:
-                self.cache_hit_count += 1
-            self.decoded_track_count += 1
-        return self._menu_clip
-
-    def _menu_cache_path(self, encoded: bytes) -> Path | None:
-        if self.cache_dir is None:
-            return None
-        digest = hashlib.sha256(encoded).hexdigest()
-        return self.cache_dir / f"{digest}-xbox-adpcm-v1-stereo.pcm"
-
-    def _read_cached_menu_clip(self, path: Path | None) -> PcmClip | None:
-        if path is None or not path.is_file():
-            return None
-        cached = path.read_bytes()
-        if len(cached) < self._PCM_CACHE_HEADER.size:
-            return None
-        magic, sample_rate, channels, bits_per_sample, size, digest = (
-            self._PCM_CACHE_HEADER.unpack_from(cached)
-        )
-        payload = cached[self._PCM_CACHE_HEADER.size :]
-        if (
-            magic != self._PCM_CACHE_MAGIC
-            or size != len(payload)
-            or hashlib.sha256(payload).digest() != digest
-        ):
-            return None
-        return PcmClip(sample_rate, channels, bits_per_sample, payload)
-
-    def _write_cached_menu_clip(self, path: Path | None, clip: PcmClip) -> None:
-        if path is None:
-            return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        header = self._PCM_CACHE_HEADER.pack(
-            self._PCM_CACHE_MAGIC,
-            clip.sample_rate,
-            clip.channels,
-            clip.bits_per_sample,
-            len(clip.payload),
-            hashlib.sha256(clip.payload).digest(),
-        )
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_bytes(header + clip.payload)
-        temporary.replace(path)
 
     def summary(self) -> dict[str, Any]:
         return {
             "set_mode_address_hex": _hex32(self.set_mode_address),
             "invocation_count": len(self.invocations),
             "menu_mode": TITLE_MUSIC_MENU_MODE,
-            "menu_track": TITLE_MUSIC_MENU_PATH.as_posix(),
             "decode_error_count": self.decode_error_count,
             "decoded_track_count": self.decoded_track_count,
             "submitted_track_count": self.submitted_track_count,
@@ -9470,7 +9988,7 @@ class RenderWriteWatchpoint:
                 *(
                     0x1B00 + stage * 0x40 + register
                     for stage in range(4)
-                    for register in (0, 4, 0x18)
+                    for register in (0, 4, 0x1C)
                 ),
             }
         )
@@ -10979,7 +11497,7 @@ class RenderWriteWatchpoint:
             self._texture_offsets[stage] = data
         elif register == 4:
             self._texture_formats[stage] = data
-        elif register == 0x18:
+        elif register == 0x1C:
             self._texture_image_rects[stage] = data
 
     @staticmethod
@@ -11460,7 +11978,10 @@ class LiveHostBridge:
         self.controller_poll_count = 0
         self.controller_poll_skip_count = 0
         self.clock_advanced_flip_count = 0
+        self.clock_wall_sync_ticks_100ns = 0
         self._clocked_flip_count = self.render_watchpoint.flip_count
+        self._live_clock_wall_anchor_ns: int | None = None
+        self._live_clock_virtual_anchor_100ns: int | None = None
         self.stop_requested = False
         self.audited_flip_count = 0
         self.audit_selected_flip_count = 0
@@ -12602,6 +13123,43 @@ class LiveHostBridge:
         self.sample_controller()
         return not self.stop_requested
 
+    def _synchronize_live_clock(self, now_ns: int) -> None:
+        flip_delta = max(
+            0,
+            self.render_watchpoint.flip_count - self._clocked_flip_count,
+        )
+        if self._live_clock_wall_anchor_ns is None:
+            if not flip_delta:
+                return
+            # Give the first published frame its nominal video ticks, then use
+            # elapsed host time. This preserves deterministic startup while
+            # preventing guest rendering throughput from stretching timers.
+            self.runtime.clock.advance_100ns(flip_delta * 166_667)
+            self.clock_advanced_flip_count += flip_delta
+            self._clocked_flip_count = self.render_watchpoint.flip_count
+            self._live_clock_wall_anchor_ns = int(now_ns)
+            self._live_clock_virtual_anchor_100ns = (
+                self.runtime.clock.query_interrupt_time()
+            )
+            return
+
+        if flip_delta:
+            self.clock_advanced_flip_count += flip_delta
+            self._clocked_flip_count = self.render_watchpoint.flip_count
+        assert self._live_clock_virtual_anchor_100ns is not None
+        elapsed_ticks_100ns = max(
+            0,
+            (int(now_ns) - self._live_clock_wall_anchor_ns) // 100,
+        )
+        target_100ns = (
+            self._live_clock_virtual_anchor_100ns + elapsed_ticks_100ns
+        )
+        current_100ns = self.runtime.clock.query_interrupt_time()
+        advance_100ns = max(0, target_100ns - current_100ns)
+        if advance_100ns:
+            self.runtime.clock.advance_100ns(advance_100ns)
+            self.clock_wall_sync_ticks_100ns += advance_100ns
+
     def on_slice(
         self,
         _state: CpuState,
@@ -12611,15 +13169,7 @@ class LiveHostBridge:
     ) -> bool:
         slice_started_ns = time.perf_counter_ns()
         self.slice_exchange_count += 1
-        flip_delta = max(0, self.render_watchpoint.flip_count - self._clocked_flip_count)
-        if flip_delta:
-            # The native guest can spend an entire frontend frame without
-            # entering a wait shim. Advance the deterministic Xbox clock at
-            # the video cadence so menu transitions and animation timers do
-            # not remain frozen near boot forever.
-            self.runtime.clock.advance_100ns(flip_delta * 166_667)
-            self.clock_advanced_flip_count += flip_delta
-            self._clocked_flip_count = self.render_watchpoint.flip_count
+        self._synchronize_live_clock(slice_started_ns)
         if self.data_export_synchronizer is not None:
             data_export_started_ns = time.perf_counter_ns()
             self.data_export_synchronizer(memory)
@@ -12829,6 +13379,7 @@ class LiveHostBridge:
             "controller_poll_count": self.controller_poll_count,
             "controller_poll_skip_count": self.controller_poll_skip_count,
             "clock_advanced_flip_count": self.clock_advanced_flip_count,
+            "clock_wall_sync_ticks_100ns": self.clock_wall_sync_ticks_100ns,
             "video_pacing_target_hz": 60,
             "video_pacing_sleep_count": self.video_pacing_sleep_count,
             "video_pacing_sleep_us": self.video_pacing_sleep_us,
@@ -13087,7 +13638,7 @@ def _scan_render_texture_bindings(
             offsets[stage] = data
         elif register == 4:
             formats[stage] = data
-        elif register == 0x18:
+        elif register == 0x1C:
             image_rects[stage] = data
         if stage in offsets and stage in formats:
             binding = (
@@ -13313,14 +13864,14 @@ class RuntimeAbiBridge:
             )
             for target, shim in self._by_target.items()
         }
-        self._scalar_data_exports = tuple(
+        self._data_exports = tuple(
             (target, shim)
             for target, shim in self._by_target.items()
             if shim.behavior == "data"
         )
         self._volatile_data_exports = tuple(
             (target, shim)
-            for target, shim in self._scalar_data_exports
+            for target, shim in self._data_exports
             if shim.name == "KeTickCount"
         )
         self._invocations: deque[RuntimeAbiInvocation] = deque(
@@ -13329,7 +13880,7 @@ class RuntimeAbiBridge:
         self._invocation_count = 0
         self._caller_counts: Counter[tuple[str, int]] = Counter()
         self._failed_caller_counts: Counter[tuple[str, int]] = Counter()
-        self._materialized_data_exports: dict[int, tuple[str, int]] = {}
+        self._materialized_data_exports: dict[int, tuple[str, int | bytes]] = {}
         self._data_export_update_count = 0
         self._thread_lifecycle_generation = 0
 
@@ -13392,18 +13943,27 @@ class RuntimeAbiBridge:
         *,
         volatile_only: bool = False,
     ) -> None:
-        """Materialize imported kernel ULONG exports at their guest addresses."""
+        """Materialize imported kernel scalar and fixed-size byte exports."""
         exports = (
             self._volatile_data_exports
             if volatile_only
-            else self._scalar_data_exports
+            else self._data_exports
         )
         for target, shim in exports:
             value = shim.handler()
+            if isinstance(value, bytes):
+                if len(value) > self.runtime.config.host_target_stride:
+                    # Larger structures need dedicated storage rather than
+                    # overlapping the next fixed host target slot.
+                    continue
+                previous = self._materialized_data_exports.get(target)
+                if previous is not None and previous[1] == value:
+                    continue
+                memory.write(target, value)
+                self._materialized_data_exports[target] = (shim.name, value)
+                self._data_export_update_count += 1
+                continue
             if not isinstance(value, (bool, int)):
-                # Pointer-sized strings, structures, and key arrays need
-                # dedicated layouts rather than overlapping the fixed host
-                # target slots. Materialize only observed scalar exports here.
                 continue
             scalar = _u32(int(value))
             previous = self._materialized_data_exports.get(target)
@@ -13635,19 +14195,28 @@ class RuntimeAbiBridge:
                 self._failed_caller_counts
             ),
             "materialized_data_exports": [
-                {
-                    "name": name,
-                    "target_address": target,
-                    "target_address_hex": _hex32(target),
-                    "value": value,
-                    "value_hex": _hex32(value),
-                }
+                self._materialized_data_export_summary(target, name, value)
                 for target, (name, value) in sorted(
                     self._materialized_data_exports.items()
                 )
             ],
             "invocations": [invocation.to_dict() for invocation in self._invocations],
         }
+
+    @staticmethod
+    def _materialized_data_export_summary(
+        target: int, name: str, value: int | bytes
+    ) -> dict[str, Any]:
+        summary = {
+            "name": name,
+            "target_address": target,
+            "target_address_hex": _hex32(target),
+        }
+        if isinstance(value, bytes):
+            summary.update({"value_kind": "bytes", "byte_count": len(value)})
+        else:
+            summary.update({"value": value, "value_hex": _hex32(value)})
+        return summary
 
     @staticmethod
     def _caller_count_summary(
@@ -13715,9 +14284,7 @@ class RuntimeAbiBridge:
                 share_access,
                 create_disposition,
                 create_options,
-                _ea_buffer,
-                _ea_length,
-            ) = arguments[:11]
+            ) = arguments[:9]
         decoded = _decode_guest_object_path(memory, object_attributes_address)
         mode = _guest_file_mode(desired_access, create_disposition)
         if decoded is None:
@@ -15094,9 +15661,21 @@ class XbeBackedSparseMemory(SparseMemory):
         return self._canonical_address(address)
 
     def native_cacheable_address(self, address: int) -> bool:
-        """Allow native snapshots for ordinary title RAM, including its high arena."""
-        address = self._canonical_address(address)
-        return address < 0x80000000 or 0x82000000 <= address < 0x84000000
+        """Keep the complete guest address space resident in the native page table."""
+        return True
+
+    def native_resident_page_indices(self) -> tuple[int, ...]:
+        """Return every mapped or overlaid guest page for native handoff."""
+        pages = set(self._pages)
+        for region in self._loaded.arena.regions:
+            if region.size <= 0:
+                continue
+            first_page = self._canonical_address(region.virtual_address) >> self._PAGE_BITS
+            last_page = (
+                self._canonical_address(region.virtual_end - 1) >> self._PAGE_BITS
+            )
+            pages.update(range(first_page, last_page + 1))
+        return tuple(sorted(pages))
 
     def add_native_observer_only_callback_addresses(
         self, addresses: Iterable[int]
@@ -16341,8 +16920,8 @@ class XbeBackedSparseMemory(SparseMemory):
         }
 
 
-class DynamicBlockCache:
-    """Lazy SQLite BLOB store for decoded dynamic guest blocks."""
+class DecodedBlockStore:
+    """Lazy SQLite BLOB store for decoded guest blocks used by AOT builds."""
 
     VERSION = 3
     LEGACY_VERSIONS = {1, 2}
@@ -16937,7 +17516,7 @@ def build_playability_probe_summary(
     internal_depth: int = DEFAULT_INTERNAL_DEPTH,
     max_blocks: int = DEFAULT_MAX_RECOVERED_BLOCKS,
     max_dynamic_blocks: int = DEFAULT_MAX_DYNAMIC_BLOCKS,
-    dynamic_block_cache_path: Path | None = None,
+    decoded_block_store_path: Path | None = None,
     render_watchpoint_limit: int | None = None,
     render_watchpoint_start: int = 0,
     save_data_root: Path | None = None,
@@ -16957,13 +17536,34 @@ def build_playability_probe_summary(
     audit_title_main_loop_exit: bool = False,
     audit_world_matrices: bool = False,
     audit_world_matrix_address: int | None = None,
+    audit_traffic_meshes: bool = False,
     audit_scene_records: bool = False,
 ) -> dict[str, Any]:
-    info = parse_xbe_file(xbe_path)
+    source_loaded = load_xbe_file(xbe_path, resolve_imports=False)
+    info = source_loaded.info
     image_sha256 = _file_sha256(xbe_path)
     imported_ordinals = [
         import_info["ordinal"] for import_info in info["kernel_imports"]["imports"]
     ]
+
+    certificate_address = info["certificate"]["virtual_address"]
+    lan_key = source_loaded.arena.read(
+        certificate_address + XBE_CERTIFICATE_LAN_KEY_OFFSET,
+        XBOX_KEY_DATA_SIZE,
+    )
+    signature_key = source_loaded.arena.read(
+        certificate_address + XBE_CERTIFICATE_SIGNATURE_KEY_OFFSET,
+        XBOX_KEY_DATA_SIZE,
+    )
+    alternate_signature_keys = tuple(
+        source_loaded.arena.read(
+            certificate_address
+            + XBE_CERTIFICATE_ALTERNATE_SIGNATURE_KEYS_OFFSET
+            + index * XBOX_KEY_DATA_SIZE,
+            XBOX_KEY_DATA_SIZE,
+        )
+        for index in range(XBE_CERTIFICATE_ALTERNATE_SIGNATURE_KEY_COUNT)
+    )
 
     runtime = XboxRuntimeShims(
         XboxRuntimeConfig(
@@ -16972,6 +17572,9 @@ def build_playability_probe_summary(
             dashboard_data_root=dashboard_data_root,
             cache_data_root=cache_data_root,
             title_id=int(info["certificate"]["title_id"]["hex"], 16),
+            xbox_lan_key=lan_key,
+            xbox_signature_key=signature_key,
+            xbox_alternate_signature_keys=alternate_signature_keys,
         )
     )
     resolver = ImportResolver()
@@ -16981,17 +17584,17 @@ def build_playability_probe_summary(
     unresolved = [
         resolution for resolution in loaded.import_resolutions if not resolution.resolved
     ]
-    legacy_dynamic_block_cache_path = None
-    preserve_legacy_dynamic_block_cache = False
+    legacy_decoded_block_store_path = None
+    preserve_legacy_decoded_block_store = False
     if (
-        dynamic_block_cache_path is not None
-        and dynamic_block_cache_path.resolve() == DEFAULT_DYNAMIC_BLOCK_STORE
+        decoded_block_store_path is not None
+        and decoded_block_store_path.resolve() == DEFAULT_DECODED_BLOCK_STORE
     ):
         if LEGACY_DYNAMIC_BLOCK_CACHE.exists():
-            legacy_dynamic_block_cache_path = LEGACY_DYNAMIC_BLOCK_CACHE
-        elif DynamicBlockCache.metadata_value(
-            dynamic_block_cache_path,
-            DynamicBlockCache.LEGACY_RECOVERY_MARKER,
+            legacy_decoded_block_store_path = LEGACY_DYNAMIC_BLOCK_CACHE
+        elif DecodedBlockStore.metadata_value(
+            decoded_block_store_path,
+            DecodedBlockStore.LEGACY_RECOVERY_MARKER,
         ) is None:
             legacy_backups = sorted(
                 LEGACY_DYNAMIC_BLOCK_CACHE.parent.glob(
@@ -17001,14 +17604,14 @@ def build_playability_probe_summary(
                 reverse=True,
             )
             if legacy_backups:
-                legacy_dynamic_block_cache_path = legacy_backups[0]
-                preserve_legacy_dynamic_block_cache = True
-    dynamic_block_cache = DynamicBlockCache(
-        dynamic_block_cache_path,
-        legacy_json_path=legacy_dynamic_block_cache_path,
-        preserve_legacy_source=preserve_legacy_dynamic_block_cache,
+                legacy_decoded_block_store_path = legacy_backups[0]
+                preserve_legacy_decoded_block_store = True
+    decoded_block_store = DecodedBlockStore(
+        decoded_block_store_path,
+        legacy_json_path=legacy_decoded_block_store_path,
+        preserve_legacy_source=preserve_legacy_decoded_block_store,
     )
-    dynamic_block_cache.prepare_for_image(
+    decoded_block_store.prepare_for_image(
         loaded,
         image_sha256=image_sha256,
     )
@@ -17018,40 +17621,44 @@ def build_playability_probe_summary(
         else ((), ())
     )
 
-    entry_summary = _recover_entry_summary(
-        loaded,
-        bridge,
-        image_sha256=image_sha256,
-        entry_bytes=entry_bytes,
-        max_instructions=max_instructions,
-        max_block_instructions=max_block_instructions,
-        execute_entry=execute_entry,
-        max_steps=max_steps,
-        internal_depth=internal_depth,
-        max_blocks=max_blocks,
-        max_dynamic_blocks=max_dynamic_blocks,
-        dynamic_block_cache=dynamic_block_cache,
-        render_watchpoint_limit=render_watchpoint_limit,
-        render_watchpoint_start=render_watchpoint_start,
-        native_guest_loop=native_guest_loop,
-        native_build_dir=native_build_dir,
-        live_render_stream_path=live_render_stream_path,
-        live_controller_state_path=live_controller_state_path,
-        live_control_transport_name=live_control_transport_name,
-        live_flip_audit_ack_path=live_flip_audit_ack_path,
-        live_flip_audit_health_interval=live_flip_audit_health_interval,
-        live_flip_audit_max_flips=live_flip_audit_max_flips,
-        native_slice_steps=native_slice_steps,
-        profile_hot_paths=profile_hot_paths,
-        developer_live_compile=developer_live_compile,
-        audit_title_main_loop_exit=audit_title_main_loop_exit,
-        audit_world_matrices=audit_world_matrices,
-        audit_world_matrix_address=audit_world_matrix_address,
-        audit_scene_records=audit_scene_records,
-        scene_record_sources=scene_record_sources,
-        scene_record_source_errors=scene_record_source_errors,
-    )
-    dynamic_block_cache.save()
+    try:
+        entry_summary = _recover_entry_summary(
+            loaded,
+            bridge,
+            image_sha256=image_sha256,
+            entry_bytes=entry_bytes,
+            max_instructions=max_instructions,
+            max_block_instructions=max_block_instructions,
+            execute_entry=execute_entry,
+            max_steps=max_steps,
+            internal_depth=internal_depth,
+            max_blocks=max_blocks,
+            max_dynamic_blocks=max_dynamic_blocks,
+            decoded_block_store=decoded_block_store,
+            render_watchpoint_limit=render_watchpoint_limit,
+            render_watchpoint_start=render_watchpoint_start,
+            native_guest_loop=native_guest_loop,
+            native_build_dir=native_build_dir,
+            live_render_stream_path=live_render_stream_path,
+            live_controller_state_path=live_controller_state_path,
+            live_control_transport_name=live_control_transport_name,
+            live_flip_audit_ack_path=live_flip_audit_ack_path,
+            live_flip_audit_health_interval=live_flip_audit_health_interval,
+            live_flip_audit_max_flips=live_flip_audit_max_flips,
+            native_slice_steps=native_slice_steps,
+            profile_hot_paths=profile_hot_paths,
+            developer_live_compile=developer_live_compile,
+            audit_title_main_loop_exit=audit_title_main_loop_exit,
+            audit_world_matrices=audit_world_matrices,
+            audit_world_matrix_address=audit_world_matrix_address,
+            audit_traffic_meshes=audit_traffic_meshes,
+            audit_scene_records=audit_scene_records,
+            scene_record_sources=scene_record_sources,
+            scene_record_source_errors=scene_record_source_errors,
+        )
+    finally:
+        runtime.audio.close_output_backend()
+    decoded_block_store.save()
 
     runtime_summary = runtime.summary()
     bridge_summary = bridge.summary()
@@ -17164,7 +17771,7 @@ def _recover_entry_summary(
     internal_depth: int,
     max_blocks: int,
     max_dynamic_blocks: int,
-    dynamic_block_cache: DynamicBlockCache,
+    decoded_block_store: DecodedBlockStore,
     render_watchpoint_limit: int | None,
     render_watchpoint_start: int,
     native_guest_loop: bool,
@@ -17181,6 +17788,7 @@ def _recover_entry_summary(
     audit_title_main_loop_exit: bool,
     audit_world_matrices: bool,
     audit_world_matrix_address: int | None,
+    audit_traffic_meshes: bool,
     audit_scene_records: bool,
     scene_record_sources: tuple[TitleSceneRecordSourceLayout, ...],
     scene_record_source_errors: tuple[str, ...],
@@ -17255,7 +17863,7 @@ def _recover_entry_summary(
             entry_bytes=entry_bytes,
             max_block_instructions=max_block_instructions,
             max_dynamic_blocks=max_dynamic_blocks,
-            dynamic_block_cache=dynamic_block_cache,
+            decoded_block_store=decoded_block_store,
             render_watchpoint_limit=render_watchpoint_limit,
             render_watchpoint_start=render_watchpoint_start,
             native_guest_loop=native_guest_loop,
@@ -17272,6 +17880,7 @@ def _recover_entry_summary(
             audit_title_main_loop_exit=audit_title_main_loop_exit,
             audit_world_matrices=audit_world_matrices,
             audit_world_matrix_address=audit_world_matrix_address,
+            audit_traffic_meshes=audit_traffic_meshes,
             audit_scene_records=audit_scene_records,
             scene_record_sources=scene_record_sources,
             scene_record_source_errors=scene_record_source_errors,
@@ -17460,6 +18069,58 @@ def _conditional_fallthrough_target(function: LiftedFunction) -> int | None:
     if last.mnemonic == "jcc":
         return last.next_address
     return None
+
+
+def _absolute_indirect_jump_table_targets(
+    function: LiftedFunction,
+    *,
+    read_u32: Callable[[int], int],
+    is_executable: Callable[[int], bool],
+    max_entries_per_direction: int = 256,
+    consecutive_miss_limit: int = 8,
+) -> tuple[int, ...]:
+    """Resolve bounded address-taken targets from absolute IA-32 jump tables."""
+
+    targets: list[int] = []
+    seen_targets: set[int] = set()
+    table_bases: set[int] = set()
+    for instruction in function.instructions:
+        if instruction.mnemonic != "jmp" or len(instruction.operands) != 1:
+            continue
+        operand = instruction.operands[0]
+        if (
+            operand.kind != "mem"
+            or operand.base is not None
+            or operand.index is None
+            or operand.scale != 4
+            or operand.absolute is not None
+        ):
+            continue
+        table_base = operand.displacement & 0xFFFFFFFF
+        if table_base in table_bases:
+            continue
+        table_bases.add(table_base)
+        for direction in (1, -1):
+            misses = 0
+            first_index = 0 if direction > 0 else -1
+            for offset in range(max_entries_per_direction):
+                index = first_index + offset * direction
+                entry_address = (table_base + index * 4) & 0xFFFFFFFF
+                try:
+                    target = int(read_u32(entry_address)) & 0xFFFFFFFF
+                except (KeyError, ValueError, XbeMemoryAccessError):
+                    target = 0
+                if not is_executable(target):
+                    misses += 1
+                    if misses >= consecutive_miss_limit:
+                        break
+                    continue
+                misses = 0
+                if target in seen_targets:
+                    continue
+                seen_targets.add(target)
+                targets.append(target)
+    return tuple(targets)
 
 
 def _recover_native_frontier_batch(
@@ -17715,7 +18376,7 @@ def _execute_recovered_control_flow_frame(
     entry_bytes: int,
     max_block_instructions: int,
     max_dynamic_blocks: int,
-    dynamic_block_cache: DynamicBlockCache,
+    decoded_block_store: DecodedBlockStore,
     render_watchpoint_limit: int | None,
     render_watchpoint_start: int,
     native_guest_loop: bool,
@@ -17732,6 +18393,7 @@ def _execute_recovered_control_flow_frame(
     audit_title_main_loop_exit: bool,
     audit_world_matrices: bool,
     audit_world_matrix_address: int | None,
+    audit_traffic_meshes: bool,
     audit_scene_records: bool,
     scene_record_sources: tuple[TitleSceneRecordSourceLayout, ...],
     scene_record_source_errors: tuple[str, ...],
@@ -17832,9 +18494,19 @@ def _execute_recovered_control_flow_frame(
     title_drive_array_fast_path = TitleStaticDriveArrayFastPath()
     title_frontend_asset_init_fast_path = TitleFrontendAssetInitFastPath()
     title_asset_stream_open_fast_path = TitleAssetStreamOpenFastPath(bridge.runtime)
+    native_audio_runtime_requested = bool(
+        native_guest_loop
+        and live_render_stream_path is not None
+        and live_controller_state_path is not None
+        and live_control_transport_name is not None
+        and live_flip_audit_ack_path is None
+        and not audit_title_main_loop_exit
+        and not render_watchpoint.retain_diagnostic_writes
+    )
     host_audio_output = (
         SdlPcmOutput(master_volume=0.5)
         if live_render_stream_path is not None
+        and not native_audio_runtime_requested
         else None
     )
     if host_audio_output is not None and host_audio_output.available:
@@ -17909,6 +18581,9 @@ def _execute_recovered_control_flow_frame(
     dynamic_summaries: list[dict[str, Any]] = []
     dynamic_frontiers: list[dict[str, Any]] = []
     dynamic_seen: set[int] = set()
+    native_bootstrap_threads: list[dict[str, Any]] = []
+    native_bootstrap_summary: dict[str, Any] | None = None
+    native_bootstrap_invocation_start = bridge.invocation_count
 
     def dynamic_block_loader(target: int) -> LiftedFunction | None:
         if target in dynamic_seen or target in covered_addresses:
@@ -17922,13 +18597,13 @@ def _execute_recovered_control_flow_frame(
             dynamic_summaries.append(frontier)
             dynamic_frontiers.append(frontier)
             return None
-        cache_key = dynamic_block_cache.key(
+        cache_key = decoded_block_store.key(
             image_sha256=image_sha256,
             target=target,
             entry_bytes=entry_bytes,
             max_block_instructions=max_block_instructions,
         )
-        cached = dynamic_block_cache.get(cache_key)
+        cached = decoded_block_store.get(cache_key)
         if cached is not None:
             dynamic_functions.append(cached)
             covered_addresses.update(
@@ -17981,7 +18656,7 @@ def _execute_recovered_control_flow_frame(
             return None
 
         dynamic_functions.append(function)
-        dynamic_block_cache.put(cache_key, function)
+        decoded_block_store.put(cache_key, function)
         covered_addresses.update(
             instruction.address for instruction in function.instructions
         )
@@ -18001,15 +18676,116 @@ def _execute_recovered_control_flow_frame(
         return function
 
     try:
-        result = execute_lifted_function(
-            frame,
-            state=state,
-            memory=memory,
-            call_handlers=handlers,
-            unhandled_call_handler=_stop_at_internal_call,
-            block_loader=dynamic_block_loader,
-            max_steps=max_steps,
-        )
+        if native_audio_runtime_requested:
+            from tools.recomp.native_executor import (
+                NATIVE_HOST_SERVICE_BOOTSTRAP,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_NT_CLOSE,
+                NATIVE_HOST_SERVICE_COLD_CALLBACK,
+                NATIVE_HOST_SERVICE_LIFECYCLE_CREATE_WORKER,
+                NATIVE_WORKER_SUSPENDED,
+                NativeHostServiceEntry,
+                NativeHostServiceState,
+                NativeResumableExecutor,
+                NativeWorkerLifecycleState,
+            )
+
+            bootstrap_entries: list[NativeHostServiceEntry] = []
+            bootstrap_targets: set[int] = set()
+            for shim in bridge.runtime.registered_shims:
+                if shim.name == "PsCreateSystemThreadEx":
+                    bootstrap_entries.append(
+                        NativeHostServiceEntry(
+                            shim.target_address,
+                            NATIVE_HOST_SERVICE_COLD_CALLBACK,
+                            bridge.guest_stack_cleanup_bytes(
+                                shim.target_address
+                            ),
+                            NATIVE_HOST_SERVICE_LIFECYCLE_CREATE_WORKER,
+                        )
+                    )
+                    bootstrap_targets.add(shim.target_address)
+                elif shim.name == "NtClose":
+                    bootstrap_entries.append(
+                        NativeHostServiceEntry(
+                            shim.target_address,
+                            NATIVE_HOST_SERVICE_BOOTSTRAP,
+                            bridge.guest_stack_cleanup_bytes(
+                                shim.target_address
+                            ),
+                            NATIVE_HOST_SERVICE_BOOTSTRAP_NT_CLOSE,
+                        )
+                    )
+                    bootstrap_targets.add(shim.target_address)
+            bootstrap_services = NativeHostServiceState(bootstrap_entries)
+            bootstrap_lifecycle = NativeWorkerLifecycleState()
+            bootstrap_services.attach_worker_lifecycle(bootstrap_lifecycle)
+            bootstrap_executor = NativeResumableExecutor(
+                frame,
+                build_dir=native_build_dir,
+                module_functions=[frame],
+                callback_addresses=bootstrap_targets,
+            )
+            returned_to = bootstrap_executor.run(
+                state,
+                memory,
+                max_steps=max_steps,
+                dispatch_host_calls_in_native=True,
+                native_host_services=bootstrap_services,
+            )
+            bootstrap_run = bootstrap_executor.last_run_summary or {}
+            result = ExecutionResult(
+                state=state,
+                memory=memory,
+                trace=ExecutionTrace(enabled=False),
+                return_address=returned_to,
+                steps=int(bootstrap_run.get("steps", 0)),
+            )
+            for index in range(int(bootstrap_lifecycle.entry_count)):
+                lifecycle_entry = bootstrap_lifecycle.entries[index]
+                start_address = int(lifecycle_entry.start_address)
+                handle = int(lifecycle_entry.handle)
+                native_bootstrap_threads.append(
+                    {
+                        "invocation_index": index,
+                        "handle": handle,
+                        "handle_hex": _hex32(handle),
+                        "start_address": start_address,
+                        "start_address_hex": _hex32(start_address),
+                        "start_context1": int(lifecycle_entry.start_context1),
+                        "start_context1_hex": _hex32(
+                            int(lifecycle_entry.start_context1)
+                        ),
+                        "start_context2": int(lifecycle_entry.start_context2),
+                        "start_context2_hex": _hex32(
+                            int(lifecycle_entry.start_context2)
+                        ),
+                        "suspended": int(lifecycle_entry.status)
+                        == NATIVE_WORKER_SUSPENDED,
+                        "executable": bool(
+                            start_address
+                            and _is_executable_address(loaded, start_address)
+                        ),
+                    }
+                )
+            native_bootstrap_summary = {
+                "backend": "native_dispatcher",
+                "run": bootstrap_run,
+                "service_call_count": int(bootstrap_services.native_call_count),
+                "worker_count": len(native_bootstrap_threads),
+                "python_runtime_abi_invocation_count": (
+                    bridge.invocation_count - native_bootstrap_invocation_start
+                ),
+            }
+        else:
+            result = execute_lifted_function(
+                frame,
+                state=state,
+                memory=memory,
+                call_handlers=handlers,
+                unhandled_call_handler=_stop_at_internal_call,
+                block_loader=dynamic_block_loader,
+                max_steps=max_steps,
+            )
     except RenderWatchpointStop as exc:
         return {
             "status": "render_watchpoint_stop",
@@ -18018,7 +18794,7 @@ def _execute_recovered_control_flow_frame(
                 render_watchpoint.history_stream(),
                 memory,
             ),
-            "dynamic_block_cache": dynamic_block_cache.summary(),
+            "decoded_block_store": decoded_block_store.summary(),
             **_dynamic_recovery_summary(
                 dynamic_functions,
                 dynamic_summaries,
@@ -18078,7 +18854,7 @@ def _execute_recovered_control_flow_frame(
                 dynamic_summaries,
                 dynamic_frontiers,
             ),
-            "dynamic_block_cache": dynamic_block_cache.summary(),
+            "decoded_block_store": decoded_block_store.summary(),
             "render_watchpoint_stream": _snapshot_render_texture_resources(
                 render_watchpoint.to_stream(),
                 render_watchpoint.history_stream(),
@@ -18126,7 +18902,7 @@ def _execute_recovered_control_flow_frame(
                 dynamic_summaries,
                 dynamic_frontiers,
             ),
-            "dynamic_block_cache": dynamic_block_cache.summary(),
+            "decoded_block_store": decoded_block_store.summary(),
             "render_watchpoint_stream": _snapshot_render_texture_resources(
                 render_watchpoint.to_stream(),
                 render_watchpoint.history_stream(),
@@ -18172,9 +18948,19 @@ def _execute_recovered_control_flow_frame(
     executed_thread_keys: set[int] = set()
     if returned_to_probe:
         while len(thread_executions) < DEFAULT_MAX_GUEST_THREAD_EXECUTIONS:
-            next_thread = _next_unexecuted_guest_thread(
-                bridge, loaded, executed_thread_keys
+            next_thread = next(
+                (
+                    (int(thread["handle"]), thread)
+                    for thread in native_bootstrap_threads
+                    if isinstance(thread.get("handle"), int)
+                    and int(thread["handle"]) not in executed_thread_keys
+                ),
+                None,
             )
+            if next_thread is None:
+                next_thread = _next_unexecuted_guest_thread(
+                    bridge, loaded, executed_thread_keys
+                )
             if next_thread is None:
                 break
             thread_key, thread = next_thread
@@ -18210,6 +18996,7 @@ def _execute_recovered_control_flow_frame(
                 ),
                 native_guest_loop=native_guest_loop,
                 native_build_dir=native_build_dir,
+                initial_guest_threads=tuple(native_bootstrap_threads),
                 live_render_stream_path=(
                     live_render_stream_path
                     if not thread_executions
@@ -18238,10 +19025,11 @@ def _execute_recovered_control_flow_frame(
                 audit_title_main_loop_exit=audit_title_main_loop_exit,
                 audit_world_matrices=audit_world_matrices,
                 audit_world_matrix_address=audit_world_matrix_address,
+                audit_traffic_meshes=audit_traffic_meshes,
                 audit_scene_records=audit_scene_records,
                 scene_record_sources=scene_record_sources,
                 scene_record_source_errors=scene_record_source_errors,
-                cached_functions=dynamic_block_cache.lifted_functions(),
+                cached_functions=decoded_block_store.lifted_functions(),
             )
             thread_executions.append(thread_execution)
             cooperative_scheduler = thread_execution.get(
@@ -18257,7 +19045,15 @@ def _execute_recovered_control_flow_frame(
             # thread here would orphan it after the presenter has closed.
             if _guest_thread_requested_live_stop(thread_execution):
                 break
-    scheduled_threads = _scheduled_guest_threads(bridge, loaded)
+    scheduled_threads = [
+        *native_bootstrap_threads,
+        *(
+            thread
+            for thread in _scheduled_guest_threads(bridge, loaded)
+            if thread.get("handle")
+            not in {item.get("handle") for item in native_bootstrap_threads}
+        ),
+    ]
     title_xinput_summary = title_xinput_fast_path.summary(memory)
     for thread_execution in thread_executions:
         native_services = thread_execution.get("native_host_services")
@@ -18307,6 +19103,7 @@ def _execute_recovered_control_flow_frame(
         "guest_threads": scheduled_threads,
         "guest_thread_execution_count": len(thread_executions),
         "guest_thread_executions": thread_executions,
+        "native_bootstrap": native_bootstrap_summary,
         "live_stop_requested": any(
             _guest_thread_requested_live_stop(execution)
             for execution in thread_executions
@@ -18317,7 +19114,7 @@ def _execute_recovered_control_flow_frame(
             dynamic_summaries,
             dynamic_frontiers,
         ),
-        "dynamic_block_cache": dynamic_block_cache.summary(),
+        "decoded_block_store": decoded_block_store.summary(),
         "render_watchpoint_stream": _snapshot_render_texture_resources(
             render_watchpoint.to_stream(),
             render_watchpoint.history_stream(),
@@ -18542,6 +19339,7 @@ def _execute_guest_thread_start(
     max_steps: int,
     native_guest_loop: bool = False,
     native_build_dir: Path = Path("build/native-guest-loop"),
+    initial_guest_threads: tuple[dict[str, Any], ...] = (),
     cached_functions: list[LiftedFunction] | None = None,
     live_render_stream_path: Path | None = None,
     live_controller_state_path: Path | None = None,
@@ -18556,6 +19354,7 @@ def _execute_guest_thread_start(
     audit_title_main_loop_exit: bool = False,
     audit_world_matrices: bool = False,
     audit_world_matrix_address: int | None = None,
+    audit_traffic_meshes: bool = False,
     audit_scene_records: bool = False,
     scene_record_sources: tuple[TitleSceneRecordSourceLayout, ...] = (),
     scene_record_source_errors: tuple[str, ...] = (),
@@ -18574,6 +19373,7 @@ def _execute_guest_thread_start(
         "title_repair_fallbacks_enabled": enable_title_repair_fallbacks,
         "hot_path_profiling_enabled": profile_hot_paths,
         "developer_live_compilation_enabled": developer_live_compile,
+        "traffic_mesh_audit_enabled": audit_traffic_meshes,
     }
     if thread["suspended"]:
         return {**summary, "status": "skipped_suspended"}
@@ -18587,21 +19387,97 @@ def _execute_guest_thread_start(
         thread_index=thread_index,
         memory=memory,
     )
-    frame_functions = [
+    initial_frame_functions = [
         *internal_functions,
         *dynamic_functions,
         *(cached_functions or []),
     ]
-    native_branch_functions = (
-        _recover_missing_branch_targets(
-            frame_functions,
-            block_loader,
-            start_address=TITLE_INPUT_CONSUMER_ADDRESS,
-            end_address=TITLE_INPUT_CONSUMER_END_ADDRESS,
+    native_aot_callbacks = (
+        _recover_required_aot_callbacks(
+            initial_frame_functions,
+            targets=TITLE_LEVEL_ADDRESS_TAKEN_CALLBACK_TARGETS,
+            block_loader=block_loader,
         )
         if native_guest_loop
         else []
     )
+    frame_functions = list(initial_frame_functions)
+    frame_function_addresses = {
+        function.base_address for function in frame_functions
+    }
+    frame_functions.extend(
+        function
+        for function in native_aot_callbacks
+        if function.base_address not in frame_function_addresses
+    )
+    native_branch_functions: list[LiftedFunction] = []
+    if native_guest_loop:
+        while True:
+            known_native_functions = [*frame_functions, *native_branch_functions]
+            stored_callback_targets = _stored_code_pointer_targets(
+                known_native_functions,
+                read_bytes=loaded.arena.read,
+                is_code=lambda address: (
+                    _is_file_backed_code_address(loaded, address)
+                ),
+            )
+            stack_callback_targets = _stack_argument_code_pointer_targets(
+                known_native_functions,
+                read_bytes=loaded.arena.read,
+                is_code=lambda address: (
+                    _is_file_backed_code_address(loaded, address)
+                ),
+                callback_argument_indices=TITLE_STACK_CALLBACK_ARGUMENT_INDICES,
+            )
+            register_callback_targets = _register_stack_argument_code_pointer_targets(
+                known_native_functions,
+                read_bytes=loaded.arena.read,
+                is_code=lambda address: (
+                    _is_file_backed_code_address(loaded, address)
+                ),
+                callback_argument_indices=TITLE_REGISTER_CALLBACK_ARGUMENT_INDICES,
+            )
+            static_table_targets = _static_code_pointer_table_targets(
+                known_native_functions,
+                read_bytes=loaded.arena.read,
+                read_u32=loaded.arena.read_u32,
+                is_code=lambda address: (
+                    _is_file_backed_code_address(loaded, address)
+                ),
+                table_ranges=_file_backed_pointer_table_ranges(loaded),
+            )
+            stored_callbacks = _recover_required_aot_callbacks(
+                known_native_functions,
+                targets=sorted(
+                    set(stored_callback_targets)
+                    | set(stack_callback_targets)
+                    | set(register_callback_targets)
+                    | set(static_table_targets)
+                ),
+                block_loader=block_loader,
+            )
+            if stored_callbacks:
+                native_aot_callbacks.extend(stored_callbacks)
+                frame_functions.extend(stored_callbacks)
+                known_native_functions.extend(stored_callbacks)
+            branch_functions = _recover_missing_branch_targets(
+                known_native_functions,
+                block_loader,
+                start_address=0,
+                end_address=1 << 32,
+                indirect_target_resolver=lambda function: (
+                    _absolute_indirect_jump_table_targets(
+                        function,
+                        read_u32=loaded.arena.read_u32,
+                        is_executable=lambda address: (
+                            _is_file_backed_code_address(loaded, address)
+                        ),
+                    )
+                ),
+            )
+            native_branch_functions.extend(branch_functions)
+            if not stored_callbacks and not branch_functions:
+                break
     frame = _merge_lifted_functions(
         entry_function,
         [*frame_functions, *native_branch_functions],
@@ -18675,6 +19551,259 @@ def _execute_guest_thread_start(
     pending_native_write_observations: list[tuple[int, bytes]] = []
     cooperative_scheduler_summary: dict[str, Any] | None = None
     native_host_services_summary: dict[str, Any] | None = None
+
+    def native_traffic_mesh_audit_summary() -> dict[str, Any]:
+        sample_capacity = len(native_host_services.native_traffic_mesh_samples)
+        sample_count = min(
+            int(native_host_services.native_traffic_mesh_sample_count),
+            sample_capacity,
+        )
+        sample_cursor = int(native_host_services.native_traffic_mesh_sample_cursor)
+        oldest_index = (
+            sample_cursor % sample_capacity
+            if sample_count == sample_capacity
+            else 0
+        )
+        samples = []
+        for sample_offset in range(sample_count):
+            sample = native_host_services.native_traffic_mesh_samples[
+                (oldest_index + sample_offset) % sample_capacity
+            ]
+            samples.append(
+                {
+                    "caller": int(sample.caller),
+                    "caller_hex": _hex32(int(sample.caller)),
+                    "owner": int(sample.owner),
+                    "owner_hex": _hex32(int(sample.owner)),
+                    "owner_mode": int(sample.owner_mode),
+                    "owner_mode_hex": _hex32(int(sample.owner_mode)),
+                    "mesh_entry": int(sample.mesh_entry),
+                    "mesh_entry_hex": _hex32(int(sample.mesh_entry)),
+                    "index_data": int(sample.index_data),
+                    "index_data_hex": _hex32(int(sample.index_data)),
+                    "index_count": int(sample.index_count),
+                }
+            )
+        return {
+            "enabled": audit_traffic_meshes,
+            "world_draw_count": int(
+                native_host_services.native_traffic_world_draw_count
+            ),
+            "zero_index_count": int(
+                native_host_services.native_traffic_world_zero_index_count
+            ),
+            "sample_count": sample_count,
+            "sample_cursor": sample_cursor,
+            "samples": samples,
+        }
+
+    def native_host_service_failure_summary() -> dict[str, Any]:
+        trace_count = min(
+            int(native_host_services.service_trace_count),
+            len(native_host_services.service_trace_targets),
+        )
+        return {
+            "backend": "native_dispatcher",
+            "traffic_mesh_audit": native_traffic_mesh_audit_summary(),
+            "call_count": int(native_host_services.native_call_count),
+            "service_trace_count": int(native_host_services.service_trace_count),
+            "service_trace_overflow_count": int(
+                native_host_services.service_trace_overflow_count
+            ),
+            "last_service_target": int(native_host_services.last_service_target),
+            "last_service_target_hex": _hex32(
+                int(native_host_services.last_service_target)
+            ),
+            "last_service_kind": int(native_host_services.last_service_kind),
+            "last_service_value": int(native_host_services.last_service_value),
+            "last_service_result": int(native_host_services.last_service_result),
+            "last_service_result_hex": _hex32(
+                int(native_host_services.last_service_result)
+            ),
+            "last_service_return_address": int(
+                native_host_services.last_service_return_address
+            ),
+            "last_service_return_address_hex": _hex32(
+                int(native_host_services.last_service_return_address)
+            ),
+            "last_service_argument0": int(
+                native_host_services.last_service_argument0
+            ),
+            "last_service_argument0_hex": _hex32(
+                int(native_host_services.last_service_argument0)
+            ),
+            "last_service_worker_handle": int(
+                native_host_services.last_service_worker_handle
+            ),
+            "last_service_worker_handle_hex": _hex32(
+                int(native_host_services.last_service_worker_handle)
+            ),
+            "native_semaphore_count": int(native_host_services.semaphore_count),
+            "native_semaphore_overflow_count": int(
+                native_host_services.semaphore_overflow_count
+            ),
+            "native_semaphores": [
+                {
+                    "handle": int(native_host_services.semaphores[index].handle),
+                    "handle_hex": _hex32(
+                        int(native_host_services.semaphores[index].handle)
+                    ),
+                    "count": int(native_host_services.semaphores[index].count),
+                    "limit": int(native_host_services.semaphores[index].limit),
+                }
+                for index in range(
+                    min(
+                        int(native_host_services.semaphore_count),
+                        len(native_host_services.semaphores),
+                    )
+                )
+            ],
+            "service_trace": [
+                {
+                    "target": int(native_host_services.service_trace_targets[index]),
+                    "target_hex": _hex32(
+                        int(native_host_services.service_trace_targets[index])
+                    ),
+                    "shim_name": runtime_target_names.get(
+                        int(native_host_services.service_trace_targets[index])
+                    ),
+                    "kind": int(native_host_services.service_trace_kinds[index]),
+                    "value": int(native_host_services.service_trace_values[index]),
+                    "result": int(native_host_services.service_trace_results[index]),
+                    "result_hex": _hex32(
+                        int(native_host_services.service_trace_results[index])
+                    ),
+                    "return_address": int(
+                        native_host_services.service_trace_return_addresses[index]
+                    ),
+                    "return_address_hex": _hex32(
+                        int(native_host_services.service_trace_return_addresses[index])
+                    ),
+                }
+                for index in range(trace_count)
+            ],
+            "last_file_guest_path": os.fsdecode(
+                native_host_services.last_file_guest_path
+            ),
+            "last_file_host_path": os.fsdecode(
+                native_host_services.last_file_host_path
+            ),
+            "native_allocation_count": int(native_host_services.allocation_count),
+            "native_allocation_overflow_count": int(
+                native_host_services.allocation_overflow_count
+            ),
+            "native_allocated_page_count": int(
+                native_host_services.native_allocated_page_count
+            ),
+            "native_page_allocation_failure_count": int(
+                native_host_services.native_page_allocation_failure_count
+            ),
+            "next_pool_address": int(native_host_services.next_pool_address),
+            "next_pool_address_hex": _hex32(
+                int(native_host_services.next_pool_address)
+            ),
+            "normal_runtime_failure_code": int(
+                native_host_services.normal_runtime_failure_code
+            ),
+            "normal_runtime_failure_target": int(
+                native_host_services.normal_runtime_failure_target
+            ),
+            "normal_runtime_failure_target_hex": _hex32(
+                int(native_host_services.normal_runtime_failure_target)
+            ),
+            "native_files": [
+                {
+                    "handle": int(native_host_services.files[index].handle),
+                    "handle_hex": _hex32(
+                        int(native_host_services.files[index].handle)
+                    ),
+                    "flags": int(native_host_services.files[index].flags),
+                    "size": int(native_host_services.files[index].size),
+                    "position": int(native_host_services.files[index].position),
+                    "active": bool(native_host_services.files[index].active),
+                    "host_open": bool(native_host_services.files[index].host_file),
+                    "guest_path": os.fsdecode(
+                        native_host_services.files[index].guest_path
+                    ),
+                    "host_path": os.fsdecode(
+                        native_host_services.files[index].host_path
+                    ),
+                }
+                for index in range(
+                    min(
+                        int(native_host_services.file_count),
+                        len(native_host_services.files),
+                    )
+                )
+            ],
+            "native_title_asset_stream_count": int(
+                native_host_services.title_asset_stream_count
+            ),
+            "native_title_asset_streams": [
+                {
+                    "object_address_hex": _hex32(
+                        native_host_services.title_asset_streams[index].object
+                    ),
+                    "payload_address_hex": _hex32(
+                        native_host_services.title_asset_streams[index].payload
+                    ),
+                    "payload_bytes": int(
+                        native_host_services.title_asset_streams[index].payload_size
+                    ),
+                    "track_pss": bool(
+                        native_host_services.title_asset_streams[index].flags & 1
+                    ),
+                    "publication_attempted": bool(
+                        native_host_services.title_asset_streams[index].flags & 2
+                    ),
+                    "published": bool(
+                        native_host_services.title_asset_streams[index].flags & 4
+                    ),
+                    "traffic_tra": bool(
+                        native_host_services.title_asset_streams[index].flags & 8
+                    ),
+                    "image_base_hex": _hex32(
+                        native_host_services.title_asset_streams[index].image_base
+                    ),
+                }
+                for index in range(
+                    min(
+                        int(native_host_services.title_asset_stream_count),
+                        len(native_host_services.title_asset_streams),
+                    )
+                )
+            ],
+            "native_title_asset_open_count": int(
+                native_host_services.title_asset_open_count
+            ),
+            "native_title_asset_open_failure_count": int(
+                native_host_services.title_asset_open_failure_count
+            ),
+            "native_title_asset_payload_bytes": int(
+                native_host_services.title_asset_payload_bytes
+            ),
+            "native_title_track_pss_candidate_count": int(
+                native_host_services.title_track_pss_candidate_count
+            ),
+            "native_title_track_pss_publication_count": int(
+                native_host_services.title_track_pss_publication_count
+            ),
+            "native_title_track_pss_validation_failure_count": int(
+                native_host_services.title_track_pss_validation_failure_count
+            ),
+            "native_title_track_pss_published_bytes": int(
+                native_host_services.title_track_pss_published_bytes
+            ),
+            "native_title_track_pss_descriptor_entry_count": int(
+                native_host_services.title_track_pss_descriptor_entry_count
+            ),
+            "native_title_track_pss_scene_record_entry_count": int(
+                native_host_services.title_track_pss_scene_record_entry_count
+            ),
+            "native_title_traffic_tra_candidate_count": int(
+                native_host_services.title_traffic_tra_candidate_count
+            ),
+        }
     enable_hot_render_audits = (
         live_render_stream_path is None or audit_title_main_loop_exit
     )
@@ -19001,15 +20130,111 @@ def _execute_guest_thread_start(
     try:
         if native_guest_loop:
             from tools.recomp.native_executor import (
+                NATIVE_HOST_SERVICE_AUDIO,
+                NATIVE_HOST_SERVICE_AUDIO_BUFFER_CREATE,
+                NATIVE_HOST_SERVICE_AUDIO_BUFFER_PLAY,
+                NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_DATA,
+                NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_FORMAT,
+                NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_FREQUENCY,
+                NATIVE_HOST_SERVICE_AUDIO_BUFFER_GET_POSITION,
+                NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_POSITION,
+                NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_VOLUME,
+                NATIVE_HOST_SERVICE_AUDIO_BUFFER_STOP,
+                NATIVE_HOST_SERVICE_AUDIO_BUFFER_STOP_EX,
+                NATIVE_HOST_SERVICE_AUDIO_DIRECTSOUND_EFFECT_IMAGE,
+                NATIVE_HOST_SERVICE_AUDIO_PASSTHROUGH,
+                NATIVE_HOST_SERVICE_AUDIO_STREAM_CREATE,
+                NATIVE_HOST_SERVICE_AUDIO_STREAM_FLUSH,
+                NATIVE_HOST_SERVICE_AUDIO_STREAM_PROCESS,
+                NATIVE_HOST_SERVICE_AUDIO_STREAM_SET_FORMAT,
+                NATIVE_HOST_SERVICE_BOOTSTRAP,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_AV_SEND_TV_ENCODER_OPTION,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_AV_GET_SAVED_DATA_ADDRESS,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_AV_SET_DISPLAY_MODE,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_AV_SET_SAVED_DATA_ADDRESS,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_HAL_GET_INTERRUPT_VECTOR,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_HAL_READ_WRITE_PCI_SPACE,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_IO_CREATE_DEVICE,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_KE_CONNECT_INTERRUPT,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_KE_INITIALIZE_INTERRUPT,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_KE_SET_EVENT,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_KE_STALL_EXECUTION_PROCESSOR,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_MM_CLAIM_GPU_INSTANCE_MEMORY,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_NT_CLOSE,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_NT_CREATE_FILE,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_NT_DEVICE_IO_CONTROL_FILE,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_NT_FS_CONTROL_FILE,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_NT_OPEN_FILE,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_NT_OPEN_SYMBOLIC_LINK_OBJECT,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_NT_QUERY_INFORMATION_FILE,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_NT_QUERY_DIRECTORY_FILE,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_NT_READ_FILE,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_NT_SET_INFORMATION_FILE,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_NT_WRITE_FILE,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_NT_QUERY_SYMBOLIC_LINK_OBJECT,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_NT_QUERY_VOLUME_INFORMATION_FILE,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_RTL_TIME_FIELDS_TO_TIME,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_RTL_TIME_TO_TIME_FIELDS,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_XC_HMAC,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_XC_RC4_CRYPT,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_XC_RC4_KEY,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_XC_SHA_FINAL,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_XC_SHA_INIT,
+                NATIVE_HOST_SERVICE_BOOTSTRAP_XC_SHA_UPDATE,
                 NATIVE_HOST_SERVICE_COLD_CALLBACK,
+                NATIVE_HOST_SERVICE_IRQL,
+                NATIVE_HOST_SERVICE_IRQL_LOWER,
+                NATIVE_HOST_SERVICE_IRQL_RAISE,
+                NATIVE_HOST_SERVICE_IRQL_RAISE_DPC,
                 NATIVE_HOST_SERVICE_LIFECYCLE_CREATE_WORKER,
+                NATIVE_HOST_SERVICE_LIFECYCLE_CREATE_SEMAPHORE,
                 NATIVE_HOST_SERVICE_LIFECYCLE_NONE,
+                NATIVE_HOST_SERVICE_LIFECYCLE_REFERENCE_WORKER,
                 NATIVE_HOST_SERVICE_LIFECYCLE_RESUME_WORKER,
+                NATIVE_HOST_SERVICE_LIFECYCLE_SET_BASE_PRIORITY,
+                NATIVE_HOST_SERVICE_LIFECYCLE_SET_DISABLE_BOOST,
+                NATIVE_HOST_SERVICE_LIFECYCLE_SET_PRIORITY,
                 NATIVE_HOST_SERVICE_LIFECYCLE_SUSPEND_WORKER,
                 NATIVE_HOST_SERVICE_LIFECYCLE_TERMINATE_WORKER,
+                NATIVE_HOST_SERVICE_MEMORY,
+                NATIVE_HOST_SERVICE_MEMORY_ALLOCATE_CONTIGUOUS,
+                NATIVE_HOST_SERVICE_MEMORY_ALLOCATE_CONTIGUOUS_EX,
+                NATIVE_HOST_SERVICE_MEMORY_ALLOCATE_VIRTUAL,
+                NATIVE_HOST_SERVICE_MEMORY_ALLOCATE_POOL,
+                NATIVE_HOST_SERVICE_MEMORY_FREE,
+                NATIVE_HOST_SERVICE_MEMORY_GET_PHYSICAL_ADDRESS,
+                NATIVE_HOST_SERVICE_MEMORY_QUERY_ALLOCATION_SIZE,
+                NATIVE_HOST_SERVICE_MEMORY_VALIDATE_RANGE,
                 NATIVE_HOST_SERVICE_PERFORMANCE_COUNTER,
                 NATIVE_HOST_SERVICE_RETURN_CONSTANT,
+                NATIVE_HOST_SERVICE_RUNTIME,
+                NATIVE_HOST_SERVICE_RUNTIME_ANSI_STRING_TO_UNICODE_STRING,
+                NATIVE_HOST_SERVICE_RUNTIME_EQUAL_STRING,
+                NATIVE_HOST_SERVICE_RUNTIME_INIT_ANSI_STRING,
+                NATIVE_HOST_SERVICE_RUNTIME_MISSING_NON_VOLATILE_SETTING,
+                NATIVE_HOST_SERVICE_RUNTIME_NT_STATUS_TO_DOS_ERROR,
+                NATIVE_HOST_SERVICE_RUNTIME_PRESERVE_RETURN,
+                NATIVE_HOST_SERVICE_RUNTIME_DELAY_THREAD,
+                NATIVE_HOST_SERVICE_RUNTIME_UNICODE_STRING_TO_ANSI_STRING,
+                NATIVE_HOST_SERVICE_SEMAPHORE,
+                NATIVE_HOST_SERVICE_SEMAPHORE_RELEASE,
+                NATIVE_HOST_SERVICE_SEMAPHORE_KERNEL_WAIT,
+                NATIVE_HOST_SERVICE_SEMAPHORE_WAIT,
                 NATIVE_HOST_SERVICE_SYSTEM_TIME,
+                NATIVE_HOST_SERVICE_TITLE,
+                NATIVE_HOST_SERVICE_TITLE_ALLOCATION_LIST_COUNT,
+                NATIVE_HOST_SERVICE_TITLE_ASSET_ACTIVATE,
+                NATIVE_HOST_SERVICE_TITLE_ASSET_OPEN,
+                NATIVE_HOST_SERVICE_TITLE_ASSET_READ,
+                NATIVE_HOST_SERVICE_TITLE_ASSET_SEEK,
+                NATIVE_HOST_SERVICE_TITLE_ASSET_STATUS,
+                NATIVE_HOST_SERVICE_TITLE_D3D_FLUSH,
+                NATIVE_HOST_SERVICE_TITLE_GLOBAL_LIST_REGISTER,
+                NATIVE_HOST_SERVICE_TITLE_HEAP_ALLOCATE,
+                NATIVE_HOST_SERVICE_TITLE_HEAP_FREE,
+                NATIVE_HOST_SERVICE_TITLE_STATIC_DRIVE_SETUP,
+                NATIVE_HOST_SERVICE_TITLE_SPIN_DELAY,
+                NATIVE_HOST_SERVICE_TITLE_TEXT_DRAW,
                 NATIVE_HOST_SERVICE_XGETDEVICES,
                 NATIVE_HOST_SERVICE_XINPUT_CAPABILITIES,
                 NATIVE_HOST_SERVICE_XINPUT_OPEN,
@@ -19017,6 +20242,7 @@ def _execute_guest_thread_start(
                 NATIVE_WORKER_BLOCKED,
                 NATIVE_WORKER_COMPLETED,
                 NATIVE_WORKER_FAILED,
+                NATIVE_WORKER_READY,
                 NATIVE_WORKER_RUNNING,
                 NATIVE_WORKER_WAITING,
                 NativeCooperativeSchedulerState,
@@ -19028,6 +20254,10 @@ def _execute_guest_thread_start(
 
             runtime_targets = {
                 shim.name: shim.target_address
+                for shim in bridge.runtime.registered_shims
+            }
+            runtime_target_names = {
+                shim.target_address: shim.name
                 for shim in bridge.runtime.registered_shims
             }
             clock_snapshot = bridge.runtime.clock.snapshot()
@@ -19063,6 +20293,228 @@ def _execute_guest_thread_start(
                     0,
                 ),
                 NativeHostServiceEntry(
+                    runtime_targets["RtlEnterCriticalSection"],
+                    NATIVE_HOST_SERVICE_RETURN_CONSTANT,
+                    4,
+                    int(XboxStatus.SUCCESS),
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["RtlLeaveCriticalSection"],
+                    NATIVE_HOST_SERVICE_RETURN_CONSTANT,
+                    4,
+                    int(XboxStatus.SUCCESS),
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["RtlInitializeCriticalSection"],
+                    NATIVE_HOST_SERVICE_RETURN_CONSTANT,
+                    4,
+                    int(XboxStatus.SUCCESS),
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["ObfDereferenceObject"],
+                    NATIVE_HOST_SERVICE_RETURN_CONSTANT,
+                    0,
+                    int(XboxStatus.SUCCESS),
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["KfRaiseIrql"],
+                    NATIVE_HOST_SERVICE_IRQL,
+                    4,
+                    NATIVE_HOST_SERVICE_IRQL_RAISE,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["KfLowerIrql"],
+                    NATIVE_HOST_SERVICE_IRQL,
+                    0,
+                    NATIVE_HOST_SERVICE_IRQL_LOWER,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["KeRaiseIrqlToDpcLevel"],
+                    NATIVE_HOST_SERVICE_IRQL,
+                    0,
+                    NATIVE_HOST_SERVICE_IRQL_RAISE_DPC,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["NtReleaseSemaphore"],
+                    NATIVE_HOST_SERVICE_SEMAPHORE,
+                    12,
+                    NATIVE_HOST_SERVICE_SEMAPHORE_RELEASE,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["NtWaitForSingleObjectEx"],
+                    NATIVE_HOST_SERVICE_SEMAPHORE,
+                    16,
+                    NATIVE_HOST_SERVICE_SEMAPHORE_WAIT,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["NtWaitForSingleObject"],
+                    NATIVE_HOST_SERVICE_SEMAPHORE,
+                    12,
+                    NATIVE_HOST_SERVICE_SEMAPHORE_WAIT,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["KeWaitForSingleObject"],
+                    NATIVE_HOST_SERVICE_SEMAPHORE,
+                    20,
+                    NATIVE_HOST_SERVICE_SEMAPHORE_KERNEL_WAIT,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["RtlInitAnsiString"],
+                    NATIVE_HOST_SERVICE_RUNTIME,
+                    8,
+                    NATIVE_HOST_SERVICE_RUNTIME_INIT_ANSI_STRING,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["RtlEqualString"],
+                    NATIVE_HOST_SERVICE_RUNTIME,
+                    12,
+                    NATIVE_HOST_SERVICE_RUNTIME_EQUAL_STRING,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["RtlAnsiStringToUnicodeString"],
+                    NATIVE_HOST_SERVICE_RUNTIME,
+                    12,
+                    NATIVE_HOST_SERVICE_RUNTIME_ANSI_STRING_TO_UNICODE_STRING,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["RtlUnicodeStringToAnsiString"],
+                    NATIVE_HOST_SERVICE_RUNTIME,
+                    12,
+                    NATIVE_HOST_SERVICE_RUNTIME_UNICODE_STRING_TO_ANSI_STRING,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["ExQueryNonVolatileSetting"],
+                    NATIVE_HOST_SERVICE_RUNTIME,
+                    20,
+                    NATIVE_HOST_SERVICE_RUNTIME_MISSING_NON_VOLATILE_SETTING,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["RtlNtStatusToDosError"],
+                    NATIVE_HOST_SERVICE_RUNTIME,
+                    4,
+                    NATIVE_HOST_SERVICE_RUNTIME_NT_STATUS_TO_DOS_ERROR,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["KeInitializeDpc"],
+                    NATIVE_HOST_SERVICE_RUNTIME,
+                    12,
+                    NATIVE_HOST_SERVICE_RUNTIME_PRESERVE_RETURN,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["KeInitializeTimerEx"],
+                    NATIVE_HOST_SERVICE_RUNTIME,
+                    8,
+                    NATIVE_HOST_SERVICE_RUNTIME_PRESERVE_RETURN,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["KeDelayExecutionThread"],
+                    NATIVE_HOST_SERVICE_RUNTIME,
+                    12,
+                    NATIVE_HOST_SERVICE_RUNTIME_DELAY_THREAD,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["IoCreateSymbolicLink"],
+                    NATIVE_HOST_SERVICE_RETURN_CONSTANT,
+                    8,
+                    int(XboxStatus.SUCCESS),
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["HalRegisterShutdownNotification"],
+                    NATIVE_HOST_SERVICE_RETURN_CONSTANT,
+                    8,
+                    int(XboxStatus.SUCCESS),
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["XeLoadSection"],
+                    NATIVE_HOST_SERVICE_RETURN_CONSTANT,
+                    4,
+                    int(XboxStatus.SUCCESS),
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["XeUnloadSection"],
+                    NATIVE_HOST_SERVICE_RETURN_CONSTANT,
+                    4,
+                    int(XboxStatus.SUCCESS),
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["KeSetTimer"],
+                    NATIVE_HOST_SERVICE_RETURN_CONSTANT,
+                    16,
+                    0,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["MmAllocateContiguousMemoryEx"],
+                    NATIVE_HOST_SERVICE_MEMORY,
+                    20,
+                    NATIVE_HOST_SERVICE_MEMORY_ALLOCATE_CONTIGUOUS_EX,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["MmAllocateContiguousMemory"],
+                    NATIVE_HOST_SERVICE_MEMORY,
+                    4,
+                    NATIVE_HOST_SERVICE_MEMORY_ALLOCATE_CONTIGUOUS,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["NtAllocateVirtualMemory"],
+                    NATIVE_HOST_SERVICE_MEMORY,
+                    20,
+                    NATIVE_HOST_SERVICE_MEMORY_ALLOCATE_VIRTUAL,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["MmGetPhysicalAddress"],
+                    NATIVE_HOST_SERVICE_MEMORY,
+                    4,
+                    NATIVE_HOST_SERVICE_MEMORY_GET_PHYSICAL_ADDRESS,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["MmQueryAllocationSize"],
+                    NATIVE_HOST_SERVICE_MEMORY,
+                    4,
+                    NATIVE_HOST_SERVICE_MEMORY_QUERY_ALLOCATION_SIZE,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["MmFreeContiguousMemory"],
+                    NATIVE_HOST_SERVICE_MEMORY,
+                    4,
+                    NATIVE_HOST_SERVICE_MEMORY_FREE,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["NtFreeVirtualMemory"],
+                    NATIVE_HOST_SERVICE_MEMORY,
+                    4,
+                    NATIVE_HOST_SERVICE_MEMORY_FREE,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["MmLockUnlockBufferPages"],
+                    NATIVE_HOST_SERVICE_MEMORY,
+                    12,
+                    NATIVE_HOST_SERVICE_MEMORY_VALIDATE_RANGE,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["MmPersistContiguousMemory"],
+                    NATIVE_HOST_SERVICE_MEMORY,
+                    12,
+                    NATIVE_HOST_SERVICE_MEMORY_VALIDATE_RANGE,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["ExAllocatePoolWithTag"],
+                    NATIVE_HOST_SERVICE_MEMORY,
+                    8,
+                    NATIVE_HOST_SERVICE_MEMORY_ALLOCATE_POOL,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["ExFreePool"],
+                    NATIVE_HOST_SERVICE_MEMORY,
+                    4,
+                    NATIVE_HOST_SERVICE_MEMORY_FREE,
+                ),
+                NativeHostServiceEntry(
+                    runtime_targets["ExQueryPoolBlockSize"],
+                    NATIVE_HOST_SERVICE_MEMORY,
+                    4,
+                    NATIVE_HOST_SERVICE_MEMORY_QUERY_ALLOCATION_SIZE,
+                ),
+                NativeHostServiceEntry(
                     TITLE_XINPUT_OPEN_ADDRESS,
                     NATIVE_HOST_SERVICE_XINPUT_OPEN,
                     16,
@@ -19080,7 +20532,289 @@ def _execute_guest_thread_start(
                     8,
                     0,
                 ),
+                NativeHostServiceEntry(
+                    TITLE_DIRECTSOUND_EFFECT_IMAGE_ADDRESS,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    12,
+                    NATIVE_HOST_SERVICE_AUDIO_DIRECTSOUND_EFFECT_IMAGE,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_FRONTEND_SPECIAL_AUDIO_CREATE_ADDRESS,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    4,
+                    NATIVE_HOST_SERVICE_AUDIO_PASSTHROUGH,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_MUSIC_MODE_SET_ADDRESS,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    4,
+                    NATIVE_HOST_SERVICE_AUDIO_PASSTHROUGH,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_DIRECTSOUND_BUFFER_CREATE_ADDRESS,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    16,
+                    NATIVE_HOST_SERVICE_AUDIO_BUFFER_CREATE,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_DIRECTSOUND_BUFFER_SET_DATA_ADDRESS,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    12,
+                    NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_DATA,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_DIRECTSOUND_BUFFER_SET_FORMAT_ADDRESS,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    8,
+                    NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_FORMAT,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_DIRECTSOUND_BUFFER_SET_VOLUME_ADDRESS,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    8,
+                    NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_VOLUME,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_DIRECTSOUND_BUFFER_SET_FREQUENCY_ADDRESS,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    8,
+                    NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_FREQUENCY,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_DIRECTSOUND_BUFFER_GET_POSITION_ADDRESS,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    12,
+                    NATIVE_HOST_SERVICE_AUDIO_BUFFER_GET_POSITION,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_DIRECTSOUND_BUFFER_SET_POSITION_ADDRESS,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    8,
+                    NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_POSITION,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_DIRECTSOUND_BUFFER_PLAY_ADDRESS,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    16,
+                    NATIVE_HOST_SERVICE_AUDIO_BUFFER_PLAY,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_DIRECTSOUND_BUFFER_STOP_ADDRESS,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    4,
+                    NATIVE_HOST_SERVICE_AUDIO_BUFFER_STOP,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_DIRECTSOUND_BUFFER_STOP_EX_ADDRESS,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    16,
+                    NATIVE_HOST_SERVICE_AUDIO_BUFFER_STOP_EX,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_DIRECTSOUND_STREAM_CREATE_ADDRESS,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    16,
+                    NATIVE_HOST_SERVICE_AUDIO_STREAM_CREATE,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_DIRECTSOUND_STREAM_PROCESS_ADDRESS,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    12,
+                    NATIVE_HOST_SERVICE_AUDIO_STREAM_PROCESS,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_DIRECTSOUND_STREAM_FLUSH_ADDRESS,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    4,
+                    NATIVE_HOST_SERVICE_AUDIO_STREAM_FLUSH,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_DIRECTSOUND_STREAM_SET_FORMAT_ADDRESS,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    8,
+                    NATIVE_HOST_SERVICE_AUDIO_STREAM_SET_FORMAT,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_HEAP_ALLOC_TRAMPOLINE_ADDRESS,
+                    NATIVE_HOST_SERVICE_TITLE,
+                    0,
+                    NATIVE_HOST_SERVICE_TITLE_HEAP_ALLOCATE,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_HEAP_FREE_TRAMPOLINE_ADDRESS,
+                    NATIVE_HOST_SERVICE_TITLE,
+                    0,
+                    NATIVE_HOST_SERVICE_TITLE_HEAP_FREE,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_ALLOCATION_LIST_COUNT_ADDRESS,
+                    NATIVE_HOST_SERVICE_TITLE,
+                    0,
+                    NATIVE_HOST_SERVICE_TITLE_ALLOCATION_LIST_COUNT,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_GLOBAL_LIST_REGISTER_ADDRESS,
+                    NATIVE_HOST_SERVICE_TITLE,
+                    0,
+                    NATIVE_HOST_SERVICE_TITLE_GLOBAL_LIST_REGISTER,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_TEXT_DRAW_ADDRESS,
+                    NATIVE_HOST_SERVICE_TITLE,
+                    TITLE_TEXT_DRAW_STACK_CLEANUP,
+                    NATIVE_HOST_SERVICE_TITLE_TEXT_DRAW,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_ASSET_STREAM_OPEN_ADDRESS,
+                    NATIVE_HOST_SERVICE_TITLE,
+                    8,
+                    NATIVE_HOST_SERVICE_TITLE_ASSET_OPEN,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_ASSET_STREAM_SYNTHETIC_ACTIVATE_TARGET_ADDRESS,
+                    NATIVE_HOST_SERVICE_TITLE,
+                    0,
+                    NATIVE_HOST_SERVICE_TITLE_ASSET_ACTIVATE,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_ASSET_STREAM_SYNTHETIC_STATUS_TARGET_ADDRESS,
+                    NATIVE_HOST_SERVICE_TITLE,
+                    0,
+                    NATIVE_HOST_SERVICE_TITLE_ASSET_STATUS,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_ASSET_STREAM_SYNTHETIC_READ_TARGET_ADDRESS,
+                    NATIVE_HOST_SERVICE_TITLE,
+                    8,
+                    NATIVE_HOST_SERVICE_TITLE_ASSET_READ,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_ASSET_STREAM_SYNTHETIC_SEEK_TARGET_ADDRESS,
+                    NATIVE_HOST_SERVICE_TITLE,
+                    12,
+                    NATIVE_HOST_SERVICE_TITLE_ASSET_SEEK,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_STATIC_DRIVE_ARRAY_SETUP_ADDRESS,
+                    NATIVE_HOST_SERVICE_TITLE,
+                    TITLE_STATIC_DRIVE_ARRAY_SETUP_STACK_CLEANUP,
+                    NATIVE_HOST_SERVICE_TITLE_STATIC_DRIVE_SETUP,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_D3D_FLUSH_ADDRESS,
+                    NATIVE_HOST_SERVICE_TITLE,
+                    0,
+                    NATIVE_HOST_SERVICE_TITLE_D3D_FLUSH,
+                ),
+                NativeHostServiceEntry(
+                    TITLE_SPIN_DELAY_ADDRESS,
+                    NATIVE_HOST_SERVICE_TITLE,
+                    0,
+                    NATIVE_HOST_SERVICE_TITLE_SPIN_DELAY,
+                ),
             ]
+            native_bootstrap_services = {
+                "AvGetSavedDataAddress": (
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_AV_GET_SAVED_DATA_ADDRESS
+                ),
+                "AvSendTVEncoderOption": (
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_AV_SEND_TV_ENCODER_OPTION
+                ),
+                "AvSetDisplayMode": (
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_AV_SET_DISPLAY_MODE
+                ),
+                "AvSetSavedDataAddress": (
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_AV_SET_SAVED_DATA_ADDRESS
+                ),
+                "HalGetInterruptVector": (
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_HAL_GET_INTERRUPT_VECTOR
+                ),
+                "HalReadWritePCISpace": (
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_HAL_READ_WRITE_PCI_SPACE
+                ),
+                "IoCreateDevice": NATIVE_HOST_SERVICE_BOOTSTRAP_IO_CREATE_DEVICE,
+                "KeConnectInterrupt": (
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_KE_CONNECT_INTERRUPT
+                ),
+                "KeInitializeInterrupt": (
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_KE_INITIALIZE_INTERRUPT
+                ),
+                "KeSetEvent": NATIVE_HOST_SERVICE_BOOTSTRAP_KE_SET_EVENT,
+                "KeStallExecutionProcessor": (
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_KE_STALL_EXECUTION_PROCESSOR
+                ),
+                "MmClaimGpuInstanceMemory": (
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_MM_CLAIM_GPU_INSTANCE_MEMORY
+                ),
+                "NtClose": NATIVE_HOST_SERVICE_BOOTSTRAP_NT_CLOSE,
+                "NtCreateFile": NATIVE_HOST_SERVICE_BOOTSTRAP_NT_CREATE_FILE,
+                "NtDeviceIoControlFile": (
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_NT_DEVICE_IO_CONTROL_FILE
+                ),
+                "NtFsControlFile": (
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_NT_FS_CONTROL_FILE
+                ),
+                "NtOpenFile": NATIVE_HOST_SERVICE_BOOTSTRAP_NT_OPEN_FILE,
+                "NtOpenSymbolicLinkObject": (
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_NT_OPEN_SYMBOLIC_LINK_OBJECT
+                ),
+                "NtQueryInformationFile": (
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_NT_QUERY_INFORMATION_FILE
+                ),
+                "NtQueryDirectoryFile": (
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_NT_QUERY_DIRECTORY_FILE
+                ),
+                "NtReadFile": NATIVE_HOST_SERVICE_BOOTSTRAP_NT_READ_FILE,
+                "NtSetInformationFile": (
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_NT_SET_INFORMATION_FILE
+                ),
+                "NtWriteFile": NATIVE_HOST_SERVICE_BOOTSTRAP_NT_WRITE_FILE,
+                "NtQuerySymbolicLinkObject": (
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_NT_QUERY_SYMBOLIC_LINK_OBJECT
+                ),
+                "NtQueryVolumeInformationFile": (
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_NT_QUERY_VOLUME_INFORMATION_FILE
+                ),
+                "RtlTimeFieldsToTime": (
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_RTL_TIME_FIELDS_TO_TIME
+                ),
+                "RtlTimeToTimeFields": (
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_RTL_TIME_TO_TIME_FIELDS
+                ),
+                "XcHMAC": NATIVE_HOST_SERVICE_BOOTSTRAP_XC_HMAC,
+                "XcRC4Crypt": NATIVE_HOST_SERVICE_BOOTSTRAP_XC_RC4_CRYPT,
+                "XcRC4Key": NATIVE_HOST_SERVICE_BOOTSTRAP_XC_RC4_KEY,
+                "XcSHAFinal": NATIVE_HOST_SERVICE_BOOTSTRAP_XC_SHA_FINAL,
+                "XcSHAInit": NATIVE_HOST_SERVICE_BOOTSTRAP_XC_SHA_INIT,
+                "XcSHAUpdate": NATIVE_HOST_SERVICE_BOOTSTRAP_XC_SHA_UPDATE,
+            }
+            for shim in bridge.runtime.registered_shims:
+                bootstrap_service = native_bootstrap_services.get(shim.name)
+                if bootstrap_service is not None:
+                    native_host_service_entries.append(
+                        NativeHostServiceEntry(
+                            shim.target_address,
+                            NATIVE_HOST_SERVICE_BOOTSTRAP,
+                            bridge.guest_stack_cleanup_bytes(shim.target_address),
+                            bootstrap_service,
+                        )
+                    )
+                    continue
+                # The title initializes and polls the offline Ethernet PHY
+                # while entering the main menu. These shims have no output
+                # payload; their runtime ABI contract is a successful status.
+                return_constant = _native_normal_runtime_return_constant(
+                    shim.name
+                )
+                if return_constant is not None:
+                    native_host_service_entries.append(
+                        NativeHostServiceEntry(
+                            shim.target_address,
+                            NATIVE_HOST_SERVICE_RETURN_CONSTANT,
+                            bridge.guest_stack_cleanup_bytes(shim.target_address),
+                            return_constant,
+                        )
+                    )
             native_lifecycle_actions = {
                 "PsCreateSystemThreadEx": (
                     NATIVE_HOST_SERVICE_LIFECYCLE_CREATE_WORKER
@@ -19090,6 +20824,21 @@ def _execute_guest_thread_start(
                 ),
                 "NtSuspendThread": NATIVE_HOST_SERVICE_LIFECYCLE_SUSPEND_WORKER,
                 "NtResumeThread": NATIVE_HOST_SERVICE_LIFECYCLE_RESUME_WORKER,
+                "NtCreateSemaphore": (
+                    NATIVE_HOST_SERVICE_LIFECYCLE_CREATE_SEMAPHORE
+                ),
+                "ObReferenceObjectByHandle": (
+                    NATIVE_HOST_SERVICE_LIFECYCLE_REFERENCE_WORKER
+                ),
+                "KeSetBasePriorityThread": (
+                    NATIVE_HOST_SERVICE_LIFECYCLE_SET_BASE_PRIORITY
+                ),
+                "KeSetDisableBoostThread": (
+                    NATIVE_HOST_SERVICE_LIFECYCLE_SET_DISABLE_BOOST
+                ),
+                "KeSetPriorityThread": (
+                    NATIVE_HOST_SERVICE_LIFECYCLE_SET_PRIORITY
+                ),
             }
             native_service_targets = {
                 int(entry.target) for entry in native_host_service_entries
@@ -19113,6 +20862,19 @@ def _execute_guest_thread_start(
                 )
             native_host_services = NativeHostServiceState(
                 native_host_service_entries
+            )
+            native_host_services.set_filesystem_roots(
+                extracted_disc_root=bridge.runtime.config.extracted_disc_root,
+                save_data_root=bridge.runtime.config.save_data_root,
+                dashboard_data_root=bridge.runtime.config.dashboard_data_root,
+                cache_data_root=bridge.runtime.config.cache_data_root,
+                title_id=bridge.runtime.config.title_id,
+            )
+            native_host_services.seed_allocations(
+                bridge.runtime.memory.native_allocation_snapshot()
+            )
+            native_host_services.seed_semaphores(
+                bridge.runtime.sync.native_semaphore_snapshot()
             )
             native_worker_lifecycle = NativeWorkerLifecycleState()
             native_host_services.attach_worker_lifecycle(
@@ -19155,6 +20917,11 @@ def _execute_guest_thread_start(
                 *TITLE_RUNTIME_CALLBACK_DISPATCH_ADDRESSES,
                 *runtime_callback_audit.observer_addresses,
                 *title_world_matrix_audit.observer_addresses,
+                *(
+                    {TITLE_WORLD_DRAW_CALLBACK_ADDRESS}
+                    if audit_traffic_meshes
+                    else set()
+                ),
                 *title_scene_record_audit.observer_addresses,
                 *(
                     title_d3d_present_audit.observer_addresses
@@ -19167,6 +20934,15 @@ def _execute_guest_thread_start(
                     else set()
                 ),
             }
+            dispatch_observers_in_native = bool(
+                live_host_bridge is not None
+                and not profile_hot_paths
+                and not enable_title_repair_fallbacks
+                and not audit_title_main_loop_exit
+                and not audit_world_matrices
+                and audit_world_matrix_address is None
+                and not audit_scene_records
+            )
             audit_memory_callback_addresses = {
                 *(
                     {TITLE_MAIN_LOOP_EXIT_FLAG_ADDRESS}
@@ -19177,6 +20953,7 @@ def _execute_guest_thread_start(
             }
             native_memory_read_callback_addresses = {
                 *TITLE_EXACT_MEMORY_CALLBACK_ADDRESSES,
+                TITLE_NV2A_MMIO_BASE_ADDRESS + 0x100,
                 *audit_memory_callback_addresses,
             }
             native_memory_write_callback_addresses = {
@@ -19188,6 +20965,33 @@ def _execute_guest_thread_start(
                 and not audit_title_main_loop_exit
                 and not render_watchpoint.retain_diagnostic_writes
             )
+            native_normal_runtime_enabled = bool(
+                native_resident_hot_path_enabled
+                and live_host_bridge is not None
+                and live_host_bridge.direct_command_transport_enabled
+                and live_host_bridge.live_control_transport is not None
+                and live_host_bridge.live_command_transport is not None
+                and live_host_bridge.live_resource_transport is not None
+            )
+            if native_normal_runtime_enabled:
+                native_host_services.enable_normal_runtime(
+                    scheduler_quantum=max(1, native_slice_steps or 100_000)
+                )
+                native_host_services.attach_live_transports(
+                    live_host_bridge.live_control_transport,
+                    live_host_bridge.live_command_transport,
+                    live_host_bridge.live_resource_transport,
+                    command_stream_generation=(
+                        live_host_bridge.command_stream_generation
+                    ),
+                    presentation_event_handle=(
+                        live_host_bridge._presentation_event_handle
+                    ),
+                    publication_event_handle=(
+                        live_host_bridge._publication_event_handle
+                    ),
+                )
+                native_host_services.set_audio_library(DEFAULT_AUDIO_LIBRARY)
 
             def live_native_slice_steps(_steps: int) -> int:
                 if render_watchpoint.flip_count == 0:
@@ -19219,7 +21023,37 @@ def _execute_guest_thread_start(
                     module_functions=module_functions,
                     incremental_module_functions=incremental_module_functions,
                     observer_addresses=observer_addresses,
-                    callback_addresses=handlers.keys(),
+                    callback_addresses={
+                        *handlers.keys(),
+                        TITLE_DIRECTSOUND_BUFFER_CREATE_ADDRESS,
+                        TITLE_DIRECTSOUND_BUFFER_SET_DATA_ADDRESS,
+                        TITLE_DIRECTSOUND_BUFFER_SET_FORMAT_ADDRESS,
+                        TITLE_DIRECTSOUND_BUFFER_SET_VOLUME_ADDRESS,
+                        TITLE_DIRECTSOUND_BUFFER_SET_FREQUENCY_ADDRESS,
+                        TITLE_DIRECTSOUND_BUFFER_GET_POSITION_ADDRESS,
+                        TITLE_DIRECTSOUND_BUFFER_SET_POSITION_ADDRESS,
+                        TITLE_DIRECTSOUND_BUFFER_PLAY_ADDRESS,
+                        TITLE_DIRECTSOUND_BUFFER_STOP_ADDRESS,
+                        TITLE_DIRECTSOUND_BUFFER_STOP_EX_ADDRESS,
+                        TITLE_DIRECTSOUND_STREAM_CREATE_ADDRESS,
+                        TITLE_DIRECTSOUND_STREAM_PROCESS_ADDRESS,
+                        TITLE_DIRECTSOUND_STREAM_FLUSH_ADDRESS,
+                        TITLE_DIRECTSOUND_STREAM_SET_FORMAT_ADDRESS,
+                    },
+                    forwarded_callback_addresses={
+                        TITLE_DIRECTSOUND_BUFFER_CREATE_ADDRESS,
+                        TITLE_DIRECTSOUND_BUFFER_SET_DATA_ADDRESS,
+                        TITLE_DIRECTSOUND_BUFFER_SET_FORMAT_ADDRESS,
+                        TITLE_DIRECTSOUND_BUFFER_STOP_ADDRESS,
+                        TITLE_DIRECTSOUND_STREAM_CREATE_ADDRESS,
+                        TITLE_DIRECTSOUND_STREAM_PROCESS_ADDRESS,
+                        TITLE_DIRECTSOUND_STREAM_FLUSH_ADDRESS,
+                        TITLE_DIRECTSOUND_STREAM_SET_FORMAT_ADDRESS,
+                    },
+                    native_passthrough_callback_addresses={
+                        TITLE_FRONTEND_SPECIAL_AUDIO_CREATE_ADDRESS,
+                        TITLE_MUSIC_MODE_SET_ADDRESS,
+                    },
                     memory_read_callback_addresses=(
                         native_memory_read_callback_addresses
                     ),
@@ -19478,7 +21312,10 @@ def _execute_guest_thread_start(
                 ):
                     active_native_executor.synchronize_worker_lifecycle(
                         native_worker_lifecycle,
-                        _scheduled_guest_threads(bridge, loaded),
+                        (
+                            initial_guest_threads
+                            or tuple(_scheduled_guest_threads(bridge, loaded))
+                        ),
                         primary_handle=(
                             primary_handle if isinstance(primary_handle, int) else 0
                         ),
@@ -19487,6 +21324,15 @@ def _execute_guest_thread_start(
                         bridge.thread_lifecycle_generation
                     )
                 for handle, session in cooperative_sessions.items():
+                    lifecycle_entry = native_worker_lifecycle.entry_for_handle(handle)
+                    if (
+                        session["status"] == "waiting_native"
+                        and lifecycle_entry is not None
+                        and int(lifecycle_entry.status) == NATIVE_WORKER_READY
+                    ):
+                        session["state"].set_register("eax", XboxStatus.SUCCESS)
+                        session["status"] = "running"
+                        cooperative_wake_count += 1
                     if session["status"] == "waiting":
                         if not _resume_cooperative_wait(session, bridge.runtime):
                             cooperative_wait_skip_count += 1
@@ -19576,6 +21422,10 @@ def _execute_guest_thread_start(
                                 else native_frontier_modules
                             ),
                         )
+                    cooperative_executor.seed_page_cache_from(
+                        active_native_executor,
+                        memory,
+                    )
                     changed_before = set(cooperative_changed_pages)
                     cooperative_service_active = True
                     session.pop("pending_wait", None)
@@ -19605,11 +21455,21 @@ def _execute_guest_thread_start(
                     native_host_services.current_worker_handle = (
                         active_worker_handle
                     )
-                    previous_runtime_thread = (
-                        bridge.runtime.sync.activate_thread(
-                            active_worker_handle
+                    previous_runtime_thread: int | None = None
+                    runtime_thread_activated = False
+                    try:
+                        previous_runtime_thread = (
+                            bridge.runtime.sync.activate_thread(
+                                active_worker_handle
+                            )
                         )
-                    )
+                        runtime_thread_activated = True
+                    except XboxRuntimeError:
+                        # Workers created by the native lifecycle service have
+                        # no Python runtime object. Their normal execution must
+                        # not require one merely to select a current shim
+                        # thread.
+                        pass
                     try:
                         returned = cooperative_executor.run(
                             session["state"],
@@ -19666,6 +21526,9 @@ def _execute_guest_thread_start(
                                 native_resident_hot_path_enabled
                             ),
                             native_host_services=native_host_services,
+                            dispatch_observers_in_native=(
+                                dispatch_observers_in_native
+                            ),
                         )
                     except NativeExecutorError as exc:
                         session["status"] = "execution_failed"
@@ -19679,9 +21542,10 @@ def _execute_guest_thread_start(
                             if isinstance(primary_handle, int)
                             else 0
                         )
-                        bridge.runtime.sync.activate_thread(
-                            previous_runtime_thread
-                        )
+                        if runtime_thread_activated:
+                            bridge.runtime.sync.activate_thread(
+                                previous_runtime_thread
+                            )
                     run = cooperative_executor.last_run_summary
                     if run is not None:
                         session["run_count"] += 1
@@ -19703,6 +21567,12 @@ def _execute_guest_thread_start(
                             == NATIVE_WORKER_COMPLETED
                         ):
                             session["status"] = "completed"
+                        elif (
+                            lifecycle_entry is not None
+                            and int(lifecycle_entry.status)
+                            == NATIVE_WORKER_WAITING
+                        ):
+                            session["status"] = "waiting_native"
                         elif returned in {0, session["return_sentinel"]}:
                             session["status"] = "completed"
                         elif run.get("reason") in {
@@ -20011,23 +21881,49 @@ def _execute_guest_thread_start(
                     native.seed_page_cache_from(native_cache_donor, memory)
                 if not native_was_reused:
                     cooperative_executor = None
+                if (
+                    native_normal_runtime_enabled
+                    and native_worker_lifecycle_generation
+                    != bridge.thread_lifecycle_generation
+                ):
+                    native.synchronize_worker_lifecycle(
+                        native_worker_lifecycle,
+                        (
+                            initial_guest_threads
+                            or tuple(_scheduled_guest_threads(bridge, loaded))
+                        ),
+                        primary_handle=(
+                            primary_handle
+                            if isinstance(primary_handle, int)
+                            else 0
+                        ),
+                    )
+                    native_worker_lifecycle_generation = (
+                        bridge.thread_lifecycle_generation
+                    )
                 try:
                     returned_to = native.run(
                         state,
                         memory,
                         call_handlers=handlers,
                         step_observer=observe_guest_thread_step,
-                        memory_write_observer=observe_native_memory_write,
+                        memory_write_observer=(
+                            None
+                            if native_normal_runtime_enabled
+                            else observe_native_memory_write
+                        ),
                         memory_write_batch_observer=(
                             observe_native_memory_write_batch
-                            if live_host_bridge is not None
+                            if not native_normal_runtime_enabled
+                            and live_host_bridge is not None
                             and not audit_title_main_loop_exit
                             and not render_watchpoint.retain_diagnostic_writes
                             else None
                         ),
                         memory_write_span_observer=(
                             observe_native_memory_write_spans
-                            if live_host_bridge is not None
+                            if not native_normal_runtime_enabled
+                            and live_host_bridge is not None
                             and live_host_bridge.direct_command_transport_enabled
                             and not audit_title_main_loop_exit
                             and not render_watchpoint.retain_diagnostic_writes
@@ -20048,23 +21944,28 @@ def _execute_guest_thread_start(
                         ),
                         max_steps=max_steps - native_steps if max_steps else 0,
                         slice_steps=(
-                            native_slice_steps
+                            0
+                            if native_normal_runtime_enabled
+                            else native_slice_steps
                             if live_host_bridge is not None or thread_index == 0
                             else 0
                         ),
                         slice_steps_provider=(
                             live_native_slice_steps
                             if native_resident_hot_path_enabled
+                            and not native_normal_runtime_enabled
                             else None
                         ),
                         yield_handler=(
                             service_native_slice
-                            if live_host_bridge is not None or thread_index == 0
+                            if not native_normal_runtime_enabled
+                            and (live_host_bridge is not None or thread_index == 0)
                             else None
                         ),
                         yield_predicate=(
                             live_host_bridge.should_yield_for_completed_flip
                             if live_host_bridge is not None
+                            and not native_normal_runtime_enabled
                             else None
                         ),
                         shared_memory_handler_predicate=(
@@ -20088,6 +21989,9 @@ def _execute_guest_thread_start(
                             native_resident_hot_path_enabled
                         ),
                         native_host_services=native_host_services,
+                        dispatch_observers_in_native=(
+                            dispatch_observers_in_native
+                        ),
                     )
                 finally:
                     native_run_summary = native.last_run_summary
@@ -20225,6 +22129,8 @@ def _execute_guest_thread_start(
                     # the warm base executor. Live frontier compilation is
                     # always deferred until the next launch's ahead build.
                     reusable_native = native
+            if native_normal_runtime_enabled and native_cache_donor is not None:
+                native_cache_donor.shutdown_normal_runtime(native_host_services)
             cooperative_scheduler_summary = {
                 "enabled": thread_index == 0,
                 "cadence": (
@@ -20275,6 +22181,7 @@ def _execute_guest_thread_start(
             }
             native_host_services_summary = {
                 "backend": "native_dispatcher",
+                "traffic_mesh_audit": native_traffic_mesh_audit_summary(),
                 "call_count": int(native_host_services.native_call_count),
                 "service_call_counts": {
                     "return_constant": int(
@@ -20317,7 +22224,108 @@ def _execute_guest_thread_start(
                             NATIVE_HOST_SERVICE_COLD_CALLBACK
                         ]
                     ),
+                    "irql": int(
+                        native_host_services.service_call_counts[
+                            NATIVE_HOST_SERVICE_IRQL
+                        ]
+                    ),
+                    "semaphore": int(
+                        native_host_services.service_call_counts[
+                            NATIVE_HOST_SERVICE_SEMAPHORE
+                        ]
+                    ),
+                    "runtime": int(
+                        native_host_services.service_call_counts[
+                            NATIVE_HOST_SERVICE_RUNTIME
+                        ]
+                    ),
+                    "memory": int(
+                        native_host_services.service_call_counts[
+                            NATIVE_HOST_SERVICE_MEMORY
+                        ]
+                    ),
+                    "audio": int(
+                        native_host_services.service_call_counts[
+                            NATIVE_HOST_SERVICE_AUDIO
+                        ]
+                    ),
+                    "title": int(
+                        native_host_services.service_call_counts[
+                            NATIVE_HOST_SERVICE_TITLE
+                        ]
+                    ),
+                    "bootstrap": int(
+                        native_host_services.service_call_counts[
+                            NATIVE_HOST_SERVICE_BOOTSTRAP
+                        ]
+                    ),
                 },
+                "service_trace_count": int(
+                    native_host_services.service_trace_count
+                ),
+                "native_observer_count": int(
+                    native_host_services.native_observer_count
+                ),
+                "native_frontend_record_table_repair_count": int(
+                    native_host_services.native_frontend_record_table_repair_count
+                ),
+                "native_frontend_record_table_last_address": int(
+                    native_host_services.native_frontend_record_table_last_address
+                ),
+                "native_frontend_record_table_last_address_hex": _hex32(
+                    int(
+                        native_host_services.native_frontend_record_table_last_address
+                    )
+                ),
+                "native_frontend_record_table_last_count": int(
+                    native_host_services.native_frontend_record_table_last_count
+                ),
+                "service_trace_overflow_count": int(
+                    native_host_services.service_trace_overflow_count
+                ),
+                "service_trace": [
+                    {
+                        "target": int(
+                            native_host_services.service_trace_targets[index]
+                        ),
+                        "target_hex": _hex32(
+                            int(native_host_services.service_trace_targets[index])
+                        ),
+                        "shim_name": runtime_target_names.get(
+                            int(native_host_services.service_trace_targets[index])
+                        ),
+                        "kind": int(
+                            native_host_services.service_trace_kinds[index]
+                        ),
+                        "value": int(
+                            native_host_services.service_trace_values[index]
+                        ),
+                        "result": int(
+                            native_host_services.service_trace_results[index]
+                        ),
+                        "result_hex": _hex32(
+                            int(native_host_services.service_trace_results[index])
+                        ),
+                        "return_address": int(
+                            native_host_services.service_trace_return_addresses[
+                                index
+                            ]
+                        ),
+                        "return_address_hex": _hex32(
+                            int(
+                                native_host_services.service_trace_return_addresses[
+                                    index
+                                ]
+                            )
+                        ),
+                    }
+                    for index in range(
+                        min(
+                            int(native_host_services.service_trace_count),
+                            len(native_host_services.service_trace_targets),
+                        )
+                    )
+                ],
                 "controller_packets": list(
                     native_host_services.controller_packets
                 ),
@@ -20330,8 +22338,447 @@ def _execute_guest_thread_start(
                 "a_pressed_poll_count": int(
                     native_host_services.a_pressed_poll_count
                 ),
+                "native_allocation_count": int(
+                    native_host_services.allocation_count
+                ),
+                "native_allocated_page_count": int(
+                    native_host_services.native_allocated_page_count
+                ),
+                "native_page_allocation_failure_count": int(
+                    native_host_services.native_page_allocation_failure_count
+                ),
+                "native_page_miss_count": int(
+                    native_host_services.native_page_miss_count
+                ),
+                "native_file_handle_count": int(
+                    native_host_services.file_count
+                ),
+                "native_file_handle_overflow_count": int(
+                    native_host_services.file_overflow_count
+                ),
+                "last_file_guest_path": os.fsdecode(
+                    native_host_services.last_file_guest_path
+                ),
+                "last_file_host_path": os.fsdecode(
+                    native_host_services.last_file_host_path
+                ),
+                "native_files": [
+                    {
+                        "handle": int(native_host_services.files[index].handle),
+                        "handle_hex": _hex32(
+                            int(native_host_services.files[index].handle)
+                        ),
+                        "flags": int(native_host_services.files[index].flags),
+                        "size": int(native_host_services.files[index].size),
+                        "position": int(
+                            native_host_services.files[index].position
+                        ),
+                        "active": bool(native_host_services.files[index].active),
+                        "host_open": bool(
+                            native_host_services.files[index].host_file
+                        ),
+                        "guest_path": os.fsdecode(
+                            native_host_services.files[index].guest_path
+                        ),
+                        "host_path": os.fsdecode(
+                            native_host_services.files[index].host_path
+                        ),
+                    }
+                    for index in range(
+                        min(
+                            int(native_host_services.file_count),
+                            len(native_host_services.files),
+                        )
+                    )
+                ],
+                "native_title_asset_stream_count": int(
+                    native_host_services.title_asset_stream_count
+                ),
+                "native_title_asset_streams": [
+                    {
+                        "object_address_hex": _hex32(
+                            native_host_services.title_asset_streams[index].object
+                        ),
+                        "payload_address_hex": _hex32(
+                            native_host_services.title_asset_streams[index].payload
+                        ),
+                        "payload_bytes": int(
+                            native_host_services.title_asset_streams[
+                                index
+                            ].payload_size
+                        ),
+                        "track_pss": bool(
+                            native_host_services.title_asset_streams[index].flags
+                            & 1
+                        ),
+                        "publication_attempted": bool(
+                            native_host_services.title_asset_streams[index].flags
+                            & 2
+                        ),
+                        "published": bool(
+                            native_host_services.title_asset_streams[index].flags
+                            & 4
+                        ),
+                        "traffic_tra": bool(
+                            native_host_services.title_asset_streams[index].flags
+                            & 8
+                        ),
+                        "image_base_hex": _hex32(
+                            native_host_services.title_asset_streams[
+                                index
+                            ].image_base
+                        ),
+                    }
+                    for index in range(
+                        min(
+                            int(native_host_services.title_asset_stream_count),
+                            len(native_host_services.title_asset_streams),
+                        )
+                    )
+                ],
+                "native_title_asset_open_count": int(
+                    native_host_services.title_asset_open_count
+                ),
+                "native_title_asset_open_failure_count": int(
+                    native_host_services.title_asset_open_failure_count
+                ),
+                "native_title_asset_payload_bytes": int(
+                    native_host_services.title_asset_payload_bytes
+                ),
+                "native_title_track_pss_candidate_count": int(
+                    native_host_services.title_track_pss_candidate_count
+                ),
+                "native_title_track_pss_publication_count": int(
+                    native_host_services.title_track_pss_publication_count
+                ),
+                "native_title_track_pss_validation_failure_count": int(
+                    native_host_services.title_track_pss_validation_failure_count
+                ),
+                "native_title_track_pss_published_bytes": int(
+                    native_host_services.title_track_pss_published_bytes
+                ),
+                "native_title_track_pss_descriptor_entry_count": int(
+                    native_host_services.title_track_pss_descriptor_entry_count
+                ),
+                "native_title_track_pss_scene_record_entry_count": int(
+                    native_host_services.title_track_pss_scene_record_entry_count
+                ),
+                "native_title_traffic_tra_candidate_count": int(
+                    native_host_services.title_traffic_tra_candidate_count
+                ),
+                "title_heap_allocation_count": int(
+                    native_host_services.title_heap_allocation_count
+                ),
+                "title_heap_free_count": int(
+                    native_host_services.title_heap_free_count
+                ),
+                "title_heap_bytes_allocated": int(
+                    native_host_services.title_heap_bytes_allocated
+                ),
+                "native_memory_write_count": int(
+                    native_host_services.native_memory_write_count
+                ),
+                "native_gpu_command_kick_count": int(
+                    native_host_services.native_gpu_command_kick_count
+                ),
+                "native_gpu_completion_count": int(
+                    native_host_services.native_gpu_completion_count
+                ),
+                "native_gpu_get_pointer_sync_count": int(
+                    native_host_services.native_gpu_get_pointer_sync_count
+                ),
+                "native_gpu_observed_range_sync_count": int(
+                    native_host_services.native_gpu_observed_range_sync_count
+                ),
+                "native_memory_read_count": int(
+                    native_host_services.native_memory_read_count
+                ),
+                "native_gpu_master_interrupt_count": int(
+                    native_host_services.native_gpu_master_interrupt_count
+                ),
+                "normal_runtime": {
+                    "enabled": bool(native_host_services.normal_runtime_enabled),
+                    "scheduler_quantum": int(
+                        native_host_services.scheduler_quantum
+                    ),
+                    "scheduler_service_count": int(
+                        native_host_services.scheduler_service_count
+                    ),
+                    "worker_run_count": int(
+                        native_host_services.scheduler_worker_run_count
+                    ),
+                    "worker_step_count": int(
+                        native_host_services.scheduler_worker_step_count
+                    ),
+                    "worker_completion_count": int(
+                        native_host_services.scheduler_worker_completion_count
+                    ),
+                    "worker_wait_count": int(
+                        native_host_services.scheduler_worker_wait_count
+                    ),
+                    "worker_failure_count": int(
+                        native_host_services.scheduler_worker_failure_count
+                    ),
+                    "d3d_vblank": {
+                        "target_hz": 60,
+                        "sequence": int(
+                            native_host_services.native_d3d_vblank_sequence
+                        ),
+                        "tick_count": int(
+                            native_host_services.native_d3d_vblank_tick_count
+                        ),
+                        "callback_address": int(
+                            native_host_services.
+                            native_d3d_vblank_callback_address
+                        ),
+                        "callback_address_hex": _hex32(
+                            int(
+                                native_host_services.
+                                native_d3d_vblank_callback_address
+                            )
+                        ),
+                        "callback_pending": bool(
+                            native_host_services.
+                            native_d3d_vblank_callback_pending
+                        ),
+                        "callback_schedule_count": int(
+                            native_host_services.
+                            native_d3d_vblank_callback_schedule_count
+                        ),
+                        "callback_run_count": int(
+                            native_host_services.
+                            native_d3d_vblank_callback_run_count
+                        ),
+                        "callback_step_count": int(
+                            native_host_services.
+                            native_d3d_vblank_callback_step_count
+                        ),
+                        "callback_completion_count": int(
+                            native_host_services.
+                            native_d3d_vblank_callback_completion_count
+                        ),
+                        "callback_failure_count": int(
+                            native_host_services.
+                            native_d3d_vblank_callback_failure_count
+                        ),
+                    },
+                    "command_record_count": int(
+                        native_host_services.live_published_record_count
+                    ),
+                    "command_byte_count": int(
+                        native_host_services.live_published_byte_count
+                    ),
+                    "command_span_count": int(
+                        native_host_services.live_published_span_count
+                    ),
+                    "flip_count": int(native_host_services.live_flip_count),
+                    "manifest_publish_count": int(
+                        native_host_services.live_manifest_publish_count
+                    ),
+                    "resource_generation": int(
+                        native_host_services.live_resource_generation
+                    ),
+                    "resource_publish_count": int(
+                        native_host_services.live_resource_publish_count
+                    ),
+                    "controller_refresh_count": int(
+                        native_host_services.live_controller_refresh_count
+                    ),
+                    "presentation_wait_count": int(
+                        native_host_services.live_presentation_wait_count
+                    ),
+                    "presentation_wait_milliseconds": int(
+                        native_host_services.live_presentation_wait_milliseconds
+                    ),
+                    "video_pacing_target_hz": 60,
+                    "video_pacing_wait_count": int(
+                        native_host_services.live_video_pacing_wait_count
+                    ),
+                    "video_pacing_wait_microseconds": int(
+                        native_host_services.live_video_pacing_wait_microseconds
+                    ),
+                    "stop_requested": bool(
+                        native_host_services.normal_runtime_stop_requested
+                    ),
+                    "failure_code": int(
+                        native_host_services.normal_runtime_failure_code
+                    ),
+                    "failure_target": int(
+                        native_host_services.normal_runtime_failure_target
+                    ),
+                    "failure_target_hex": _hex32(
+                        int(native_host_services.normal_runtime_failure_target)
+                    ),
+                    "audio": {
+                        "backend": "native_sdl3_mixer",
+                        "output_open": bool(
+                            native_host_services.native_audio_output_open
+                        ),
+                        "looping": bool(
+                            native_host_services.native_audio_looping
+                        ),
+                        "decoded_special_clip_count": int(
+                            native_host_services.native_audio_decoded_special_clip_count
+                        ),
+                        "decoded_music_track_count": int(
+                            native_host_services.native_audio_decoded_music_track_count
+                        ),
+                        "decoded_buffer_count": int(
+                            native_host_services.native_audio_decoded_buffer_count
+                        ),
+                        "decoded_stream_packet_count": int(
+                            native_host_services.native_audio_decoded_stream_packet_count
+                        ),
+                        "buffer_create_count": int(
+                            native_host_services.native_audio_buffer_create_count
+                        ),
+                        "buffer_data_count": int(
+                            native_host_services.native_audio_buffer_data_count
+                        ),
+                        "buffer_format_count": int(
+                            native_host_services.native_audio_buffer_format_count
+                        ),
+                        "buffer_volume_count": int(
+                            native_host_services.native_audio_buffer_volume_count
+                        ),
+                        "buffer_frequency_count": int(
+                            native_host_services.native_audio_buffer_frequency_count
+                        ),
+                        "buffer_play_count": int(
+                            native_host_services.native_audio_buffer_play_count
+                        ),
+                        "buffer_repeated_play_count": int(
+                            native_host_services.native_audio_buffer_repeated_play_count
+                        ),
+                        "buffer_get_position_count": int(
+                            native_host_services.native_audio_buffer_get_position_count
+                        ),
+                        "buffer_set_position_count": int(
+                            native_host_services.native_audio_buffer_set_position_count
+                        ),
+                        "buffer_refresh_count": int(
+                            native_host_services.native_audio_buffer_refresh_count
+                        ),
+                        "buffer_play_stage": int(
+                            native_host_services.native_audio_buffer_play_stage
+                        ),
+                        "last_buffer": int(
+                            native_host_services.native_audio_last_buffer
+                        ),
+                        "last_buffer_hex": _hex32(
+                            int(native_host_services.native_audio_last_buffer)
+                        ),
+                        "last_data": int(
+                            native_host_services.native_audio_last_data
+                        ),
+                        "last_data_hex": _hex32(
+                            int(native_host_services.native_audio_last_data)
+                        ),
+                        "last_size": int(
+                            native_host_services.native_audio_last_size
+                        ),
+                        "last_sample_rate": int(
+                            native_host_services.native_audio_last_sample_rate
+                        ),
+                        "last_format_tag": int(
+                            native_host_services.native_audio_last_format_tag
+                        ),
+                        "last_channels": int(
+                            native_host_services.native_audio_last_channels
+                        ),
+                        "last_bits_per_sample": int(
+                            native_host_services.native_audio_last_bits_per_sample
+                        ),
+                        "last_block_align": int(
+                            native_host_services.native_audio_last_block_align
+                        ),
+                        "last_samples_per_block": int(
+                            native_host_services.native_audio_last_samples_per_block
+                        ),
+                        "last_volume": int(
+                            native_host_services.native_audio_last_volume
+                        ),
+                        "last_frequency": int(
+                            native_host_services.native_audio_last_frequency
+                        ),
+                        "largest_loop": {
+                            "buffer": int(
+                                native_host_services.native_audio_largest_loop_buffer
+                            ),
+                            "buffer_hex": _hex32(
+                                native_host_services.native_audio_largest_loop_buffer
+                            ),
+                            "data": int(
+                                native_host_services.native_audio_largest_loop_data
+                            ),
+                            "data_hex": _hex32(
+                                native_host_services.native_audio_largest_loop_data
+                            ),
+                            "play_length": int(
+                                native_host_services.native_audio_largest_loop_play_length
+                            ),
+                            "loop_start": int(
+                                native_host_services.native_audio_largest_loop_start
+                            ),
+                            "loop_length": int(
+                                native_host_services.native_audio_largest_loop_length
+                            ),
+                            "sample_rate": int(
+                                native_host_services.native_audio_largest_loop_sample_rate
+                            ),
+                            "frequency": int(
+                                native_host_services.native_audio_largest_loop_frequency
+                            ),
+                            "format_tag": int(
+                                native_host_services.native_audio_largest_loop_format_tag
+                            ),
+                        },
+                        "buffer_stop_count": int(
+                            native_host_services.native_audio_buffer_stop_count
+                        ),
+                        "active_buffer_count": int(
+                            native_host_services.native_audio_active_buffer_count
+                        ),
+                        "stream_create_count": int(
+                            native_host_services.native_audio_stream_create_count
+                        ),
+                        "stream_process_count": int(
+                            native_host_services.native_audio_stream_process_count
+                        ),
+                        "stream_flush_count": int(
+                            native_host_services.native_audio_stream_flush_count
+                        ),
+                        "stream_packet_byte_count": int(
+                            native_host_services.native_audio_stream_packet_byte_count
+                        ),
+                        "active_stream_count": int(
+                            native_host_services.native_audio_active_stream_count
+                        ),
+                        "decode_failure_count": int(
+                            native_host_services.native_audio_decode_failure_count
+                        ),
+                        "submitted_buffer_count": int(
+                            native_host_services.native_audio_submitted_buffer_count
+                        ),
+                        "submitted_byte_count": int(
+                            native_host_services.native_audio_submitted_byte_count
+                        ),
+                        "mixed_chunk_count": int(
+                            native_host_services.native_audio_mixed_chunk_count
+                        ),
+                        "dropped_buffer_count": int(
+                            native_host_services.native_audio_dropped_buffer_count
+                        ),
+                        "output_error_count": int(
+                            native_host_services.native_audio_output_error_count
+                        ),
+                        "queued_bytes": int(
+                            native_host_services.native_audio_queued_bytes
+                        ),
+                    },
+                },
             }
-            if live_host_bridge is not None:
+            if live_host_bridge is not None and not native_normal_runtime_enabled:
                 live_host_bridge.on_slice(state, memory, native_steps, True)
             result = ExecutionResult(
                 state=state,
@@ -20536,6 +22983,22 @@ def _execute_guest_thread_start(
             "native_run_history": native_run_history.summary(),
         }
         if isinstance(exc, NativeExecutorError):
+            failure["native_host_services"] = native_host_service_failure_summary()
+            coverage_gap = _record_native_normal_runtime_coverage_gap(
+                native_run_summary,
+                failure_code=int(
+                    native_host_services.normal_runtime_failure_code
+                ),
+                failure_target=int(
+                    native_host_services.normal_runtime_failure_target
+                ),
+                is_executable=lambda target: _is_executable_address(
+                    loaded, target
+                ),
+                block_loader=block_loader,
+            )
+            if coverage_gap is not None:
+                failure["native_normal_runtime_coverage_gap"] = coverage_gap
             failure["state"] = state.to_dict()
             failure["steps"] = (
                 native_run_summary.get("steps", native_steps)
@@ -21941,6 +24404,50 @@ def _is_executable_address(loaded: LoadedXbeImage, address: int) -> bool:
     )
 
 
+def _is_file_backed_code_address(
+    loaded: LoadedXbeImage, address: int
+) -> bool:
+    return any(
+        region.name not in {".rdata", ".data"}
+        and region.contains(address)
+        and "execute" in region.permissions
+        and address < region.virtual_address + region.file_backed_size
+        for region in loaded.arena.regions
+    )
+
+
+def _file_backed_pointer_table_ranges(
+    loaded: LoadedXbeImage,
+) -> tuple[tuple[int, int], ...]:
+    """Return every file-backed XBE section that can hold static pointers.
+
+    Xbox library sections can interleave callback descriptors with executable
+    code, so limiting table recovery to conventional data sections misses
+    address-taken methods.  Headers and zero-fill tails remain excluded.
+    """
+
+    return tuple(
+        (
+            region.virtual_address,
+            region.virtual_address + region.file_backed_size,
+        )
+        for region in loaded.arena.regions
+        if region.kind == "section" and region.file_backed_size > 0
+    )
+
+
+def _is_file_backed_title_code_address(
+    loaded: LoadedXbeImage, address: int
+) -> bool:
+    return any(
+        region.name == ".text"
+        and region.contains(address)
+        and "execute" in region.permissions
+        and address < region.virtual_address + region.file_backed_size
+        for region in loaded.arena.regions
+    )
+
+
 def _merge_lifted_functions(
     entry_function: LiftedFunction,
     internal_functions: list[LiftedFunction],
@@ -21979,19 +24486,33 @@ def _recover_missing_branch_targets(
     *,
     start_address: int,
     end_address: int,
+    indirect_target_resolver: Callable[[LiftedFunction], Iterable[int]] | None = None,
 ) -> list[LiftedFunction]:
-    """Close direct branch gaps in a bounded title routine before native emission."""
+    """Close statically knowable control-flow gaps before native emission."""
 
     known_addresses = {
         instruction.address
         for function in functions
         for instruction in function.instructions
     }
+    def successors(function: LiftedFunction) -> tuple[int, ...]:
+        targets = [*function.call_targets, *function.branch_targets]
+        fallthrough = _conditional_fallthrough_target(function)
+        if fallthrough is not None:
+            targets.append(fallthrough)
+        if indirect_target_resolver is not None:
+            targets.extend(indirect_target_resolver(function))
+        return tuple(
+            target
+            for target in targets
+            if start_address <= target < end_address
+        )
+
     pending = deque(
         target
         for function in functions
-        for target in function.branch_targets
-        if start_address <= target < end_address and target not in known_addresses
+        for target in successors(function)
+        if target not in known_addresses
     )
     recovered: list[LiftedFunction] = []
     attempted: set[int] = set()
@@ -22008,10 +24529,9 @@ def _recover_missing_branch_targets(
             instruction.address for instruction in function.instructions
         )
         pending.extend(
-            branch_target
-            for branch_target in function.branch_targets
-            if start_address <= branch_target < end_address
-            and branch_target not in known_addresses
+            successor
+            for successor in successors(function)
+            if successor not in known_addresses
         )
     return recovered
 
@@ -22767,6 +25287,17 @@ def _guest_file_information_payload(
         payload = struct.pack("<Q", allocation_size)
     elif information_class == 20:
         payload = struct.pack("<Q", size)
+    elif information_class == 34:
+        payload = struct.pack(
+            "<QQQQQQI4x",
+            0,
+            0,
+            0,
+            0,
+            allocation_size,
+            size,
+            attributes,
+        )
     elif information_class == 18:
         payload = (
             basic_information
@@ -23002,6 +25533,23 @@ def _hex32(value: int) -> str:
     return f"0x{value & 0xFFFFFFFF:08X}"
 
 
+def _probe_execution_failure(summary: dict[str, Any]) -> str | None:
+    entry_recovery = summary.get("entry_recovery", {})
+    if not isinstance(entry_recovery, dict):
+        return None
+    if entry_recovery.get("status") == "decode_failed":
+        return str(entry_recovery.get("error") or "entry decode failed")
+    execution = entry_recovery.get("execution", {})
+    if not isinstance(execution, dict):
+        return None
+    if execution.get("status") == "execution_failed":
+        return str(execution.get("error") or "entry execution failed")
+    for thread in execution.get("guest_thread_executions", []):
+        if isinstance(thread, dict) and thread.get("status") == "execution_failed":
+            return str(thread.get("error") or "guest thread execution failed")
+    return None
+
+
 def _u32(value: int) -> int:
     return value & 0xFFFFFFFF
 
@@ -23107,9 +25655,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Maximum executable blocks to decode on demand during execution.",
     )
     parser.add_argument(
-        "--dynamic-block-cache",
+        "--decoded-block-store",
         type=Path,
-        help="Optional SQLite BLOB store for dynamically decoded blocks.",
+        help="Optional SQLite BLOB store of decoded blocks for ahead-of-time builds.",
+    )
+    parser.add_argument(
+        "--dynamic-block-cache",
+        dest="decoded_block_store",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--native-guest-loop",
@@ -23213,6 +25768,14 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--audit-traffic-meshes",
+        action="store_true",
+        help=(
+            "Capture a bounded native ring of world-mesh submissions while "
+            "preserving the normal native renderer."
+        ),
+    )
+    parser.add_argument(
         "--audit-scene-records",
         action="store_true",
         help=(
@@ -23310,7 +25873,7 @@ def main(argv: list[str] | None = None) -> int:
         internal_depth=args.internal_depth,
         max_blocks=args.max_blocks,
         max_dynamic_blocks=args.max_dynamic_blocks,
-        dynamic_block_cache_path=args.dynamic_block_cache,
+        decoded_block_store_path=args.decoded_block_store,
         render_watchpoint_limit=args.render_watchpoint_limit,
         render_watchpoint_start=args.render_watchpoint_start,
         save_data_root=args.save_data_root,
@@ -23330,6 +25893,7 @@ def main(argv: list[str] | None = None) -> int:
         audit_title_main_loop_exit=args.audit_title_main_loop_exit,
         audit_world_matrices=args.audit_world_matrices,
         audit_world_matrix_address=args.audit_world_matrix_address,
+        audit_traffic_meshes=args.audit_traffic_meshes,
         audit_scene_records=args.audit_scene_records,
     )
     summary["identity"] = {
@@ -23367,6 +25931,10 @@ def main(argv: list[str] | None = None) -> int:
     if not args.quiet:
         assert output is not None
         print(output)
+    execution_failure = _probe_execution_failure(summary)
+    if execution_failure is not None:
+        print(f"Playability probe execution failed: {execution_failure}", file=sys.stderr)
+        return 1
     return 0
 
 

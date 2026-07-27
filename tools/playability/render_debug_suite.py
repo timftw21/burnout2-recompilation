@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import struct
 import sys
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,8 @@ DEFAULT_ANALYSIS_SUMMARY = (
 APPEND_ONLY_COMMAND_MAGIC = b"B2APPND1"
 APPEND_ONLY_COMMAND_HEADER_SIZE = 8
 APPEND_ONLY_COMMAND_RECORD_SIZE = 16
+SPAN_COMMAND_MAGIC = b"B2SPAN01"
+SPAN_COMMAND_HEADER_SIZE = 16
 
 
 def latest_retained_render_manifest(presenter_events: Path) -> Path | None:
@@ -164,6 +167,46 @@ def inspect_render_snapshot_integrity(render_manifest: Path) -> dict[str, Any]:
         snapshot_size = command_path.stat().st_size
         with command_path.open("rb") as handle:
             magic = handle.read(APPEND_ONLY_COMMAND_HEADER_SIZE)
+            snapshot_transport: str | None = None
+            snapshot_record_count: int | None = None
+            if magic == APPEND_ONLY_COMMAND_MAGIC:
+                snapshot_transport = "packed_direct"
+                payload_size = snapshot_size - APPEND_ONLY_COMMAND_HEADER_SIZE
+                if payload_size >= 0 and not (
+                    payload_size % APPEND_ONLY_COMMAND_RECORD_SIZE
+                ):
+                    snapshot_record_count = (
+                        payload_size // APPEND_ONLY_COMMAND_RECORD_SIZE
+                    )
+            elif magic == SPAN_COMMAND_MAGIC:
+                snapshot_transport = "bulk_span_v1"
+                logical_write_count = 0
+                while True:
+                    span_header = handle.read(SPAN_COMMAND_HEADER_SIZE)
+                    if not span_header:
+                        snapshot_record_count = logical_write_count
+                        break
+                    if len(span_header) != SPAN_COMMAND_HEADER_SIZE:
+                        break
+                    (
+                        kind,
+                        flags,
+                        reserved,
+                        _address,
+                        span_payload_size,
+                        span_write_count,
+                    ) = struct.unpack("<BBHIII", span_header)
+                    if (
+                        kind > 1
+                        or flags & ~1
+                        or reserved != 0
+                        or span_payload_size <= 0
+                        or span_write_count <= 0
+                    ):
+                        break
+                    if len(handle.read(span_payload_size)) != span_payload_size:
+                        break
+                    logical_write_count += span_write_count
     except OSError as exc:
         return {
             **result,
@@ -171,22 +214,20 @@ def inspect_render_snapshot_integrity(render_manifest: Path) -> dict[str, Any]:
             "accepted": False,
             "error": str(exc),
         }
-    if magic != APPEND_ONLY_COMMAND_MAGIC:
+    if snapshot_transport is None:
         return {
             **result,
             "status": "invalid_snapshot_header",
             "accepted": False,
             "snapshot_byte_count": snapshot_size,
         }
-    payload_size = snapshot_size - APPEND_ONLY_COMMAND_HEADER_SIZE
-    if payload_size < 0 or payload_size % APPEND_ONLY_COMMAND_RECORD_SIZE:
+    if snapshot_record_count is None:
         return {
             **result,
             "status": "invalid_snapshot_size",
             "accepted": False,
             "snapshot_byte_count": snapshot_size,
         }
-    snapshot_record_count = payload_size // APPEND_ONLY_COMMAND_RECORD_SIZE
     trailing_record_count = max(0, snapshot_record_count - manifest_record_count)
     missing_record_count = max(0, manifest_record_count - snapshot_record_count)
     if trailing_record_count:
@@ -242,6 +283,7 @@ def inspect_render_snapshot_integrity(render_manifest: Path) -> dict[str, Any]:
         "status": status,
         "accepted": status == "exact",
         "snapshot_byte_count": snapshot_size,
+        "snapshot_transport": snapshot_transport,
         "snapshot_record_count": snapshot_record_count,
         "trailing_record_count": trailing_record_count,
         "missing_record_count": missing_record_count,
@@ -442,6 +484,12 @@ def run_render_debug_suite(
             "register_combiner_applied_draw_count": render_state.get(
                 "register_combiner_applied_draw_count", 0
             ),
+            "fixed_function_texture_combiner_recovered_draw_count": (
+                render_state.get(
+                    "fixed_function_texture_combiner_recovered_draw_count",
+                    0,
+                )
+            ),
             "register_combiner_state_mismatch_draw_count": render_state.get(
                 "register_combiner_state_mismatch_draw_count", 0
             ),
@@ -462,6 +510,9 @@ def run_render_debug_suite(
             ),
             "zero_payload_textured_draw_count": render_state.get(
                 "zero_payload_textured_draw_count", 0
+            ),
+            "missing_texture_resource_draw_count": render_state_coverage.get(
+                "missing_texture_resource_draw_count", 0
             ),
             "unproduced_zero_payload_texture_draw_count": render_state.get(
                 "unproduced_zero_payload_texture_draw_count", 0

@@ -1434,9 +1434,13 @@ bool VulkanPresenter::draw_surface_clip_is_subsurface_viewport(
     const uint32_t clip_width = draw.surface_clip_horizontal >> 16u;
     const uint32_t clip_y = draw.surface_clip_vertical & 0xFFFFu;
     const uint32_t clip_height = draw.surface_clip_vertical >> 16u;
+    // An atlas target occupies a strict sub-rectangle on both axes. The
+    // car-select preview deliberately uses the full presented width with a
+    // vertically clipped viewport, so treating every viewport smaller on
+    // either axis as offscreen drops the preview body draws.
     if (clip_width == 0u || clip_height == 0u
-        || (clip_width >= swapchain_extent_.width
-            && clip_height >= swapchain_extent_.height)
+        || clip_width >= swapchain_extent_.width
+        || clip_height >= swapchain_extent_.height
         || (draw.transform_execution_mode & 3u) != 2u) {
         return false;
     }

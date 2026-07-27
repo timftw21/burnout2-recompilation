@@ -50,6 +50,33 @@ class RenderD3D8StreamTests(unittest.TestCase):
             [("clear_color", "0x804020FF"), ("clear_surface", "0x000000F0")],
         )
 
+    def test_decodes_nv2a_texture_image_rect_at_hardware_method(self) -> None:
+        image_rect = (640 << 16) | 480
+        decoded = decode_render_stream(
+            {
+                "format": "b2-recomp-render-command-stream",
+                "writes": [
+                    {
+                        "kind": "d3d_push_buffer",
+                        "address": 0x80000080,
+                        "value": (1 << 18) | 0x1B1C,
+                    },
+                    {
+                        "kind": "d3d_push_buffer",
+                        "address": 0x80000084,
+                        "value": image_rect,
+                    },
+                ],
+            }
+        )
+
+        packet = next(
+            command for command in decoded["commands"]
+            if command.get("method") == "nv2a_increasing_methods"
+        )
+        self.assertEqual(packet["methods"][0]["name"], "texture_image_rect_0")
+        self.assertEqual(packet["methods"][0]["data"], image_rect)
+
     def test_merges_sequential_windows_for_persistent_nv2a_state(self) -> None:
         first = {
             "format": "b2-recomp-render-command-stream",

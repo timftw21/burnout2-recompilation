@@ -68,6 +68,12 @@ def _i64_from_u32_parts(low: int, high: int) -> int:
     return value - 0x1_0000_0000_0000_0000 if value & 0x8000_0000_0000_0000 else value
 
 
+XBOX_KEY_DATA_SIZE = 16
+DEFAULT_XBOX_HD_KEY = hashlib.sha256(
+    b"b2_recomp deterministic XboxHDKey v1"
+).digest()[:XBOX_KEY_DATA_SIZE]
+
+
 @dataclass(frozen=True)
 class ShimTraceEvent:
     sequence: int
@@ -151,6 +157,12 @@ class XboxRuntimeConfig:
     dashboard_data_root: Path | None = None
     cache_data_root: Path | None = None
     title_id: int | None = None
+    xbox_hd_key: bytes = DEFAULT_XBOX_HD_KEY
+    xbox_lan_key: bytes = b"\x00" * XBOX_KEY_DATA_SIZE
+    xbox_signature_key: bytes = b"\x00" * XBOX_KEY_DATA_SIZE
+    xbox_alternate_signature_keys: tuple[bytes, ...] = (
+        (b"\x00" * XBOX_KEY_DATA_SIZE,) * 16
+    )
     host_target_base: int = 0xE0000000
     host_target_stride: int = 0x10
     allocation_base: int = 0x10000000
@@ -282,6 +294,13 @@ class GuestHandleTable:
         self._trace.add("object_manager", "close_handle", kind=kind, handle=handle)
         return XboxStatus.SUCCESS
 
+    def objects_of_kind(self, kind: str) -> tuple[tuple[int, Any], ...]:
+        return tuple(
+            (handle, value)
+            for handle, (actual_kind, value) in sorted(self._objects.items())
+            if actual_kind == kind
+        )
+
     def snapshot(self) -> dict[str, Any]:
         kinds = Counter(kind for kind, _ in self._objects.values())
         return {
@@ -293,6 +312,10 @@ class GuestHandleTable:
 
 class XboxFileSystemShim:
     """Guest filesystem view rooted at local disc and save-data directories."""
+
+    _RAW_PARTITION_ZERO = "\\Device\\Harddisk0\\Partition0"
+    _RAW_PARTITION_ZERO_FILE = "partition0.bin"
+    _RAW_PARTITION_ZERO_MINIMUM_SIZE = 0xA00
 
     _DISC_PREFIXES = (
         "\\Device\\Cdrom0\\",
@@ -387,7 +410,11 @@ class XboxFileSystemShim:
         root = self._root_for_guest_path(guest_path, for_write=for_write)
         if root is None:
             raise XboxPathError(f"no host root configured for {root_kind} volume")
-        parts = self._guest_path_parts(guest_path)
+        parts = (
+            (self._RAW_PARTITION_ZERO_FILE,)
+            if self._is_raw_partition_zero(guest_path)
+            else self._guest_path_parts(guest_path)
+        )
         current = root
         for part in parts:
             if current.exists() and current.is_dir():
@@ -564,6 +591,12 @@ class XboxFileSystemShim:
                 "error": str(exc),
             }
         existed = host_path.exists()
+        if self._is_raw_partition_zero(guest_path):
+            host_path.parent.mkdir(parents=True, exist_ok=True)
+            with host_path.open("ab") as raw_partition:
+                if raw_partition.tell() < self._RAW_PARTITION_ZERO_MINIMUM_SIZE:
+                    raw_partition.truncate(self._RAW_PARTITION_ZERO_MINIMUM_SIZE)
+            existed = True
         if create_disposition == 2 and existed:
             return {
                 "status": XboxStatus.OBJECT_NAME_COLLISION,
@@ -1131,6 +1164,8 @@ class XboxFileSystemShim:
 
     def _root_kind_for_guest_path(self, guest_path: str) -> str:
         normalized = guest_path.replace("/", "\\").strip()
+        if self._is_raw_partition_zero(normalized):
+            return "cache"
         if self._guest_path_matches_any_prefix(normalized, self._DISC_PREFIXES):
             return "disc"
         if self._guest_path_matches_any_prefix(normalized, self._SAVE_PREFIXES):
@@ -1152,6 +1187,11 @@ class XboxFileSystemShim:
             if drive in {"x", "y", "z"}:
                 return "cache"
         return "save" if self._is_save_path(guest_path) else "disc"
+
+    @classmethod
+    def _is_raw_partition_zero(cls, guest_path: str) -> bool:
+        normalized = guest_path.replace("/", "\\").strip().rstrip("\\")
+        return normalized.casefold() == cls._RAW_PARTITION_ZERO.casefold()
 
     def _is_save_path(self, guest_path: str) -> bool:
         normalized = guest_path.replace("/", "\\").strip()
@@ -1266,6 +1306,14 @@ class XboxMemoryShim:
     def allocations(self) -> tuple[Allocation, ...]:
         return tuple(sorted(self._allocations.values(), key=lambda item: item.address))
 
+    def native_allocation_snapshot(self) -> dict[str, Any]:
+        """Describe allocator state for a native runtime handoff."""
+        return {
+            "next_pool_address": self._next_pool,
+            "next_contiguous_address": self._next_contiguous,
+            "allocations": [allocation.to_dict() for allocation in self.allocations],
+        }
+
     def allocate_pool(self, size: int, tag: int | None = None) -> int:
         address = self._allocate(size, 0x10, "pool", tag)
         self._trace.add("allocator", "allocate_pool", address=address, size=size, tag=tag)
@@ -1283,13 +1331,53 @@ class XboxMemoryShim:
         size: int,
         *,
         alignment: int = 0x1000,
+        lowest_physical_address: int = 0,
+        highest_physical_address: int = 0xFFFFFFFF,
+        boundary_address_multiple: int = 0,
         kind: str = "contiguous",
         protection: str = "rw",
     ) -> int:
         if size <= 0:
             raise XboxRuntimeError("allocation size must be positive")
-        address = _align_up(self._next_contiguous, alignment)
-        self._next_contiguous = _align_up(address + size, alignment)
+        if (
+            lowest_physical_address != 0
+            or highest_physical_address != 0xFFFFFFFF
+        ):
+            physical_address = _align_up(lowest_physical_address, 0x1000)
+            for _ in range(len(self._allocations) + 1):
+                if boundary_address_multiple:
+                    boundary_end = (
+                        physical_address // boundary_address_multiple + 1
+                    ) * boundary_address_multiple
+                    if physical_address + size > boundary_end:
+                        physical_address = _align_up(boundary_end, 0x1000)
+                physical_end = physical_address + size
+                if (
+                    physical_end - 1 > highest_physical_address
+                    or physical_end > 0x04000000
+                ):
+                    raise XboxRuntimeError(
+                        "contiguous allocation does not fit its physical range"
+                    )
+                overlapping_ends = [
+                    (allocation.address & 0x03FFFFFF) + allocation.size
+                    for allocation in self._allocations.values()
+                    if 0x80000000 <= allocation.address < 0x84000000
+                    and physical_address
+                    < (allocation.address & 0x03FFFFFF) + allocation.size
+                    and physical_end > (allocation.address & 0x03FFFFFF)
+                ]
+                if not overlapping_ends:
+                    break
+                physical_address = _align_up(max(overlapping_ends), 0x1000)
+            else:
+                raise XboxRuntimeError(
+                    "contiguous allocation does not fit its physical range"
+                )
+            address = physical_address | 0x80000000
+        else:
+            address = _align_up(self._next_contiguous, alignment)
+            self._next_contiguous = _align_up(address + size, alignment)
         self._allocations[address] = Allocation(
             address, size, kind, None, protection
         )
@@ -1299,6 +1387,9 @@ class XboxMemoryShim:
             address=address,
             size=size,
             alignment=alignment,
+            lowest_physical_address=lowest_physical_address,
+            highest_physical_address=highest_physical_address,
+            boundary_address_multiple=boundary_address_multiple,
             kind=kind,
         )
         return address
@@ -1452,7 +1543,11 @@ class XboxMemoryShim:
     def get_physical_address(self, address: int) -> int:
         self._find_allocation(address, 1)
         self._trace.add("allocator", "get_physical_address", address=address)
-        return address
+        return (
+            address & 0x7FFFFFFF
+            if 0x80000000 <= address < 0x84000000
+            else address
+        )
 
     def _allocate(
         self,
@@ -1742,6 +1837,12 @@ class XboxSynchronizationShim:
             limit=limit,
         )
         return handle
+
+    def native_semaphore_snapshot(self) -> tuple[dict[str, int], ...]:
+        return tuple(
+            {"handle": handle, "count": semaphore.count, "limit": semaphore.limit}
+            for handle, semaphore in self._handles.objects_of_kind("semaphore")
+        )
 
     def initialize_semaphore(self, initial_count: int, limit: int) -> SemaphoreObject:
         if initial_count < 0 or limit <= 0 or initial_count > limit:
@@ -2292,6 +2393,8 @@ class AudioOutputBackend(Protocol):
         bits_per_sample: int,
     ) -> bool: ...
 
+    def close(self) -> None: ...
+
 
 class XboxAudioShim:
     def __init__(
@@ -2313,6 +2416,20 @@ class XboxAudioShim:
             "set_output_backend",
             enabled=backend is not None,
             backend=type(backend).__name__ if backend is not None else None,
+        )
+
+    def close_output_backend(self) -> None:
+        backend = self._output_backend
+        self._output_backend = None
+        if backend is None:
+            return
+        close = getattr(backend, "close", None)
+        if callable(close):
+            close()
+        self._trace.add(
+            "audio",
+            "close_output_backend",
+            backend=type(backend).__name__,
         )
 
     def initialize(self) -> int:
@@ -3044,22 +3161,45 @@ class XboxRuntimeShims:
         )
 
     def _build_kernel_variables(self) -> dict[str, KernelVariable]:
+        xbox_hd_key = self._validated_xbox_key(
+            "xbox_hd_key", self.config.xbox_hd_key
+        )
+        xbox_lan_key = self._validated_xbox_key(
+            "xbox_lan_key", self.config.xbox_lan_key
+        )
+        xbox_signature_key = self._validated_xbox_key(
+            "xbox_signature_key", self.config.xbox_signature_key
+        )
+        alternate_signature_keys = tuple(
+            self._validated_xbox_key(
+                f"xbox_alternate_signature_keys[{index}]", key
+            )
+            for index, key in enumerate(self.config.xbox_alternate_signature_keys)
+        )
+        if len(alternate_signature_keys) != 16:
+            raise XboxRuntimeError(
+                "xbox_alternate_signature_keys must contain exactly 16 keys"
+            )
         return {
             "ExEventObjectType": KernelVariable("ExEventObjectType", "Event", "OBJECT_TYPE"),
             "IoFileObjectType": KernelVariable("IoFileObjectType", "File", "OBJECT_TYPE"),
             "PsThreadObjectType": KernelVariable("PsThreadObjectType", "Thread", "OBJECT_TYPE"),
-            "HalDiskCachePartitionCount": KernelVariable("HalDiskCachePartitionCount", 0, "ULONG"),
+            "HalDiskCachePartitionCount": KernelVariable("HalDiskCachePartitionCount", 3, "ULONG"),
             "HalDiskModelNumber": KernelVariable("HalDiskModelNumber", "B2_RECOMP_DISC", "STRING"),
             "HalDiskSerialNumber": KernelVariable("HalDiskSerialNumber", "B2RECOMP0001", "STRING"),
             "HalBootSMCVideoMode": KernelVariable("HalBootSMCVideoMode", 0, "ULONG"),
             "LaunchDataPage": KernelVariable("LaunchDataPage", {"launch_type": "cold"}, "PLAUNCH_DATA_PAGE"),
             "IdexChannelObject": KernelVariable("IdexChannelObject", {"channel": "dvd"}, "IDE_CHANNEL_OBJECT"),
             "XePublicKeyData": KernelVariable("XePublicKeyData", b"\x00" * 284, "UCHAR[]"),
-            "XboxHDKey": KernelVariable("XboxHDKey", b"\x00" * 16, "XBOX_KEY_DATA"),
-            "XboxLANKey": KernelVariable("XboxLANKey", b"\x00" * 16, "XBOX_KEY_DATA"),
-            "XboxSignatureKey": KernelVariable("XboxSignatureKey", b"\x00" * 16, "XBOX_KEY_DATA"),
+            "XboxHDKey": KernelVariable("XboxHDKey", xbox_hd_key, "XBOX_KEY_DATA"),
+            "XboxLANKey": KernelVariable("XboxLANKey", xbox_lan_key, "XBOX_KEY_DATA"),
+            "XboxSignatureKey": KernelVariable(
+                "XboxSignatureKey", xbox_signature_key, "XBOX_KEY_DATA"
+            ),
             "XboxAlternateSignatureKeys": KernelVariable(
-                "XboxAlternateSignatureKeys", [b"\x00" * 16 for _ in range(16)], "XBOX_KEY_DATA[]"
+                "XboxAlternateSignatureKeys",
+                alternate_signature_keys,
+                "XBOX_KEY_DATA[]",
             ),
             "XboxHardwareInfo": KernelVariable(
                 "XboxHardwareInfo",
@@ -3070,6 +3210,15 @@ class XboxRuntimeShims:
                 "XboxKrnlVersion", {"major": 1, "minor": 0, "build": 5838, "qfe": 0}, "XBOX_KRNL_VERSION"
             ),
         }
+
+    @staticmethod
+    def _validated_xbox_key(name: str, value: bytes) -> bytes:
+        key = bytes(value)
+        if len(key) != XBOX_KEY_DATA_SIZE:
+            raise XboxRuntimeError(
+                f"{name} must contain exactly {XBOX_KEY_DATA_SIZE} bytes"
+            )
+        return key
 
     def _handler_for_registered_shim(
         self, name: str, handler_name: str, subsystem: str
@@ -3182,6 +3331,9 @@ class XboxRuntimeShims:
         address = self.memory.allocate_contiguous_memory(
             size,
             alignment=alignment,
+            lowest_physical_address=lowest_acceptable_address,
+            highest_physical_address=highest_acceptable_address,
+            boundary_address_multiple=boundary_address_multiple,
             protection="rw",
         )
         self.trace.add(
@@ -4224,6 +4376,8 @@ class XboxRuntimeShims:
         mapping = {
             XboxStatus.SUCCESS: 0,
             XboxStatus.NO_SUCH_FILE: 2,
+            XboxStatus.OBJECT_NAME_NOT_FOUND: 2,
+            XboxStatus.OBJECT_NAME_COLLISION: 183,
             XboxStatus.ACCESS_DENIED: 5,
             XboxStatus.INVALID_HANDLE: 6,
             XboxStatus.INVALID_PARAMETER: 87,

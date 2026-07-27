@@ -5,6 +5,7 @@ from __future__ import annotations
 import mmap
 import os
 import struct
+import ctypes
 from dataclasses import dataclass
 
 
@@ -87,6 +88,9 @@ _MANIFEST_FIELD_IDS = {
         ),
         start=1,
     )
+}
+_MANIFEST_FIELDS_BY_ID = {
+    field_id: field for field, field_id in _MANIFEST_FIELD_IDS.items()
 }
 
 
@@ -172,6 +176,15 @@ class LiveControlTransport:
     def stop_requested(self) -> bool:
         return bool(_U32.unpack_from(self._mapping, _STOP_REQUESTED_OFFSET)[0])
 
+    def buffer_address(self) -> int:
+        """Return the writable mapping address for the native normal runtime."""
+
+        return ctypes.addressof(ctypes.c_uint8.from_buffer(self._mapping))
+
+    @property
+    def buffer_size(self) -> int:
+        return LIVE_CONTROL_SIZE
+
     def read_controller(
         self,
         last_sequence: int,
@@ -216,6 +229,48 @@ class LiveControlTransport:
             thumb_ry=thumb_ry,
             host_connected=bool(host_connected),
         )
+
+    def publish_controller(
+        self,
+        *,
+        buttons: int = 0,
+        left_trigger: int = 0,
+        right_trigger: int = 0,
+        thumb_lx: int = 0,
+        thumb_ly: int = 0,
+        thumb_rx: int = 0,
+        thumb_ry: int = 0,
+        connected: bool = True,
+        host_connected: bool = True,
+    ) -> int:
+        """Publish one controller state for deterministic diagnostics."""
+
+        sequence = _U32.unpack_from(
+            self._mapping, _CONTROLLER_SEQUENCE_OFFSET
+        )[0]
+        publishing = (sequence + 1) | 1
+        published = (publishing + 1) & 0xFFFFFFFF
+        _U32.pack_into(
+            self._mapping, _CONTROLLER_SEQUENCE_OFFSET, publishing
+        )
+        _CONTROLLER_PAYLOAD.pack_into(
+            self._mapping,
+            _CONTROLLER_PAYLOAD_OFFSET,
+            buttons & 0xFFFF,
+            left_trigger & 0xFF,
+            right_trigger & 0xFF,
+            thumb_lx,
+            thumb_ly,
+            thumb_rx,
+            thumb_ry,
+            int(connected),
+            int(host_connected),
+            0,
+        )
+        _U32.pack_into(
+            self._mapping, _CONTROLLER_SEQUENCE_OFFSET, published
+        )
+        return int(published)
 
     def read_presentation_ack(self) -> tuple[int, int] | None:
         sequence = _U32.unpack_from(
@@ -308,6 +363,123 @@ class LiveControlTransport:
             and _MANIFEST_HEADER.size <= payload_size
             <= LIVE_CONTROL_SIZE - _MANIFEST_PAYLOAD_OFFSET
         )
+
+    def read_manifest(self) -> dict[str, object] | None:
+        sequence = _U32.unpack_from(
+            self._mapping, _MANIFEST_SEQUENCE_OFFSET
+        )[0]
+        if sequence == 0 or sequence & 1:
+            return None
+        payload_size = _U32.unpack_from(
+            self._mapping, _MANIFEST_SIZE_OFFSET
+        )[0]
+        if not (
+            _MANIFEST_HEADER.size <= payload_size
+            <= LIVE_CONTROL_SIZE - _MANIFEST_PAYLOAD_OFFSET
+        ):
+            return None
+        payload = bytes(
+            self._mapping[
+                _MANIFEST_PAYLOAD_OFFSET :
+                _MANIFEST_PAYLOAD_OFFSET + payload_size
+            ]
+        )
+        confirmed = _U32.unpack_from(
+            self._mapping, _MANIFEST_SEQUENCE_OFFSET
+        )[0]
+        if confirmed != sequence or confirmed & 1:
+            return None
+        magic, schema_version, record_count = _MANIFEST_HEADER.unpack_from(
+            payload
+        )
+        if magic != _MANIFEST_MAGIC or schema_version != LIVE_CONTROL_SCHEMA_VERSION:
+            return None
+        manifest: dict[str, object] = {}
+        cursor = _MANIFEST_HEADER.size
+        for _index in range(record_count):
+            if cursor + _MANIFEST_RECORD.size > len(payload):
+                return None
+            field_id, kind, _reserved, size = _MANIFEST_RECORD.unpack_from(
+                payload, cursor
+            )
+            cursor += _MANIFEST_RECORD.size
+            if size > len(payload) - cursor:
+                return None
+            encoded = payload[cursor : cursor + size]
+            cursor += size
+            field = _MANIFEST_FIELDS_BY_ID.get(field_id)
+            if field is None:
+                continue
+            if kind == _MANIFEST_TYPE_U64 and size == _U64.size:
+                manifest[field] = _U64.unpack(encoded)[0]
+            elif kind == _MANIFEST_TYPE_BOOL and size == 1:
+                manifest[field] = bool(encoded[0])
+            elif kind == _MANIFEST_TYPE_UTF8:
+                try:
+                    manifest[field] = encoded.decode("utf-8")
+                except UnicodeDecodeError:
+                    return None
+        return manifest
+
+    def diagnostic_state(self) -> dict[str, int]:
+        """Return fixed-header counters without decoding a live manifest."""
+
+        return {
+            "stop_requested": int(self.stop_requested()),
+            "manifest_sequence": _U32.unpack_from(
+                self._mapping,
+                _MANIFEST_SEQUENCE_OFFSET,
+            )[0],
+            "manifest_size": _U32.unpack_from(
+                self._mapping,
+                _MANIFEST_SIZE_OFFSET,
+            )[0],
+            "presentation_sequence": _U32.unpack_from(
+                self._mapping,
+                _PRESENTATION_SEQUENCE_OFFSET,
+            )[0],
+            "scheduler_worker_handle": _U32.unpack_from(
+                self._mapping,
+                160,
+            )[0],
+            "scheduler_eip": _U32.unpack_from(
+                self._mapping,
+                164,
+            )[0],
+            "scheduler_main_steps": _U64.unpack_from(
+                self._mapping,
+                168,
+            )[0],
+            "scheduler_worker_steps": _U64.unpack_from(
+                self._mapping,
+                176,
+            )[0],
+            "scheduler_phase": _U32.unpack_from(
+                self._mapping,
+                184,
+            )[0],
+            "semaphore_count": _U32.unpack_from(self._mapping, 188)[0],
+            "worker_lifecycle_count": _U32.unpack_from(self._mapping, 192)[0],
+            "wait_handle": _U32.unpack_from(self._mapping, 196)[0],
+            "current_worker_handle": _U32.unpack_from(self._mapping, 200)[0],
+            "scheduler_eax": _U32.unpack_from(self._mapping, 204)[0],
+            "scheduler_ecx": _U32.unpack_from(self._mapping, 208)[0],
+            "scheduler_edx": _U32.unpack_from(self._mapping, 212)[0],
+            "scheduler_ebx": _U32.unpack_from(self._mapping, 216)[0],
+            "scheduler_esp": _U32.unpack_from(self._mapping, 220)[0],
+            "scheduler_ebp": _U32.unpack_from(self._mapping, 224)[0],
+            "scheduler_esi": _U32.unpack_from(self._mapping, 228)[0],
+            "scheduler_edi": _U32.unpack_from(self._mapping, 232)[0],
+            "audio_buffer_play_stage": _U32.unpack_from(
+                self._mapping, 236
+            )[0],
+            "audio_last_buffer": _U32.unpack_from(self._mapping, 240)[0],
+            "audio_last_data": _U32.unpack_from(self._mapping, 244)[0],
+            "audio_last_size": _U32.unpack_from(self._mapping, 248)[0],
+            "audio_last_sample_rate": _U32.unpack_from(
+                self._mapping, 252
+            )[0],
+        }
 
     def close(self) -> None:
         self._mapping.close()
@@ -409,6 +581,15 @@ class LiveCommandTransport:
             int(read_cursor),
         )
 
+    def buffer_address(self) -> int:
+        """Return the writable mapping address for the native normal runtime."""
+
+        return ctypes.addressof(ctypes.c_uint8.from_buffer(self._mapping))
+
+    @property
+    def buffer_size(self) -> int:
+        return LIVE_COMMAND_SIZE
+
     def close(self) -> None:
         self._mapping.close()
 
@@ -491,6 +672,26 @@ class LiveResourceTransport:
             int(generation),
         )
         return slot
+
+    def buffer_address(self) -> int:
+        """Return the writable mapping address for the native normal runtime."""
+
+        return ctypes.addressof(ctypes.c_uint8.from_buffer(self._mapping))
+
+    def slot_metadata(self) -> tuple[tuple[int, int, int], ...]:
+        slots: list[tuple[int, int, int]] = []
+        for offset in _RESOURCE_SLOT_METADATA_OFFSET:
+            sequence, payload_size, generation = (
+                _RESOURCE_SLOT_METADATA.unpack_from(self._mapping, offset)
+            )
+            slots.append(
+                (int(sequence), int(payload_size), int(generation))
+            )
+        return tuple(slots)
+
+    @property
+    def buffer_size(self) -> int:
+        return LIVE_RESOURCE_SIZE
 
     def close(self) -> None:
         self._mapping.close()

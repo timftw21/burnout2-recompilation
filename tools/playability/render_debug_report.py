@@ -1364,6 +1364,11 @@ def _summarize_vertex_transforms(
             }
         )
     tiny_draws.sort(key=lambda draw: (-draw["vertex_count"], draw["presented_index"]))
+    defaulted_position_w_draws = [
+        draw
+        for draw in latest_draw_events
+        if _as_int(draw.get("defaulted_position_w_vertex_count")) > 0
+    ]
     return {
         "status": (
             "indexed_program_tiny_coverage"
@@ -1394,6 +1399,29 @@ def _summarize_vertex_transforms(
         ),
         "draw_event_count": len(draw_events),
         "latest_draw_event_count": len(latest_draw_events),
+        "defaulted_position_w_draw_count": len(defaulted_position_w_draws),
+        "defaulted_position_w_vertex_count": sum(
+            _as_int(draw.get("defaulted_position_w_vertex_count"))
+            for draw in defaulted_position_w_draws
+        ),
+        "invalid_position_w_vertex_count": sum(
+            _as_int(draw.get("invalid_position_w_vertex_count"))
+            for draw in defaulted_position_w_draws
+        ),
+        "non_finite_position_w_vertex_count": sum(
+            _as_int(draw.get("non_finite_position_w_vertex_count"))
+            for draw in defaulted_position_w_draws
+        ),
+        "implicit_position_w_draw_count": sum(
+            1
+            for draw in defaulted_position_w_draws
+            if _as_int(draw.get("implicit_position_w_vertex_count")) > 0
+        ),
+        "implicit_position_w_vertex_count": sum(
+            _as_int(draw.get("implicit_position_w_vertex_count"))
+            for draw in defaulted_position_w_draws
+        ),
+        "defaulted_position_w_draws": defaulted_position_w_draws[:32],
         "tiny_indexed_program_draws": tiny_draws[:32],
         "near_zero_position_c96_c99_basis_draw_count": (
             near_zero_position_basis_draw_count
@@ -1451,6 +1479,14 @@ def _summarize_render_state_diagnostics(
         event
         for event in latest_draws
         if event.get("texture_resource_payload_all_zero") is True
+        and event.get("host_render_target_feedback_supported") is not True
+    ]
+    missing_texture_resource_draws = [
+        event
+        for event in latest_draws
+        if event.get("texture_enabled") is True
+        and event.get("texture_resource_matched") is False
+        and event.get("host_render_target_feedback_supported") is not True
     ]
     aliased_gpu_produced_draws = [
         event
@@ -1502,7 +1538,7 @@ def _summarize_render_state_diagnostics(
     return {
         "status": (
             "translation_mismatch"
-            if mismatch_draw_count
+            if mismatch_draw_count or missing_texture_resource_draws
             else "healthy"
             if state_complete
             else "healthy_partial_history"
@@ -1514,6 +1550,10 @@ def _summarize_render_state_diagnostics(
         ),
         "mismatch_draw_count": mismatch_draw_count,
         "mismatching_draws": mismatching_draws[:8],
+        "missing_texture_resource_draw_count": len(
+            missing_texture_resource_draws
+        ),
+        "missing_texture_resource_draws": missing_texture_resource_draws[:16],
         "zero_payload_draws": zero_payload_draws[:16],
         "aliased_gpu_produced_draws": aliased_gpu_produced_draws[:16],
         "offscreen_replay_draws": offscreen_replay_draws[:16],
@@ -3203,6 +3243,23 @@ def _rank_diagnostic_findings(
     unproduced_zero_payload_count = _as_int(
         latest_render_state.get("unproduced_zero_payload_texture_draw_count")
     )
+    missing_texture_resource_count = _as_int(
+        render_state_coverage.get("missing_texture_resource_draw_count")
+    )
+    if missing_texture_resource_count:
+        findings.append(
+            {
+                "id": "presented_texture_resources_missing",
+                "severity": "critical",
+                "category": "rendering",
+                "evidence": {
+                    "draw_count": missing_texture_resource_count,
+                    "draws": render_state_coverage.get(
+                        "missing_texture_resource_draws", []
+                    ),
+                },
+            }
+        )
     if unproduced_zero_payload_count:
         findings.append(
             {

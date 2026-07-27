@@ -30,7 +30,7 @@ class LiveTestTests(unittest.TestCase):
             save_data_root=Path("save"),
             dashboard_root=Path("dashboard"),
             cache_root=Path("cache-data"),
-            dynamic_block_cache=Path("cache.json"),
+            decoded_block_store=Path("cache.json"),
             native_slice_steps=20_000,
             max_steps=0,
             live_render_stream=Path("render.json"),
@@ -43,6 +43,7 @@ class LiveTestTests(unittest.TestCase):
             no_diagnostics=False,
             audit_world_matrices=False,
             audit_world_matrix_address=None,
+            audit_traffic_meshes=False,
             audit_scene_records=False,
             scene_record_audit_output=Path("scene-record-audit.json"),
             lossless_flip_audit=False,
@@ -61,7 +62,7 @@ class LiveTestTests(unittest.TestCase):
             root = Path(temp_dir)
             args = self._args()
             args.run_manifest = root / "run-manifest.json"
-            args.dynamic_block_cache = root / "decoded-blocks.sqlite3"
+            args.decoded_block_store = root / "decoded-blocks.sqlite3"
             build_validation = {
                 "status": "valid",
                 "valid": True,
@@ -104,7 +105,7 @@ class LiveTestTests(unittest.TestCase):
             args = self._args()
             args.run_manifest = root / "run-manifest.json"
             args.presenter_build_manifest = root / "missing.build.json"
-            args.dynamic_block_cache = root / "decoded-blocks.sqlite3"
+            args.decoded_block_store = root / "decoded-blocks.sqlite3"
             target = {
                 "status": "supported",
                 "supported": True,
@@ -128,6 +129,8 @@ class LiveTestTests(unittest.TestCase):
         self.assertEqual(command[1], "-u")
         self.assertEqual(command[command.index("--max-steps") + 1], "0")
         self.assertIn("--native-guest-loop", command)
+        self.assertIn("--decoded-block-store", command)
+        self.assertNotIn("--dynamic-block-cache", command)
         self.assertIn("--quiet", command)
         self.assertEqual(command[command.index("--save-data-root") + 1], "save")
         self.assertEqual(command[command.index("--dashboard-root") + 1], "dashboard")
@@ -155,10 +158,91 @@ class LiveTestTests(unittest.TestCase):
             (cache.parent / "native-loop-one.dll").touch()
 
             status = _startup_wait_status(cache, 30.0)
+            exited_status = _startup_wait_status(
+                cache,
+                30.0,
+                guest_active=False,
+            )
 
         self.assertIn("after 30s", status)
         self.assertIn("decoded store 1.0 MiB", status)
         self.assertIn("native DLLs 1", status)
+        self.assertIn("ended without publishing a frame", exited_status)
+        self.assertNotIn("still preparing", exited_status)
+
+    def test_embedded_guest_exit_before_first_frame_is_failure(self) -> None:
+        control = Mock()
+        control.manifest_available.return_value = False
+        control.diagnostic_state.return_value = {
+            "manifest_sequence": 0,
+            "manifest_size": 0,
+            "scheduler_phase": 41,
+            "scheduler_worker_handle": 0,
+            "scheduler_eip": 0x0028C180,
+            "scheduler_main_steps": 460446,
+            "scheduler_worker_steps": 0,
+            "semaphore_count": 0,
+            "worker_lifecycle_count": 0,
+            "wait_handle": 0,
+            "current_worker_handle": 0,
+            "scheduler_eax": 0,
+            "scheduler_ecx": 0,
+            "scheduler_edx": 0,
+            "scheduler_ebx": 0,
+            "scheduler_esp": 0,
+            "scheduler_ebp": 0,
+            "scheduler_esi": 0,
+            "scheduler_edi": 0,
+        }
+        commands = Mock()
+        commands.cursors.return_value = (0, 0)
+        resources = Mock()
+        resources.slot_metadata.return_value = ((0, 0, 0), (0, 0, 0))
+        guest = Mock()
+        guest.poll.return_value = 0
+        guest.wait.return_value = 0
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            args = self._args()
+            args.no_diagnostics = True
+            args.live_render_stream = root / "render.json"
+            args.live_controller_state = root / "controller.json"
+            args.save_data_root = root / "save"
+            args.dashboard_root = root / "dashboard"
+            args.cache_root = root / "cache"
+            args.decoded_block_store = root / "decoded-blocks.sqlite3"
+            args.live_transport_name = "Local\\test"
+            args.startup_timeout_seconds = 60.0
+            with (
+                patch.object(
+                    live_test.LiveControlTransport,
+                    "create",
+                    return_value=control,
+                ),
+                patch.object(
+                    live_test.LiveCommandTransport,
+                    "create",
+                    return_value=commands,
+                ),
+                patch.object(
+                    live_test.LiveResourceTransport,
+                    "create",
+                    return_value=resources,
+                ),
+                patch.object(live_test, "_InProcessGuest", return_value=guest),
+                patch("builtins.print") as output,
+            ):
+                result = live_test._run_live_test_embedded(args)
+
+        self.assertEqual(result, 1)
+        self.assertTrue(
+            any(
+                "ended without publishing a frame" in str(call.args[0])
+                for call in output.call_args_list
+                if call.args
+            )
+        )
 
     def test_hot_path_profile_is_opt_in_and_forwarded_to_guest(self) -> None:
         args = self._args()
@@ -204,6 +288,12 @@ class LiveTestTests(unittest.TestCase):
             command[command.index("--audit-world-matrix-address") + 1],
             "0x20D74D00",
         )
+
+    def test_traffic_mesh_audit_is_forwarded_to_guest(self) -> None:
+        args = self._args()
+        args.audit_traffic_meshes = True
+
+        self.assertIn("--audit-traffic-meshes", build_guest_command(args))
 
     def test_scene_record_audit_uses_compact_dedicated_output(self) -> None:
         args = self._args()
@@ -322,6 +412,53 @@ class LiveTestTests(unittest.TestCase):
         )
         process.wait.assert_called_once_with()
         process.terminate.assert_not_called()
+
+    def test_windows_process_job_kills_children_when_launcher_exits(self) -> None:
+        kernel32 = Mock()
+        kernel32.CreateJobObjectW.return_value = 0x1234
+        kernel32.AssignProcessToJobObject.return_value = True
+        kernel32.CloseHandle.return_value = True
+        process = Mock()
+        process._handle = 0x5678
+        captured_limits: dict[str, int] = {}
+
+        def set_job_information(
+            _job: object,
+            _information_class: int,
+            limit_pointer: object,
+            _limit_size: int,
+        ) -> bool:
+            limits = live_test.ctypes.cast(
+                limit_pointer,
+                live_test.ctypes.POINTER(
+                    live_test._JobObjectExtendedLimitInformation
+                ),
+            ).contents
+            captured_limits["flags"] = int(
+                limits.basic_limit_information.limit_flags
+            )
+            return True
+
+        kernel32.SetInformationJobObject.side_effect = set_job_information
+
+        with (
+            patch.object(live_test.sys, "platform", "win32"),
+            patch.object(live_test.ctypes, "WinDLL", return_value=kernel32),
+        ):
+            job = live_test._WindowsKillOnCloseJob()
+            job.assign(process)
+            job.close()
+
+        self.assertEqual(
+            kernel32.SetInformationJobObject.call_args.args[1],
+            live_test._WindowsKillOnCloseJob._EXTENDED_LIMIT_INFORMATION_CLASS,
+        )
+        self.assertEqual(
+            captured_limits["flags"],
+            live_test._WindowsKillOnCloseJob._LIMIT_KILL_ON_JOB_CLOSE,
+        )
+        kernel32.AssignProcessToJobObject.assert_called_once()
+        kernel32.CloseHandle.assert_called_once()
 
     def test_guest_shutdown_timeout_forces_cleanup_and_reports_failure(self) -> None:
         process = Mock()

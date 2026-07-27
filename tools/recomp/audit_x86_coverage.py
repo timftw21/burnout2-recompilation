@@ -29,9 +29,23 @@ except ModuleNotFoundError:  # pragma: no cover - direct script fallback
 
 DEFAULT_MAX_BLOCKS = 65536
 DEFAULT_MAX_BLOCK_BYTES = 4096
+STATIC_EXECUTABLE_DATA_SECTIONS = {".rdata", ".data"}
 
 
-def _dynamic_block_cache_seed_addresses(path: Path) -> tuple[int, set[int]]:
+def _file_backed_code_ranges(info: dict[str, Any]) -> list[tuple[int, int]]:
+    return [
+        (
+            section["virtual_address"],
+            section["virtual_address"] + section["raw_size"],
+        )
+        for section in info["sections"]
+        if "EXECUTABLE" in section["flag_names"]
+        and section["name"] not in STATIC_EXECUTABLE_DATA_SECTIONS
+        and section["raw_size"] > 0
+    ]
+
+
+def _decoded_block_store_seed_addresses(path: Path) -> tuple[int, set[int]]:
     with path.open("rb") as source:
         prefix = source.read(16)
     if prefix.startswith(b"SQLite format 3"):
@@ -56,25 +70,21 @@ def _dynamic_block_cache_seed_addresses(path: Path) -> tuple[int, set[int]]:
 def audit_x86_coverage(
     xbe_path: Path,
     *,
-    dynamic_block_cache_path: Path | None = None,
+    decoded_block_store_path: Path | None = None,
     seeds: list[int] | None = None,
     max_blocks: int = DEFAULT_MAX_BLOCKS,
     max_block_bytes: int = DEFAULT_MAX_BLOCK_BYTES,
 ) -> dict[str, Any]:
     info = parse_xbe_file(xbe_path)
     loaded = load_xbe_file(xbe_path)
-    executable_ranges = [
-        (section["virtual_address"], section["virtual_end"])
-        for section in info["sections"]
-        if "EXECUTABLE" in section["flag_names"]
-    ]
+    executable_ranges = _file_backed_code_ranges(info)
     initial_seeds = set(seeds or [])
-    cache_record_count = 0
-    if dynamic_block_cache_path is not None and dynamic_block_cache_path.exists():
-        cache_record_count, cache_seeds = _dynamic_block_cache_seed_addresses(
-            dynamic_block_cache_path
+    store_record_count = 0
+    if decoded_block_store_path is not None and decoded_block_store_path.exists():
+        store_record_count, store_seeds = _decoded_block_store_seed_addresses(
+            decoded_block_store_path
         )
-        initial_seeds.update(cache_seeds)
+        initial_seeds.update(store_seeds)
 
     def executable_range(address: int) -> tuple[int, int] | None:
         for start, end in executable_ranges:
@@ -169,7 +179,7 @@ def audit_x86_coverage(
         "format": "b2-recomp-x86-coverage-audit",
         "public_safe": False,
         "source": {"kind": "xbe", "name": xbe_path.name},
-        "cache_record_count": cache_record_count,
+        "decoded_block_store_record_count": store_record_count,
         "seed_count": len(initial_seeds),
         "visited_block_count": len(visited_blocks),
         "visited_instruction_count": len(visited_instructions),
@@ -190,7 +200,14 @@ def _parse_int(value: str) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("xbe", type=Path)
-    parser.add_argument("--dynamic-block-cache", type=Path)
+    parser.add_argument("--decoded-block-store", type=Path)
+    parser.add_argument(
+        "--dynamic-block-cache",
+        dest="decoded_block_store",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--seed", type=_parse_int, action="append", default=[])
     parser.add_argument("--max-blocks", type=int, default=DEFAULT_MAX_BLOCKS)
     parser.add_argument("--max-block-bytes", type=int, default=DEFAULT_MAX_BLOCK_BYTES)
@@ -199,7 +216,7 @@ def main() -> int:
     args = parser.parse_args()
     summary = audit_x86_coverage(
         args.xbe,
-        dynamic_block_cache_path=args.dynamic_block_cache,
+        decoded_block_store_path=args.decoded_block_store,
         seeds=args.seed,
         max_blocks=args.max_blocks,
         max_block_bytes=args.max_block_bytes,

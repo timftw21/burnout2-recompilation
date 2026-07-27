@@ -432,6 +432,11 @@ void VulkanPresenter::emit_presented_vertex_transform_diagnostics(bool emit_draw
             {"invalid_fixed_function_vertex_count", std::to_string(diagnostics.invalid_fixed_function_vertex_count)},
             {"position_output_vertex_count", std::to_string(diagnostics.position_output_vertex_count)},
             {"homogeneous_position_vertex_count", std::to_string(diagnostics.homogeneous_position_vertex_count)},
+            {"implicit_position_w_vertex_count", std::to_string(diagnostics.implicit_position_w_vertex_count)},
+            {"invalid_position_w_vertex_count", std::to_string(diagnostics.invalid_position_w_vertex_count)},
+            {"non_finite_position_w_vertex_count", std::to_string(diagnostics.non_finite_position_w_vertex_count)},
+            {"defaulted_position_w_vertex_count", std::to_string(diagnostics.defaulted_position_w_vertex_count)},
+            {"position_output_mask_union", std::to_string(diagnostics.position_output_mask_union)},
             {"screen_space_position_vertex_count", std::to_string(diagnostics.screen_space_position_vertex_count)},
             {"viewport_mapped_vertex_count", std::to_string(diagnostics.viewport_mapped_vertex_count)},
             {"raw_position_fallback_vertex_count", std::to_string(diagnostics.raw_position_fallback_vertex_count)},
@@ -577,6 +582,8 @@ void VulkanPresenter::emit_presented_vertex_transform_diagnostics(bool emit_draw
         uint32_t texture_producer_draw_count = 0u;
         uint32_t texture_raw_producer_draw_count = 0u;
         uint32_t texture_first_producer_address = 0u;
+        uint32_t texture_width = 0u;
+        uint32_t texture_height = 0u;
         if (native_draw != nullptr) {
             enabled_texture_stage_count = static_cast<uint32_t>(
                 std::count_if(
@@ -589,8 +596,8 @@ void VulkanPresenter::emit_presented_vertex_transform_diagnostics(bool emit_draw
                 const auto texture_extent = nv2a_texture_extent(
                     native_draw->texture_formats[texture_stage],
                     native_draw->texture_image_rects[texture_stage]);
-                const uint32_t texture_width = texture_extent.first;
-                const uint32_t texture_height = texture_extent.second;
+                texture_width = texture_extent.first;
+                texture_height = texture_extent.second;
                 const auto texture_match = std::find_if(
                     recovered_source_.textures.begin(),
                     recovered_source_.textures.end(),
@@ -636,6 +643,21 @@ void VulkanPresenter::emit_presented_vertex_transform_diagnostics(bool emit_draw
                 recovered_texture->payload.begin(),
                 recovered_texture->payload.end(),
                 [](uint8_t value) { return value == 0u; });
+        const bool host_render_target_feedback_supported =
+            native_draw != nullptr
+            && std::any_of(
+                host_feedback_specs.begin(),
+                host_feedback_specs.end(),
+                [&](const RenderTargetFeedbackSpec& spec) {
+                    return nv2a_canonical_resource_address(spec.address)
+                            == nv2a_canonical_resource_address(
+                                native_draw->texture_address)
+                        && spec.width == texture_width
+                        && spec.height == texture_height
+                        && nv2a_texture_format_matches(
+                            spec.format,
+                            native_draw->texture_formats[texture_stage]);
+                });
         const bool host_offscreen_target_replay_supported =
             native_draw != nullptr
             && std::any_of(
@@ -658,6 +680,16 @@ void VulkanPresenter::emit_presented_vertex_transform_diagnostics(bool emit_draw
                         == nv2a_canonical_resource_address(
                             native_draw->texture_address);
                 });
+        const float viewport_depth_scale = native_draw != nullptr
+            ? float_from_u32(native_draw->transform_constants[58][2])
+            : 0.0f;
+        const float viewport_depth_offset = native_draw != nullptr
+            ? float_from_u32(native_draw->transform_constants[59][2])
+            : 0.0f;
+        const bool normalized_depth_valid =
+            transform.program_output_z_bounds.valid
+            && std::isfinite(viewport_depth_scale)
+            && std::abs(viewport_depth_scale) > 0.000001f;
         log_.emit(
             "nv2a_presented_transform_diagnostics",
             {
@@ -688,11 +720,13 @@ void VulkanPresenter::emit_presented_vertex_transform_diagnostics(bool emit_draw
                 {"texture_offsets", native_draw != nullptr ? json_u32_array(native_draw->texture_offsets) : "null"},
                 {"texture_addresses", native_draw != nullptr ? json_u32_array(native_draw->texture_addresses) : "null"},
                 {"texture_formats", native_draw != nullptr ? json_u32_array(native_draw->texture_formats) : "null"},
+                {"texture_image_rects", native_draw != nullptr ? json_u32_array(native_draw->texture_image_rects) : "null"},
                 {"texture_controls", native_draw != nullptr ? json_u32_array(native_draw->texture_controls) : "null"},
                 {"texture_filters", native_draw != nullptr ? json_u32_array(native_draw->texture_filters) : "null"},
                 {"texture_resource_matched", native_draw != nullptr ? json_bool(recovered_texture != nullptr) : "null"},
                 {"texture_resource_payload_bytes", recovered_texture != nullptr ? std::to_string(recovered_texture->payload.size()) : "null"},
                 {"texture_resource_payload_all_zero", recovered_texture != nullptr ? json_bool(texture_payload_all_zero) : "null"},
+                {"host_render_target_feedback_supported", json_bool(host_render_target_feedback_supported)},
                 {"texture_producer_draw_count", native_draw != nullptr ? std::to_string(texture_producer_draw_count) : "null"},
                 {"texture_raw_producer_draw_count", native_draw != nullptr ? std::to_string(texture_raw_producer_draw_count) : "null"},
                 {"texture_first_producer_address", native_draw != nullptr ? std::to_string(texture_first_producer_address) : "null"},
@@ -709,11 +743,21 @@ void VulkanPresenter::emit_presented_vertex_transform_diagnostics(bool emit_draw
                 {"depth_test_enable", native_draw != nullptr ? std::to_string(native_draw->depth_test_enable) : "null"},
                 {"depth_function", native_draw != nullptr ? std::to_string(native_draw->depth_function) : "null"},
                 {"depth_write_enable", native_draw != nullptr ? std::to_string(native_draw->depth_write_enable) : "null"},
+                {"viewport_depth_scale", native_draw != nullptr ? json_float(viewport_depth_scale) : "null"},
+                {"viewport_depth_offset", native_draw != nullptr ? json_float(viewport_depth_offset) : "null"},
+                {"normalized_depth_min", normalized_depth_valid ? json_float((transform.program_output_z_bounds.minimum - viewport_depth_offset) / viewport_depth_scale) : "null"},
+                {"normalized_depth_max", normalized_depth_valid ? json_float((transform.program_output_z_bounds.maximum - viewport_depth_offset) / viewport_depth_scale) : "null"},
+                {"surface_color_offset", native_draw != nullptr ? std::to_string(native_draw->surface_color_offset) : "null"},
+                {"surface_pitch", native_draw != nullptr ? std::to_string(native_draw->surface_pitch) : "null"},
+                {"surface_format", native_draw != nullptr ? std::to_string(native_draw->surface_format) : "null"},
+                {"surface_clip_horizontal", native_draw != nullptr ? std::to_string(native_draw->surface_clip_horizontal) : "null"},
+                {"surface_clip_vertical", native_draw != nullptr ? std::to_string(native_draw->surface_clip_vertical) : "null"},
                 {"polygon_offset_fill_enable", native_draw != nullptr ? std::to_string(native_draw->polygon_offset_fill_enable) : "null"},
                 {"polygon_offset_scale_factor", native_draw != nullptr ? json_float(float_from_u32(native_draw->polygon_offset_scale_factor)) : "null"},
                 {"polygon_offset_bias", native_draw != nullptr ? json_float(float_from_u32(native_draw->polygon_offset_bias)) : "null"},
                 {"combiner_stage_count", native_draw != nullptr ? std::to_string(native_draw->combiner_control & 0xFFu) : "null"},
                 {"host_register_combiner_applied", native_draw != nullptr ? json_bool(true) : "null"},
+                {"fixed_function_texture_combiner_recovered", native_draw != nullptr ? json_bool(default_fixed_function_texture_combiner_recovery_required(*native_draw)) : "null"},
                 {"combiner_control", native_draw != nullptr ? std::to_string(native_draw->combiner_control) : "null"},
                 {"combiner_color_inputs", native_draw != nullptr ? json_u32_array(native_draw->combiner_color_inputs) : "null"},
                 {"combiner_color_outputs", native_draw != nullptr ? json_u32_array(native_draw->combiner_color_outputs) : "null"},
@@ -774,6 +818,13 @@ void VulkanPresenter::emit_presented_vertex_transform_diagnostics(bool emit_draw
                     : "null"},
                 {"valid_program_vertex_count", std::to_string(transform.valid_program_vertex_count)},
                 {"invalid_program_vertex_count", std::to_string(transform.invalid_program_vertex_count)},
+                {"position_output_vertex_count", std::to_string(transform.position_output_vertex_count)},
+                {"homogeneous_position_vertex_count", std::to_string(transform.homogeneous_position_vertex_count)},
+                {"implicit_position_w_vertex_count", std::to_string(transform.implicit_position_w_vertex_count)},
+                {"invalid_position_w_vertex_count", std::to_string(transform.invalid_position_w_vertex_count)},
+                {"non_finite_position_w_vertex_count", std::to_string(transform.non_finite_position_w_vertex_count)},
+                {"defaulted_position_w_vertex_count", std::to_string(transform.defaulted_position_w_vertex_count)},
+                {"position_output_mask_union", std::to_string(transform.position_output_mask_union)},
                 {"viewport_mapped_vertex_count", std::to_string(transform.viewport_mapped_vertex_count)},
                 {"raw_position_fallback_vertex_count", std::to_string(transform.raw_position_fallback_vertex_count)},
                 {"near_zero_w_vertex_count", std::to_string(transform.near_zero_w_vertex_count)},
@@ -870,6 +921,64 @@ void VulkanPresenter::emit_presented_render_state_diagnostics() {
     const size_t first_draw = std::min<size_t>(
         interpreted_stream_.presented_draw_begin,
         interpreted_stream_.draws.size());
+    const size_t end_draw = std::min<size_t>(
+        first_draw + interpreted_stream_.presented_draw_count,
+        interpreted_stream_.draws.size());
+    uint32_t routed_presented_draw_count = 0u;
+    uint32_t different_surface_draw_count = 0u;
+    uint32_t subsurface_viewport_draw_count = 0u;
+    uint32_t presented_surface_subsurface_viewport_draw_count = 0u;
+    for (size_t draw_index = first_draw; draw_index < end_draw; ++draw_index) {
+        const NativeDraw& draw = interpreted_stream_.draws[draw_index];
+        const bool subsurface_viewport =
+            draw_surface_clip_is_subsurface_viewport(draw);
+        const bool selected_surface = presented_surface_color_offset_ != 0u
+            && draw.surface_color_offset == presented_surface_color_offset_;
+        const bool routed_presented = draw_targets_presented_surface(draw);
+        routed_presented_draw_count += routed_presented ? 1u : 0u;
+        different_surface_draw_count +=
+            !routed_presented && !subsurface_viewport ? 1u : 0u;
+        subsurface_viewport_draw_count += subsurface_viewport ? 1u : 0u;
+        presented_surface_subsurface_viewport_draw_count +=
+            subsurface_viewport && selected_surface ? 1u : 0u;
+        if (!options_.analyze_render_stream_only || !subsurface_viewport) {
+            continue;
+        }
+        const uint32_t clip_x = draw.surface_clip_horizontal & 0xFFFFu;
+        const uint32_t clip_width = draw.surface_clip_horizontal >> 16u;
+        const uint32_t clip_y = draw.surface_clip_vertical & 0xFFFFu;
+        const uint32_t clip_height = draw.surface_clip_vertical >> 16u;
+        log_.emit(
+            "nv2a_subsurface_viewport_draw",
+            {
+                {"presented_index", std::to_string(draw_index - first_draw)},
+                {"surface_color_offset", std::to_string(draw.surface_color_offset)},
+                {"selected_surface", json_bool(selected_surface)},
+                {"clip_x", std::to_string(clip_x)},
+                {"clip_y", std::to_string(clip_y)},
+                {"clip_width", std::to_string(clip_width)},
+                {"clip_height", std::to_string(clip_height)},
+                {"viewport_scale_x", json_float(float_from_u32(draw.transform_constants[58][0]))},
+                {"viewport_scale_y", json_float(float_from_u32(draw.transform_constants[58][1]))},
+                {"viewport_offset_x", json_float(float_from_u32(draw.transform_constants[59][0]))},
+                {"viewport_offset_y", json_float(float_from_u32(draw.transform_constants[59][1]))},
+                {"primitive", std::to_string(draw.primitive)},
+                {"vertex_count", std::to_string(draw.vertex_count)},
+                {"indexed_array", json_bool(draw.indexed_array)},
+                {"texture_enabled", json_bool(draw.texture_enabled)},
+                {"texture_address", std::to_string(draw.texture_address)},
+            });
+    }
+    log_.emit(
+        "nv2a_draw_surface_routing_diagnostics",
+        {
+            {"source_presented_draw_count", std::to_string(end_draw - first_draw)},
+            {"presented_surface_color_offset", std::to_string(presented_surface_color_offset_)},
+            {"routed_presented_draw_count", std::to_string(routed_presented_draw_count)},
+            {"different_surface_draw_count", std::to_string(different_surface_draw_count)},
+            {"subsurface_viewport_draw_count", std::to_string(subsurface_viewport_draw_count)},
+            {"presented_surface_subsurface_viewport_draw_count", std::to_string(presented_surface_subsurface_viewport_draw_count)},
+        });
     uint32_t textured_draw_count = 0u;
     uint32_t texture_address_state_draw_count = 0u;
     uint32_t out_of_unit_texture_coordinate_draw_count = 0u;
@@ -890,6 +999,7 @@ void VulkanPresenter::emit_presented_render_state_diagnostics() {
     uint32_t uncompressed_texture_unswizzled_draw_count = 0u;
     uint32_t register_combiner_programmed_draw_count = 0u;
     uint32_t register_combiner_applied_draw_count = 0u;
+    uint32_t fixed_function_texture_combiner_recovered_draw_count = 0u;
     uint32_t register_combiner_state_mismatch_draw_count = 0u;
     uint32_t fog_enabled_draw_count = 0u;
     uint32_t fog_factor_applied_draw_count = 0u;
@@ -900,11 +1010,14 @@ void VulkanPresenter::emit_presented_render_state_diagnostics() {
     uint32_t unproduced_zero_payload_texture_draw_count = 0u;
     uint32_t aliased_gpu_produced_texture_draw_count = 0u;
     uint32_t offscreen_render_target_replay_draw_count = 0u;
+    uint32_t render_target_feedback_draw_count = 0u;
     uint32_t fixed_function_draw_count = 0u;
     uint32_t fixed_function_transformed_draw_count = 0u;
     uint32_t fixed_function_raw_fallback_draw_count = 0u;
     uint32_t fixed_function_filtered_draw_count = 0u;
     uint64_t fixed_function_invalid_vertex_count = 0u;
+    const std::vector<RenderTargetFeedbackSpec>& feedback_specs =
+        presented_render_target_feedback_specs();
     for (const PresentedDrawTransformDiagnostics& diagnostics :
          presented_draw_transform_diagnostics_) {
         const size_t native_draw_index = first_draw
@@ -920,6 +1033,9 @@ void VulkanPresenter::emit_presented_render_state_diagnostics() {
             combiner_programmed ? 1u : 0u;
         register_combiner_applied_draw_count +=
             combiner_programmed ? 1u : 0u;
+        fixed_function_texture_combiner_recovered_draw_count +=
+            default_fixed_function_texture_combiner_recovery_required(draw)
+            ? 1u : 0u;
         const bool fog_enabled = draw.fog_enable != 0u;
         const bool fog_parameters_available = draw.fog_params[0] != 0u
             || draw.fog_params[1] != 0u;
@@ -990,14 +1106,32 @@ void VulkanPresenter::emit_presented_render_state_diagnostics() {
                 uncompressed_swizzled ? 1u : 0u;
             uncompressed_texture_unswizzled_draw_count +=
                 uncompressed_swizzled ? 1u : 0u;
+            const auto texture_extent = nv2a_texture_extent(
+                draw.texture_formats[stage],
+                draw.texture_image_rects[stage]);
+            const bool render_target_feedback = std::any_of(
+                feedback_specs.begin(),
+                feedback_specs.end(),
+                [&](const RenderTargetFeedbackSpec& target) {
+                    return nv2a_canonical_resource_address(target.address)
+                            == nv2a_canonical_resource_address(
+                                draw.texture_address)
+                        && target.width == texture_extent.first
+                        && target.height == texture_extent.second
+                        && nv2a_texture_format_matches(
+                            target.format,
+                            draw.texture_formats[stage]);
+                });
+            render_target_feedback_draw_count +=
+                render_target_feedback ? 1u : 0u;
             const auto resource = std::find_if(
                 recovered_source_.textures.begin(),
                 recovered_source_.textures.end(),
                 [&](const RecoveredTextureResource& candidate) {
                     return candidate.address == draw.texture_address;
                 });
-            const bool all_zero =
-                resource != recovered_source_.textures.end()
+            const bool all_zero = !render_target_feedback
+                && resource != recovered_source_.textures.end()
                 && !resource->payload.empty()
                 && std::all_of(
                     resource->payload.begin(),
@@ -1022,9 +1156,6 @@ void VulkanPresenter::emit_presented_render_state_diagnostics() {
                     producer_exists ? 0u : 1u;
                 aliased_gpu_produced_texture_draw_count +=
                     producer_exists && !raw_producer_exists ? 1u : 0u;
-                const std::vector<RenderTargetFeedbackSpec>&
-                    feedback_specs =
-                        presented_render_target_feedback_specs();
                 offscreen_render_target_replay_draw_count +=
                     std::any_of(
                         feedback_specs.begin(),
@@ -1061,8 +1192,6 @@ void VulkanPresenter::emit_presented_render_state_diagnostics() {
         fixed_function_invalid_vertex_count +=
             diagnostics.transform.invalid_fixed_function_vertex_count;
     }
-    const std::vector<RenderTargetFeedbackSpec>& feedback_specs =
-        presented_render_target_feedback_specs();
     std::ostringstream feedback_addresses;
     feedback_addresses << '[';
     for (size_t index = 0; index < feedback_specs.size(); ++index) {
@@ -1102,6 +1231,7 @@ void VulkanPresenter::emit_presented_render_state_diagnostics() {
             {"uncompressed_texture_unswizzled_draw_count", std::to_string(uncompressed_texture_unswizzled_draw_count)},
             {"register_combiner_programmed_draw_count", std::to_string(register_combiner_programmed_draw_count)},
             {"register_combiner_applied_draw_count", std::to_string(register_combiner_applied_draw_count)},
+            {"fixed_function_texture_combiner_recovered_draw_count", std::to_string(fixed_function_texture_combiner_recovered_draw_count)},
             {"register_combiner_state_mismatch_draw_count", std::to_string(register_combiner_state_mismatch_draw_count)},
             {"fog_enabled_draw_count", std::to_string(fog_enabled_draw_count)},
             {"fog_factor_applied_draw_count", std::to_string(fog_factor_applied_draw_count)},
@@ -1112,6 +1242,7 @@ void VulkanPresenter::emit_presented_render_state_diagnostics() {
             {"unproduced_zero_payload_texture_draw_count", std::to_string(unproduced_zero_payload_texture_draw_count)},
             {"aliased_gpu_produced_texture_draw_count", std::to_string(aliased_gpu_produced_texture_draw_count)},
             {"offscreen_render_target_replay_draw_count", std::to_string(offscreen_render_target_replay_draw_count)},
+            {"render_target_feedback_draw_count", std::to_string(render_target_feedback_draw_count)},
             {"render_target_feedback_required", std::to_string(
                 feedback_specs.size())},
             {"render_target_feedback_required_addresses",

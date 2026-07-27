@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,49 @@ from tools.playability.render_debug_suite import (
 
 
 class RenderDebugReportTests(unittest.TestCase):
+    def test_reports_defaulted_position_w_completion_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            probe = root / "probe.json"
+            events = root / "events.jsonl"
+            probe.write_text("{}", encoding="utf-8")
+            events.write_text(
+                "\n".join(
+                    json.dumps(event)
+                    for event in (
+                        {
+                            "event": "nv2a_vertex_transform_diagnostics",
+                            "invalid_program_vertex_count": 0,
+                        },
+                        {
+                            "event": "nv2a_presented_transform_diagnostics",
+                            "presented_index": 514,
+                            "invalid_position_w_vertex_count": 4,
+                            "non_finite_position_w_vertex_count": 4,
+                            "defaulted_position_w_vertex_count": 4,
+                        },
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = build_render_debug_report(
+                probe_summary_path=probe,
+                presenter_events_path=events,
+                stream_analysis_events_path=None,
+            )
+
+        transforms = report["vertex_transforms"]
+        self.assertEqual(transforms["defaulted_position_w_draw_count"], 1)
+        self.assertEqual(transforms["defaulted_position_w_vertex_count"], 4)
+        self.assertEqual(transforms["invalid_position_w_vertex_count"], 4)
+        self.assertEqual(transforms["non_finite_position_w_vertex_count"], 4)
+        self.assertEqual(
+            transforms["defaulted_position_w_draws"][0]["presented_index"],
+            514,
+        )
+
     def test_debug_suite_detects_unpresented_trailing_snapshot_records(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -60,6 +104,61 @@ class RenderDebugReportTests(unittest.TestCase):
         self.assertEqual(integrity["status"], "exact")
         self.assertTrue(integrity["accepted"])
         self.assertTrue(integrity["exact_prefix"])
+
+    def test_debug_suite_accepts_an_exact_bulk_span_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            commands = root / "commands.bin"
+            commands.write_bytes(
+                b"B2SPAN01"
+                + struct.pack("<BBHIII", 1, 0, 0, 0x80000000, 12, 3)
+                + bytes(12)
+                + struct.pack("<BBHIII", 1, 1, 0, 0x8000000C, 4, 1)
+                + bytes(4)
+            )
+            manifest = root / "render.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "command_snapshot_path": str(commands),
+                        "command_snapshot_record_count": 4,
+                        "command_snapshot_exact_prefix": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            integrity = inspect_render_snapshot_integrity(manifest)
+
+        self.assertEqual(integrity["status"], "exact")
+        self.assertTrue(integrity["accepted"])
+        self.assertEqual(integrity["snapshot_transport"], "bulk_span_v1")
+        self.assertEqual(integrity["snapshot_record_count"], 4)
+
+    def test_debug_suite_rejects_a_truncated_bulk_span_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            commands = root / "commands.bin"
+            commands.write_bytes(
+                b"B2SPAN01"
+                + struct.pack("<BBHIII", 1, 0, 0, 0x80000000, 8, 2)
+                + bytes(4)
+            )
+            manifest = root / "render.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "command_snapshot_path": str(commands),
+                        "command_snapshot_record_count": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            integrity = inspect_render_snapshot_integrity(manifest)
+
+        self.assertEqual(integrity["status"], "invalid_snapshot_size")
+        self.assertFalse(integrity["accepted"])
 
     def test_debug_suite_rejects_a_continuation_without_interpreter_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1168,6 +1267,22 @@ class RenderDebugReportTests(unittest.TestCase):
                             "presented_index": 12,
                             "host_transform_path": "filtered",
                         },
+                        {
+                            "event": "nv2a_presented_transform_diagnostics",
+                            "presented_index": 13,
+                            "texture_enabled": True,
+                            "texture_resource_matched": False,
+                            "host_transform_path": "programmable",
+                        },
+                        {
+                            "event": "nv2a_presented_transform_diagnostics",
+                            "presented_index": 14,
+                            "texture_enabled": True,
+                            "texture_resource_matched": False,
+                            "texture_resource_payload_all_zero": True,
+                            "host_render_target_feedback_supported": True,
+                            "host_transform_path": "programmable",
+                        },
                     )
                 )
                 + "\n",
@@ -1183,11 +1298,13 @@ class RenderDebugReportTests(unittest.TestCase):
         coverage = report["render_state_coverage"]
         self.assertEqual(coverage["status"], "translation_mismatch")
         self.assertEqual(coverage["mismatch_draw_count"], 5)
+        self.assertEqual(coverage["missing_texture_resource_draw_count"], 1)
         self.assertEqual(coverage["mismatching_draws"][0]["presented_index"], 10)
         finding_ids = {finding["id"] for finding in report["diagnostic_findings"]}
         self.assertIn("texture_sampler_address_mode_mismatch", finding_ids)
         self.assertIn("alpha_test_state_not_applied", finding_ids)
         self.assertIn("fixed_function_draws_not_host_transformed", finding_ids)
+        self.assertIn("presented_texture_resources_missing", finding_ids)
 
     def test_supported_fixed_function_draws_are_not_reported_as_filtered(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

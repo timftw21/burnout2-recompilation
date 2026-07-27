@@ -96,9 +96,9 @@ TEXTURE_METHOD_OFFSETS = {
     0x0C: "texture_control0",
     0x10: "texture_control1",
     0x14: "texture_filter",
-    0x18: "texture_image_rect",
-    0x1C: "texture_palette",
-    0x20: "texture_border_color",
+    0x1C: "texture_image_rect",
+    0x20: "texture_palette",
+    0x24: "texture_border_color",
 }
 
 

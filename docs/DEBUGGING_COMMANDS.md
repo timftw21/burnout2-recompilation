@@ -63,6 +63,37 @@ Bounded execution:
 python .\tools\playability\live_test.py --max-steps 1000000 --skip-host-build
 ```
 
+`--max-steps` is a diagnostic instruction cap, not a play-time timeout. When it
+is exhausted, guest publication stops and the presenter can remain interactive
+on the last frame until it is closed. Confirm `run-manifest.json` and
+`native-live.json` before classifying that display as a guest crash or wait.
+For manual play, omit `--max-steps`.
+
+Deterministic title-confirm injection for a bounded scheduler/render probe:
+
+```powershell
+python .\tools\playability\live_test.py `
+  --max-steps 100000000 `
+  --inject-confirm-after-flip 1200 `
+  --skip-host-build
+```
+
+The injector presses and releases guest A once the binary manifest reaches the
+requested completed-flip count. If publication then stops, it reports the live
+scheduler phase, worker/PC, step counters, semaphore/wait state, and registers.
+Phase 40 means the dispatcher is checking an uncompiled target; phase 41 means
+neither an AOT entry nor a native host service accepted it. Phase 5 is ordinary
+AOT module execution and, by itself, is not a missing-service diagnosis.
+
+The fixed live scheduler snapshot also exposes the native DirectSound buffer
+`Play` stage and its last buffer metadata. `audio_buffer_play_stage` values 1-3
+cover mirror resolution and decode entry, 4 means decode completed, 5 means the
+SDL output is open, 6 means playback was queued, 20 means the payload or format
+was rejected, and 21 means output initialization failed. The companion fields
+are `audio_last_buffer`, `audio_last_data`, `audio_last_size`, and
+`audio_last_sample_rate`. These fields occupy the reserved diagnostic header
+and do not publish controller input or alter guest execution.
+
 Override the first-frame startup timeout:
 
 ```powershell
@@ -149,6 +180,18 @@ python .\tools\playability\live_test.py `
   --audit-scene-records `
   --skip-host-build
 ```
+
+Native traffic/world-mesh submission audit:
+
+```powershell
+python .\tools\playability\live_test.py `
+  --audit-traffic-meshes `
+  --skip-host-build
+```
+
+This retains a bounded ring of world-draw callers, mesh entries, index buffers,
+and index counts entirely inside the native runtime. It preserves the normal
+renderer and controls, unlike the callback-heavy world-matrix audits below.
 
 Broad RenderWare world-matrix audit:
 
@@ -296,7 +339,7 @@ Bounded native probe:
 python .\tools\playability\playability_probe.py `
   $Xbe `
   --extracted-root $Extracted `
-  --dynamic-block-cache .\build\native-guest-loop\decoded-blocks.sqlite3 `
+  --decoded-block-store .\build\native-guest-loop\decoded-blocks.sqlite3 `
   --native-guest-loop `
   --max-steps 1000000 `
   --json-output .\reports\local\playability\native-loop-1m.json
@@ -311,6 +354,7 @@ Direct-probe-only diagnostic switches:
 | `--render-watchpoint-limit N` | Stop after retaining N D3D writes |
 | `--no-execute-entry` | Decode the entry prefix without executing |
 | `--profile-hot-paths` | Exact module edges and sampled callback timing |
+| `--audit-traffic-meshes` | Native bounded world-mesh submission ring |
 | `--audit-world-matrices` | Broad world-matrix observer |
 | `--audit-world-matrix-address ADDRESS` | Exact matrix-write and shader-input audit |
 | `--audit-scene-records` | Compact scene/source audit |
@@ -319,7 +363,59 @@ Direct-probe-only diagnostic switches:
 Decoded blocks are stored as individually compressed records in
 `build/native-guest-loop/decoded-blocks.sqlite3`; a lookup decodes only the
 requested block. Normal runs persist new frontier information for the next AOT
-build without compiling it in the active process.
+build without compiling it in the active process. A native transport-code-9
+stop records the exact executable target after the run has stopped and reports
+`native_normal_runtime_coverage_gap.status=decoded_for_next_aot`; rerun normally
+to consume the block in the next static build. Known callback tables are seeded
+as complete families during artifact preparation so adjacent members do not
+require one failing run apiece. Preparation also proves contiguous `.rdata` and
+`.data` code-pointer families plus embedded data islands in other file-backed
+XBE sections from raw return/alignment boundaries, retains the complete family,
+and rejects packed numeric runs. Headers and zero-fill tails are never scanned.
+Static data sections are not treated as code by jump-table closure or the IA-32
+coverage audit merely because their XBE section flags include execute.
+
+A guest that exits before the first frame is a failure even if its nested
+runner returned zero. Fatal entry or guest-thread execution also makes the
+probe itself return nonzero, and the launcher reports the final preparation
+state instead of saying that an exited guest is still preparing.
+
+Immediate code-looking values must not be seeded generically from `push` or
+register `mov` instructions: executable library sections contain interleaved
+strings and packed data that can resemble function boundaries. Stack-passed
+callbacks are recovered only for declared callback-consuming ABIs. The CRT
+vector-constructor helper at `0x000134D0`, for example, consumes argument 3 as
+an element-constructor callback. Preparation traces a bounded same-block push
+sequence backwards from each direct consumer call, permits intervening
+instructions only while they preserve the CPU stack and linear control flow,
+and verifies the executable target before adding it to the AOT closure.
+The linked-list iterator at `0x000FD810` similarly consumes argument 1 as its
+visitor callback, so all direct callers contribute their complete visitor
+family during the same preparation pass. The spatial-query consumer at
+`0x0008F3D0` consumes argument 2; its callers interleave floating-point and
+register work with argument pushes, which the stack-safe trace accepts without
+weakening recovery into a generic immediate scan. The related spatial-collision
+consumer at `0x00090420` also consumes argument 2; all 13 of its direct
+callsites contribute their complete four-visitor family.
+
+The frontend-card constructor at `0x0001D180` consumes argument 7 as a callback
+but receives it through a register push after two reserved floating-point
+stack slots. Its declared ABI recovery traces that stack layout, then collects
+the bounded branch-family definitions of the pushed register. This seeds the
+`0x00024440`, `0x00025150`, and `0x00025A10` card callbacks before the AOT build
+without treating arbitrary register immediates as code.
+
+Normal live play paces completed guest publications to 60 Hz in the native
+runtime. With the depth-two presentation pipeline, the presenter may consume
+and acknowledge one completed publication while waiting for the current frame
+deadline; this avoids quantizing a narrowly missed loop-boundary probe down to
+30 FPS. The remainder of that deadline wait does not consume another
+publication, so the guest cannot advance twice per displayed-frame interval.
+
+Bounded runs use separate guest and presenter processes. On Windows both are
+assigned to a kill-on-close job, so closing or losing the launcher cannot leave
+an executing recomp child behind; the usual graceful stop and timeout cleanup
+still run first.
 
 ## ETW/WPA profiling
 
@@ -484,7 +580,7 @@ IA-32 coverage audit:
 ```powershell
 python .\tools\recomp\audit_x86_coverage.py `
   $Xbe `
-  --dynamic-block-cache .\build\native-guest-loop\decoded-blocks.sqlite3 `
+  --decoded-block-store .\build\native-guest-loop\decoded-blocks.sqlite3 `
   --json-output .\reports\local\recomp\x86-coverage-audit.json `
   --pretty
 ```

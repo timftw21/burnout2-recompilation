@@ -12,7 +12,7 @@ remain owned by their rights holders.
 
 ## Project status
 
-Updated: July 23, 2026.
+Updated: July 26, 2026.
 
 The recovered boot path runs through a resumable native guest loop, presents
 completed NV2A frames through Vulkan, and uses SDL3 for frontend audio plus
@@ -27,7 +27,7 @@ semantics remain active work.
 | Runtime ABI shims | Implemented for the currently reached path |
 | IA-32 execution | Recovered boot, frontend, and Lesson One path running |
 | Vulkan presentation | Live completed-flip presentation with strict validation |
-| Audio and input | SDL3 audio stream and SDL3 keyboard/gamepad state |
+| Audio and input | Native PCM/Xbox ADPCM observation, mixing, SDL3 submission, and buffer `Play` ABI completion; gameplay audio still needs manual acceptance |
 | Provenance | Exact supported-XBE gate and content-addressed build/run manifests |
 | Save states | Not implemented |
 
@@ -96,9 +96,11 @@ target verification, local paths, controls, and ordinary runtime options are in
 Normal play keeps the guest dispatcher and Vulkan presenter in one process:
 
 1. The launcher verifies the exact XBE and presenter build identities.
-2. Native code owns resident guest dispatch, hot services, worker lifecycle,
-   dirty-page generations, and cooperative cadence. Python supplies cold
-   service bodies and tooling.
+2. Native code owns resident guest dispatch, registered service ABI
+   continuation, primary/worker scheduling, allocation state, dirty-memory
+   ownership, reached kernel/title services, audio decode/mix/submission, and
+   render publication. Python prepares deterministic artifacts, validates
+   identity, launches the runtime, and materializes post-run diagnostics.
 3. A versioned shared-memory control record carries input, stop, and
    completed-flip acknowledgements. A bounded command ring and immutable
    resource slots publish NV2A work.
@@ -107,18 +109,47 @@ Normal play keeps the guest dispatcher and Vulkan presenter in one process:
 5. Direct Vulkan retains device, swapchain, resource, pipeline,
    synchronization, presentation, and readback ownership.
 
-Python retains title-specific RenderWare audio decoding and mix policy; a
-narrow native ABI queues normalized PCM16 to SDL3. Bounded probes, lossless
-audits, and frozen replays intentionally retain isolated diagnostic paths.
+The native normal runtime decodes title-specific RenderWare PCM/ADPCM, applies
+gain and looping policy, mixes normalized PCM16, and submits it through the
+narrow SDL3 presenter ABI. Bounded probes, lossless audits, and frozen replays
+intentionally retain isolated Python diagnostic paths.
+
+The loading path now services the title's registered D3D vertical-blank
+callback natively at a wall-clock-paced 60 Hz, which unblocks the asynchronous
+asset pump that previously remained on `Loading - please wait`. The reached
+`IDirectSoundBuffer::Play` wrapper is now a complete native host ABI boundary:
+it commits the recovered guest voice state, returns the guest HRESULT, performs
+the exact stack cleanup, and does not enter the Xbox SDK hardware path. Manual
+gameplay acceptance beyond the former stall remains pending; current status and
+the exact retained snapshot are recorded in
+[docs/VALIDATION.md](docs/VALIDATION.md#july-26-native-vblank-and-audio-investigation).
+
+The native-boundary checkpoint now reports zero Python runtime ABI, handler,
+cold-host, memory, observer, and slice-yield callbacks on warm bounded runs
+through the currently reached path. One Python dirty-page materialization
+occurs only after guest execution to compose the diagnostic report. Bounded run
+`e0884dd7-5a27-403f-88c6-a4be1263df12` completed the render-publication
+acceptance: native code published 53 exact command/resource generations, the
+presenter acknowledged all 53 and applied 52 incremental reloads, and all
+generations passed render validation with zero frontier-interpreter activity
+and runtime compilation disabled. See
+[Audit.md](Audit.md#python-runtime-migration-checkpoint-2026-07-24).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full ownership model.
 
 ## Validation
 
-The current asset-free closeout gate passes 548 Python tests and 10 native
-CTest cases. The exact supported target reaches Lesson One with live Vulkan
-rendering, SDL3 frontend audio and input, local storage, streamed track data,
-and cooperative workers.
+The current Python unit suite passes 624 tests; the last retained asset-free
+closeout gate passed 548 Python tests and 10 native CTest cases. The validated
+exact-target baseline reaches Lesson One with live Vulkan rendering, SDL3
+frontend audio and input, local storage, streamed track data, and cooperative
+workers. Native local storage includes first-run Xbox cache-partition table
+assignment and FATX device formatting. The migrated native path has cleared the
+former `sample.xsb` XACT
+failure and runs native-clean through 20 million guest instructions, with
+longer coverage probes reaching about 91 million. The `0x00073150` and
+`0x00055970` address-taken targets are persisted, and the fully warm first-flip
+acceptance run completes the current native migration checkpoint.
 
 Local evidence under `reports/local/` is ignored and must not be committed.
 Performance and compatibility claims must cite their exact run identity,
