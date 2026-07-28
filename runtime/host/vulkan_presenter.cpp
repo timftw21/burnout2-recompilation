@@ -1,4 +1,5 @@
 #include "vulkan_presenter_runtime.h"
+#include "live_transport_layout.h"
 
 namespace b2r::host::vulkan_detail {
 
@@ -2097,6 +2098,27 @@ uint32_t VulkanPresenter::handle_platform_result(PlatformPollResult result) {
     if (result.toggle_fps_counter) {
         toggle_fps_counter();
     }
+    if (result.toggle_hot_path_profile) {
+        const uint32_t state = transport_.toggle_hot_path_profile();
+        const char* state_name = "disabled";
+        if (state == b2r::live_transport::kLiveHotPathProfileActive) {
+            state_name = "active";
+            platform_.set_window_title(
+                narrow(options_.title) + " | Hot-path capture ACTIVE (F10 to stop)");
+        } else if (state == b2r::live_transport::kLiveHotPathProfileComplete) {
+            state_name = "complete";
+            platform_.set_window_title(
+                narrow(options_.title) + " | Hot-path capture COMPLETE");
+        }
+        log_.emit(
+            "hot_path_profile_capture",
+            {
+                {"state", json_string(state_name)},
+                {"frame", std::to_string(frame_count_ + 1u)},
+                {"guest_flip_count", std::to_string(
+                    current_manifest_guest_flip_count_)},
+            });
+    }
     if (result.write_metrics_report
         && !options_.metrics_report_directory.empty()) {
         write_metrics_report();
@@ -2120,6 +2142,19 @@ void VulkanPresenter::initialize_live_control_transport() {
         return;
     }
     const auto info = transport_.open(options_.live_control_transport_name);
+    if (transport_.hot_path_profile_state()
+        == b2r::live_transport::kLiveHotPathProfileArmed) {
+        platform_.set_window_title(
+            narrow(options_.title) + " | Hot-path capture ARMED (F10 to start)");
+        log_.emit(
+            "hot_path_profile_capture",
+            {
+                {"state", json_string("armed")},
+                {"frame", std::to_string(frame_count_)},
+                {"guest_flip_count", std::to_string(
+                    current_manifest_guest_flip_count_)},
+            });
+    }
     log_.emit(
         "live_control_transport_opened",
         {

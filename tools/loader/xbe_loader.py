@@ -133,10 +133,15 @@ class XbeMemoryArena:
         self.image_end = base_address + image_size
         self._data = bytearray(image_size)
         self._regions: list[MemoryRegion] = []
+        self._sorted_regions: tuple[MemoryRegion, ...] | None = None
 
     @property
     def regions(self) -> tuple[MemoryRegion, ...]:
-        return tuple(sorted(self._regions, key=lambda region: region.virtual_address))
+        if self._sorted_regions is None:
+            self._sorted_regions = tuple(
+                sorted(self._regions, key=lambda region: region.virtual_address)
+            )
+        return self._sorted_regions
 
     def map_region(self, region: MemoryRegion, payload: bytes) -> None:
         if region.size < 0:
@@ -162,6 +167,7 @@ class XbeMemoryArena:
                 region.size - len(payload)
             )
         self._regions.append(region)
+        self._sorted_regions = None
 
     def region_for(self, address: int, size: int = 1) -> MemoryRegion:
         self._validate_image_range(address, size)

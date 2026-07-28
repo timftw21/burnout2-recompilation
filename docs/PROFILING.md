@@ -6,6 +6,41 @@ event, resource, pipeline, barrier, and pass-structure questions. The existing
 `--profile-hot-paths` counters are reserved for guest-semantic attribution that
 those tools cannot provide.
 
+The in-process profiler is native-clean and windowed. Start
+`live_test.py --profile-hot-paths`, navigate while the title
+shows `ARMED`, press F10 to begin the representative workload, press F10 again
+to complete it, and then close the presenter. Exact CPU module/edge accounting,
+sampled native target timing, presenter CPU/GPU timestamps, guest flip rate,
+and Python-boundary acceptance use that same window. The target timer samples
+the first call and every 256th call; the report includes sample confidence and
+an estimated exact-accounting cost. Treat its FPS as instrumented and consult
+that cost before comparing it with an ordinary diagnostics-off or ETW baseline.
+`performance-debug-report.json` marks the profile invalid if the capture window
+crosses a Python runtime callback, live-compilation/frontier/promotion boundary,
+disables native observer dispatch, is incomplete, or records no native module
+calls. Session-wide counters remain available but do not invalidate a clean
+controlled window.
+
+The expanded report keeps all populated target and transition records, not
+only a short "top N" list. It provides four complementary views:
+
+- exact calls, guest steps, exit reasons, entry-to-exit transitions, fan-in,
+  fan-out, and transition probabilities;
+- sampled target and native host-service duration with min/max, standard
+  deviation, 95% margin of error, and time per sampled guest step;
+- exact primary-worker-vblank execution-lane attribution, per-second and
+  per-completed-flip rates, and 16.667 ms frame-budget shares;
+- strongly connected guest cycles, hot branch entropy, concentration ratios,
+  sample-instability warnings, and normalized before/after regressions.
+
+Deterministic samples are not random independent observations. The 95% interval
+quantifies observed sample dispersion; it does not remove phase-alias risk.
+Keep a capture running long enough for high-cost targets to reach high or
+medium confidence, and use ETW when native stack, scheduling, or host-library
+attribution is the actual question. A profiled live run also writes sortable
+`targets.csv`, `transitions.csv`, `cycles.csv`, and `native-services.csv` under
+`reports/local/playability/hot-path-tables/`.
+
 All profiler output is local evidence. ETL files contain system-wide process,
 thread, module, and command-line data; RenderDoc captures contain rendered game
 resources. Keep both under `reports/local/profiling/` and never commit or share

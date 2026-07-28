@@ -28,8 +28,8 @@ Use the smallest diagnostic mode that answers the current question:
 
 For throughput questions, start with an ordinary diagnostics-off warm run,
 then regenerate `performance-debug-report.json`. Enable `--profile-hot-paths`
-only when native-dispatch or callback attribution remains ambiguous; it has
-measurable overhead.
+only when native-dispatch attribution remains ambiguous. Its F10 capture window
+has measurable overhead and is not the baseline FPS measurement.
 
 Normal live diagnostics write:
 
@@ -39,9 +39,9 @@ Normal live diagnostics write:
 - `reports/local/playability/performance-debug-report.json`
 
 Native-run summaries retain the first 8 and latest 56 entries. Edge collection
-is capped at 65,536 slots with at most 1,024 edges serialized, and callback
-timing tracks at most 256 addresses. Reports disclose dropped records instead
-of presenting a truncated trace as exact.
+and serialization retain every populated entry up to the 65,536-slot table
+capacity. Reports disclose table overflow instead of presenting a truncated
+trace as exact.
 
 ## Live runtime and manual capture
 
@@ -107,6 +107,7 @@ Presenter hotkeys during a normal diagnostic run:
 | Input | Function |
 | --- | --- |
 | F9 | Toggle completed-guest-flip FPS in the title |
+| F10 | Start or stop an armed native hot-path capture |
 | F11 | Write a timestamped metrics snapshot |
 | F12 | Capture a BMP and standalone frozen render bundle |
 | Escape | Stop the runtime |
@@ -121,9 +122,29 @@ Hot-path profiling:
 
 ```powershell
 python .\tools\playability\live_test.py `
-  --profile-hot-paths `
-  --skip-host-build
+  --profile-hot-paths
 ```
+
+The run starts with capture paused and renders through the normal native path.
+Navigate to the section you want to measure, press F10 once to start, exercise
+the section for 20-30 seconds, press F10 again to stop, then close with Escape.
+The window title shows `ARMED`, `ACTIVE`, and `COMPLETE`. Guest module targets,
+exact entry-to-exit edges, sampled native target time, presenter CPU stages,
+and GPU timestamps are restricted to the same capture window. Target timing
+samples the first call and every 256th call while call, step, exit-reason, and
+edge counts remain exact. Native host-service targets use the same sampling
+schedule, and guest targets are attributed exactly to primary, cooperative
+worker, or vblank execution. The report includes timing dispersion and a 95%
+margin of error, estimated time and calls per completed flip, strongly
+connected hot cycles, branch probabilities/entropy, frame-budget shares, and
+an estimate of profiling bookkeeping cost. It writes sortable targets,
+transitions, cycles, and native-service CSVs under
+`reports/local/playability/hot-path-tables/`. Capture acceptance uses
+capture-window callbacks and guest flip counters; whole-session values remain
+visible separately. The performance report rejects the sample if the window
+observes Python runtime callbacks, live compilation, frontier interpretation,
+native promotion, disabled native observer dispatch, or an empty/incomplete
+capture.
 
 Lock-step pipeline comparison:
 
@@ -286,12 +307,23 @@ Regenerate the performance report:
 python .\tools\playability\performance_debug_report.py `
   --probe-summary .\reports\local\playability\native-live.json `
   --json-output .\reports\local\playability\performance-debug-report.json `
+  --tables-directory .\reports\local\playability\hot-path-tables `
   --pretty
 ```
 
 The performance report separates guest flip rate, host waits, and active guest
 time; ranks native, cache, callback, and presenter boundaries; and distinguishes
-initial, synchronous incremental, and background frontier compilation.
+initial, synchronous incremental, and background frontier compilation. To rank
+per-target regressions against a retained controlled capture, preserve the old
+report and add:
+
+```powershell
+  --compare-to .\reports\local\playability\baseline-performance-report.json
+```
+
+The comparison normalizes guest modules by estimated native time per second,
+then reports per-flip deltas when both captures contain completed guest flips.
+`comparison.csv` is added to the tables directory.
 
 Replay a frozen render stream:
 
@@ -353,7 +385,7 @@ Direct-probe-only diagnostic switches:
 | `--render-watchpoint-start N` | Skip the first N observed D3D writes |
 | `--render-watchpoint-limit N` | Stop after retaining N D3D writes |
 | `--no-execute-entry` | Decode the entry prefix without executing |
-| `--profile-hot-paths` | Exact module edges and sampled callback timing |
+| `--profile-hot-paths` | F10-windowed exact native edges, sampled target timing, and profiling-cost estimate |
 | `--audit-traffic-meshes` | Native bounded world-mesh submission ring |
 | `--audit-world-matrices` | Broad world-matrix observer |
 | `--audit-world-matrix-address ADDRESS` | Exact matrix-write and shader-input audit |
@@ -374,6 +406,25 @@ XBE sections from raw return/alignment boundaries, retains the complete family,
 and rejects packed numeric runs. Headers and zero-fill tails are never scanned.
 Static data sections are not treated as code by jump-table closure or the IA-32
 coverage audit merely because their XBE section flags include execute.
+
+After the canonical records for an image are materialized, the store keeps a
+versioned, interpreter-tagged prepared snapshot in compact chunks. The snapshot
+is invalidated whenever decoded content changes; it only avoids rebuilding the
+same in-memory lifted IR on later AOT preparations. Inspect
+`decoded_block_store.prepared_snapshot_hits`, `prepared_snapshot_load_us`, and
+`prepared_snapshot_build_us` to distinguish snapshot loading from a rebuild.
+
+The native module manifest keys each partition by semantic lifted content and
+its module-local callback, observer, and fast-path configuration. A change to
+one address-sensitive hook therefore rebuilds only the owning partition. Exact
+generated-source matches can adopt an existing DLL even when conservative
+emitter identity changes. Resumable modules larger than 2,048 instructions are
+emitted as bounded internal functions in the same DLL, limiting Clang optimizer
+latency without adding a runtime compilation or cross-DLL dispatch boundary.
+Use `native_module_cache.warm_hit_count`, `equivalent_source_reuse_count`,
+`ahead_compiled_count`, `source_emit_us`, `compile_wall_us`, and
+`compiler_process_us` to separate cache lookup, emission, wall-clock build time,
+and summed parallel compiler work.
 
 A guest that exits before the first frame is a failure even if its nested
 runner returned zero. Fatal entry or guest-thread execution also makes the

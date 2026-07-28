@@ -30,6 +30,16 @@ void test_transport_layout_and_sequences(TestContext& context) {
     context.expect(kLiveControlMagic[0] == 'B', "control magic");
     context.expect(kLiveControlSchemaVersion == 1u, "schema version");
     context.expect(
+        kLiveHotPathProfileStateOffset == 36u,
+        "hot-path profile control occupies the reserved header word"
+    );
+    context.expect(
+        kLiveHotPathProfileArmed == 1u &&
+            kLiveHotPathProfileActive == 2u &&
+            kLiveHotPathProfileComplete == 3u,
+        "hot-path profile states are stable"
+    );
+    context.expect(
         kLiveManifestPayloadOffset < kLiveControlSize,
         "manifest payload fits control mapping"
     );

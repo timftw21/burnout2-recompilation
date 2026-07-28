@@ -51,6 +51,7 @@ struct PlatformEvent {
 struct PlatformPollResult {
     bool close_requested = false;
     bool toggle_fps_counter = false;
+    bool toggle_hot_path_profile = false;
     bool write_metrics_report = false;
     bool capture_screenshot = false;
     bool controller_state_changed = false;

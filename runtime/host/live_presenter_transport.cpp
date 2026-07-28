@@ -273,6 +273,34 @@ uint64_t LivePresenterTransport::resource_slot_capacity() const {
     return impl_->resource_slot_capacity;
 }
 
+uint32_t LivePresenterTransport::hot_path_profile_state() const {
+    if (!impl_->control_view) {
+        return kLiveHotPathProfileDisabled;
+    }
+    const auto* state = reinterpret_cast<volatile const LONG*>(
+        impl_->control_view + kLiveHotPathProfileStateOffset);
+    return static_cast<uint32_t>(*state);
+}
+
+uint32_t LivePresenterTransport::toggle_hot_path_profile() {
+    if (!impl_->control_view) {
+        return kLiveHotPathProfileDisabled;
+    }
+    auto* state = reinterpret_cast<volatile LONG*>(
+        impl_->control_view + kLiveHotPathProfileStateOffset);
+    const uint32_t current = static_cast<uint32_t>(*state);
+    uint32_t next = current;
+    if (current == kLiveHotPathProfileArmed) {
+        next = kLiveHotPathProfileActive;
+    } else if (current == kLiveHotPathProfileActive) {
+        next = kLiveHotPathProfileComplete;
+    }
+    if (next != current) {
+        InterlockedExchange(state, static_cast<LONG>(next));
+    }
+    return next;
+}
+
 std::optional<std::string> LivePresenterTransport::read_manifest() const {
     if (!impl_->control_view) {
         return std::nullopt;

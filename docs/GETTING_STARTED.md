@@ -123,6 +123,7 @@ guest polling.
 | Input | Function |
 | --- | --- |
 | F9 | Toggle completed-guest-flip FPS in the window title |
+| F10 | Start or stop an armed native hot-path capture |
 | F11 | Write a timestamped metrics snapshot under `reports/local/` |
 | F12 | Capture a BMP and standalone frozen render bundle |
 | Escape | Stop the runtime |

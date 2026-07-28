@@ -1341,7 +1341,8 @@ class FirstFrameSmokeTests(unittest.TestCase):
         metrics_source = Path("runtime/host/frame_metrics.h").read_text(encoding="utf-8")
 
         self.assertIn("key.key == SDLK_F9", host_source)
-        self.assertNotIn("key.key == SDLK_F10", host_source)
+        self.assertIn("key.key == SDLK_F10", host_source)
+        self.assertIn("result.toggle_hot_path_profile = true", host_source)
         self.assertIn("fps_counter_enabled_ = !fps_counter_enabled_", host_source)
         self.assertIn("CompletedFlipFpsSampler", host_source)
         self.assertIn("std::chrono::seconds(1)", metrics_source)

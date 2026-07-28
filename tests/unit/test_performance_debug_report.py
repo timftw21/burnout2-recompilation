@@ -6,8 +6,11 @@ import unittest
 from pathlib import Path
 
 from tools.playability.performance_debug_report import (
+    _compare_hot_path_reports,
+    _summarize_hot_path_analysis,
     _summarize_native_compilation,
     build_performance_debug_report,
+    write_hot_path_tables,
 )
 
 
@@ -210,6 +213,23 @@ class PerformanceDebugReportTests(unittest.TestCase):
         native_performance = {
             "elapsed_us": 2_000_000,
             "hot_path_profiling_enabled": True,
+            "native_observer_dispatch_enabled": True,
+            "profiled_native_module_call_count": 50_000,
+            "profile_capture_window": {
+                "controlled": True,
+                "state": "complete",
+                "started_count": 1,
+                "completed_count": 1,
+                "active_dispatch_count": 10,
+                "captured_module_calls": 50_000,
+                "python_runtime_callbacks": {
+                    "boundary_counts": {
+                        "handler_call_count": 100,
+                        "read_u32_callback_count": 2_000,
+                    },
+                    "evidence_count": 2_100,
+                },
+            },
             "native_dispatch_count": 10,
             "native_module_call_count": 50_000,
             "handler_call_count": 100,
@@ -275,6 +295,9 @@ class PerformanceDebugReportTests(unittest.TestCase):
                     "target": 0x1000,
                     "module_calls": 50_000,
                     "guest_steps": 1_000_000,
+                    "timing_sample_interval": 256,
+                    "timing_sample_count": 200,
+                    "sampled_total_ns": 10_000_000,
                     "module_exit_reasons": {
                         "branch": 5_000,
                         "call": 10_000,
@@ -304,6 +327,11 @@ class PerformanceDebugReportTests(unittest.TestCase):
                         {
                             "thread_index": 0,
                             "status": "live_stop",
+                            "runtime_abi_invocation_count": 0,
+                            "developer_live_compilation_enabled": False,
+                            "native_host_services": {
+                                "normal_runtime": {"enabled": True},
+                            },
                             "native_runs": [
                                 {
                                     "reason": "yield_handler_stop",
@@ -339,6 +367,11 @@ class PerformanceDebugReportTests(unittest.TestCase):
                     {
                         "performance": {
                             "presenter": {
+                                "profile_capture_window": {
+                                    "state": "complete",
+                                    "started_guest_flip_count": 100,
+                                    "completed_guest_flip_count": 160,
+                                },
                                 "reload_count": 60,
                                 "reload_busy_ratio": 0.25,
                                 "reload_stages": {
@@ -359,6 +392,7 @@ class PerformanceDebugReportTests(unittest.TestCase):
                                 },
                                 "frame_pacing": {
                                     "frame_count": 120,
+                                    "elapsed_total_seconds": 2.0,
                                     "missed_target_ratio": 0.20,
                                     "target_frame_us": 16_667,
                                     "elapsed_us": {"p50_us": 16_000, "p95_us": 25_000},
@@ -398,8 +432,17 @@ class PerformanceDebugReportTests(unittest.TestCase):
                 render_debug_report_path=render_path,
             )
 
-        self.assertEqual(report["status"], "optimization_required")
+        self.assertEqual(report["status"], "invalid_profile_boundary")
+        self.assertEqual(
+            report["profiling"]["status"],
+            "python_callbacks_observed",
+        )
         self.assertEqual(report["target"]["target_attainment_ratio"], 0.5)
+        self.assertEqual(
+            report["target"]["guest_flip_rate_source"],
+            "profile_capture_window",
+        )
+        self.assertEqual(report["target"]["guest_flip_sample_count"], 60)
         self.assertEqual(report["throughput"]["host_wait_us"], 500_000)
         self.assertEqual(
             report["boundaries"]["memory_callback_policy_cache_hit_ratio"],
@@ -424,6 +467,12 @@ class PerformanceDebugReportTests(unittest.TestCase):
         self.assertEqual(
             report["sampled_hot_paths"]["native_dispatch_targets"][0]["target_hex"],
             "0x00001000",
+        )
+        self.assertEqual(
+            report["sampled_hot_paths"]["native_dispatch_timing_targets"][0][
+                "estimated_native_time_us"
+            ],
+            2_500_000.0,
         )
         self.assertEqual(
             report["boundaries"]["native_module_exit_profile"]["reason_counts"],
@@ -454,6 +503,7 @@ class PerformanceDebugReportTests(unittest.TestCase):
                 "compiled_module_and_call_us": 1_450_000,
                 "self_ratio": 0.033333,
                 "exclusive_measurement_available": True,
+                "target_measurement_mode": "deterministic_sampled",
             },
         )
         self.assertEqual(
@@ -469,6 +519,7 @@ class PerformanceDebugReportTests(unittest.TestCase):
             "0x002256B8",
         )
         finding_ids = {finding["id"] for finding in report["findings"]}
+        self.assertIn("hot_path_profile_is_not_native_clean", finding_ids)
         self.assertIn("guest_below_60_fps_target", finding_ids)
         self.assertIn("render_write_batches_are_fragmented", finding_ids)
         self.assertIn("presenter_frame_pacing_misses_target", finding_ids)
@@ -480,6 +531,259 @@ class PerformanceDebugReportTests(unittest.TestCase):
         self.assertIn(
             "synchronous_pipeline_compile_exceeds_frame_budget", finding_ids
         )
+
+    def test_report_accepts_native_clean_profile_window(self) -> None:
+        performance = {
+            "elapsed_us": 1_000_000,
+            "hot_path_profiling_enabled": True,
+            "native_observer_dispatch_enabled": True,
+            "native_module_call_count": 100,
+            "profiled_native_module_call_count": 100,
+            "read_u32_callback_count": 50,
+            "profile_capture_window": {
+                "controlled": True,
+                "state": "complete",
+                "started_count": 1,
+                "completed_count": 1,
+                "active_dispatch_count": 4,
+                "captured_module_calls": 100,
+                "python_runtime_callbacks": {
+                    "boundary_counts": {},
+                    "evidence_count": 0,
+                },
+            },
+        }
+        payload = {
+            "format": "b2-recomp-playability-probe",
+            "entry_recovery": {
+                "execution": {
+                    "status": "returned",
+                    "native_bootstrap": {
+                        "python_runtime_abi_invocation_count": 0,
+                    },
+                    "guest_thread_executions": [
+                        {
+                            "thread_index": 0,
+                            "status": "live_stop",
+                            "runtime_abi_invocation_count": 0,
+                            "developer_live_compilation_enabled": False,
+                            "native_host_services": {
+                                "normal_runtime": {
+                                    "enabled": True,
+                                    "scheduler_service_count": 12,
+                                },
+                                "service_call_counts": {"runtime": 8},
+                            },
+                            "native_frontier_interpreter": {
+                                "enabled": True,
+                                "invocation_count": 0,
+                                "steps": 0,
+                            },
+                            "native_frontier_promotion": {"enabled": False},
+                            "native_runs": [
+                                {
+                                    "reason": "live_stop",
+                                    "steps": 1_000,
+                                    "performance": performance,
+                                }
+                            ],
+                            "live_host_bridge": {
+                                "recent_guest_flip_rate_hz": 60.0,
+                                "performance": {"metrics": {}},
+                            },
+                        }
+                    ],
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "probe.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            report = build_performance_debug_report(path)
+
+        self.assertEqual(report["status"], "target_met")
+        self.assertTrue(report["profiling"]["accepted"])
+        self.assertEqual(report["profiling"]["status"], "native_profile_clean")
+        self.assertEqual(
+            report["profiling"]["python_runtime_callbacks"]["scope"],
+            "capture_window",
+        )
+        self.assertEqual(
+            report["profiling"]["python_runtime_callbacks"]["evidence_count"],
+            0,
+        )
+        self.assertEqual(
+            report["profiling"]["python_runtime_callbacks"]["session"][
+                "evidence_count"
+            ],
+            50,
+        )
+        self.assertEqual(
+            report["profiling"]["native_service_activity"][
+                "scheduler_service_count"
+            ],
+            12,
+        )
+
+    def test_hot_path_analysis_finds_cycles_lanes_and_regressions(self) -> None:
+        guest = {
+            "hot_path_profile": {"captured_elapsed_us": 1_000_000},
+            "native_dispatch_targets": [
+                {
+                    "target": 0x1000,
+                    "target_hex": "0x00001000",
+                    "module_calls": 100,
+                    "guest_steps": 1_000,
+                    "estimated_native_time_us": 10_000.0,
+                    "timing_confidence": "high",
+                    "relative_margin_of_error_95": 0.05,
+                    "execution_lanes": {
+                        "primary": {"module_calls": 80, "guest_steps": 800},
+                        "worker": {"module_calls": 20, "guest_steps": 200},
+                        "vblank": {"module_calls": 0, "guest_steps": 0},
+                    },
+                },
+                {
+                    "target": 0x2000,
+                    "target_hex": "0x00002000",
+                    "module_calls": 50,
+                    "guest_steps": 500,
+                    "estimated_native_time_us": 5_000.0,
+                    "timing_confidence": "low",
+                    "relative_margin_of_error_95": 0.75,
+                    "execution_lanes": {
+                        "primary": {"module_calls": 0, "guest_steps": 0},
+                        "worker": {"module_calls": 50, "guest_steps": 500},
+                        "vblank": {"module_calls": 0, "guest_steps": 0},
+                    },
+                },
+            ],
+            "native_host_service_hot_targets": [
+                {
+                    "target": 0x3000,
+                    "target_hex": "0x00003000",
+                    "kind": 13,
+                    "kind_name": "audio",
+                    "value": 4,
+                    "calls": 60,
+                    "estimated_native_time_us": 3_000.0,
+                    "timing_confidence": "high",
+                    "execution_lanes": {
+                        "primary": {"calls": 60},
+                        "worker": {"calls": 0},
+                        "vblank": {"calls": 0},
+                    },
+                }
+            ],
+            "native_module_edge_profile": {
+                "exact": True,
+                "overflow_module_calls": 0,
+                "unclassified_module_calls": 0,
+                "edges": [
+                    {
+                        "entry_target": 0x1000,
+                        "entry_target_hex": "0x00001000",
+                        "exit_target": 0x2000,
+                        "exit_target_hex": "0x00002000",
+                        "module_calls": 100,
+                        "module_exit_reasons": {"call": 100},
+                    },
+                    {
+                        "entry_target": 0x2000,
+                        "entry_target_hex": "0x00002000",
+                        "exit_target": 0x1000,
+                        "exit_target_hex": "0x00001000",
+                        "module_calls": 50,
+                        "module_exit_reasons": {"return": 50},
+                    },
+                ],
+            },
+        }
+        flips = {
+            "source": "profile_capture_window",
+            "sample_count": 60,
+        }
+        analysis = _summarize_hot_path_analysis(guest, flips)
+
+        self.assertEqual(analysis["status"], "complete")
+        self.assertEqual(analysis["cycles"]["count"], 1)
+        self.assertEqual(
+            analysis["cycles"]["hot_cycles"][0]["targets"],
+            ["0x00001000", "0x00002000"],
+        )
+        self.assertEqual(
+            analysis["execution_lanes"]["worker"]["guest_steps"],
+            700,
+        )
+        self.assertEqual(
+            analysis["native_host_services"][0]["calls_per_flip"],
+            1.0,
+        )
+        self.assertEqual(
+            analysis["transitions"]["edges"][0][
+                "source_transition_ratio"
+            ],
+            1.0,
+        )
+        diagnostic_ids = {
+            diagnostic["id"] for diagnostic in analysis["diagnostics"]
+        }
+        self.assertIn("hot_target_timing_needs_more_samples", diagnostic_ids)
+        self.assertIn("hot_target_timing_is_variable", diagnostic_ids)
+
+        current_report = {
+            "hot_path_analysis": analysis,
+            "target": {"guest_flip_rate_hz": 60.0},
+        }
+        baseline_report = json.loads(json.dumps(current_report))
+        baseline_report["hot_path_analysis"]["targets"][0][
+            "estimated_native_us_per_second"
+        ] = 5_000.0
+        baseline_report["hot_path_analysis"]["native_host_services"][0][
+            "estimated_native_us_per_second"
+        ] = 1_000.0
+        comparison = _compare_hot_path_reports(
+            current_report,
+            baseline_report,
+        )
+        self.assertEqual(comparison["status"], "comparable")
+        self.assertEqual(
+            comparison["largest_regressions"][0]["target_hex"],
+            "0x00001000",
+        )
+        self.assertEqual(
+            comparison["native_host_services"]["largest_regressions"][0][
+                "target_hex"
+            ],
+            "0x00003000",
+        )
+
+        report_with_comparison = {
+            **current_report,
+            "comparison": comparison,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            written = write_hot_path_tables(
+                report_with_comparison,
+                Path(temp_dir) / "tables",
+            )
+            self.assertEqual(
+                {path.name for path in written},
+                {
+                    "targets.csv",
+                    "transitions.csv",
+                    "cycles.csv",
+                    "native-services.csv",
+                    "comparison.csv",
+                    "native-service-comparison.csv",
+                },
+            )
+            self.assertIn(
+                "0x00001000",
+                (Path(temp_dir) / "tables" / "targets.csv").read_text(
+                    encoding="utf-8"
+                ),
+            )
 
 
 if __name__ == "__main__":

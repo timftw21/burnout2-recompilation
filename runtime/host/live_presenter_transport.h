@@ -33,6 +33,8 @@ public:
     bool active() const;
     uint64_t command_capacity() const;
     uint64_t resource_slot_capacity() const;
+    uint32_t hot_path_profile_state() const;
+    uint32_t toggle_hot_path_profile();
 
     std::optional<std::string> read_manifest() const;
     std::optional<std::string> read_manifest_file(

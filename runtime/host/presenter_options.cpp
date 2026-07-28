@@ -71,6 +71,7 @@ uint32_t parse_u32(const std::wstring& value, const wchar_t* label) {
         << L"                          [--screenshot PATH] [--hotkey-screenshot-directory PATH]\n"
         << L"                          [--metrics-report-directory PATH]\n"
         << L"  Press F9 to toggle the completed-guest-frame FPS counter.\n"
+        << L"  Press F10 to start or stop an armed native hot-path capture.\n"
         << L"  Press F11 to write a metrics snapshot in the metrics report directory.\n"
         << L"  Press F12 to save the current frame in the hotkey screenshot directory.\n"
         << L"                          [--vertex-shader PATH] [--fragment-shader PATH]\n"

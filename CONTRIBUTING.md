@@ -30,8 +30,8 @@ include evidence and a focused regression.
   one-second samples must not be presented as distributions.
 - Update the focused document that owns the changed behavior. Keep README.md to
   project status, first-run commands, and navigation; update it only when those
-  entry-point facts change. Update Audit.md when completing an audit task or
-  changing a recorded audit claim.
+  entry-point facts change. Keep personal agent instructions and audit work
+  logs outside source control.
 
 ## Required validation
 

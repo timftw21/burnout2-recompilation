@@ -32,8 +32,7 @@ semantics remain active work.
 | Save states | Not implemented |
 
 Detailed rendering coverage, retained measurements, and current limitations
-are maintained in [docs/VALIDATION.md](docs/VALIDATION.md). The architectural
-audit and remediation record is in [Audit.md](Audit.md).
+are maintained in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## Ground rules
 
@@ -133,13 +132,13 @@ acceptance: native code published 53 exact command/resource generations, the
 presenter acknowledged all 53 and applied 52 incremental reloads, and all
 generations passed render validation with zero frontier-interpreter activity
 and runtime compilation disabled. See
-[Audit.md](Audit.md#python-runtime-migration-checkpoint-2026-07-24).
+[docs/VALIDATION.md](docs/VALIDATION.md#native-migration-acceptance).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full ownership model.
 
 ## Validation
 
-The current Python unit suite passes 624 tests; the last retained asset-free
+The current Python unit suite passes 644 tests; the last retained asset-free
 closeout gate passed 548 Python tests and 10 native CTest cases. The validated
 exact-target baseline reaches Lesson One with live Vulkan rendering, SDL3
 frontend audio and input, local storage, streamed track data, and cooperative

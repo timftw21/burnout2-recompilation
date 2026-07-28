@@ -5,6 +5,8 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
+import marshal
+import math
 import os
 import shutil
 import sqlite3
@@ -15,7 +17,6 @@ from concurrent.futures import ThreadPoolExecutor
 from collections import Counter, deque
 from pathlib import Path
 from typing import Any, Callable, Iterable
-
 from tools.recomp.x86_lifter import (
     CpuFlags,
     CpuState,
@@ -30,8 +31,70 @@ NATIVE_MEMORY_CALLBACK_SAMPLE_INTERVAL = 1024
 NATIVE_MEMORY_CALLBACK_HOT_ADDRESS_LIMIT = 32
 NATIVE_MEMORY_CALLBACK_SAMPLE_KEY_LIMIT = 256
 NATIVE_DISPATCH_EDGE_CAPACITY_LIMIT = 1 << 16
-NATIVE_DISPATCH_EDGE_REPORT_LIMIT = 1024
+NATIVE_DISPATCH_EDGE_REPORT_LIMIT = NATIVE_DISPATCH_EDGE_CAPACITY_LIMIT
+NATIVE_TARGET_TIMING_SAMPLE_INTERVAL = 256
+NATIVE_PROFILE_EXECUTION_LANES = ("primary", "worker", "vblank")
+NATIVE_PROFILE_EXECUTION_LANE_COUNT = len(NATIVE_PROFILE_EXECUTION_LANES)
+NATIVE_HOST_SERVICE_KIND_NAMES = {
+    1: "return_constant",
+    2: "performance_counter",
+    3: "system_time",
+    4: "xgetdevices",
+    5: "xinput_open",
+    6: "xinput_capabilities",
+    7: "xinput_state",
+    8: "cold_callback",
+    9: "irql",
+    10: "semaphore",
+    11: "runtime",
+    12: "memory",
+    13: "audio",
+    14: "title",
+    15: "bootstrap",
+}
 NATIVE_EMITTER_SOURCE_FILE = Path(emit_cpp.__code__.co_filename).resolve()
+
+
+def _native_module_content_digest(module: LiftedFunction) -> str:
+    """Hash semantic IR without materializing verbose diagnostic JSON."""
+
+    record = (
+        "b2-recomp-native-module-ir-v1",
+        module.symbol,
+        module.base_address,
+        module.code_size,
+        module.target_platform,
+        module.generated_language,
+        module.renderer_backend,
+        tuple(
+            (
+                instruction.address,
+                instruction.size,
+                instruction.mnemonic,
+                tuple(
+                    (
+                        operand.kind,
+                        operand.size,
+                        operand.reg,
+                        operand.immediate,
+                        operand.base,
+                        operand.index,
+                        operand.scale,
+                        operand.displacement,
+                        operand.absolute,
+                        operand.segment,
+                    )
+                    for operand in instruction.operands
+                ),
+                instruction.bytes_hex,
+                instruction.target,
+                instruction.condition,
+                instruction.ret_stack_adjust,
+            )
+            for instruction in module.instructions
+        ),
+    )
+    return hashlib.sha256(marshal.dumps(record, 4)).hexdigest()
 
 
 def _is_native_dll_artifact(path: Path) -> bool:
@@ -239,6 +302,19 @@ class NativeModuleManifest:
             """,
             (partition_start, partition_end, content_digest),
         ).fetchall()
+        if not rows:
+            # Digest encodings can change without changing emitted C++. Compare
+            # the exact retained source before paying for a full recompile.
+            rows = self._connection.execute(
+                """
+                SELECT source_name, artifact_name
+                FROM native_modules
+                WHERE partition_start=? AND partition_end=?
+                ORDER BY last_used_ns DESC
+                LIMIT 16
+                """,
+                (partition_start, partition_end),
+            ).fetchall()
         for source_name, artifact_name in rows:
             source_path = self._owned_path(source_name)
             artifact_path = self._owned_path(artifact_name)
@@ -515,7 +591,6 @@ def _partition_instructions_for_call_fusion(
             continue
         if member_counts[left_root] + member_counts[right_root] > maximum_count:
             continue
-        # Retain the lowest address chunk as the stable partition anchor.
         if base_modules[left_root][0].address > base_modules[right_root][0].address:
             left_root, right_root = right_root, left_root
         parents[right_root] = left_root
@@ -1039,6 +1114,21 @@ struct B2RNativeHostServiceState {
     uint32_t* dirty_page_count;
     uint32_t dirty_page_capacity;
     bool normal_runtime_enabled;
+    uint32_t profile_capture_control_state;
+    uint64_t profile_capture_started_count;
+    uint64_t profile_capture_completed_count;
+    uint64_t profile_capture_active_dispatch_count;
+    uint64_t profile_capture_started_time_ns;
+    uint64_t profile_capture_elapsed_ns;
+    bool hot_path_profiling_enabled;
+    uint32_t profile_execution_lane;
+    uint64_t* profile_service_call_counts;
+    uint64_t* profile_service_timed_call_counts;
+    uint64_t* profile_service_sample_time_ns;
+    double* profile_service_sample_time_ns_squared;
+    uint64_t* profile_service_sample_min_time_ns;
+    uint64_t* profile_service_sample_max_time_ns;
+    uint64_t* profile_service_lane_call_counts;
     uint64_t scheduler_quantum;
     uint64_t scheduler_last_main_steps;
     uint64_t scheduler_service_count;
@@ -3047,6 +3137,54 @@ static bool b2r_try_native_host_service(
     if (service == nullptr || service->kind == 0u || service->kind >= 16u) {
         return false;
     }
+    const uint32_t service_index = static_cast<uint32_t>(
+        service - state->entries);
+    const bool profile_service = state->hot_path_profiling_enabled &&
+        (state->profile_capture_control_state == 0u ||
+         state->profile_capture_control_state == 2u) &&
+        state->profile_service_call_counts != nullptr &&
+        state->profile_service_timed_call_counts != nullptr &&
+        state->profile_service_sample_time_ns != nullptr &&
+        state->profile_service_sample_time_ns_squared != nullptr &&
+        state->profile_service_sample_min_time_ns != nullptr &&
+        state->profile_service_sample_max_time_ns != nullptr &&
+        state->profile_service_lane_call_counts != nullptr;
+    const uint64_t prior_profile_service_calls = profile_service
+        ? state->profile_service_call_counts[service_index] : 0u;
+    const bool sample_service_time = profile_service &&
+        (prior_profile_service_calls == 0u ||
+         prior_profile_service_calls % 256u == 0u);
+    const uint64_t profile_service_started_ns = sample_service_time
+        ? b2r_dispatch_now_ns() : 0u;
+    auto record_service_profile = [&]() {
+        if (!profile_service) { return; }
+        ++state->profile_service_call_counts[service_index];
+        const uint32_t lane = state->profile_execution_lane < 3u
+            ? state->profile_execution_lane : 0u;
+        ++state->profile_service_lane_call_counts[
+            service_index * 3u + lane];
+        if (!sample_service_time) { return; }
+        const uint64_t elapsed_ns =
+            b2r_dispatch_now_ns() - profile_service_started_ns;
+        const uint64_t prior_sample_count =
+            state->profile_service_timed_call_counts[service_index];
+        ++state->profile_service_timed_call_counts[service_index];
+        state->profile_service_sample_time_ns[service_index] += elapsed_ns;
+        state->profile_service_sample_time_ns_squared[service_index] +=
+            static_cast<double>(elapsed_ns) *
+            static_cast<double>(elapsed_ns);
+        if (prior_sample_count == 0u ||
+            elapsed_ns <
+                state->profile_service_sample_min_time_ns[service_index]) {
+            state->profile_service_sample_min_time_ns[service_index] =
+                elapsed_ns;
+        }
+        if (elapsed_ns >
+                state->profile_service_sample_max_time_ns[service_index]) {
+            state->profile_service_sample_max_time_ns[service_index] =
+                elapsed_ns;
+        }
+    };
     uint8_t* bytes = static_cast<uint8_t*>(context);
     uint32_t& eax = *reinterpret_cast<uint32_t*>(bytes + state->eax_offset);
     uint32_t& esp = *reinterpret_cast<uint32_t*>(bytes + state->esp_offset);
@@ -5381,6 +5519,7 @@ static bool b2r_try_native_host_service(
         ++state->service_call_counts[service->kind];
         ++state->native_call_count;
         ++state->native_observer_count;
+        record_service_profile();
         return true;
     }
     esp += 4u + service->stack_cleanup_bytes;
@@ -5388,6 +5527,7 @@ static bool b2r_try_native_host_service(
     *next_target = return_address;
     ++state->service_call_counts[service->kind];
     ++state->native_call_count;
+    record_service_profile();
     return true;
 }
 
@@ -5414,6 +5554,17 @@ static uint32_t b2r_native_dispatch_context(
     uint64_t* target_exit_reason_counts,
     uint64_t* target_call_counts,
     uint64_t* target_step_counts,
+    uint64_t* target_timed_call_counts,
+    uint64_t* target_sample_time_ns,
+    double* target_sample_time_ns_squared,
+    uint64_t* target_sample_min_time_ns,
+    uint64_t* target_sample_max_time_ns,
+    uint64_t* target_sample_step_counts,
+    uint64_t* target_sample_min_steps,
+    uint64_t* target_sample_max_steps,
+    uint64_t* target_lane_call_counts,
+    uint64_t* target_lane_step_counts,
+    uint32_t execution_lane,
     uint32_t* touched_target_slots,
     uint32_t* touched_target_count,
     uint64_t* edge_keys,
@@ -5423,11 +5574,13 @@ static uint32_t b2r_native_dispatch_context(
     uint32_t* touched_edge_slots,
     uint32_t* touched_edge_count,
     uint64_t* edge_overflow_count,
-    uint64_t* dispatcher_self_time_ns
+    uint64_t* profile_bookkeeping_sample_time_ns,
+    uint64_t* profile_bookkeeping_sample_count
 ) {
-    uint64_t dispatcher_segment_started_ns =
-        profile_targets ? b2r_dispatch_now_ns() : 0u;
     for (;;) {
+        if (native_host_services != nullptr) {
+            native_host_services->profile_execution_lane = execution_lane;
+        }
         if (native_host_services != nullptr &&
             native_host_services->normal_runtime_enabled &&
             native_host_services->live_control_mapping != nullptr &&
@@ -5526,30 +5679,15 @@ static uint32_t b2r_native_dispatch_context(
                 for (;;) {
                     const uint32_t key = host_call_keys[host_slot];
                     if (key == target) {
-                        if (profile_targets) {
-                            *dispatcher_self_time_ns +=
-                                b2r_dispatch_now_ns() - dispatcher_segment_started_ns;
-                        }
                         target = host_call(host_user, target, context);
                         ++*host_call_count;
-                        if (profile_targets) {
-                            dispatcher_segment_started_ns = b2r_dispatch_now_ns();
-                        }
                         if (*yield_requested || *fault_code ||
                             (*step_budget != 0u && *steps >= *step_budget)) {
-                            if (profile_targets) {
-                                *dispatcher_self_time_ns +=
-                                    b2r_dispatch_now_ns() - dispatcher_segment_started_ns;
-                            }
                             return target;
                         }
                         break;
                     }
                     if (key == 0xffffffffu) {
-                        if (profile_targets) {
-                            *dispatcher_self_time_ns +=
-                                b2r_dispatch_now_ns() - dispatcher_segment_started_ns;
-                        }
                         return target;
                     }
                     if (host_probe_count++ >= host_call_mask) {
@@ -5559,18 +5697,19 @@ static uint32_t b2r_native_dispatch_context(
                 }
                 continue;
             }
-            if (profile_targets) {
-                *dispatcher_self_time_ns +=
-                    b2r_dispatch_now_ns() - dispatcher_segment_started_ns;
-            }
             return target;
         }
         const uint32_t entry_target = target;
         uint64_t steps_before = 0u;
+        uint64_t module_started_ns = 0u;
+        bool sample_target_time = false;
         if (profile_targets) {
             steps_before = *steps;
-            *dispatcher_self_time_ns +=
-                b2r_dispatch_now_ns() - dispatcher_segment_started_ns;
+            sample_target_time = target_call_counts[slot] == 0u ||
+                target_call_counts[slot] % 256u == 0u;
+            if (sample_target_time) {
+                module_started_ns = b2r_dispatch_now_ns();
+            }
         }
         if (native_host_services != nullptr &&
             native_host_services->normal_runtime_enabled &&
@@ -5584,7 +5723,9 @@ static uint32_t b2r_native_dispatch_context(
         target = entry(context);
         ++*module_call_count;
         if (profile_targets) {
-            dispatcher_segment_started_ns = b2r_dispatch_now_ns();
+            const uint64_t module_completed_ns = sample_target_time
+                ? b2r_dispatch_now_ns() : 0u;
+            const uint64_t elapsed_steps = *steps - steps_before;
             uint32_t reason = *module_exit_reason;
             if (reason >= B2R_MODULE_EXIT_REASON_COUNT) {
                 reason = 0u;
@@ -5597,7 +5738,38 @@ static uint32_t b2r_native_dispatch_context(
                 touched_target_slots[(*touched_target_count)++] = slot;
             }
             ++target_call_counts[slot];
-            target_step_counts[slot] += *steps - steps_before;
+            target_step_counts[slot] += elapsed_steps;
+            const uint32_t lane = execution_lane < 3u
+                ? execution_lane : 0u;
+            const uint32_t lane_slot = slot * 3u + lane;
+            ++target_lane_call_counts[lane_slot];
+            target_lane_step_counts[lane_slot] += elapsed_steps;
+            if (sample_target_time) {
+                const uint64_t elapsed_ns =
+                    module_completed_ns - module_started_ns;
+                const uint64_t prior_sample_count =
+                    target_timed_call_counts[slot];
+                ++target_timed_call_counts[slot];
+                target_sample_time_ns[slot] += elapsed_ns;
+                target_sample_time_ns_squared[slot] +=
+                    static_cast<double>(elapsed_ns) *
+                    static_cast<double>(elapsed_ns);
+                if (prior_sample_count == 0u ||
+                    elapsed_ns < target_sample_min_time_ns[slot]) {
+                    target_sample_min_time_ns[slot] = elapsed_ns;
+                }
+                if (elapsed_ns > target_sample_max_time_ns[slot]) {
+                    target_sample_max_time_ns[slot] = elapsed_ns;
+                }
+                target_sample_step_counts[slot] += elapsed_steps;
+                if (prior_sample_count == 0u ||
+                    elapsed_steps < target_sample_min_steps[slot]) {
+                    target_sample_min_steps[slot] = elapsed_steps;
+                }
+                if (elapsed_steps > target_sample_max_steps[slot]) {
+                    target_sample_max_steps[slot] = elapsed_steps;
+                }
+            }
             b2r_record_dispatch_edge(
                 entry_target,
                 target,
@@ -5610,13 +5782,14 @@ static uint32_t b2r_native_dispatch_context(
                 touched_edge_count,
                 edge_overflow_count
             );
+            if (sample_target_time) {
+                *profile_bookkeeping_sample_time_ns +=
+                    b2r_dispatch_now_ns() - module_completed_ns;
+                ++*profile_bookkeeping_sample_count;
+            }
         }
         if (*yield_requested || *fault_code ||
             (*step_budget != 0u && *steps >= *step_budget)) {
-            if (profile_targets) {
-                *dispatcher_self_time_ns +=
-                    b2r_dispatch_now_ns() - dispatcher_segment_started_ns;
-            }
             return target;
         }
     }
@@ -5880,6 +6053,42 @@ static uint32_t b2r_service_native_normal_runtime(
 static void b2r_shutdown_native_normal_runtime(
     B2RNativeHostServiceState* state);
 
+static bool b2r_hot_path_profile_active(
+    B2RNativeHostServiceState* state,
+    bool profile_targets
+) {
+    if (!profile_targets) { return false; }
+    if (state == nullptr || !state->normal_runtime_enabled ||
+        state->live_control_mapping == nullptr ||
+        state->live_control_size < 40u) {
+        if (state != nullptr) { ++state->profile_capture_active_dispatch_count; }
+        return true;
+    }
+    uint32_t control_state = 0u;
+    MemoryBarrier();
+    std::memcpy(
+        &control_state, state->live_control_mapping + 36u,
+        sizeof(control_state));
+    if (control_state != state->profile_capture_control_state) {
+        if (control_state == 2u) {
+            ++state->profile_capture_started_count;
+            state->profile_capture_started_time_ns = b2r_dispatch_now_ns();
+        } else if (control_state == 3u &&
+                   state->profile_capture_control_state == 2u) {
+            ++state->profile_capture_completed_count;
+            const uint64_t completed_time_ns = b2r_dispatch_now_ns();
+            if (completed_time_ns >= state->profile_capture_started_time_ns) {
+                state->profile_capture_elapsed_ns +=
+                    completed_time_ns - state->profile_capture_started_time_ns;
+            }
+        }
+        state->profile_capture_control_state = control_state;
+    }
+    const bool active = control_state == 0u || control_state == 2u;
+    if (active) { ++state->profile_capture_active_dispatch_count; }
+    return active;
+}
+
 extern "C" __declspec(dllexport) uint32_t b2r_native_dispatch(
     void* context,
     uint32_t target,
@@ -5903,6 +6112,16 @@ extern "C" __declspec(dllexport) uint32_t b2r_native_dispatch(
     uint64_t* target_exit_reason_counts,
     uint64_t* target_call_counts,
     uint64_t* target_step_counts,
+    uint64_t* target_timed_call_counts,
+    uint64_t* target_sample_time_ns,
+    double* target_sample_time_ns_squared,
+    uint64_t* target_sample_min_time_ns,
+    uint64_t* target_sample_max_time_ns,
+    uint64_t* target_sample_step_counts,
+    uint64_t* target_sample_min_steps,
+    uint64_t* target_sample_max_steps,
+    uint64_t* target_lane_call_counts,
+    uint64_t* target_lane_step_counts,
     uint32_t* touched_target_slots,
     uint32_t* touched_target_count,
     uint64_t* edge_keys,
@@ -5912,7 +6131,8 @@ extern "C" __declspec(dllexport) uint32_t b2r_native_dispatch(
     uint32_t* touched_edge_slots,
     uint32_t* touched_edge_count,
     uint64_t* edge_overflow_count,
-    uint64_t* dispatcher_self_time_ns
+    uint64_t* profile_bookkeeping_sample_time_ns,
+    uint64_t* profile_bookkeeping_sample_count
 ) {
     if (native_host_services == nullptr ||
         !native_host_services->normal_runtime_enabled) {
@@ -5920,12 +6140,21 @@ extern "C" __declspec(dllexport) uint32_t b2r_native_dispatch(
             context, target, keys, entries, mask, host_call_keys,
             host_call_mask, native_host_services, host_call, host_user,
             host_call_count, yield_requested, fault_code, steps, step_budget,
-            module_call_count, module_exit_reason, profile_targets,
+            module_call_count, module_exit_reason,
+            b2r_hot_path_profile_active(native_host_services, profile_targets),
             exit_reason_counts, target_exit_reason_counts,
-            target_call_counts, target_step_counts, touched_target_slots,
+            target_call_counts, target_step_counts,
+            target_timed_call_counts, target_sample_time_ns,
+            target_sample_time_ns_squared,
+            target_sample_min_time_ns, target_sample_max_time_ns,
+            target_sample_step_counts, target_sample_min_steps,
+            target_sample_max_steps, target_lane_call_counts,
+            target_lane_step_counts, 0u,
+            touched_target_slots,
             touched_target_count, edge_keys, edge_reasons, edge_counts,
             edge_mask, touched_edge_slots, touched_edge_count,
-            edge_overflow_count, dispatcher_self_time_ns);
+            edge_overflow_count, profile_bookkeeping_sample_time_ns,
+            profile_bookkeeping_sample_count);
     }
 
     B2RContext* main_context = static_cast<B2RContext*>(context);
@@ -5962,12 +6191,21 @@ extern "C" __declspec(dllexport) uint32_t b2r_native_dispatch(
             host_call_count, &main_context->yield_requested,
             &main_context->fault_code, &main_context->steps,
             &main_context->step_budget, module_call_count,
-            &main_context->module_exit_reason, profile_targets,
+            &main_context->module_exit_reason,
+            b2r_hot_path_profile_active(native_host_services, profile_targets),
             exit_reason_counts, target_exit_reason_counts,
-            target_call_counts, target_step_counts, touched_target_slots,
+            target_call_counts, target_step_counts,
+            target_timed_call_counts, target_sample_time_ns,
+            target_sample_time_ns_squared,
+            target_sample_min_time_ns, target_sample_max_time_ns,
+            target_sample_step_counts, target_sample_min_steps,
+            target_sample_max_steps, target_lane_call_counts,
+            target_lane_step_counts, 0u,
+            touched_target_slots,
             touched_target_count, edge_keys, edge_reasons, edge_counts,
             edge_mask, touched_edge_slots, touched_edge_count,
-            edge_overflow_count, dispatcher_self_time_ns);
+            edge_overflow_count, profile_bookkeeping_sample_time_ns,
+            profile_bookkeeping_sample_count);
         if (main_context->fault_code != 0u) { return target; }
         const bool reached_budget =
             main_context->steps >= main_context->step_budget;
@@ -6015,12 +6253,21 @@ extern "C" __declspec(dllexport) uint32_t b2r_native_dispatch(
                 &vblank_context->yield_requested,
                 &vblank_context->fault_code, &vblank_context->steps,
                 &vblank_context->step_budget, module_call_count,
-                &vblank_context->module_exit_reason, profile_targets,
+                &vblank_context->module_exit_reason,
+                b2r_hot_path_profile_active(native_host_services, profile_targets),
                 exit_reason_counts, target_exit_reason_counts,
-                target_call_counts, target_step_counts, touched_target_slots,
+                target_call_counts, target_step_counts,
+                target_timed_call_counts, target_sample_time_ns,
+                target_sample_time_ns_squared,
+                target_sample_min_time_ns, target_sample_max_time_ns,
+                target_sample_step_counts, target_sample_min_steps,
+                target_sample_max_steps, target_lane_call_counts,
+                target_lane_step_counts, 2u,
+                touched_target_slots,
                 touched_target_count, edge_keys, edge_reasons, edge_counts,
                 edge_mask, touched_edge_slots, touched_edge_count,
-                edge_overflow_count, dispatcher_self_time_ns);
+                edge_overflow_count, profile_bookkeeping_sample_time_ns,
+                profile_bookkeeping_sample_count);
             vblank_context->eip = callback_target;
             ++native_host_services->native_d3d_vblank_callback_run_count;
             native_host_services->native_d3d_vblank_callback_step_count +=
@@ -6106,12 +6353,21 @@ extern "C" __declspec(dllexport) uint32_t b2r_native_dispatch(
                 host_call_count, &worker_context->yield_requested,
                 &worker_context->fault_code, &worker_context->steps,
                 &worker_context->step_budget, module_call_count,
-                &worker_context->module_exit_reason, profile_targets,
+                &worker_context->module_exit_reason,
+                b2r_hot_path_profile_active(native_host_services, profile_targets),
                 exit_reason_counts, target_exit_reason_counts,
-                target_call_counts, target_step_counts, touched_target_slots,
+                target_call_counts, target_step_counts,
+                target_timed_call_counts, target_sample_time_ns,
+                target_sample_time_ns_squared,
+                target_sample_min_time_ns, target_sample_max_time_ns,
+                target_sample_step_counts, target_sample_min_steps,
+                target_sample_max_steps, target_lane_call_counts,
+                target_lane_step_counts, 1u,
+                touched_target_slots,
                 touched_target_count, edge_keys, edge_reasons, edge_counts,
                 edge_mask, touched_edge_slots, touched_edge_count,
-                edge_overflow_count, dispatcher_self_time_ns);
+                edge_overflow_count, profile_bookkeeping_sample_time_ns,
+                profile_bookkeeping_sample_count);
             worker_context->eip = worker_target;
             const uint64_t worker_steps =
                 worker_context->steps - worker_steps_before;
@@ -9609,6 +9865,36 @@ class NativeHostServiceState(ctypes.Structure):
         ("dirty_page_count", ctypes.POINTER(ctypes.c_uint32)),
         ("dirty_page_capacity", ctypes.c_uint32),
         ("normal_runtime_enabled", ctypes.c_bool),
+        ("profile_capture_control_state", ctypes.c_uint32),
+        ("profile_capture_started_count", ctypes.c_uint64),
+        ("profile_capture_completed_count", ctypes.c_uint64),
+        ("profile_capture_active_dispatch_count", ctypes.c_uint64),
+        ("profile_capture_started_time_ns", ctypes.c_uint64),
+        ("profile_capture_elapsed_ns", ctypes.c_uint64),
+        ("hot_path_profiling_enabled", ctypes.c_bool),
+        ("profile_execution_lane", ctypes.c_uint32),
+        ("profile_service_call_counts", ctypes.POINTER(ctypes.c_uint64)),
+        (
+            "profile_service_timed_call_counts",
+            ctypes.POINTER(ctypes.c_uint64),
+        ),
+        ("profile_service_sample_time_ns", ctypes.POINTER(ctypes.c_uint64)),
+        (
+            "profile_service_sample_time_ns_squared",
+            ctypes.POINTER(ctypes.c_double),
+        ),
+        (
+            "profile_service_sample_min_time_ns",
+            ctypes.POINTER(ctypes.c_uint64),
+        ),
+        (
+            "profile_service_sample_max_time_ns",
+            ctypes.POINTER(ctypes.c_uint64),
+        ),
+        (
+            "profile_service_lane_call_counts",
+            ctypes.POINTER(ctypes.c_uint64),
+        ),
         ("scheduler_quantum", ctypes.c_uint64),
         ("scheduler_last_main_steps", ctypes.c_uint64),
         ("scheduler_service_count", ctypes.c_uint64),
@@ -9725,6 +10011,48 @@ class NativeHostServiceState(ctypes.Structure):
         )
         self.entries = self._entry_storage if active_entries else None
         self.entry_count = len(active_entries)
+        profile_capacity = max(1, len(active_entries))
+        self._profile_service_call_counts = (
+            ctypes.c_uint64 * profile_capacity
+        )()
+        self._profile_service_timed_call_counts = (
+            ctypes.c_uint64 * profile_capacity
+        )()
+        self._profile_service_sample_time_ns = (
+            ctypes.c_uint64 * profile_capacity
+        )()
+        self._profile_service_sample_time_ns_squared = (
+            ctypes.c_double * profile_capacity
+        )()
+        self._profile_service_sample_min_time_ns = (
+            ctypes.c_uint64 * profile_capacity
+        )()
+        self._profile_service_sample_max_time_ns = (
+            ctypes.c_uint64 * profile_capacity
+        )()
+        self._profile_service_lane_call_counts = (
+            ctypes.c_uint64
+            * (profile_capacity * NATIVE_PROFILE_EXECUTION_LANE_COUNT)
+        )()
+        self.profile_service_call_counts = self._profile_service_call_counts
+        self.profile_service_timed_call_counts = (
+            self._profile_service_timed_call_counts
+        )
+        self.profile_service_sample_time_ns = (
+            self._profile_service_sample_time_ns
+        )
+        self.profile_service_sample_time_ns_squared = (
+            self._profile_service_sample_time_ns_squared
+        )
+        self.profile_service_sample_min_time_ns = (
+            self._profile_service_sample_min_time_ns
+        )
+        self.profile_service_sample_max_time_ns = (
+            self._profile_service_sample_max_time_ns
+        )
+        self.profile_service_lane_call_counts = (
+            self._profile_service_lane_call_counts
+        )
         self.eax_offset = _Context.eax.offset
         self.ecx_offset = _Context.ecx.offset
         self.esp_offset = _Context.esp.offset
@@ -9740,6 +10068,22 @@ class NativeHostServiceState(ctypes.Structure):
         self._controller_snapshots: list[tuple[int, ...] | None] = [None] * 4
         self._worker_lifecycle: NativeWorkerLifecycleState | None = None
         self._live_transports: tuple[Any, Any, Any] | None = None
+
+    def configure_hot_path_profile(self, enabled: bool) -> None:
+        self.hot_path_profiling_enabled = bool(enabled)
+        self.profile_execution_lane = 0
+        for index in range(int(self.entry_count)):
+            self._profile_service_call_counts[index] = 0
+            self._profile_service_timed_call_counts[index] = 0
+            self._profile_service_sample_time_ns[index] = 0
+            self._profile_service_sample_time_ns_squared[index] = 0.0
+            self._profile_service_sample_min_time_ns[index] = 0
+            self._profile_service_sample_max_time_ns[index] = 0
+            lane_base = index * NATIVE_PROFILE_EXECUTION_LANE_COUNT
+            for lane_index in range(NATIVE_PROFILE_EXECUTION_LANE_COUNT):
+                self._profile_service_lane_call_counts[
+                    lane_base + lane_index
+                ] = 0
 
     def enable_normal_runtime(self, *, scheduler_quantum: int = 100_000) -> None:
         if scheduler_quantum <= 0:
@@ -10164,10 +10508,7 @@ class NativeResumableExecutor:
             "maximum_instructions_per_module": self.MAX_INSTRUCTIONS_PER_MODULE,
             "base_instructions_per_module": self.BASE_INSTRUCTIONS_PER_MODULE,
             "partition_strategy": "weighted-direct-call-and-tail-call-fusion-v1",
-            "observer_addresses": sorted(observer_addresses),
-            "callback_addresses": sorted(callback_addresses),
-            "forwarded_callback_addresses": sorted(forwarded_callback_addresses),
-            "synchronize_eip_for_callbacks": bool(synchronize_eip_for_callbacks),
+            "address_configuration": "partition-local-v1",
         }
         base_configuration_key = hashlib.sha256(
             json.dumps(
@@ -10197,6 +10538,19 @@ class NativeResumableExecutor:
             module_configuration = {
                 "base_configuration_key": base_configuration_key,
                 "native_fast_paths": module_fast_paths,
+                "observer_addresses": sorted(
+                    module_addresses & observer_addresses
+                ),
+                "callback_addresses": sorted(
+                    module_addresses & callback_addresses
+                ),
+                "forwarded_callback_addresses": sorted(
+                    module_addresses & forwarded_callback_addresses
+                ),
+                "synchronize_eip_for_callbacks": bool(
+                    synchronize_eip_for_callbacks
+                    and module_addresses & callback_addresses
+                ),
             }
             if module_kind == "incremental":
                 module_configuration["incremental_module_profile"] = (
@@ -10209,13 +10563,7 @@ class NativeResumableExecutor:
                     separators=(",", ":"),
                 ).encode("utf-8")
             ).hexdigest()
-            content_digest = hashlib.sha256(
-                json.dumps(
-                    module.to_dict(include_bytes=True),
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest()
+            content_digest = _native_module_content_digest(module)
             cached_paths = manifest.resolve(
                 configuration_key=configuration_key,
                 partition_start=partition_start,
@@ -10379,6 +10727,8 @@ class NativeResumableExecutor:
                 {item["configuration_key"] for item in modules}
             ),
             "localized_fast_path_configuration": True,
+            "localized_address_configuration": True,
+            "content_digest_mode": "marshal-ir-v1",
             "known_reachable_partition_count": len(modules),
             "base_partition_count": sum(
                 item["module_kind"] == "base" for item in modules
@@ -10582,6 +10932,16 @@ class NativeResumableExecutor:
             ctypes.POINTER(ctypes.c_uint64),
             ctypes.POINTER(ctypes.c_uint64),
             ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
             ctypes.POINTER(ctypes.c_uint32),
             ctypes.POINTER(ctypes.c_uint32),
             ctypes.POINTER(ctypes.c_uint64),
@@ -10590,6 +10950,7 @@ class NativeResumableExecutor:
             ctypes.c_uint32,
             ctypes.POINTER(ctypes.c_uint32),
             ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint64),
             ctypes.POINTER(ctypes.c_uint64),
             ctypes.POINTER(ctypes.c_uint64),
         ]
@@ -10716,6 +11077,38 @@ class NativeResumableExecutor:
         self._dispatch_addresses_by_slot = [0] * table_capacity
         self._dispatch_target_call_counts = (ctypes.c_uint64 * table_capacity)()
         self._dispatch_target_step_counts = (ctypes.c_uint64 * table_capacity)()
+        self._dispatch_target_timed_call_counts = (
+            ctypes.c_uint64 * table_capacity
+        )()
+        self._dispatch_target_sample_time_ns = (
+            ctypes.c_uint64 * table_capacity
+        )()
+        self._dispatch_target_sample_time_ns_squared = (
+            ctypes.c_double * table_capacity
+        )()
+        self._dispatch_target_sample_min_time_ns = (
+            ctypes.c_uint64 * table_capacity
+        )()
+        self._dispatch_target_sample_max_time_ns = (
+            ctypes.c_uint64 * table_capacity
+        )()
+        self._dispatch_target_sample_step_counts = (
+            ctypes.c_uint64 * table_capacity
+        )()
+        self._dispatch_target_sample_min_steps = (
+            ctypes.c_uint64 * table_capacity
+        )()
+        self._dispatch_target_sample_max_steps = (
+            ctypes.c_uint64 * table_capacity
+        )()
+        self._dispatch_target_lane_call_counts = (
+            ctypes.c_uint64
+            * (table_capacity * NATIVE_PROFILE_EXECUTION_LANE_COUNT)
+        )()
+        self._dispatch_target_lane_step_counts = (
+            ctypes.c_uint64
+            * (table_capacity * NATIVE_PROFILE_EXECUTION_LANE_COUNT)
+        )()
         self._dispatch_exit_reason_counts = (
             ctypes.c_uint64 * _NATIVE_MODULE_EXIT_REASON_COUNT
         )()
@@ -11204,6 +11597,22 @@ class NativeResumableExecutor:
             slot = int(self._dispatch_touched_slots[index])
             self._dispatch_target_call_counts[slot] = 0
             self._dispatch_target_step_counts[slot] = 0
+            self._dispatch_target_timed_call_counts[slot] = 0
+            self._dispatch_target_sample_time_ns[slot] = 0
+            self._dispatch_target_sample_time_ns_squared[slot] = 0.0
+            self._dispatch_target_sample_min_time_ns[slot] = 0
+            self._dispatch_target_sample_max_time_ns[slot] = 0
+            self._dispatch_target_sample_step_counts[slot] = 0
+            self._dispatch_target_sample_min_steps[slot] = 0
+            self._dispatch_target_sample_max_steps[slot] = 0
+            lane_base = slot * NATIVE_PROFILE_EXECUTION_LANE_COUNT
+            for lane_index in range(NATIVE_PROFILE_EXECUTION_LANE_COUNT):
+                self._dispatch_target_lane_call_counts[
+                    lane_base + lane_index
+                ] = 0
+                self._dispatch_target_lane_step_counts[
+                    lane_base + lane_index
+                ] = 0
             reason_base = slot * _NATIVE_MODULE_EXIT_REASON_COUNT
             for reason_index in range(_NATIVE_MODULE_EXIT_REASON_COUNT):
                 self._dispatch_target_exit_reason_counts[
@@ -11277,7 +11686,37 @@ class NativeResumableExecutor:
             "shared_memory_observer_sync_bypass_count": 0,
             "shared_memory_yield_sync_bypass_count": 0,
             "slice_quantum_change_count": 0,
+            "native_observer_dispatch_enabled": bool(
+                dispatch_observers_in_native
+            ),
         }
+        profile_callback_fields = (
+            "handler_call_count",
+            "native_cold_host_call_count",
+            "read_u32_callback_count",
+            "read_u8_callback_count",
+            "write_u32_callback_count",
+            "write_u8_callback_count",
+            "observer_callback_count",
+            "call_handler_yield_count",
+            "slice_yield_count",
+            "predicate_yield_count",
+        )
+        profile_capture_callback_counts = {
+            field: 0 for field in profile_callback_fields
+        }
+
+        def record_profile_callback(field: str) -> None:
+            if not profile_hot_paths or field not in profile_capture_callback_counts:
+                return
+            control_state = (
+                int(native_host_services.profile_capture_control_state)
+                if native_host_services is not None
+                else 0
+            )
+            if control_state in (0, 2):
+                profile_capture_callback_counts[field] += 1
+
         observer_address_counts: Counter[int] = Counter()
         self.current_run_metrics = performance_counts
         performance_timings: dict[str, dict[str, int]] = {}
@@ -11344,6 +11783,8 @@ class NativeResumableExecutor:
             exact: bool,
         ) -> tuple[tuple[str, int], int] | None:
             if (
+                not exact
+                and
                 (callback_count - 1) % NATIVE_MEMORY_CALLBACK_SAMPLE_INTERVAL
                 != 0
             ):
@@ -12033,6 +12474,7 @@ class NativeResumableExecutor:
 
         def read32(_user, address: int) -> int:
             performance_counts["read_u32_callback_count"] += 1
+            record_profile_callback("read_u32_callback_count")
             memory_address = cache_address(address)
             exact_callback = requires_read_memory_callback(address, 4)
             if exact_callback:
@@ -12076,6 +12518,7 @@ class NativeResumableExecutor:
 
         def read8(_user, address: int) -> int:
             performance_counts["read_u8_callback_count"] += 1
+            record_profile_callback("read_u8_callback_count")
             memory_address = cache_address(address)
             exact_callback = requires_read_memory_callback(address, 1)
             if exact_callback:
@@ -12130,6 +12573,7 @@ class NativeResumableExecutor:
 
         def write32(_user, address: int, value: int) -> None:
             performance_counts["write_u32_callback_count"] += 1
+            record_profile_callback("write_u32_callback_count")
             memory_address = cache_address(address)
             sample = begin_memory_callback_sample(
                 "write_u32",
@@ -12176,6 +12620,7 @@ class NativeResumableExecutor:
 
         def write8(_user, address: int, value: int) -> None:
             performance_counts["write_u8_callback_count"] += 1
+            record_profile_callback("write_u8_callback_count")
             memory_address = cache_address(address)
             sample = begin_memory_callback_sample(
                 "write_u8",
@@ -12226,6 +12671,7 @@ class NativeResumableExecutor:
         def observe(_user, context_pointer) -> None:
             started_ns = time.perf_counter_ns()
             performance_counts["observer_callback_count"] += 1
+            record_profile_callback("observer_callback_count")
             observer_address_counts[int(context_pointer.contents.eip)] += 1
             if step_observer is None:
                 record_performance("observer_callback", started_ns)
@@ -12330,6 +12776,7 @@ class NativeResumableExecutor:
                 sync_dirty_pages()
             _state_from_context(state, active_context)
             performance_counts["handler_call_count"] += 1
+            record_profile_callback("handler_call_count")
             handler_started_ns = time.perf_counter_ns()
             try:
                 handler(state, memory, target, trace)
@@ -12361,6 +12808,7 @@ class NativeResumableExecutor:
             try:
                 if invoke_call_handler(int(target), active_context):
                     performance_counts["call_handler_yield_count"] += 1
+                    record_profile_callback("call_handler_yield_count")
                     native_host_call_yield_requested[0] = True
                     active_context.yield_requested = True
                 return int(active_context.eip)
@@ -12382,9 +12830,11 @@ class NativeResumableExecutor:
             try:
                 if invoke_call_handler(int(target), active_context):
                     performance_counts["call_handler_yield_count"] += 1
+                    record_profile_callback("call_handler_yield_count")
                     native_host_call_yield_requested[0] = True
                     active_context.yield_requested = True
                 performance_counts["native_cold_host_call_count"] += 1
+                record_profile_callback("native_cold_host_call_count")
             except BaseException as exc:
                 callback_error.append(exc)
                 active_context.yield_requested = True
@@ -12478,9 +12928,31 @@ class NativeResumableExecutor:
                 or native_host_services.normal_runtime_enabled
             )
         )
+        if native_host_services is not None:
+            native_host_services.configure_hot_path_profile(profile_hot_paths)
         native_host_service_start_count = (
             int(native_host_services.native_call_count)
             if native_host_services_enabled and native_host_services is not None
+            else 0
+        )
+        profile_capture_started_start_count = (
+            int(native_host_services.profile_capture_started_count)
+            if native_host_services is not None
+            else 0
+        )
+        profile_capture_completed_start_count = (
+            int(native_host_services.profile_capture_completed_count)
+            if native_host_services is not None
+            else 0
+        )
+        profile_capture_dispatch_start_count = (
+            int(native_host_services.profile_capture_active_dispatch_count)
+            if native_host_services is not None
+            else 0
+        )
+        profile_capture_elapsed_start_ns = (
+            int(native_host_services.profile_capture_elapsed_ns)
+            if native_host_services is not None
             else 0
         )
         if native_host_services_enabled and native_host_services is not None:
@@ -12727,7 +13199,10 @@ class NativeResumableExecutor:
         )
         module_call_count = ctypes.c_uint64()
         host_call_count = ctypes.c_uint64()
-        dispatch_self_time_ns = ctypes.c_uint64()
+        profile_bookkeeping_sample_time_ns = ctypes.c_uint64()
+        profile_bookkeeping_sample_count = ctypes.c_uint64()
+        profile_bookkeeping_sample_time_ns_total = 0
+        profile_bookkeeping_sample_count_total = 0
         transitions: deque[dict[str, int]] = deque(maxlen=32)
 
         def finish(reason: str, target: int, dispatch_eip: int) -> int:
@@ -12764,6 +13239,183 @@ class NativeResumableExecutor:
                     )
                 }
 
+            def target_timing_profile(
+                slot: int,
+                module_calls: int,
+            ) -> dict[str, Any]:
+                sample_count = int(
+                    self._dispatch_target_timed_call_counts[slot]
+                )
+                sampled_total_ns = int(
+                    self._dispatch_target_sample_time_ns[slot]
+                )
+                sampled_total_ns_squared = float(
+                    self._dispatch_target_sample_time_ns_squared[slot]
+                )
+                sampled_average_ns = (
+                    sampled_total_ns / sample_count if sample_count else 0.0
+                )
+                sample_variance_ns_squared = (
+                    max(
+                        0.0,
+                        (
+                            sampled_total_ns_squared
+                            - sampled_total_ns * sampled_total_ns / sample_count
+                        )
+                        / (sample_count - 1),
+                    )
+                    if sample_count > 1
+                    else None
+                )
+                sample_standard_deviation_ns = (
+                    math.sqrt(sample_variance_ns_squared)
+                    if sample_variance_ns_squared is not None
+                    else None
+                )
+                sample_standard_error_ns = (
+                    sample_standard_deviation_ns / math.sqrt(sample_count)
+                    if sample_standard_deviation_ns is not None
+                    else None
+                )
+                confidence_margin_ns = (
+                    1.96 * sample_standard_error_ns
+                    if sample_standard_error_ns is not None
+                    else None
+                )
+                relative_margin = (
+                    confidence_margin_ns / sampled_average_ns
+                    if confidence_margin_ns is not None and sampled_average_ns
+                    else None
+                )
+                estimated_native_time_us = (
+                    sampled_average_ns * module_calls / 1_000.0
+                )
+                sampled_guest_steps = int(
+                    self._dispatch_target_sample_step_counts[slot]
+                )
+                confidence = (
+                    "high"
+                    if sample_count >= 64
+                    and relative_margin is not None
+                    and relative_margin <= 0.10
+                    else "medium"
+                    if sample_count >= 16
+                    and relative_margin is not None
+                    and relative_margin <= 0.25
+                    else "low"
+                )
+                return {
+                    "timing_mode": "deterministic_sampled",
+                    "timing_sample_interval": (
+                        NATIVE_TARGET_TIMING_SAMPLE_INTERVAL
+                    ),
+                    "timing_sample_count": sample_count,
+                    "timing_sample_coverage_ratio": round(
+                        sample_count / module_calls,
+                        9,
+                    ) if module_calls else None,
+                    "sampled_total_ns": sampled_total_ns,
+                    "sampled_total_ns_squared": round(
+                        sampled_total_ns_squared,
+                        3,
+                    ),
+                    "sampled_average_ns": round(sampled_average_ns, 3),
+                    "sampled_min_ns": int(
+                        self._dispatch_target_sample_min_time_ns[slot]
+                    ) if sample_count else None,
+                    "sampled_max_ns": int(
+                        self._dispatch_target_sample_max_time_ns[slot]
+                    ) if sample_count else None,
+                    "sample_standard_deviation_ns": (
+                        round(sample_standard_deviation_ns, 3)
+                        if sample_standard_deviation_ns is not None
+                        else None
+                    ),
+                    "sample_standard_error_ns": (
+                        round(sample_standard_error_ns, 3)
+                        if sample_standard_error_ns is not None
+                        else None
+                    ),
+                    "relative_margin_of_error_95": (
+                        round(relative_margin, 6)
+                        if relative_margin is not None
+                        else None
+                    ),
+                    "sampled_guest_steps": sampled_guest_steps,
+                    "sampled_min_guest_steps": int(
+                        self._dispatch_target_sample_min_steps[slot]
+                    ) if sample_count else None,
+                    "sampled_max_guest_steps": int(
+                        self._dispatch_target_sample_max_steps[slot]
+                    ) if sample_count else None,
+                    "sampled_ns_per_guest_step": (
+                        round(sampled_total_ns / sampled_guest_steps, 3)
+                        if sampled_guest_steps
+                        else None
+                    ),
+                    "estimated_native_time_us": round(
+                        estimated_native_time_us,
+                        3,
+                    ),
+                    "estimated_native_time_95_interval_us": (
+                        {
+                            "lower": round(
+                                max(0.0, sampled_average_ns - confidence_margin_ns)
+                                * module_calls
+                                / 1_000.0,
+                                3,
+                            ),
+                            "upper": round(
+                                (sampled_average_ns + confidence_margin_ns)
+                                * module_calls
+                                / 1_000.0,
+                                3,
+                            ),
+                        }
+                        if confidence_margin_ns is not None
+                        else None
+                    ),
+                    "timing_confidence": confidence,
+                }
+
+            def target_execution_lanes(slot: int) -> dict[str, Any]:
+                lane_base = slot * NATIVE_PROFILE_EXECUTION_LANE_COUNT
+                lanes = {
+                    lane_name: {
+                        "module_calls": int(
+                            self._dispatch_target_lane_call_counts[
+                                lane_base + lane_index
+                            ]
+                        ),
+                        "guest_steps": int(
+                            self._dispatch_target_lane_step_counts[
+                                lane_base + lane_index
+                            ]
+                        ),
+                    }
+                    for lane_index, lane_name in enumerate(
+                        NATIVE_PROFILE_EXECUTION_LANES
+                    )
+                }
+                total_calls = sum(
+                    lane["module_calls"] for lane in lanes.values()
+                )
+                total_steps = sum(
+                    lane["guest_steps"] for lane in lanes.values()
+                )
+                for lane in lanes.values():
+                    lane["call_ratio"] = (
+                        round(lane["module_calls"] / total_calls, 6)
+                        if total_calls
+                        else None
+                    )
+                    lane["step_ratio"] = (
+                        round(lane["guest_steps"] / total_steps, 6)
+                        if total_steps
+                        else None
+                    )
+                return lanes
+
             dispatch_hot_targets = sorted(
                 (
                     {
@@ -12785,6 +13437,11 @@ class NativeResumableExecutor:
                             ),
                             3,
                         ),
+                        **target_timing_profile(
+                            slot,
+                            int(self._dispatch_target_call_counts[slot]),
+                        ),
+                        "execution_lanes": target_execution_lanes(slot),
                         "module_exit_reasons": target_exit_reason_counts(slot),
                     }
                     for slot in (
@@ -12800,8 +13457,230 @@ class NativeResumableExecutor:
                     item["target"],
                 ),
             )
+            native_host_service_hot_targets: list[dict[str, Any]] = []
+            if profile_hot_paths and native_host_services is not None:
+                for service_index in range(
+                    int(native_host_services.entry_count)
+                ):
+                    module_calls = int(
+                        native_host_services.
+                        _profile_service_call_counts[service_index]
+                    )
+                    if not module_calls:
+                        continue
+                    sample_count = int(
+                        native_host_services.
+                        _profile_service_timed_call_counts[service_index]
+                    )
+                    sampled_total_ns = int(
+                        native_host_services.
+                        _profile_service_sample_time_ns[service_index]
+                    )
+                    sampled_total_ns_squared = float(
+                        native_host_services.
+                        _profile_service_sample_time_ns_squared[
+                            service_index
+                        ]
+                    )
+                    sampled_average_ns = (
+                        sampled_total_ns / sample_count
+                        if sample_count
+                        else 0.0
+                    )
+                    variance = (
+                        max(
+                            0.0,
+                            (
+                                sampled_total_ns_squared
+                                - sampled_total_ns
+                                * sampled_total_ns
+                                / sample_count
+                            )
+                            / (sample_count - 1),
+                        )
+                        if sample_count > 1
+                        else None
+                    )
+                    standard_deviation_ns = (
+                        math.sqrt(variance)
+                        if variance is not None
+                        else None
+                    )
+                    standard_error_ns = (
+                        standard_deviation_ns / math.sqrt(sample_count)
+                        if standard_deviation_ns is not None
+                        else None
+                    )
+                    margin_ns = (
+                        1.96 * standard_error_ns
+                        if standard_error_ns is not None
+                        else None
+                    )
+                    relative_margin = (
+                        margin_ns / sampled_average_ns
+                        if margin_ns is not None and sampled_average_ns
+                        else None
+                    )
+                    service = native_host_services._entry_storage[
+                        service_index
+                    ]
+                    lane_base = (
+                        service_index * NATIVE_PROFILE_EXECUTION_LANE_COUNT
+                    )
+                    lanes = {
+                        lane_name: {
+                            "calls": int(
+                                native_host_services.
+                                _profile_service_lane_call_counts[
+                                    lane_base + lane_index
+                                ]
+                            )
+                        }
+                        for lane_index, lane_name in enumerate(
+                            NATIVE_PROFILE_EXECUTION_LANES
+                        )
+                    }
+                    for lane in lanes.values():
+                        lane["call_ratio"] = round(
+                            lane["calls"] / module_calls,
+                            6,
+                        )
+                    native_host_service_hot_targets.append(
+                        {
+                            "target": int(service.target),
+                            "target_hex": f"0x{int(service.target):08X}",
+                            "kind": int(service.kind),
+                            "kind_name": NATIVE_HOST_SERVICE_KIND_NAMES.get(
+                                int(service.kind),
+                                f"kind_{int(service.kind)}",
+                            ),
+                            "value": int(service.value),
+                            "calls": module_calls,
+                            "timing_mode": "deterministic_sampled",
+                            "timing_sample_interval": (
+                                NATIVE_TARGET_TIMING_SAMPLE_INTERVAL
+                            ),
+                            "timing_sample_count": sample_count,
+                            "sampled_total_ns": sampled_total_ns,
+                            "sampled_total_ns_squared": round(
+                                sampled_total_ns_squared,
+                                3,
+                            ),
+                            "sampled_average_ns": round(
+                                sampled_average_ns,
+                                3,
+                            ),
+                            "sampled_min_ns": int(
+                                native_host_services.
+                                _profile_service_sample_min_time_ns[
+                                    service_index
+                                ]
+                            ) if sample_count else None,
+                            "sampled_max_ns": int(
+                                native_host_services.
+                                _profile_service_sample_max_time_ns[
+                                    service_index
+                                ]
+                            ) if sample_count else None,
+                            "sample_standard_deviation_ns": (
+                                round(standard_deviation_ns, 3)
+                                if standard_deviation_ns is not None
+                                else None
+                            ),
+                            "relative_margin_of_error_95": (
+                                round(relative_margin, 6)
+                                if relative_margin is not None
+                                else None
+                            ),
+                            "estimated_native_time_us": round(
+                                sampled_average_ns * module_calls / 1_000.0,
+                                3,
+                            ),
+                            "timing_confidence": (
+                                "high"
+                                if sample_count >= 64
+                                and relative_margin is not None
+                                and relative_margin <= 0.10
+                                else "medium"
+                                if sample_count >= 16
+                                and relative_margin is not None
+                                and relative_margin <= 0.25
+                                else "low"
+                            ),
+                            "execution_lanes": lanes,
+                        }
+                    )
+            native_host_service_hot_targets.sort(
+                key=lambda item: (
+                    -item["estimated_native_time_us"],
+                    -item["calls"],
+                    item["target"],
+                )
+            )
             performance_counts["native_dispatch_hot_target_count"] = len(
                 dispatch_hot_targets
+            )
+            profiled_module_call_count = sum(
+                item["module_calls"] for item in dispatch_hot_targets
+            )
+            profiled_guest_steps = sum(
+                item["guest_steps"] for item in dispatch_hot_targets
+            )
+            target_timing_sample_count = sum(
+                item["timing_sample_count"] for item in dispatch_hot_targets
+            )
+            execution_lane_totals = {
+                lane_name: {
+                    "module_calls": sum(
+                        item["execution_lanes"][lane_name]["module_calls"]
+                        for item in dispatch_hot_targets
+                    ),
+                    "guest_steps": sum(
+                        item["execution_lanes"][lane_name]["guest_steps"]
+                        for item in dispatch_hot_targets
+                    ),
+                }
+                for lane_name in NATIVE_PROFILE_EXECUTION_LANES
+            }
+            for lane in execution_lane_totals.values():
+                lane["call_ratio"] = (
+                    round(lane["module_calls"] / profiled_module_call_count, 6)
+                    if profiled_module_call_count
+                    else None
+                )
+                lane["step_ratio"] = (
+                    round(lane["guest_steps"] / profiled_guest_steps, 6)
+                    if profiled_guest_steps
+                    else None
+                )
+            estimated_profiled_native_time_us = round(
+                sum(
+                    item["estimated_native_time_us"]
+                    for item in dispatch_hot_targets
+                ),
+                3,
+            )
+            estimated_profiled_native_service_time_us = round(
+                sum(
+                    item["estimated_native_time_us"]
+                    for item in native_host_service_hot_targets
+                ),
+                3,
+            )
+            bookkeeping_sample_average_ns = (
+                profile_bookkeeping_sample_time_ns_total
+                / profile_bookkeeping_sample_count_total
+                if profile_bookkeeping_sample_count_total
+                else 0.0
+            )
+            estimated_profile_bookkeeping_us = round(
+                bookkeeping_sample_average_ns
+                * profiled_module_call_count
+                / 1_000.0,
+                3,
+            )
+            performance_counts["profiled_native_module_call_count"] = (
+                profiled_module_call_count
             )
             dispatch_edges_by_pair: dict[tuple[int, int], dict[str, Any]] = {}
             if profile_hot_paths and self._dispatch_edge_counts is not None:
@@ -12852,9 +13731,165 @@ class NativeResumableExecutor:
             )
             edge_unclassified_module_calls = max(
                 0,
-                int(performance_counts["native_module_call_count"])
-                - edge_profiled_module_calls,
+                profiled_module_call_count - edge_profiled_module_calls,
             )
+            profile_capture_control_state = (
+                int(native_host_services.profile_capture_control_state)
+                if native_host_services is not None
+                else 0
+            )
+            profile_capture_state_names = {
+                0: "full_session",
+                1: "armed",
+                2: "active_until_shutdown",
+                3: "complete",
+            }
+            profile_capture_elapsed_ns = (
+                max(
+                    0,
+                    int(native_host_services.profile_capture_elapsed_ns)
+                    - profile_capture_elapsed_start_ns,
+                )
+                if native_host_services is not None
+                and profile_capture_control_state == 3
+                else elapsed_ns
+                if profile_capture_control_state == 0
+                else 0
+            )
+            profile_capture_callback_evidence_count = sum(
+                profile_capture_callback_counts.values()
+            )
+            profile_capture_window = {
+                "controlled": profile_capture_control_state in (1, 2, 3),
+                "state": profile_capture_state_names.get(
+                    profile_capture_control_state,
+                    "unknown",
+                ),
+                "control_state": profile_capture_control_state,
+                "started_count": (
+                    max(
+                        0,
+                        int(native_host_services.profile_capture_started_count)
+                        - profile_capture_started_start_count,
+                    )
+                    if native_host_services is not None
+                    else 0
+                ),
+                "completed_count": (
+                    max(
+                        0,
+                        int(native_host_services.profile_capture_completed_count)
+                        - profile_capture_completed_start_count,
+                    )
+                    if native_host_services is not None
+                    else 0
+                ),
+                "active_dispatch_count": (
+                    max(
+                        0,
+                        int(
+                            native_host_services.
+                            profile_capture_active_dispatch_count
+                        )
+                        - profile_capture_dispatch_start_count,
+                    )
+                    if native_host_services is not None
+                    else 0
+                ),
+                "captured_module_calls": profiled_module_call_count,
+                "captured_guest_steps": profiled_guest_steps,
+                "captured_elapsed_us": profile_capture_elapsed_ns // 1_000,
+                "guest_steps_per_second": (
+                    round(
+                        profiled_guest_steps
+                        * 1_000_000_000
+                        / profile_capture_elapsed_ns,
+                        3,
+                    )
+                    if profile_capture_elapsed_ns
+                    else None
+                ),
+                "module_calls_per_second": (
+                    round(
+                        profiled_module_call_count
+                        * 1_000_000_000
+                        / profile_capture_elapsed_ns,
+                        3,
+                    )
+                    if profile_capture_elapsed_ns
+                    else None
+                ),
+                "python_runtime_callbacks": {
+                    "boundary_counts": dict(
+                        sorted(profile_capture_callback_counts.items())
+                    ),
+                    "evidence_count": (
+                        profile_capture_callback_evidence_count
+                    ),
+                },
+                "native_target_timing": {
+                    "mode": "deterministic_sampled",
+                    "sample_interval": NATIVE_TARGET_TIMING_SAMPLE_INTERVAL,
+                    "sample_count": target_timing_sample_count,
+                    "confidence_counts": dict(
+                        sorted(
+                            Counter(
+                                item["timing_confidence"]
+                                for item in dispatch_hot_targets
+                            ).items()
+                        )
+                    ),
+                    "estimated_profiled_native_time_us": (
+                        estimated_profiled_native_time_us
+                    ),
+                },
+                "native_host_service_timing": {
+                    "mode": "deterministic_sampled",
+                    "sample_interval": NATIVE_TARGET_TIMING_SAMPLE_INTERVAL,
+                    "service_target_count": len(
+                        native_host_service_hot_targets
+                    ),
+                    "call_count": sum(
+                        item["calls"]
+                        for item in native_host_service_hot_targets
+                    ),
+                    "sample_count": sum(
+                        item["timing_sample_count"]
+                        for item in native_host_service_hot_targets
+                    ),
+                    "estimated_profiled_native_time_us": (
+                        estimated_profiled_native_service_time_us
+                    ),
+                },
+                "execution_lanes": execution_lane_totals,
+                "profiling_overhead_estimate": {
+                    "mode": "sampled_exact_bookkeeping",
+                    "sample_count": (
+                        profile_bookkeeping_sample_count_total
+                    ),
+                    "sampled_total_ns": (
+                        profile_bookkeeping_sample_time_ns_total
+                    ),
+                    "sampled_average_ns": round(
+                        bookkeeping_sample_average_ns,
+                        3,
+                    ),
+                    "estimated_total_us": (
+                        estimated_profile_bookkeeping_us
+                    ),
+                    "estimated_capture_ratio": (
+                        round(
+                            estimated_profile_bookkeeping_us
+                            * 1_000
+                            / profile_capture_elapsed_ns,
+                            6,
+                        )
+                        if profile_capture_elapsed_ns
+                        else None
+                    ),
+                    "exact_call_and_edge_accounting": True,
+                },
+            }
             ordered_callback_samples = sorted(
                 memory_callback_samples.items(),
                 key=lambda item: (
@@ -12954,6 +13989,7 @@ class NativeResumableExecutor:
                         for address, count in observer_address_counts.most_common(32)
                     ],
                     "hot_path_profiling_enabled": bool(profile_hot_paths),
+                    "profile_capture_window": profile_capture_window,
                     "native_module_exit_profile": {
                         "enabled": bool(profile_hot_paths),
                         "reason_counts": module_exit_reason_counts,
@@ -12963,7 +13999,7 @@ class NativeResumableExecutor:
                         "unclassified_module_calls": (
                             max(
                                 0,
-                                int(performance_counts["native_module_call_count"])
+                                profiled_module_call_count
                                 - sum(module_exit_reason_counts.values()),
                             )
                             if profile_hot_paths
@@ -13007,6 +14043,7 @@ class NativeResumableExecutor:
                     },
                     "read_callback_sampling": {
                         "interval": NATIVE_MEMORY_CALLBACK_SAMPLE_INTERVAL,
+                        "exact_interval": 1,
                         "address_capacity": NATIVE_MEMORY_CALLBACK_SAMPLE_KEY_LIMIT,
                         "tracked_address_count": len(memory_callback_samples),
                         "sample_count": sum(
@@ -13033,7 +14070,10 @@ class NativeResumableExecutor:
                         ),
                         "hot_addresses": callback_sample_records(reads_only=False),
                     },
-                    "native_dispatch_hot_targets": dispatch_hot_targets[:32],
+                    "native_dispatch_hot_targets": dispatch_hot_targets,
+                    "native_host_service_hot_targets": (
+                        native_host_service_hot_targets
+                    ),
                     "timings": timing_summary,
                     "hot_paths": [
                         {"name": name, **timing_summary[name]}
@@ -13082,6 +14122,22 @@ class NativeResumableExecutor:
                 slot = int(self._dispatch_touched_slots[index])
                 self._dispatch_target_call_counts[slot] = 0
                 self._dispatch_target_step_counts[slot] = 0
+                self._dispatch_target_timed_call_counts[slot] = 0
+                self._dispatch_target_sample_time_ns[slot] = 0
+                self._dispatch_target_sample_time_ns_squared[slot] = 0.0
+                self._dispatch_target_sample_min_time_ns[slot] = 0
+                self._dispatch_target_sample_max_time_ns[slot] = 0
+                self._dispatch_target_sample_step_counts[slot] = 0
+                self._dispatch_target_sample_min_steps[slot] = 0
+                self._dispatch_target_sample_max_steps[slot] = 0
+                lane_base = slot * NATIVE_PROFILE_EXECUTION_LANE_COUNT
+                for lane_index in range(NATIVE_PROFILE_EXECUTION_LANE_COUNT):
+                    self._dispatch_target_lane_call_counts[
+                        lane_base + lane_index
+                    ] = 0
+                    self._dispatch_target_lane_step_counts[
+                        lane_base + lane_index
+                    ] = 0
                 reason_base = slot * _NATIVE_MODULE_EXIT_REASON_COUNT
                 for reason_index in range(_NATIVE_MODULE_EXIT_REASON_COUNT):
                     self._dispatch_target_exit_reason_counts[
@@ -13108,7 +14164,8 @@ class NativeResumableExecutor:
             dispatch_started_ns = time.perf_counter_ns()
             module_call_count.value = 0
             host_call_count.value = 0
-            dispatch_self_time_ns.value = 0
+            profile_bookkeeping_sample_time_ns.value = 0
+            profile_bookkeeping_sample_count.value = 0
             # Cooperative worker execution temporarily shares this service
             # state with a nested executor. Restore this run's callback and
             # page-cache view before every dispatcher residency.
@@ -13152,6 +14209,16 @@ class NativeResumableExecutor:
                     self._dispatch_target_exit_reason_counts,
                     self._dispatch_target_call_counts,
                     self._dispatch_target_step_counts,
+                    self._dispatch_target_timed_call_counts,
+                    self._dispatch_target_sample_time_ns,
+                    self._dispatch_target_sample_time_ns_squared,
+                    self._dispatch_target_sample_min_time_ns,
+                    self._dispatch_target_sample_max_time_ns,
+                    self._dispatch_target_sample_step_counts,
+                    self._dispatch_target_sample_min_steps,
+                    self._dispatch_target_sample_max_steps,
+                    self._dispatch_target_lane_call_counts,
+                    self._dispatch_target_lane_step_counts,
                     self._dispatch_touched_slots,
                     ctypes.byref(self._dispatch_touched_count),
                     self._dispatch_edge_keys,
@@ -13161,8 +14228,15 @@ class NativeResumableExecutor:
                     self._dispatch_edge_touched_slots,
                     ctypes.byref(self._dispatch_edge_touched_count),
                     ctypes.byref(self._dispatch_edge_overflow_count),
-                    ctypes.byref(dispatch_self_time_ns),
+                    ctypes.byref(profile_bookkeeping_sample_time_ns),
+                    ctypes.byref(profile_bookkeeping_sample_count),
                 )
+            )
+            profile_bookkeeping_sample_time_ns_total += int(
+                profile_bookkeeping_sample_time_ns.value
+            )
+            profile_bookkeeping_sample_count_total += int(
+                profile_bookkeeping_sample_count.value
             )
             performance_counts["native_module_call_count"] += module_call_count.value
             performance_counts["native_host_call_dispatch_count"] += (
@@ -13174,11 +14248,6 @@ class NativeResumableExecutor:
                     - native_host_service_start_count
                 )
             record_performance("native_dispatch", dispatch_started_ns)
-            if profile_hot_paths:
-                record_performance_duration(
-                    "native_dispatch_self",
-                    dispatch_self_time_ns.value,
-                )
             if (
                 native_host_services_enabled
                 and native_host_services is not None
@@ -13390,6 +14459,7 @@ class NativeResumableExecutor:
             handled_requested_yield = False
             if context.yield_requested:
                 performance_counts["predicate_yield_count"] += 1
+                record_profile_callback("predicate_yield_count")
                 sync_yield_boundary()
                 _state_from_context(state, context)
                 context.yield_requested = False
@@ -13409,6 +14479,7 @@ class NativeResumableExecutor:
                         sync_dirty_pages()
                         return finish("yield_handler_stop", int(context.eip), dispatch_eip)
                 performance_counts["slice_yield_count"] += 1
+                record_profile_callback("slice_yield_count")
                 _update_context(context, state)
                 invalidate_changed_pages()
                 handled_requested_yield = True
@@ -13446,6 +14517,7 @@ class NativeResumableExecutor:
                             sync_dirty_pages()
                             return finish("yield_handler_stop", int(context.eip), dispatch_eip)
                     performance_counts["slice_yield_count"] += 1
+                    record_profile_callback("slice_yield_count")
                     _update_context(context, state)
                     invalidate_changed_pages()
                 if max_steps and context.steps >= max_steps:
@@ -13481,6 +14553,7 @@ class NativeResumableExecutor:
                 continue
             if invoke_call_handler(target, context):
                 performance_counts["call_handler_yield_count"] += 1
+                record_profile_callback("call_handler_yield_count")
                 sync_dirty_pages()
                 return finish("call_handler_yield", int(context.eip), dispatch_eip)
 

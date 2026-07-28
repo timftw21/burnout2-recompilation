@@ -17,6 +17,11 @@ LIVE_RESOURCE_SIZE = 64 * 1024 * 1024
 
 _HEADER = struct.Struct("<8sII")
 _STOP_REQUESTED_OFFSET = 32
+_HOT_PATH_PROFILE_STATE_OFFSET = 36
+HOT_PATH_PROFILE_STATE_DISABLED = 0
+HOT_PATH_PROFILE_STATE_ARMED = 1
+HOT_PATH_PROFILE_STATE_ACTIVE = 2
+HOT_PATH_PROFILE_STATE_COMPLETE = 3
 _CONTROLLER_SEQUENCE_OFFSET = 64
 _CONTROLLER_PAYLOAD_OFFSET = 68
 _CONTROLLER_PAYLOAD = struct.Struct("<HBBhhhhBBH")
@@ -175,6 +180,23 @@ class LiveControlTransport:
 
     def stop_requested(self) -> bool:
         return bool(_U32.unpack_from(self._mapping, _STOP_REQUESTED_OFFSET)[0])
+
+    def configure_hot_path_profile(self, enabled: bool) -> None:
+        """Arm a native profiling window without collecting navigation/boot work."""
+        state = (
+            HOT_PATH_PROFILE_STATE_ARMED
+            if enabled
+            else HOT_PATH_PROFILE_STATE_DISABLED
+        )
+        _U32.pack_into(self._mapping, _HOT_PATH_PROFILE_STATE_OFFSET, state)
+
+    def hot_path_profile_state(self) -> int:
+        return int(
+            _U32.unpack_from(
+                self._mapping,
+                _HOT_PATH_PROFILE_STATE_OFFSET,
+            )[0]
+        )
 
     def buffer_address(self) -> int:
         """Return the writable mapping address for the native normal runtime."""
@@ -426,6 +448,7 @@ class LiveControlTransport:
 
         return {
             "stop_requested": int(self.stop_requested()),
+            "hot_path_profile_state": self.hot_path_profile_state(),
             "manifest_sequence": _U32.unpack_from(
                 self._mapping,
                 _MANIFEST_SEQUENCE_OFFSET,

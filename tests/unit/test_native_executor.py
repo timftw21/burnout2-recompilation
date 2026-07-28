@@ -92,6 +92,7 @@ from tools.recomp.native_executor import (
     NATIVE_WORKER_RUNNING,
     NATIVE_DISPATCH_EDGE_CAPACITY_LIMIT,
     NATIVE_DISPATCH_EDGE_REPORT_LIMIT,
+    NATIVE_TARGET_TIMING_SAMPLE_INTERVAL,
     NativeCooperativeSchedulerState,
     NativeExecutorError,
     NativeHostServiceEntry,
@@ -103,6 +104,7 @@ from tools.recomp.native_executor import (
     _partition_instructions_for_call_fusion,
 )
 from tools.recomp.x86_lifter import (
+    CppEmitter,
     CpuState,
     ExecutionTrace,
     LiftedFunction,
@@ -984,8 +986,7 @@ class NativeResumableExecutorTests(unittest.TestCase):
                 "tools.recomp.native_executor._partition_instructions_for_call_fusion",
                 side_effect=lambda instructions, **_limits: (
                     _partition_instructions_by_address(
-                        instructions,
-                        maximum_count=3000,
+                        instructions, maximum_count=3000
                     )
                 ),
             ):
@@ -1049,6 +1050,10 @@ class NativeResumableExecutorTests(unittest.TestCase):
         self.assertEqual(edge_profile["reported_edge_count"], 3)
         self.assertEqual(edge_profile["dropped_edge_count"], 0)
         self.assertEqual(edge_profile["report_limit"], NATIVE_DISPATCH_EDGE_REPORT_LIMIT)
+        self.assertEqual(
+            NATIVE_DISPATCH_EDGE_REPORT_LIMIT,
+            NATIVE_DISPATCH_EDGE_CAPACITY_LIMIT,
+        )
         self.assertLessEqual(
             edge_profile["table_capacity"],
             NATIVE_DISPATCH_EDGE_CAPACITY_LIMIT,
@@ -1071,10 +1076,43 @@ class NativeResumableExecutorTests(unittest.TestCase):
                 (0x1005, 0): {"return": 1},
             },
         )
-        self.assertIn("native_dispatch_self", performance["timings"])
-        self.assertLessEqual(
-            performance["timings"]["native_dispatch_self"]["total_us"],
-            performance["timings"]["native_dispatch"]["total_us"],
+        timing_targets = performance["native_dispatch_hot_targets"]
+        self.assertEqual(
+            {item["target"] for item in timing_targets},
+            {0x1000, 0x1005, 0x11000},
+        )
+        self.assertTrue(
+            all(item["timing_sample_count"] == 1 for item in timing_targets)
+        )
+        self.assertTrue(
+            all(item["sampled_min_ns"] is not None for item in timing_targets)
+        )
+        self.assertTrue(
+            all(item["sampled_max_ns"] is not None for item in timing_targets)
+        )
+        self.assertTrue(
+            all(item["sampled_guest_steps"] > 0 for item in timing_targets)
+        )
+        self.assertTrue(
+            all(
+                item["execution_lanes"]["primary"]["module_calls"] == 1
+                and item["execution_lanes"]["worker"]["module_calls"] == 0
+                and item["execution_lanes"]["vblank"]["module_calls"] == 0
+                for item in timing_targets
+            )
+        )
+        self.assertTrue(
+            all(
+                item["timing_sample_interval"]
+                == NATIVE_TARGET_TIMING_SAMPLE_INTERVAL
+                for item in timing_targets
+            )
+        )
+        self.assertEqual(
+            performance["profile_capture_window"][
+                "profiling_overhead_estimate"
+            ]["sample_count"],
+            3,
         )
 
     def test_cross_module_jump_is_classified_as_branch(self) -> None:
@@ -1101,8 +1139,7 @@ class NativeResumableExecutorTests(unittest.TestCase):
                 "tools.recomp.native_executor._partition_instructions_for_call_fusion",
                 side_effect=lambda instructions, **_limits: (
                     _partition_instructions_by_address(
-                        instructions,
-                        maximum_count=3000,
+                        instructions, maximum_count=3000
                     )
                 ),
             ):
@@ -1390,6 +1427,50 @@ class NativeResumableExecutorTests(unittest.TestCase):
         self.assertEqual(recovered.cache_summary["ahead_compiled_count"], 0)
         self.assertEqual(generated_import_libraries, [])
 
+    def test_split_resumable_switch_preserves_cross_chunk_control_flow(self) -> None:
+        caller = lift_x86_function(
+            bytes.fromhex(
+                "40"          # inc eax
+                "E802000000"  # call 0x1008
+                "40"          # inc eax
+                "C3"          # ret
+            ),
+            base_address=0x1000,
+            symbol="split_resumable_caller",
+        )
+        callee = lift_x86_function(
+            bytes.fromhex("40C3"),  # inc eax; ret
+            base_address=0x1008,
+            symbol="split_resumable_callee",
+        )
+        function = LiftedFunction(
+            symbol="split_resumable_switch",
+            base_address=caller.base_address,
+            code_size=callee.instructions[-1].next_address - caller.base_address,
+            instructions=tuple((*caller.instructions, *callee.instructions)),
+        )
+        state = CpuState.with_registers(esp=0x8000)
+        memory = SparseMemory({0x8000: 0})
+
+        with (
+            tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir,
+            patch.object(CppEmitter, "MAX_RESUMABLE_SWITCH_INSTRUCTIONS", 2),
+        ):
+            executor = NativeResumableExecutor(
+                function,
+                build_dir=Path(temp_dir),
+            )
+            returned_to = executor.run(state, memory, max_steps=12)
+
+        self.assertEqual(returned_to, 0)
+        self.assertEqual(state.get_register("eax"), 3)
+        performance = executor.last_run_summary["performance"]
+        self.assertEqual(performance["native_module_call_count"], 1)
+        self.assertEqual(
+            performance["native_module_exit_profile"]["reason_counts"]["return"],
+            1,
+        )
+
     def test_native_fast_path_change_invalidates_only_owning_partition(self) -> None:
         first = lift_x86_function(
             bytes.fromhex("C3"),
@@ -1440,6 +1521,43 @@ class NativeResumableExecutorTests(unittest.TestCase):
         self.assertEqual(changed.cache_summary["warm_hit_count"], 1)
         self.assertEqual(changed.cache_summary["ahead_compiled_count"], 1)
         self.assertTrue(changed.cache_summary["localized_fast_path_configuration"])
+
+    def test_native_callback_change_invalidates_only_owning_partition(self) -> None:
+        first = lift_x86_function(
+            bytes.fromhex("40C3"),
+            base_address=0x1000,
+            symbol="localized_callback_first",
+        )
+        second = lift_x86_function(
+            bytes.fromhex("48C3"),
+            base_address=0x2000,
+            symbol="localized_callback_second",
+        )
+        function = LiftedFunction(
+            symbol="localized_callback_frame",
+            base_address=first.base_address,
+            code_size=second.instructions[-1].next_address - first.base_address,
+            instructions=tuple((*first.instructions, *second.instructions)),
+        )
+
+        with (
+            tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir,
+            patch.object(NativeResumableExecutor, "BASE_INSTRUCTIONS_PER_MODULE", 2),
+            patch.object(NativeResumableExecutor, "MAX_INSTRUCTIONS_PER_MODULE", 2),
+        ):
+            build_dir = Path(temp_dir)
+            cold = NativeResumableExecutor(function, build_dir=build_dir)
+            changed = NativeResumableExecutor(
+                function,
+                build_dir=build_dir,
+                callback_addresses={first.base_address},
+            )
+
+        self.assertEqual(cold.cache_summary["known_reachable_partition_count"], 2)
+        self.assertEqual(cold.cache_summary["ahead_compiled_count"], 2)
+        self.assertEqual(changed.cache_summary["warm_hit_count"], 1)
+        self.assertEqual(changed.cache_summary["ahead_compiled_count"], 1)
+        self.assertTrue(changed.cache_summary["localized_address_configuration"])
 
     def test_native_module_manifest_prunes_old_artifacts(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
@@ -1671,6 +1789,8 @@ class NativeResumableExecutorTests(unittest.TestCase):
         self.assertGreater(performance["dirty_sync_no_work_count"], 0)
         read_samples = performance["read_callback_sampling"]
         self.assertEqual(read_samples["interval"], 1024)
+        self.assertEqual(read_samples["exact_interval"], 1)
+        self.assertEqual(read_samples["sample_count"], 1)
         self.assertEqual(
             {
                 (sample["kind"], sample["address_hex"])
@@ -2666,6 +2786,7 @@ class NativeResumableExecutorTests(unittest.TestCase):
                 dispatch_host_calls_in_native=True,
                 native_host_services=services,
                 dispatch_observers_in_native=True,
+                profile_hot_paths=True,
                 max_steps=4,
             )
 
@@ -2675,6 +2796,14 @@ class NativeResumableExecutorTests(unittest.TestCase):
             executor.last_run_summary["performance"]["observer_callback_count"],
             0,
         )
+        performance = executor.last_run_summary["performance"]
+        self.assertTrue(performance["hot_path_profiling_enabled"])
+        self.assertTrue(performance["native_observer_dispatch_enabled"])
+        self.assertEqual(
+            performance["profile_capture_window"]["captured_module_calls"],
+            1,
+        )
+        self.assertTrue(performance["native_module_edge_profile"]["exact"])
 
     def test_native_world_draw_observer_records_mesh_submission(self) -> None:
         base_address = 0x000C4A70
@@ -2855,6 +2984,25 @@ class NativeResumableExecutorTests(unittest.TestCase):
         performance = executor.last_run_summary["performance"]
         self.assertEqual(performance["native_host_service_call_count"], 4)
         self.assertEqual(performance["handler_call_count"], 0)
+        service_profiles = {
+            item["target"]: item
+            for item in performance["native_host_service_hot_targets"]
+        }
+        self.assertEqual(
+            set(service_profiles),
+            {raise_target, lower_target, current_target},
+        )
+        self.assertEqual(service_profiles[current_target]["calls"], 2)
+        self.assertEqual(
+            service_profiles[current_target]["execution_lanes"]["primary"][
+                "calls"
+            ],
+            2,
+        )
+        self.assertEqual(
+            service_profiles[current_target]["timing_sample_count"],
+            1,
+        )
 
     def test_native_semaphore_release_and_wait_bypass_python(self) -> None:
         base_address = 0x1000

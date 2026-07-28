@@ -47,6 +47,7 @@ from tools.playability.render_debug_report import (
 )
 from tools.playability.performance_debug_report import (
     build_performance_debug_report,
+    write_hot_path_tables,
     write_performance_debug_report,
 )
 from tools.playability.live_transport import (
@@ -71,7 +72,6 @@ from tools.project_identity import (
     verify_supported_xbe,
     write_json_atomic,
 )
-
 DEFAULT_XBE = REPO_ROOT / "data" / "local" / "extracted" / "burnout_2_poi_usa" / "default.xbe"
 DEFAULT_EXTRACTED_ROOT = DEFAULT_XBE.parent
 DEFAULT_SAVE_DATA_ROOT = REPO_ROOT / "data" / "local" / "save-data"
@@ -872,13 +872,20 @@ def _finalize_performance_diagnostics(args: argparse.Namespace) -> None:
             render_debug_report_path=args.render_debug_report,
         )
         write_performance_debug_report(report, args.performance_debug_report)
+        hot_path_tables = []
+        if getattr(args, "profile_hot_paths", False):
+            hot_path_tables = write_hot_path_tables(
+                report,
+                args.performance_debug_report.with_name("hot-path-tables"),
+            )
         print(
             "Performance diagnostics: "
             f"{report['status']}; report={args.performance_debug_report}"
         )
+        if hot_path_tables:
+            print(f"Hot-path tables: {hot_path_tables[0].parent}")
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         print(f"Could not finalize performance diagnostics: {exc}")
-
 
 def _finalize_diagnostics(args: argparse.Namespace) -> None:
     if getattr(args, "no_diagnostics", False):
@@ -1041,6 +1048,9 @@ def _run_live_test_embedded(args: argparse.Namespace) -> int:
         directory.mkdir(parents=True, exist_ok=True)
 
     live_transport = LiveControlTransport.create(args.live_transport_name)
+    live_transport.configure_hot_path_profile(
+        getattr(args, "profile_hot_paths", False)
+    )
     live_command_transport = LiveCommandTransport.create(args.live_transport_name)
     live_resource_transport = LiveResourceTransport.create(args.live_transport_name)
     guest = _InProcessGuest(build_guest_command(args)[3:])
@@ -1201,6 +1211,9 @@ def _run_live_test_processes(args: argparse.Namespace) -> int:
     process_job: _WindowsKillOnCloseJob | None = None
     presenter_started: float | None = None
     live_transport = LiveControlTransport.create(args.live_transport_name)
+    live_transport.configure_hot_path_profile(
+        getattr(args, "profile_hot_paths", False)
+    )
     live_command_transport = LiveCommandTransport.create(
         args.live_transport_name
     )
@@ -1709,9 +1722,9 @@ def main() -> int:
         "--profile-hot-paths",
         action="store_true",
         help=(
-            "Enable sampled callback latency, exact native module edges, and "
-            "exclusive dispatcher timing; use only for profiling runs because "
-            "it adds diagnostic accounting."
+            "Arm an F10-controlled native capture window for exact module "
+            "edges and exclusive dispatcher timing; use only for profiling "
+            "runs because active capture adds diagnostic accounting."
         ),
     )
     parser.add_argument(

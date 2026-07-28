@@ -42,6 +42,10 @@ logs/
 tmp/
 temp/
 
+# Local agent and audit notes
+/AGENTS.md
+/Audit.md
+
 # Tool caches
 .cache/
 .mypy_cache/

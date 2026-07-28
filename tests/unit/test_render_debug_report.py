@@ -7,7 +7,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tools.playability.render_debug_report import build_render_debug_report
+from tools.playability.render_debug_report import (
+    _events_in_profile_capture_window,
+    _profile_capture_window,
+    build_render_debug_report,
+)
 from tools.playability.render_debug_suite import (
     inspect_render_snapshot_integrity,
     latest_retained_render_manifest,
@@ -16,6 +20,31 @@ from tools.playability.render_debug_suite import (
 
 
 class RenderDebugReportTests(unittest.TestCase):
+    def test_profile_capture_window_selects_only_events_between_f10_edges(
+        self,
+    ) -> None:
+        window = _profile_capture_window(
+            [
+                {"sequence": 2, "state": "armed"},
+                {"sequence": 10, "state": "active", "guest_flip_count": 4},
+                {"sequence": 20, "state": "complete", "guest_flip_count": 9},
+            ]
+        )
+        selected = _events_in_profile_capture_window(
+            [
+                {"sequence": 9, "frame": 1},
+                {"sequence": 11, "frame": 2},
+                {"sequence": 19, "frame": 3},
+                {"sequence": 21, "frame": 4},
+            ],
+            window,
+        )
+
+        self.assertEqual(window["state"], "complete")
+        self.assertEqual(window["started_guest_flip_count"], 4)
+        self.assertEqual(window["completed_guest_flip_count"], 9)
+        self.assertEqual([event["frame"] for event in selected], [2, 3])
+
     def test_reports_defaulted_position_w_completion_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2198,6 +2227,7 @@ class RenderDebugReportTests(unittest.TestCase):
                 "compiled_module_and_call_us": 570_000,
                 "self_ratio": 0.05,
                 "exclusive_measurement_available": True,
+                "target_measurement_mode": "deterministic_sampled",
             },
         )
         finding_ids = {finding["id"] for finding in report["diagnostic_findings"]}

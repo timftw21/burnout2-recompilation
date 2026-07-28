@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from collections import Counter
 from pathlib import Path
@@ -72,6 +73,7 @@ PRESENTER_EVENT_NAMES = (
     "nv2a_gpu_texture_conversion_pipeline_created",
     "nv2a_gpu_texture_conversion_batch",
     "nv2a_gpu_texture_conversion_validation",
+    "hot_path_profile_capture",
     "hotkey_screenshot_queued",
     "hotkey_render_capture_retained",
     "render_stream_continuation_bootstrapped",
@@ -136,7 +138,13 @@ FRAME_BOUNDARY_FIELDS = (
 NATIVE_COUNTER_FIELDS = (
     "native_dispatch_count",
     "native_module_call_count",
+    "profiled_native_module_call_count",
+    "native_host_service_call_count",
+    "native_cold_host_call_count",
     "handler_call_count",
+    "call_handler_yield_count",
+    "slice_yield_count",
+    "predicate_yield_count",
     "read_u32_callback_count",
     "read_u8_callback_count",
     "exact_read_u32_callback_count",
@@ -214,6 +222,82 @@ def _as_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _profile_capture_window(events: list[dict[str, Any]]) -> dict[str, Any]:
+    armed = next(
+        (event for event in events if event.get("state") == "armed"),
+        None,
+    )
+    active = next(
+        (event for event in events if event.get("state") == "active"),
+        None,
+    )
+    active_sequence = (
+        _as_int(active.get("sequence"), -1) if active is not None else None
+    )
+    complete = next(
+        (
+            event
+            for event in events
+            if event.get("state") == "complete"
+            and active_sequence is not None
+            and _as_int(event.get("sequence"), -1) > active_sequence
+        ),
+        None,
+    )
+    complete_sequence = (
+        _as_int(complete.get("sequence"), -1)
+        if complete is not None
+        else None
+    )
+    if active_sequence is not None:
+        state = (
+            "complete"
+            if complete_sequence is not None
+            else "active_until_shutdown"
+        )
+    elif armed is not None:
+        state = "armed"
+    else:
+        state = "full_session"
+    return {
+        "controlled": bool(events),
+        "state": state,
+        "start_sequence": active_sequence,
+        "end_sequence": complete_sequence,
+        "started_guest_flip_count": (
+            _as_int(active.get("guest_flip_count"))
+            if active is not None
+            else None
+        ),
+        "completed_guest_flip_count": (
+            _as_int(complete.get("guest_flip_count"))
+            if complete is not None
+            else None
+        ),
+    }
+
+
+def _events_in_profile_capture_window(
+    events: list[dict[str, Any]],
+    window: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not window.get("controlled"):
+        return events
+    start_sequence = window.get("start_sequence")
+    if start_sequence is None:
+        return []
+    end_sequence = window.get("end_sequence")
+    return [
+        event
+        for event in events
+        if _as_int(event.get("sequence"), -1) > int(start_sequence)
+        and (
+            end_sequence is None
+            or _as_int(event.get("sequence"), -1) < int(end_sequence)
+        )
+    ]
+
+
 def _percentile(values: list[int], fraction: float) -> int | None:
     if not values:
         return None
@@ -245,6 +329,8 @@ def _summarize_presenter_performance(
     compute_pipeline_creations: list[dict[str, Any]],
     texture_conversion_batches: list[dict[str, Any]],
     texture_conversion_validations: list[dict[str, Any]],
+    *,
+    profile_capture_window: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     stages = {
         field: _duration_summary(
@@ -589,6 +675,7 @@ def _summarize_presenter_performance(
         for event in resource_breakdown_reloads
     )
     return {
+        "profile_capture_window": profile_capture_window,
         "reload_count": len(reloads),
         "reload_stages": stages,
         "hot_paths_by_total_time": hot_paths,
@@ -2291,6 +2378,7 @@ def _summarize_guest_performance(execution: dict[str, Any]) -> dict[str, Any]:
     read_callback_sample_intervals: set[int] = set()
     memory_callback_samples: dict[tuple[str, int], dict[str, int]] = {}
     dispatch_targets: dict[int, dict[str, Any]] = {}
+    native_service_targets: dict[tuple[int, int, int], dict[str, Any]] = {}
     dispatch_edges: dict[tuple[int, int], dict[str, Any]] = {}
     module_exit_reason_counts: Counter[str] = Counter()
     module_exit_profiled_run_count = 0
@@ -2301,10 +2389,18 @@ def _summarize_guest_performance(execution: dict[str, Any]) -> dict[str, Any]:
     module_edge_unclassified_call_count = 0
     module_edge_table_capacities: set[int] = set()
     profiled_native_run_count = 0
+    profile_capture_windows: list[dict[str, Any]] = []
+    native_observer_dispatch_values: list[bool] = []
     for run in native_runs:
         performance = run.get("performance") or {}
         if performance.get("hot_path_profiling_enabled"):
             profiled_native_run_count += 1
+            profile_capture_windows.append(
+                performance.get("profile_capture_window") or {}
+            )
+            native_observer_dispatch_values.append(
+                performance.get("native_observer_dispatch_enabled") is True
+            )
         module_exit_profile = performance.get("native_module_exit_profile") or {}
         if module_exit_profile.get("enabled"):
             module_exit_profiled_run_count += 1
@@ -2410,11 +2506,76 @@ def _summarize_guest_performance(execution: dict[str, Any]) -> dict[str, Any]:
                 {
                     "module_calls": 0,
                     "guest_steps": 0,
+                    "timing_sample_count": 0,
+                    "sampled_total_ns": 0,
+                    "sampled_total_ns_squared": 0.0,
+                    "sampled_min_ns": None,
+                    "sampled_max_ns": None,
+                    "sampled_guest_steps": 0,
+                    "sampled_min_guest_steps": None,
+                    "sampled_max_guest_steps": None,
+                    "timing_sample_intervals": set(),
                     "module_exit_reasons": Counter(),
+                    "execution_lanes": {
+                        lane: {"module_calls": 0, "guest_steps": 0}
+                        for lane in ("primary", "worker", "vblank")
+                    },
                 },
             )
             aggregate["module_calls"] += _as_int(target.get("module_calls"))
             aggregate["guest_steps"] += _as_int(target.get("guest_steps"))
+            aggregate["timing_sample_count"] += _as_int(
+                target.get("timing_sample_count")
+            )
+            aggregate["sampled_total_ns"] += _as_int(
+                target.get("sampled_total_ns")
+            )
+            aggregate["sampled_total_ns_squared"] += float(
+                target.get("sampled_total_ns_squared") or 0.0
+            )
+            for field in (
+                "sampled_min_ns",
+                "sampled_min_guest_steps",
+            ):
+                value = target.get(field)
+                if value is not None:
+                    aggregate[field] = (
+                        _as_int(value)
+                        if aggregate[field] is None
+                        else min(aggregate[field], _as_int(value))
+                    )
+            for field in (
+                "sampled_max_ns",
+                "sampled_max_guest_steps",
+            ):
+                value = target.get(field)
+                if value is not None:
+                    aggregate[field] = (
+                        _as_int(value)
+                        if aggregate[field] is None
+                        else max(aggregate[field], _as_int(value))
+                    )
+            aggregate["sampled_guest_steps"] += _as_int(
+                target.get("sampled_guest_steps")
+            )
+            for lane_name, lane in (
+                target.get("execution_lanes") or {}
+            ).items():
+                if lane_name not in aggregate["execution_lanes"]:
+                    continue
+                aggregate["execution_lanes"][lane_name][
+                    "module_calls"
+                ] += _as_int((lane or {}).get("module_calls"))
+                aggregate["execution_lanes"][lane_name][
+                    "guest_steps"
+                ] += _as_int((lane or {}).get("guest_steps"))
+            timing_sample_interval = _as_int(
+                target.get("timing_sample_interval")
+            )
+            if timing_sample_interval:
+                aggregate["timing_sample_intervals"].add(
+                    timing_sample_interval
+                )
             aggregate["module_exit_reasons"].update(
                 {
                     str(name): _as_int(count)
@@ -2423,6 +2584,59 @@ def _summarize_guest_performance(execution: dict[str, Any]) -> dict[str, Any]:
                     ).items()
                 }
             )
+        for service in performance.get(
+            "native_host_service_hot_targets", []
+        ):
+            key = (
+                _as_int(service.get("target")),
+                _as_int(service.get("kind")),
+                _as_int(service.get("value")),
+            )
+            aggregate = native_service_targets.setdefault(
+                key,
+                {
+                    "kind_name": service.get("kind_name"),
+                    "calls": 0,
+                    "timing_sample_count": 0,
+                    "sampled_total_ns": 0,
+                    "sampled_total_ns_squared": 0.0,
+                    "sampled_min_ns": None,
+                    "sampled_max_ns": None,
+                    "execution_lanes": {
+                        lane: {"calls": 0}
+                        for lane in ("primary", "worker", "vblank")
+                    },
+                },
+            )
+            aggregate["calls"] += _as_int(service.get("calls"))
+            aggregate["timing_sample_count"] += _as_int(
+                service.get("timing_sample_count")
+            )
+            aggregate["sampled_total_ns"] += _as_int(
+                service.get("sampled_total_ns")
+            )
+            aggregate["sampled_total_ns_squared"] += float(
+                service.get("sampled_total_ns_squared") or 0.0
+            )
+            for field, operation in (
+                ("sampled_min_ns", min),
+                ("sampled_max_ns", max),
+            ):
+                value = service.get(field)
+                if value is None:
+                    continue
+                aggregate[field] = (
+                    _as_int(value)
+                    if aggregate[field] is None
+                    else operation(aggregate[field], _as_int(value))
+                )
+            for lane_name, lane in (
+                service.get("execution_lanes") or {}
+            ).items():
+                if lane_name in aggregate["execution_lanes"]:
+                    aggregate["execution_lanes"][lane_name][
+                        "calls"
+                    ] += _as_int((lane or {}).get("calls"))
     timing_hot_paths = sorted(
         (
             {
@@ -2441,6 +2655,9 @@ def _summarize_guest_performance(execution: dict[str, Any]) -> dict[str, Any]:
     )
     native_dispatch_self_us = _as_int(
         aggregate_timings.get("native_dispatch_self", {}).get("total_us")
+    )
+    native_dispatch_self_available = (
+        "native_dispatch_self" in aggregate_timings
     )
     dirty_sync_calls = counter_totals["dirty_sync_call_count"]
     memory_read_callbacks = (
@@ -2493,9 +2710,314 @@ def _summarize_guest_performance(execution: dict[str, Any]) -> dict[str, Any]:
             ),
         )
     ]
+    dispatch_target_records = []
+    for address, metric in dispatch_targets.items():
+        timing_sample_count = metric["timing_sample_count"]
+        sampled_total_ns = metric["sampled_total_ns"]
+        sampled_total_ns_squared = metric["sampled_total_ns_squared"]
+        sampled_average_ns = (
+            sampled_total_ns / timing_sample_count
+            if timing_sample_count
+            else 0.0
+        )
+        sample_variance_ns_squared = (
+            max(
+                0.0,
+                (
+                    sampled_total_ns_squared
+                    - sampled_total_ns * sampled_total_ns / timing_sample_count
+                )
+                / (timing_sample_count - 1),
+            )
+            if timing_sample_count > 1
+            else None
+        )
+        sample_standard_deviation_ns = (
+            math.sqrt(sample_variance_ns_squared)
+            if sample_variance_ns_squared is not None
+            else None
+        )
+        sample_standard_error_ns = (
+            sample_standard_deviation_ns / math.sqrt(timing_sample_count)
+            if sample_standard_deviation_ns is not None
+            else None
+        )
+        confidence_margin_ns = (
+            1.96 * sample_standard_error_ns
+            if sample_standard_error_ns is not None
+            else None
+        )
+        relative_margin = (
+            confidence_margin_ns / sampled_average_ns
+            if confidence_margin_ns is not None and sampled_average_ns
+            else None
+        )
+        estimated_native_time_us = (
+            sampled_average_ns * metric["module_calls"] / 1_000.0
+        )
+        timing_confidence = (
+            "high"
+            if timing_sample_count >= 64
+            and relative_margin is not None
+            and relative_margin <= 0.10
+            else "medium"
+            if timing_sample_count >= 16
+            and relative_margin is not None
+            and relative_margin <= 0.25
+            else "low"
+        )
+        execution_lanes = {
+            lane_name: {
+                **lane,
+                "call_ratio": (
+                    round(lane["module_calls"] / metric["module_calls"], 6)
+                    if metric["module_calls"]
+                    else None
+                ),
+                "step_ratio": (
+                    round(lane["guest_steps"] / metric["guest_steps"], 6)
+                    if metric["guest_steps"]
+                    else None
+                ),
+            }
+            for lane_name, lane in metric["execution_lanes"].items()
+        }
+        dispatch_target_records.append(
+            {
+                "target": address,
+                "target_hex": f"0x{address:08X}",
+                "module_calls": metric["module_calls"],
+                "guest_steps": metric["guest_steps"],
+                "module_exit_reasons": dict(
+                    sorted(metric["module_exit_reasons"].items())
+                ),
+                "average_guest_steps_per_call": round(
+                    metric["guest_steps"] / max(1, metric["module_calls"]),
+                    3,
+                ),
+                "timing_mode": "deterministic_sampled",
+                "timing_sample_intervals": sorted(
+                    metric["timing_sample_intervals"]
+                ),
+                "timing_sample_count": timing_sample_count,
+                "timing_sample_coverage_ratio": (
+                    round(timing_sample_count / metric["module_calls"], 9)
+                    if metric["module_calls"]
+                    else None
+                ),
+                "sampled_total_ns": sampled_total_ns,
+                "sampled_total_ns_squared": round(
+                    sampled_total_ns_squared,
+                    3,
+                ),
+                "sampled_average_ns": round(sampled_average_ns, 3),
+                "sampled_min_ns": metric["sampled_min_ns"],
+                "sampled_max_ns": metric["sampled_max_ns"],
+                "sample_standard_deviation_ns": (
+                    round(sample_standard_deviation_ns, 3)
+                    if sample_standard_deviation_ns is not None
+                    else None
+                ),
+                "sample_standard_error_ns": (
+                    round(sample_standard_error_ns, 3)
+                    if sample_standard_error_ns is not None
+                    else None
+                ),
+                "relative_margin_of_error_95": (
+                    round(relative_margin, 6)
+                    if relative_margin is not None
+                    else None
+                ),
+                "sampled_guest_steps": metric["sampled_guest_steps"],
+                "sampled_min_guest_steps": metric[
+                    "sampled_min_guest_steps"
+                ],
+                "sampled_max_guest_steps": metric[
+                    "sampled_max_guest_steps"
+                ],
+                "sampled_ns_per_guest_step": (
+                    round(
+                        sampled_total_ns / metric["sampled_guest_steps"],
+                        3,
+                    )
+                    if metric["sampled_guest_steps"]
+                    else None
+                ),
+                "estimated_native_time_us": round(
+                    estimated_native_time_us,
+                    3,
+                ),
+                "estimated_native_time_95_interval_us": (
+                    {
+                        "lower": round(
+                            max(0.0, sampled_average_ns - confidence_margin_ns)
+                            * metric["module_calls"]
+                            / 1_000.0,
+                            3,
+                        ),
+                        "upper": round(
+                            (sampled_average_ns + confidence_margin_ns)
+                            * metric["module_calls"]
+                            / 1_000.0,
+                            3,
+                        ),
+                    }
+                    if confidence_margin_ns is not None
+                    else None
+                ),
+                "timing_confidence": timing_confidence,
+                "execution_lanes": execution_lanes,
+            }
+        )
+    native_service_target_records: list[dict[str, Any]] = []
+    for (address, kind, value), metric in native_service_targets.items():
+        sample_count = metric["timing_sample_count"]
+        sampled_total_ns = metric["sampled_total_ns"]
+        sampled_average_ns = (
+            sampled_total_ns / sample_count if sample_count else 0.0
+        )
+        variance = (
+            max(
+                0.0,
+                (
+                    metric["sampled_total_ns_squared"]
+                    - sampled_total_ns * sampled_total_ns / sample_count
+                )
+                / (sample_count - 1),
+            )
+            if sample_count > 1
+            else None
+        )
+        standard_deviation_ns = (
+            math.sqrt(variance) if variance is not None else None
+        )
+        standard_error_ns = (
+            standard_deviation_ns / math.sqrt(sample_count)
+            if standard_deviation_ns is not None
+            else None
+        )
+        margin_ns = (
+            1.96 * standard_error_ns
+            if standard_error_ns is not None
+            else None
+        )
+        relative_margin = (
+            margin_ns / sampled_average_ns
+            if margin_ns is not None and sampled_average_ns
+            else None
+        )
+        lanes = {
+            lane_name: {
+                **lane,
+                "call_ratio": (
+                    round(lane["calls"] / metric["calls"], 6)
+                    if metric["calls"]
+                    else None
+                ),
+            }
+            for lane_name, lane in metric["execution_lanes"].items()
+        }
+        native_service_target_records.append(
+            {
+                "target": address,
+                "target_hex": f"0x{address:08X}",
+                "kind": kind,
+                "kind_name": metric["kind_name"],
+                "value": value,
+                "calls": metric["calls"],
+                "timing_mode": "deterministic_sampled",
+                "timing_sample_interval": 256,
+                "timing_sample_count": sample_count,
+                "sampled_total_ns": sampled_total_ns,
+                "sampled_total_ns_squared": round(
+                    metric["sampled_total_ns_squared"], 3
+                ),
+                "sampled_average_ns": round(sampled_average_ns, 3),
+                "sampled_min_ns": metric["sampled_min_ns"],
+                "sampled_max_ns": metric["sampled_max_ns"],
+                "sample_standard_deviation_ns": (
+                    round(standard_deviation_ns, 3)
+                    if standard_deviation_ns is not None
+                    else None
+                ),
+                "relative_margin_of_error_95": (
+                    round(relative_margin, 6)
+                    if relative_margin is not None
+                    else None
+                ),
+                "estimated_native_time_us": round(
+                    sampled_average_ns * metric["calls"] / 1_000.0,
+                    3,
+                ),
+                "timing_confidence": (
+                    "high"
+                    if sample_count >= 64
+                    and relative_margin is not None
+                    and relative_margin <= 0.10
+                    else "medium"
+                    if sample_count >= 16
+                    and relative_margin is not None
+                    and relative_margin <= 0.25
+                    else "low"
+                ),
+                "execution_lanes": lanes,
+            }
+        )
+    native_service_target_records.sort(
+        key=lambda item: (
+            -item["estimated_native_time_us"],
+            -item["calls"],
+            item["target"],
+        )
+    )
+    dispatch_targets_by_guest_steps = sorted(
+        dispatch_target_records,
+        key=lambda item: (
+            -item["guest_steps"],
+            -item["module_calls"],
+            item["target"],
+        ),
+    )
+    dispatch_targets_by_native_time = sorted(
+        dispatch_target_records,
+        key=lambda item: (
+            -item["estimated_native_time_us"],
+            -item["guest_steps"],
+            item["target"],
+        ),
+    )
     return {
         "native_run_count": len(native_runs),
         "profiled_native_run_count": profiled_native_run_count,
+        "hot_path_profile": {
+            "enabled": profiled_native_run_count > 0,
+            "profiled_native_run_count": profiled_native_run_count,
+            "native_observer_dispatch_all": (
+                bool(native_observer_dispatch_values)
+                and all(native_observer_dispatch_values)
+            ),
+            "captured_module_calls": sum(
+                _as_int(window.get("captured_module_calls"))
+                for window in profile_capture_windows
+            ),
+            "captured_guest_steps": sum(
+                _as_int(window.get("captured_guest_steps"))
+                for window in profile_capture_windows
+            ),
+            "captured_elapsed_us": sum(
+                _as_int(window.get("captured_elapsed_us"))
+                for window in profile_capture_windows
+            ),
+            "estimated_profile_bookkeeping_us": sum(
+                _as_int(
+                    (
+                        window.get("profiling_overhead_estimate") or {}
+                    ).get("estimated_total_us")
+                )
+                for window in profile_capture_windows
+            ),
+            "capture_windows": profile_capture_windows,
+        },
         "native_module_exit_profile": {
             "enabled": module_exit_profiled_run_count > 0,
             "profiled_native_run_count": module_exit_profiled_run_count,
@@ -2535,10 +3057,18 @@ def _summarize_guest_performance(execution: dict[str, Any]) -> dict[str, Any]:
         "timing_hot_paths": timing_hot_paths,
         "native_dispatch_timing": {
             "inclusive_us": native_dispatch_inclusive_us,
-            "self_us": native_dispatch_self_us,
-            "compiled_module_and_call_us": max(
-                0,
-                native_dispatch_inclusive_us - native_dispatch_self_us,
+            "self_us": (
+                native_dispatch_self_us
+                if native_dispatch_self_available
+                else None
+            ),
+            "compiled_module_and_call_us": (
+                max(
+                    0,
+                    native_dispatch_inclusive_us - native_dispatch_self_us,
+                )
+                if native_dispatch_self_available
+                else None
             ),
             "self_ratio": (
                 round(
@@ -2546,12 +3076,11 @@ def _summarize_guest_performance(execution: dict[str, Any]) -> dict[str, Any]:
                     6,
                 )
                 if native_dispatch_inclusive_us
-                and "native_dispatch_self" in aggregate_timings
+                and native_dispatch_self_available
                 else None
             ),
-            "exclusive_measurement_available": (
-                "native_dispatch_self" in aggregate_timings
-            ),
+            "exclusive_measurement_available": native_dispatch_self_available,
+            "target_measurement_mode": "deterministic_sampled",
         },
         "dirty_sync_no_work_ratio": (
             round(counter_totals["dirty_sync_no_work_count"] / dirty_sync_calls, 6)
@@ -2649,29 +3178,12 @@ def _summarize_guest_performance(execution: dict[str, Any]) -> dict[str, Any]:
                 )[:32]
             ],
         },
-        "native_dispatch_hot_targets": [
-            {
-                "target": address,
-                "target_hex": f"0x{address:08X}",
-                "module_calls": metric["module_calls"],
-                "guest_steps": metric["guest_steps"],
-                "module_exit_reasons": dict(
-                    sorted(metric["module_exit_reasons"].items())
-                ),
-                "average_guest_steps_per_call": round(
-                    metric["guest_steps"] / max(1, metric["module_calls"]),
-                    3,
-                ),
-            }
-            for address, metric in sorted(
-                dispatch_targets.items(),
-                key=lambda item: (
-                    -item[1]["guest_steps"],
-                    -item[1]["module_calls"],
-                    item[0],
-                ),
-            )[:64]
-        ],
+        "native_dispatch_targets": dispatch_targets_by_guest_steps,
+        "native_dispatch_hot_targets": dispatch_targets_by_guest_steps[:128],
+        "native_dispatch_timing_targets": (
+            dispatch_targets_by_native_time[:128]
+        ),
+        "native_host_service_hot_targets": native_service_target_records,
         "handler_hot_paths": handler_hot_paths,
         "live_host_bridge": live_bridges[-1]["performance"] if live_bridges else None,
         "live_host_bridge_summary": latest_live_bridge_summary,
@@ -3767,16 +4279,27 @@ def build_render_debug_report(
             }
         )
     guest_performance = _summarize_guest_performance(execution)
+    profile_capture_window = _profile_capture_window(
+        retained_events["hot_path_profile_capture"]
+    )
+
+    def performance_events(name: str) -> list[dict[str, Any]]:
+        return _events_in_profile_capture_window(
+            retained_events[name],
+            profile_capture_window,
+        )
+
     presenter_performance = _summarize_presenter_performance(
-        retained_events["live_render_stream_reloaded"],
-        retained_events["frame_presented"],
-        retained_events["live_render_stream_reload_skipped"],
-        retained_events["nv2a_raw_vertex_buffers_refreshed"],
-        retained_events["nv2a_texture_resources_refreshed"],
-        retained_events["nv2a_graphics_pipeline_created"],
-        retained_events["nv2a_gpu_texture_conversion_pipeline_created"],
-        retained_events["nv2a_gpu_texture_conversion_batch"],
-        retained_events["nv2a_gpu_texture_conversion_validation"],
+        performance_events("live_render_stream_reloaded"),
+        performance_events("frame_presented"),
+        performance_events("live_render_stream_reload_skipped"),
+        performance_events("nv2a_raw_vertex_buffers_refreshed"),
+        performance_events("nv2a_texture_resources_refreshed"),
+        performance_events("nv2a_graphics_pipeline_created"),
+        performance_events("nv2a_gpu_texture_conversion_pipeline_created"),
+        performance_events("nv2a_gpu_texture_conversion_batch"),
+        performance_events("nv2a_gpu_texture_conversion_validation"),
+        profile_capture_window=profile_capture_window,
     )
     composition_coverage = _summarize_composition_coverage(
         submitted_geometry_by_flip=guest_geometry_by_flip,

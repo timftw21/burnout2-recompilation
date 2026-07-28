@@ -219,6 +219,8 @@ from tools.playability.playability_probe import (
     TITLE_VERTEX_APPEND_STRIDE,
     TITLE_GPU_PFIFO_CACHE1_STATUS_ADDRESS,
     TITLE_EXACT_MEMORY_CALLBACK_ADDRESSES,
+    TITLE_EXACT_MEMORY_READ_CALLBACK_ADDRESSES,
+    TITLE_EXACT_MEMORY_WRITE_CALLBACK_ADDRESSES,
     TITLE_GPU_PFIFO_IDLE_BIT,
     TITLE_GPU_PFIFO_INTERRUPT_STATUS_ADDRESS,
     TITLE_GPU_PFIFO_RUNOUT_STATUS_ADDRESS,
@@ -2113,6 +2115,14 @@ class PlayabilityProbeTests(unittest.TestCase):
     def test_xbe_memory_declares_exact_callback_dependencies(self) -> None:
         memory = XbeBackedSparseMemory(load_xbe_bytes(_synthetic_xbe()[0]))
 
+        self.assertNotIn(
+            TITLE_GPU_COMMAND_KICK_ADDRESS,
+            TITLE_EXACT_MEMORY_READ_CALLBACK_ADDRESSES,
+        )
+        self.assertIn(
+            TITLE_GPU_COMMAND_KICK_ADDRESS,
+            TITLE_EXACT_MEMORY_WRITE_CALLBACK_ADDRESSES,
+        )
         self.assertEqual(
             memory.native_memory_callback_dependency_addresses(
                 TITLE_D3D_CONTEXT_GET_POINTER_ADDRESS,
@@ -5623,6 +5633,15 @@ class PlayabilityProbeTests(unittest.TestCase):
             "title_text_draw_fast_path: TitleTextDrawFastPath,",
             source,
         )
+
+    def test_hot_path_profiling_keeps_native_observer_dispatch_enabled(
+        self,
+    ) -> None:
+        source = Path("tools/playability/playability_probe.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertNotIn("and not profile_hot_paths", source)
 
     def test_title_d3d_primitive_draw_fast_path_preserves_call_contract(self) -> None:
         base_address = 0x2500
@@ -9213,6 +9232,69 @@ class PlayabilityProbeTests(unittest.TestCase):
         self.assertEqual(backend, "sqlite-zlib-json-blob")
         self.assertEqual(audit_record_count, 1)
         self.assertEqual(audit_seeds, {0x1000})
+
+    def test_decoded_block_store_reuses_prepared_image_snapshot(self) -> None:
+        functions = [
+            lift_x86_function(
+                bytes.fromhex("40C3"),
+                base_address=address,
+                symbol=f"prepared_block_{address:08X}",
+            )
+            for address in (0x1000, 0x2000)
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "decoded-blocks.sqlite3"
+            cache = DecodedBlockStore(path)
+            cache.prepare_for_image(object(), image_sha256="ABCDEF")
+            for function in functions:
+                cache.put(
+                    cache.key(
+                        image_sha256="ABCDEF",
+                        target=function.base_address,
+                        entry_bytes=512,
+                        max_block_instructions=224,
+                    ),
+                    function,
+                )
+            first_load = cache.lifted_functions()
+            first_summary = cache.summary()
+            cache.close()
+
+            warm_cache = DecodedBlockStore(path)
+            warm_cache.prepare_for_image(object(), image_sha256="ABCDEF")
+            warm_load = warm_cache.lifted_functions()
+            warm_summary = warm_cache.summary()
+            additional = lift_x86_function(
+                bytes.fromhex("48C3"),
+                base_address=0x3000,
+                symbol="prepared_block_00003000",
+            )
+            warm_cache.put(
+                warm_cache.key(
+                    image_sha256="ABCDEF",
+                    target=additional.base_address,
+                    entry_bytes=512,
+                    max_block_instructions=224,
+                ),
+                additional,
+            )
+            refreshed_load = warm_cache.lifted_functions()
+            refreshed_summary = warm_cache.summary()
+            warm_cache.close()
+
+        self.assertEqual(
+            [function.to_dict(include_bytes=True) for function in first_load],
+            [function.to_dict(include_bytes=True) for function in warm_load],
+        )
+        self.assertEqual(first_summary["prepared_snapshot_builds"], 1)
+        self.assertEqual(first_summary["prepared_snapshot_hits"], 0)
+        self.assertEqual(warm_summary["prepared_snapshot_builds"], 0)
+        self.assertEqual(warm_summary["prepared_snapshot_hits"], 1)
+        self.assertGreater(warm_summary["prepared_snapshot_payload_bytes"], 0)
+        self.assertEqual(len(refreshed_load), 3)
+        self.assertEqual(refreshed_summary["prepared_snapshot_misses"], 1)
+        self.assertEqual(refreshed_summary["prepared_snapshot_builds"], 1)
+        self.assertEqual(refreshed_summary["prepared_snapshot_chunk_count"], 1)
 
     def test_decoded_block_store_refreshes_legacy_decoder_semantics(self) -> None:
         legacy_function = LiftedFunction(

@@ -15,6 +15,15 @@ class LiveControlTransportTests(unittest.TestCase):
         with live_transport.LiveControlTransport.create(name) as owner:
             with live_transport.LiveControlTransport.open(name) as guest:
                 self.assertFalse(guest.stop_requested())
+                self.assertEqual(
+                    guest.hot_path_profile_state(),
+                    live_transport.HOT_PATH_PROFILE_STATE_DISABLED,
+                )
+                owner.configure_hot_path_profile(True)
+                self.assertEqual(
+                    guest.hot_path_profile_state(),
+                    live_transport.HOT_PATH_PROFILE_STATE_ARMED,
+                )
                 owner.request_stop()
                 self.assertTrue(guest.stop_requested())
 
@@ -64,6 +73,10 @@ class LiveControlTransportTests(unittest.TestCase):
                 ):
                     struct.pack_into("<I", owner._mapping, offset, value)
                 diagnostic = guest.diagnostic_state()
+                self.assertEqual(
+                    diagnostic["hot_path_profile_state"],
+                    live_transport.HOT_PATH_PROFILE_STATE_ARMED,
+                )
                 self.assertEqual(diagnostic["audio_buffer_play_stage"], 3)
                 self.assertEqual(diagnostic["audio_last_buffer"], 0x5000)
                 self.assertEqual(diagnostic["audio_last_data"], 0x6000)

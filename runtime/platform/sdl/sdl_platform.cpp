@@ -326,6 +326,8 @@ struct SdlPlatform::Impl {
         }
         if (key.down && !key.repeat && key.key == SDLK_F9) {
             result.toggle_fps_counter = true;
+        } else if (key.down && !key.repeat && key.key == SDLK_F10) {
+            result.toggle_hot_path_profile = true;
         } else if (key.down && !key.repeat && key.key == SDLK_F11) {
             result.write_metrics_report = true;
         } else if (key.down && !key.repeat && key.key == SDLK_F12) {

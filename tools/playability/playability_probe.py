@@ -10,6 +10,7 @@ import hashlib
 import inspect
 import itertools
 import json
+import marshal
 import math
 import os
 import sqlite3
@@ -797,6 +798,9 @@ TITLE_ZERO_GUARDED_U32_READ_CALLBACK_ADDRESSES = frozenset(
         TITLE_GPU_SUBMISSION_BASE_ADDRESS,
         TITLE_GPU_SUBMISSION_LIMIT_ADDRESS,
     }
+)
+TITLE_EXACT_MEMORY_READ_CALLBACK_ADDRESSES = frozenset(
+    TITLE_EXACT_MEMORY_CALLBACK_ADDRESSES - {TITLE_GPU_COMMAND_KICK_ADDRESS}
 )
 TITLE_EXACT_MEMORY_WRITE_CALLBACK_ADDRESSES = frozenset(
     {
@@ -2664,7 +2668,7 @@ def _static_code_pointer_table_targets(
     """Find function entries in credible static callback and vtable runs."""
 
     functions = tuple(known_functions)
-    table_ranges = tuple(table_ranges)
+    table_ranges = tuple(sorted(table_ranges))
     known_instruction_bytes = {
         address
         for function in functions
@@ -2699,14 +2703,37 @@ def _static_code_pointer_table_targets(
         # non-return control flow and therefore lack an independent boundary.
         targets.update(unique_targets - known_instruction_bytes)
 
+    prepared_ranges: list[tuple[int, int, bytes | None]] = []
     for start_address, end_address in table_ranges:
-        run: list[int] = []
         aligned_start = (start_address + 3) & ~3
-        for entry_address in range(aligned_start, end_address - 3, 4):
+        readable_size = max(0, end_address - aligned_start) & ~3
+        table_data = None
+        if readable_size:
             try:
-                target = int(read_u32(entry_address)) & 0xFFFFFFFF
+                candidate = read_bytes(aligned_start, readable_size)
+                if len(candidate) == readable_size:
+                    table_data = candidate
             except (KeyError, ValueError, XbeMemoryAccessError):
-                target = 0
+                pass
+        prepared_ranges.append((aligned_start, end_address, table_data))
+
+    for aligned_start, end_address, table_data in prepared_ranges:
+        run: list[int] = []
+        if table_data is not None:
+            targets_in_range = (
+                int(words[0]) & 0xFFFFFFFF
+                for words in struct.iter_unpack("<I", table_data)
+            )
+        else:
+            def fallback_targets() -> Iterable[int]:
+                for entry_address in range(aligned_start, end_address - 3, 4):
+                    try:
+                        yield int(read_u32(entry_address)) & 0xFFFFFFFF
+                    except (KeyError, ValueError, XbeMemoryAccessError):
+                        yield 0
+
+            targets_in_range = fallback_targets()
+        for target in targets_in_range:
             if is_code(target):
                 run.append(target)
                 continue
@@ -2718,15 +2745,15 @@ def _static_code_pointer_table_targets(
     # repeated six-DWORD descriptor record instead of as a contiguous vtable.
     # Require the two static descriptor pointers, exact zero/one sentinels, a
     # run of records, and the same independent code-boundary proof used above.
-    def is_static_pointer(address: int) -> bool:
-        return any(start <= address < end for start, end in table_ranges)
+    table_range_starts = tuple(start for start, _end in table_ranges)
 
-    for start_address, end_address in table_ranges:
+    def is_static_pointer(address: int) -> bool:
+        index = bisect.bisect_right(table_range_starts, address) - 1
+        return index >= 0 and address < table_ranges[index][1]
+
+    for aligned_start, _end_address, table_data in prepared_ranges:
         run = []
-        aligned_start = (start_address + 3) & ~3
-        try:
-            table_data = read_bytes(aligned_start, end_address - aligned_start)
-        except (KeyError, ValueError, XbeMemoryAccessError):
+        if table_data is None:
             continue
         offset = 0
         while offset + 24 <= len(table_data):
@@ -16928,6 +16955,8 @@ class DecodedBlockStore:
     LEGACY_RECOVERY_MARKER = "legacy_recovery_complete_v2"
     DEFAULT_MAX_RECORDS = 131072
     DEFAULT_MAX_PAYLOAD_BYTES = 256 * 1024 * 1024
+    PREPARED_IR_VERSION = 1
+    PREPARED_IR_CHUNK_FUNCTIONS = 2048
 
     def __init__(
         self,
@@ -16950,6 +16979,13 @@ class DecodedBlockStore:
         self.stores = 0
         self.pruned_records = 0
         self.pruned_payload_bytes = 0
+        self.prepared_snapshot_hits = 0
+        self.prepared_snapshot_misses = 0
+        self.prepared_snapshot_builds = 0
+        self.prepared_snapshot_load_us = 0
+        self.prepared_snapshot_build_us = 0
+        self._content_revision = 1
+        self._content_revision_dirty = False
         self.migration_performed = False
         self.migration_validated_record_count = 0
         self.migration_decode_count = 0
@@ -17001,6 +17037,19 @@ class DecodedBlockStore:
                 ON decoded_blocks(image_sha256, target);
             CREATE INDEX IF NOT EXISTS decoded_blocks_last_used
                 ON decoded_blocks(last_used_ns);
+            CREATE TABLE IF NOT EXISTS prepared_image_chunks (
+                image_sha256 TEXT NOT NULL,
+                content_revision INTEGER NOT NULL,
+                format_version INTEGER NOT NULL,
+                interpreter_tag TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                chunk_count INTEGER NOT NULL,
+                function_count INTEGER NOT NULL,
+                payload BLOB NOT NULL,
+                payload_bytes INTEGER NOT NULL,
+                last_used_ns INTEGER NOT NULL,
+                PRIMARY KEY (image_sha256, chunk_index)
+            );
             """
         )
         row = self._connection.execute(
@@ -17020,8 +17069,29 @@ class DecodedBlockStore:
             "INSERT OR REPLACE INTO cache_metadata(key, value) "
             "VALUES('payload_format', 'zlib-json-blob')"
         )
+        revision_row = self._connection.execute(
+            "SELECT value FROM cache_metadata WHERE key='content_revision'"
+        ).fetchone()
+        if revision_row is None:
+            self._content_revision_dirty = True
+        else:
+            self._content_revision = max(1, int(revision_row[0]))
         self.prune()
+        self._persist_content_revision()
         self._connection.commit()
+
+    def _mark_content_changed(self) -> None:
+        self._content_revision += 1
+        self._content_revision_dirty = True
+
+    def _persist_content_revision(self) -> None:
+        if not self._content_revision_dirty:
+            return
+        self._connection.execute(
+            "INSERT OR REPLACE INTO cache_metadata(key, value) VALUES(?, ?)",
+            ("content_revision", str(self._content_revision)),
+        )
+        self._content_revision_dirty = False
 
     @staticmethod
     def metadata_value(path: Path, key: str) -> str | None:
@@ -17261,6 +17331,7 @@ class DecodedBlockStore:
 
         self._legacy_records.clear()
         self.migration_performed = True
+        self._persist_content_revision()
         self._connection.commit()
         if (
             self.migration_source_path is not None
@@ -17319,6 +17390,7 @@ class DecodedBlockStore:
                 "DELETE FROM decoded_blocks WHERE cache_key=?",
                 (key,),
             )
+            self._mark_content_changed()
             self.misses += 1
             return None
         self._connection.execute(
@@ -17373,9 +17445,11 @@ class DecodedBlockStore:
         )
         if cursor.rowcount > 0:
             self.stores += 1
+            self._mark_content_changed()
 
     def save(self) -> None:
         self.prune()
+        self._persist_content_revision()
         self._connection.commit()
 
     def close(self) -> None:
@@ -17421,6 +17495,8 @@ class DecodedBlockStore:
             removed_bytes += int(byte_count)
         self.pruned_records += removed_count
         self.pruned_payload_bytes += removed_bytes
+        if removed_count:
+            self._mark_content_changed()
 
     def summary(self) -> dict[str, Any]:
         record_count, payload_bytes = self._connection.execute(
@@ -17434,6 +17510,12 @@ class DecodedBlockStore:
                     (self.prepared_image_sha256,),
                 ).fetchone()[0]
             )
+        prepared_chunk_count, prepared_payload_bytes = self._connection.execute(
+            """
+            SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0)
+            FROM prepared_image_chunks
+            """
+        ).fetchone()
         return {
             "enabled": self.path is not None,
             "path": str(self.path) if self.path is not None else None,
@@ -17451,6 +17533,14 @@ class DecodedBlockStore:
             "stores": self.stores,
             "pruned_records": self.pruned_records,
             "pruned_payload_bytes": self.pruned_payload_bytes,
+            "content_revision": self._content_revision,
+            "prepared_snapshot_chunk_count": int(prepared_chunk_count),
+            "prepared_snapshot_payload_bytes": int(prepared_payload_bytes),
+            "prepared_snapshot_hits": self.prepared_snapshot_hits,
+            "prepared_snapshot_misses": self.prepared_snapshot_misses,
+            "prepared_snapshot_builds": self.prepared_snapshot_builds,
+            "prepared_snapshot_load_us": self.prepared_snapshot_load_us,
+            "prepared_snapshot_build_us": self.prepared_snapshot_build_us,
             "migration_performed": self.migration_performed,
             "migration_source_path": (
                 str(self.migration_source_path)
@@ -17478,10 +17568,227 @@ class DecodedBlockStore:
             "load_errors": self.load_errors,
         }
 
-    def lifted_functions(self) -> list[LiftedFunction]:
+    @staticmethod
+    def _prepared_function_record(function: LiftedFunction) -> tuple[Any, ...]:
+        return (
+            function.symbol,
+            function.base_address,
+            function.code_size,
+            tuple(
+                (
+                    instruction.address,
+                    instruction.size,
+                    instruction.mnemonic,
+                    tuple(
+                        (
+                            operand.kind,
+                            operand.size,
+                            operand.reg,
+                            operand.immediate,
+                            operand.base,
+                            operand.index,
+                            operand.scale,
+                            operand.displacement,
+                            operand.absolute,
+                            operand.segment,
+                        )
+                        for operand in instruction.operands
+                    ),
+                    instruction.bytes_hex,
+                    instruction.target,
+                    instruction.condition,
+                    instruction.ret_stack_adjust,
+                )
+                for instruction in function.instructions
+            ),
+            function.target_platform,
+            function.generated_language,
+            function.renderer_backend,
+        )
+
+    @classmethod
+    def _encode_prepared_chunk(
+        cls, functions: Iterable[LiftedFunction]
+    ) -> bytes:
+        record = (
+            cls.PREPARED_IR_VERSION,
+            tuple(cls._prepared_function_record(function) for function in functions),
+        )
+        return zlib.compress(marshal.dumps(record, 4), level=1)
+
+    @classmethod
+    def _decode_prepared_chunk(cls, payload: bytes) -> list[LiftedFunction]:
+        version, records = marshal.loads(zlib.decompress(payload))
+        if version != cls.PREPARED_IR_VERSION or not isinstance(records, tuple):
+            raise ValueError("prepared decoded-block snapshot version is invalid")
         functions: list[LiftedFunction] = []
+        for record in records:
+            (
+                symbol,
+                base_address,
+                code_size,
+                instruction_records,
+                target_platform,
+                generated_language,
+                renderer_backend,
+            ) = record
+            instructions = tuple(
+                X86Instruction(
+                    address,
+                    size,
+                    mnemonic,
+                    tuple(Operand(*operand) for operand in operand_records),
+                    bytes_hex,
+                    target,
+                    condition,
+                    ret_stack_adjust,
+                )
+                for (
+                    address,
+                    size,
+                    mnemonic,
+                    operand_records,
+                    bytes_hex,
+                    target,
+                    condition,
+                    ret_stack_adjust,
+                ) in instruction_records
+            )
+            functions.append(
+                LiftedFunction(
+                    symbol,
+                    base_address,
+                    code_size,
+                    instructions,
+                    target_platform,
+                    generated_language,
+                    renderer_backend,
+                )
+            )
+        return functions
+
+    def _load_prepared_lifted_functions(self) -> list[LiftedFunction] | None:
         if self.prepared_image_sha256 is None:
-            return functions
+            return None
+        started_ns = time.perf_counter_ns()
+        interpreter_tag = str(sys.implementation.cache_tag)
+        rows = self._connection.execute(
+            """
+            SELECT chunk_index, chunk_count, function_count, payload
+            FROM prepared_image_chunks
+            WHERE image_sha256=? AND content_revision=?
+                AND format_version=? AND interpreter_tag=?
+            ORDER BY chunk_index
+            """,
+            (
+                self.prepared_image_sha256,
+                self._content_revision,
+                self.PREPARED_IR_VERSION,
+                interpreter_tag,
+            ),
+        ).fetchall()
+        if not rows:
+            self.prepared_snapshot_misses += 1
+            return None
+        try:
+            chunk_count = int(rows[0][1])
+            function_count = int(rows[0][2])
+            if len(rows) != chunk_count or [row[0] for row in rows] != list(
+                range(chunk_count)
+            ):
+                raise ValueError("prepared decoded-block snapshot is incomplete")
+            functions: list[LiftedFunction] = []
+            for _index, expected_chunks, expected_functions, payload in rows:
+                if (
+                    int(expected_chunks) != chunk_count
+                    or int(expected_functions) != function_count
+                ):
+                    raise ValueError(
+                        "prepared decoded-block snapshot metadata is inconsistent"
+                    )
+                functions.extend(self._decode_prepared_chunk(payload))
+            if len(functions) != function_count:
+                raise ValueError(
+                    "prepared decoded-block snapshot function count is invalid"
+                )
+        except (EOFError, TypeError, ValueError, zlib.error) as exc:
+            self.load_errors.append(f"prepared snapshot: {exc}")
+            self._connection.execute(
+                "DELETE FROM prepared_image_chunks WHERE image_sha256=?",
+                (self.prepared_image_sha256,),
+            )
+            self.prepared_snapshot_misses += 1
+            return None
+        self._connection.execute(
+            """
+            UPDATE prepared_image_chunks SET last_used_ns=?
+            WHERE image_sha256=?
+            """,
+            (time.time_ns(), self.prepared_image_sha256),
+        )
+        self.prepared_snapshot_hits += 1
+        self.prepared_snapshot_load_us += (
+            time.perf_counter_ns() - started_ns
+        ) // 1_000
+        return functions
+
+    def _store_prepared_lifted_functions(
+        self, functions: list[LiftedFunction]
+    ) -> None:
+        if self.prepared_image_sha256 is None:
+            return
+        started_ns = time.perf_counter_ns()
+        chunks = [
+            functions[index : index + self.PREPARED_IR_CHUNK_FUNCTIONS]
+            for index in range(0, len(functions), self.PREPARED_IR_CHUNK_FUNCTIONS)
+        ] or [[]]
+        encoded_chunks = [self._encode_prepared_chunk(chunk) for chunk in chunks]
+        self._connection.execute(
+            """
+            DELETE FROM prepared_image_chunks
+            WHERE content_revision<>? OR image_sha256=?
+            """,
+            (self._content_revision, self.prepared_image_sha256),
+        )
+        now_ns = time.time_ns()
+        self._connection.executemany(
+            """
+            INSERT INTO prepared_image_chunks(
+                image_sha256, content_revision, format_version,
+                interpreter_tag, chunk_index, chunk_count, function_count,
+                payload, payload_bytes, last_used_ns
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    self.prepared_image_sha256,
+                    self._content_revision,
+                    self.PREPARED_IR_VERSION,
+                    str(sys.implementation.cache_tag),
+                    index,
+                    len(encoded_chunks),
+                    len(functions),
+                    payload,
+                    len(payload),
+                    now_ns,
+                )
+                for index, payload in enumerate(encoded_chunks)
+            ),
+        )
+        self._persist_content_revision()
+        self._connection.commit()
+        self.prepared_snapshot_builds += 1
+        self.prepared_snapshot_build_us += (
+            time.perf_counter_ns() - started_ns
+        ) // 1_000
+
+    def lifted_functions(self) -> list[LiftedFunction]:
+        if self.prepared_image_sha256 is None:
+            return []
+        prepared_functions = self._load_prepared_lifted_functions()
+        if prepared_functions is not None:
+            return prepared_functions
+        functions: list[LiftedFunction] = []
         rows = self._connection.execute(
             """
             SELECT cache_key, payload FROM decoded_blocks
@@ -17501,6 +17808,7 @@ class DecodedBlockStore:
                 json.JSONDecodeError,
             ) as exc:
                 self.load_errors.append(f"{key}: {exc}")
+        self._store_prepared_lifted_functions(functions)
         return functions
 
 
@@ -19019,7 +19327,7 @@ def _execute_recovered_control_flow_frame(
                 ),
                 live_flip_audit_health_interval=live_flip_audit_health_interval,
                 live_flip_audit_max_flips=live_flip_audit_max_flips,
-                native_slice_steps=native_slice_steps,
+            native_slice_steps=native_slice_steps,
             profile_hot_paths=profile_hot_paths,
             developer_live_compile=developer_live_compile,
                 audit_title_main_loop_exit=audit_title_main_loop_exit,
@@ -19412,38 +19720,31 @@ def _execute_guest_thread_start(
     )
     native_branch_functions: list[LiftedFunction] = []
     if native_guest_loop:
+        is_file_backed_code = _file_backed_code_address_predicate(loaded)
         while True:
             known_native_functions = [*frame_functions, *native_branch_functions]
             stored_callback_targets = _stored_code_pointer_targets(
                 known_native_functions,
                 read_bytes=loaded.arena.read,
-                is_code=lambda address: (
-                    _is_file_backed_code_address(loaded, address)
-                ),
+                is_code=is_file_backed_code,
             )
             stack_callback_targets = _stack_argument_code_pointer_targets(
                 known_native_functions,
                 read_bytes=loaded.arena.read,
-                is_code=lambda address: (
-                    _is_file_backed_code_address(loaded, address)
-                ),
+                is_code=is_file_backed_code,
                 callback_argument_indices=TITLE_STACK_CALLBACK_ARGUMENT_INDICES,
             )
             register_callback_targets = _register_stack_argument_code_pointer_targets(
                 known_native_functions,
                 read_bytes=loaded.arena.read,
-                is_code=lambda address: (
-                    _is_file_backed_code_address(loaded, address)
-                ),
+                is_code=is_file_backed_code,
                 callback_argument_indices=TITLE_REGISTER_CALLBACK_ARGUMENT_INDICES,
             )
             static_table_targets = _static_code_pointer_table_targets(
                 known_native_functions,
                 read_bytes=loaded.arena.read,
                 read_u32=loaded.arena.read_u32,
-                is_code=lambda address: (
-                    _is_file_backed_code_address(loaded, address)
-                ),
+                is_code=is_file_backed_code,
                 table_ranges=_file_backed_pointer_table_ranges(loaded),
             )
             stored_callbacks = _recover_required_aot_callbacks(
@@ -19469,9 +19770,7 @@ def _execute_guest_thread_start(
                     _absolute_indirect_jump_table_targets(
                         function,
                         read_u32=loaded.arena.read_u32,
-                        is_executable=lambda address: (
-                            _is_file_backed_code_address(loaded, address)
-                        ),
+                        is_executable=is_file_backed_code,
                     )
                 ),
             )
@@ -20936,7 +21235,6 @@ def _execute_guest_thread_start(
             }
             dispatch_observers_in_native = bool(
                 live_host_bridge is not None
-                and not profile_hot_paths
                 and not enable_title_repair_fallbacks
                 and not audit_title_main_loop_exit
                 and not audit_world_matrices
@@ -20952,7 +21250,7 @@ def _execute_guest_thread_start(
                 *title_world_matrix_audit.memory_callback_addresses,
             }
             native_memory_read_callback_addresses = {
-                *TITLE_EXACT_MEMORY_CALLBACK_ADDRESSES,
+                *TITLE_EXACT_MEMORY_READ_CALLBACK_ADDRESSES,
                 TITLE_NV2A_MMIO_BASE_ADDRESS + 0x100,
                 *audit_memory_callback_addresses,
             }
@@ -22498,6 +22796,21 @@ def _execute_guest_thread_start(
                 ),
                 "normal_runtime": {
                     "enabled": bool(native_host_services.normal_runtime_enabled),
+                    "hot_path_profile_capture": {
+                        "control_state": int(
+                            native_host_services.profile_capture_control_state
+                        ),
+                        "started_count": int(
+                            native_host_services.profile_capture_started_count
+                        ),
+                        "completed_count": int(
+                            native_host_services.profile_capture_completed_count
+                        ),
+                        "active_dispatch_count": int(
+                            native_host_services.
+                            profile_capture_active_dispatch_count
+                        ),
+                    },
                     "scheduler_quantum": int(
                         native_host_services.scheduler_quantum
                     ),
@@ -24416,6 +24729,30 @@ def _is_file_backed_code_address(
     )
 
 
+def _file_backed_code_address_predicate(
+    loaded: LoadedXbeImage,
+) -> Callable[[int], bool]:
+    ranges = tuple(
+        sorted(
+            (
+                region.virtual_address,
+                region.virtual_address + region.file_backed_size,
+            )
+            for region in loaded.arena.regions
+            if region.name not in {".rdata", ".data"}
+            and "execute" in region.permissions
+            and region.file_backed_size > 0
+        )
+    )
+    starts = tuple(start for start, _end in ranges)
+
+    def contains(address: int) -> bool:
+        index = bisect.bisect_right(starts, address) - 1
+        return index >= 0 and address < ranges[index][1]
+
+    return contains
+
+
 def _file_backed_pointer_table_ranges(
     loaded: LoadedXbeImage,
 ) -> tuple[tuple[int, int], ...]:
@@ -25730,9 +26067,9 @@ def main(argv: list[str] | None = None) -> int:
         "--profile-hot-paths",
         action="store_true",
         help=(
-            "Enable exact native module-edge profiling, exclusive dispatcher "
-            "timing, and sampled callback latencies; normal live runs keep this "
-            "extra accounting disabled."
+            "Enable exact native module-edge profiling and exclusive dispatcher "
+            "timing; the live launcher controls the native capture window and "
+            "normal runs keep this extra accounting disabled."
         ),
     )
     parser.add_argument(

@@ -144,7 +144,6 @@ class LiveTestTests(unittest.TestCase):
             command[command.index("--supported-targets") + 1],
             "supported-targets.json",
         )
-
     def test_default_native_slice_cadence_targets_frame_rate(self) -> None:
         self.assertEqual(live_test.DEFAULT_NATIVE_SLICE_STEPS, 100_000)
 

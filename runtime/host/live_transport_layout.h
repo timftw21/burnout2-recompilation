@@ -10,6 +10,11 @@ inline constexpr std::array<uint8_t, 8> kLiveControlMagic = {
     'B', '2', 'L', 'I', 'V', '0', '0', '1'};
 inline constexpr uint32_t kLiveControlSchemaVersion = 1u;
 inline constexpr uint32_t kLiveControlSize = 65536u;
+inline constexpr size_t kLiveHotPathProfileStateOffset = 36u;
+inline constexpr uint32_t kLiveHotPathProfileDisabled = 0u;
+inline constexpr uint32_t kLiveHotPathProfileArmed = 1u;
+inline constexpr uint32_t kLiveHotPathProfileActive = 2u;
+inline constexpr uint32_t kLiveHotPathProfileComplete = 3u;
 inline constexpr size_t kLiveControllerSequenceOffset = 64u;
 inline constexpr size_t kLiveControllerPayloadOffset = 68u;
 inline constexpr size_t kLivePresentationSequenceOffset = 128u;
