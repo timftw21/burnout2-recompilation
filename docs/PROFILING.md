@@ -21,6 +21,10 @@ disables native observer dispatch, is incomplete, or records no native module
 calls. Session-wide counters remain available but do not invalidate a clean
 controlled window.
 
+The first `--profile-hot-paths` run may build a separate symbol-bearing AOT
+configuration. It retains address-named guest PDBs and reuses them on later
+profiling runs; ordinary release preparation does not carry that storage cost.
+
 The expanded report keeps all populated target and transition records, not
 only a short "top N" list. It provides four complementary views:
 

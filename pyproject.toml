@@ -40,11 +40,19 @@ follow_imports = "skip"
 show_error_codes = true
 warn_unreachable = true
 files = [
+    "tools/compiler_cache.py",
+    "tools/dev_check.py",
     "tools/native_build.py",
     "tools/native_toolchain.py",
     "tools/project_identity.py",
     "tools/project_maintenance.py",
     "tools/profiling/system_profile.py",
     "tools/quality_gate.py",
+    "tools/python_test_shards.py",
+    "tools/playability/differential_replay.py",
+    "tools/playability/replay_capsule.py",
+    "tools/recomp/debug_metadata.py",
+    "tools/recomp/representative_aot.py",
+    "tools/validation_runner.py",
     "tools/playability/live_transport.py",
 ]

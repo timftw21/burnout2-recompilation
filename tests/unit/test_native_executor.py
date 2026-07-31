@@ -168,6 +168,8 @@ class NativeResumableExecutorTests(unittest.TestCase):
             1,
         )
         self.assertEqual(executor.cache_summary["preferred_fusion_edge_count"], 0)
+        self.assertFalse(executor.cache_summary["preserve_debug_symbols"])
+        self.assertEqual(executor.cache_summary["generated_pdb_count"], 0)
 
     def test_fusion_aot_mode_enables_coalesced_memory_accesses(self) -> None:
         function = lift_x86_function(
@@ -1769,16 +1771,22 @@ class NativeResumableExecutorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             build_dir = Path(temp_dir)
             manifest = NativeModuleManifest(build_dir, max_artifacts=1)
-            first_source = build_dir / "first.cpp"
-            first_artifact = build_dir / "first.dll"
-            second_source = build_dir / "second.cpp"
-            second_artifact = build_dir / "second.dll"
+            first_source = build_dir / "native-loop-first.cpp"
+            first_artifact = build_dir / "native-loop-first.dll"
+            first_object = first_source.with_suffix(".obj")
+            first_pdb = first_artifact.with_suffix(".pdb")
+            first_metadata = first_source.with_suffix(".debug.json")
+            second_source = build_dir / "native-loop-second.cpp"
+            second_artifact = build_dir / "native-loop-second.dll"
             orphan_import_library = build_dir / "native-loop-legacy.lib"
             for path in (
                 first_source,
                 first_artifact,
                 second_source,
                 second_artifact,
+                first_object,
+                first_pdb,
+                first_metadata,
                 orphan_import_library,
             ):
                 path.write_bytes(path.name.encode("ascii"))
@@ -1814,6 +1822,9 @@ class NativeResumableExecutorTests(unittest.TestCase):
             self.assertEqual(summary["pruned_artifacts"], 1)
             self.assertFalse(first_artifact.exists())
             self.assertFalse(first_source.exists())
+            self.assertFalse(first_object.exists())
+            self.assertFalse(first_pdb.exists())
+            self.assertFalse(first_metadata.exists())
             self.assertTrue(second_artifact.exists())
             self.assertFalse(orphan_import_library.exists())
             self.assertEqual(summary["pruned_orphan_files"], 1)

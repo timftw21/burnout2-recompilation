@@ -28,14 +28,91 @@ fails before configuration on any revision or artifact mismatch. Update the
 lock only as an intentional toolchain change, review every new hash, and run
 all presets plus the strict presenter build.
 
+The optional compiler launcher is independently locked in
+`tools/compiler_cache.lock.json`. Install its exact archive once with:
+
+```powershell
+python .\tools\compiler_cache.py install
+```
+
+Native builds use that sccache installation automatically when present. Pass
+`--compiler-cache required` in reproducible/CI builds or `off` while diagnosing
+the launcher. Cache data stays under `build/cache/sccache`; per-run JSON
+telemetry under `build/local/compiler-cache/` reports hits, misses, hit rate,
+compiled source count, and source bytes.
+
 ## Commands
 
-Install dependencies and run the complete asset-free gate:
+For the ordinary edit/debug loop, run the changed-file-aware gate:
+
+```powershell
+python .\tools\dev_check.py --explain
+```
+
+It maps the current Git diff to explicit Python test modules, static checks,
+CMake targets, and CTest labels. Independent checks run concurrently; Python
+tests are distributed by individual test case using retained local durations.
+Successful nodes are reused only when their content, command, Python and native
+tool identities, declared environment, dependency keys, and output identities
+still match. Cache hits and misses are printed. Use `--dry-run --explain` to
+inspect selection without running it, `--path <path>` to diagnose a specific
+file, and `--all` to select the complete asset-free base gate:
+
+```powershell
+python .\tools\dev_check.py --dry-run --explain
+python .\tools\dev_check.py --path tools/recomp/x86_lifter.py --explain
+python .\tools\dev_check.py --all
+python .\tools\dev_check.py --launch-closeout
+```
+
+Local cache and timing state is confined to `build/local/dev-check/`.
+`--no-cache` forces execution without reading or updating the node cache.
+Every node has an enforced wall-time budget; the history stores bounded p50 and
+p95 samples and flags material regressions. Python shard stdout is buffered and
+shown only for failures.
+
+`--launch-closeout` runs the normal changed/subsystem selection first and, only
+after it passes, starts a detached matrix containing the complete asset-free
+gate, debug/release/sanitizer native builds, and the strict release presenter.
+The native presets run concurrently with bounded parallelism. A new launch
+requests cooperative cancellation of an older local closeout on the same
+branch. Inspect a run without waiting for it:
+
+```powershell
+python .\tools\validation_closeout.py launch --jobs 6
+python .\tools\validation_closeout.py status .\reports\local\validation\closeout\<run>
+```
+
+Pass one or more manually captured `--replay-capsule` paths to put long,
+proprietary deterministic replays in that integration boundary. The tool does
+not capture input or create title data. CI hard-cancels superseded revisions,
+shards Python cases, restores compiler/representative-AOT/ThinLTO artifacts,
+and retains compact timing and failure evidence.
+
+Test budgets and the separate repeat-only quarantine live in
+`tools/test_runtime_budgets.json`. Ordinary gates exclude entries in
+`repeat_only`; run them deliberately with
+`python .\tools\python_test_shards.py --repeat-quarantine <count>`. Declared
+`shared_fixture_groups` keep tests using one expensive deterministic fixture in
+one worker instead of rebuilding it in several shards.
+
+On the first node or test failure, the gate prints a one-command focused rerun,
+the deterministic seed, temporary artifact location, input/cache identity, and
+last successful prerequisite. It also writes a bounded capsule under
+`reports/local/validation/failures/`; only the newest eight capsules and at
+most 64 MiB are retained.
+
+Install dependencies and run the blocking complete asset-free/debug gate when
+an immediate foreground result is specifically needed:
 
 ```powershell
 python -m pip install --requirement .\requirements-dev.lock
 python .\tools\quality_gate.py --full
 ```
+
+`quality_gate.py` is the compatibility entry point for `dev_check.py --all`.
+It uses the same exact-key cache and case-level sharding; add `--no-cache` when
+a deliberately cold authoritative rerun is required.
 
 Build individual native configurations:
 
@@ -45,9 +122,61 @@ python .\tools\native_build.py --preset release
 python .\tools\native_build.py --preset profiling
 python .\tools\native_build.py --preset sanitizer
 python .\tools\native_build.py --preset release --presenter
+python .\tools\native_build.py --preset debug --target b2r_host_core_tests --test-regex '^native\.host_core\.dirty_range_lifetime$' --parallel 8
+python .\tools\native_build.py --preset debug --target b2r_host_core_tests --label texture --label pipeline
+python .\tools\native_build.py --preset debug --configure-only
+python .\tools\native_build.py --preset debug --target b2r_host_core_tests --build-only
 ```
 
-Debug, release, and sanitizer CTest presets run in Windows CI. The Python CI
+`--target`, `--test-regex`, and `--label` are repeatable; repeated filters are
+ORed. The feature labels are `renderer`, `transport`, `texture`, `pipeline`,
+and `nv2a`. The default path configures, invokes Ninja only for the selected
+targets, and runs only the selected CTest cases. `--configure-only` stops after
+CMake generation; `--build-only` assumes that generation already happened and
+does not run CTest. The validation graph uses these options after its single
+pinned-toolchain node, avoiding duplicate toolchain validation.
+
+Emitter/executor edits use the bounded asset-free AOT corpus:
+
+```powershell
+python .\tools\recomp\representative_aot.py
+```
+
+It covers the major generated-helper and instruction families and reuses the
+same content-addressed module, object, sccache, and ThinLTO caches as title AOT
+preparation. Use it for iteration. Complete decoded-store preparation belongs
+only in explicit preflight/full validation before a gameplay handoff.
+
+## Replay-oriented iteration
+
+Create and validate the asset-free replay checkpoint without building the
+presenter or starting the title:
+
+```powershell
+python .\tools\playability\replay_capsule.py synthetic `
+  --output .\build\local\replay\synthetic.b2rcap
+python .\tools\playability\differential_replay.py execute `
+  .\build\local\replay\synthetic.b2rcap `
+  --experimental interpreter `
+  --max-steps 4 `
+  --report .\build\local\replay\synthetic-differential.json
+```
+
+`dev_check.py --all` contains equivalent cached `capsule_synthetic` and
+`differential_synthetic` nodes. Real checkpoints are produced only after a
+manual gameplay capture and must stay below `reports/local/` or `data/local/`;
+the tools never drive controller input. Native differential replay is an
+explicit local diagnostic build, preserves its generated PDBs, and reuses the
+content-addressed object and ThinLTO caches.
+
+Generated AOT source always receives `native-debug-index.json`. PDB retention
+is opt-in for diagnostic/profiling executors so normal title preparation does
+not multiply the generated-artifact footprint. The module manifest owns and
+prunes the related `.cpp`, `.obj`, `.dll`, `.pdb`, and `.debug.json` files as a
+single cache entry.
+
+Debug, release, and sanitizer CTest presets run in Windows CI with the pinned
+compiler cache restored by compiler/target/flags/lock/source identity. The Python CI
 job runs the same default `tools/quality_gate.py` command used by pre-commit.
 The `--full` local form adds the debug native build and tests.
 

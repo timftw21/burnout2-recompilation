@@ -16,8 +16,16 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter, deque
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping, Sequence
+from tools.compiler_cache import cache_environment, resolve_compiler_cache, write_stats
+from tools.recomp.debug_metadata import (
+    build_module_debug_metadata,
+    guest_address_ranges,
+    write_module_debug_metadata,
+    write_native_debug_index,
+)
 from tools.recomp.x86_lifter import (
+    AOT_RUNTIME_ABI_VERSION,
     CpuFlags,
     CpuState,
     ExecutionTrace,
@@ -25,6 +33,7 @@ from tools.recomp.x86_lifter import (
     NativeFastPath,
     SparseMemory,
     emit_cpp,
+    emit_cpp_runtime_support,
 )
 
 NATIVE_MEMORY_CALLBACK_SAMPLE_INTERVAL = 1024
@@ -60,6 +69,90 @@ NATIVE_HOST_SERVICE_KIND_NAMES = {
     15: "bootstrap",
 }
 NATIVE_EMITTER_SOURCE_FILE = Path(emit_cpp.__code__.co_filename).resolve()
+NATIVE_DEBUG_ETW_PROVIDER = "{B2EC0A07-7E71-4A64-923B-327751105EB2}"
+
+
+class _EtwGuid(ctypes.Structure):
+    _fields_ = [
+        ("data1", ctypes.c_uint32),
+        ("data2", ctypes.c_uint16),
+        ("data3", ctypes.c_uint16),
+        ("data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class _NativeEtwAnnotations:
+    """Emit opt-in debug boundaries without entering the guest execution path."""
+
+    def __init__(self, enabled: bool) -> None:
+        self._library: Any = None
+        self._handle = ctypes.c_uint64()
+        if not enabled or os.name != "nt":
+            return
+        try:
+            library = ctypes.WinDLL("advapi32", use_last_error=True)
+            library.EventRegister.argtypes = [
+                ctypes.POINTER(_EtwGuid),
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint64),
+            ]
+            library.EventRegister.restype = ctypes.c_ulong
+            library.EventWriteString.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_ubyte,
+                ctypes.c_uint64,
+                ctypes.c_wchar_p,
+            ]
+            library.EventWriteString.restype = ctypes.c_ulong
+            library.EventUnregister.argtypes = [ctypes.c_uint64]
+            library.EventUnregister.restype = ctypes.c_ulong
+            provider = _EtwGuid(
+                0xB2EC0A07,
+                0x7E71,
+                0x4A64,
+                (ctypes.c_ubyte * 8)(0x92, 0x3B, 0x32, 0x77, 0x51, 0x10, 0x5E, 0xB2),
+            )
+            if library.EventRegister(
+                ctypes.byref(provider), None, None, ctypes.byref(self._handle)
+            ) == 0:
+                self._library = library
+        except (AttributeError, OSError):
+            self._library = None
+            self._handle.value = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self._library is not None and bool(self._handle.value)
+
+    def write(
+        self,
+        *,
+        reason: str,
+        guest_eip: int,
+        current_service: int,
+        native_symbol: str | None,
+    ) -> None:
+        if not self.enabled:
+            return
+        message = (
+            f"reason={reason} guest_eip=0x{guest_eip:08X} "
+            f"current_service=0x{current_service:08X} "
+            f"native_symbol={native_symbol or '<unknown>'}"
+        )
+        self._library.EventWriteString(self._handle.value, 4, 1, message)
+
+    def close(self) -> None:
+        if self.enabled:
+            self._library.EventUnregister(self._handle.value)
+            self._handle.value = 0
+        self._library = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except (AttributeError, OSError):
+            pass
 
 
 def aot_optimization_features(mode: str) -> tuple[bool, bool]:
@@ -129,6 +222,17 @@ def _is_native_dll_artifact(path: Path) -> bool:
                 return False
             artifact.seek(pe_offset)
             return artifact.read(4) == b"PE\0\0"
+    except OSError:
+        return False
+
+
+def _is_native_object_artifact(path: Path) -> bool:
+    try:
+        if not path.is_file() or path.stat().st_size < 64:
+            return False
+        with path.open("rb") as artifact:
+            magic = artifact.read(4)
+        return magic == b"BC\xc0\xde" or magic[:2] == b"\x64\x86"
     except OSError:
         return False
 
@@ -207,6 +311,29 @@ class NativeModuleManifest:
             return None
         return candidate
 
+    @staticmethod
+    def _related_names(artifact_name: str, source_name: str) -> set[str]:
+        artifact = Path(artifact_name)
+        source = Path(source_name)
+        return {
+            artifact.name,
+            source.name,
+            artifact.with_suffix(".pdb").name,
+            source.with_suffix(".obj").name,
+            source.with_suffix(".debug.json").name,
+        }
+
+    def _related_bytes(self, artifact_name: str, source_name: str) -> int:
+        total = 0
+        for name in self._related_names(artifact_name, source_name):
+            path = self._owned_path(name)
+            if path is not None and path.is_file():
+                try:
+                    total += path.stat().st_size
+                except OSError:
+                    pass
+        return total
+
     def resolve(
         self,
         *,
@@ -243,11 +370,13 @@ class NativeModuleManifest:
                 (configuration_key, partition_start, partition_end),
             )
             self._connection.commit()
-            if source_path is not None:
-                try:
-                    source_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            for name in self._related_names(row[1], row[2]):
+                path = self._owned_path(name)
+                if path is not None:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
             self.misses += 1
             return None
         self._connection.execute(
@@ -369,15 +498,16 @@ class NativeModuleManifest:
                     """,
                     row[:3],
                 )
-                source_path = self._owned_path(row[4])
-                if source_path is not None:
-                    try:
-                        source_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+                for name in self._related_names(row[3], row[4]):
+                    path = self._owned_path(name)
+                    if path is not None:
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
                 continue
             valid_rows.append(row)
-            total_bytes += int(row[5]) + int(row[6])
+            total_bytes += self._related_bytes(row[3], row[4])
         excess_count = max(0, len(valid_rows) - self.max_artifacts)
         excess_bytes = max(0, total_bytes - self.max_artifact_bytes)
         removed_count = 0
@@ -388,9 +518,9 @@ class NativeModuleManifest:
             artifact_path = self._owned_path(row[3])
             if artifact_path is None or artifact_path in protected:
                 continue
-            row_bytes = int(row[5]) + int(row[6])
+            row_bytes = self._related_bytes(row[3], row[4])
             deleted = True
-            for name in (row[3], row[4]):
+            for name in self._related_names(row[3], row[4]):
                 path = self._owned_path(name)
                 if path is None:
                     continue
@@ -411,11 +541,11 @@ class NativeModuleManifest:
             removed_count += 1
             removed_bytes += row_bytes
         referenced_names = {
-            name
+            related_name
             for artifact_name, source_name in self._connection.execute(
                 "SELECT artifact_name, source_name FROM native_modules"
             ).fetchall()
-            for name in (artifact_name, source_name)
+            for related_name in self._related_names(artifact_name, source_name)
         }
         current_time_ns = time.time_ns()
         orphan_count = 0
@@ -425,7 +555,8 @@ class NativeModuleManifest:
                 not path.is_file()
                 or path.name in referenced_names
                 or path.resolve() in protected
-                or path.suffix.casefold() not in {".cpp", ".dll", ".lib", ".exp"}
+                or path.suffix.casefold()
+                not in {".cpp", ".dll", ".lib", ".exp", ".obj", ".pdb", ".json"}
             ):
                 continue
             try:
@@ -448,7 +579,12 @@ class NativeModuleManifest:
         self.pruned_orphan_files += orphan_count
         self.pruned_orphan_bytes += orphan_bytes
 
-    def prune_if_needed(self, *, protected_artifacts: Iterable[Path] = ()) -> None:
+    def prune_if_needed(
+        self,
+        *,
+        protected_artifacts: Iterable[Path] = (),
+        force_size_check: bool = False,
+    ) -> None:
         row = self._connection.execute(
             "SELECT value FROM cache_metadata WHERE key='last_prune_ns'"
         ).fetchone()
@@ -461,7 +597,8 @@ class NativeModuleManifest:
             """
         ).fetchone()
         if (
-            time.time_ns() - last_prune_ns >= self.PRUNE_INTERVAL_NS
+            force_size_check
+            or time.time_ns() - last_prune_ns >= self.PRUNE_INTERVAL_NS
             or int(artifact_count) > self.max_artifacts
             or int(artifact_bytes) > self.max_artifact_bytes
         ):
@@ -481,6 +618,7 @@ class NativeModuleManifest:
             "version": self.VERSION,
             "artifact_count": int(artifact_count),
             "artifact_bytes": int(artifact_bytes),
+            "artifact_bytes_excludes_debug_sidecars": True,
             "hits": self.hits,
             "misses": self.misses,
             "stores": self.stores,
@@ -11285,8 +11423,10 @@ class NativeResumableExecutor:
         module_functions: Iterable[LiftedFunction] | None = None,
         incremental_module_functions: Iterable[LiftedFunction] | None = None,
         compiler: str | None = None,
+        compiler_cache_mode: str = "auto",
         compile_worker_limit: int | None = None,
         low_priority_compilation: bool = False,
+        preserve_debug_symbols: bool = False,
     ) -> None:
         aot_optimization_mode = str(aot_optimization_mode).strip().lower()
         (
@@ -11298,7 +11438,10 @@ class NativeResumableExecutor:
             "registerization-only",
             "combined",
         }
-        compile_profile = f"clang-cl-o2-aot-targeted-v14-{aot_optimization_mode}"
+        debug_profile = "debug" if preserve_debug_symbols else "release"
+        compile_profile = (
+            f"clang-cl-thinlto-aot-targeted-v16-{aot_optimization_mode}-{debug_profile}"
+        )
         build_dir.mkdir(parents=True, exist_ok=True)
         compiler_path = compiler or shutil.which("clang-cl")
         if compiler_path is None:
@@ -11424,6 +11567,17 @@ class NativeResumableExecutor:
             chunk_specs = [([], "base", "/O2")]
 
         compiler_executable = shutil.which(compiler_path) or compiler_path
+        compiler_cache_executable = resolve_compiler_cache(compiler_cache_mode)
+        compile_environment = (
+            cache_environment(os.environ.copy())
+            if compiler_cache_executable is not None
+            else os.environ.copy()
+        )
+        compiler_command_prefix = (
+            [str(compiler_cache_executable), str(compiler_executable)]
+            if compiler_cache_executable is not None
+            else [str(compiler_executable)]
+        )
         compile_worker_limit = (
             6 if compile_worker_limit is None else max(1, int(compile_worker_limit))
         )
@@ -11452,6 +11606,43 @@ class NativeResumableExecutor:
             }
         except OSError:
             emitter_identity = {"path": str(emitter_file)}
+        runtime_header_name = f"b2r_aot_runtime_v{AOT_RUNTIME_ABI_VERSION}.h"
+        runtime_header, runtime_source = emit_cpp_runtime_support(header_name=runtime_header_name)
+        runtime_support_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "abi": AOT_RUNTIME_ABI_VERSION,
+                    "compiler": compiler_identity,
+                    "compile_flags": [
+                        "/std:c++17",
+                        "/O2",
+                        *(["/Z7"] if preserve_debug_symbols else []),
+                        "/c",
+                        "-flto=thin",
+                    ],
+                    "header": hashlib.sha256(runtime_header.encode("utf-8")).hexdigest(),
+                    "source": hashlib.sha256(runtime_source.encode("utf-8")).hexdigest(),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        runtime_header_path = build_dir / runtime_header_name
+        runtime_source_path = build_dir / (
+            f"b2r-aot-runtime-v{AOT_RUNTIME_ABI_VERSION}-{runtime_support_digest[:24]}.cpp"
+        )
+        runtime_object_path = runtime_source_path.with_suffix(".obj")
+        if (
+            not runtime_header_path.is_file()
+            or runtime_header_path.read_text(encoding="utf-8") != runtime_header
+        ):
+            runtime_header_path.write_text(runtime_header, encoding="utf-8", newline="\n")
+        if (
+            not runtime_source_path.is_file()
+            or runtime_source_path.read_text(encoding="utf-8") != runtime_source
+        ):
+            runtime_source_path.write_text(runtime_source, encoding="utf-8", newline="\n")
+        thinlto_cache_directory = build_dir / "thinlto-cache"
         base_configuration = {
             "schema": "native-partition-manifest-v1",
             "compile_profile": compile_profile,
@@ -11486,6 +11677,10 @@ class NativeResumableExecutor:
                 else "scalar-u8-u32-v1"
             ),
             "address_configuration": "partition-local-v1",
+            "runtime_abi_version": AOT_RUNTIME_ABI_VERSION,
+            "runtime_support_digest": runtime_support_digest,
+            "object_strategy": "content-addressed-thinlto-v1",
+            "preserve_debug_symbols": bool(preserve_debug_symbols),
         }
         base_configuration_key = hashlib.sha256(
             json.dumps(
@@ -11500,6 +11695,7 @@ class NativeResumableExecutor:
             partition_start = chunk[0].address if chunk else function.base_address
             partition_end = chunk[-1].next_address if chunk else function.base_address
             module_identity = f"{partition_start:08X}_{partition_end:08X}"
+            native_symbol = f"b2r_guest_{module_identity}"
             module = LiftedFunction(
                 symbol=f"b2r_partition_{module_identity}",
                 base_address=partition_start,
@@ -11563,9 +11759,11 @@ class NativeResumableExecutor:
                     ).encode("ascii")
                 ).hexdigest()[:24]
                 source_path = build_dir / f"native-loop-{artifact_digest}.cpp"
+                object_path = build_dir / f"native-loop-{artifact_digest}.obj"
                 dll_path = build_dir / f"native-loop-{artifact_digest}.dll"
             else:
                 source_path, dll_path = cached_paths
+                object_path = source_path.with_suffix(".obj")
             modules.append(
                 {
                     "module": module,
@@ -11574,13 +11772,17 @@ class NativeResumableExecutor:
                     "configuration_key": configuration_key,
                     "content_digest": content_digest,
                     "source_path": source_path,
+                    "object_path": object_path,
                     "dll_path": dll_path,
                     "cache_hit": cache_hit,
                     "module_kind": module_kind,
                     "optimization": optimization,
+                    "native_symbol": native_symbol,
+                    "pdb_path": dll_path.with_suffix(".pdb"),
+                    "debug_metadata_path": source_path.with_suffix(".debug.json"),
                     "equivalent_source_candidates": (
                         []
-                        if cache_hit
+                        if cache_hit or preserve_debug_symbols
                         else manifest.equivalent_source_candidates(
                             partition_start=partition_start,
                             partition_end=partition_end,
@@ -11597,17 +11799,75 @@ class NativeResumableExecutor:
 
         modules_to_compile = [item for item in modules if not item["cache_hit"]]
 
+        def compile_object(
+            source_path: Path,
+            object_path: Path,
+            optimization: str,
+        ) -> int:
+            if _is_native_object_artifact(object_path):
+                return 0
+            temporary_object_path = object_path.with_name(
+                f"{object_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+            compile_started_ns = time.perf_counter_ns()
+            completed = subprocess.run(
+                [
+                    *compiler_command_prefix,
+                    "/nologo",
+                    "/std:c++17",
+                    optimization,
+                    *(["/Z7"] if preserve_debug_symbols else []),
+                    "/c",
+                    "-flto=thin",
+                    str(source_path),
+                    f"/Fo{temporary_object_path}",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                creationflags=compile_creation_flags,
+                env=compile_environment,
+            )
+            compile_us = (time.perf_counter_ns() - compile_started_ns) // 1_000
+            if completed.returncode != 0:
+                temporary_object_path.unlink(missing_ok=True)
+                raise NativeExecutorError(
+                    "native guest-loop object compilation failed:\n"
+                    + (completed.stdout + completed.stderr).strip()
+                )
+            if not _is_native_object_artifact(temporary_object_path):
+                temporary_object_path.unlink(missing_ok=True)
+                raise NativeExecutorError(
+                    f"native guest-loop compiler produced an invalid object: {object_path}"
+                )
+            if object_path.exists():
+                temporary_object_path.unlink(missing_ok=True)
+            else:
+                temporary_object_path.replace(object_path)
+            return int(compile_us)
+
+        runtime_compile_us = 0
+        if modules_to_compile:
+            runtime_compile_us = compile_object(
+                runtime_source_path,
+                runtime_object_path,
+                "/O2",
+            )
+            thinlto_cache_directory.mkdir(parents=True, exist_ok=True)
+
         def compile_module(item: dict[str, Any]) -> None:
             module = item["module"]
             source_path = item["source_path"]
+            object_path = item["object_path"]
             dll_path = item["dll_path"]
+            pdb_path = item["pdb_path"]
             if _is_native_dll_artifact(dll_path):
                 item["artifact_adopted"] = True
                 return
             emit_started_ns = time.perf_counter_ns()
             source = emit_cpp(
                 module,
-                exported_symbol=self.SYMBOL,
+                exported_symbol=item["native_symbol"],
                 resumable=True,
                 observer_addresses=observer_addresses,
                 callback_addresses=callback_addresses,
@@ -11616,6 +11876,7 @@ class NativeResumableExecutor:
                 registerize_guest_state=registerized_guest_state_enabled,
                 coalesce_memory_accesses=coalesced_memory_accesses_enabled,
                 synchronize_eip_for_callbacks=synchronize_eip_for_callbacks,
+                runtime_header=runtime_header_name,
             )
             source_path.write_text(source, encoding="utf-8", newline="\n")
             item["source_emit_us"] = (
@@ -11642,29 +11903,39 @@ class NativeResumableExecutor:
                 item["artifact_adopted"] = True
                 item["equivalent_source_reused"] = True
                 return
-            compile_started_ns = time.perf_counter_ns()
+            item["compile_us"] = compile_object(
+                source_path,
+                object_path,
+                item["optimization"],
+            )
+            link_started_ns = time.perf_counter_ns()
             completed = subprocess.run(
                 [
                     compiler_executable,
                     "/nologo",
                     "/std:c++17",
-                    item["optimization"],
                     "/LD",
-                    str(source_path),
+                    "-fuse-ld=lld",
+                    str(object_path),
+                    str(runtime_object_path),
                     f"/Fe:{temporary_dll_path}",
                     "/link",
                     "/NOIMPLIB",
+                    "/OPT:REF",
+                    "/OPT:ICF",
+                    *(["/DEBUG:FULL", f"/PDB:{pdb_path}"] if preserve_debug_symbols else []),
+                    f"/lldltocache:{thinlto_cache_directory}",
                 ],
                 capture_output=True,
                 text=True,
                 check=False,
                 creationflags=compile_creation_flags,
+                env=compile_environment,
             )
-            item["compile_us"] = (
-                time.perf_counter_ns() - compile_started_ns
-            ) // 1_000
+            item["link_us"] = (time.perf_counter_ns() - link_started_ns) // 1_000
             if completed.returncode != 0:
                 temporary_dll_path.unlink(missing_ok=True)
+                pdb_path.unlink(missing_ok=True)
                 raise NativeExecutorError(
                     "native guest-loop compilation failed:\n"
                     + (completed.stdout + completed.stderr).strip()
@@ -11703,8 +11974,66 @@ class NativeResumableExecutor:
                     artifact_path=item["dll_path"],
                 )
         manifest.prune_if_needed(
-            protected_artifacts=(item["dll_path"] for item in modules)
+            protected_artifacts=(item["dll_path"] for item in modules),
+            force_size_check=preserve_debug_symbols,
         )
+        debug_metadata_records = []
+        debug_module_records = []
+        for item in modules:
+            metadata_path = item["debug_metadata_path"]
+            if not metadata_path.is_file():
+                source = item["source_path"].read_text(encoding="utf-8")
+                metadata = build_module_debug_metadata(
+                    item["module"],
+                    source,
+                    source_path=item["source_path"],
+                    object_path=item["object_path"],
+                    artifact_path=item["dll_path"],
+                    pdb_path=(
+                        item["pdb_path"] if item["pdb_path"].is_file() else None
+                    ),
+                    native_symbol=item["native_symbol"],
+                    configuration_key=item["configuration_key"],
+                    content_digest=item["content_digest"],
+                )
+                write_module_debug_metadata(metadata_path, metadata)
+            else:
+                address_ranges = guest_address_ranges(item["module"])
+                metadata = {
+                    "partition_start": item["partition_start"],
+                    "partition_end": item["partition_end"],
+                    "native_symbol": item["native_symbol"],
+                    "address_ranges": [
+                        {"start": start, "end": end}
+                        for start, end in address_ranges
+                    ],
+                    "source": item["source_path"].name,
+                    "object": item["object_path"].name,
+                    "artifact": item["dll_path"].name,
+                    "pdb": (
+                        item["pdb_path"].name
+                        if item["pdb_path"].is_file()
+                        else None
+                    ),
+                    "entry_count": len(item["module"].instructions),
+                }
+            debug_metadata_records.append((metadata_path, metadata))
+            debug_module_records.append(
+                {
+                    "partition_start": item["partition_start"],
+                    "partition_end": item["partition_end"],
+                    "metadata_path": metadata_path,
+                    "native_symbol": item["native_symbol"],
+                    "address_ranges": guest_address_ranges(item["module"]),
+                }
+            )
+        self.debug_metadata_path = write_native_debug_index(
+            build_dir, debug_metadata_records
+        )
+        self._debug_module_records = tuple(debug_module_records)
+        self._debug_locations_by_address: dict[int, dict[str, Any]] = {}
+        self._loaded_debug_metadata: set[Path] = set()
+        self._etw_annotations = _NativeEtwAnnotations(preserve_debug_symbols)
         self.cache_summary = {
             **manifest.summary(),
             "configuration_key": base_configuration_key,
@@ -11778,46 +12107,118 @@ class NativeResumableExecutor:
             "compile_wall_us": compile_wall_us,
             "source_emit_us": sum(int(item["source_emit_us"]) for item in modules),
             "compiler_process_us": sum(int(item["compile_us"]) for item in modules),
+            "link_process_us": sum(int(item.get("link_us", 0)) for item in modules),
+            "runtime_support_compile_us": runtime_compile_us,
+            "runtime_support_digest": runtime_support_digest,
+            "runtime_abi_version": AOT_RUNTIME_ABI_VERSION,
+            "compiler_cache_enabled": compiler_cache_executable is not None,
+            "thinlto_cache_directory": str(thinlto_cache_directory),
+            "generated_object_count": sum(
+                _is_native_object_artifact(item["object_path"]) for item in modules
+            ),
+            "generated_pdb_count": sum(item["pdb_path"].is_file() for item in modules),
+            "preserve_debug_symbols": bool(preserve_debug_symbols),
+            "debug_metadata_path": str(self.debug_metadata_path),
+            "debug_etw_provider": (
+                NATIVE_DEBUG_ETW_PROVIDER if self._etw_annotations.enabled else None
+            ),
         }
         manifest.close()
 
         dispatcher_digest = hashlib.sha256(
-            ("clang-cl-o2-native-module-dispatch-v5\n" + _NATIVE_DISPATCH_SOURCE).encode(
-                "utf-8"
-            )
-        ).hexdigest()[:16]
+            json.dumps(
+                {
+                    "profile": "clang-cl-thinlto-native-module-dispatch-v7",
+                    "compiler": compiler_identity,
+                    "flags": [
+                        "/std:c++17",
+                        "/O2",
+                        *(["/Z7"] if preserve_debug_symbols else []),
+                        "/c",
+                        "-flto=thin",
+                    ],
+                    "source": hashlib.sha256(
+                        _NATIVE_DISPATCH_SOURCE.encode("utf-8")
+                    ).hexdigest(),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:24]
         dispatcher_source_path = build_dir / f"native-dispatch-{dispatcher_digest}.cpp"
+        dispatcher_object_path = build_dir / f"native-dispatch-{dispatcher_digest}.obj"
         dispatcher_dll_path = build_dir / f"native-dispatch-{dispatcher_digest}.dll"
+        dispatcher_pdb_path = dispatcher_dll_path.with_suffix(".pdb")
+        dispatcher_compiled = False
         if not dispatcher_dll_path.exists():
             dispatcher_source_path.write_text(
                 _NATIVE_DISPATCH_SOURCE,
                 encoding="utf-8",
                 newline="\n",
             )
+            compile_object(dispatcher_source_path, dispatcher_object_path, "/O2")
+            thinlto_cache_directory.mkdir(parents=True, exist_ok=True)
             completed = subprocess.run(
                 [
                     compiler_executable,
                     "/nologo",
                     "/std:c++17",
-                    "/O2",
                     "/LD",
-                    str(dispatcher_source_path),
+                    "-fuse-ld=lld",
+                    str(dispatcher_object_path),
                     f"/Fe:{dispatcher_dll_path}",
                     "/link",
                     "/NOIMPLIB",
+                    "/OPT:REF",
+                    "/OPT:ICF",
+                    *(
+                        ["/DEBUG:FULL", f"/PDB:{dispatcher_pdb_path}"]
+                        if preserve_debug_symbols
+                        else []
+                    ),
+                    f"/lldltocache:{thinlto_cache_directory}",
                 ],
                 capture_output=True,
                 text=True,
                 check=False,
                 creationflags=compile_creation_flags,
+                env=compile_environment,
             )
             if completed.returncode != 0:
                 raise NativeExecutorError(
                     "native module dispatcher compilation failed:\n"
                     + (completed.stdout + completed.stderr).strip()
                 )
+            dispatcher_compiled = True
+
+        source_bytes_compiled = sum(
+            int(item["source_path"].stat().st_size) for item in modules if item["compiled"]
+        )
+        compiled_source_count = sum(bool(item["compiled"]) for item in modules)
+        if runtime_compile_us:
+            source_bytes_compiled += runtime_source_path.stat().st_size
+            compiled_source_count += 1
+        if dispatcher_compiled:
+            source_bytes_compiled += dispatcher_source_path.stat().st_size
+            compiled_source_count += 1
+        self.cache_summary["source_bytes_compiled"] = source_bytes_compiled
+        self.cache_summary["compiled_source_count"] = compiled_source_count
+        if compiler_cache_executable is not None:
+            cache_stats_path = build_dir / "compiler-cache-stats.json"
+            compiler_cache_stats = write_stats(
+                compiler_cache_executable,
+                compile_environment,
+                cache_stats_path,
+                source_bytes_compiled=source_bytes_compiled,
+                compiled_source_count=compiled_source_count,
+            )
+            self.cache_summary["compiler_cache_telemetry"] = compiler_cache_stats.get(
+                "b2_recomp", {}
+            )
+            self.cache_summary["compiler_cache_stats_path"] = str(cache_stats_path)
 
         self.dll_path = modules[0]["dll_path"]
+        self._capsule_functions = tuple(item["module"] for item in modules)
         self._base_address = function.base_address
         self._native_fast_paths = native_fast_paths
         self._host_call_addresses = frozenset(callback_addresses)
@@ -11851,7 +12252,7 @@ class NativeResumableExecutor:
             module = item["module"]
             dll_path = item["dll_path"]
             library = ctypes.CDLL(str(dll_path))
-            entry = getattr(library, self.SYMBOL)
+            entry = getattr(library, item["native_symbol"])
             entry.argtypes = [ctypes.POINTER(_Context)]
             entry.restype = ctypes.c_uint32
             self._libraries.append(library)
@@ -12258,6 +12659,71 @@ class NativeResumableExecutor:
         self._resource_span_scan_tracked_word_count = ctypes.c_uint64()
         self._resource_span_scan_skipped_word_count = ctypes.c_uint64()
         self._resource_span_scan_aggregated_index_word_count = ctypes.c_uint64()
+
+    def _native_symbol_for_address(self, address: int) -> str | None:
+        for record in self._debug_module_records:
+            if any(start <= address < end for start, end in record["address_ranges"]):
+                return str(record["native_symbol"])
+        return None
+
+    def _debug_location_for_address(self, address: int) -> dict[str, Any] | None:
+        cached = self._debug_locations_by_address.get(address)
+        if cached is not None:
+            return cached
+        for record in self._debug_module_records:
+            if not any(
+                start <= address < end for start, end in record["address_ranges"]
+            ):
+                continue
+            metadata_path = record["metadata_path"]
+            if metadata_path not in self._loaded_debug_metadata:
+                try:
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    return None
+                if not isinstance(metadata, dict):
+                    return None
+                for entry in metadata.get("entries", []):
+                    if isinstance(entry, dict):
+                        self._debug_locations_by_address[
+                            int(entry["guest_address"])
+                        ] = entry
+                self._loaded_debug_metadata.add(metadata_path)
+            return self._debug_locations_by_address.get(address)
+        return None
+
+    def capture_manual_replay_capsule(
+        self,
+        output: Path,
+        *,
+        state: CpuState,
+        memory: SparseMemory,
+        scheduler_state: Mapping[str, Any],
+        service_state: Mapping[str, Any],
+        provenance: Mapping[str, Any],
+        resources: Mapping[str, bytes | Path] | None = None,
+        events: Mapping[str, Sequence[Any]] | None = None,
+    ) -> Path:
+        """Capture an explicitly requested local checkpoint at a host boundary."""
+
+        from tools.playability.replay_capsule import (
+            capture_replay_capsule,
+            require_local_capsule_output,
+        )
+
+        require_local_capsule_output(output, synthetic=False)
+        return capture_replay_capsule(
+            output,
+            state=state,
+            memory=memory,
+            functions=self._capsule_functions,
+            scheduler_state=scheduler_state,
+            service_state=service_state,
+            provenance={**provenance, "manual_capture": True},
+            resources=resources,
+            events=events,
+            capture_kind="manual",
+        )
 
     def scan_resource_methods(
         self,
@@ -14950,12 +15416,44 @@ class NativeResumableExecutor:
                 if address
             ]
             native_fast_path_counts.sort(key=lambda item: item["address"])
+            debug_location = self._debug_location_for_address(target)
+            if debug_location is None:
+                debug_location = self._debug_location_for_address(dispatch_eip)
+            current_service = (
+                int(native_host_services.last_service_target)
+                if native_host_services_enabled and native_host_services is not None
+                else 0
+            )
+            diagnostic_context = {
+                "guest_eip": target,
+                "guest_eip_hex": f"0x{target:08X}",
+                "dispatch_eip": dispatch_eip,
+                "dispatch_eip_hex": f"0x{dispatch_eip:08X}",
+                "current_service": current_service or None,
+                "current_service_hex": (f"0x{current_service:08X}" if current_service else None),
+                "native_symbol": (
+                    debug_location.get("native_symbol")
+                    if debug_location is not None
+                    else self._native_symbol_for_address(dispatch_eip)
+                ),
+                "generated_function": (
+                    debug_location.get("generated_function") if debug_location is not None else None
+                ),
+                "generated_source": (
+                    debug_location.get("source") if debug_location is not None else None
+                ),
+                "generated_source_line": (
+                    debug_location.get("source_line") if debug_location is not None else None
+                ),
+                "debug_metadata": str(self.debug_metadata_path),
+            }
             self.last_run_summary = {
                 "reason": reason,
                 "target": target,
                 "target_hex": f"0x{target:08X}",
                 "dispatch_eip": dispatch_eip,
                 "dispatch_eip_hex": f"0x{dispatch_eip:08X}",
+                "diagnostic_context": diagnostic_context,
                 "native_module_cache": self.cache_summary,
                 "steps": int(context.steps),
                 "step_budget": int(context.step_budget),
@@ -15121,6 +15619,12 @@ class NativeResumableExecutor:
                 ],
                 "transitions": list(transitions),
             }
+            self._etw_annotations.write(
+                reason=reason,
+                guest_eip=target,
+                current_service=current_service,
+                native_symbol=diagnostic_context["native_symbol"],
+            )
             for index in range(int(self._dispatch_touched_count.value)):
                 slot = int(self._dispatch_touched_slots[index])
                 self._dispatch_target_call_counts[slot] = 0
@@ -15431,6 +15935,14 @@ class NativeResumableExecutor:
                             )
                             for edge in relevant_edges[-8:]
                         ) + "]"
+                fault_debug = self._debug_location_for_address(fault_eip)
+                native_debug_context = ""
+                if fault_debug is not None:
+                    native_debug_context = (
+                        f", native_symbol={fault_debug['native_symbol']}"
+                        f", generated_source={fault_debug['source']}:"
+                        f"{fault_debug['source_line']}"
+                    )
                 raise NativeExecutorError(
                     f"native guest {fault_label} at 0x{fault_eip:08X} "
                     f"from dispatch 0x{dispatch_eip:08X} "
@@ -15438,7 +15950,7 @@ class NativeResumableExecutor:
                     f"ecx=0x{int(context.ecx):08X}, "
                     f"edx=0x{int(context.edx):08X}, "
                     f"ebp=0x{frame_pointer:08X}{frame_context}"
-                    f"{service_context}{edge_context})"
+                    f"{service_context}{edge_context}{native_debug_context})"
                 )
             transitions.append(
                 {

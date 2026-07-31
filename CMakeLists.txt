@@ -88,6 +88,8 @@ if(BUILD_TESTING)
     add_executable(
         b2r_native_tests
         tests/native/nv2a_vertex_program_tests.cpp
+        tests/native/nv2a_vertex_program_execution_tests.cpp
+        tests/native/nv2a_vertex_program_test_main.cpp
     )
     target_link_libraries(b2r_native_tests PRIVATE b2r_nv2a_vertex_program)
     b2r_configure_native_target(b2r_native_tests)
@@ -95,6 +97,10 @@ if(BUILD_TESTING)
     add_executable(
         b2r_host_core_tests
         tests/native/host_core_tests.cpp
+        tests/native/host_transport_tests.cpp
+        tests/native/host_texture_tests.cpp
+        tests/native/host_pipeline_tests.cpp
+        tests/native/host_core_test_main.cpp
     )
     target_link_libraries(b2r_host_core_tests PRIVATE b2r_nv2a_vertex_program)
     b2r_configure_native_target(b2r_host_core_tests)
@@ -110,6 +116,10 @@ if(BUILD_TESTING)
         add_test(
             NAME "native.nv2a_vertex_program.${test_case}"
             COMMAND b2r_native_tests "${test_case}"
+        )
+        set_tests_properties(
+            "native.nv2a_vertex_program.${test_case}"
+            PROPERTIES LABELS "native;nv2a;nv2a_vertex_program"
         )
     endforeach()
 
@@ -128,7 +138,34 @@ if(BUILD_TESTING)
             NAME "native.host_core.${test_case}"
             COMMAND b2r_host_core_tests "${test_case}"
         )
+        set_tests_properties(
+            "native.host_core.${test_case}"
+            PROPERTIES LABELS "native;host_core"
+        )
     endforeach()
+    set_tests_properties(
+        native.host_core.transport_layout_and_sequences
+        native.host_core.dirty_range_lifetime
+        PROPERTIES LABELS "native;host_core;renderer;transport"
+    )
+    set_tests_properties(
+        native.host_core.texture_layout_and_formats
+        native.host_core.texture_unswizzle
+        PROPERTIES LABELS "native;host_core;renderer;texture;nv2a"
+    )
+    set_tests_properties(
+        native.host_core.native_pipeline_primitives
+        native.host_core.pipeline_key_and_fps_sampler
+        PROPERTIES LABELS "native;host_core;renderer;pipeline"
+    )
+    set_tests_properties(
+        native.host_core.nv2a_raster_coordinates
+        PROPERTIES LABELS "native;host_core;renderer;nv2a"
+    )
+    set_tests_properties(
+        native.host_core.command_work_cache_layout_reuse
+        PROPERTIES LABELS "native;host_core;renderer;transport;pipeline"
+    )
 endif()
 
 if(B2R_BUILD_PRESENTER)

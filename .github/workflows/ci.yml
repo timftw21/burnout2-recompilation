@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: b2-recomp-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   synthetic-validation:
     runs-on: windows-2025
@@ -26,8 +30,37 @@ jobs:
       - name: Install pinned dependencies
         run: python -m pip install --requirement requirements-dev.lock
 
+      - name: Install pinned compiler cache
+        run: python tools/compiler_cache.py install
+
+      - name: Restore representative AOT, ThinLTO, and compiler caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/cache/sccache
+            build/local/representative-aot
+          key: >-
+            synthetic-aot-${{ runner.os }}-
+            ${{ hashFiles('tools/native_toolchain.lock.json', 'tools/compiler_cache.lock.json') }}-
+            ${{ hashFiles('requirements*.lock', 'tools/recomp/**/*.py', 'tools/compiler_cache.py') }}
+          restore-keys: |
+            synthetic-aot-${{ runner.os }}-
+
       - name: Run Python and asset-free quality gate
         run: python tools/quality_gate.py
+
+      - name: Retain concise validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-validation-evidence
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            reports/local/validation/failures
+            build/local/dev-check/validation-timings.json
+            build/local/dev-check/test-durations.json
+            build/local/representative-aot/compiler-cache-stats.json
 
   native-validation:
     runs-on: windows-2025
@@ -35,10 +68,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        preset:
-          - debug
-          - release
-          - sanitizer
+        include:
+          - name: debug
+            preset: debug
+            presenter_args: ""
+          - name: release
+            preset: release
+            presenter_args: ""
+          - name: sanitizer
+            preset: sanitizer
+            presenter_args: ""
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -53,5 +92,44 @@ jobs:
       - name: Install pinned native build tools
         run: python -m pip install --requirement requirements-dev.lock
 
+      - name: Install pinned compiler cache
+        run: python tools/compiler_cache.py install
+
+      - name: Restore content-addressed compiler outputs
+        uses: actions/cache@v4
+        with:
+          path: build/cache/sccache
+          key: >-
+            sccache-${{ runner.os }}-${{ matrix.name }}-
+            ${{ hashFiles('tools/native_toolchain.lock.json', 'tools/compiler_cache.lock.json') }}-
+            ${{ hashFiles('CMakeLists.txt', 'CMakePresets.json') }}-
+            ${{ hashFiles('requirements*.lock', 'runtime/**/*.cpp', 'runtime/**/*.h', 'tests/native/**/*.cpp', 'tests/native/**/*.h', 'tools/recomp/**/*.py') }}
+          restore-keys: |
+            sccache-${{ runner.os }}-${{ matrix.name }}-
+
       - name: Configure, build, and test native targets
-        run: python tools/native_build.py --preset ${{ matrix.preset }}
+        run: >-
+          python tools/validation_command.py
+          --name native-${{ matrix.name }}
+          --budget-seconds 600
+          --
+          python tools/native_build.py
+          --preset ${{ matrix.preset }}
+          ${{ matrix.presenter_args }}
+          --compiler-cache required
+
+      - name: Report compiler-cache telemetry
+        if: always()
+        run: python tools/compiler_cache.py stats --output build/local/compiler-cache/ci-${{ matrix.name }}.json
+
+      - name: Retain concise native validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.name }}-validation-evidence
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            reports/local/validation/failures
+            build/local/dev-check/validation-timings.json
+            build/local/compiler-cache/ci-${{ matrix.name }}.json

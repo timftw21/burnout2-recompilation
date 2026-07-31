@@ -35,16 +35,34 @@ include evidence and a focused regression.
 
 ## Required validation
 
-Run the complete asset-free gate before requesting review:
+During development, use the focused selector and review its explanation:
 
 ```powershell
-python .\tools\quality_gate.py --full
+python .\tools\dev_check.py --explain
 ```
 
-The command runs bytecode compilation, Ruff, strict type checking, native
-build-tool validation, maintenance budgets, the synthetic four-layer preflight,
-the Python unit suite, and the debug CTest suite. Presenter changes additionally
-require the exact local SDK build:
+Unknown source or build areas deliberately fan out to the complete Python
+suite. `--all` bypasses changed-file selection, and `--no-cache` forces every
+selected node to execute. Emitter changes run the bounded representative AOT
+corpus during iteration; do not regenerate the complete decoded store until an
+explicit preflight/full closeout.
+
+Launch the exhaustive matrix before requesting review; it starts only after
+the focused changed/subsystem gate passes and does not block further editing:
+
+```powershell
+python .\tools\dev_check.py --launch-closeout
+```
+
+The background closeout runs bytecode compilation, Ruff, strict type checking,
+native build-tool validation, maintenance budgets, the synthetic four-layer
+preflight, case-sharded Python tests, debug/release/sanitizer CTest, and the
+strict release presenter through a budgeted dependency graph. Add manually
+captured `--closeout-replay-capsule` inputs when the change requires long title
+replay coverage. Cache reuse is explicit; use `quality_gate.py --full
+--no-cache` only when a blocking cold debug result is specifically required.
+Presenter changes still require the exact local SDK boundary used by the
+closeout:
 
 ```powershell
 python .\tools\native_build.py --preset release --presenter

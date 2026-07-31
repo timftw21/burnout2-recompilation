@@ -12,24 +12,24 @@ remain owned by their rights holders.
 
 ## Project status
 
-Updated: July 26, 2026.
+Updated: July 31, 2026.
 
-The recovered boot path runs through a resumable native guest loop, presents
-completed NV2A frames through Vulkan, and uses SDL3 for frontend audio plus
-keyboard and gamepad input. Lesson One renders the world, HUD, and player car
-at the correct chase-camera scale. Guest throughput and unimplemented title
-semantics remain active work.
+The supported Xbox build boots through a static, resumable native guest loop
+and is playable through the frontend and Lesson One. Vulkan output is close to
+the original console, and SDL3 audio, keyboard, and gamepad input are active.
+Performance is the main blocker: current gameplay is well below the 60 Hz
+simulation target. Autosave and controller rumble remain incomplete.
 
 | Area | Status |
 | --- | --- |
 | XBE inspection and loader | Complete for the current title |
 | Analysis database | Complete and reproducible |
 | Runtime ABI shims | Implemented for the currently reached path |
-| IA-32 execution | Recovered boot, frontend, and Lesson One path running |
-| Vulkan presentation | Live completed-flip presentation with strict validation |
-| Audio and input | Native PCM/Xbox ADPCM observation, mixing, SDL3 submission, and buffer `Play` ABI completion; gameplay audio still needs manual acceptance |
+| IA-32 execution | Static native boot, frontend, and Lesson One path running |
+| Vulkan presentation | Live completed-flip presentation with close visual parity |
+| Audio and input | Native PCM/Xbox ADPCM mixing and SDL3 submission/input; rumble pending |
 | Provenance | Exact supported-XBE gate and content-addressed build/run manifests |
-| Save states | Not implemented |
+| Saves | Local storage works; autosave remains incomplete |
 
 Detailed rendering coverage, retained measurements, and current limitations
 are maintained in [docs/VALIDATION.md](docs/VALIDATION.md).
@@ -65,12 +65,16 @@ python .\tools\extract\extract_disc.py `
   --iso ".\Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso"
 ```
 
-Run the complete asset-free gate, then launch normal live execution:
+Run the changed-file-aware development gate, then launch normal live execution:
 
 ```powershell
-python .\tools\quality_gate.py --full
+python .\tools\dev_check.py --explain
 python .\tools\playability\live_test.py
 ```
+
+Use `python .\tools\dev_check.py --launch-closeout` to run the focused handoff
+gate and then start the exhaustive closeout matrix without blocking the edit
+loop. `tools/validation_closeout.py status <run-directory>` reports progress.
 
 The native presenter requires the pinned Vulkan/SDL3 toolchain. Initial native
 recovery can take substantially longer than a warm launch. Setup details,
@@ -113,43 +117,20 @@ gain and looping policy, mixes normalized PCM16, and submits it through the
 narrow SDL3 presenter ABI. Bounded probes, lossless audits, and frozen replays
 intentionally retain isolated Python diagnostic paths.
 
-The loading path now services the title's registered D3D vertical-blank
-callback natively at a wall-clock-paced 60 Hz, which unblocks the asynchronous
-asset pump that previously remained on `Loading - please wait`. The reached
-`IDirectSoundBuffer::Play` wrapper is now a complete native host ABI boundary:
-it commits the recovered guest voice state, returns the guest HRESULT, performs
-the exact stack cleanup, and does not enter the Xbox SDK hardware path. Manual
-gameplay acceptance beyond the former stall remains pending; current status and
-the exact retained snapshot are recorded in
-[docs/VALIDATION.md](docs/VALIDATION.md#july-26-native-vblank-and-audio-investigation).
-
-The native-boundary checkpoint now reports zero Python runtime ABI, handler,
-cold-host, memory, observer, and slice-yield callbacks on warm bounded runs
-through the currently reached path. One Python dirty-page materialization
-occurs only after guest execution to compose the diagnostic report. Bounded run
-`e0884dd7-5a27-403f-88c6-a4be1263df12` completed the render-publication
-acceptance: native code published 53 exact command/resource generations, the
-presenter acknowledged all 53 and applied 52 incremental reloads, and all
-generations passed render validation with zero frontier-interpreter activity
-and runtime compilation disabled. See
-[docs/VALIDATION.md](docs/VALIDATION.md#native-migration-acceptance).
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full ownership model.
+Normal gameplay reports zero Python runtime callbacks, runtime compilation,
+native promotion, and frontier-interpreter activity. Python remains responsible
+for deterministic artifact preparation, launch, and post-run diagnostics. See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the ownership model and
+[docs/VALIDATION.md](docs/VALIDATION.md) for retained run evidence.
 
 ## Validation
 
-The current Python unit suite passes 675 tests and the current native suite
-passes 13 CTest cases; the last retained asset-free closeout gate passed 548
-Python tests and 10 native CTest cases. The validated
-exact-target baseline reaches Lesson One with live Vulkan rendering, SDL3
-frontend audio and input, local storage, streamed track data, and cooperative
-workers. Native local storage includes first-run Xbox cache-partition table
-assignment and FATX device formatting. The migrated native path has cleared the
-former `sample.xsb` XACT
-failure and runs native-clean through 20 million guest instructions, with
-longer coverage probes reaching about 91 million. The `0x00073150` and
-`0x00055970` address-taken targets are persisted, and the fully warm first-flip
-acceptance run completes the current native migration checkpoint.
+The current asset-free suite discovers 727 Python cases and 13 native CTest
+cases. The July 31 exhaustive closeout passed the asset-free gate, debug,
+release, sanitizer, and strict-presenter stages in 130.16 seconds. Validation
+uses changed-file selection, case-level sharding, content-addressed caches,
+runtime budgets, and bounded first-failure capsules. Run the focused gate while
+editing and reserve the exhaustive matrix for integration or handoff.
 
 Local evidence under `reports/local/` is ignored and must not be committed.
 Performance and compatibility claims must cite their exact run identity,
@@ -182,20 +163,6 @@ tests/native/    Asset-free C++/CTest regressions
 
 `data/local/`, `reports/local/`, build/cache directories, extracted game
 content, generated C++, and recovered stream reports are ignored.
-
-## Development priorities
-
-1. Build a bounded, workload-locked gameplay performance distribution.
-2. Promote corrected complete-world and Load/Save captures into strict
-   preflight replay coverage.
-3. Optimize remaining guest simulation cost without changing guest-visible
-   behavior.
-4. Design a versioned save state covering CPU, sparse-memory changes, runtime
-   objects, audio, and the live bridge.
-5. Characterize longer-run input/audio behavior and replace remaining
-   probe-only models when evidence permits.
-6. Extend IA-32, NV2A, and Xbox ABI support only for observed paths, with a
-   focused regression for every new edge.
 
 See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md) for licensing and third-party
 notices.

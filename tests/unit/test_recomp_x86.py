@@ -16,6 +16,7 @@ from tools.recomp.x86_lifter import (
     build_recompilation_summary,
     cpp_sha256,
     emit_cpp,
+    emit_cpp_runtime_support,
     execute_lifted_function,
     lift_x86_block,
     lift_x86_function,
@@ -40,6 +41,32 @@ def _sum_helper_bytes() -> bytes:
 
 
 class X86RecompPrototypeTests(unittest.TestCase):
+    def test_aot_runtime_helpers_are_emitted_once_behind_a_versioned_header(self) -> None:
+        function = lift_x86_function(
+            _sum_helper_bytes(),
+            base_address=0x1000,
+            symbol="compact_sum_helper",
+        )
+        legacy = emit_cpp(function, resumable=True)
+        header, implementation = emit_cpp_runtime_support(
+            header_name="b2r_aot_runtime_v1.h"
+        )
+        compact = emit_cpp(
+            function,
+            resumable=True,
+            runtime_header="b2r_aot_runtime_v1.h",
+        )
+
+        self.assertIn("#define B2R_AOT_RUNTIME_ABI_VERSION 1", header)
+        self.assertIn("void b2r_write_u32(B2RContext* ctx", header)
+        self.assertNotIn("static inline", header)
+        self.assertIn('#include "b2r_aot_runtime_v1.h"', implementation)
+        self.assertIn("void b2r_write_u32(B2RContext* ctx", implementation)
+        self.assertNotIn("static inline", implementation)
+        self.assertIn('#include "b2r_aot_runtime_v1.h"', compact)
+        self.assertNotIn("struct B2RContext", compact)
+        self.assertLess(len(compact), len(legacy) // 2)
+
     def test_sparse_memory_reports_only_pages_changed_since_last_boundary(self) -> None:
         memory = SparseMemory({0x3000: 1, 0x8000: 2})
 

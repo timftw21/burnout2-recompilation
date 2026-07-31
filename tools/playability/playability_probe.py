@@ -19488,6 +19488,7 @@ def _execute_recovered_control_flow_frame(
                 module_functions=[frame],
                 callback_addresses=bootstrap_targets,
                 aot_optimization_mode=aot_optimization_mode,
+                preserve_debug_symbols=profile_hot_paths,
             )
             returned_to = bootstrap_executor.run(
                 state,
@@ -22125,6 +22126,7 @@ def _execute_guest_thread_start(
                     synchronize_eip_for_callbacks=audit_title_main_loop_exit,
                     compile_worker_limit=compile_worker_limit,
                     low_priority_compilation=low_priority_compilation,
+                    preserve_debug_symbols=profile_hot_paths,
                 )
                 if install_render_scanners:
                     render_watchpoint.set_native_resource_method_scanner(

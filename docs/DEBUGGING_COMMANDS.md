@@ -691,6 +691,66 @@ the application screenshot handler.
 
 ## Preflight and regression gates
 
+### Deterministic replay capsules
+
+The user first reaches the desired gameplay boundary manually. A capture hook
+can then call `NativeResumableExecutor.capture_manual_replay_capsule(...)` at
+that host boundary, or serialize the same CPU,
+sparse-page, decoded-program, scheduler/service, resource, event, and provenance
+records for the packer:
+
+```powershell
+python .\tools\playability\replay_capsule.py capture `
+  --spec .\reports\local\replay\manual-checkpoint.json `
+  --output .\reports\local\replay\before-flip.b2rcap
+python .\tools\playability\replay_capsule.py inspect `
+  .\reports\local\replay\before-flip.b2rcap
+```
+
+The spec must declare `provenance.manual_capture=true`. Proprietary output is
+accepted only below `reports/local/` or `data/local/`; no command automates
+input. To compare the accepted interpreter with native AOT and preserve a
+last-matching failure capsule:
+
+```powershell
+python .\tools\playability\differential_replay.py execute `
+  .\reports\local\replay\before-flip.b2rcap `
+  --experimental native `
+  --max-steps 20000 `
+  --build-dir .\build\local\replay\native `
+  --failure-capsule .\reports\local\replay\first-divergence.b2rcap `
+  --report .\reports\local\replay\first-divergence.json
+```
+
+Compare old/new presenter traces at the typed packet boundary without running
+guest code:
+
+```powershell
+python .\tools\playability\differential_replay.py compare-events `
+  .\reports\local\replay\accepted-events.json `
+  .\reports\local\replay\experimental-events.json `
+  --stream render_events `
+  --report .\reports\local\replay\packet-divergence.json
+```
+
+### Native address lookup and ETW correlation
+
+Print the exact generated case, decoded block/IR, object, DLL, PDB, source line,
+and address-derived symbol for a guest address:
+
+```powershell
+python .\tools\recomp\debug_metadata.py 0x0021976D `
+  --build-dir .\build\native-guest-loop
+```
+
+Use `--metadata-only` to omit the source body and `--context N` to include
+neighboring generated lines. Local debug replay retains PDBs and emits run
+boundary annotations with guest EIP, current service, and native symbol through
+ETW provider `{B2EC0A07-7E71-4A64-923B-327751105EB2}`. The same tuple is present
+in `last_run_summary.diagnostic_context` and native fault text for crash-dump
+correlation. Normal release AOT still emits the compact JSON mapping but does
+not retain PDBs.
+
 Asset-free synthetic preflight:
 
 ```powershell

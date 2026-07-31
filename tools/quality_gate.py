@@ -1,60 +1,41 @@
 #!/usr/bin/env python3
-"""Run the repository's asset-free validation gates from one entry point."""
+"""Run the repository's asset-free validation gates through the cached DAG."""
 
 from __future__ import annotations
 
 import argparse
-import subprocess
+import os
 import sys
 from pathlib import Path
+from typing import Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PYTHON = sys.executable
-
-BASE_COMMANDS: tuple[tuple[str, ...], ...] = (
-    (PYTHON, "-m", "compileall", "-q", "runtime", "tools", "tests"),
-    (PYTHON, "-m", "ruff", "check", "runtime", "tools", "tests"),
-    (PYTHON, "-m", "mypy"),
-    (PYTHON, "tools/native_toolchain.py", "--build-tools-only"),
-    (
-        PYTHON,
-        "tools/project_maintenance.py",
-        "status",
-        "--fail-over-budget",
-    ),
-    (
-        PYTHON,
-        "tools/playability/preflight_validation.py",
-        "--synthetic-fixtures",
-    ),
-    (PYTHON, "-m", "unittest", "discover", "-s", "tests", "-t", "."),
-)
-
-FULL_COMMANDS: tuple[tuple[str, ...], ...] = (
-    (PYTHON, "tools/native_build.py", "--preset", "debug"),
-)
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
-def run_commands(commands: tuple[tuple[str, ...], ...]) -> int:
-    for command in commands:
-        print(f"+ {subprocess.list2cmdline(command)}", flush=True)
-        result = subprocess.run(command, cwd=REPO_ROOT, check=False)
-        if result.returncode != 0:
-            return result.returncode
-    return 0
-
-
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--full",
         action="store_true",
         help="also configure, build, and run the debug native CTest suite",
     )
+    parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--explain", action="store_true")
+    parser.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 1))
     args = parser.parse_args(argv)
-    commands = BASE_COMMANDS + (FULL_COMMANDS if args.full else ())
-    return run_commands(commands)
+    from tools.dev_check import main as dev_check_main
+
+    forwarded = ["--all", "--jobs", str(args.jobs)]
+    if args.full:
+        forwarded.append("--full")
+    if args.no_cache:
+        forwarded.append("--no-cache")
+    if args.explain:
+        forwarded.append("--explain")
+    return dev_check_main(forwarded)
 
 
 if __name__ == "__main__":
