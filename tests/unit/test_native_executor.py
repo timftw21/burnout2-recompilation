@@ -22,6 +22,7 @@ from tools.recomp.native_executor import (
     NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_FORMAT,
     NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_FREQUENCY,
     NATIVE_HOST_SERVICE_AUDIO_BUFFER_GET_POSITION,
+    NATIVE_HOST_SERVICE_AUDIO_BUFFER_GET_STATUS,
     NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_POSITION,
     NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_VOLUME,
     NATIVE_HOST_SERVICE_AUDIO_BUFFER_STOP_EX,
@@ -81,6 +82,7 @@ from tools.recomp.native_executor import (
     NATIVE_HOST_SERVICE_RETURN_CONSTANT,
     NATIVE_HOST_SERVICE_SYSTEM_TIME,
     NATIVE_HOST_SERVICE_TITLE,
+    NATIVE_HOST_SERVICE_TITLE_ASSET_CLOSE,
     NATIVE_HOST_SERVICE_TITLE_ASSET_OPEN,
     NATIVE_HOST_SERVICE_TITLE_ASSET_READ,
     NATIVE_HOST_SERVICE_TITLE_FRONTEND_SPECIAL_AUDIO_CREATE,
@@ -93,6 +95,7 @@ from tools.recomp.native_executor import (
     NATIVE_DISPATCH_EDGE_CAPACITY_LIMIT,
     NATIVE_DISPATCH_EDGE_REPORT_LIMIT,
     NATIVE_TARGET_TIMING_SAMPLE_INTERVAL,
+    AOT_OPTIMIZATION_MODES,
     NativeCooperativeSchedulerState,
     NativeExecutorError,
     NativeHostServiceEntry,
@@ -102,6 +105,7 @@ from tools.recomp.native_executor import (
     NativeWorkerLifecycleState,
     _partition_instructions_by_address,
     _partition_instructions_for_call_fusion,
+    aot_optimization_features,
 )
 from tools.recomp.x86_lifter import (
     CppEmitter,
@@ -116,6 +120,77 @@ from tools.recomp.x86_lifter import (
 
 
 class NativeResumableExecutorTests(unittest.TestCase):
+    def test_aot_ab_modes_resolve_independent_features(self) -> None:
+        expected = {
+            "baseline": (False, False),
+            "fusion-only": (True, False),
+            "registerization-only": (False, True),
+            "combined": (True, True),
+        }
+
+        self.assertEqual(set(AOT_OPTIMIZATION_MODES), set(expected))
+        for mode, features in expected.items():
+            with self.subTest(mode=mode):
+                self.assertEqual(aot_optimization_features(mode), features)
+
+        with self.assertRaisesRegex(ValueError, "unknown AOT optimization mode"):
+            aot_optimization_features("invalid")
+
+    def test_baseline_aot_mode_compiles_context_resident_guest_state(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex("C3"),
+            base_address=0x1000,
+            symbol="baseline_aot_mode",
+        )
+        state = CpuState.with_registers(esp=0x8000)
+        memory = SparseMemory({0x8000: 0})
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            executor = NativeResumableExecutor(
+                function,
+                build_dir=Path(temp_dir),
+                preferred_fusion_edges={(0x1000, 0x2000)},
+                aot_optimization_mode="baseline",
+            )
+            returned_to = executor.run(state, memory, max_steps=2)
+
+        self.assertEqual(returned_to, 0)
+        self.assertEqual(executor.cache_summary["aot_optimization_mode"], "baseline")
+        self.assertFalse(executor.cache_summary["preferred_fusion_enabled"])
+        self.assertFalse(
+            executor.cache_summary["registerized_guest_state_enabled"]
+        )
+        self.assertFalse(
+            executor.cache_summary["coalesced_memory_accesses_enabled"]
+        )
+        self.assertEqual(
+            executor.cache_summary["configured_preferred_fusion_edge_count"],
+            1,
+        )
+        self.assertEqual(executor.cache_summary["preferred_fusion_edge_count"], 0)
+
+    def test_fusion_aot_mode_enables_coalesced_memory_accesses(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex("C3"),
+            base_address=0x1100,
+            symbol="fusion_coalesced_memory",
+        )
+        state = CpuState.with_registers(esp=0x8100)
+        memory = SparseMemory({0x8100: 0})
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            executor = NativeResumableExecutor(
+                function,
+                build_dir=Path(temp_dir),
+                aot_optimization_mode="fusion-only",
+            )
+            returned_to = executor.run(state, memory, max_steps=2)
+
+        self.assertEqual(returned_to, 0)
+        self.assertTrue(
+            executor.cache_summary["coalesced_memory_accesses_enabled"]
+        )
+
     def test_native_runtime_status_collision_maps_to_already_exists(self) -> None:
         base_address = 0x1000
         status_target = 0x2000
@@ -163,6 +238,56 @@ class NativeResumableExecutorTests(unittest.TestCase):
 
         self.assertEqual(returned_to, 0)
         self.assertEqual(state.get_register("eax"), 183)
+
+    def test_native_runtime_status_path_not_found_maps_to_path_not_found(
+        self,
+    ) -> None:
+        base_address = 0x1000
+        status_target = 0x2000
+        code = bytearray(b"\x68\x3A\x00\x00\xC0")
+        call_address = base_address + len(code)
+        code.extend(
+            b"\xE8" + struct.pack("<i", status_target - (call_address + 5))
+        )
+        code.extend(b"\xC3")
+        function = lift_x86_function(
+            bytes(code),
+            base_address=base_address,
+            symbol="native_status_path_not_found_mapping",
+        )
+        services = NativeHostServiceState(
+            [
+                NativeHostServiceEntry(
+                    status_target,
+                    NATIVE_HOST_SERVICE_RUNTIME,
+                    4,
+                    NATIVE_HOST_SERVICE_RUNTIME_NT_STATUS_TO_DOS_ERROR,
+                )
+            ]
+        )
+        memory = SparseMemory({0x8000: 0})
+
+        def unexpected_handler(*_args: object) -> None:
+            self.fail("native status conversion crossed into Python")
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            executor = NativeResumableExecutor(
+                function,
+                build_dir=Path(temp_dir),
+                callback_addresses={status_target},
+            )
+            state = CpuState.with_registers(esp=0x8000)
+            returned_to = executor.run(
+                state,
+                memory,
+                call_handlers={status_target: unexpected_handler},
+                dispatch_host_calls_in_native=True,
+                native_host_services=services,
+                max_steps=8,
+            )
+
+        self.assertEqual(returned_to, 0)
+        self.assertEqual(state.get_register("eax"), 3)
         self.assertEqual(
             executor.last_run_summary["performance"]["handler_call_count"],
             0,
@@ -386,6 +511,63 @@ class NativeResumableExecutorTests(unittest.TestCase):
         self.assertEqual(memory.read_u32(0x2008), 3)
         self.assertEqual(state.fpu_stack, [])
         self.assertEqual(state.fpu_control_word, 0x037F)
+
+    def test_x87_stack_preserves_double_precision_between_instructions(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex(
+                "D90500200000"  # fld dword [0x2000]
+                "D80504200000"  # fadd dword [0x2004]
+                "D82500200000"  # fsub dword [0x2000]
+                "D91D08200000"  # fstp dword [0x2008]
+                "C3"
+            ),
+            base_address=0x6080,
+            symbol="native_x87_double_precision_stack",
+        )
+        state = CpuState.with_registers(esp=0x8000)
+        state.fpu_control_word = 0x023F
+        memory = SparseMemory(
+            {
+                0x2000: struct.pack("<f", 16_777_216.0),
+                0x2004: struct.pack("<f", 1.0),
+                0x8000: 0,
+            }
+        )
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            executor = NativeResumableExecutor(function, build_dir=Path(temp_dir))
+            returned_to = executor.run(state, memory, max_steps=8)
+
+        self.assertEqual(returned_to, 0)
+        self.assertEqual(struct.unpack("<f", memory.read(0x2008, 4))[0], 1.0)
+        self.assertEqual(state.fpu_stack, [])
+        self.assertEqual(state.fpu_control_word, 0x023F)
+
+    def test_rsqrtss_uses_xbox_intel_approximation_natively(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex(
+                "F30F100500200000"  # movss xmm0, [0x2000]
+                "F30F52C0"  # rsqrtss xmm0, xmm0
+                "F30F110504200000"  # movss [0x2004], xmm0
+                "C3"
+            ),
+            base_address=0x60C0,
+            symbol="native_rsqrtss_intel_approximation",
+        )
+        state = CpuState.with_registers(esp=0x8000)
+        memory = SparseMemory(
+            {
+                0x2000: struct.pack("<f", 1.0),
+                0x8000: 0,
+            }
+        )
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            executor = NativeResumableExecutor(function, build_dir=Path(temp_dir))
+            returned_to = executor.run(state, memory, max_steps=8)
+
+        self.assertEqual(returned_to, 0)
+        self.assertEqual(memory.read_u32(0x2004), 0x3F7FF000)
 
     def test_batched_vector_frontiers_execute_natively(self) -> None:
         function = lift_x86_function(
@@ -1357,6 +1539,30 @@ class NativeResumableExecutorTests(unittest.TestCase):
         self.assertEqual(
             [[item.address for item in module] for module in modules],
             [[0x1000], [0x21000], [0x41000]],
+        )
+
+    def test_preferred_superblock_edge_overrides_fast_path_isolation(self) -> None:
+        class Instruction:
+            def __init__(self, address: int, mnemonic: str = "nop") -> None:
+                self.address = address
+                self.mnemonic = mnemonic
+                self.target = None
+
+        caller = Instruction(0x1000)
+        fast_path_owner = Instruction(0x21000, "ret")
+        unrelated = Instruction(0x41000)
+
+        modules = _partition_instructions_for_call_fusion(
+            [caller, fast_path_owner, unrelated],
+            base_maximum_count=1,
+            maximum_count=2,
+            isolated_addresses={fast_path_owner.address},
+            preferred_edges={(caller.address, fast_path_owner.address)},
+        )
+
+        self.assertEqual(
+            [[item.address for item in module] for module in modules],
+            [[0x1000, 0x21000], [0x41000]],
         )
 
     def test_call_fused_native_module_executes_cross_partition_return(self) -> None:
@@ -4266,11 +4472,127 @@ class NativeResumableExecutorTests(unittest.TestCase):
         self.assertEqual(services.title_asset_open_count, 1)
         self.assertEqual(services.title_asset_open_failure_count, 0)
         self.assertEqual(services.title_asset_payload_bytes, len(payload))
+        self.assertEqual(services.title_asset_open_event_count, 1)
+        self.assertEqual(services.title_asset_open_event_overflow_count, 0)
+        open_event = services.title_asset_open_events[0]
+        self.assertEqual(os.fsdecode(open_event.guest_path), "D:\\frontend\\global.dic")
+        self.assertEqual(open_event.flip_count, 0)
+        self.assertEqual(open_event.object, object_address)
+        self.assertEqual(open_event.payload_size, len(payload))
+        self.assertEqual(open_event.failure_stage, 0)
+        self.assertEqual(open_event.flags, 3)
+        self.assertEqual(open_event.read_call_count, 1)
+        self.assertEqual(open_event.read_requested_bytes, len(payload))
+        self.assertEqual(open_event.read_returned_bytes, len(payload))
+        self.assertEqual(open_event.close_count, 0)
+        self.assertEqual(
+            bytes(open_event.header_words)[: len(payload)],
+            payload,
+        )
         self.assertEqual(services.title_track_pss_candidate_count, 0)
         self.assertEqual(services.title_track_pss_publication_count, 0)
         performance = executor.last_run_summary["performance"]
         self.assertEqual(performance["native_host_service_call_count"], 2)
         self.assertEqual(performance["handler_call_count"], 0)
+
+    def test_native_title_asset_open_close_reuses_stream_beyond_capacity(
+        self,
+    ) -> None:
+        base_address = 0x1000
+        open_target = 0x2000
+        close_target = 0x31F10200
+        path_address = 0x3000
+        payload = b"reusable-native-title-asset"
+        code = bytearray()
+
+        def emit_call(target: int) -> None:
+            call_address = base_address + len(code)
+            code.extend(
+                b"\xE8" + struct.pack("<i", target - (call_address + 5))
+            )
+
+        for _ in range(129):
+            code.extend(b"\x6A\x01")
+            code.extend(b"\x68" + struct.pack("<I", path_address))
+            emit_call(open_target)
+            code.extend(b"\x89\xC1")
+            emit_call(close_target)
+        code.extend(b"\xC3")
+        function = lift_x86_function(
+            bytes(code),
+            base_address=base_address,
+            symbol="native_title_asset_open_close_reuse",
+            max_instructions=2048,
+        )
+        services = NativeHostServiceState(
+            [
+                NativeHostServiceEntry(
+                    open_target,
+                    NATIVE_HOST_SERVICE_TITLE,
+                    8,
+                    NATIVE_HOST_SERVICE_TITLE_ASSET_OPEN,
+                ),
+                NativeHostServiceEntry(
+                    close_target,
+                    NATIVE_HOST_SERVICE_TITLE,
+                    0,
+                    NATIVE_HOST_SERVICE_TITLE_ASSET_CLOSE,
+                ),
+            ]
+        )
+        memory = SparseMemory(
+            {0x8000: 0, path_address: b"D:\\frontend\\global.dic\0"}
+        )
+
+        def unexpected_handler(*_args: object) -> None:
+            self.fail("native title asset service crossed into Python")
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            root = Path(temp_dir)
+            asset = root / "frontend" / "global.dic"
+            asset.parent.mkdir(parents=True)
+            asset.write_bytes(payload)
+            services.set_extracted_root(root)
+            executor = NativeResumableExecutor(
+                function,
+                build_dir=root / "build",
+                callback_addresses={open_target, close_target},
+            )
+            state = CpuState.with_registers(esp=0x8000)
+            returned_to = executor.run(
+                state,
+                memory,
+                call_handlers={
+                    open_target: unexpected_handler,
+                    close_target: unexpected_handler,
+                },
+                dispatch_host_calls_in_native=True,
+                native_host_services=services,
+                max_steps=2048,
+            )
+
+        self.assertEqual(returned_to, 0)
+        self.assertEqual(services.title_asset_stream_count, 1)
+        self.assertEqual(services.title_asset_open_count, 129)
+        self.assertEqual(services.title_asset_close_count, 129)
+        self.assertEqual(services.title_asset_reuse_count, 128)
+        self.assertEqual(services.title_asset_open_failure_count, 0)
+        self.assertEqual(services.title_asset_active_stream_count, 0)
+        self.assertEqual(services.title_asset_peak_active_stream_count, 1)
+        self.assertEqual(services.title_asset_open_event_count, 128)
+        self.assertEqual(services.title_asset_open_event_overflow_count, 1)
+        self.assertTrue(
+            all(
+                event.close_count == 1
+                for event in services.title_asset_open_events
+            )
+        )
+        self.assertEqual(memory.read_u32(0x31F10000), 0x31F10100)
+        self.assertEqual(memory.read_u32(0x31F10104), close_target)
+        self.assertEqual(
+            services.title_asset_streams[0].payload_capacity,
+            len(payload),
+        )
 
     def test_native_title_asset_read_publishes_track_pss_image(self) -> None:
         base_address = 0x1000
@@ -4387,7 +4709,7 @@ class NativeResumableExecutorTests(unittest.TestCase):
         )
         self.assertEqual(services.title_track_pss_scene_record_entry_count, 1)
         self.assertEqual(services.title_asset_streams[0].image_base, image_base)
-        self.assertEqual(services.title_asset_streams[0].flags, 7)
+        self.assertEqual(services.title_asset_streams[0].flags, 0x17)
         performance = executor.last_run_summary["performance"]
         self.assertEqual(performance["native_host_service_call_count"], 2)
         self.assertEqual(performance["handler_call_count"], 0)
@@ -4487,7 +4809,7 @@ class NativeResumableExecutorTests(unittest.TestCase):
         self.assertEqual(memory.read(guest_destination, len(payload)), payload)
         self.assertEqual(services.title_traffic_tra_candidate_count, 1)
         self.assertEqual(services.title_asset_streams[0].image_base, 0)
-        self.assertEqual(services.title_asset_streams[0].flags, 8)
+        self.assertEqual(services.title_asset_streams[0].flags, 0x18)
 
     def test_native_title_audio_state_services_bypass_python(self) -> None:
         base_address = 0x1000
@@ -4850,6 +5172,159 @@ class NativeResumableExecutorTests(unittest.TestCase):
         self.assertEqual(performance["native_host_service_call_count"], 5)
         self.assertEqual(performance["handler_call_count"], 0)
 
+    def test_native_audio_failed_play_does_not_leave_voice_permanently_playing(
+        self,
+    ) -> None:
+        base_address = 0x1000
+        set_data_target = 0x2000
+        set_format_target = 0x2010
+        play_target = 0x2020
+        get_status_target = 0x2030
+        buffer = 0x5000
+        buffer_descriptor = 0x5400
+        voice = 0x5800
+        invalid_data_address = 0x6000
+        valid_data_address = 0x6100
+        adpcm_format_address = 0x7000
+        pcm_format_address = 0x7100
+        status_output = 0x7200
+        code = bytearray()
+
+        def push(value: int) -> None:
+            code.extend(b"\x68" + struct.pack("<I", value))
+
+        def call(target: int) -> None:
+            call_address = base_address + len(code)
+            code.extend(b"\xE8" + struct.pack("<i", target - (call_address + 5)))
+
+        push(36)
+        push(invalid_data_address)
+        push(buffer)
+        call(set_data_target)
+        push(adpcm_format_address)
+        push(buffer)
+        call(set_format_target)
+        push(1)
+        push(0)
+        push(0)
+        push(buffer)
+        call(play_target)
+        push(36)
+        push(valid_data_address)
+        push(buffer)
+        call(set_data_target)
+        push(pcm_format_address)
+        push(buffer)
+        call(set_format_target)
+        push(1)
+        push(0)
+        push(0)
+        push(buffer)
+        call(play_target)
+        push(status_output)
+        push(buffer)
+        call(get_status_target)
+        code.extend(b"\xC3")
+        function = lift_x86_function(
+            bytes(code),
+            base_address=base_address,
+            symbol="native_audio_failed_play_retry_caller",
+        )
+        target_functions = (
+            lift_x86_function(
+                b"\x31\xC0\xC2\x0C\x00",
+                base_address=set_data_target,
+                symbol="native_audio_failed_play_set_data_original",
+            ),
+            lift_x86_function(
+                b"\x31\xC0\xC2\x08\x00",
+                base_address=set_format_target,
+                symbol="native_audio_failed_play_set_format_original",
+            ),
+        )
+        services = NativeHostServiceState(
+            [
+                NativeHostServiceEntry(
+                    set_data_target,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    12,
+                    NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_DATA,
+                ),
+                NativeHostServiceEntry(
+                    set_format_target,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    8,
+                    NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_FORMAT,
+                ),
+                NativeHostServiceEntry(
+                    play_target,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    16,
+                    NATIVE_HOST_SERVICE_AUDIO_BUFFER_PLAY,
+                ),
+                NativeHostServiceEntry(
+                    get_status_target,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    8,
+                    NATIVE_HOST_SERVICE_AUDIO_BUFFER_GET_STATUS,
+                ),
+            ]
+        )
+        services.enable_normal_runtime(scheduler_quantum=100)
+        memory = SparseMemory({0x8000: 0})
+        memory.write_u32(buffer, buffer_descriptor)
+        memory.write_u32(buffer + 4, voice)
+        memory.write_u32(buffer_descriptor + 0xC0, 0)
+        memory.write_u32(buffer_descriptor + 0xC4, 36)
+        memory.write_u32(buffer_descriptor + 0xC8, 0)
+        memory.write_u32(buffer_descriptor + 0xCC, 36)
+        memory.write_u32(voice + 0x12, 1)
+        invalid_adpcm = bytearray(36)
+        invalid_adpcm[2] = 89
+        memory.write(invalid_data_address, invalid_adpcm)
+        memory.write(valid_data_address, struct.pack("<18h", *range(18)))
+        memory.write(
+            adpcm_format_address,
+            struct.pack("<HHIIHHH", 0x69, 1, 48000, 24000, 36, 4, 64),
+        )
+        memory.write(
+            pcm_format_address,
+            struct.pack("<HHIIHHH", 1, 1, 22050, 44100, 2, 16, 0),
+        )
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            executor = NativeResumableExecutor(
+                function,
+                build_dir=Path(temp_dir),
+                callback_addresses={
+                    set_data_target,
+                    set_format_target,
+                    play_target,
+                    get_status_target,
+                },
+                forwarded_callback_addresses={set_data_target, set_format_target},
+                module_functions=(function, *target_functions),
+            )
+            state = CpuState.with_registers(esp=0x8000)
+            returned_to = executor.run(
+                state,
+                memory,
+                dispatch_host_calls_in_native=True,
+                native_host_services=services,
+                max_steps=200,
+            )
+            executor.shutdown_normal_runtime(services)
+
+        self.assertEqual(returned_to, 0)
+        self.assertEqual(memory.read_u32(status_output), 0)
+        self.assertEqual(memory.read_u32(voice + 0x12), 1)
+        self.assertEqual(services.native_audio_buffer_play_count, 2)
+        self.assertEqual(services.native_audio_decoded_buffer_count, 1)
+        self.assertEqual(services.native_audio_decode_failure_count, 1)
+        self.assertEqual(services.native_audio_buffer_repeated_play_count, 0)
+        self.assertEqual(services.native_audio_buffer_get_status_count, 1)
+        self.assertEqual(services.native_audio_stale_playing_repair_count, 1)
+
     def test_native_audio_buffer_position_boundaries_complete_without_sdk_forward(
         self,
     ) -> None:
@@ -5101,8 +5576,8 @@ class NativeResumableExecutorTests(unittest.TestCase):
         self.assertEqual(memory.read_u32(voice + 0x12), 3)
         self.assertEqual(services.native_audio_buffer_create_count, 1)
         self.assertEqual(services.native_audio_buffer_play_count, 2)
-        self.assertEqual(services.native_audio_buffer_repeated_play_count, 1)
-        self.assertEqual(services.native_audio_decoded_buffer_count, 1)
+        self.assertEqual(services.native_audio_buffer_repeated_play_count, 0)
+        self.assertEqual(services.native_audio_decoded_buffer_count, 2)
         self.assertEqual(services.native_audio_decode_failure_count, 0)
         self.assertEqual(services.native_audio_last_data, data_address)
         self.assertEqual(services.native_audio_last_size, 8)
@@ -6166,6 +6641,7 @@ class NativeResumableExecutorTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             save_root = Path(temp_dir) / "save"
+            (save_root / "TDATA" / "41430019").mkdir(parents=True)
             services.set_filesystem_roots(
                 extracted_disc_root=None,
                 save_data_root=save_root,
@@ -6200,6 +6676,436 @@ class NativeResumableExecutorTests(unittest.TestCase):
         self.assertEqual(memory.read_u32(io_status + 4), len(payload))
         performance = executor.last_run_summary["performance"]
         self.assertEqual(performance["native_host_service_call_count"], 7)
+        self.assertEqual(performance["handler_call_count"], 0)
+
+    def test_native_autosave_delete_recreate_and_truncate_bypass_python(self) -> None:
+        base_address = 0x1000
+        open_target = 0x2000
+        set_target = 0x2010
+        close_target = 0x2020
+        create_target = 0x2030
+        write_target = 0x2040
+        delete_handle = 0x3000
+        create_handle = 0x3004
+        io_status = 0x3010
+        disposition = 0x3020
+        end_of_file = 0x3030
+        write_buffer = 0x3100
+        attributes = 0x4000
+        descriptor = 0x4010
+        path_buffer = 0x4100
+        old_payload = b"old autosave payload that must be replaced"
+        fresh_payload = b"fresh autosave payload"
+        host_write_payload = fresh_payload + b"obsolete tail"
+
+        code = bytearray()
+
+        def emit_call(target: int, arguments: tuple[int, ...]) -> None:
+            for argument in reversed(arguments):
+                code.extend(b"\x68" + struct.pack("<I", argument))
+            call_address = base_address + len(code)
+            code.extend(
+                b"\xE8" + struct.pack("<i", target - (call_address + 5))
+            )
+
+        emit_call(
+            open_target,
+            (delete_handle, 0x00110000, attributes, io_status, 7, 0x4020),
+        )
+        emit_call(set_target, (0x108, io_status, disposition, 1, 13))
+        emit_call(close_target, (0x108,))
+        emit_call(
+            create_target,
+            (
+                create_handle,
+                0x40100000,
+                attributes,
+                io_status,
+                0,
+                4,
+                1,
+                2,
+                0x22,
+            ),
+        )
+        emit_call(
+            write_target,
+            (
+                0x10C,
+                0,
+                0,
+                0,
+                io_status,
+                write_buffer,
+                len(host_write_payload),
+                0,
+            ),
+        )
+        emit_call(set_target, (0x10C, io_status, end_of_file, 8, 20))
+        emit_call(close_target, (0x10C,))
+        code.extend(b"\xC3")
+        function = lift_x86_function(
+            bytes(code),
+            base_address=base_address,
+            symbol="native_autosave_delete_recreate",
+        )
+        services = NativeHostServiceState(
+            [
+                NativeHostServiceEntry(
+                    open_target,
+                    NATIVE_HOST_SERVICE_BOOTSTRAP,
+                    24,
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_NT_OPEN_FILE,
+                ),
+                NativeHostServiceEntry(
+                    set_target,
+                    NATIVE_HOST_SERVICE_BOOTSTRAP,
+                    20,
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_NT_SET_INFORMATION_FILE,
+                ),
+                NativeHostServiceEntry(
+                    close_target,
+                    NATIVE_HOST_SERVICE_BOOTSTRAP,
+                    4,
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_NT_CLOSE,
+                ),
+                NativeHostServiceEntry(
+                    create_target,
+                    NATIVE_HOST_SERVICE_BOOTSTRAP,
+                    36,
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_NT_CREATE_FILE,
+                ),
+                NativeHostServiceEntry(
+                    write_target,
+                    NATIVE_HOST_SERVICE_BOOTSTRAP,
+                    32,
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_NT_WRITE_FILE,
+                ),
+            ]
+        )
+        memory = SparseMemory({0x9000: 0})
+        path = b"U:\\0F71DA412427\\Profile 1"
+        memory.write_u32(attributes + 4, descriptor)
+        memory.write(
+            descriptor,
+            struct.pack("<HHI", len(path), len(path), path_buffer),
+        )
+        memory.write(path_buffer, path)
+        memory.write(disposition, b"\x01")
+        memory.write(end_of_file, struct.pack("<Q", len(fresh_payload)))
+        memory.write(write_buffer, host_write_payload)
+        targets = {
+            open_target,
+            set_target,
+            close_target,
+            create_target,
+            write_target,
+        }
+
+        def unexpected_handler(*_args: object) -> None:
+            self.fail("native autosave service crossed into Python")
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            save_root = Path(temp_dir) / "save"
+            profile = (
+                save_root
+                / "UDATA"
+                / "41430019"
+                / "0F71DA412427"
+                / "Profile 1"
+            )
+            profile.parent.mkdir(parents=True)
+            profile.write_bytes(old_payload)
+            services.set_filesystem_roots(
+                extracted_disc_root=None,
+                save_data_root=save_root,
+                dashboard_data_root=None,
+                cache_data_root=None,
+                title_id=0x41430019,
+            )
+            executor = NativeResumableExecutor(
+                function,
+                build_dir=Path(temp_dir) / "build",
+                callback_addresses=targets,
+            )
+            state = CpuState.with_registers(esp=0x9000)
+            returned_to = executor.run(
+                state,
+                memory,
+                call_handlers={target: unexpected_handler for target in targets},
+                dispatch_host_calls_in_native=True,
+                native_host_services=services,
+                max_steps=160,
+            )
+            saved_payload = profile.read_bytes()
+
+        self.assertEqual(returned_to, 0)
+        self.assertEqual(memory.read_u32(delete_handle), 0x108)
+        self.assertEqual(memory.read_u32(create_handle), 0x10C)
+        self.assertEqual(memory.read_u32(io_status), 0)
+        self.assertEqual(saved_payload, fresh_payload)
+        self.assertEqual(services.filesystem_event_count, 7)
+        self.assertEqual(
+            [services.filesystem_events[index].service_value for index in range(7)],
+            [12, 21, 9, 11, 22, 21, 9],
+        )
+        self.assertEqual(services.filesystem_events[1].arguments[4], 13)
+        self.assertEqual(services.filesystem_events[5].arguments[4], 20)
+        self.assertEqual(
+            os.fsdecode(services.filesystem_events[1].guest_path),
+            "U:\\0F71DA412427\\Profile 1",
+        )
+        self.assertEqual(services.save_filesystem_event_count, 7)
+        self.assertEqual(
+            [
+                services.save_filesystem_events[index].service_value
+                for index in range(7)
+            ],
+            [12, 21, 9, 11, 22, 21, 9],
+        )
+        performance = executor.last_run_summary["performance"]
+        self.assertEqual(performance["native_host_service_call_count"], 7)
+        self.assertEqual(performance["handler_call_count"], 0)
+
+    def test_native_failed_save_container_cleanup_deletes_file_and_directory(
+        self,
+    ) -> None:
+        base_address = 0x1000
+        open_target = 0x2000
+        set_target = 0x2010
+        close_target = 0x2020
+        file_handle = 0x3000
+        directory_handle = 0x3004
+        io_status = 0x3010
+        disposition = 0x3020
+        file_attributes = 0x4000
+        file_descriptor = 0x4010
+        file_path_buffer = 0x4100
+        directory_attributes = 0x4200
+        directory_descriptor = 0x4210
+        directory_path_buffer = 0x4300
+
+        code = bytearray()
+
+        def emit_call(target: int, arguments: tuple[int, ...]) -> None:
+            for argument in reversed(arguments):
+                code.extend(b"\x68" + struct.pack("<I", argument))
+            call_address = base_address + len(code)
+            code.extend(
+                b"\xE8" + struct.pack("<i", target - (call_address + 5))
+            )
+
+        emit_call(
+            open_target,
+            (file_handle, 0x00110000, file_attributes, io_status, 7, 0x4020),
+        )
+        emit_call(set_target, (0x108, io_status, disposition, 1, 13))
+        emit_call(close_target, (0x108,))
+        emit_call(
+            open_target,
+            (
+                directory_handle,
+                0x00110000,
+                directory_attributes,
+                io_status,
+                7,
+                0x4021,
+            ),
+        )
+        emit_call(set_target, (0x10C, io_status, disposition, 1, 13))
+        emit_call(close_target, (0x10C,))
+        code.extend(b"\xC3")
+        function = lift_x86_function(
+            bytes(code),
+            base_address=base_address,
+            symbol="native_failed_save_container_cleanup",
+        )
+        services = NativeHostServiceState(
+            [
+                NativeHostServiceEntry(
+                    open_target,
+                    NATIVE_HOST_SERVICE_BOOTSTRAP,
+                    24,
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_NT_OPEN_FILE,
+                ),
+                NativeHostServiceEntry(
+                    set_target,
+                    NATIVE_HOST_SERVICE_BOOTSTRAP,
+                    20,
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_NT_SET_INFORMATION_FILE,
+                ),
+                NativeHostServiceEntry(
+                    close_target,
+                    NATIVE_HOST_SERVICE_BOOTSTRAP,
+                    4,
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_NT_CLOSE,
+                ),
+            ]
+        )
+        memory = SparseMemory({0x9000: 0})
+        file_path = b"U:\\0F71DA412428\\SaveMeta.xbx"
+        directory_path = b"U:\\0F71DA412428"
+        memory.write_u32(file_attributes + 4, file_descriptor)
+        memory.write(
+            file_descriptor,
+            struct.pack("<HHI", len(file_path), len(file_path), file_path_buffer),
+        )
+        memory.write(file_path_buffer, file_path)
+        memory.write_u32(directory_attributes + 4, directory_descriptor)
+        memory.write(
+            directory_descriptor,
+            struct.pack(
+                "<HHI",
+                len(directory_path),
+                len(directory_path),
+                directory_path_buffer,
+            ),
+        )
+        memory.write(directory_path_buffer, directory_path)
+        memory.write(disposition, b"\x01")
+        targets = {open_target, set_target, close_target}
+
+        def unexpected_handler(*_args: object) -> None:
+            self.fail("native save cleanup crossed into Python")
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            save_root = Path(temp_dir) / "save"
+            container = save_root / "UDATA" / "41430019" / "0F71DA412428"
+            container.mkdir(parents=True)
+            (container / "SaveMeta.xbx").write_bytes(b"")
+            services.set_filesystem_roots(
+                extracted_disc_root=None,
+                save_data_root=save_root,
+                dashboard_data_root=None,
+                cache_data_root=None,
+                title_id=0x41430019,
+            )
+            executor = NativeResumableExecutor(
+                function,
+                build_dir=Path(temp_dir) / "build",
+                callback_addresses=targets,
+            )
+            state = CpuState.with_registers(esp=0x9000)
+            returned_to = executor.run(
+                state,
+                memory,
+                call_handlers={target: unexpected_handler for target in targets},
+                dispatch_host_calls_in_native=True,
+                native_host_services=services,
+                max_steps=120,
+            )
+            container_exists = container.exists()
+
+        self.assertEqual(returned_to, 0)
+        self.assertEqual(memory.read_u32(file_handle), 0x108)
+        self.assertEqual(memory.read_u32(directory_handle), 0x10C)
+        self.assertEqual(memory.read_u32(io_status), 0)
+        self.assertFalse(container_exists)
+        self.assertEqual(services.filesystem_event_count, 6)
+        self.assertEqual(
+            [services.filesystem_events[index].service_value for index in range(6)],
+            [12, 21, 9, 12, 21, 9],
+        )
+        self.assertEqual(services.save_filesystem_event_count, 6)
+        performance = executor.last_run_summary["performance"]
+        self.assertEqual(performance["native_host_service_call_count"], 6)
+        self.assertEqual(performance["handler_call_count"], 0)
+
+    def test_native_save_metadata_probe_does_not_create_missing_container(
+        self,
+    ) -> None:
+        base_address = 0x1000
+        create_target = 0x2000
+        output_handle = 0x3000
+        io_status = 0x3010
+        attributes = 0x4000
+        descriptor = 0x4010
+        path_buffer = 0x4100
+        path = b"U:\\0F71DA412428\\SaveMeta.xbx"
+
+        code = bytearray()
+        for argument in reversed(
+            (
+                output_handle,
+                0x80100080,
+                attributes,
+                io_status,
+                0,
+                4,
+                0,
+                3,
+                0x60,
+            )
+        ):
+            code.extend(b"\x68" + struct.pack("<I", argument))
+        call_address = base_address + len(code)
+        code.extend(
+            b"\xE8" + struct.pack("<i", create_target - (call_address + 5))
+        )
+        code.extend(b"\xC3")
+        function = lift_x86_function(
+            bytes(code),
+            base_address=base_address,
+            symbol="native_missing_save_metadata_probe",
+        )
+        services = NativeHostServiceState(
+            [
+                NativeHostServiceEntry(
+                    create_target,
+                    NATIVE_HOST_SERVICE_BOOTSTRAP,
+                    36,
+                    NATIVE_HOST_SERVICE_BOOTSTRAP_NT_CREATE_FILE,
+                )
+            ]
+        )
+        memory = SparseMemory({0x9000: 0})
+        memory.write_u32(attributes + 4, descriptor)
+        memory.write(
+            descriptor,
+            struct.pack("<HHI", len(path), len(path), path_buffer),
+        )
+        memory.write(path_buffer, path)
+
+        def unexpected_handler(*_args: object) -> None:
+            self.fail("native save metadata probe crossed into Python")
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            save_root = Path(temp_dir) / "save"
+            title_root = save_root / "UDATA" / "41430019"
+            title_root.mkdir(parents=True)
+            services.set_filesystem_roots(
+                extracted_disc_root=None,
+                save_data_root=save_root,
+                dashboard_data_root=None,
+                cache_data_root=None,
+                title_id=0x41430019,
+            )
+            executor = NativeResumableExecutor(
+                function,
+                build_dir=Path(temp_dir) / "build",
+                callback_addresses={create_target},
+            )
+            state = CpuState.with_registers(esp=0x9000)
+            returned_to = executor.run(
+                state,
+                memory,
+                call_handlers={create_target: unexpected_handler},
+                dispatch_host_calls_in_native=True,
+                native_host_services=services,
+                max_steps=40,
+            )
+            container_exists = (title_root / "0F71DA412428").exists()
+
+        self.assertEqual(returned_to, 0)
+        self.assertEqual(state.get_register("eax"), 0xC000003A)
+        self.assertEqual(memory.read_u32(output_handle), 0)
+        self.assertEqual(memory.read_u32(io_status), 0xC000003A)
+        self.assertFalse(container_exists)
+        self.assertEqual(services.filesystem_event_count, 1)
+        self.assertEqual(services.filesystem_events[0].result, 0xC000003A)
+        self.assertEqual(services.save_filesystem_event_count, 1)
+        performance = executor.last_run_summary["performance"]
+        self.assertEqual(performance["native_host_service_call_count"], 1)
         self.assertEqual(performance["handler_call_count"], 0)
 
     def test_native_save_crypto_matches_xbox_sha_hmac_and_rc4(self) -> None:
@@ -6750,6 +7656,23 @@ class NativeResumableExecutorTests(unittest.TestCase):
         self.assertEqual(memory.read_u32(handle_address), 0x108 + (cycle_count - 1) * 4)
         self.assertEqual(services.file_count, 1)
         self.assertEqual(services.file_overflow_count, 0)
+        self.assertEqual(services.filesystem_event_count, cycle_count * 2)
+        first_retained_sequence = cycle_count * 2 - len(
+            services.filesystem_events
+        )
+        self.assertEqual(
+            services.filesystem_events[
+                first_retained_sequence % len(services.filesystem_events)
+            ].sequence,
+            first_retained_sequence,
+        )
+        self.assertEqual(
+            services.filesystem_events[
+                (cycle_count * 2 - 1) % len(services.filesystem_events)
+            ].sequence,
+            cycle_count * 2 - 1,
+        )
+        self.assertEqual(services.save_filesystem_event_count, 0)
         performance = executor.last_run_summary["performance"]
         self.assertEqual(
             performance["native_host_service_call_count"],
@@ -7150,9 +8073,14 @@ class NativeResumableExecutorTests(unittest.TestCase):
                 executor.shutdown_normal_runtime(services)
 
         self.assertIn(returned_to, (0x1000, 0x1005, 0x100A))
-        self.assertGreater(memory.read_u32(vblank_value_address), 0)
-        self.assertGreater(services.native_d3d_vblank_tick_count, 0)
+        self.assertEqual(memory.read_u32(vblank_value_address), 1)
+        self.assertEqual(services.native_d3d_vblank_sequence, 1)
+        self.assertEqual(services.native_d3d_vblank_tick_count, 1)
         self.assertEqual(services.native_d3d_vblank_callback_schedule_count, 1)
+        self.assertEqual(
+            services.native_d3d_vblank_tick_count,
+            services.native_d3d_vblank_callback_schedule_count,
+        )
         self.assertEqual(services.native_d3d_vblank_callback_completion_count, 1)
         self.assertEqual(services.native_d3d_vblank_callback_failure_count, 0)
         self.assertEqual(services.native_d3d_vblank_callback_context, 0)
@@ -7392,6 +8320,18 @@ class NativeResumableExecutorTests(unittest.TestCase):
             0x02210600,
             0x000417FC,
             1,
+            0x00041B00,
+            0x00010000,
+            0x00041B04,
+            0x07710529,
+            0x000417FC,
+            1,
+            0x00041B40,
+            0x00010000,
+            0x00041B44,
+            0x0771052D,
+            0x000417FC,
+            1,
             0x0004012C,
             7,
         )
@@ -7407,9 +8347,15 @@ class NativeResumableExecutorTests(unittest.TestCase):
         )
         texture = bytes(range(64))
         second_texture = bytes(reversed(range(64)))
+        cubemap_face_size = 128 * 128 * 2
+        cubemap = b"".join(
+            bytes([face + 1]) * cubemap_face_size
+            for face in range(6)
+        )
         memory = SparseMemory({0x3000: 0, 0x8000: 0})
         memory.write(0x5000, texture)
         memory.write(0x6000, second_texture)
+        memory.write(0x10000, cubemap)
         memory.write(0x9000, b"Loading - please wait\0")
         memory.write(
             0x9100,
@@ -7583,7 +8529,7 @@ class NativeResumableExecutorTests(unittest.TestCase):
             0,
             (command_header, direct_payload.hex(), scan_result[4:]),
         )
-        self.assertEqual(struct.unpack_from("<I", payload, 8)[0], 2)
+        self.assertEqual(struct.unpack_from("<I", payload, 8)[0], 3)
         (
             stage,
             address,
@@ -7638,6 +8584,42 @@ class NativeResumableExecutorTests(unittest.TestCase):
         )
         self.assertEqual(
             second_content_hash, hashlib.sha256(second_texture).digest()
+        )
+        third_offset = (
+            second_format_offset
+            + second_format_size
+            + second_texture_size
+        )
+        (
+            third_stage,
+            third_address,
+            third_width,
+            third_height,
+            third_format_size,
+            third_texture_size,
+            third_content_hash,
+        ) = struct.unpack_from("<IIIIII32s", payload, third_offset)
+        self.assertEqual(
+            (third_stage, third_address, third_width, third_height),
+            (1, 0x10000, 128, 128),
+        )
+        third_format_offset = third_offset + struct.calcsize("<IIIIII32s")
+        self.assertEqual(
+            payload[
+                third_format_offset : third_format_offset + third_format_size
+            ],
+            b"R5G6B5",
+        )
+        self.assertEqual(third_texture_size, len(cubemap))
+        self.assertEqual(
+            payload[
+                third_format_offset + third_format_size :
+                third_format_offset + third_format_size + third_texture_size
+            ],
+            cubemap,
+        )
+        self.assertEqual(
+            third_content_hash, hashlib.sha256(cubemap).digest()
         )
         self.assertEqual(services.live_resource_publish_count, 1)
         self.assertEqual(services.live_manifest_publish_count, 1)

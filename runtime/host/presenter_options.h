@@ -25,6 +25,7 @@ struct PresenterOptions {
     std::filesystem::path screenshot;
     std::filesystem::path hotkey_screenshot_directory;
     std::filesystem::path metrics_report_directory;
+    std::filesystem::path command_work_cache_trace;
     std::filesystem::path flip_audit_ack;
     std::filesystem::path flip_audit_frame_directory;
     std::filesystem::path vertex_shader;

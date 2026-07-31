@@ -317,6 +317,11 @@ class RenderDebugReportTests(unittest.TestCase):
                 "render_state_coverage": {
                     "status": "healthy",
                     "state_history_complete": True,
+                    "clear_surface_method_count": 40,
+                    "last_clear_surface_method_count": 0,
+                    "presented_surface_clear_count": 0,
+                    "presented_color_clear_count": 0,
+                    "retained_presented_surface_available": True,
                     "latest_event": {
                         "repeat_address_draw_count": 361,
                         "alpha_test_enabled_draw_count": 150,
@@ -366,6 +371,7 @@ class RenderDebugReportTests(unittest.TestCase):
         self.assertEqual(coverage["repeat_address_draw_count"], 361)
         self.assertEqual(coverage["alpha_test_applied_draw_count"], 150)
         self.assertEqual(coverage["fixed_function_transformed_draw_count"], 3)
+        self.assertEqual(coverage["presented_color_clear_count"], 0)
         self.assertEqual(
             result["presenter_performance"]["gpu_texture_conversion"][
                 "gpu_converted_textures"
@@ -1335,6 +1341,53 @@ class RenderDebugReportTests(unittest.TestCase):
         self.assertIn("fixed_function_draws_not_host_transformed", finding_ids)
         self.assertIn("presented_texture_resources_missing", finding_ids)
 
+    def test_reports_presented_surface_clear_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            probe = root / "probe.json"
+            events = root / "events.jsonl"
+            analysis = root / "analysis.jsonl"
+            probe.write_text("{}", encoding="utf-8")
+            events.write_text("", encoding="utf-8")
+            analysis.write_text(
+                json.dumps(
+                    {
+                        "event": "nv2a_render_state_diagnostics",
+                        "presented_surface_clear_count": 1,
+                        "presented_color_clear_count": 1,
+                        "latest_presented_surface_clear_address": 0x00330000,
+                        "latest_presented_surface_clear_flags": 0xF3,
+                        "latest_presented_surface_clear_color_argb": 0xFF000000,
+                        "latest_presented_surface_clear_draw_index": 0,
+                        "presented_draw_begin": 600,
+                        "presented_draw_count": 6,
+                        "analysis_state_complete": True,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = build_render_debug_report(
+                probe_summary_path=probe,
+                presenter_events_path=events,
+                stream_analysis_events_path=analysis,
+            )
+
+        coverage = report["render_state_coverage"]
+        self.assertEqual(coverage["presented_color_clear_count"], 1)
+        self.assertEqual(
+            coverage["latest_presented_surface_clear_address"],
+            0x00330000,
+        )
+        self.assertEqual(coverage["latest_presented_surface_clear_flags"], 0xF3)
+        self.assertEqual(
+            coverage["latest_presented_surface_clear_color_argb"],
+            0xFF000000,
+        )
+        self.assertEqual(coverage["latest_presented_surface_clear_draw_index"], 0)
+        self.assertEqual(coverage["presented_draw_count"], 6)
+
     def test_supported_fixed_function_draws_are_not_reported_as_filtered(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1764,6 +1817,26 @@ class RenderDebugReportTests(unittest.TestCase):
                             "interpreted_method_delta": 1000,
                             "bulk_indexed_method_delta": 700,
                             "bulk_inline_method_delta": 100,
+                            "bulk_state_method_delta": 100,
+                            "state_method_noop_delta": 80,
+                            "command_work_cache_us": 30,
+                            "command_work_cache_hit": False,
+                            "command_work_cacheable": True,
+                            "command_work_cache_words": 100,
+                            "command_work_cache_segments": 4,
+                            "command_work_cache_segment_hits": 1,
+                            "command_work_cache_segment_builds": 3,
+                            "command_work_cache_windows": 4,
+                            "command_work_cache_window_hits": 1,
+                            "command_work_cache_window_builds": 3,
+                            "command_work_cache_lookups": 1,
+                            "command_work_cache_hits": 0,
+                            "command_work_cache_builds": 1,
+                            "command_work_cache_fallbacks": 0,
+                            "command_work_cache_evictions": 0,
+                            "command_work_cache_epoch_changes": 0,
+                            "command_work_cache_resident_plans": 1,
+                            "command_work_cache_resident_bytes": 1200,
                             "state_seed_updates_required": True,
                             "texture_binding_image_descriptor_updates": 88,
                             "texture_binding_descriptor_sets_allocated": 88,
@@ -1796,6 +1869,26 @@ class RenderDebugReportTests(unittest.TestCase):
                             "interpreted_method_delta": 500,
                             "bulk_indexed_method_delta": 350,
                             "bulk_inline_method_delta": 50,
+                            "bulk_state_method_delta": 50,
+                            "state_method_noop_delta": 40,
+                            "command_work_cache_us": 10,
+                            "command_work_cache_hit": True,
+                            "command_work_cacheable": True,
+                            "command_work_cache_words": 50,
+                            "command_work_cache_segments": 3,
+                            "command_work_cache_segment_hits": 3,
+                            "command_work_cache_segment_builds": 0,
+                            "command_work_cache_windows": 3,
+                            "command_work_cache_window_hits": 3,
+                            "command_work_cache_window_builds": 0,
+                            "command_work_cache_lookups": 2,
+                            "command_work_cache_hits": 1,
+                            "command_work_cache_builds": 1,
+                            "command_work_cache_fallbacks": 0,
+                            "command_work_cache_evictions": 0,
+                            "command_work_cache_epoch_changes": 0,
+                            "command_work_cache_resident_plans": 1,
+                            "command_work_cache_resident_bytes": 1200,
                             "state_seed_updates_required": False,
                             "texture_binding_image_descriptor_updates": 2,
                             "texture_binding_descriptor_sets_allocated": 0,
@@ -1863,8 +1956,10 @@ class RenderDebugReportTests(unittest.TestCase):
         self.assertEqual(method["interpreted_method_count"], 1500)
         self.assertEqual(method["bulk_indexed_method_count"], 1050)
         self.assertEqual(method["bulk_inline_method_count"], 150)
-        self.assertEqual(method["scalar_method_count"], 300)
-        self.assertEqual(method["bulk_method_ratio"], 0.8)
+        self.assertEqual(method["bulk_state_method_count"], 150)
+        self.assertEqual(method["state_method_noop_count"], 120)
+        self.assertEqual(method["scalar_method_count"], 150)
+        self.assertEqual(method["bulk_method_ratio"], 0.9)
         self.assertEqual(method["state_seed_status_reload_count"], 2)
         self.assertEqual(method["state_seed_update_reload_count"], 1)
         self.assertEqual(method["state_seed_bypass_reload_count"], 1)
@@ -1872,6 +1967,27 @@ class RenderDebugReportTests(unittest.TestCase):
         self.assertEqual(method["push_buffer_collect_us"]["total_us"], 150)
         self.assertEqual(method["method_apply_us"]["total_us"], 300)
         self.assertEqual(method["method_finalize_us"]["total_us"], 75)
+        command_cache = method["command_work_cache"]
+        self.assertEqual(command_cache["instrumented_reload_count"], 2)
+        self.assertEqual(command_cache["cacheable_reload_count"], 2)
+        self.assertEqual(command_cache["hit_reload_count"], 1)
+        self.assertEqual(command_cache["hit_ratio"], 0.5)
+        self.assertEqual(command_cache["materialized_word_count"], 150)
+        self.assertEqual(command_cache["segment_count"], 7)
+        self.assertEqual(command_cache["segment_hit_count"], 4)
+        self.assertEqual(command_cache["segment_build_count"], 3)
+        self.assertEqual(command_cache["segment_hit_ratio"], 0.571429)
+        self.assertEqual(command_cache["window_count"], 7)
+        self.assertEqual(command_cache["window_hit_count"], 4)
+        self.assertEqual(command_cache["window_build_count"], 3)
+        self.assertEqual(command_cache["window_hit_ratio"], 0.571429)
+        self.assertEqual(command_cache["lookup_us"]["total_us"], 40)
+        self.assertEqual(command_cache["latest_lookup_count"], 2)
+        self.assertEqual(command_cache["latest_hit_count"], 1)
+        self.assertEqual(command_cache["latest_build_count"], 1)
+        self.assertEqual(command_cache["latest_epoch_change_count"], 0)
+        self.assertEqual(command_cache["latest_resident_plan_count"], 1)
+        self.assertEqual(command_cache["latest_resident_bytes"], 1200)
         pipelines = presenter["pipeline_compilation"]
         self.assertEqual(pipelines["graphics_pipeline_count"], 2)
         self.assertEqual(pipelines["compute_pipeline_count"], 1)

@@ -51,6 +51,7 @@ DEFAULT_PRESENTER_MODULES = (
     REPO_ROOT / "runtime" / "platform" / "sdl" / "sdl_platform.cpp",
 )
 DEFAULT_PRESENTER_HEADERS = (
+    REPO_ROOT / "runtime" / "host" / "command_work_cache.h",
     REPO_ROOT / "runtime" / "host" / "dirty_ranges.h",
     REPO_ROOT / "runtime" / "host" / "frame_metrics.h",
     REPO_ROOT / "runtime" / "host" / "live_presenter_transport.h",
@@ -570,6 +571,7 @@ def build_presenter_arguments(
     screenshot: Path | None = None,
     hotkey_screenshot_directory: Path | None = DEFAULT_HOTKEY_SCREENSHOT_DIR,
     metrics_report_directory: Path | None = DEFAULT_METRICS_REPORT_DIR,
+    command_work_cache_trace: Path | None = None,
     vertex_shader: Path = DEFAULT_VERTEX_SPV,
     fragment_shader: Path = DEFAULT_FRAGMENT_SPV,
     texture_convert_shader: Path = DEFAULT_TEXTURE_CONVERT_SPV,
@@ -676,6 +678,14 @@ def build_presenter_arguments(
             "--metrics-report-directory",
             str(metrics_report_directory),
         ])
+    if command_work_cache_trace is not None:
+        command_work_cache_trace.parent.mkdir(parents=True, exist_ok=True)
+        if command_work_cache_trace.exists():
+            command_work_cache_trace.unlink()
+        command.extend([
+            "--command-work-cache-trace",
+            str(command_work_cache_trace),
+        ])
     if not analyze_render_stream:
         if pipeline_cache is not None:
             pipeline_cache.parent.mkdir(parents=True, exist_ok=True)
@@ -702,6 +712,7 @@ def run_first_frame(
     screenshot: Path | None = None,
     hotkey_screenshot_directory: Path | None = DEFAULT_HOTKEY_SCREENSHOT_DIR,
     metrics_report_directory: Path | None = DEFAULT_METRICS_REPORT_DIR,
+    command_work_cache_trace: Path | None = None,
     vertex_shader: Path = DEFAULT_VERTEX_SPV,
     fragment_shader: Path = DEFAULT_FRAGMENT_SPV,
     texture_convert_shader: Path = DEFAULT_TEXTURE_CONVERT_SPV,
@@ -733,6 +744,7 @@ def run_first_frame(
         screenshot=screenshot,
         hotkey_screenshot_directory=hotkey_screenshot_directory,
         metrics_report_directory=metrics_report_directory,
+        command_work_cache_trace=command_work_cache_trace,
         vertex_shader=vertex_shader,
         fragment_shader=fragment_shader,
         texture_convert_shader=texture_convert_shader,
@@ -1596,6 +1608,14 @@ def main() -> int:
         help="Persistent Vulkan driver pipeline cache.",
     )
     parser.add_argument(
+        "--command-work-cache-trace",
+        type=Path,
+        help=(
+            "Diagnostic-only JSONL trace of command reconstruction layouts, "
+            "cache reuse distances, plan sizes, and evictions."
+        ),
+    )
+    parser.add_argument(
         "--controller-state-json",
         type=Path,
         help="Publish keyboard-mapped Xbox controller state for the resumable runner.",
@@ -1747,6 +1767,7 @@ def main() -> int:
         metrics_report_directory=(
             None if args.analyze_render_stream else args.metrics_report_directory
         ),
+        command_work_cache_trace=args.command_work_cache_trace,
         analyze_render_stream=args.analyze_render_stream,
         cpu_vertex_programs=args.cpu_vertex_programs,
         cpu_vertex_attributes=args.cpu_vertex_attributes,

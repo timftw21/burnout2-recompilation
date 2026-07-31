@@ -19,6 +19,12 @@ struct LivePresenterTransportInfo {
     uint64_t resource_slot_capacity = 0u;
 };
 
+struct LiveCommandReadTiming {
+    uint64_t provenance_us = 0u;
+    uint64_t resize_us = 0u;
+    uint64_t copy_us = 0u;
+};
+
 class LivePresenterTransport {
 public:
     LivePresenterTransport();
@@ -43,7 +49,8 @@ public:
     bool read_command_bytes(
         uint64_t first_byte_count,
         uint64_t required_byte_count,
-        std::vector<uint8_t>& payload) const;
+        std::vector<uint8_t>& payload,
+        LiveCommandReadTiming* timing = nullptr) const;
     void commit_command_read_cursor(uint64_t byte_count);
     bool read_resource_slot(
         uint32_t slot,

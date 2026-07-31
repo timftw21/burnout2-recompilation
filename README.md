@@ -138,8 +138,9 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full ownership model.
 
 ## Validation
 
-The current Python unit suite passes 644 tests; the last retained asset-free
-closeout gate passed 548 Python tests and 10 native CTest cases. The validated
+The current Python unit suite passes 675 tests and the current native suite
+passes 13 CTest cases; the last retained asset-free closeout gate passed 548
+Python tests and 10 native CTest cases. The validated
 exact-target baseline reaches Lesson One with live Vulkan rendering, SDL3
 frontend audio and input, local storage, streamed track data, and cooperative
 workers. Native local storage includes first-run Xbox cache-partition table

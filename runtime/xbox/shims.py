@@ -47,6 +47,7 @@ class XboxStatus:
     BUFFER_TOO_SMALL = 0xC0000023
     OBJECT_NAME_COLLISION = 0xC0000035
     OBJECT_NAME_NOT_FOUND = 0xC0000034
+    OBJECT_PATH_NOT_FOUND = 0xC000003A
     END_OF_FILE = 0xC0000011
     INVALID_INFO_CLASS = 0xC0000003
     INFO_LENGTH_MISMATCH = 0xC0000004
@@ -4377,6 +4378,7 @@ class XboxRuntimeShims:
             XboxStatus.SUCCESS: 0,
             XboxStatus.NO_SUCH_FILE: 2,
             XboxStatus.OBJECT_NAME_NOT_FOUND: 2,
+            XboxStatus.OBJECT_PATH_NOT_FOUND: 3,
             XboxStatus.OBJECT_NAME_COLLISION: 183,
             XboxStatus.ACCESS_DENIED: 5,
             XboxStatus.INVALID_HANDLE: 6,

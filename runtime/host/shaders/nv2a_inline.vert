@@ -7,11 +7,18 @@ layout(location = 1) in vec4 in_color;
 layout(location = 2) in vec4 in_uv;
 layout(location = 3) in vec4 in_secondary_color;
 layout(location = 4) in float in_fog;
+layout(location = 5) in vec4 in_uv0;
+layout(location = 6) in vec4 in_uv1;
+layout(location = 7) in vec4 in_uv2;
+layout(location = 8) in vec4 in_uv3;
 
 layout(location = 0) out vec4 frag_color;
 layout(location = 1) out vec4 frag_uv;
 layout(location = 2) out vec4 frag_secondary_color;
 layout(location = 3) out float frag_fog;
+layout(location = 4) out vec4 frag_uv1;
+layout(location = 5) out vec4 frag_uv2;
+layout(location = 6) out vec4 frag_uv3;
 
 struct VertexProgramState {
     uint enabled;
@@ -39,17 +46,20 @@ struct VertexProgramState {
     uint reserved1;
     uint reserved2;
     uint reserved3;
+    uvec4 texture_linears;
+    uvec4 texture_widths;
+    uvec4 texture_heights;
 };
 
-layout(std430, set = 0, binding = 2) readonly buffer VertexProgramStates {
+layout(std430, set = 0, binding = 9) readonly buffer VertexProgramStates {
     VertexProgramState states[];
 } vertex_program_states;
 
-layout(std430, set = 0, binding = 3) readonly buffer VertexWords {
+layout(std430, set = 0, binding = 10) readonly buffer VertexWords {
     uint words[];
 } vertex_words;
 
-layout(std430, set = 0, binding = 4) readonly buffer RawVertexWords {
+layout(std430, set = 0, binding = 11) readonly buffer RawVertexWords {
     uint words[];
 } raw_vertex_resource_words;
 
@@ -459,7 +469,13 @@ void main() {
     if (vertex_program_states.states[state_index].enabled == 0u) {
         gl_Position = in_position;
         frag_color = clamp(in_color, 0.0, 1.0);
-        frag_uv = in_uv;
+        frag_uv = vertex_program_states.states[state_index]
+                .texture_widths[0] != 0u
+            ? in_uv0
+            : in_uv;
+        frag_uv1 = in_uv1;
+        frag_uv2 = in_uv2;
+        frag_uv3 = in_uv3;
         frag_secondary_color = clamp(in_secondary_color, 0.0, 1.0);
         frag_fog = in_fog;
         return;
@@ -508,14 +524,16 @@ void main() {
     bool program_valid = execute_vertex_program(
         inputs, outputs, output_masks);
 
-    uint texture_output = vertex_program_states.states[state_index]
-        .texture_output;
     vec4 position = raw_attribute_fetch ? inputs[0] : in_position;
     vec4 color = raw_attribute_fetch ? inputs[3] : in_color;
     vec4 secondary_color = raw_attribute_fetch
         ? inputs[4]
         : in_secondary_color;
-    vec4 texture = raw_attribute_fetch ? inputs[texture_output] : in_uv;
+    vec4 textures[4];
+    textures[0] = raw_attribute_fetch ? inputs[9] : in_uv0;
+    textures[1] = raw_attribute_fetch ? inputs[10] : in_uv1;
+    textures[2] = raw_attribute_fetch ? inputs[11] : in_uv2;
+    textures[3] = raw_attribute_fetch ? inputs[12] : in_uv3;
     float fog = raw_attribute_fetch ? 1.0 : in_fog;
     bool program_position_valid = false;
     if (program_valid) {
@@ -573,21 +591,31 @@ void main() {
                             : 0.0;
             fog = programmable_fog_factor(fog_distance);
         }
-        if (output_masks[texture_output] != 0u) {
-            write_mask(texture, outputs[texture_output],
-                output_masks[texture_output]);
+        for (uint stage = 0u; stage < 4u; ++stage) {
+            uint texture_output = 9u + stage;
+            if (output_masks[texture_output] != 0u) {
+                write_mask(textures[stage], outputs[texture_output],
+                    output_masks[texture_output]);
+            }
         }
     }
 
-    if (vertex_program_states.states[state_index].texture_linear != 0u
-        && vertex_program_states.states[state_index].texture_width != 0u
-        && vertex_program_states.states[state_index].texture_height != 0u) {
-        texture.x /= float(
-            vertex_program_states.states[state_index].texture_width);
-        texture.y /= float(
-            vertex_program_states.states[state_index].texture_height);
+    for (uint stage = 0u; stage < 4u; ++stage) {
+        if (vertex_program_states.states[state_index].texture_linears[stage] != 0u
+            && vertex_program_states.states[state_index].texture_widths[stage] != 0u
+            && vertex_program_states.states[state_index].texture_heights[stage] != 0u) {
+            textures[stage].x /= float(
+                vertex_program_states.states[state_index].texture_widths[stage]);
+            textures[stage].y /= float(
+                vertex_program_states.states[state_index].texture_heights[stage]);
+        }
     }
 
+    if (program_position_valid) {
+        // NV2A viewport constants target its 0.53125 subpixel center. Move
+        // transformed screen coordinates onto Vulkan's 0.5 pixel centers.
+        position.xy -= vec2(0.03125);
+    }
     position.x = position.x * 2.0
         / float(vertex_program_states.states[state_index].target_width) - 1.0;
     position.y = position.y * 2.0
@@ -601,7 +629,10 @@ void main() {
 
     gl_Position = position;
     frag_color = clamp(color, 0.0, 1.0);
-    frag_uv = texture;
+    frag_uv = textures[0];
+    frag_uv1 = textures[1];
+    frag_uv2 = textures[2];
+    frag_uv3 = textures[3];
     frag_secondary_color = clamp(secondary_color, 0.0, 1.0);
     frag_fog = fog;
 }

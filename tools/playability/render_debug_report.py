@@ -650,7 +650,19 @@ def _summarize_presenter_performance(
         _as_int(event.get("bulk_inline_method_delta"))
         for event in method_interpretation_reloads
     )
-    bulk_method_count = bulk_indexed_method_count + bulk_inline_method_count
+    bulk_state_method_count = sum(
+        _as_int(event.get("bulk_state_method_delta"))
+        for event in method_interpretation_reloads
+    )
+    state_method_noop_count = sum(
+        _as_int(event.get("state_method_noop_delta"))
+        for event in method_interpretation_reloads
+    )
+    bulk_method_count = (
+        bulk_indexed_method_count
+        + bulk_inline_method_count
+        + bulk_state_method_count
+    )
     state_seed_status_reloads = [
         event
         for event in method_interpretation_reloads
@@ -661,6 +673,21 @@ def _summarize_presenter_performance(
         for event in state_seed_status_reloads
         if event.get("state_seed_updates_required") is True
     )
+    command_work_cache_reloads = [
+        event
+        for event in method_interpretation_reloads
+        if event.get("command_work_cache_hit") is not None
+    ]
+    command_work_cacheable_reloads = [
+        event
+        for event in command_work_cache_reloads
+        if event.get("command_work_cacheable") is True
+    ]
+    command_work_cache_hit_reloads = [
+        event
+        for event in command_work_cache_reloads
+        if event.get("command_work_cache_hit") is True
+    ]
     resource_breakdown_reloads = [
         event
         for event in reloads
@@ -795,6 +822,28 @@ def _summarize_presenter_performance(
                     if event.get("command_record_validation_us") is not None
                 ]
             ),
+            "shared_transport_provenance_us": _duration_summary(
+                [
+                    _as_int(event.get("command_transport_provenance_us"))
+                    for event in command_loading_reloads
+                    if event.get("command_transport_provenance_us")
+                    is not None
+                ]
+            ),
+            "shared_transport_resize_us": _duration_summary(
+                [
+                    _as_int(event.get("command_transport_resize_us"))
+                    for event in command_loading_reloads
+                    if event.get("command_transport_resize_us") is not None
+                ]
+            ),
+            "shared_transport_copy_us": _duration_summary(
+                [
+                    _as_int(event.get("command_transport_copy_us"))
+                    for event in command_loading_reloads
+                    if event.get("command_transport_copy_us") is not None
+                ]
+            ),
             "read_mib_per_second": (
                 round(
                     command_read_bytes
@@ -863,6 +912,8 @@ def _summarize_presenter_performance(
             "interpreted_method_count": interpreted_method_count,
             "bulk_indexed_method_count": bulk_indexed_method_count,
             "bulk_inline_method_count": bulk_inline_method_count,
+            "bulk_state_method_count": bulk_state_method_count,
+            "state_method_noop_count": state_method_noop_count,
             "scalar_method_count": max(
                 0,
                 interpreted_method_count - bulk_method_count,
@@ -909,6 +960,199 @@ def _summarize_presenter_performance(
                     for event in method_interpretation_reloads
                 ]
             ),
+            "command_work_cache": {
+                "instrumented_reload_count": len(command_work_cache_reloads),
+                "cacheable_reload_count": len(
+                    command_work_cacheable_reloads
+                ),
+                "hit_reload_count": len(command_work_cache_hit_reloads),
+                "hit_ratio": (
+                    round(
+                        len(command_work_cache_hit_reloads)
+                        / len(command_work_cacheable_reloads),
+                        6,
+                    )
+                    if command_work_cacheable_reloads
+                    else None
+                ),
+                "materialized_word_count": sum(
+                    _as_int(event.get("command_work_cache_words"))
+                    for event in command_work_cache_reloads
+                ),
+                "segment_count": sum(
+                    _as_int(event.get("command_work_cache_segments"))
+                    for event in command_work_cache_reloads
+                ),
+                "segment_hit_count": sum(
+                    _as_int(event.get("command_work_cache_segment_hits"))
+                    for event in command_work_cache_reloads
+                ),
+                "segment_build_count": sum(
+                    _as_int(event.get("command_work_cache_segment_builds"))
+                    for event in command_work_cache_reloads
+                ),
+                "segment_hit_ratio": (
+                    round(
+                        sum(
+                            _as_int(
+                                event.get("command_work_cache_segment_hits")
+                            )
+                            for event in command_work_cache_reloads
+                        )
+                        / sum(
+                            _as_int(event.get("command_work_cache_segments"))
+                            for event in command_work_cache_reloads
+                        ),
+                        6,
+                    )
+                    if any(
+                        _as_int(event.get("command_work_cache_segments"))
+                        for event in command_work_cache_reloads
+                    )
+                    else None
+                ),
+                "window_count": sum(
+                    _as_int(
+                        event.get(
+                            "command_work_cache_windows",
+                            event.get("command_work_cache_segments"),
+                        )
+                    )
+                    for event in command_work_cache_reloads
+                ),
+                "window_hit_count": sum(
+                    _as_int(
+                        event.get(
+                            "command_work_cache_window_hits",
+                            event.get("command_work_cache_segment_hits"),
+                        )
+                    )
+                    for event in command_work_cache_reloads
+                ),
+                "window_build_count": sum(
+                    _as_int(
+                        event.get(
+                            "command_work_cache_window_builds",
+                            event.get("command_work_cache_segment_builds"),
+                        )
+                    )
+                    for event in command_work_cache_reloads
+                ),
+                "window_hit_ratio": (
+                    round(
+                        sum(
+                            _as_int(
+                                event.get(
+                                    "command_work_cache_window_hits",
+                                    event.get(
+                                        "command_work_cache_segment_hits"
+                                    ),
+                                )
+                            )
+                            for event in command_work_cache_reloads
+                        )
+                        / sum(
+                            _as_int(
+                                event.get(
+                                    "command_work_cache_windows",
+                                    event.get("command_work_cache_segments"),
+                                )
+                            )
+                            for event in command_work_cache_reloads
+                        ),
+                        6,
+                    )
+                    if any(
+                        _as_int(
+                            event.get(
+                                "command_work_cache_windows",
+                                event.get("command_work_cache_segments"),
+                            )
+                        )
+                        for event in command_work_cache_reloads
+                    )
+                    else None
+                ),
+                "lookup_us": _duration_summary(
+                    [
+                        _as_int(event.get("command_work_cache_us"))
+                        for event in command_work_cache_reloads
+                        if event.get("command_work_cache_us") is not None
+                    ]
+                ),
+                "latest_lookup_count": (
+                    _as_int(
+                        command_work_cache_reloads[-1].get(
+                            "command_work_cache_lookups"
+                        )
+                    )
+                    if command_work_cache_reloads
+                    else 0
+                ),
+                "latest_hit_count": (
+                    _as_int(
+                        command_work_cache_reloads[-1].get(
+                            "command_work_cache_hits"
+                        )
+                    )
+                    if command_work_cache_reloads
+                    else 0
+                ),
+                "latest_build_count": (
+                    _as_int(
+                        command_work_cache_reloads[-1].get(
+                            "command_work_cache_builds"
+                        )
+                    )
+                    if command_work_cache_reloads
+                    else 0
+                ),
+                "latest_fallback_count": (
+                    _as_int(
+                        command_work_cache_reloads[-1].get(
+                            "command_work_cache_fallbacks"
+                        )
+                    )
+                    if command_work_cache_reloads
+                    else 0
+                ),
+                "latest_eviction_count": (
+                    _as_int(
+                        command_work_cache_reloads[-1].get(
+                            "command_work_cache_evictions"
+                        )
+                    )
+                    if command_work_cache_reloads
+                    else 0
+                ),
+                "latest_epoch_change_count": (
+                    _as_int(
+                        command_work_cache_reloads[-1].get(
+                            "command_work_cache_epoch_changes"
+                        )
+                    )
+                    if command_work_cache_reloads
+                    else 0
+                ),
+                "latest_resident_plan_count": (
+                    _as_int(
+                        command_work_cache_reloads[-1].get(
+                            "command_work_cache_resident_plans"
+                        )
+                    )
+                    if command_work_cache_reloads
+                    else 0
+                ),
+                "latest_resident_bytes": (
+                    _as_int(
+                        command_work_cache_reloads[-1].get(
+                            "command_work_cache_resident_bytes"
+                        )
+                    )
+                    if command_work_cache_reloads
+                    else 0
+                ),
+            },
         },
         "pipeline_compilation": {
             "graphics_event_count": len(graphics_pipeline_creations),
@@ -1634,6 +1878,35 @@ def _summarize_render_state_diagnostics(
         "state_history_complete": state_complete,
         "continuation_bootstrap_used": bool(
             latest.get("continuation_bootstrap_used")
+        ),
+        "clear_surface_method_count": _as_int(
+            latest.get("clear_surface_method_count")
+        ),
+        "last_clear_surface_method_count": _as_int(
+            latest.get("last_clear_surface_method_count")
+        ),
+        "presented_surface_clear_count": _as_int(
+            latest.get("presented_surface_clear_count")
+        ),
+        "presented_color_clear_count": _as_int(
+            latest.get("presented_color_clear_count")
+        ),
+        "latest_presented_surface_clear_address": latest.get(
+            "latest_presented_surface_clear_address"
+        ),
+        "latest_presented_surface_clear_flags": latest.get(
+            "latest_presented_surface_clear_flags"
+        ),
+        "latest_presented_surface_clear_color_argb": latest.get(
+            "latest_presented_surface_clear_color_argb"
+        ),
+        "latest_presented_surface_clear_draw_index": latest.get(
+            "latest_presented_surface_clear_draw_index"
+        ),
+        "presented_draw_begin": _as_int(latest.get("presented_draw_begin")),
+        "presented_draw_count": _as_int(latest.get("presented_draw_count")),
+        "retained_presented_surface_available": latest.get(
+            "retained_presented_surface_available"
         ),
         "mismatch_draw_count": mismatch_draw_count,
         "mismatching_draws": mismatching_draws[:8],
@@ -3745,6 +4018,14 @@ def _rank_diagnostic_findings(
                     "mismatch_draw_count": texture_stage_mismatch_count,
                     "multiple_texture_stage_draw_count": latest_render_state.get(
                         "multiple_texture_stage_draw_count"
+                    ),
+                    "cubemap_texture_stage_draw_count": latest_render_state.get(
+                        "cubemap_texture_stage_draw_count"
+                    ),
+                    "cubemap_texture_stage_coverage_mismatch_draw_count": (
+                        latest_render_state.get(
+                            "cubemap_texture_stage_coverage_mismatch_draw_count"
+                        )
                     ),
                     "draws": render_state_coverage.get(
                         "multiple_texture_draws", []

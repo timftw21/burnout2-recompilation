@@ -317,7 +317,8 @@ HostTexture VulkanPresenter::create_host_texture(
     const std::vector<uint8_t>& rgba,
     VkFormat image_format,
     bool render_target_feedback,
-    const std::vector<std::vector<uint8_t>>& recovered_mips) {
+    const std::vector<std::vector<uint8_t>>& recovered_mips,
+    bool cubemap) {
     HostTexture texture{};
     texture.guest_address = guest_address;
     texture.width = width;
@@ -326,7 +327,8 @@ HostTexture VulkanPresenter::create_host_texture(
     texture.content_hash = std::move(content_hash);
     texture.image_format = image_format;
     texture.render_target_feedback = render_target_feedback;
-    const bool use_recovered_mips = recovered_mips.size() > 1u;
+    texture.cubemap = cubemap;
+    const bool use_recovered_mips = !cubemap && recovered_mips.size() > 1u;
     std::vector<uint8_t> upload_rgba = use_recovered_mips
         ? recovered_mips.front()
         : rgba;
@@ -334,7 +336,21 @@ HostTexture VulkanPresenter::create_host_texture(
     uint32_t mip_width = width;
     uint32_t mip_height = height;
     size_t mip_offset = 0u;
-    while (true) {
+    if (cubemap) {
+        const size_t face_size = static_cast<size_t>(width) * height * 4u;
+        if (upload_rgba.size() != face_size * 6u) {
+            throw std::runtime_error("invalid cubemap RGBA payload");
+        }
+        for (uint32_t face = 0u; face < 6u; ++face) {
+            VkBufferImageCopy region{};
+            region.bufferOffset = face_size * face;
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.baseArrayLayer = face;
+            region.imageSubresource.layerCount = 1u;
+            region.imageExtent = {width, height, 1u};
+            upload_regions.push_back(region);
+        }
+    } else while (true) {
         VkBufferImageCopy region{};
         region.bufferOffset = mip_offset;
         region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -405,7 +421,9 @@ HostTexture VulkanPresenter::create_host_texture(
         mip_width = next_width;
         mip_height = next_height;
     }
-    texture.mip_levels = static_cast<uint32_t>(upload_regions.size());
+    texture.mip_levels = cubemap
+        ? 1u
+        : static_cast<uint32_t>(upload_regions.size());
     VkBuffer staging = VK_NULL_HANDLE;
     VkDeviceMemory staging_memory = VK_NULL_HANDLE;
     create_buffer(
@@ -425,7 +443,8 @@ HostTexture VulkanPresenter::create_host_texture(
     image_info.imageType = VK_IMAGE_TYPE_2D;
     image_info.extent = {width, height, 1};
     image_info.mipLevels = texture.mip_levels;
-    image_info.arrayLayers = 1;
+    image_info.arrayLayers = cubemap ? 6u : 1u;
+    image_info.flags = cubemap ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u;
     image_info.format = image_format;
     image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
     image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -459,7 +478,7 @@ HostTexture VulkanPresenter::create_host_texture(
         to_transfer.image = texture.image;
         to_transfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         to_transfer.subresourceRange.levelCount = texture.mip_levels;
-        to_transfer.subresourceRange.layerCount = 1;
+        to_transfer.subresourceRange.layerCount = cubemap ? 6u : 1u;
         ++recording_barrier_count_;
         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_transfer);
         vkCmdCopyBufferToImage(
@@ -488,11 +507,13 @@ HostTexture VulkanPresenter::create_host_texture(
     VkImageViewCreateInfo view_info{};
     view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     view_info.image = texture.image;
-    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.viewType = cubemap
+        ? VK_IMAGE_VIEW_TYPE_CUBE
+        : VK_IMAGE_VIEW_TYPE_2D;
     view_info.format = image_format;
     view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     view_info.subresourceRange.levelCount = texture.mip_levels;
-    view_info.subresourceRange.layerCount = 1;
+    view_info.subresourceRange.layerCount = cubemap ? 6u : 1u;
     vk_check(vkCreateImageView(device_, &view_info, nullptr, &texture.view), "vkCreateImageView(texture)");
     return texture;
 }
@@ -1307,10 +1328,61 @@ bool VulkanPresenter::execute_gpu_texture_conversion_batch(
 
 std::optional<HostTexture> VulkanPresenter::create_cpu_converted_host_texture(
     const RecoveredTextureResource& resource,
-    const std::string& content_identity) {
+    const std::string& content_identity,
+    bool cubemap) {
     std::vector<uint8_t> rgba;
     std::vector<std::vector<uint8_t>> recovered_mips;
-    if (resource.format == "DXT1" || resource.format == "DXT5") {
+    if (cubemap) {
+        const size_t face_payload_size = resource.format == "DXT1"
+            ? static_cast<size_t>((resource.width + 3u) / 4u)
+                * ((resource.height + 3u) / 4u) * 8u
+            : resource.format == "DXT3" || resource.format == "DXT5"
+                ? static_cast<size_t>((resource.width + 3u) / 4u)
+                    * ((resource.height + 3u) / 4u) * 16u
+                : static_cast<size_t>(resource.width) * resource.height
+                    * (resource.format == "R5G6B5" ? 2u : 4u);
+        if (resource.payload.size() < face_payload_size * 6u
+            || resource.payload.size() % 6u != 0u) {
+            return std::nullopt;
+        }
+        const size_t face_stride = resource.payload.size() / 6u;
+        if (face_stride < face_payload_size) {
+            return std::nullopt;
+        }
+        rgba.reserve(
+            static_cast<size_t>(resource.width) * resource.height * 4u * 6u);
+        for (uint32_t face = 0u; face < 6u; ++face) {
+            RecoveredTextureResource face_resource = resource;
+            const auto face_begin = resource.payload.begin()
+                + static_cast<std::ptrdiff_t>(face * face_stride);
+            face_resource.payload.assign(
+                face_begin,
+                face_begin + static_cast<std::ptrdiff_t>(face_payload_size));
+            std::vector<uint8_t> face_rgba;
+            if (resource.format == "DXT1") {
+                face_rgba = decompress_dxt1(face_resource);
+            } else if (resource.format == "DXT5") {
+                face_rgba = decompress_dxt5(face_resource);
+            } else if (resource.format == "R5G6B5") {
+                face_rgba = convert_r5g6b5_texture(face_resource);
+            } else if (resource.format == "A8R8G8B8"
+                       || resource.format == "A8R8G8B8_LINEAR") {
+                face_rgba = convert_bgra8_texture(
+                    face_resource,
+                    false,
+                    resource.format == "A8R8G8B8");
+            } else if (resource.format == "X8R8G8B8"
+                       || resource.format == "X8R8G8B8_LINEAR") {
+                face_rgba = convert_bgra8_texture(
+                    face_resource,
+                    true,
+                    resource.format == "X8R8G8B8");
+            } else {
+                return std::nullopt;
+            }
+            rgba.insert(rgba.end(), face_rgba.begin(), face_rgba.end());
+        }
+    } else if (resource.format == "DXT1" || resource.format == "DXT5") {
         recovered_mips = build_cpu_dxt_conversion_mips(resource);
         if (recovered_mips.empty()) {
             return std::nullopt;
@@ -1347,7 +1419,8 @@ std::optional<HostTexture> VulkanPresenter::create_cpu_converted_host_texture(
         rgba,
         VK_FORMAT_R8G8B8A8_UNORM,
         false,
-        recovered_mips);
+        recovered_mips,
+        cubemap);
 }
 
 void VulkanPresenter::clear_moved_texture_handles(HostTexture& texture) {
@@ -1460,7 +1533,6 @@ bool VulkanPresenter::draw_surface_clip_is_subsurface_viewport(
         return false;
     }
 
-    constexpr float kViewportBias = 0.53125f;
     constexpr float kViewportTolerance = 0.01f;
     const float half_width = static_cast<float>(clip_width) * 0.5f;
     const float half_height = static_cast<float>(clip_height) * 0.5f;
@@ -1471,12 +1543,12 @@ bool VulkanPresenter::draw_surface_clip_is_subsurface_viewport(
         && std::abs(
             viewport_offset_x
                 - (static_cast<float>(clip_x) + half_width
-                    + kViewportBias))
+                    + b2r::nv2a::kNv2aViewportSubpixelBias))
             <= kViewportTolerance
         && std::abs(
             viewport_offset_y
                 - (static_cast<float>(clip_y) + half_height
-                    + kViewportBias))
+                    + b2r::nv2a::kNv2aViewportSubpixelBias))
             <= kViewportTolerance;
 }
 
@@ -1636,25 +1708,64 @@ VulkanPresenter::presented_render_target_feedback_specs() const {
         }
     }
 
+    // The title renders camera views into clipped regions of the presented
+    // allocation before copying those regions into dependent textures. Keep
+    // a GPU-backed version of that allocation and replay the clipped writes
+    // into it before dependent offscreen passes run.
+    for (RenderTargetFeedbackSpec& spec : specs) {
+        if (nv2a_canonical_resource_address(spec.address)
+            != nv2a_canonical_resource_address(
+                presented_surface_color_offset_)) {
+            continue;
+        }
+        const auto atlas_producer = std::find_if(
+            interpreted_stream_.draws.begin()
+                + static_cast<std::ptrdiff_t>(first_draw),
+            interpreted_stream_.draws.begin()
+                + static_cast<std::ptrdiff_t>(end_draw),
+            [&](const NativeDraw& draw) {
+                return !draw_targets_presented_surface(draw)
+                    && draw_surface_clip_is_subsurface_viewport(draw)
+                    && nv2a_canonical_resource_address(
+                        draw.surface_color_offset)
+                        == nv2a_canonical_resource_address(spec.address);
+            });
+        if (atlas_producer != interpreted_stream_.draws.begin()
+                + static_cast<std::ptrdiff_t>(end_draw)) {
+            spec.producer_address = atlas_producer->surface_color_offset;
+            spec.offscreen_produced = true;
+        }
+    }
+
     // Surface offsets and texture DMA offsets can name the same allocation
     // through different NV2A windows. Retain any offscreen surface that is
     // sampled later in the frame so the producer pass can be replayed into
     // the host texture instead of uploading stale CPU backing bytes.
     std::map<std::array<uint32_t, 3>, const NativeDraw*>
         latest_offscreen_producers;
+    std::unordered_map<uint32_t, const NativeDraw*>
+        latest_offscreen_producers_by_address;
     for (size_t consumer_index = first_draw;
          consumer_index < end_draw;
          ++consumer_index) {
         const NativeDraw& consumer =
             interpreted_stream_.draws[consumer_index];
-        if (consumer.texture_enabled
-            && consumer.texture_stage < consumer.texture_formats.size()
-            && consumer.texture_address != 0u) {
-            const uint32_t format_raw =
-                consumer.texture_formats[consumer.texture_stage];
+        for (uint32_t stage = 0u;
+             stage < consumer.texture_formats.size();
+             ++stage) {
+            const uint32_t texture_mode =
+                (consumer.shader_stage_program >> (stage * 5u)) & 0x1Fu;
+            const uint32_t texture_address = consumer.texture_offsets[stage];
+            if (texture_mode == 0u
+                || (consumer.texture_controls[stage] & (1u << 30u)) == 0u
+                || texture_address == 0u) {
+                continue;
+            }
+            const uint32_t format_raw = consumer.texture_formats[stage];
             const uint32_t color_format = (format_raw >> 8u) & 0xFFu;
             std::string format;
             switch (color_format) {
+            case 0x05u: format = "R5G6B5"; break;
             case 0x06u: format = "A8R8G8B8"; break;
             case 0x07u: format = "X8R8G8B8"; break;
             case 0x12u: format = "A8R8G8B8_LINEAR"; break;
@@ -1665,11 +1776,66 @@ VulkanPresenter::presented_render_target_feedback_specs() const {
                 const auto [texture_width, texture_height] =
                     nv2a_texture_extent(
                         format_raw,
-                        consumer.texture_image_rects[
-                            consumer.texture_stage]);
+                        consumer.texture_image_rects[stage]);
+                if (nv2a_texture_format_is_cubemap(format_raw)) {
+                    const uint32_t bytes_per_pixel =
+                        b2r::nv2a::nv2a_texture_uncompressed_bytes_per_pixel(
+                            format_raw);
+                    const uint64_t face_stride = static_cast<uint64_t>(
+                        texture_width) * texture_height * bytes_per_pixel;
+                    std::array<uint32_t, 6> face_producers{};
+                    bool complete = bytes_per_pixel != 0u
+                        && face_stride <= std::numeric_limits<uint32_t>::max();
+                    for (uint32_t face = 0u;
+                         complete && face < face_producers.size();
+                         ++face) {
+                        const uint64_t face_address =
+                            static_cast<uint64_t>(texture_address)
+                                + face_stride * face;
+                        if (face_address
+                            > std::numeric_limits<uint32_t>::max()) {
+                            complete = false;
+                            break;
+                        }
+                        const auto producer =
+                            latest_offscreen_producers_by_address.find(
+                                nv2a_canonical_resource_address(
+                                    static_cast<uint32_t>(face_address)));
+                        if (producer
+                            == latest_offscreen_producers_by_address.end()) {
+                            complete = false;
+                            break;
+                        }
+                        const uint32_t clip_width =
+                            producer->second->surface_clip_horizontal >> 16u;
+                        const uint32_t clip_height =
+                            producer->second->surface_clip_vertical >> 16u;
+                        if (clip_width != texture_width
+                            || clip_height != texture_height) {
+                            complete = false;
+                            break;
+                        }
+                        face_producers[face] =
+                            producer->second->surface_color_offset;
+                    }
+                    if (complete) {
+                        RenderTargetFeedbackSpec spec{};
+                        spec.address = texture_address;
+                        spec.width = texture_width;
+                        spec.height = texture_height;
+                        spec.format = std::move(format);
+                        spec.producer_address = face_producers.front();
+                        spec.offscreen_produced = true;
+                        spec.cubemap = true;
+                        spec.cubemap_face_producer_addresses =
+                            face_producers;
+                        append_unique(std::move(spec));
+                    }
+                    continue;
+                }
                 const std::array<uint32_t, 3> producer_key{
                     nv2a_canonical_resource_address(
-                        consumer.texture_address),
+                        texture_address),
                     texture_width,
                     texture_height,
                 };
@@ -1677,7 +1843,7 @@ VulkanPresenter::presented_render_target_feedback_specs() const {
                     producer_key);
                 if (producer != latest_offscreen_producers.end()) {
                     append_unique({
-                        consumer.texture_address,
+                        texture_address,
                         texture_width,
                         texture_height,
                         std::move(format),
@@ -1696,6 +1862,9 @@ VulkanPresenter::presented_render_target_feedback_specs() const {
                 surface_width,
                 surface_height,
             }] = &consumer;
+            latest_offscreen_producers_by_address[
+                nv2a_canonical_resource_address(
+                    consumer.surface_color_offset)] = &consumer;
         }
     }
     feedback_spec_cache_generation_ = render_work_generation_;
@@ -1713,7 +1882,8 @@ bool VulkanPresenter::render_target_feedback_texture_matches_spec(
         && texture.guest_address == spec.address
         && texture.width == spec.width
         && texture.height == spec.height
-        && texture.format == spec.format;
+        && texture.format == spec.format
+        && texture.cubemap == spec.cubemap;
 }
 
 void VulkanPresenter::cache_render_target_feedback_texture(HostTexture& texture) {
@@ -1730,7 +1900,8 @@ void VulkanPresenter::cache_render_target_feedback_texture(HostTexture& texture)
             return cached.guest_address == texture.guest_address
                 && cached.width == texture.width
                 && cached.height == texture.height
-                && cached.format == texture.format;
+                && cached.format == texture.format
+                && cached.cubemap == texture.cubemap;
         });
     if (duplicate != render_target_feedback_image_cache_.end()) {
         destroy_host_texture(*duplicate);
@@ -1784,6 +1955,7 @@ bool VulkanPresenter::render_target_feedback_refresh_required() const {
 
 HostTexture VulkanPresenter::create_render_target_feedback_texture(
     const RenderTargetFeedbackSpec& spec) {
+    const size_t layer_count = spec.cubemap ? 6u : 1u;
     return create_host_texture(
         spec.address,
         spec.width,
@@ -1791,10 +1963,13 @@ HostTexture VulkanPresenter::create_render_target_feedback_texture(
         spec.format,
         "render-target-feedback",
         std::vector<uint8_t>(
-            static_cast<size_t>(spec.width) * spec.height * 4u,
+            static_cast<size_t>(spec.width) * spec.height * 4u
+                * layer_count,
             0u),
         swapchain_format_,
-        true);
+        true,
+        {},
+        spec.cubemap);
 }
 
 void VulkanPresenter::destroy_offscreen_render_targets() {
@@ -1803,11 +1978,17 @@ void VulkanPresenter::destroy_offscreen_render_targets() {
             vkDestroyFramebuffer(device_, target.framebuffer, nullptr);
             target.framebuffer = VK_NULL_HANDLE;
         }
+        if (target.owns_color_view
+            && target.color_view != VK_NULL_HANDLE) {
+            vkDestroyImageView(device_, target.color_view, nullptr);
+        }
         destroy_depth_attachment(
             target.depth_image,
             target.depth_memory,
             target.depth_view);
+        target.color_image = VK_NULL_HANDLE;
         target.color_view = VK_NULL_HANDLE;
+        target.owns_color_view = false;
     }
     offscreen_render_targets_.clear();
 }
@@ -1818,7 +1999,8 @@ bool VulkanPresenter::offscreen_render_targets_match_presented_specs() const {
     std::vector<RenderTargetFeedbackSpec> expected;
     for (const RenderTargetFeedbackSpec& spec : specs) {
         if (spec.offscreen_produced) {
-            expected.push_back(spec);
+            const uint32_t target_count = spec.cubemap ? 6u : 1u;
+            expected.insert(expected.end(), target_count, spec);
         }
     }
     if (expected.size() != offscreen_render_targets_.size()) {
@@ -1828,6 +2010,7 @@ bool VulkanPresenter::offscreen_render_targets_match_presented_specs() const {
         const OffscreenRenderTarget& target = offscreen_render_targets_[index];
         if (!(target.spec == expected[index])
             || target.framebuffer == VK_NULL_HANDLE
+            || target.color_image == VK_NULL_HANDLE
             || target.color_view == VK_NULL_HANDLE
             || target.depth_image == VK_NULL_HANDLE
             || target.depth_memory == VK_NULL_HANDLE
@@ -1840,7 +2023,7 @@ bool VulkanPresenter::offscreen_render_targets_match_presented_specs() const {
             [&](const HostTexture& texture) {
                 return texture.image != VK_NULL_HANDLE
                     && texture.memory != VK_NULL_HANDLE
-                    && texture.view == target.color_view
+                    && texture.image == target.color_image
                     && render_target_feedback_texture_matches_spec(
                         texture,
                         expected[index]);
@@ -1865,59 +2048,95 @@ void VulkanPresenter::create_offscreen_render_targets() {
             host_textures_.begin(),
             host_textures_.end(),
             [&](const HostTexture& candidate) {
-                return candidate.render_target_feedback
-                    && nv2a_canonical_resource_address(
-                        candidate.guest_address)
-                        == nv2a_canonical_resource_address(spec.address)
-                    && candidate.width == spec.width
-                    && candidate.height == spec.height;
+                return render_target_feedback_texture_matches_spec(
+                    candidate, spec);
             });
         if (texture == host_textures_.end()) {
             continue;
         }
-        OffscreenRenderTarget target{};
-        target.spec = spec;
-        target.color_view = texture->view;
-        try {
-            create_depth_attachment(
-                spec.width,
-                spec.height,
-                target.depth_image,
-                target.depth_memory,
-                target.depth_view);
-            const std::array<VkImageView, 2> attachments = {
-                target.color_view,
-                target.depth_view,
-            };
-            VkFramebufferCreateInfo create_info{};
-            create_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-            create_info.renderPass = render_pass_;
-            create_info.attachmentCount = static_cast<uint32_t>(
-                attachments.size());
-            create_info.pAttachments = attachments.data();
-            create_info.width = spec.width;
-            create_info.height = spec.height;
-            create_info.layers = 1;
-            vk_check(
-                vkCreateFramebuffer(
-                    device_,
-                    &create_info,
-                    nullptr,
-                    &target.framebuffer),
-                "vkCreateFramebuffer(offscreen)");
-        } catch (...) {
-            destroy_depth_attachment(
-                target.depth_image,
-                target.depth_memory,
-                target.depth_view);
-            throw;
+        const uint32_t target_count = spec.cubemap ? 6u : 1u;
+        for (uint32_t layer = 0u; layer < target_count; ++layer) {
+            OffscreenRenderTarget target{};
+            target.spec = spec;
+            target.array_layer = layer;
+            target.producer_address = spec.cubemap
+                ? spec.cubemap_face_producer_addresses[layer]
+                : spec.producer_address;
+            target.color_image = texture->image;
+            target.color_view = texture->view;
+            try {
+                if (spec.cubemap) {
+                    VkImageViewCreateInfo view_info{};
+                    view_info.sType =
+                        VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+                    view_info.image = texture->image;
+                    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                    view_info.format = texture->image_format;
+                    view_info.subresourceRange.aspectMask =
+                        VK_IMAGE_ASPECT_COLOR_BIT;
+                    view_info.subresourceRange.baseArrayLayer = layer;
+                    view_info.subresourceRange.layerCount = 1u;
+                    view_info.subresourceRange.levelCount = 1u;
+                    vk_check(
+                        vkCreateImageView(
+                            device_,
+                            &view_info,
+                            nullptr,
+                            &target.color_view),
+                        "vkCreateImageView(offscreen cube face)");
+                    target.owns_color_view = true;
+                }
+                create_depth_attachment(
+                    spec.width,
+                    spec.height,
+                    target.depth_image,
+                    target.depth_memory,
+                    target.depth_view);
+                const std::array<VkImageView, 2> attachments = {
+                    target.color_view,
+                    target.depth_view,
+                };
+                VkFramebufferCreateInfo create_info{};
+                create_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+                create_info.renderPass = render_pass_;
+                create_info.attachmentCount = static_cast<uint32_t>(
+                    attachments.size());
+                create_info.pAttachments = attachments.data();
+                create_info.width = spec.width;
+                create_info.height = spec.height;
+                create_info.layers = 1;
+                vk_check(
+                    vkCreateFramebuffer(
+                        device_,
+                        &create_info,
+                        nullptr,
+                        &target.framebuffer),
+                    "vkCreateFramebuffer(offscreen)");
+            } catch (...) {
+                if (target.owns_color_view
+                    && target.color_view != VK_NULL_HANDLE) {
+                    vkDestroyImageView(
+                        device_, target.color_view, nullptr);
+                }
+                destroy_depth_attachment(
+                    target.depth_image,
+                    target.depth_memory,
+                    target.depth_view);
+                throw;
+            }
+            offscreen_render_targets_.push_back(std::move(target));
         }
-        offscreen_render_targets_.push_back(std::move(target));
     }
     log_.emit(
         "nv2a_offscreen_render_targets_created",
         {
             {"count", std::to_string(offscreen_render_targets_.size())},
+            {"cubemap_face_count", std::to_string(std::count_if(
+                offscreen_render_targets_.begin(),
+                offscreen_render_targets_.end(),
+                [](const OffscreenRenderTarget& target) {
+                    return target.spec.cubemap;
+                }))},
             {"dedicated_depth_count", std::to_string(
                 std::count_if(
                     offscreen_render_targets_.begin(),
@@ -1935,19 +2154,30 @@ void VulkanPresenter::destroy_host_texture_bindings() {
         texture_descriptor_pool_ = VK_NULL_HANDLE;
     }
     for (const HostTextureBinding& binding : host_texture_bindings_) {
-        if (binding.sampler) {
-            vkDestroySampler(device_, binding.sampler, nullptr);
+        for (const HostTextureStageBinding& stage : binding.stages) {
+            if (stage.sampler) {
+                vkDestroySampler(device_, stage.sampler, nullptr);
+            }
         }
     }
     host_texture_bindings_.clear();
 }
 
 size_t VulkanPresenter::host_texture_index_for_draw(const NativeDraw& draw) const {
+    return host_texture_index_for_stage(draw, draw.texture_stage);
+}
+
+size_t VulkanPresenter::host_texture_index_for_stage(
+    const NativeDraw& draw,
+    uint32_t stage) const {
+    if (stage >= draw.texture_formats.size()) {
+        return 0u;
+    }
     const auto match = std::find_if(
         host_textures_.begin(),
         host_textures_.end(),
         [&](const HostTexture& texture) {
-            return host_texture_matches_draw(texture, draw);
+            return host_texture_matches_stage(texture, draw, stage);
         });
     return match == host_textures_.end()
         ? 0u
@@ -1956,7 +2186,7 @@ size_t VulkanPresenter::host_texture_index_for_draw(const NativeDraw& draw) cons
 
 std::vector<HostTextureBindingSpec>
 VulkanPresenter::required_host_texture_bindings() const {
-    std::vector<HostTextureBindingSpec> required{{0u, 0u, 0u, 0u, 0u}};
+    std::vector<HostTextureBindingSpec> required(1u);
     const size_t first_draw = std::min<size_t>(
         interpreted_stream_.presented_draw_begin,
         interpreted_stream_.draws.size());
@@ -1977,32 +2207,30 @@ VulkanPresenter::required_host_texture_bindings() const {
             feedback_specs.end(),
             [&](const RenderTargetFeedbackSpec& target) {
                 return target.offscreen_produced
-                    && nv2a_canonical_resource_address(
-                        target.producer_address)
-                        == nv2a_canonical_resource_address(
-                            draw.surface_color_offset);
+                    && target.producer_matches(
+                        draw.surface_color_offset);
             });
         if ((!draw_targets_presented_surface(draw)
                 && !targets_offscreen_feedback)
             || !draw_has_supported_host_transform(draw)
-            || (draw.primitive != 5u && draw.primitive != 6u)
+            || !native_pipeline_primitive_supported(draw.primitive)
             || draw.vertex_count == 0u) {
             continue;
         }
-        const size_t texture_index = host_texture_index_for_draw(draw);
-        const uint32_t address = draw.texture_enabled
-                && draw.texture_stage < draw.texture_addresses.size()
-            ? draw.texture_addresses[draw.texture_stage]
-            : 0u;
-        const uint32_t stage = std::min<uint32_t>(
-            draw.texture_stage, 3u);
-        const HostTextureBindingSpec spec{
-            texture_index,
-            address,
-            draw.texture_formats[stage],
-            draw.texture_controls[stage],
-            draw.texture_filters[stage],
-        };
+        HostTextureBindingSpec spec{};
+        for (uint32_t stage = 0u; stage < spec.stages.size(); ++stage) {
+            const uint32_t texture_mode =
+                (draw.shader_stage_program >> (stage * 5u)) & 0x1Fu;
+            const bool enabled = texture_mode != 0u
+                && (draw.texture_controls[stage] & (1u << 30u)) != 0u;
+            spec.stages[stage] = {
+                enabled ? host_texture_index_for_stage(draw, stage) : 0u,
+                enabled ? draw.texture_addresses[stage] : 0u,
+                enabled ? draw.texture_formats[stage] : 0u,
+                enabled ? draw.texture_controls[stage] : 0u,
+                enabled ? draw.texture_filters[stage] : 0u,
+            };
+        }
         if (std::find(required.begin(), required.end(), spec)
             == required.end()) {
             required.push_back(spec);
@@ -2031,47 +2259,80 @@ void VulkanPresenter::refresh_host_texture_bindings() {
         && std::equal(
             required.begin(), required.end(),
             host_texture_bindings_.begin(),
-            [&](const auto& spec, const HostTextureBinding& binding) {
-                return spec.texture_index == binding.texture_index
-                    && spec.address == binding.address
-                    && spec.format == binding.format
-                    && spec.control == binding.control
-                    && spec.filter == binding.filter
-                    && spec.texture_index < host_textures_.size()
-                    && binding.texture_mip_levels
-                        == host_textures_[spec.texture_index].mip_levels;
+            [&](const HostTextureBindingSpec& spec,
+                const HostTextureBinding& binding) {
+                for (uint32_t stage = 0u; stage < spec.stages.size(); ++stage) {
+                    const auto& expected = spec.stages[stage];
+                    const auto& actual = binding.stages[stage];
+                    if (expected.texture_index >= host_textures_.size()
+                        || expected.texture_index != actual.texture_index
+                        || expected.address != actual.address
+                        || expected.format != actual.format
+                        || expected.control != actual.control
+                        || expected.filter != actual.filter
+                        || actual.texture_mip_levels
+                            != host_textures_[expected.texture_index].mip_levels) {
+                        return false;
+                    }
+                }
+                return true;
             });
     if (layout_unchanged) {
         uint32_t image_descriptor_update_count = 0u;
         uint32_t repeat_binding_count = 0u;
         uint32_t mirrored_repeat_binding_count = 0u;
         for (HostTextureBinding& binding : host_texture_bindings_) {
-            const HostTexture& texture =
-                host_textures_[binding.texture_index];
-            if (binding.texture_view != texture.view) {
-                VkDescriptorImageInfo image_info{
-                    binding.sampler,
-                    texture.view,
-                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-                VkWriteDescriptorSet write{};
-                write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                write.dstSet = binding.descriptor_set;
-                write.dstBinding = 0u;
-                write.descriptorCount = 1u;
-                write.descriptorType =
-                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                write.pImageInfo = &image_info;
-                vkUpdateDescriptorSets(
-                    device_, 1u, &write, 0u, nullptr);
-                binding.texture_view = texture.view;
-                ++image_descriptor_update_count;
+            std::array<VkDescriptorImageInfo, 8> image_infos{};
+            std::array<VkWriteDescriptorSet, 8> writes{};
+            uint32_t write_count = 0u;
+            for (uint32_t stage = 0u; stage < binding.stages.size(); ++stage) {
+                HostTextureStageBinding& stage_binding = binding.stages[stage];
+                const HostTexture& texture =
+                    host_textures_[stage_binding.texture_index];
+                const VkImageView view_2d = texture.cubemap
+                    ? host_textures_[0].view
+                    : texture.view;
+                const VkImageView view_cube = texture.cubemap
+                    ? texture.view
+                    : host_textures_[1].view;
+                const std::array<VkImageView, 2> views{view_2d, view_cube};
+                std::array<VkImageView*, 2> cached_views{
+                    &stage_binding.texture_2d_view,
+                    &stage_binding.texture_cube_view,
+                };
+                for (uint32_t dimension = 0u; dimension < 2u; ++dimension) {
+                    if (*cached_views[dimension] == views[dimension]) {
+                        continue;
+                    }
+                    image_infos[write_count] = {
+                        stage_binding.sampler,
+                        views[dimension],
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    };
+                    VkWriteDescriptorSet& write = writes[write_count];
+                    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    write.dstSet = binding.descriptor_set;
+                    write.dstBinding = stage + dimension * 4u;
+                    write.descriptorCount = 1u;
+                    write.descriptorType =
+                        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                    write.pImageInfo = &image_infos[write_count];
+                    *cached_views[dimension] = views[dimension];
+                    ++write_count;
+                }
+                const uint32_t u_mode = stage_binding.address & 7u;
+                const uint32_t v_mode =
+                    (stage_binding.address >> 8u) & 7u;
+                repeat_binding_count +=
+                    u_mode == 1u || v_mode == 1u ? 1u : 0u;
+                mirrored_repeat_binding_count +=
+                    u_mode == 2u || v_mode == 2u ? 1u : 0u;
             }
-            const uint32_t u_mode = binding.address & 7u;
-            const uint32_t v_mode = (binding.address >> 8u) & 7u;
-            repeat_binding_count +=
-                u_mode == 1u || v_mode == 1u ? 1u : 0u;
-            mirrored_repeat_binding_count +=
-                u_mode == 2u || v_mode == 2u ? 1u : 0u;
+            if (write_count != 0u) {
+                vkUpdateDescriptorSets(
+                    device_, write_count, writes.data(), 0u, nullptr);
+                image_descriptor_update_count += write_count;
+            }
         }
         ++texture_binding_set_reuse_count_;
         texture_binding_image_descriptor_update_count_ +=
@@ -2102,48 +2363,65 @@ void VulkanPresenter::refresh_host_texture_bindings() {
     host_texture_bindings_.reserve(required.size());
     for (const HostTextureBindingSpec& spec : required) {
         HostTextureBinding binding{};
-        binding.texture_index = spec.texture_index;
-        binding.address = spec.address;
-        binding.format = spec.format;
-        binding.control = spec.control;
-        binding.filter = spec.filter;
-        binding.texture_mip_levels =
-            host_textures_[spec.texture_index].mip_levels;
-        binding.texture_view = host_textures_[spec.texture_index].view;
-        VkSamplerCreateInfo sampler_info{};
-        sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-        const uint32_t min_filter = (spec.filter >> 16u) & 0xFFu;
-        const uint32_t mag_filter = (spec.filter >> 24u) & 0x0Fu;
-        sampler_info.magFilter = mag_filter == 1u
-            ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-        sampler_info.minFilter = min_filter == 1u
-                || min_filter == 3u || min_filter == 5u
-            ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-        sampler_info.mipmapMode = min_filter == 5u || min_filter == 6u
-            ? VK_SAMPLER_MIPMAP_MODE_LINEAR
-            : VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        sampler_info.addressModeU = nv2a_sampler_address_mode(spec.address);
-        sampler_info.addressModeV = nv2a_sampler_address_mode(spec.address >> 8u);
-        sampler_info.addressModeW = nv2a_sampler_address_mode(spec.address >> 16u);
-        sampler_info.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-        const HostTexture& texture = host_textures_[spec.texture_index];
-        const uint32_t requested_mip_levels =
-            (spec.format >> 16u) & 0x0Fu;
-        const uint32_t available_mip_levels = std::min(
-            texture.mip_levels,
-            std::max(requested_mip_levels, 1u));
-        sampler_info.maxLod = min_filter >= 3u
-            ? static_cast<float>(available_mip_levels - 1u)
-            : 0.0f;
-        int32_t lod_bias = static_cast<int32_t>(spec.filter & 0x1FFFu);
-        if ((lod_bias & 0x1000) != 0) {
-            lod_bias -= 0x2000;
+        for (uint32_t stage = 0u; stage < spec.stages.size(); ++stage) {
+            const HostTextureStageBindingSpec& stage_spec = spec.stages[stage];
+            HostTextureStageBinding& stage_binding = binding.stages[stage];
+            stage_binding.texture_index = stage_spec.texture_index;
+            stage_binding.address = stage_spec.address;
+            stage_binding.format = stage_spec.format;
+            stage_binding.control = stage_spec.control;
+            stage_binding.filter = stage_spec.filter;
+            const HostTexture& texture =
+                host_textures_[stage_spec.texture_index];
+            stage_binding.texture_mip_levels = texture.mip_levels;
+            stage_binding.texture_2d_view = texture.cubemap
+                ? host_textures_[0].view
+                : texture.view;
+            stage_binding.texture_cube_view = texture.cubemap
+                ? texture.view
+                : host_textures_[1].view;
+            VkSamplerCreateInfo sampler_info{};
+            sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+            const uint32_t min_filter = (stage_spec.filter >> 16u) & 0xFFu;
+            const uint32_t mag_filter = (stage_spec.filter >> 24u) & 0x0Fu;
+            sampler_info.magFilter = mag_filter == 1u
+                ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+            sampler_info.minFilter = min_filter == 1u
+                    || min_filter == 3u || min_filter == 5u
+                ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+            sampler_info.mipmapMode = min_filter == 5u || min_filter == 6u
+                ? VK_SAMPLER_MIPMAP_MODE_LINEAR
+                : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            sampler_info.addressModeU =
+                nv2a_sampler_address_mode(stage_spec.address);
+            sampler_info.addressModeV =
+                nv2a_sampler_address_mode(stage_spec.address >> 8u);
+            sampler_info.addressModeW =
+                nv2a_sampler_address_mode(stage_spec.address >> 16u);
+            sampler_info.borderColor =
+                VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+            const uint32_t requested_mip_levels =
+                (stage_spec.format >> 16u) & 0x0Fu;
+            const uint32_t available_mip_levels = std::min(
+                texture.mip_levels,
+                std::max(requested_mip_levels, 1u));
+            sampler_info.maxLod = min_filter >= 3u
+                ? static_cast<float>(available_mip_levels - 1u)
+                : 0.0f;
+            int32_t lod_bias = static_cast<int32_t>(
+                stage_spec.filter & 0x1FFFu);
+            if ((lod_bias & 0x1000) != 0) {
+                lod_bias -= 0x2000;
+            }
+            sampler_info.mipLodBias = static_cast<float>(lod_bias) / 256.0f;
+            vk_check(
+                vkCreateSampler(
+                    device_,
+                    &sampler_info,
+                    nullptr,
+                    &stage_binding.sampler),
+                "vkCreateSampler(texture stage binding)");
         }
-        sampler_info.mipLodBias = static_cast<float>(lod_bias) / 256.0f;
-        vk_check(
-            vkCreateSampler(
-                device_, &sampler_info, nullptr, &binding.sampler),
-            "vkCreateSampler(texture binding)");
         host_texture_bindings_.push_back(binding);
     }
 
@@ -2152,7 +2430,7 @@ void VulkanPresenter::refresh_host_texture_bindings() {
     std::array<VkDescriptorPoolSize, 2> pool_sizes{{
         {
             VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            descriptor_count,
+            descriptor_count * 8u,
         },
         {
             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -2188,11 +2466,21 @@ void VulkanPresenter::refresh_host_texture_bindings() {
     for (size_t index = 0; index < host_texture_bindings_.size(); ++index) {
         HostTextureBinding& binding = host_texture_bindings_[index];
         binding.descriptor_set = descriptor_sets[index];
-        const HostTexture& texture = host_textures_[binding.texture_index];
-        VkDescriptorImageInfo image_info{
-            binding.sampler,
-            texture.view,
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        std::array<VkDescriptorImageInfo, 8> image_infos{};
+        for (uint32_t stage = 0u; stage < binding.stages.size(); ++stage) {
+            const HostTextureStageBinding& stage_binding =
+                binding.stages[stage];
+            image_infos[stage] = {
+                stage_binding.sampler,
+                stage_binding.texture_2d_view,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            };
+            image_infos[4u + stage] = {
+                stage_binding.sampler,
+                stage_binding.texture_cube_view,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            };
+        }
         VkDescriptorBufferInfo fragment_buffer_info{
             fragment_state_buffer_,
             0,
@@ -2209,54 +2497,50 @@ void VulkanPresenter::refresh_host_texture_bindings() {
             raw_vertex_resource_buffer_,
             0,
             raw_vertex_resource_buffer_size_};
-        std::array<VkWriteDescriptorSet, 5> writes{};
-        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet = binding.descriptor_set;
-        writes[0].dstBinding = 0;
-        writes[0].descriptorCount = 1;
-        writes[0].descriptorType =
-            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[0].pImageInfo = &image_info;
-        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet = binding.descriptor_set;
-        writes[1].dstBinding = 1;
-        writes[1].descriptorCount = 1;
-        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[1].pBufferInfo = &fragment_buffer_info;
-        writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[2].dstSet = binding.descriptor_set;
-        writes[2].dstBinding = 2;
-        writes[2].descriptorCount = 1;
-        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[2].pBufferInfo = &vertex_program_buffer_info;
-        writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[3].dstSet = binding.descriptor_set;
-        writes[3].dstBinding = 3;
-        writes[3].descriptorCount = 1;
-        writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[3].pBufferInfo = &vertex_buffer_info;
-        writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[4].dstSet = binding.descriptor_set;
-        writes[4].dstBinding = 4;
-        writes[4].descriptorCount = 1;
-        writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[4].pBufferInfo = &raw_resource_buffer_info;
+        std::array<VkWriteDescriptorSet, 12> writes{};
+        for (uint32_t image = 0u; image < image_infos.size(); ++image) {
+            writes[image].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[image].dstSet = binding.descriptor_set;
+            writes[image].dstBinding = image;
+            writes[image].descriptorCount = 1u;
+            writes[image].descriptorType =
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[image].pImageInfo = &image_infos[image];
+        }
+        const std::array<VkDescriptorBufferInfo*, 4> buffer_infos{
+            &fragment_buffer_info,
+            &vertex_program_buffer_info,
+            &vertex_buffer_info,
+            &raw_resource_buffer_info,
+        };
+        for (uint32_t buffer = 0u; buffer < buffer_infos.size(); ++buffer) {
+            VkWriteDescriptorSet& write = writes[8u + buffer];
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = binding.descriptor_set;
+            write.dstBinding = 8u + buffer;
+            write.descriptorCount = 1u;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            write.pBufferInfo = buffer_infos[buffer];
+        }
         vkUpdateDescriptorSets(
             device_,
             static_cast<uint32_t>(writes.size()),
             writes.data(),
             0,
             nullptr);
-        const uint32_t u_mode = binding.address & 7u;
-        const uint32_t v_mode = (binding.address >> 8u) & 7u;
-        repeat_binding_count += u_mode == 1u || v_mode == 1u ? 1u : 0u;
-        mirrored_repeat_binding_count +=
-            u_mode == 2u || v_mode == 2u ? 1u : 0u;
+        for (const HostTextureStageBinding& stage : binding.stages) {
+            const uint32_t u_mode = stage.address & 7u;
+            const uint32_t v_mode = (stage.address >> 8u) & 7u;
+            repeat_binding_count +=
+                u_mode == 1u || v_mode == 1u ? 1u : 0u;
+            mirrored_repeat_binding_count +=
+                u_mode == 2u || v_mode == 2u ? 1u : 0u;
+        }
     }
     ++texture_binding_set_rebuild_count_;
-    texture_binding_image_descriptor_update_count_ += descriptor_count;
+    texture_binding_image_descriptor_update_count_ += descriptor_count * 8u;
     texture_binding_descriptor_set_allocation_count_ += descriptor_count;
-    last_texture_binding_image_descriptor_update_count_ = descriptor_count;
+    last_texture_binding_image_descriptor_update_count_ = descriptor_count * 8u;
     last_texture_binding_descriptor_set_allocation_count_ =
         descriptor_count;
     last_texture_binding_update_us_ = std::chrono::duration_cast<
@@ -2268,7 +2552,7 @@ void VulkanPresenter::refresh_host_texture_bindings() {
             {"bindings", std::to_string(host_texture_bindings_.size())},
             {"binding_set_reused", json_bool(false)},
             {"image_descriptor_updates", std::to_string(
-                descriptor_count)},
+                descriptor_count * 8u)},
             {"descriptor_sets_allocated", std::to_string(
                 descriptor_count)},
             {"update_us", std::to_string(
@@ -2400,6 +2684,21 @@ void VulkanPresenter::refresh_host_textures(bool retain_unlisted_resources) {
         index_active_texture();
         ++uploaded_texture_count;
     }
+    if (!retain_matching(0u, 1u, 1u, "fallback", "white-cubemap")) {
+        host_textures_.push_back(create_host_texture(
+            0u,
+            1u,
+            1u,
+            "fallback",
+            "white-cubemap",
+            std::vector<uint8_t>(6u * 4u, 255u),
+            VK_FORMAT_R8G8B8A8_UNORM,
+            false,
+            {},
+            true));
+        index_active_texture();
+        ++uploaded_texture_count;
+    }
     for (const RenderTargetFeedbackSpec& spec : feedback_specs) {
         const size_t retained = find_previous_index(
             spec.address,
@@ -2456,16 +2755,41 @@ void VulkanPresenter::refresh_host_textures(bool retain_unlisted_resources) {
         if (replaced_by_feedback) {
             continue;
         }
-        const std::string content_identity = texture_content_identity(resource);
+        const bool cubemap = std::any_of(
+            interpreted_stream_.draws.begin(),
+            interpreted_stream_.draws.end(),
+            [&](const NativeDraw& draw) {
+                for (uint32_t stage = 0u;
+                     stage < draw.texture_formats.size();
+                     ++stage) {
+                    if (nv2a_canonical_resource_address(
+                            draw.texture_offsets[stage])
+                            == nv2a_canonical_resource_address(
+                                resource.address)
+                        && nv2a_texture_format_is_cubemap(
+                            draw.texture_formats[stage])
+                        && nv2a_texture_format_matches(
+                            resource.format,
+                            draw.texture_formats[stage])) {
+                        return true;
+                    }
+                }
+                return false;
+            });
+        const std::string content_identity =
+            texture_content_identity(resource)
+            + (cubemap ? ":cubemap" : "");
         const size_t rgba_size = static_cast<size_t>(resource.width)
             * resource.height * 4u;
         const size_t r5g6b5_size = static_cast<size_t>(resource.width)
             * resource.height * 2u;
+        const size_t required_layer_count = cubemap ? 6u : 1u;
         const bool supported = resource.format == "DXT1"
             || resource.format == "DXT5"
             || (resource.format == "R5G6B5"
-                && resource.payload.size() >= r5g6b5_size)
-            || resource.payload.size() >= rgba_size;
+                && resource.payload.size()
+                    >= r5g6b5_size * required_layer_count)
+            || resource.payload.size() >= rgba_size * required_layer_count;
         if (!supported) {
             ++unsupported_texture_resource_count_;
             log_.emit(
@@ -2495,7 +2819,8 @@ void VulkanPresenter::refresh_host_textures(bool retain_unlisted_resources) {
             continue;
         }
         GpuTextureConversionJob gpu_job{};
-        if (build_gpu_texture_conversion_job(
+        if (!cubemap
+            && build_gpu_texture_conversion_job(
                 resource,
                 host_textures_.size(),
                 gpu_job)
@@ -2515,7 +2840,7 @@ void VulkanPresenter::refresh_host_textures(bool retain_unlisted_resources) {
         const auto cpu_begin = std::chrono::steady_clock::now();
         std::optional<HostTexture> texture =
             create_cpu_converted_host_texture(
-                resource, content_identity);
+                resource, content_identity, cubemap);
         cpu_texture_path_us += std::chrono::duration_cast<
             std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - cpu_begin).count();
@@ -2539,7 +2864,8 @@ void VulkanPresenter::refresh_host_textures(bool retain_unlisted_resources) {
                 std::optional<HostTexture> texture =
                     create_cpu_converted_host_texture(
                         *job.resource,
-                        host_textures_[job.host_texture_index].content_hash);
+                        host_textures_[job.host_texture_index].content_hash,
+                        false);
                 cpu_texture_path_us += std::chrono::duration_cast<
                     std::chrono::microseconds>(
                         std::chrono::steady_clock::now() - cpu_begin).count();

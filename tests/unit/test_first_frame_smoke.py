@@ -25,6 +25,8 @@ from tools.host.first_frame_smoke import (
 
 
 PRESENTER_SOURCE_PATHS = (
+    Path("runtime/host/command_work_cache.h"),
+    Path("runtime/nv2a/raster_coordinates.h"),
     Path("runtime/host/nv2a_command_processor.cpp"),
     Path("runtime/host/vulkan_presenter.cpp"),
     Path("runtime/host/vulkan_renderer.cpp"),
@@ -286,6 +288,33 @@ class FirstFrameSmokeTests(unittest.TestCase):
             "Local\\b2_recomp_live_test",
         )
 
+    def test_presenter_run_forwards_command_work_cache_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            executable = root / "presenter.exe"
+            trace = root / "diagnostics" / "cache-trace.jsonl"
+            executable.touch()
+            completed = Mock(returncode=0, stdout="", stderr="")
+            with patch(
+                "tools.host.first_frame_smoke.subprocess.run",
+                return_value=completed,
+            ) as run:
+                run_first_frame(
+                    executable=executable,
+                    debug_json=None,
+                    max_frames=0,
+                    timeout_seconds=0,
+                    screenshot=None,
+                    hotkey_screenshot_directory=None,
+                    command_work_cache_trace=trace,
+                )
+
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[command.index("--command-work-cache-trace") + 1],
+            str(trace),
+        )
+
     def test_live_presenter_hot_reloads_render_and_publishes_controller_state(self) -> None:
         host_source = presenter_source_text()
         runner_source = Path("tools/host/first_frame_smoke.py").read_text(encoding="utf-8")
@@ -515,8 +544,8 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("--cpu-vertex-programs", host_source)
         self.assertIn("--cpu-vertex-programs", runner_source)
 
-        self.assertIn("binding = 2", shader_source)
-        self.assertIn("binding = 3", shader_source)
+        self.assertIn("binding = 9", shader_source)
+        self.assertIn("binding = 10", shader_source)
         self.assertIn("bool execute_vertex_program", shader_source)
         self.assertIn("temporary_index == 12u", shader_source)
         self.assertIn("temporary_index < 12u", shader_source)
@@ -555,8 +584,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("--cpu-vertex-attributes", host_source)
         self.assertIn("--cpu-vertex-attributes", runner_source)
 
-        self.assertIn("binding = 4", shader_source)
-        self.assertNotIn("binding = 5", shader_source)
+        self.assertIn("binding = 11", shader_source)
         self.assertIn("decode_raw_vertex_attribute", shader_source)
         self.assertIn("raw_vertex_u32", shader_source)
         self.assertIn("raw_source_index_base", shader_source)
@@ -714,7 +742,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("surface_payload_scan_required", source)
         self.assertIn("surface_payload_scan_skipped_count", source)
 
-    def test_method_interpreter_batches_hot_index_and_inline_packets(self) -> None:
+    def test_method_interpreter_batches_hot_data_and_state_packets(self) -> None:
         source = presenter_source_text()
         interpreter = source.split(
             "void interpret_push_buffer_method_packet", 1
@@ -724,13 +752,42 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("first_method == 0x1800u", interpreter)
         self.assertIn("bulk_inline", interpreter)
         self.assertIn("first_method == 0x1818u", interpreter)
+        self.assertIn("bulk_state", interpreter)
+        self.assertIn("nv2a_method_is_batchable_state", interpreter)
+        self.assertIn("nv2a_state_method_is_unchanged", interpreter)
         self.assertIn("one_contiguous_run", interpreter)
         self.assertIn("active_vertex_indices.resize", interpreter)
         self.assertIn("inline_words.resize", interpreter)
         self.assertIn("push_buffer_words_scratch", source)
         self.assertIn('"bulk_indexed_method_delta"', source)
         self.assertIn('"bulk_inline_method_delta"', source)
+        self.assertIn('"bulk_state_method_delta"', source)
+        self.assertIn('"state_method_noop_delta"', source)
         self.assertIn("state_seed_updates_required", source)
+
+    def test_live_span_interpreter_caches_structural_command_work(self) -> None:
+        source = presenter_source_text()
+        cache = Path("runtime/host/command_work_cache.h").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("CommandWorkCache command_work_cache_", source)
+        self.assertIn("command_work_cache->materialize", source)
+        self.assertIn("live_command_generation_", source)
+        self.assertIn('"command_work_cache_hit"', source)
+        self.assertIn("later span payload replaces", Path(
+            "tests/native/host_core_tests.cpp"
+        ).read_text(encoding="utf-8"))
+        self.assertIn("kPlanCapacity = 256u", cache)
+        self.assertIn("std::unordered_multimap<uint64_t, PlanIterator>", cache)
+        self.assertIn("plans_.splice(plans_.end(), plans_, plan_iterator)", cache)
+        self.assertIn("kByteCapacity = 64u * 1024u * 1024u", cache)
+        self.assertIn("descriptor.address + 0x1000u < pending_max_address", cache)
+        self.assertIn("structural.address = descriptor.address - segment_anchor", cache)
+        self.assertIn("descriptor.address + layout.descriptor_payload_offset", cache)
+        self.assertIn("kWindowBytes = 16u * 1024u", cache)
+        self.assertIn("allow_contiguous_merge", cache)
+        self.assertIn("std::memcpy", cache)
 
     def test_feedback_specs_are_indexed_and_cached_per_render_generation(self) -> None:
         source = presenter_source_text()
@@ -740,6 +797,9 @@ class FirstFrameSmokeTests(unittest.TestCase):
 
         self.assertIn("feedback_spec_cache_generation_", feedback)
         self.assertIn("latest_offscreen_producers", feedback)
+        self.assertIn("latest_offscreen_producers_by_address", feedback)
+        self.assertIn("cubemap_face_producer_addresses", feedback)
+        self.assertIn("nv2a_texture_uncompressed_bytes_per_pixel", feedback)
         self.assertNotIn("producer_index < consumer_index", feedback)
         self.assertIn('"feedback_spec_build_us"', source)
         self.assertIn('"feedback_spec_cache_hits"', source)
@@ -754,8 +814,9 @@ class FirstFrameSmokeTests(unittest.TestCase):
         )[1].split("std::vector<NativeVertex> prepare_presented_vertices", 1)[0]
 
         self.assertIn("const bool layout_unchanged", binding_refresh)
-        self.assertIn("binding.texture_view != texture.view", binding_refresh)
-        self.assertIn("write.dstBinding = 0u", binding_refresh)
+        self.assertIn("stage_binding.texture_2d_view", binding_refresh)
+        self.assertIn("stage_binding.texture_cube_view", binding_refresh)
+        self.assertIn("write.dstBinding = stage + dimension * 4u", binding_refresh)
         self.assertIn("texture_binding_set_reuse_count_", binding_refresh)
         self.assertIn("texture_binding_set_rebuild_count_", binding_refresh)
         self.assertNotIn("refresh_host_texture_bindings(true)", source)
@@ -1077,7 +1138,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("presented_surface_color_offset", source)
         self.assertIn("draw_targets_presented_surface", source)
         self.assertIn("draw_surface_clip_is_subsurface_viewport", source)
-        self.assertIn("kViewportBias = 0.53125f", source)
+        self.assertIn("kNv2aViewportSubpixelBias = 0.53125f", source)
         self.assertIn(
             "clip_width >= swapchain_extent_.width\n"
             "        || clip_height >= swapchain_extent_.height",
@@ -1089,10 +1150,19 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("VK_DYNAMIC_STATE_SCISSOR", source)
         self.assertIn("vkCmdSetScissor", source)
         self.assertIn("draw_scissor(draw, target_extent)", source)
+        self.assertIn("nv2a_screen_coordinate_to_vulkan_ndc", source)
+        shader = Path("runtime/host/shaders/nv2a_inline.vert").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("position.xy -= vec2(0.03125);", shader)
         self.assertIn('"offscreen_render_target_draw_count"', source)
-        self.assertIn("state.primitive == 5u", source)
+        self.assertIn('"presented_primitive_draw_counts"', source)
+        self.assertIn('"unsupported_primitive_draw_counts"', source)
+        self.assertIn('"nv2a_unsupported_presented_primitive"', source)
+        self.assertIn("case 5u:", source)
         self.assertIn("VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST", source)
-        self.assertIn("draw.primitive != 5u && draw.primitive != 6u", source)
+        self.assertIn("native_pipeline_primitive_supported", source)
+        self.assertIn("VK_PRIMITIVE_TOPOLOGY_LINE_LIST", source)
 
     def test_native_replay_retains_linear_render_target_feedback(self) -> None:
         source = presenter_source_text()
@@ -1143,8 +1213,8 @@ class FirstFrameSmokeTests(unittest.TestCase):
         preserve_block = source[preserve_begin:preserve_end]
 
         self.assertIn("VkImageView color_view = VK_NULL_HANDLE", source)
-        self.assertIn("texture.view == target.color_view", source)
-        self.assertIn("target.color_view = texture->view", source)
+        self.assertIn("texture.image == target.color_image", source)
+        self.assertIn("target.color_image = texture->image", source)
         self.assertIn("!offscreen_render_targets_.empty()", preserve_block)
         self.assertIn(
             "offscreen_render_targets_match_presented_specs()",
@@ -1467,12 +1537,13 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("state.combiner_alpha_inputs[0] = 0x18140000u", host_source)
         self.assertIn("vkCmdPushConstants", host_source)
         self.assertIn("layout(location = 2) in vec4 in_uv", vertex_shader)
-        self.assertIn("textureProj(texture0, frag_uv.xyw)", fragment_shader)
-        self.assertIn("texture_alpha_kill", fragment_shader)
-        self.assertIn("texture_opaque_alpha", fragment_shader)
+        self.assertIn("sampleTexture2DProjective", fragment_shader)
+        self.assertIn("sampleTextureCube", fragment_shader)
+        self.assertIn("state.texture_alpha_kill_mask", fragment_shader)
+        self.assertIn("state.texture_opaque_alpha_mask", fragment_shader)
         self.assertLess(
             fragment_shader.index("sampled.a = 1.0"),
-            fragment_shader.index("state.texture_alpha_kill"),
+            fragment_shader.index("state.texture_alpha_kill_mask"),
         )
         self.assertIn("discard", fragment_shader)
 
@@ -1483,18 +1554,60 @@ class FirstFrameSmokeTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn(
-            "state.texture_mode = draw.texture_enabled",
+            "state.texture_modes[stage] = enabled",
             host_source,
         )
         self.assertIn(
-            "state.texture_alpha_kill = state.texture_mode != 0u",
+            "state.texture_alpha_kill_mask |=",
             host_source,
         )
         self.assertIn(
-            "if (state.texture_mode != 0u\n"
-            "        && state.texture_alpha_kill != 0u",
+            "if ((state.texture_alpha_kill_mask & (1u << stage)) != 0u\n"
+            "            && sampled.a == 0.0)",
             fragment_shader,
         )
+
+    def test_renderer_replays_multistage_cubemap_textures(self) -> None:
+        host_source = presenter_source_text()
+        vertex_shader = Path(
+            "runtime/host/shaders/nv2a_inline.vert"
+        ).read_text(encoding="utf-8")
+        fragment_shader = Path(
+            "runtime/host/shaders/nv2a_inline.frag"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("nv2a_texture_format_is_cubemap", host_source)
+        self.assertIn("VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT", host_source)
+        self.assertIn("VK_IMAGE_VIEW_TYPE_CUBE", host_source)
+        self.assertIn("VK_IMAGE_VIEW_TYPE_2D", host_source)
+        self.assertIn("cubemap_face_producer_addresses", host_source)
+        self.assertIn('"render_target_feedback_cubemaps"', host_source)
+        self.assertIn('"cubemap_face_count"', host_source)
+        self.assertIn("descriptor_count * 8u", host_source)
+        self.assertIn("host_texture_matches_stage", host_source)
+        self.assertIn(
+            "nv2a_canonical_resource_address(\n"
+            "                draw.texture_offsets[stage])",
+            host_source,
+        )
+        self.assertIn(
+            "nv2a_canonical_resource_address(\n"
+            "                            draw.texture_offsets[stage])\n"
+            "                            == nv2a_canonical_resource_address(\n"
+            "                                resource.address)",
+            host_source,
+        )
+        self.assertNotIn(
+            "nv2a_canonical_resource_address(\n"
+            "                draw.texture_addresses[stage])",
+            host_source,
+        )
+        self.assertIn("texture_linears", vertex_shader)
+        self.assertIn("outputs[texture_output]", vertex_shader)
+        self.assertIn("uniform samplerCube textureCube1", fragment_shader)
+        self.assertIn("state.texture_modes[stage]", fragment_shader)
+        self.assertIn("texture_mode == 3u", fragment_shader)
+        self.assertIn("registers[8u + stage] = sampled", fragment_shader)
 
     def test_native_replay_overlays_recovered_text_on_rendered_frames(self) -> None:
         source = presenter_source_text()

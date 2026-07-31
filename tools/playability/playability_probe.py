@@ -59,7 +59,11 @@ try:
         new_run_id,
         verify_supported_xbe,
     )
-    from tools.recomp.native_executor import NativeExecutorError
+    from tools.recomp.native_executor import (
+        AOT_OPTIMIZATION_MODES,
+        DEFAULT_AOT_OPTIMIZATION_MODE,
+        NativeExecutorError,
+    )
     from tools.recomp.x86_lifter import (
         CpuState,
         ExecutionTrace,
@@ -118,7 +122,11 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
         new_run_id,
         verify_supported_xbe,
     )
-    from tools.recomp.native_executor import NativeExecutorError
+    from tools.recomp.native_executor import (
+        AOT_OPTIMIZATION_MODES,
+        DEFAULT_AOT_OPTIMIZATION_MODE,
+        NativeExecutorError,
+    )
     from tools.recomp.x86_lifter import (
         CpuState,
         ExecutionTrace,
@@ -318,7 +326,7 @@ TITLE_FRONTEND_SYNTHETIC_GLASS_HANDLE_ADDRESS = 0x31F05000
 TITLE_ASSET_STREAM_OPEN_ADDRESS = 0x000D8680
 TITLE_ASSET_STREAM_SYNTHETIC_OBJECT_ADDRESS = 0x31F10000
 TITLE_ASSET_STREAM_SYNTHETIC_VTABLE_ADDRESS = 0x31F10100
-TITLE_ASSET_STREAM_SYNTHETIC_ACTIVATE_TARGET_ADDRESS = 0x31F10200
+TITLE_ASSET_STREAM_SYNTHETIC_CLOSE_TARGET_ADDRESS = 0x31F10200
 TITLE_ASSET_STREAM_SYNTHETIC_STATUS_TARGET_ADDRESS = 0x31F10300
 TITLE_ASSET_STREAM_SYNTHETIC_READ_TARGET_ADDRESS = 0x31F10700
 TITLE_ASSET_STREAM_SYNTHETIC_SEEK_TARGET_ADDRESS = 0x31F10800
@@ -909,8 +917,71 @@ TITLE_D3D_INDEXED_DRAW_ADDRESS = 0x00219750
 TITLE_D3D_INDEXED_DRAW_CONTINUATION_ADDRESS = 0x0021976D
 TITLE_D3D_INDEXED_DRAW_WRAPPER_ADDRESS = 0x000EE140
 TITLE_D3D_INDEXED_DRAW_WRAPPER_RETURN_ADDRESS = 0x000EE159
+TITLE_D3D_DEFERRED_STATE_FLUSH_ADDRESS = 0x000ED570
 TITLE_D3D_INDEXED_STATE_PREPARE_ADDRESS = 0x0021F9C0
+TITLE_D3D_INDEXED_STATE_SLOW_PATH_ADDRESS = 0x00221450
+TITLE_D3D_INDEXED_STATE_RESUME_ADDRESS = 0x0021F965
+TITLE_FLOAT_FINITE_CHECK_ADDRESS = 0x0011FFF5
+TITLE_WORLD_STATE_BLOCK_ADDRESS = 0x0008D1E3
+TITLE_WORLD_STATE_BLOCK_RESUME_ADDRESS = 0x0008E019
+TITLE_MATRIX_PREPARE_ADDRESS = 0x0022784C
+TITLE_MATRIX_PREPARE_RESUME_ADDRESS = 0x00227B44
+TITLE_PUSH_INLINE_16_ADDRESS = 0x00214ED0
+TITLE_PUSH_INLINE_64_ADDRESS = 0x00214F30
+TITLE_PUSH_INLINE_VARIABLE_ADDRESS = 0x002150C0
+TITLE_RESOURCE_BIND_ADDRESS = 0x00215100
 TITLE_INDEXED_RESOURCE_DRAW_ADDRESS = 0x000C5550
+TITLE_INDEXED_RESOURCE_DISPATCH_ADDRESS = 0x00215100
+TITLE_INDEXED_RESOURCE_DISPATCH_RETURN_ADDRESS = 0x000C5561
+TITLE_INDEXED_RESOURCE_DRAW_RETURN_ADDRESS = 0x000C5570
+TITLE_SECONDARY_RESOURCE_DRAW_ADDRESS = 0x0008E540
+TITLE_SECONDARY_RESOURCE_DISPATCH_ADDRESS = 0x00214ED0
+TITLE_AOT_SUPERBLOCK_EDGES = (
+    (
+        TITLE_INDEXED_RESOURCE_DRAW_ADDRESS,
+        TITLE_INDEXED_RESOURCE_DISPATCH_ADDRESS,
+    ),
+    (
+        TITLE_INDEXED_RESOURCE_DISPATCH_ADDRESS,
+        TITLE_INDEXED_RESOURCE_DISPATCH_RETURN_ADDRESS,
+    ),
+    (
+        TITLE_INDEXED_RESOURCE_DISPATCH_RETURN_ADDRESS,
+        TITLE_D3D_INDEXED_DRAW_WRAPPER_ADDRESS,
+    ),
+    (
+        TITLE_D3D_INDEXED_DRAW_WRAPPER_ADDRESS,
+        TITLE_INDEXED_RESOURCE_DRAW_RETURN_ADDRESS,
+    ),
+    (
+        TITLE_SECONDARY_RESOURCE_DRAW_ADDRESS,
+        TITLE_SECONDARY_RESOURCE_DISPATCH_ADDRESS,
+    ),
+    (
+        TITLE_WORLD_STATE_BLOCK_ADDRESS,
+        TITLE_WORLD_STATE_BLOCK_RESUME_ADDRESS,
+    ),
+    (
+        TITLE_D3D_INDEXED_STATE_PREPARE_ADDRESS,
+        TITLE_D3D_INDEXED_DRAW_CONTINUATION_ADDRESS,
+    ),
+    (
+        TITLE_D3D_INDEXED_STATE_PREPARE_ADDRESS,
+        TITLE_D3D_INDEXED_STATE_SLOW_PATH_ADDRESS,
+    ),
+    (
+        TITLE_D3D_INDEXED_STATE_SLOW_PATH_ADDRESS,
+        TITLE_D3D_INDEXED_STATE_RESUME_ADDRESS,
+    ),
+    (
+        TITLE_D3D_INDEXED_STATE_RESUME_ADDRESS,
+        TITLE_D3D_INDEXED_DRAW_CONTINUATION_ADDRESS,
+    ),
+    (
+        TITLE_MATRIX_PREPARE_ADDRESS,
+        TITLE_FLOAT_FINITE_CHECK_ADDRESS,
+    ),
+)
 TITLE_SCENE_RECORD_DISTANCE_CULL_ADDRESS = 0x000C3A28
 TITLE_SCENE_RECORD_RESOURCE_DRAW_ADDRESS = 0x000C3C00
 TITLE_SCENE_RECORD_INDEXED_DRAW_ADDRESS = 0x000C3C30
@@ -964,6 +1035,7 @@ TITLE_DIRECTSOUND_BUFFER_SET_VOLUME_ADDRESS = 0x0022D7D2
 TITLE_DIRECTSOUND_BUFFER_SET_FREQUENCY_ADDRESS = 0x0022E738
 TITLE_DIRECTSOUND_BUFFER_GET_POSITION_ADDRESS = 0x0022D932
 TITLE_DIRECTSOUND_BUFFER_SET_POSITION_ADDRESS = 0x0022D952
+TITLE_DIRECTSOUND_BUFFER_GET_STATUS_ADDRESS = 0x0022D916
 TITLE_DIRECTSOUND_BUFFER_SET_DATA_ADDRESS = 0x0022EF4B
 TITLE_DIRECTSOUND_BUFFER_SET_FORMAT_ADDRESS = 0x0022EF2F
 TITLE_DIRECTSOUND_STREAM_CREATE_ADDRESS = 0x0022F90E
@@ -1027,6 +1099,38 @@ def _native_fast_path_frame_return(stack_argument_bytes: int) -> tuple[str, ...]
         "ctx->ebx = b2r_saved_ebx; ctx->ebp = b2r_saved_ebp;",
         f"ctx->esp = b2r_frame + {stack_argument_bytes + 8}u;",
         "eip = b2r_return_address;",
+        "pending_module_exit_reason = B2R_MODULE_EXIT_RETURN;",
+        "continue;",
+    )
+
+
+def _native_fast_path_frame_return_through(
+    stack_argument_bytes: int,
+    through_return_address: int,
+) -> tuple[str, ...]:
+    """Return through one known leaf `ret` when the budget permits it."""
+
+    frame_return_esp = stack_argument_bytes + 8
+    final_return_esp = frame_return_esp + 4
+    return (
+        "const uint32_t b2r_saved_edi = b2r_read_u32(ctx, ctx->esp);",
+        "const uint32_t b2r_saved_esi = b2r_read_u32(ctx, ctx->esp + 0x4u);",
+        "const uint32_t b2r_saved_ebx = b2r_read_u32(ctx, ctx->esp + 0x8u);",
+        "const uint32_t b2r_frame = ctx->ebp;",
+        "const uint32_t b2r_saved_ebp = b2r_read_u32(ctx, b2r_frame);",
+        "const uint32_t b2r_return_address = b2r_read_u32(ctx, b2r_frame + 0x4u);",
+        "ctx->edi = b2r_saved_edi; ctx->esi = b2r_saved_esi;",
+        "ctx->ebx = b2r_saved_ebx; ctx->ebp = b2r_saved_ebp;",
+        f"ctx->esp = b2r_frame + {frame_return_esp}u;",
+        f"if (b2r_return_address == 0x{through_return_address:08x}u &&",
+        "    !ctx->yield_requested &&",
+        "    (ctx->step_budget == 0u || ctx->steps < ctx->step_budget)) {",
+        "    ++ctx->steps;",
+        "    eip = b2r_read_u32(ctx, ctx->esp);",
+        f"    ctx->esp = b2r_frame + {final_return_esp}u;",
+        "} else {",
+        "    eip = b2r_return_address;",
+        "}",
         "pending_module_exit_reason = B2R_MODULE_EXIT_RETURN;",
         "continue;",
     )
@@ -1162,6 +1266,211 @@ def _title_native_fast_paths() -> dict[int, NativeFastPath]:
             *_native_fast_path_return(8),
             "    }",
             "}",
+        ),
+    )
+
+    push_inline_16 = NativeFastPath(
+        name="title_push_inline_16",
+        guard=(
+            "b2r_read_u32(ctx, 0x002256c0u) <= 0xffffffe3u && "
+            "b2r_read_u32(ctx, 0x002256c0u) + 0x1cu < "
+            "b2r_read_u32(ctx, 0x002256c4u)"
+        ),
+        body=(
+            "const uint32_t b2r_push = b2r_read_u32(ctx, 0x002256c0u);",
+            "const uint32_t b2r_next_push = b2r_push + 0x1cu;",
+            "const uint32_t b2r_index = ctx->ecx;",
+            "const uint32_t b2r_mirror = 0x00224600u + b2r_index * 16u;",
+            "const uint64_t b2r_source_01 = b2r_read_u64(ctx, ctx->edx);",
+            "const uint64_t b2r_source_23 = b2r_read_u64(ctx, ctx->edx + 0x8u);",
+            "b2r_record_native_fast_path(ctx, 0x00214ed0u);",
+            "ctx->eip = 0x00214ed0u;",
+            "b2r_write_u32(ctx, 0x002256c0u, b2r_next_push);",
+            "b2r_write_push_u64(ctx, b2r_push,",
+            "    0x00041ea4ull | (static_cast<uint64_t>(b2r_index) << 32u));",
+            "b2r_write_push_u64(ctx, b2r_push + 0x8u,",
+            "    0x00100b80ull | (b2r_source_01 << 32u));",
+            "b2r_write_push_u64(ctx, b2r_push + 0x10u,",
+            "    (b2r_source_01 >> 32u) | (b2r_source_23 << 32u));",
+            "b2r_write_u32(ctx, b2r_push + 0x18u,",
+            "    static_cast<uint32_t>(b2r_source_23 >> 32u));",
+            "b2r_write_u64(ctx, b2r_mirror, b2r_source_01);",
+            "b2r_write_u64(ctx, b2r_mirror + 0x8u, b2r_source_23);",
+            "const uint32_t b2r_shifted_index = b2r_index << 4u;",
+            "b2r_logic_flags(ctx, b2r_shifted_index, 32u);",
+            "ctx->eax = b2r_next_push; ctx->ecx = b2r_mirror;",
+            *_native_fast_path_return(0),
+        ),
+    )
+
+    push_inline_64 = NativeFastPath(
+        name="title_push_inline_64",
+        guard=(
+            "b2r_read_u32(ctx, 0x002256c0u) <= 0xffffffb3u && "
+            "b2r_read_u32(ctx, 0x002256c0u) + 0x4cu < "
+            "b2r_read_u32(ctx, 0x002256c4u)"
+        ),
+        body=(
+            "const uint32_t b2r_push = b2r_read_u32(ctx, 0x002256c0u);",
+            "const uint32_t b2r_next_push = b2r_push + 0x4cu;",
+            "const uint32_t b2r_index = ctx->ecx;",
+            "const uint32_t b2r_mirror = 0x00224600u + b2r_index * 16u;",
+            "uint64_t b2r_source_words[8];",
+            "for (uint32_t b2r_word = 0u; b2r_word < 8u; ++b2r_word) {",
+            "    b2r_source_words[b2r_word] =",
+            "        b2r_read_u64(ctx, ctx->edx + b2r_word * 8u);",
+            "    ctx->mmx[b2r_word] = b2r_source_words[b2r_word];",
+            "}",
+            "b2r_record_native_fast_path(ctx, 0x00214f30u);",
+            "ctx->eip = 0x00214f30u;",
+            "b2r_write_u32(ctx, 0x002256c0u, b2r_next_push);",
+            "b2r_write_push_u64(ctx, b2r_push,",
+            "    0x00041ea4ull | (static_cast<uint64_t>(b2r_index) << 32u));",
+            "b2r_write_u32(ctx, b2r_push + 0x8u, 0x00400b80u);",
+            "for (uint32_t b2r_word = 0u; b2r_word < 8u; ++b2r_word) {",
+            "    b2r_write_push_u64(ctx, b2r_push + 0xcu + b2r_word * 8u,",
+            "        b2r_source_words[b2r_word]);",
+            "    b2r_write_u64(ctx, b2r_mirror + b2r_word * 8u,",
+            "        b2r_source_words[b2r_word]);",
+            "}",
+            "const uint32_t b2r_shifted_index = b2r_index << 4u;",
+            "b2r_logic_flags(ctx, b2r_shifted_index, 32u);",
+            "ctx->eax = b2r_next_push; ctx->ecx = b2r_mirror;",
+            *_native_fast_path_return(0),
+        ),
+    )
+
+    push_inline_variable = NativeFastPath(
+        name="title_push_inline_variable",
+        guard=(
+            "([&]() { "
+            "const uint32_t b2r_count = b2r_read_u32(ctx, ctx->esp + 0x4u); "
+            "const uint32_t b2r_push = b2r_read_u32(ctx, 0x002256c0u); "
+            "const uint32_t b2r_limit = b2r_read_u32(ctx, 0x002256c4u); "
+            "const uint64_t b2r_full = b2r_count / 16u; "
+            "const uint32_t b2r_tail = b2r_count & 15u; "
+            "const uint64_t b2r_bytes = 8u + b2r_full * 68u + "
+            "    ((b2r_tail != 0u || b2r_count < 16u) ? "
+            "        4u + static_cast<uint64_t>(b2r_tail) * 4u : 0u); "
+            "return b2r_count <= 0x4000u && b2r_push < b2r_limit && "
+            "    static_cast<uint64_t>(b2r_push) + b2r_bytes <= b2r_limit; "
+            "})()"
+        ),
+        body=(
+            "const uint32_t b2r_index = ctx->ecx;",
+            "const uint32_t b2r_count = b2r_read_u32(ctx, ctx->esp + 0x4u);",
+            "const uint32_t b2r_source_start = ctx->edx;",
+            "const bool b2r_update_mirror =",
+            "    (b2r_read_u8(ctx, 0x002256c8u) & 0x10u) == 0u;",
+            "if (b2r_update_mirror) {",
+            "    const uint32_t b2r_mirror = 0x00224600u + b2r_index * 16u;",
+            "    for (uint32_t b2r_word = 0u; b2r_word < b2r_count; ++b2r_word) {",
+            "        b2r_write_u32(ctx, b2r_mirror + b2r_word * 4u,",
+            "            b2r_read_u32(ctx, b2r_source_start + b2r_word * 4u));",
+            "    }",
+            "}",
+            "uint32_t b2r_push = b2r_read_u32(ctx, 0x002256c0u);",
+            "uint32_t b2r_source = b2r_source_start;",
+            "uint32_t b2r_remaining = b2r_count;",
+            "b2r_record_native_fast_path(ctx, 0x002150c0u);",
+            "ctx->eip = 0x002150c0u;",
+            "b2r_write_push_u64(ctx, b2r_push,",
+            "    0x00041ea4ull | (static_cast<uint64_t>(b2r_index) << 32u));",
+            "b2r_push += 8u;",
+            "while (b2r_remaining >= 16u) {",
+            "    b2r_write_u32(ctx, b2r_push, 0x00400b80u);",
+            "    b2r_push += 4u;",
+            "    for (uint32_t b2r_word = 0u; b2r_word < 8u; ++b2r_word) {",
+            "        const uint64_t b2r_value =",
+            "            b2r_read_u64(ctx, b2r_source + b2r_word * 8u);",
+            "        ctx->mmx[b2r_word] = b2r_value;",
+            "        b2r_write_push_u64(ctx, b2r_push + b2r_word * 8u, b2r_value);",
+            "    }",
+            "    b2r_push += 64u; b2r_source += 64u; b2r_remaining -= 16u;",
+            "}",
+            "if (b2r_remaining != 0u || b2r_count < 16u) {",
+            "    const uint32_t b2r_method =",
+            "        (b2r_remaining << 18u) | 0x00000b80u;",
+            "    b2r_write_u32(ctx, b2r_push, b2r_method);",
+            "    b2r_push += 4u;",
+            "    for (uint32_t b2r_word = 0u; b2r_word < b2r_remaining; ++b2r_word) {",
+            "        b2r_write_u32(ctx, b2r_push + b2r_word * 4u,",
+            "            b2r_read_u32(ctx, b2r_source + b2r_word * 4u));",
+            "    }",
+            "    b2r_push += b2r_remaining * 4u;",
+            "    ctx->eax = b2r_method; ctx->ecx = 0u;",
+            "    b2r_logic_flags(ctx, b2r_method, 32u);",
+            "} else {",
+            "    ctx->eax = 0u; ctx->ecx = b2r_index;",
+            "    b2r_sub_flags(ctx, 16u, 16u, 0u, 32u);",
+            "}",
+            "b2r_write_u32(ctx, 0x002256c0u, b2r_push);",
+            *_native_fast_path_return(4),
+        ),
+    )
+
+    resource_bind = NativeFastPath(
+        name="title_resource_bind",
+        guard=(
+            "b2r_read_u32(ctx, 0x002256b8u) != 0u && "
+            "([&]() { "
+            "const uint32_t b2r_index = b2r_read_u32(ctx, ctx->esp + 0x4u); "
+            "const uint32_t b2r_old = b2r_read_u32(ctx, "
+            "    0x002242f8u + b2r_index * 12u); "
+            "return b2r_old == 0u || "
+            "    ((b2r_read_u32(ctx, b2r_old) - 0x00080000u) & "
+            "        0x0078ffffu) != 0u; "
+            "})()"
+        ),
+        body=(
+            "const uint32_t b2r_context = b2r_read_u32(ctx, 0x002256b8u);",
+            "const uint32_t b2r_index = b2r_read_u32(ctx, ctx->esp + 0x4u);",
+            "const uint32_t b2r_new_resource =",
+            "    b2r_read_u32(ctx, ctx->esp + 0x8u);",
+            "const uint32_t b2r_new_format =",
+            "    b2r_read_u32(ctx, ctx->esp + 0xcu);",
+            "const uint32_t b2r_record = 0x002242f0u + b2r_index * 12u;",
+            "const uint32_t b2r_old_format = b2r_read_u32(ctx, b2r_record);",
+            "const uint32_t b2r_old_resource = b2r_read_u32(ctx, b2r_record + 0x8u);",
+            "b2r_record_native_fast_path(ctx, 0x00215100u);",
+            "ctx->eip = 0x00215100u;",
+            "if (b2r_new_resource != 0u) {",
+            "    b2r_write_u32(ctx, b2r_new_resource,",
+            "        b2r_read_u32(ctx, b2r_new_resource) + 0x00080000u);",
+            "}",
+            "if (b2r_old_resource != 0u) {",
+            "    b2r_write_u32(ctx, b2r_old_resource + 0x8u,",
+            "        b2r_read_u32(ctx, b2r_context + 0x2cu));",
+            "    const uint32_t b2r_old_reference =",
+            "        b2r_read_u32(ctx, b2r_old_resource) - 0x00080000u;",
+            "    b2r_write_u32(ctx, b2r_old_resource, b2r_old_reference);",
+            "    ctx->edx = b2r_old_reference;",
+            "}",
+            "b2r_write_u32(ctx, b2r_record, b2r_new_format);",
+            "b2r_write_u32(ctx, b2r_record + 0x8u, b2r_new_resource);",
+            "const uint32_t b2r_state_flags =",
+            "    b2r_read_u32(ctx, 0x00225218u) |",
+            "    (b2r_old_format == b2r_new_format ? 0x40u : 0x70u);",
+            "b2r_write_u32(ctx, 0x00225218u, b2r_state_flags);",
+            "ctx->eax = b2r_new_format; ctx->ecx = b2r_state_flags;",
+            "b2r_logic_flags(ctx, b2r_state_flags, 32u);",
+            *_native_fast_path_return(12),
+        ),
+    )
+
+    float_finite_check = NativeFastPath(
+        name="title_float_finite_check",
+        guard="true",
+        body=(
+            "const uint32_t b2r_exponent =",
+            "    b2r_read_u32(ctx, ctx->esp + 0xau) & 0x00007ff0u;",
+            "const uint32_t b2r_compare = b2r_exponent - 0x00007ff0u;",
+            "const uint32_t b2r_finite = b2r_exponent != 0x00007ff0u ? 1u : 0u;",
+            "b2r_record_native_fast_path(ctx, 0x0011fff5u);",
+            "ctx->eip = 0x0011fff5u;",
+            "b2r_sub_flags(ctx, b2r_exponent, 0x00007ff0u, b2r_compare, 32u);",
+            "ctx->eax = b2r_finite; ctx->ecx = b2r_finite;",
+            *_native_fast_path_return(0),
         ),
     )
 
@@ -1691,7 +2000,10 @@ def _title_native_fast_paths() -> dict[int, NativeFastPath]:
                     "0x00219750u": "0x0021976du",
                 },
             ),
-            *_native_fast_path_frame_return(12),
+            *_native_fast_path_frame_return_through(
+                12,
+                TITLE_D3D_INDEXED_DRAW_WRAPPER_RETURN_ADDRESS,
+            ),
             "}",
         ),
     )
@@ -1967,6 +2279,69 @@ def _title_native_fast_paths() -> dict[int, NativeFastPath]:
         f"({deferred_texture_state_clean_guard})"
     )
 
+    deferred_state_flush = NativeFastPath(
+        name="title_d3d_deferred_state_flush",
+        guard=(
+            f"({deferred_texture_state_clean_guard}) && "
+            "([&]() { "
+            "const uint32_t b2r_count = b2r_read_u32(ctx, 0x005ad740u); "
+            "if (b2r_count > 0x100u) { return false; } "
+            "uint64_t b2r_seen_low = 0u; uint64_t b2r_seen_high = 0u; "
+            "uint32_t b2r_changed = 0u; "
+            "for (uint32_t b2r_index = 0u; b2r_index < b2r_count; ++b2r_index) { "
+            "const uint32_t b2r_state = "
+            "    b2r_read_u32(ctx, 0x005ada00u + b2r_index * 4u); "
+            "if (b2r_state >= 0x5cu) { return false; } "
+            "uint64_t* const b2r_seen = b2r_state < 64u ? "
+            "    &b2r_seen_low : &b2r_seen_high; "
+            "const uint64_t b2r_bit = 1ull << (b2r_state & 63u); "
+            "if ((*b2r_seen & b2r_bit) != 0u) { return false; } "
+            "*b2r_seen |= b2r_bit; "
+            "b2r_changed += b2r_read_u32(ctx, 0x005ad080u + b2r_state * 4u) != "
+            "    b2r_read_u32(ctx, 0x00225420u + b2r_state * 4u); "
+            "} "
+            "if (b2r_changed == 0u) { return true; } "
+            "const uint32_t b2r_push = b2r_read_u32(ctx, 0x002256c0u); "
+            "const uint32_t b2r_limit = b2r_read_u32(ctx, 0x002256c4u); "
+            "return b2r_push != 0u && "
+            "    static_cast<uint64_t>(b2r_push) + b2r_changed * 8u < b2r_limit; "
+            "})()"
+        ),
+        body=(
+            "const uint32_t b2r_count = b2r_read_u32(ctx, 0x005ad740u);",
+            "uint32_t b2r_push = b2r_read_u32(ctx, 0x002256c0u);",
+            "bool b2r_changed_state = false;",
+            "uint32_t b2r_last_value = ctx->edx;",
+            "b2r_record_native_fast_path(ctx, 0x000ed570u);",
+            "ctx->eip = 0x000ed570u;",
+            "for (uint32_t b2r_index = 0u; b2r_index < b2r_count; ++b2r_index) {",
+            "    const uint32_t b2r_state =",
+            "        b2r_read_u32(ctx, 0x005ada00u + b2r_index * 4u);",
+            "    const uint32_t b2r_value =",
+            "        b2r_read_u32(ctx, 0x005ad080u + b2r_state * 4u);",
+            "    if (b2r_read_u32(ctx, 0x00225420u + b2r_state * 4u) !=",
+            "        b2r_value) {",
+            "        const uint32_t b2r_method =",
+            "            b2r_read_u32(ctx, 0x00293ff0u + b2r_state * 4u);",
+            "        b2r_write_push_u64(ctx, b2r_push,",
+            "            static_cast<uint64_t>(b2r_method) |",
+            "            (static_cast<uint64_t>(b2r_value) << 32u));",
+            "        b2r_push += 8u;",
+            "        b2r_write_u32(ctx, 0x002256c0u, b2r_push);",
+            "        b2r_write_u32(ctx, 0x00225420u + b2r_state * 4u,",
+            "            b2r_value);",
+            "        b2r_last_value = b2r_value; b2r_changed_state = true;",
+            "    }",
+            "    b2r_write_u32(ctx, 0x005ad760u + b2r_state * 4u, 0u);",
+            "}",
+            "b2r_write_u32(ctx, 0x005ad740u, 0u);",
+            "ctx->eax = b2r_read_u32(ctx, 0x005ad75cu);",
+            "if (b2r_changed_state) { ctx->edx = b2r_last_value; }",
+            "b2r_sub_flags(ctx, 4u, 4u, 0u, 32u);",
+            *_native_fast_path_return(0),
+        ),
+    )
+
     def draw_wrapper_body(
         fast_path: NativeFastPath,
         *,
@@ -2234,6 +2609,12 @@ def _title_native_fast_paths() -> dict[int, NativeFastPath]:
     return {
         TITLE_D3D_PACKET_ALLOC_ADDRESS: packet_alloc,
         TITLE_D3D_RESERVE_ADDRESS: reserve,
+        TITLE_PUSH_INLINE_16_ADDRESS: push_inline_16,
+        TITLE_PUSH_INLINE_64_ADDRESS: push_inline_64,
+        TITLE_PUSH_INLINE_VARIABLE_ADDRESS: push_inline_variable,
+        TITLE_RESOURCE_BIND_ADDRESS: resource_bind,
+        TITLE_FLOAT_FINITE_CHECK_ADDRESS: float_finite_check,
+        TITLE_D3D_DEFERRED_STATE_FLUSH_ADDRESS: deferred_state_flush,
         TITLE_D3D_INDEXED_DRAW_ADDRESS: indexed_draw,
         TITLE_D3D_INDEXED_DRAW_CONTINUATION_ADDRESS: indexed_continuation,
         TITLE_D3D_INDEXED_DRAW_WRAPPER_ADDRESS: indexed_draw_wrapper,
@@ -3779,7 +4160,7 @@ class TitleAssetStreamOpenFastPath:
         open_address: int = TITLE_ASSET_STREAM_OPEN_ADDRESS,
         object_address: int = TITLE_ASSET_STREAM_SYNTHETIC_OBJECT_ADDRESS,
         vtable_address: int = TITLE_ASSET_STREAM_SYNTHETIC_VTABLE_ADDRESS,
-        activate_target: int = TITLE_ASSET_STREAM_SYNTHETIC_ACTIVATE_TARGET_ADDRESS,
+        close_target: int = TITLE_ASSET_STREAM_SYNTHETIC_CLOSE_TARGET_ADDRESS,
         status_target: int = TITLE_ASSET_STREAM_SYNTHETIC_STATUS_TARGET_ADDRESS,
         read_target: int = TITLE_ASSET_STREAM_SYNTHETIC_READ_TARGET_ADDRESS,
         seek_target: int = TITLE_ASSET_STREAM_SYNTHETIC_SEEK_TARGET_ADDRESS,
@@ -3788,12 +4169,13 @@ class TitleAssetStreamOpenFastPath:
         self.open_address = open_address
         self.object_address = object_address
         self.vtable_address = vtable_address
-        self.activate_target = activate_target
+        self.close_target = close_target
         self.status_target = status_target
         self.read_target = read_target
         self.seek_target = seek_target
         self.invocations: list[dict[str, Any]] = []
-        self.activation_count = 0
+        self.close_count = 0
+        self.reuse_count = 0
         self.status_poll_count = 0
         self.read_count = 0
         self.bytes_read = 0
@@ -4108,7 +4490,7 @@ class TitleAssetStreamOpenFastPath:
     ) -> dict[int, Callable[[CpuState, SparseMemory, int, ExecutionTrace], None]]:
         return {
             self.open_address: self.open_handler,
-            self.activate_target: self.activate_handler,
+            self.close_target: self.close_handler,
             self.status_target: self.status_handler,
             self.read_target: self.read_handler,
             self.seek_target: self.seek_handler,
@@ -4143,12 +4525,52 @@ class TitleAssetStreamOpenFastPath:
                 read_payload = read_result.get("data", b"")
                 payload = bytes(read_payload) if isinstance(read_payload, bytes) else b""
                 self.runtime.nt_close(handle)
-            result_address = _u32(
-                self.object_address
-                + len(self._states) * TITLE_ASSET_STREAM_SYNTHETIC_OBJECT_STRIDE
+            reusable = sorted(
+                (
+                    (address, state)
+                    for address, state in self._states.items()
+                    if not bool(state.get("active", True))
+                ),
+                key=lambda item: (
+                    int(item[1].get("payload_capacity", 0)) < len(payload),
+                    int(item[1].get("payload_capacity", 0)),
+                    item[0],
+                ),
             )
+            previous_state = reusable[0][1] if reusable else None
+            result_address = (
+                reusable[0][0]
+                if reusable
+                else _u32(
+                    self.object_address
+                    + len(self._states) * TITLE_ASSET_STREAM_SYNTHETIC_OBJECT_STRIDE
+                )
+            )
+            payload_capacity = (
+                int(previous_state.get("payload_capacity", 0))
+                if previous_state is not None
+                else 0
+            )
+            native_payload_address = (
+                int(previous_state.get("native_payload_address", 0))
+                if previous_state is not None
+                else 0
+            )
+            if native_payload_address == 0 or payload_capacity < len(payload):
+                native_payload_address = _align_up_u32(
+                    self._next_native_payload_address, 0x1000
+                )
+                payload_capacity = max(len(payload), 1)
+                self._next_native_payload_address = _align_up_u32(
+                    native_payload_address + payload_capacity, 0x1000
+                )
+            if previous_state is not None:
+                self.reuse_count += 1
             self._states[result_address] = {
                 "payload": payload,
+                "payload_capacity": payload_capacity,
+                "native_payload_address": native_payload_address,
+                "active": True,
                 "position": 0,
                 "title_path": title_path.replace("\\", "/").casefold(),
                 "status": 2,
@@ -4162,12 +4584,6 @@ class TitleAssetStreamOpenFastPath:
                 "track_descriptor_publication_attempted": False,
                 "track_descriptor_tables_published": False,
             }
-            native_payload_address = _align_up_u32(
-                self._next_native_payload_address, 0x1000
-            )
-            self._next_native_payload_address = _align_up_u32(
-                native_payload_address + len(payload), 0x1000
-            )
             if payload:
                 memory.write(native_payload_address, payload)
             memory.write_u32(result_address, self.vtable_address)
@@ -4179,7 +4595,7 @@ class TitleAssetStreamOpenFastPath:
             memory.write_u32(_u32(result_address + 0x30), native_payload_address)
             memory.write_u32(_u32(result_address + 0x34), len(payload))
             memory.write_u32(_u32(result_address + 0x38), 0)
-            memory.write_u32(_u32(self.vtable_address + 4), self.activate_target)
+            memory.write_u32(_u32(self.vtable_address + 4), self.close_target)
             memory.write_u32(_u32(self.vtable_address + 8), self.read_target)
             memory.write_u32(_u32(self.vtable_address + 0x10), self.seek_target)
             memory.write_u32(_u32(self.vtable_address + 0x1C), self.status_target)
@@ -4205,21 +4621,27 @@ class TitleAssetStreamOpenFastPath:
                 return bytes(state.get("payload", b""))
         return None
 
-    def activate_handler(
+    def close_handler(
         self,
         cpu: CpuState,
         memory: SparseMemory,
         target: int,
         trace: ExecutionTrace,
     ) -> None:
-        self.activation_count += 1
+        object_address = cpu.get_register("ecx")
+        state = self._states.get(object_address)
+        if state is not None and bool(state.get("active", True)):
+            state["active"] = False
+            state["status"] = 0
+            memory.write_u32(_u32(object_address + 0x2C), 0)
+            self.close_count += 1
         cpu.set_register("eax", 1)
         _prepare_stdcall_return(cpu, memory, 0)
         trace.add(
             target,
-            "title_asset_stream_activate_fast_path",
-            activation_count=self.activation_count,
-            object_address_hex=_hex32(cpu.get_register("ecx")),
+            "title_asset_stream_close_fast_path",
+            close_count=self.close_count,
+            object_address_hex=_hex32(object_address),
         )
 
     def read_handler(
@@ -4234,6 +4656,8 @@ class TitleAssetStreamOpenFastPath:
         requested = memory.read_u32(_u32(esp + 8))
         object_address = cpu.get_register("ecx")
         state = self._states.get(object_address)
+        if state is not None and not bool(state.get("active", True)):
+            state = None
         if state is None:
             payload = b""
             position_before = 0
@@ -4319,8 +4743,9 @@ class TitleAssetStreamOpenFastPath:
         # real provider exposes that transition both as the return value and in
         # its guest-visible mode field.
         state = self._states.get(object_address)
-        status = 1 if state is not None else 3
-        if state is not None:
+        active = state is not None and bool(state.get("active", True))
+        status = 1 if active else 0
+        if active:
             self._publish_ready(memory, object_address, state)
         self.status_poll_count += 1
         cpu.set_register("eax", status)
@@ -4348,6 +4773,8 @@ class TitleAssetStreamOpenFastPath:
         origin = memory.read_u32(_u32(esp + 0xC))
         object_address = cpu.get_register("ecx")
         state = self._states.get(object_address)
+        if state is not None and not bool(state.get("active", True)):
+            state = None
         payload = state["payload"] if state is not None else b""
         position = int(state["position"]) if state is not None else 0
         signed_offset = (offset_high << 32) | offset_low
@@ -4384,6 +4811,8 @@ class TitleAssetStreamOpenFastPath:
                 {
                     "object_address_hex": _hex32(object_address),
                     "title_path": state.get("title_path"),
+                    "active": bool(state.get("active", True)),
+                    "payload_capacity": int(state.get("payload_capacity", size)),
                     "status": int(state.get("status", 2)),
                     "position": position,
                     "size": size,
@@ -4423,7 +4852,8 @@ class TitleAssetStreamOpenFastPath:
             "successful_open_count": sum(
                 1 for invocation in self.invocations if invocation["status"] == XboxStatus.SUCCESS
             ),
-            "activation_count": self.activation_count,
+            "close_count": self.close_count,
+            "reuse_count": self.reuse_count,
             "status_poll_count": self.status_poll_count,
             "read_count": self.read_count,
             "bytes_read": self.bytes_read,
@@ -4443,7 +4873,9 @@ class TitleAssetStreamOpenFastPath:
             "track_scene_record_table_count": self.track_scene_record_table_count,
             "track_scene_record_table_repair_count": self.track_scene_record_table_repair_count,
             "track_scene_record_entry_count": self.track_scene_record_entry_count,
-            "active_stream_count": len(self._states),
+            "active_stream_count": sum(
+                bool(state.get("active", True)) for state in self._states.values()
+            ),
             "stream_states": stream_states,
             "recent_reads": self.recent_reads,
             "recent_track_descriptor_publications": self.recent_track_descriptor_publications,
@@ -13526,31 +13958,38 @@ def _snapshot_render_texture_resources(
         if address == 0 or width <= 0 or height <= 0:
             continue
         declared_mipmap_levels = max(1, (format_raw >> 16) & 0xF)
+        cubemap = (format_raw & (1 << 2)) != 0
         mipmap_levels = (
             1
             if format_name.endswith("_LINEAR")
             else min(declared_mipmap_levels, max(width, height).bit_length())
         )
-        byte_count = 0
+        face_byte_count = 0
         mip_width = width
         mip_height = height
         for _ in range(mipmap_levels):
             if format_name == "DXT1":
-                byte_count += max(
+                face_byte_count += max(
                     8,
                     ((mip_width + 3) // 4) * ((mip_height + 3) // 4) * 8,
                 )
             elif format_name in {"DXT3", "DXT5"}:
-                byte_count += max(
+                face_byte_count += max(
                     16,
                     ((mip_width + 3) // 4) * ((mip_height + 3) // 4) * 16,
                 )
             elif format_name == "R5G6B5":
-                byte_count += mip_width * mip_height * 2
+                face_byte_count += mip_width * mip_height * 2
             else:
-                byte_count += mip_width * mip_height * 4
+                face_byte_count += mip_width * mip_height * 4
             mip_width = max(1, mip_width // 2)
             mip_height = max(1, mip_height // 2)
+        face_stride = (
+            (face_byte_count + 127) & ~127
+            if cubemap
+            else face_byte_count
+        )
+        byte_count = face_stride * 6 if cubemap else face_byte_count
         if byte_count > 16 * 1024 * 1024:
             continue
         resource_key = (address, width, height, format_name)
@@ -13564,7 +14003,13 @@ def _snapshot_render_texture_resources(
         )
         cached = cache.get(cache_key) if cache is not None else None
         if cached is not None and cached[0] == page_generations:
-            resources[resource_key] = cached[1]
+            existing = resources.get(resource_key)
+            if (
+                existing is None
+                or int(cached[1]["byte_count"])
+                > int(existing["byte_count"])
+            ):
+                resources[resource_key] = cached[1]
             continue
         payload = memory.read(source_address, byte_count)
         resource = {
@@ -13576,13 +14021,18 @@ def _snapshot_render_texture_resources(
             "format": format_name,
             "width": width,
             "height": height,
+            "cubemap": cubemap,
             "mipmap_levels": mipmap_levels,
+            "face_byte_count": face_byte_count,
+            "face_stride": face_stride,
             "byte_count": byte_count,
             "nonzero_byte_count": sum(byte != 0 for byte in payload),
             "sha256": hashlib.sha256(payload).hexdigest().upper(),
             "bytes_hex": payload.hex().upper(),
         }
-        resources[resource_key] = resource
+        existing = resources.get(resource_key)
+        if existing is None or byte_count > int(existing["byte_count"]):
+            resources[resource_key] = resource
         if cache is not None:
             cache[cache_key] = (page_generations, resource)
     for vertex_range in history_stream.get("vertex_buffer_ranges", []):
@@ -17840,6 +18290,7 @@ def build_playability_probe_summary(
     live_flip_audit_max_flips: int = 0,
     native_slice_steps: int = 100000,
     profile_hot_paths: bool = False,
+    aot_optimization_mode: str = DEFAULT_AOT_OPTIMIZATION_MODE,
     developer_live_compile: bool = False,
     audit_title_main_loop_exit: bool = False,
     audit_world_matrices: bool = False,
@@ -17955,6 +18406,7 @@ def build_playability_probe_summary(
             live_flip_audit_max_flips=live_flip_audit_max_flips,
             native_slice_steps=native_slice_steps,
             profile_hot_paths=profile_hot_paths,
+            aot_optimization_mode=aot_optimization_mode,
             developer_live_compile=developer_live_compile,
             audit_title_main_loop_exit=audit_title_main_loop_exit,
             audit_world_matrices=audit_world_matrices,
@@ -18092,6 +18544,7 @@ def _recover_entry_summary(
     live_flip_audit_max_flips: int,
     native_slice_steps: int,
     profile_hot_paths: bool,
+    aot_optimization_mode: str,
     developer_live_compile: bool,
     audit_title_main_loop_exit: bool,
     audit_world_matrices: bool,
@@ -18184,6 +18637,7 @@ def _recover_entry_summary(
             live_flip_audit_max_flips=live_flip_audit_max_flips,
             native_slice_steps=native_slice_steps,
             profile_hot_paths=profile_hot_paths,
+            aot_optimization_mode=aot_optimization_mode,
             developer_live_compile=developer_live_compile,
             audit_title_main_loop_exit=audit_title_main_loop_exit,
             audit_world_matrices=audit_world_matrices,
@@ -18697,6 +19151,7 @@ def _execute_recovered_control_flow_frame(
     live_flip_audit_max_flips: int,
     native_slice_steps: int,
     profile_hot_paths: bool,
+    aot_optimization_mode: str,
     developer_live_compile: bool,
     audit_title_main_loop_exit: bool,
     audit_world_matrices: bool,
@@ -19032,6 +19487,7 @@ def _execute_recovered_control_flow_frame(
                 build_dir=native_build_dir,
                 module_functions=[frame],
                 callback_addresses=bootstrap_targets,
+                aot_optimization_mode=aot_optimization_mode,
             )
             returned_to = bootstrap_executor.run(
                 state,
@@ -19329,6 +19785,7 @@ def _execute_recovered_control_flow_frame(
                 live_flip_audit_max_flips=live_flip_audit_max_flips,
             native_slice_steps=native_slice_steps,
             profile_hot_paths=profile_hot_paths,
+            aot_optimization_mode=aot_optimization_mode,
             developer_live_compile=developer_live_compile,
                 audit_title_main_loop_exit=audit_title_main_loop_exit,
                 audit_world_matrices=audit_world_matrices,
@@ -19657,6 +20114,7 @@ def _execute_guest_thread_start(
     live_flip_audit_max_flips: int = 0,
     native_slice_steps: int = 100000,
     profile_hot_paths: bool = False,
+    aot_optimization_mode: str = DEFAULT_AOT_OPTIMIZATION_MODE,
     developer_live_compile: bool = False,
     enable_title_repair_fallbacks: bool = False,
     audit_title_main_loop_exit: bool = False,
@@ -19680,6 +20138,7 @@ def _execute_guest_thread_start(
         "start_context2_hex": thread["start_context2_hex"],
         "title_repair_fallbacks_enabled": enable_title_repair_fallbacks,
         "hot_path_profiling_enabled": profile_hot_paths,
+        "aot_optimization_mode": aot_optimization_mode,
         "developer_live_compilation_enabled": developer_live_compile,
         "traffic_mesh_audit_enabled": audit_traffic_meshes,
     }
@@ -19896,6 +20355,248 @@ def _execute_guest_thread_start(
             "samples": samples,
         }
 
+    def native_filesystem_event_summary(
+        *,
+        event_count: int | None = None,
+        event_buffer: Any | None = None,
+        include_save_data: bool = True,
+    ) -> dict[str, Any]:
+        service_names = {
+            9: "NtClose",
+            11: "NtCreateFile",
+            12: "NtOpenFile",
+            13: "NtOpenSymbolicLinkObject",
+            14: "NtQueryInformationFile",
+            15: "NtQuerySymbolicLinkObject",
+            16: "NtQueryVolumeInformationFile",
+            20: "NtReadFile",
+            21: "NtSetInformationFile",
+            22: "NtWriteFile",
+            23: "NtQueryDirectoryFile",
+            32: "NtDeviceIoControlFile",
+            33: "NtFsControlFile",
+        }
+        total_count = int(
+            native_host_services.filesystem_event_count
+            if event_count is None
+            else event_count
+        )
+        source_events = (
+            native_host_services.filesystem_events
+            if event_buffer is None
+            else event_buffer
+        )
+        capacity = len(source_events)
+        retained_count = min(total_count, capacity)
+        first_sequence = total_count - retained_count
+        events: list[dict[str, Any]] = []
+        for sequence in range(first_sequence, total_count):
+            event = source_events[sequence % capacity]
+            arguments = [int(value) for value in event.arguments]
+            record = {
+                "sequence": int(event.sequence),
+                "service_value": int(event.service_value),
+                "shim_name": service_names.get(int(event.service_value)),
+                "result": int(event.result),
+                "result_hex": _hex32(int(event.result)),
+                "return_address": int(event.return_address),
+                "return_address_hex": _hex32(int(event.return_address)),
+                "handle": int(event.handle),
+                "handle_hex": _hex32(int(event.handle)),
+                "arguments": arguments,
+                "argument_hex": [_hex32(value) for value in arguments],
+                "guest_path": os.fsdecode(event.guest_path),
+            }
+            if int(event.service_value) == 11:
+                record.update(
+                    {
+                        "desired_access": arguments[1],
+                        "create_disposition": arguments[7],
+                        "create_options": arguments[8],
+                    }
+                )
+            elif int(event.service_value) == 12:
+                record.update(
+                    {
+                        "desired_access": arguments[1],
+                        "create_options": arguments[5],
+                    }
+                )
+            elif int(event.service_value) in {14, 16, 21, 23}:
+                record["information_class"] = arguments[4]
+                record["requested_length"] = arguments[3]
+            elif int(event.service_value) in {20, 22}:
+                record["requested_length"] = arguments[6]
+                record["byte_offset_address"] = arguments[7]
+            events.append(record)
+        summary = {
+            "event_count": total_count,
+            "retained_event_count": retained_count,
+            "overflow_event_count": max(0, total_count - retained_count),
+            "events": events,
+        }
+        if include_save_data:
+            summary["save_data"] = native_filesystem_event_summary(
+                event_count=int(native_host_services.save_filesystem_event_count),
+                event_buffer=native_host_services.save_filesystem_events,
+                include_save_data=False,
+            )
+        return summary
+
+    def native_persistence_event_summary() -> dict[str, Any]:
+        target_names = {
+            0x00053970: "save_ui_set_state",
+            0x00053A80: "save_ui_update",
+            0x00053C4C: "save_ui_start",
+            0x00053C69: "save_ui_start_profile",
+            0x00053C92: "save_ui_failure",
+            0x000D6420: "profile_validate",
+            0x000D64C0: "profile_state",
+            0x000D67B0: "save_start",
+            0x000D681C: "save_open_existing",
+            0x000D6858: "save_start_failure",
+            0x000D6980: "save_update",
+            0x000D6A4B: "save_update_failure",
+            0x000D6F50: "save_manager_update",
+            0x000D6F94: "save_manager_result",
+            0x000D8D70: "save_file_open",
+            0x000D8EF4: "save_game_open_failure",
+            0x000D9370: "save_io_poll",
+            0x000D9529: "save_io_failure",
+        }
+        register_names = (
+            "eax",
+            "ecx",
+            "edx",
+            "ebx",
+            "esp",
+            "ebp",
+            "esi",
+            "edi",
+        )
+        save_manager_offsets = (
+            0x000,
+            0x034,
+            0x038,
+            0x03C,
+            0x040,
+            0x044,
+            0x048,
+            0x04C,
+            0x050,
+            0x054,
+            0x058,
+            0x05C,
+            0xC80,
+            0xC84,
+            0xC88,
+            0xC8C,
+        )
+        active_object_offsets = (
+            0x000,
+            0x004,
+            0x008,
+            0x00C,
+            0x044,
+            0x048,
+            0x058,
+            0x05C,
+            0x068,
+            0x130,
+            0x134,
+            0xBF8,
+            0xC80,
+            0xC84,
+            0xC88,
+            0xC8C,
+            0x1084,
+            0x1088,
+            0x1090,
+            0x1124,
+            0x1128,
+        )
+        io_operation_offsets = (
+            0x000,
+            0x004,
+            0x008,
+            0x00C,
+            0x130,
+            0x134,
+            0x138,
+            0x13C,
+            0x140,
+            0x144,
+            0x148,
+            0x14C,
+            0x150,
+            0x154,
+            0x158,
+            0x15C,
+        )
+        total_count = int(native_host_services.persistence_event_count)
+        capacity = len(native_host_services.persistence_events)
+        retained_count = min(total_count, capacity)
+        first_sequence = total_count - retained_count
+        events = []
+        for sequence in range(first_sequence, total_count):
+            event = native_host_services.persistence_events[
+                sequence % capacity
+            ]
+            target = int(event.target)
+            registers = {
+                name: int(event.registers[index])
+                for index, name in enumerate(register_names)
+            }
+            events.append(
+                {
+                    "sequence": int(event.sequence),
+                    "steps": int(event.steps),
+                    "target": target,
+                    "target_hex": _hex32(target),
+                    "target_name": target_names.get(target),
+                    "execution_lane": int(event.execution_lane),
+                    "worker_handle": int(event.worker_handle),
+                    "worker_handle_hex": _hex32(int(event.worker_handle)),
+                    "ui_state": int(event.ui_state),
+                    "ui_state_changed": bool(event.ui_state_changed),
+                    "registers": registers,
+                    "register_hex": {
+                        name: _hex32(value)
+                        for name, value in registers.items()
+                    },
+                    "stack_words": [
+                        int(value) for value in event.stack_words
+                    ],
+                    "stack_word_hex": [
+                        _hex32(int(value)) for value in event.stack_words
+                    ],
+                    "save_manager": {
+                        f"0x{offset:03X}": int(
+                            event.save_manager_words[index]
+                        )
+                        for index, offset in enumerate(save_manager_offsets)
+                    },
+                    "active_object": {
+                        f"0x{offset:03X}": int(
+                            event.active_object_words[index]
+                        )
+                        for index, offset in enumerate(active_object_offsets)
+                    },
+                    "io_operation": {
+                        f"0x{offset:03X}": int(
+                            event.io_operation_words[index]
+                        )
+                        for index, offset in enumerate(io_operation_offsets)
+                    },
+                }
+            )
+        return {
+            "event_count": total_count,
+            "retained_event_count": retained_count,
+            "overflow_event_count": max(0, total_count - retained_count),
+            "events": events,
+        }
+
     def native_host_service_failure_summary() -> dict[str, Any]:
         trace_count = min(
             int(native_host_services.service_trace_count),
@@ -19904,6 +20605,8 @@ def _execute_guest_thread_start(
         return {
             "backend": "native_dispatcher",
             "traffic_mesh_audit": native_traffic_mesh_audit_summary(),
+            "filesystem": native_filesystem_event_summary(),
+            "persistence": native_persistence_event_summary(),
             "call_count": int(native_host_services.native_call_count),
             "service_trace_count": int(native_host_services.service_trace_count),
             "service_trace_overflow_count": int(
@@ -20020,6 +20723,9 @@ def _execute_guest_thread_start(
                     "size": int(native_host_services.files[index].size),
                     "position": int(native_host_services.files[index].position),
                     "active": bool(native_host_services.files[index].active),
+                    "delete_pending": bool(
+                        native_host_services.files[index].delete_pending
+                    ),
                     "host_open": bool(native_host_services.files[index].host_file),
                     "guest_path": os.fsdecode(
                         native_host_services.files[index].guest_path
@@ -20049,6 +20755,14 @@ def _execute_guest_thread_start(
                     "payload_bytes": int(
                         native_host_services.title_asset_streams[index].payload_size
                     ),
+                    "payload_capacity": int(
+                        native_host_services.title_asset_streams[
+                            index
+                        ].payload_capacity
+                    ),
+                    "active": bool(
+                        native_host_services.title_asset_streams[index].flags & 16
+                    ),
                     "track_pss": bool(
                         native_host_services.title_asset_streams[index].flags & 1
                     ),
@@ -20072,6 +20786,24 @@ def _execute_guest_thread_start(
                     )
                 )
             ],
+            "native_title_asset_open_event_count": int(
+                native_host_services.title_asset_open_event_count
+            ),
+            "native_title_asset_open_event_overflow_count": int(
+                native_host_services.title_asset_open_event_overflow_count
+            ),
+            "native_title_asset_open_events": _native_title_asset_open_events(
+                native_host_services
+            ),
+            "native_replay_state_sample_count": int(
+                native_host_services.replay_state_sample_count
+            ),
+            "native_replay_state_sample_overflow_count": int(
+                native_host_services.replay_state_sample_overflow_count
+            ),
+            "native_replay_state_samples": _native_replay_state_samples(
+                native_host_services
+            ),
             "native_title_asset_open_count": int(
                 native_host_services.title_asset_open_count
             ),
@@ -20080,6 +20812,24 @@ def _execute_guest_thread_start(
             ),
             "native_title_asset_payload_bytes": int(
                 native_host_services.title_asset_payload_bytes
+            ),
+            "native_title_asset_close_count": int(
+                native_host_services.title_asset_close_count
+            ),
+            "native_title_asset_reuse_count": int(
+                native_host_services.title_asset_reuse_count
+            ),
+            "native_title_asset_payload_reallocation_count": int(
+                native_host_services.title_asset_payload_reallocation_count
+            ),
+            "native_title_asset_resident_payload_bytes": int(
+                native_host_services.title_asset_resident_payload_bytes
+            ),
+            "native_title_asset_active_stream_count": int(
+                native_host_services.title_asset_active_stream_count
+            ),
+            "native_title_asset_peak_active_stream_count": int(
+                native_host_services.title_asset_peak_active_stream_count
             ),
             "native_title_track_pss_candidate_count": int(
                 native_host_services.title_track_pss_candidate_count
@@ -20436,6 +21186,7 @@ def _execute_guest_thread_start(
                 NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_FORMAT,
                 NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_FREQUENCY,
                 NATIVE_HOST_SERVICE_AUDIO_BUFFER_GET_POSITION,
+                NATIVE_HOST_SERVICE_AUDIO_BUFFER_GET_STATUS,
                 NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_POSITION,
                 NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_VOLUME,
                 NATIVE_HOST_SERVICE_AUDIO_BUFFER_STOP,
@@ -20522,7 +21273,7 @@ def _execute_guest_thread_start(
                 NATIVE_HOST_SERVICE_SYSTEM_TIME,
                 NATIVE_HOST_SERVICE_TITLE,
                 NATIVE_HOST_SERVICE_TITLE_ALLOCATION_LIST_COUNT,
-                NATIVE_HOST_SERVICE_TITLE_ASSET_ACTIVATE,
+                NATIVE_HOST_SERVICE_TITLE_ASSET_CLOSE,
                 NATIVE_HOST_SERVICE_TITLE_ASSET_OPEN,
                 NATIVE_HOST_SERVICE_TITLE_ASSET_READ,
                 NATIVE_HOST_SERVICE_TITLE_ASSET_SEEK,
@@ -20886,6 +21637,12 @@ def _execute_guest_thread_start(
                     NATIVE_HOST_SERVICE_AUDIO_BUFFER_GET_POSITION,
                 ),
                 NativeHostServiceEntry(
+                    TITLE_DIRECTSOUND_BUFFER_GET_STATUS_ADDRESS,
+                    NATIVE_HOST_SERVICE_AUDIO,
+                    8,
+                    NATIVE_HOST_SERVICE_AUDIO_BUFFER_GET_STATUS,
+                ),
+                NativeHostServiceEntry(
                     TITLE_DIRECTSOUND_BUFFER_SET_POSITION_ADDRESS,
                     NATIVE_HOST_SERVICE_AUDIO,
                     8,
@@ -20970,10 +21727,10 @@ def _execute_guest_thread_start(
                     NATIVE_HOST_SERVICE_TITLE_ASSET_OPEN,
                 ),
                 NativeHostServiceEntry(
-                    TITLE_ASSET_STREAM_SYNTHETIC_ACTIVATE_TARGET_ADDRESS,
+                    TITLE_ASSET_STREAM_SYNTHETIC_CLOSE_TARGET_ADDRESS,
                     NATIVE_HOST_SERVICE_TITLE,
                     0,
-                    NATIVE_HOST_SERVICE_TITLE_ASSET_ACTIVATE,
+                    NATIVE_HOST_SERVICE_TITLE_ASSET_CLOSE,
                 ),
                 NativeHostServiceEntry(
                     TITLE_ASSET_STREAM_SYNTHETIC_STATUS_TARGET_ADDRESS,
@@ -21329,6 +22086,7 @@ def _execute_guest_thread_start(
                         TITLE_DIRECTSOUND_BUFFER_SET_VOLUME_ADDRESS,
                         TITLE_DIRECTSOUND_BUFFER_SET_FREQUENCY_ADDRESS,
                         TITLE_DIRECTSOUND_BUFFER_GET_POSITION_ADDRESS,
+                        TITLE_DIRECTSOUND_BUFFER_GET_STATUS_ADDRESS,
                         TITLE_DIRECTSOUND_BUFFER_SET_POSITION_ADDRESS,
                         TITLE_DIRECTSOUND_BUFFER_PLAY_ADDRESS,
                         TITLE_DIRECTSOUND_BUFFER_STOP_ADDRESS,
@@ -21362,6 +22120,8 @@ def _execute_guest_thread_start(
                         TITLE_ZERO_GUARDED_U32_READ_CALLBACK_ADDRESSES
                     ),
                     native_fast_paths=title_native_fast_paths,
+                    preferred_fusion_edges=TITLE_AOT_SUPERBLOCK_EDGES,
+                    aot_optimization_mode=aot_optimization_mode,
                     synchronize_eip_for_callbacks=audit_title_main_loop_exit,
                     compile_worker_limit=compile_worker_limit,
                     low_priority_compilation=low_priority_compilation,
@@ -22480,6 +23240,8 @@ def _execute_guest_thread_start(
             native_host_services_summary = {
                 "backend": "native_dispatcher",
                 "traffic_mesh_audit": native_traffic_mesh_audit_summary(),
+                "filesystem": native_filesystem_event_summary(),
+                "persistence": native_persistence_event_summary(),
                 "call_count": int(native_host_services.native_call_count),
                 "service_call_counts": {
                     "return_constant": int(
@@ -22672,6 +23434,9 @@ def _execute_guest_thread_start(
                             native_host_services.files[index].position
                         ),
                         "active": bool(native_host_services.files[index].active),
+                        "delete_pending": bool(
+                            native_host_services.files[index].delete_pending
+                        ),
                         "host_open": bool(
                             native_host_services.files[index].host_file
                         ),
@@ -22705,6 +23470,15 @@ def _execute_guest_thread_start(
                                 index
                             ].payload_size
                         ),
+                        "payload_capacity": int(
+                            native_host_services.title_asset_streams[
+                                index
+                            ].payload_capacity
+                        ),
+                        "active": bool(
+                            native_host_services.title_asset_streams[index].flags
+                            & 16
+                        ),
                         "track_pss": bool(
                             native_host_services.title_asset_streams[index].flags
                             & 1
@@ -22734,6 +23508,24 @@ def _execute_guest_thread_start(
                         )
                     )
                 ],
+                "native_title_asset_open_event_count": int(
+                    native_host_services.title_asset_open_event_count
+                ),
+                "native_title_asset_open_event_overflow_count": int(
+                    native_host_services.title_asset_open_event_overflow_count
+                ),
+                "native_title_asset_open_events": (
+                    _native_title_asset_open_events(native_host_services)
+                ),
+                "native_replay_state_sample_count": int(
+                    native_host_services.replay_state_sample_count
+                ),
+                "native_replay_state_sample_overflow_count": int(
+                    native_host_services.replay_state_sample_overflow_count
+                ),
+                "native_replay_state_samples": _native_replay_state_samples(
+                    native_host_services
+                ),
                 "native_title_asset_open_count": int(
                     native_host_services.title_asset_open_count
                 ),
@@ -22742,6 +23534,24 @@ def _execute_guest_thread_start(
                 ),
                 "native_title_asset_payload_bytes": int(
                     native_host_services.title_asset_payload_bytes
+                ),
+                "native_title_asset_close_count": int(
+                    native_host_services.title_asset_close_count
+                ),
+                "native_title_asset_reuse_count": int(
+                    native_host_services.title_asset_reuse_count
+                ),
+                "native_title_asset_payload_reallocation_count": int(
+                    native_host_services.title_asset_payload_reallocation_count
+                ),
+                "native_title_asset_resident_payload_bytes": int(
+                    native_host_services.title_asset_resident_payload_bytes
+                ),
+                "native_title_asset_active_stream_count": int(
+                    native_host_services.title_asset_active_stream_count
+                ),
+                "native_title_asset_peak_active_stream_count": int(
+                    native_host_services.title_asset_peak_active_stream_count
                 ),
                 "native_title_track_pss_candidate_count": int(
                     native_host_services.title_track_pss_candidate_count
@@ -22840,6 +23650,17 @@ def _execute_guest_thread_start(
                         "tick_count": int(
                             native_host_services.native_d3d_vblank_tick_count
                         ),
+                        "unscheduled_tick_count": max(
+                            int(
+                                native_host_services.
+                                native_d3d_vblank_tick_count
+                            )
+                            - int(
+                                native_host_services.
+                                native_d3d_vblank_callback_schedule_count
+                            ),
+                            0,
+                        ),
                         "callback_address": int(
                             native_host_services.
                             native_d3d_vblank_callback_address
@@ -22924,6 +23745,9 @@ def _execute_guest_thread_start(
                     ),
                     "audio": {
                         "backend": "native_sdl3_mixer",
+                        "sample_rate_conversion": "linear_interpolation",
+                        "pitch_conversion": "linear_interpolation",
+                        "mixer_accumulation": "int32_clamp_after_sum",
                         "output_open": bool(
                             native_host_services.native_audio_output_open
                         ),
@@ -22963,6 +23787,9 @@ def _execute_guest_thread_start(
                         "buffer_repeated_play_count": int(
                             native_host_services.native_audio_buffer_repeated_play_count
                         ),
+                        "buffer_get_status_count": int(
+                            native_host_services.native_audio_buffer_get_status_count
+                        ),
                         "buffer_get_position_count": int(
                             native_host_services.native_audio_buffer_get_position_count
                         ),
@@ -22971,6 +23798,21 @@ def _execute_guest_thread_start(
                         ),
                         "buffer_refresh_count": int(
                             native_host_services.native_audio_buffer_refresh_count
+                        ),
+                        "buffer_completion_count": int(
+                            native_host_services.native_audio_buffer_completion_count
+                        ),
+                        "buffer_loop_wrap_count": int(
+                            native_host_services.native_audio_buffer_loop_wrap_count
+                        ),
+                        "stale_playing_repair_count": int(
+                            native_host_services.native_audio_stale_playing_repair_count
+                        ),
+                        "linear_resampled_frame_count": int(
+                            native_host_services.native_audio_linear_resampled_frame_count
+                        ),
+                        "pitch_interpolated_frame_count": int(
+                            native_host_services.native_audio_pitch_interpolated_frame_count
                         ),
                         "buffer_play_stage": int(
                             native_host_services.native_audio_buffer_play_stage
@@ -25870,6 +26712,76 @@ def _hex32(value: int) -> str:
     return f"0x{value & 0xFFFFFFFF:08X}"
 
 
+def _native_title_asset_open_events(native_host_services: Any) -> list[dict[str, Any]]:
+    failure_stages = {
+        0: "none",
+        1: "path_validation",
+        2: "host_open_or_size",
+        3: "stream_capacity",
+        4: "payload_allocation_or_read",
+    }
+    return [
+        {
+            "flip_count": int(event.flip_count),
+            "guest_path": os.fsdecode(event.guest_path),
+            "object_address_hex": _hex32(int(event.object)),
+            "payload_bytes": int(event.payload_size),
+            "path_valid": bool(event.flags & 1),
+            "opened": bool(event.flags & 2),
+            "failure_stage": failure_stages.get(
+                int(event.failure_stage),
+                f"unknown_{int(event.failure_stage)}",
+            ),
+            "read_call_count": int(event.read_call_count),
+            "read_requested_bytes": int(event.read_requested_bytes),
+            "read_returned_bytes": int(event.read_returned_bytes),
+            "close_count": int(event.close_count),
+            "header_words_hex": [
+                _hex32(int(value)) for value in event.header_words
+            ],
+        }
+        for event in native_host_services.title_asset_open_events[
+            : min(
+                int(native_host_services.title_asset_open_event_count),
+                len(native_host_services.title_asset_open_events),
+            )
+        ]
+    ]
+
+
+def _native_replay_state_samples(native_host_services: Any) -> list[dict[str, Any]]:
+    return [
+        {
+            "flip_count": int(sample.flip_count),
+            "record_count": int(sample.record_count),
+            "record_index": int(sample.record_index),
+            "loaded": int(sample.loaded),
+            "mode": int(sample.mode),
+            "field_10": int(sample.field_10),
+            "field_14": int(sample.field_14),
+            "field_18_hex": _hex32(int(sample.field_18)),
+            "field_1c": int(sample.field_1c),
+            "buffer_begin_hex": _hex32(int(sample.buffer_begin)),
+            "buffer_end_hex": _hex32(int(sample.buffer_end)),
+            "buffer_limit_hex": _hex32(int(sample.buffer_limit)),
+            "replay_disabled": int(sample.replay_disabled),
+            "route_variant": int(sample.route_variant),
+            "game_state": int(sample.game_state),
+            "route_value": int(sample.route_value),
+            "demo_field_4": int(sample.demo_field_4),
+            "demo_field_8": int(sample.demo_field_8),
+            "demo_field_c": int(sample.demo_field_c),
+            "demo_enabled": int(sample.demo_enabled),
+        }
+        for sample in native_host_services.replay_state_samples[
+            : min(
+                int(native_host_services.replay_state_sample_count),
+                len(native_host_services.replay_state_samples),
+            )
+        ]
+    ]
+
+
 def _probe_execution_failure(summary: dict[str, Any]) -> str | None:
     entry_recovery = summary.get("entry_recovery", {})
     if not isinstance(entry_recovery, dict):
@@ -26073,6 +26985,16 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--aot-ab-mode",
+        choices=AOT_OPTIMIZATION_MODES,
+        default=DEFAULT_AOT_OPTIMIZATION_MODE,
+        help=(
+            "Developer profiling split for preferred AOT fusion and "
+            "registerized guest state; non-default modes require "
+            "--profile-hot-paths."
+        ),
+    )
+    parser.add_argument(
         "--developer-live-compile",
         action="store_true",
         help=(
@@ -26162,6 +27084,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Write requested artifacts without duplicating the full summary to stdout.",
     )
     args = parser.parse_args(argv)
+    if (
+        args.aot_ab_mode != DEFAULT_AOT_OPTIMIZATION_MODE
+        and not args.profile_hot_paths
+    ):
+        parser.error("non-default --aot-ab-mode requires --profile-hot-paths")
     if (args.live_render_stream is None) != (args.live_controller_state is None):
         parser.error("--live-render-stream and --live-controller-state must be used together")
     if args.live_control_transport is not None and args.live_render_stream is None:
@@ -26226,6 +27153,7 @@ def main(argv: list[str] | None = None) -> int:
         live_flip_audit_max_flips=args.live_flip_audit_max_flips,
         native_slice_steps=args.native_slice_steps,
         profile_hot_paths=args.profile_hot_paths,
+        aot_optimization_mode=args.aot_ab_mode,
         developer_live_compile=args.developer_live_compile,
         audit_title_main_loop_exit=args.audit_title_main_loop_exit,
         audit_world_matrices=args.audit_world_matrices,

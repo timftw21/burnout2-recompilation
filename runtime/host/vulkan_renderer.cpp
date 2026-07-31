@@ -558,7 +558,7 @@ void VulkanPresenter::create_render_pass() {
     create_info.dependencyCount = 1;
     create_info.pDependencies = &dependency;
     vk_check(vkCreateRenderPass(device_, &create_info, nullptr, &render_pass_), "vkCreateRenderPass");
-    log_.emit("render_pass_created");
+
 }
 
 void VulkanPresenter::create_framebuffers() {
@@ -796,28 +796,22 @@ void VulkanPresenter::create_native_graphics_pipeline() {
     last_pipeline_unique_state_count_ = 0u;
     last_pipeline_missing_state_count_ = 0u;
     if (!texture_descriptor_layout_) {
-        std::array<VkDescriptorSetLayoutBinding, 5> bindings{};
-        bindings[0].binding = 0;
-        bindings[0].descriptorType =
-            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        bindings[0].descriptorCount = 1;
-        bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-        bindings[1].binding = 1;
-        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        bindings[1].descriptorCount = 1;
-        bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-        bindings[2].binding = 2;
-        bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        bindings[2].descriptorCount = 1;
-        bindings[2].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-        bindings[3].binding = 3;
-        bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        bindings[3].descriptorCount = 1;
-        bindings[3].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-        bindings[4].binding = 4;
-        bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        bindings[4].descriptorCount = 1;
-        bindings[4].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        std::array<VkDescriptorSetLayoutBinding, 12> bindings{};
+        for (uint32_t binding = 0u; binding < 8u; ++binding) {
+            bindings[binding].binding = binding;
+            bindings[binding].descriptorType =
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            bindings[binding].descriptorCount = 1;
+            bindings[binding].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        for (uint32_t binding = 8u; binding < 12u; ++binding) {
+            bindings[binding].binding = binding;
+            bindings[binding].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[binding].descriptorCount = 1;
+            bindings[binding].stageFlags = binding == 8u
+                ? VK_SHADER_STAGE_FRAGMENT_BIT
+                : VK_SHADER_STAGE_VERTEX_BIT;
+        }
         VkDescriptorSetLayoutCreateInfo descriptor_info{};
         descriptor_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         descriptor_info.bindingCount = static_cast<uint32_t>(
@@ -867,15 +861,13 @@ void VulkanPresenter::create_native_graphics_pipeline() {
             feedback_specs.end(),
             [&](const RenderTargetFeedbackSpec& spec) {
                 return spec.offscreen_produced
-                    && nv2a_canonical_resource_address(
-                        spec.producer_address)
-                        == nv2a_canonical_resource_address(
-                            draw.surface_color_offset);
+                    && spec.producer_matches(
+                        draw.surface_color_offset);
             });
         if ((!draw_targets_presented_surface(draw)
                 && !targets_offscreen_feedback)
             || !draw_has_supported_host_transform(draw)
-            || (draw.primitive != 5u && draw.primitive != 6u)) {
+            || !native_pipeline_primitive_supported(draw.primitive)) {
             continue;
         }
         ++last_pipeline_candidate_draw_count_;
@@ -941,12 +933,22 @@ void VulkanPresenter::create_native_graphics_pipeline() {
     binding.binding = 0;
     binding.stride = sizeof(NativeVertex);
     binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-    std::array<VkVertexInputAttributeDescription, 5> attributes{};
+    std::array<VkVertexInputAttributeDescription, 9> attributes{};
     attributes[0] = {0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, static_cast<uint32_t>(offsetof(NativeVertex, x))};
     attributes[1] = {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, static_cast<uint32_t>(offsetof(NativeVertex, r))};
     attributes[2] = {2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, static_cast<uint32_t>(offsetof(NativeVertex, u))};
     attributes[3] = {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, static_cast<uint32_t>(offsetof(NativeVertex, secondary_r))};
     attributes[4] = {4, 0, VK_FORMAT_R32_SFLOAT, static_cast<uint32_t>(offsetof(NativeVertex, fog))};
+    for (uint32_t stage = 0u; stage < 4u; ++stage) {
+        attributes[5u + stage] = {
+            5u + stage,
+            0,
+            VK_FORMAT_R32G32B32A32_SFLOAT,
+            static_cast<uint32_t>(
+                offsetof(NativeVertex, texture_coordinates)
+                + stage * sizeof(std::array<float, 4>)),
+        };
+    }
     VkPipelineVertexInputStateCreateInfo vertex_input{};
     vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     vertex_input.vertexBindingDescriptionCount = 1;
@@ -1035,9 +1037,17 @@ void VulkanPresenter::create_native_graphics_pipeline() {
             state.raw_attribute_fetch
             ? 0u
             : static_cast<uint32_t>(attributes.size());
-        assemblies[index].topology = state.primitive == 5u
-            ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
-            : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+        switch (state.primitive) {
+        case 2u:
+            assemblies[index].topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+            break;
+        case 5u:
+            assemblies[index].topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            break;
+        default:
+            assemblies[index].topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+            break;
+        }
         VkPipelineColorBlendAttachmentState& state_blend =
             blend_attachments[index];
         state_blend.blendEnable = state.blend_enable ? VK_TRUE : VK_FALSE;
@@ -1399,10 +1409,8 @@ void VulkanPresenter::refresh_vertex_program_states() {
                 feedback_specs.end(),
                 [&](const RenderTargetFeedbackSpec& spec) {
                     return spec.offscreen_produced
-                        && nv2a_canonical_resource_address(
-                            spec.producer_address)
-                            == nv2a_canonical_resource_address(
-                                draw.surface_color_offset);
+                        && spec.producer_matches(
+                            draw.surface_color_offset);
                 });
             if (target != feedback_specs.end()) {
                 target_extent = {target->width, target->height};
@@ -1674,6 +1682,13 @@ void VulkanPresenter::create_native_render_resources(
             [](const HostTexture& texture) {
                 return texture.render_target_feedback;
             }));
+    const uint32_t render_target_feedback_cubemap_count =
+        static_cast<uint32_t>(std::count_if(
+            feedback_specs.begin(),
+            feedback_specs.end(),
+            [](const RenderTargetFeedbackSpec& spec) {
+                return spec.cubemap;
+            }));
     const uint32_t missing_render_target_feedback_texture_count =
         static_cast<uint32_t>(std::count_if(
             feedback_specs.begin(),
@@ -1737,9 +1752,16 @@ void VulkanPresenter::create_native_render_resources(
             {"guest_flips", std::to_string(interpreted_stream_.flip_count)},
             {"manifest_guest_flip_count", std::to_string(current_manifest_guest_flip_count_)},
             {"manifest_guest_steps", std::to_string(current_manifest_guest_steps_)},
-            {"textures", std::to_string(host_textures_.size() - 1u)},
+            {"textures", std::to_string(std::count_if(
+                host_textures_.begin(),
+                host_textures_.end(),
+                [](const HostTexture& texture) {
+                    return texture.format != "fallback";
+                }))},
             {"render_target_feedback_textures", std::to_string(render_target_feedback_texture_count)},
             {"render_target_feedback_required", std::to_string(feedback_specs.size())},
+            {"render_target_feedback_cubemaps", std::to_string(
+                render_target_feedback_cubemap_count)},
             {"render_target_feedback_missing", std::to_string(
                 missing_render_target_feedback_texture_count)},
             {"render_target_feedback_stale", std::to_string(
@@ -1822,6 +1844,8 @@ void VulkanPresenter::create_native_render_resources(
     uint32_t textured_presented_draw_count = 0;
     uint32_t unmatched_presented_texture_draw_count = 0;
     uint32_t unsupported_presented_primitive_count = 0;
+    std::array<uint32_t, 16> presented_primitive_draw_counts{};
+    std::array<uint32_t, 16> unsupported_primitive_draw_counts{};
     uint32_t missing_presented_indexed_resource_draw_count = 0;
     uint32_t filtered_fixed_function_indexed_draw_count = 0;
     uint32_t filtered_fixed_function_draw_count = 0;
@@ -1877,8 +1901,35 @@ void VulkanPresenter::create_native_render_resources(
                 | VK_COLOR_COMPONENT_B_BIT)) == 0u) {
             ++alpha_only_presented_draw_count;
         }
-        if (draw.primitive != 5u && draw.primitive != 6u) {
+        if (draw.primitive < presented_primitive_draw_counts.size()) {
+            ++presented_primitive_draw_counts[draw.primitive];
+        }
+        if (!native_pipeline_primitive_supported(draw.primitive)) {
             ++unsupported_presented_primitive_count;
+            if (draw.primitive < unsupported_primitive_draw_counts.size()) {
+                ++unsupported_primitive_draw_counts[draw.primitive];
+            }
+            log_.emit(
+                "nv2a_unsupported_presented_primitive",
+                {
+                    {"presented_index", std::to_string(
+                        draw_index - diagnostic_first_draw)},
+                    {"primitive", std::to_string(draw.primitive)},
+                    {"vertex_count", std::to_string(draw.vertex_count)},
+                    {"indexed_array", json_bool(draw.indexed_array)},
+                    {"transform_execution_mode", std::to_string(
+                        draw.transform_execution_mode)},
+                    {"texture_enabled", json_bool(draw.texture_enabled)},
+                    {"texture_address", std::to_string(
+                        draw.texture_address)},
+                    {"blend_enable", std::to_string(draw.blend_enable)},
+                    {"depth_test_enable", std::to_string(
+                        draw.depth_test_enable)},
+                    {"depth_write_enable", std::to_string(
+                        draw.depth_write_enable)},
+                    {"cull_face_enable", std::to_string(
+                        draw.cull_face_enable)},
+                });
         }
         if (draw.indexed_array && draw.vertex_count == 0u) {
             ++missing_presented_indexed_resource_draw_count;
@@ -2031,6 +2082,10 @@ void VulkanPresenter::create_native_render_resources(
             {"manifest_guest_flip_count", std::to_string(current_manifest_guest_flip_count_)},
             {"manifest_guest_steps", std::to_string(current_manifest_guest_steps_)},
             {"presented_draw_count", std::to_string(diagnostic_end_draw - diagnostic_first_draw)},
+            {"presented_primitive_draw_counts", json_u32_array(
+                presented_primitive_draw_counts)},
+            {"unsupported_primitive_draw_counts", json_u32_array(
+                unsupported_primitive_draw_counts)},
             {"offscreen_render_target_draw_count", std::to_string(offscreen_render_target_draw_count)},
             {"presented_vertex_count", std::to_string(presented_vertex_count)},
             {"fullscreen_draw_count", std::to_string(fullscreen_draw_count)},
@@ -2087,6 +2142,10 @@ void VulkanPresenter::create_native_render_resources(
             {"textured_presented_draw_count", std::to_string(textured_presented_draw_count)},
             {"unmatched_presented_texture_draw_count", std::to_string(unmatched_presented_texture_draw_count)},
             {"unsupported_presented_primitive_count", std::to_string(unsupported_presented_primitive_count)},
+            {"presented_primitive_draw_counts", json_u32_array(
+                presented_primitive_draw_counts)},
+            {"unsupported_primitive_draw_counts", json_u32_array(
+                unsupported_primitive_draw_counts)},
             {"missing_presented_indexed_resource_draw_count", std::to_string(missing_presented_indexed_resource_draw_count)},
             {"unsupported_draw_arrays_count", std::to_string(interpreted_stream_.unsupported_draw_arrays_count)},
             {"passed", json_bool(
@@ -2360,21 +2419,38 @@ void VulkanPresenter::create_native_render_resources(
 }
 
 VkDescriptorSet VulkanPresenter::descriptor_for_draw(const NativeDraw& draw) const {
-    const size_t texture_index = host_texture_index_for_draw(draw);
-    const uint32_t stage = std::min<uint32_t>(draw.texture_stage, 3u);
-    const uint32_t address = draw.texture_enabled
-            && draw.texture_stage < draw.texture_addresses.size()
-        ? draw.texture_addresses[draw.texture_stage]
-        : 0u;
+    HostTextureBindingSpec expected{};
+    for (uint32_t stage = 0u; stage < expected.stages.size(); ++stage) {
+        const uint32_t texture_mode =
+            (draw.shader_stage_program >> (stage * 5u)) & 0x1Fu;
+        const bool enabled = texture_mode != 0u
+            && (draw.texture_controls[stage] & (1u << 30u)) != 0u;
+        expected.stages[stage] = {
+            enabled ? host_texture_index_for_stage(draw, stage) : 0u,
+            enabled ? draw.texture_addresses[stage] : 0u,
+            enabled ? draw.texture_formats[stage] : 0u,
+            enabled ? draw.texture_controls[stage] : 0u,
+            enabled ? draw.texture_filters[stage] : 0u,
+        };
+    }
     const auto match = std::find_if(
         host_texture_bindings_.begin(),
         host_texture_bindings_.end(),
         [&](const HostTextureBinding& binding) {
-            return binding.texture_index == texture_index
-                && binding.address == address
-                && binding.format == draw.texture_formats[stage]
-                && binding.control == draw.texture_controls[stage]
-                && binding.filter == draw.texture_filters[stage];
+            for (uint32_t stage = 0u; stage < expected.stages.size(); ++stage) {
+                const HostTextureStageBindingSpec& stage_spec =
+                    expected.stages[stage];
+                const HostTextureStageBinding& stage_binding =
+                    binding.stages[stage];
+                if (stage_spec.texture_index != stage_binding.texture_index
+                    || stage_spec.address != stage_binding.address
+                    || stage_spec.format != stage_binding.format
+                    || stage_spec.control != stage_binding.control
+                    || stage_spec.filter != stage_binding.filter) {
+                    return false;
+                }
+            }
+            return true;
         });
     if (match != host_texture_bindings_.end()) {
         return match->descriptor_set;
@@ -2411,6 +2487,19 @@ const HostTexture* VulkanPresenter::presented_render_target_feedback_texture() c
         }
     }
     return nullptr;
+}
+
+uint32_t VulkanPresenter::presented_surface_color_clear_count() const {
+    return static_cast<uint32_t>(std::count_if(
+        interpreted_stream_.presented_surface_clears.begin(),
+        interpreted_stream_.presented_surface_clears.end(),
+        [&](const NativeSurfaceClear& clear) {
+            return (clear.flags & 0xF0u) != 0u
+                && nv2a_canonical_resource_address(
+                    clear.surface_color_offset)
+                    == nv2a_canonical_resource_address(
+                        presented_surface_color_offset_);
+        }));
 }
 
 bool VulkanPresenter::record_render_target_feedback(
@@ -2525,7 +2614,7 @@ void VulkanPresenter::record_native_draws_for_target(
             : draw_targets_presented_surface(draw);
         if (!targets_requested_surface
             || !draw_has_supported_host_transform(draw)
-            || (draw.primitive != 5u && draw.primitive != 6u)
+            || !native_pipeline_primitive_supported(draw.primitive)
             || draw.vertex_count == 0u) {
             continue;
         }
@@ -2554,7 +2643,9 @@ void VulkanPresenter::record_native_draws_for_target(
             &fragment_state);
         const uint64_t triangle_count = draw.primitive == 5u
             ? draw.vertex_count / 3u
-            : (draw.vertex_count >= 3u ? draw.vertex_count - 2u : 0u);
+            : draw.primitive == 6u && draw.vertex_count >= 3u
+                ? draw.vertex_count - 2u
+                : 0u;
         if (draw.gpu_raw_attribute_fetch) {
             ++recording_draw_count_;
             recording_triangle_count_ += triangle_count;
@@ -2599,13 +2690,9 @@ uint32_t VulkanPresenter::record_offscreen_render_targets(
             host_textures_.begin(),
             host_textures_.end(),
             [&](const HostTexture& candidate) {
-                return candidate.render_target_feedback
-                    && nv2a_canonical_resource_address(
-                        candidate.guest_address)
-                        == nv2a_canonical_resource_address(
-                            target.spec.address)
-                    && candidate.width == target.spec.width
-                    && candidate.height == target.spec.height;
+                return candidate.image == target.color_image
+                    && render_target_feedback_texture_matches_spec(
+                        candidate, target.spec);
             });
         if (texture == host_textures_.end()
             || target.framebuffer == VK_NULL_HANDLE) {
@@ -2633,7 +2720,7 @@ uint32_t VulkanPresenter::record_offscreen_render_targets(
         record_native_draws_for_target(
             command_buffer,
             extent,
-            target.spec.producer_address);
+            target.producer_address);
         vkCmdEndRenderPass(command_buffer);
 
         VkImageMemoryBarrier to_shader{};
@@ -2646,6 +2733,7 @@ uint32_t VulkanPresenter::record_offscreen_render_targets(
         to_shader.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         to_shader.image = texture->image;
         to_shader.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        to_shader.subresourceRange.baseArrayLayer = target.array_layer;
         to_shader.subresourceRange.levelCount = 1;
         to_shader.subresourceRange.layerCount = 1;
         ++recording_barrier_count_;
@@ -3055,6 +3143,8 @@ void VulkanPresenter::create_command_buffers() {
     current_work_has_readback_ = record_frame_readback;
     uint32_t recorded_render_target_feedback_copy_count = 0;
     uint32_t recorded_offscreen_render_target_pass_count = 0;
+    const uint32_t presented_color_clear_count =
+        presented_surface_color_clear_count();
     for (size_t index = 0; index < command_buffers_.size(); ++index) {
         recording_draw_count_ = 0u;
         recording_triangle_count_ = 0u;
@@ -3286,6 +3376,14 @@ void VulkanPresenter::create_command_buffers() {
             {"state_seed", std::to_string(interpreted_stream.state_seed)},
             {"clear_color_valid", interpreted_stream.clear_color_valid ? "true" : "false"},
             {"clear_color_argb", std::to_string(interpreted_stream.clear_color_argb)},
+            {"clear_surface_methods", std::to_string(
+                interpreted_stream.clear_surface_method_count)},
+            {"last_clear_surface_methods", std::to_string(
+                interpreted_stream.last_clear_surface_method_count)},
+            {"presented_surface_clears", std::to_string(
+                interpreted_stream.presented_surface_clears.size())},
+            {"presented_color_clears", std::to_string(
+                presented_color_clear_count)},
             {"native_vertices", std::to_string(interpreted_stream.vertices.size())},
             {"native_draws", std::to_string(interpreted_stream.draws.size())},
             {"translation_semantics", json_string("d3d8-nv2a-method-push-buffer-interpretation")},
@@ -3314,7 +3412,12 @@ void VulkanPresenter::create_command_buffers() {
             {"zero_count_indexed_array_noop_packets", std::to_string(interpreted_stream.zero_count_indexed_array_noop_packet_count)},
             {"native_vertices", std::to_string(interpreted_stream.vertices.size())},
             {"native_draws", std::to_string(interpreted_stream.draws.size())},
-            {"native_textures", std::to_string(host_textures_.size() - 1u)},
+            {"native_textures", std::to_string(std::count_if(
+                host_textures_.begin(),
+                host_textures_.end(),
+                [](const HostTexture& texture) {
+                    return texture.format != "fallback";
+                }))},
             {"translation_semantics", json_string("d3d8-nv2a-method-push-buffer-interpretation")},
         });
     if (!recovered_frontend_text_.empty() && frontend_text_rectangle_count_ != 0u) {
@@ -3347,6 +3450,8 @@ void VulkanPresenter::create_command_buffers() {
             {"source_d3d_commands", std::to_string(recovered_d3d_stream.size())},
             {"render_target_feedback_copies", std::to_string(recorded_render_target_feedback_copy_count)},
             {"offscreen_render_target_passes", std::to_string(recorded_offscreen_render_target_pass_count)},
+            {"presented_color_clears", std::to_string(
+                presented_color_clear_count)},
         });
 }
 

@@ -566,6 +566,8 @@ def _convert_pcm16_to_stereo_48k(
 
     if bits_per_sample != 16 or channels not in {1, 2} or sample_rate <= 0:
         raise ValueError("host mixer requires mono/stereo PCM16 with a valid sample rate")
+    if not payload or len(payload) % (channels * 2):
+        raise ValueError("host mixer requires frame-aligned PCM16")
     if sample_rate == 48000 and channels == 2 and len(payload) % 4 == 0:
         return bytes(payload)
     samples = array.array("h")
@@ -576,9 +578,19 @@ def _convert_pcm16_to_stereo_48k(
     output_frame_count = round(frame_count * 48000 / sample_rate)
     output = array.array("h")
     for output_frame in range(output_frame_count):
-        source_frame = min(frame_count - 1, output_frame * sample_rate // 48000)
-        left = samples[source_frame * channels]
-        right = samples[source_frame * channels + 1] if channels == 2 else left
+        source_position = output_frame * sample_rate
+        source_frame = min(frame_count - 1, source_position // 48000)
+        next_source_frame = min(frame_count - 1, source_frame + 1)
+        fraction = (source_position % 48000) / 48000
+        left_start = samples[source_frame * channels]
+        left_end = samples[next_source_frame * channels]
+        left = left_start + int((left_end - left_start) * fraction)
+        if channels == 2:
+            right_start = samples[source_frame * channels + 1]
+            right_end = samples[next_source_frame * channels + 1]
+            right = right_start + int((right_end - right_start) * fraction)
+        else:
+            right = left
         output.extend((left, right))
     if sys.byteorder != "little":
         output.byteswap()

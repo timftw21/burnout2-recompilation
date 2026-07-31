@@ -162,7 +162,8 @@ private:
         const std::vector<uint8_t>& rgba,
         VkFormat image_format = VK_FORMAT_R8G8B8A8_UNORM,
         bool render_target_feedback = false,
-        const std::vector<std::vector<uint8_t>>& recovered_mips = {});
+        const std::vector<std::vector<uint8_t>>& recovered_mips = {},
+        bool cubemap = false);
 
     bool build_gpu_texture_conversion_job(
         const RecoveredTextureResource& resource,
@@ -174,7 +175,8 @@ private:
 
     std::optional<HostTexture> create_cpu_converted_host_texture(
         const RecoveredTextureResource& resource,
-        const std::string& content_identity);
+        const std::string& content_identity,
+        bool cubemap);
 
     static void clear_moved_texture_handles(HostTexture& texture);
 
@@ -225,6 +227,10 @@ private:
 
     size_t host_texture_index_for_draw(const NativeDraw& draw) const;
 
+    size_t host_texture_index_for_stage(
+        const NativeDraw& draw,
+        uint32_t stage) const;
+
     std::vector<HostTextureBindingSpec>
     required_host_texture_bindings() const;
 
@@ -246,6 +252,8 @@ private:
     VkDescriptorSet descriptor_for_draw(const NativeDraw& draw) const;
 
     const HostTexture* presented_render_target_feedback_texture() const;
+
+    uint32_t presented_surface_color_clear_count() const;
 
     bool record_render_target_feedback(
         VkCommandBuffer command_buffer,
@@ -351,10 +359,14 @@ private:
 
     void write_controller_state();
 
+    void write_command_work_cache_trace();
+
     void cleanup();
 
     Options options_;
     DebugLog log_;
+    std::ofstream command_work_cache_trace_;
+    uint64_t command_work_cache_trace_reload_count_ = 0u;
     PresenterMetricsReporter metrics_reporter_;
     LivePresenterTransport transport_;
     SdlPlatform platform_;
@@ -374,10 +386,14 @@ private:
     int64_t last_command_file_open_us_ = 0;
     int64_t last_command_file_read_us_ = 0;
     int64_t last_command_record_validation_us_ = 0;
+    uint64_t last_command_transport_provenance_us_ = 0u;
+    uint64_t last_command_transport_resize_us_ = 0u;
+    uint64_t last_command_transport_copy_us_ = 0u;
     bool last_command_file_reused_ = false;
     int64_t last_interpret_us_ = 0;
     int64_t last_method_interpret_us_ = 0;
     int64_t last_indexed_materialize_us_ = 0;
+    uint64_t last_command_work_cache_us_ = 0u;
     int64_t last_render_validation_us_ = 0;
     uint64_t last_resource_snapshot_reused_count_ = 0u;
     uint64_t last_resource_snapshot_reused_bytes_ = 0u;
@@ -389,6 +405,8 @@ private:
     size_t last_command_read_bytes_ = 0;
     uint64_t native_command_read_count_ = 0;
     uint64_t native_command_span_read_count_ = 0;
+    std::vector<CommandSpanDescriptor> live_command_span_descriptors_;
+    CommandWorkCache command_work_cache_;
     uint32_t last_live_command_mmio_count_ = 0;
     bool last_resource_generation_changed_ = false;
     bool last_command_cursor_reset_ = false;

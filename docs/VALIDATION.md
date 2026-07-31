@@ -261,6 +261,67 @@ their contents. All 624 Python unit tests pass, and both pre-fix save
 directories were moved to recoverable local quarantine for a clean manual
 create, restart, load, and overwrite check.
 
+### July 30 autosave investigation handoff
+
+Manual save/load remains functional, but autosave is not accepted. Native
+filesystem diagnostics first showed that metadata probes for a new save slot
+were recursively creating the missing container and leaving zero-byte
+artifacts. The native services now preserve Xbox/NT leaf-only creation,
+delete-on-close, disposition, and truncate semantics. A missing parent returns
+`STATUS_OBJECT_PATH_NOT_FOUND` without creating the container, and
+`RtlNtStatusToDosError` maps that status to `ERROR_PATH_NOT_FOUND` (3). Focused
+native regressions cover missing-parent probes, failed-container cleanup, and
+delete/recreate/truncate behavior without Python handlers.
+
+Those repairs were necessary but did not close autosave. Normal static run
+`0759728e-edf7-4356-bf7e-d755d9770b0a` still displayed `Autosave failed` after
+the user triggered an autosave. The retained native persistence trace records
+the lower I/O operation finishing with title error 9 after `save_file_open`
+(`0x000D8D70`), then the save manager publishing error 13 at offset `0x048`
+and the UI entering failure state 4. No autosave payload write followed. This
+proves the corrected path-not-found conversion reaches the title, but a
+higher-level save-manager transition still rejects the new-slot path.
+
+Autosave is therefore pinned as unresolved. The next investigation should
+trace the manager transition immediately after error 9 and determine whether
+the title expects the autosave container to be created before its metadata
+probe or expects error 9 to advance the existing operation. The diagnostic
+suite now retains bounded native filesystem, save-only filesystem, and
+persistence event rings for that work. Local reports remain ignored evidence.
+
+### July 30 How to Play timing investigation
+
+Manual run `1d52ff0e-c940-45bf-9010-2ba506bda291` reached the Driver's Ed
+How to Play card with the HUD over black and then advanced without further
+controller changes. The run remained static- and native-clean: live
+compilation and native promotion were disabled, frontier interpreter counts
+were zero, and normal execution made zero Python callbacks. An exact F12
+capture showed that the guest explicitly cleared presented surface
+`0x00330000` to black at draw index zero and then submitted only six HUD draws;
+there was no missing presenter copy or retained-backbuffer operation to repair.
+
+The same run exposed 1,904 guest-visible VBlank ticks but only 1,719 scheduled
+VBlank callbacks. The scheduler had advanced its sequence by all elapsed host
+wall-clock intervals while delivering only one callback. Native VBlank pacing
+now advances exactly one guest-visible tick for each delivered callback and
+resets a late deadline from the current host time rather than synthesizing
+missed ticks. The report exposes `unscheduled_tick_count`, and an
+overdue-deadline regression requires sequence, tick, and callback schedule
+counts to remain one-to-one.
+
+Manual run `9642a6e1-3ac0-46d4-a3dd-59aef3cf16b2` disproved VBlank drift as the
+How to Play root cause. All 1,079 guest-visible ticks had matching callback
+schedules, runs, and completions with zero unscheduled ticks or failures, but
+the title still rendered only the six HUD draws over its own black clear for
+27 flips before resuming world rendering. There were no controller changes
+during that interval. Static analysis identifies the Driver's Ed demonstration
+input as the track's `DReplayNXBOX.dat` or `DReplayPXBOX.dat` stream loaded by
+guest function `0x00088D30`. Native diagnostics now retain each title-asset
+path, header, read result, and close result, plus the guest replay controller's
+count, index, loaded, mode, buffer, and selection state on every published
+flip. A manual rerun without an F12 capture is the next acceptance step; input
+remains manual.
+
 ## Performance records
 
 The July 14 presenter pacing regression completed 494 flips for 12,000,000
@@ -385,6 +446,10 @@ input was used; progression beyond retained run
   not yet replayed.
 - Corrected gameplay and Load/Save captures still need promotion into the
   checked-in strict preflight suite.
+- Autosave still fails when creating a new autosave slot. Run
+  `0759728e-edf7-4356-bf7e-d755d9770b0a` reaches lower-layer error 9 but the
+  save manager surfaces error 13 and failure UI state 4; see the July 30
+  autosave investigation handoff above.
 - The Xbox DirectSound buffer `Play` forwarding stall is source-closed, but its
   manual gameplay acceptance is pending. Sound-effect timing, gameplay music,
   and long-run stream continuity remain unverified.

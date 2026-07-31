@@ -47,6 +47,10 @@ class RuntimeShimTests(unittest.TestCase):
             runtime.rtl_nt_status_to_dos_error(XboxStatus.OBJECT_NAME_NOT_FOUND),
             2,
         )
+        self.assertEqual(
+            runtime.rtl_nt_status_to_dos_error(XboxStatus.OBJECT_PATH_NOT_FOUND),
+            3,
+        )
 
     def test_active_worker_owns_current_thread_termination(self) -> None:
         runtime = XboxRuntimeShims()

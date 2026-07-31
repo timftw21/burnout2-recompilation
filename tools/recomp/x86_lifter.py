@@ -3412,7 +3412,7 @@ def execute_lifted_function(
                 instruction.operands[1],
             )
             current = active_state.get_xmm_register(destination.reg or "")
-            result = 1.0 / math.sqrt(value) if value > 0.0 else float("nan")
+            result = _sse_reciprocal_sqrt_approximation(value)
             _write_xmm_operand(
                 active_state,
                 active_memory,
@@ -4869,6 +4869,36 @@ def _sse_round_float32_to_i32(value: float, mxcsr: int) -> int:
     return _u32(int(rounded))
 
 
+def _sse_reciprocal_sqrt_approximation(value: float) -> float:
+    bits = struct.unpack("<I", struct.pack("<f", value))[0]
+    sign = bits & 0x80000000
+    exponent = bits & 0x7F800000
+    fraction = bits & 0x007FFFFF
+
+    def float_from_bits(result_bits: int) -> float:
+        return struct.unpack("<f", struct.pack("<I", result_bits))[0]
+
+    if exponent == 0:
+        return float_from_bits(sign | 0x7F800000)
+    if exponent == 0x7F800000:
+        if fraction != 0:
+            return float_from_bits(bits | 0x00400000)
+        return float_from_bits(0xFFC00000 if sign else 0)
+    if sign:
+        return float_from_bits(0xFFC00000)
+
+    # Intel RSQRTSS selects one of 1024 mantissa buckets for each exponent
+    # parity, then rounds its estimate to 11 fraction bits. Evaluating the
+    # bucket midpoint reproduces that deterministic lookup without depending
+    # on the host CPU's vendor-specific reciprocal-square-root estimate.
+    midpoint_bits = (bits & 0xFFFFE000) | 0x00001000
+    midpoint = float_from_bits(midpoint_bits)
+    estimate_bits = struct.unpack(
+        "<I", struct.pack("<f", 1.0 / math.sqrt(midpoint))
+    )[0]
+    return float_from_bits((estimate_bits + 0x00000400) & 0xFFFFF800)
+
+
 def _sse_minmax_float32(left: float, right: float, *, minimum: bool) -> float:
     if math.isnan(left) or math.isnan(right) or left == right:
         return right
@@ -5517,9 +5547,17 @@ class CppEmitter:
         callback_addresses: Iterable[int] = (),
         forwarded_callback_addresses: Iterable[int] = (),
         native_fast_paths: Mapping[int, NativeFastPath] | None = None,
+        registerize_guest_state: bool = True,
+        coalesce_memory_accesses: bool = False,
         synchronize_eip_for_callbacks: bool = False,
     ) -> str:
         self._resumable = resumable
+        self._registerize_guest_state = bool(
+            resumable and registerize_guest_state
+        )
+        self._coalesce_memory_accesses = bool(
+            resumable and coalesce_memory_accesses
+        )
         self._observer_addresses = {_u32(address) for address in observer_addresses}
         self._callback_addresses = {_u32(address) for address in callback_addresses}
         self._forwarded_callback_addresses = {
@@ -5544,6 +5582,24 @@ class CppEmitter:
             )
             if _u32(current.next_address) == _u32(following.address)
         }
+        self._unchecked_step_run_lengths: dict[int, int] = {}
+        if self._registerize_guest_state:
+            following_run_length = 0
+            for instruction in reversed(function.instructions):
+                emitted_lines = self._emit_instruction(instruction)
+                native_fast_path = self._native_fast_paths.get(instruction.address)
+                records_memory_write = self._instruction_records_memory_write(
+                    emitted_lines,
+                    native_fast_path,
+                )
+                direct_fallthrough = self._can_direct_thread_fallthrough(
+                    instruction,
+                    records_memory_write=records_memory_write,
+                    native_fast_path=native_fast_path,
+                )
+                run_length = 1 + following_run_length if direct_fallthrough else 1
+                self._unchecked_step_run_lengths[instruction.address] = run_length
+                following_run_length = run_length
         symbol = _cpp_identifier(exported_symbol or function.symbol)
         split_resumable_switch = (
             resumable
@@ -5594,7 +5650,7 @@ class CppEmitter:
             "    uint32_t mxcsr;",
             "    uint32_t fpu_control_word;",
             "    uint32_t fpu_status_word;",
-            "    float fpu_stack[8];",
+            "    double fpu_stack[8];",
             "    uint32_t fpu_depth;",
             "    B2RXmm xmm[8];",
             "    uint64_t mmx[8];",
@@ -5670,6 +5726,54 @@ class CppEmitter:
             "    uint32_t native_fast_path_address_mask;",
             "};",
             "",
+            "// Guest values used by nearly deterministic AOT paths stay local",
+            "// until the generated module reaches an explicit boundary.",
+            "struct B2RHotState {",
+            "    uint32_t eax;",
+            "    uint32_t ecx;",
+            "    uint32_t edx;",
+            "    uint32_t ebx;",
+            "    uint32_t esp;",
+            "    uint32_t ebp;",
+            "    uint32_t edi;",
+            "    B2RFlags flags;",
+            "    uint64_t steps;",
+            "    uint64_t step_budget;",
+            "};",
+            "",
+            "static inline B2RHotState b2r_load_hot_state(const B2RContext* ctx) {",
+            "    return B2RHotState{",
+            "        ctx->eax, ctx->ecx, ctx->edx, ctx->ebx,",
+            "        ctx->esp, ctx->ebp, ctx->edi, ctx->flags,",
+            "        ctx->steps, ctx->step_budget",
+            "    };",
+            "}",
+            "",
+            "static inline void b2r_commit_hot_state(",
+            "    B2RContext* ctx, const B2RHotState& hot) {",
+            "    ctx->eax = hot.eax;",
+            "    ctx->ecx = hot.ecx;",
+            "    ctx->edx = hot.edx;",
+            "    ctx->ebx = hot.ebx;",
+            "    ctx->esp = hot.esp;",
+            "    ctx->ebp = hot.ebp;",
+            "    ctx->edi = hot.edi;",
+            "    ctx->flags = hot.flags;",
+            "    ctx->steps = hot.steps;",
+            "}",
+            "",
+            "struct B2RHotStateCommit {",
+            "    B2RContext* ctx;",
+            "    B2RHotState* hot;",
+            "    ~B2RHotStateCommit() { b2r_commit_hot_state(ctx, *hot); }",
+            "};",
+            "",
+            "static inline void b2r_sync_hot_observation_state(",
+            "    B2RContext* ctx, const B2RHotState& hot, uint32_t eip) {",
+            "    ctx->eip = eip;",
+            "    ctx->steps = hot.steps;",
+            "}",
+            "",
             "enum B2RModuleExitReason : uint32_t {",
             "    B2R_MODULE_EXIT_FALLTHROUGH_OR_UNKNOWN = 0u,",
             "    B2R_MODULE_EXIT_BRANCH = 1u,",
@@ -5690,6 +5794,33 @@ class CppEmitter:
             "        return false;",
             "    }",
             "    ++ctx->steps;",
+            "    return true;",
+            "}",
+            "",
+            "static inline bool b2r_begin_instruction(",
+            "    B2RContext* ctx, B2RHotState& hot, uint32_t address,",
+            "    uint32_t run_length, uint32_t& unchecked_step_count) {",
+            "    if (unchecked_step_count == 0u) {",
+            "        if (hot.step_budget != 0u && hot.steps >= hot.step_budget) {",
+            "            ctx->eip = address;",
+            "            ctx->module_exit_reason = B2R_MODULE_EXIT_STEP_BUDGET;",
+            "            return false;",
+            "        }",
+            "        unchecked_step_count = run_length;",
+            "        if (hot.step_budget != 0u) {",
+            "            const uint64_t available = hot.step_budget - hot.steps;",
+            "            if (available < unchecked_step_count) {",
+            "                unchecked_step_count = static_cast<uint32_t>(available);",
+            "            }",
+            "        }",
+            "    }",
+            "    if (unchecked_step_count == 0u) {",
+            "        ctx->eip = address;",
+            "        ctx->module_exit_reason = B2R_MODULE_EXIT_STEP_BUDGET;",
+            "        return false;",
+            "    }",
+            "    ++hot.steps;",
+            "    --unchecked_step_count;",
             "    return true;",
             "}",
             "",
@@ -5753,6 +5884,18 @@ class CppEmitter:
             "        ctx->callback_address_keys == nullptr || size == 0u) {",
             "        return false;",
             "    }",
+            *(
+                [
+                    "    const uint32_t first = b2r_cache_address(ctx, address);",
+                    "    const uint32_t last = b2r_cache_address(ctx, address + size - 1u);",
+                    "    if ((first >> 12u) == (last >> 12u) &&",
+                    "        ctx->callback_pages[first >> 12u] == 0u) {",
+                    "        return false;",
+                    "    }",
+                ]
+                if self._coalesce_memory_accesses
+                else []
+            ),
             "    for (uint32_t offset = 0u; offset < size; ++offset) {",
             "        const uint32_t current = b2r_cache_address(ctx, address + offset);",
             "        if (ctx->callback_pages[current >> 12u] == 0u) { continue; }",
@@ -5774,6 +5917,18 @@ class CppEmitter:
             "        ctx->write_callback_address_keys == nullptr || size == 0u) {",
             "        return false;",
             "    }",
+            *(
+                [
+                    "    const uint32_t first = b2r_cache_address(ctx, address);",
+                    "    const uint32_t last = b2r_cache_address(ctx, address + size - 1u);",
+                    "    if ((first >> 12u) == (last >> 12u) &&",
+                    "        ctx->write_callback_pages[first >> 12u] == 0u) {",
+                    "        return false;",
+                    "    }",
+                ]
+                if self._coalesce_memory_accesses
+                else []
+            ),
             "    for (uint32_t offset = 0u; offset < size; ++offset) {",
             "        const uint32_t current = b2r_cache_address(ctx, address + offset);",
             "        if (ctx->write_callback_pages[current >> 12u] == 0u) { continue; }",
@@ -6095,12 +6250,61 @@ class CppEmitter:
             "}",
             "",
             "static inline uint16_t b2r_read_u16(B2RContext* ctx, uint32_t address) {",
+            *(
+                [
+                    "    const uint32_t cache_address = b2r_cache_address(ctx, address);",
+                    "    const uint32_t page = cache_address >> 12u;",
+                    "    const bool requires_callback =",
+                    "        b2r_requires_read_memory_callback(ctx, address, 2u);",
+                    "    if ((cache_address & 0xfffu) <= 0xffeu &&",
+                    "        ctx->read_pages != nullptr &&",
+                    "        ctx->read_pages[page] != nullptr && !requires_callback) {",
+                    "        uint16_t value;",
+                    "        std::memcpy(&value, ctx->read_pages[page] +",
+                    "            (cache_address & 0xfffu), sizeof(value));",
+                    "        return value;",
+                    "    }",
+                ]
+                if self._coalesce_memory_accesses
+                else []
+            ),
             "    return static_cast<uint16_t>(",
             "        static_cast<uint16_t>(b2r_read_u8(ctx, address)) |",
             "        static_cast<uint16_t>(b2r_read_u8(ctx, address + 1u) << 8));",
             "}",
             "",
             "static inline void b2r_write_u16(B2RContext* ctx, uint32_t address, uint16_t value) {",
+            *(
+                [
+                    "    const uint32_t cache_address = b2r_cache_address(ctx, address);",
+                    "    const uint32_t page = cache_address >> 12u;",
+                    "    const bool requires_callback =",
+                    "        b2r_requires_write_memory_callback(ctx, address, 2u);",
+                    "    if ((cache_address & 0xfffu) <= 0xffeu &&",
+                    "        ctx->direct_observed_write_transport &&",
+                    "        ctx->observed_write_range_start < ctx->observed_write_range_end &&",
+                    "        ctx->observed_write_range_end - ctx->observed_write_range_start >= 2u &&",
+                    "        cache_address >= ctx->observed_write_range_start &&",
+                    "        cache_address <= ctx->observed_write_range_end - 2u &&",
+                    "        !requires_callback &&",
+                    "        b2r_record_direct_observed_write(",
+                    "            ctx, cache_address, 2u, value)) {",
+                    "        return;",
+                    "    }",
+                    "    if ((cache_address & 0xfffu) <= 0xffeu &&",
+                    "        ctx->read_pages != nullptr &&",
+                    "        ctx->read_pages[page] != nullptr && !requires_callback) {",
+                    "        b2r_record_observed_write(ctx, cache_address, 2u, value);",
+                    "        std::memcpy(ctx->read_pages[page] +",
+                    "            (cache_address & 0xfffu), &value, sizeof(value));",
+                    "        b2r_mark_dirty_page(ctx, page,",
+                    "            static_cast<uint16_t>(cache_address & 0xfffu), 2u);",
+                    "        return;",
+                    "    }",
+                ]
+                if self._coalesce_memory_accesses
+                else []
+            ),
             "    b2r_write_u8(ctx, address, static_cast<uint8_t>(value & 0xffu));",
             "    b2r_write_u8(ctx, address + 1u, static_cast<uint8_t>((value >> 8) & 0xffu));",
             "}",
@@ -6112,6 +6316,24 @@ class CppEmitter:
             "}",
             "",
             "static inline uint64_t b2r_read_u64(B2RContext* ctx, uint32_t address) {",
+            *(
+                [
+                    "    const uint32_t cache_address = b2r_cache_address(ctx, address);",
+                    "    const uint32_t page = cache_address >> 12u;",
+                    "    const bool requires_callback =",
+                    "        b2r_requires_read_memory_callback(ctx, address, 8u);",
+                    "    if ((cache_address & 0xfffu) <= 0xff8u &&",
+                    "        ctx->read_pages != nullptr &&",
+                    "        ctx->read_pages[page] != nullptr && !requires_callback) {",
+                    "        uint64_t value;",
+                    "        std::memcpy(&value, ctx->read_pages[page] +",
+                    "            (cache_address & 0xfffu), sizeof(value));",
+                    "        return value;",
+                    "    }",
+                ]
+                if self._coalesce_memory_accesses
+                else []
+            ),
             "    const uint64_t low = static_cast<uint64_t>(b2r_read_u32(ctx, address));",
             "    const uint64_t high = static_cast<uint64_t>(b2r_read_u32(ctx, address + 4u));",
             "    return (high << 32) | low;",
@@ -6124,11 +6346,42 @@ class CppEmitter:
             "}",
             "",
             "static inline void b2r_write_u64(B2RContext* ctx, uint32_t address, uint64_t value) {",
+            *(
+                [
+                    "    const uint32_t cache_address = b2r_cache_address(ctx, address);",
+                    "    const uint32_t page = cache_address >> 12u;",
+                    "    const bool requires_callback =",
+                    "        b2r_requires_write_memory_callback(ctx, address, 8u);",
+                    "    if ((cache_address & 0xfffu) <= 0xff8u &&",
+                    "        ctx->direct_observed_write_transport &&",
+                    "        ctx->observed_write_range_start < ctx->observed_write_range_end &&",
+                    "        ctx->observed_write_range_end - ctx->observed_write_range_start >= 8u &&",
+                    "        cache_address >= ctx->observed_write_range_start &&",
+                    "        cache_address <= ctx->observed_write_range_end - 8u &&",
+                    "        !requires_callback &&",
+                    "        b2r_record_direct_observed_write(",
+                    "            ctx, cache_address, 8u, value)) {",
+                    "        return;",
+                    "    }",
+                    "    if ((cache_address & 0xfffu) <= 0xff8u &&",
+                    "        ctx->read_pages != nullptr &&",
+                    "        ctx->read_pages[page] != nullptr && !requires_callback) {",
+                    "        b2r_record_observed_write(ctx, cache_address, 8u, value);",
+                    "        std::memcpy(ctx->read_pages[page] +",
+                    "            (cache_address & 0xfffu), &value, sizeof(value));",
+                    "        b2r_mark_dirty_page(ctx, page,",
+                    "            static_cast<uint16_t>(cache_address & 0xfffu), 8u);",
+                    "        return;",
+                    "    }",
+                ]
+                if self._coalesce_memory_accesses
+                else []
+            ),
             "    b2r_write_u32(ctx, address, static_cast<uint32_t>(value & 0xffffffffu));",
             "    b2r_write_u32(ctx, address + 4u, static_cast<uint32_t>(value >> 32));",
             "}",
             "",
-            "static inline int64_t b2r_fistp_i64(float value) {",
+            "static inline int64_t b2r_fistp_i64(double value) {",
             "    if (!std::isfinite(value)) {",
             "        return std::numeric_limits<int64_t>::min();",
             "    }",
@@ -6140,7 +6393,7 @@ class CppEmitter:
             "    return static_cast<int64_t>(rounded);",
             "}",
             "",
-            "static inline uint32_t b2r_fistp_i32(float value) {",
+            "static inline uint32_t b2r_fistp_i32(double value) {",
             "    if (!std::isfinite(value)) {",
             "        return 0x80000000u;",
             "    }",
@@ -6152,57 +6405,83 @@ class CppEmitter:
             "    return static_cast<uint32_t>(static_cast<int32_t>(rounded));",
             "}",
             "",
-            "static inline void b2r_logic_flags(B2RContext* ctx, uint32_t result, uint32_t bits) {",
+            "static inline void b2r_logic_flags(B2RFlags& flags, uint32_t result, uint32_t bits) {",
             "    const uint32_t mask = b2r_mask_for_bits(bits);",
             "    const uint32_t sign_bit = b2r_sign_bit_for_bits(bits);",
             "    result &= mask;",
-            "    ctx->flags.cf = false;",
-            "    ctx->flags.of = false;",
-            "    ctx->flags.af = false;",
-            "    ctx->flags.zf = result == 0u;",
-            "    ctx->flags.sf = (result & sign_bit) != 0u;",
-            "    ctx->flags.pf = b2r_parity8(result);",
+            "    flags.cf = false;",
+            "    flags.of = false;",
+            "    flags.af = false;",
+            "    flags.zf = result == 0u;",
+            "    flags.sf = (result & sign_bit) != 0u;",
+            "    flags.pf = b2r_parity8(result);",
             "}",
             "",
-            "static inline void b2r_add_flags(B2RContext* ctx, uint32_t lhs, uint64_t rhs, uint32_t result, uint32_t bits) {",
+            "static inline void b2r_add_flags(B2RFlags& flags, uint32_t lhs, uint64_t rhs, uint32_t result, uint32_t bits) {",
             "    const uint32_t mask = b2r_mask_for_bits(bits);",
             "    const uint32_t sign_bit = b2r_sign_bit_for_bits(bits);",
             "    lhs &= mask;",
             "    const uint64_t rhs_full = rhs;",
             "    const uint32_t rhs_masked = static_cast<uint32_t>(rhs) & mask;",
             "    result &= mask;",
-            "    ctx->flags.cf = (static_cast<uint64_t>(lhs) + rhs_full) > mask;",
-            "    ctx->flags.of = ((~(lhs ^ rhs_masked) & (lhs ^ result) & sign_bit) != 0u);",
-            "    ctx->flags.af = ((lhs ^ rhs_masked ^ result) & 0x10u) != 0u;",
-            "    ctx->flags.zf = result == 0u;",
-            "    ctx->flags.sf = (result & sign_bit) != 0u;",
-            "    ctx->flags.pf = b2r_parity8(result);",
+            "    flags.cf = (static_cast<uint64_t>(lhs) + rhs_full) > mask;",
+            "    flags.of = ((~(lhs ^ rhs_masked) & (lhs ^ result) & sign_bit) != 0u);",
+            "    flags.af = ((lhs ^ rhs_masked ^ result) & 0x10u) != 0u;",
+            "    flags.zf = result == 0u;",
+            "    flags.sf = (result & sign_bit) != 0u;",
+            "    flags.pf = b2r_parity8(result);",
             "}",
             "",
-            "static inline void b2r_sub_flags(B2RContext* ctx, uint32_t lhs, uint64_t rhs, uint32_t result, uint32_t bits) {",
+            "static inline void b2r_sub_flags(B2RFlags& flags, uint32_t lhs, uint64_t rhs, uint32_t result, uint32_t bits) {",
             "    const uint32_t mask = b2r_mask_for_bits(bits);",
             "    const uint32_t sign_bit = b2r_sign_bit_for_bits(bits);",
             "    lhs &= mask;",
             "    const uint64_t rhs_full = rhs;",
             "    const uint32_t rhs_masked = static_cast<uint32_t>(rhs) & mask;",
             "    result &= mask;",
-            "    ctx->flags.cf = static_cast<uint64_t>(lhs) < rhs_full;",
-            "    ctx->flags.of = (((lhs ^ rhs_masked) & (lhs ^ result) & sign_bit) != 0u);",
-            "    ctx->flags.af = ((lhs ^ rhs_masked ^ result) & 0x10u) != 0u;",
-            "    ctx->flags.zf = result == 0u;",
-            "    ctx->flags.sf = (result & sign_bit) != 0u;",
-            "    ctx->flags.pf = b2r_parity8(result);",
+            "    flags.cf = static_cast<uint64_t>(lhs) < rhs_full;",
+            "    flags.of = (((lhs ^ rhs_masked) & (lhs ^ result) & sign_bit) != 0u);",
+            "    flags.af = ((lhs ^ rhs_masked ^ result) & 0x10u) != 0u;",
+            "    flags.zf = result == 0u;",
+            "    flags.sf = (result & sign_bit) != 0u;",
+            "    flags.pf = b2r_parity8(result);",
+            "}",
+            "",
+            "static inline void b2r_logic_flags(",
+            "    B2RContext* ctx, uint32_t result, uint32_t bits) {",
+            "    b2r_logic_flags(ctx->flags, result, bits);",
+            "}",
+            "",
+            "static inline void b2r_add_flags(",
+            "    B2RContext* ctx, uint32_t lhs, uint64_t rhs,",
+            "    uint32_t result, uint32_t bits) {",
+            "    b2r_add_flags(ctx->flags, lhs, rhs, result, bits);",
+            "}",
+            "",
+            "static inline void b2r_sub_flags(",
+            "    B2RContext* ctx, uint32_t lhs, uint64_t rhs,",
+            "    uint32_t result, uint32_t bits) {",
+            "    b2r_sub_flags(ctx->flags, lhs, rhs, result, bits);",
+            "}",
+            "",
+            "static inline void b2r_push(",
+            "    B2RContext* ctx, uint32_t& esp, uint32_t value) {",
+            "    esp -= 4u;",
+            "    ctx->write_u32(ctx->user, esp, value);",
+            "}",
+            "",
+            "static inline uint32_t b2r_pop(B2RContext* ctx, uint32_t& esp) {",
+            "    const uint32_t value = ctx->read_u32(ctx->user, esp);",
+            "    esp += 4u;",
+            "    return value;",
             "}",
             "",
             "static inline void b2r_push(B2RContext* ctx, uint32_t value) {",
-            "    ctx->esp -= 4u;",
-            "    ctx->write_u32(ctx->user, ctx->esp, value);",
+            "    b2r_push(ctx, ctx->esp, value);",
             "}",
             "",
             "static inline uint32_t b2r_pop(B2RContext* ctx) {",
-            "    const uint32_t value = ctx->read_u32(ctx->user, ctx->esp);",
-            "    ctx->esp += 4u;",
-            "    return value;",
+            "    return b2r_pop(ctx, ctx->esp);",
             "}",
             "",
             "static inline float b2r_read_f32(B2RContext* ctx, uint32_t address) {",
@@ -6212,56 +6491,56 @@ class CppEmitter:
             "    return value;",
             "}",
             "",
-            "static inline float b2r_read_f64(B2RContext* ctx, uint32_t address) {",
+            "static inline double b2r_read_f64(B2RContext* ctx, uint32_t address) {",
             "    const uint64_t bits = b2r_read_u64(ctx, address);",
             "    double value;",
             "    std::memcpy(&value, &bits, sizeof(value));",
-            "    return static_cast<float>(value);",
+            "    return value;",
             "}",
             "",
-            "static inline void b2r_write_f32(B2RContext* ctx, uint32_t address, float value) {",
+            "static inline void b2r_write_f32(B2RContext* ctx, uint32_t address, double value) {",
+            "    const float narrowed = static_cast<float>(value);",
             "    uint32_t bits;",
-            "    std::memcpy(&bits, &value, sizeof(bits));",
+            "    std::memcpy(&bits, &narrowed, sizeof(bits));",
             "    ctx->write_u32(ctx->user, address, bits);",
             "}",
             "",
-            "static inline void b2r_write_f64(B2RContext* ctx, uint32_t address, float value) {",
-            "    const double widened = static_cast<double>(value);",
+            "static inline void b2r_write_f64(B2RContext* ctx, uint32_t address, double value) {",
             "    uint64_t bits;",
-            "    std::memcpy(&bits, &widened, sizeof(bits));",
+            "    std::memcpy(&bits, &value, sizeof(bits));",
             "    b2r_write_u64(ctx, address, bits);",
             "}",
             "",
-            "static inline float b2r_read_f80(B2RContext* ctx, uint32_t address) {",
+            "static inline double b2r_read_f80(B2RContext* ctx, uint32_t address) {",
             "    const uint64_t significand = b2r_read_u64(ctx, address);",
             "    const uint16_t exponent_sign = b2r_read_u16(ctx, address + 8u);",
             "    const uint32_t exponent = exponent_sign & 0x7fffu;",
-            "    float value;",
+            "    double value;",
             "    if (exponent == 0x7fffu) {",
             "        value = significand == 0x8000000000000000ull",
-            "            ? std::numeric_limits<float>::infinity()",
-            "            : std::numeric_limits<float>::quiet_NaN();",
+            "            ? std::numeric_limits<double>::infinity()",
+            "            : std::numeric_limits<double>::quiet_NaN();",
             "    } else if (exponent == 0u && significand == 0u) {",
-            "        value = 0.0f;",
+            "        value = 0.0;",
             "    } else {",
             "        const double fraction = static_cast<double>(significand) / 9223372036854775808.0;",
             "        const int unbiased = exponent == 0u ? 1 - 16383 : static_cast<int>(exponent) - 16383;",
-            "        value = static_cast<float>(std::ldexp(fraction, unbiased));",
+            "        value = std::ldexp(fraction, unbiased);",
             "    }",
             "    return (exponent_sign & 0x8000u) != 0u ? -value : value;",
             "}",
             "",
-            "static inline void b2r_write_f80(B2RContext* ctx, uint32_t address, float value) {",
+            "static inline void b2r_write_f80(B2RContext* ctx, uint32_t address, double value) {",
             "    uint64_t significand = 0u;",
             "    uint16_t exponent = 0u;",
-            "    const float magnitude = std::fabs(value);",
+            "    const double magnitude = std::fabs(value);",
             "    if (std::isnan(value)) {",
             "        significand = 0xc000000000000000ull;",
             "        exponent = 0x7fffu;",
             "    } else if (std::isinf(value)) {",
             "        significand = 0x8000000000000000ull;",
             "        exponent = 0x7fffu;",
-            "    } else if (magnitude != 0.0f) {",
+            "    } else if (magnitude != 0.0) {",
             "        int binary_exponent = 0;",
             "        const double fraction = std::frexp(static_cast<double>(magnitude), &binary_exponent);",
             "        exponent = static_cast<uint16_t>(binary_exponent - 1 + 16383);",
@@ -6385,13 +6664,33 @@ class CppEmitter:
             "}",
             "",
             "static inline float b2r_rsqrtss(float value) {",
-            "    if (value <= 0.0f) {",
-            "        return std::numeric_limits<float>::quiet_NaN();",
+            "    uint32_t bits;",
+            "    std::memcpy(&bits, &value, sizeof(bits));",
+            "    const uint32_t sign = bits & 0x80000000u;",
+            "    const uint32_t exponent = bits & 0x7f800000u;",
+            "    const uint32_t fraction = bits & 0x007fffffu;",
+            "    uint32_t result_bits;",
+            "    if (exponent == 0u) {",
+            "        result_bits = sign | 0x7f800000u;",
+            "    } else if (exponent == 0x7f800000u) {",
+            "        result_bits = fraction != 0u ? bits | 0x00400000u : (sign != 0u ? 0xffc00000u : 0u);",
+            "    } else if (sign != 0u) {",
+            "        result_bits = 0xffc00000u;",
+            "    } else {",
+            "        const uint32_t midpoint_bits = (bits & 0xffffe000u) | 0x00001000u;",
+            "        float midpoint;",
+            "        std::memcpy(&midpoint, &midpoint_bits, sizeof(midpoint));",
+            "        const float estimate = static_cast<float>(1.0 / std::sqrt(static_cast<double>(midpoint)));",
+            "        uint32_t estimate_bits;",
+            "        std::memcpy(&estimate_bits, &estimate, sizeof(estimate_bits));",
+            "        result_bits = (estimate_bits + 0x00000400u) & 0xfffff800u;",
             "    }",
-            "    return 1.0f / std::sqrt(value);",
+            "    float result;",
+            "    std::memcpy(&result, &result_bits, sizeof(result));",
+            "    return result;",
             "}",
             "",
-            "static inline void b2r_fpu_push(B2RContext* ctx, float value) {",
+            "static inline void b2r_fpu_push(B2RContext* ctx, double value) {",
             "    for (uint32_t index = 7u; index > 0u; --index) {",
             "        ctx->fpu_stack[index] = ctx->fpu_stack[index - 1u];",
             "    }",
@@ -6401,8 +6700,8 @@ class CppEmitter:
             "    }",
             "}",
             "",
-            "static inline float b2r_fpu_pop(B2RContext* ctx) {",
-            "    const float value = ctx->fpu_stack[0];",
+            "static inline double b2r_fpu_pop(B2RContext* ctx) {",
+            "    const double value = ctx->fpu_stack[0];",
             "    for (uint32_t index = 0u; index < 7u; ++index) {",
             "        ctx->fpu_stack[index] = ctx->fpu_stack[index + 1u];",
             "    }",
@@ -6420,9 +6719,9 @@ class CppEmitter:
             "    --ctx->fpu_depth;",
             "}",
             "",
-            "static inline uint32_t b2r_fpu_tag(float value) {",
+            "static inline uint32_t b2r_fpu_tag(double value) {",
             "    if (std::isnan(value) || std::isinf(value)) { return 2u; }",
-            "    return value == 0.0f ? 1u : 0u;",
+            "    return value == 0.0 ? 1u : 0u;",
             "}",
             "",
             "static inline void b2r_fnsave(B2RContext* ctx, uint32_t address) {",
@@ -6459,7 +6758,7 @@ class CppEmitter:
             "    }",
             "}",
             "",
-            "static inline uint32_t b2r_fpu_compare_status(float left, float right, uint32_t status_word) {",
+            "static inline uint32_t b2r_fpu_compare_status(double left, double right, uint32_t status_word) {",
             "    status_word &= ~0x4700u;",
             "    if (std::isnan(left) || std::isnan(right)) {",
             "        return status_word | 0x4500u;",
@@ -6475,9 +6774,13 @@ class CppEmitter:
             "",
         ]
         if split_resumable_switch:
-            lines.extend(
-                self._emit_split_resumable_function(function, symbol=symbol)
+            split_lines = self._emit_split_resumable_function(
+                function,
+                symbol=symbol,
             )
+            if self._registerize_guest_state:
+                split_lines = self._registerize_resumable_lines(split_lines)
+            lines.extend(split_lines)
             source = "\n".join(lines)
             return (
                 source.replace("ctx->read_u32(ctx->user,", "b2r_read_u32(ctx,")
@@ -6485,9 +6788,19 @@ class CppEmitter:
                 .replace("ctx->read_u8(ctx->user,", "b2r_read_u8(ctx,")
                 .replace("ctx->write_u8(ctx->user,", "b2r_write_u8(ctx,")
             )
+        execution_start = len(lines)
         lines.extend(
             [
                 f'extern "C" __declspec(dllexport) uint32_t {symbol}(B2RContext* ctx) {{',
+                *(
+                    [
+                        "    B2RHotState hot = b2r_load_hot_state(ctx);",
+                        "    B2RHotStateCommit hot_commit{ctx, &hot};",
+                        "    uint32_t unchecked_step_count = 0u;",
+                    ]
+                    if resumable and self._registerize_guest_state
+                    else []
+                ),
                 (
                     "    uint32_t eip = ctx->eip != 0u ? ctx->eip : "
                     f"{_cpp_u32(function.base_address)};"
@@ -6561,6 +6874,10 @@ class CppEmitter:
                 "",
             ]
         )
+        if resumable and self._registerize_guest_state:
+            lines[execution_start:] = self._registerize_resumable_lines(
+                lines[execution_start:]
+            )
         source = "\n".join(lines)
         return (
             source.replace("ctx->read_u32(ctx->user,", "b2r_read_u32(ctx,")
@@ -6592,7 +6909,12 @@ class CppEmitter:
                 [
                     "static __declspec(noinline) uint32_t "
                     f"{chunk_symbol}(B2RContext* ctx, uint32_t eip, "
-                    "bool* matched, uint32_t& pending_module_exit_reason) {",
+                    + (
+                        "B2RHotState& hot, uint32_t& unchecked_step_count, "
+                        if self._registerize_guest_state
+                        else ""
+                    )
+                    + "bool* matched, uint32_t& pending_module_exit_reason) {",
                     "    for (;;) {",
                 ]
             )
@@ -6652,6 +6974,15 @@ class CppEmitter:
         lines.extend(
             [
                 f'extern "C" __declspec(dllexport) uint32_t {symbol}(B2RContext* ctx) {{',
+                *(
+                    [
+                        "    B2RHotState hot = b2r_load_hot_state(ctx);",
+                        "    B2RHotStateCommit hot_commit{ctx, &hot};",
+                        "    uint32_t unchecked_step_count = 0u;",
+                    ]
+                    if self._registerize_guest_state
+                    else []
+                ),
                 "    uint32_t eip = ctx->eip != 0u ? ctx->eip : "
                 f"{_cpp_u32(function.base_address)};",
                 "    uint32_t pending_module_exit_reason =",
@@ -6667,7 +6998,14 @@ class CppEmitter:
                     f"        {condition} (eip <= "
                     f"{_cpp_u32(chunk[-1].address)}) {{",
                     f"            eip = {symbol}_chunk_{chunk_index:03d}("
-                    "ctx, eip, &matched, pending_module_exit_reason);",
+                    "ctx, eip, "
+                    + (
+                        "hot, unchecked_step_count, "
+                        if self._registerize_guest_state
+                        else ""
+                    )
+                    + "&matched, "
+                    "pending_module_exit_reason);",
                     "        }",
                 ]
             )
@@ -6692,16 +7030,12 @@ class CppEmitter:
         )
         return lines
 
-    def _emit_instruction_case(
-        self,
-        instruction: X86Instruction,
-        *,
-        matched_line: str | None = None,
-        allow_direct_fallthrough: bool = True,
-    ) -> list[str]:
-        native_fast_path = self._native_fast_paths.get(instruction.address)
-        emitted_lines = self._emit_instruction(instruction)
-        instruction_records_memory_write = any(
+    @staticmethod
+    def _instruction_records_memory_write(
+        emitted_lines: Iterable[str],
+        native_fast_path: NativeFastPath | None,
+    ) -> bool:
+        return any(
             token in line
             for line in (
                 *emitted_lines,
@@ -6712,15 +7046,75 @@ class CppEmitter:
                 "ctx->write_u32(ctx->user,",
                 "b2r_write_",
                 "b2r_fpu_store",
+                "b2r_push(ctx,",
             )
         )
-        if (
+
+    def _can_direct_thread_fallthrough(
+        self,
+        instruction: X86Instruction,
+        *,
+        records_memory_write: bool,
+        native_fast_path: NativeFastPath | None,
+    ) -> bool:
+        return bool(
             self._resumable
-            and allow_direct_fallthrough
-            and not instruction_records_memory_write
+            and not records_memory_write
             and native_fast_path is None
             and instruction.address not in self._observer_addresses
             and instruction.next_address not in self._callback_addresses
+            and instruction.address in self._direct_fallthrough_addresses
+        )
+
+    @staticmethod
+    def _registerize_resumable_lines(lines: Iterable[str]) -> list[str]:
+        """Keep high-traffic guest state local until a native boundary."""
+        result: list[str] = []
+        helper_replacements = {
+            "b2r_logic_flags(ctx,": "b2r_logic_flags(hot.flags,",
+            "b2r_add_flags(ctx,": "b2r_add_flags(hot.flags,",
+            "b2r_sub_flags(ctx,": "b2r_sub_flags(hot.flags,",
+            "b2r_push(ctx,": "b2r_push(ctx, hot.esp,",
+            "b2r_pop(ctx)": "b2r_pop(ctx, hot.esp)",
+        }
+        field_names = (
+            "eax",
+            "ecx",
+            "edx",
+            "ebx",
+            "esp",
+            "ebp",
+            "edi",
+            "flags",
+            "steps",
+            "step_budget",
+        )
+        for original in lines:
+            line = original
+            for old, new in helper_replacements.items():
+                line = line.replace(old, new)
+            for field_name in field_names:
+                line = line.replace(f"ctx->{field_name}", f"hot.{field_name}")
+            result.append(line)
+        return result
+
+    def _emit_instruction_case(
+        self,
+        instruction: X86Instruction,
+        *,
+        matched_line: str | None = None,
+        allow_direct_fallthrough: bool = True,
+    ) -> list[str]:
+        native_fast_path = self._native_fast_paths.get(instruction.address)
+        emitted_lines = self._emit_instruction(instruction)
+        instruction_records_memory_write = self._instruction_records_memory_write(
+            emitted_lines,
+            native_fast_path,
+        )
+        if allow_direct_fallthrough and self._can_direct_thread_fallthrough(
+            instruction,
+            records_memory_write=instruction_records_memory_write,
+            native_fast_path=native_fast_path,
         ):
             emitted_lines = self._direct_thread_fallthrough(
                 instruction,
@@ -6730,11 +7124,23 @@ class CppEmitter:
         if matched_line is not None:
             lines.append(matched_line)
         if self._resumable:
-            lines.append(
-                "            if (!b2r_begin_instruction(ctx, "
-                f"{_cpp_u32(instruction.address)})) "
-                f"{{ return {_cpp_u32(instruction.address)}; }}"
-            )
+            if self._registerize_guest_state:
+                run_length = self._unchecked_step_run_lengths.get(
+                    instruction.address,
+                    1,
+                )
+                lines.append(
+                    "            if (!b2r_begin_instruction(ctx, hot, "
+                    f"{_cpp_u32(instruction.address)}, {run_length}u, "
+                    "unchecked_step_count)) "
+                    f"{{ return {_cpp_u32(instruction.address)}; }}"
+                )
+            else:
+                lines.append(
+                    "            if (!b2r_begin_instruction(ctx, "
+                    f"{_cpp_u32(instruction.address)})) "
+                    f"{{ return {_cpp_u32(instruction.address)}; }}"
+                )
             lines.append(
                 "            pending_module_exit_reason = "
                 "B2R_MODULE_EXIT_FALLTHROUGH_OR_UNKNOWN;"
@@ -6745,13 +7151,33 @@ class CppEmitter:
         # the live loop. Store instructions retain precision without imposing
         # the full callback-audit cost.
         if self._synchronize_eip_for_callbacks or instruction_records_memory_write:
-            lines.append(f"            ctx->eip = {_cpp_u32(instruction.address)};")
+            if self._registerize_guest_state:
+                lines.append(
+                    "            b2r_sync_hot_observation_state(ctx, hot, "
+                    f"{_cpp_u32(instruction.address)});"
+                )
+            else:
+                lines.append(
+                    f"            ctx->eip = {_cpp_u32(instruction.address)};"
+                )
         if instruction.address in self._observer_addresses:
-            lines.append(
-                "            if (ctx->observe != nullptr) { "
-                f"ctx->eip = {_cpp_u32(instruction.address)}; "
-                "ctx->observe(ctx->user, ctx); }"
-            )
+            if self._registerize_guest_state:
+                lines.extend(
+                    [
+                        "            if (ctx->observe != nullptr) {",
+                        "                b2r_commit_hot_state(ctx, hot);",
+                        f"                ctx->eip = {_cpp_u32(instruction.address)};",
+                        "                ctx->observe(ctx->user, ctx);",
+                        "                hot = b2r_load_hot_state(ctx);",
+                        "            }",
+                    ]
+                )
+            else:
+                lines.append(
+                    "            if (ctx->observe != nullptr) { "
+                    f"ctx->eip = {_cpp_u32(instruction.address)}; "
+                    "ctx->observe(ctx->user, ctx); }"
+                )
         if native_fast_path is not None:
             lines.append(f"            // Native fast path: {native_fast_path.name}")
             lines.append(f"            if ({native_fast_path.guard}) {{")
@@ -6805,7 +7231,7 @@ class CppEmitter:
             ]
         if instruction.mnemonic == "fpatan":
             return [
-                "const float x = b2r_fpu_pop(ctx);",
+                "const double x = b2r_fpu_pop(ctx);",
                 "ctx->fpu_stack[0] = std::atan2(ctx->fpu_stack[0], x);",
                 f"eip = {next_eip};",
                 "continue;",
@@ -6915,10 +7341,10 @@ class CppEmitter:
         if instruction.mnemonic == "fild":
             operand = instruction.operands[0]
             if operand.size == 64:
-                value = f"static_cast<float>(b2r_read_i64(ctx, {self._effective_address_expr(operand)}))"
+                value = f"static_cast<double>(b2r_read_i64(ctx, {self._effective_address_expr(operand)}))"
             else:
                 value = (
-                    "static_cast<float>(static_cast<int32_t>("
+                    "static_cast<double>(static_cast<int32_t>("
                     f"{self._operand_read(operand)}))"
                 )
             return [
@@ -6958,13 +7384,13 @@ class CppEmitter:
             "fldz",
         }:
             constants = {
-                "fld1": "1.0f",
-                "fldl2t": "3.32192809489f",
-                "fldl2e": "1.44269504089f",
-                "fldpi": "3.14159265359f",
-                "fldlg2": "0.30102999566f",
-                "fldln2": "0.69314718056f",
-                "fldz": "0.0f",
+                "fld1": "1.0",
+                "fldl2t": "3.32192809488736234787",
+                "fldl2e": "1.44269504088896340736",
+                "fldpi": "3.14159265358979323846",
+                "fldlg2": "0.30102999566398119521",
+                "fldln2": "0.69314718055994530942",
+                "fldz": "0.0",
             }
             return [
                 f"b2r_fpu_push(ctx, {constants[instruction.mnemonic]});",
@@ -6985,7 +7411,7 @@ class CppEmitter:
             ]
         if instruction.mnemonic == "f2xm1":
             return [
-                "ctx->fpu_stack[0] = std::exp2(ctx->fpu_stack[0]) - 1.0f;",
+                "ctx->fpu_stack[0] = std::exp2(ctx->fpu_stack[0]) - 1.0;",
                 f"eip = {next_eip};",
                 "continue;",
             ]
@@ -7002,22 +7428,22 @@ class CppEmitter:
             ]
         if instruction.mnemonic == "fyl2x":
             return [
-                "const float x = b2r_fpu_pop(ctx);",
-                "ctx->fpu_stack[0] = x > 0.0f ? ctx->fpu_stack[0] * std::log2(x) : std::numeric_limits<float>::quiet_NaN();",
+                "const double x = b2r_fpu_pop(ctx);",
+                "ctx->fpu_stack[0] = x > 0.0 ? ctx->fpu_stack[0] * std::log2(x) : std::numeric_limits<double>::quiet_NaN();",
                 f"eip = {next_eip};",
                 "continue;",
             ]
         if instruction.mnemonic == "fptan":
             return [
                 "ctx->fpu_stack[0] = std::tan(ctx->fpu_stack[0]);",
-                "b2r_fpu_push(ctx, 1.0f);",
+                "b2r_fpu_push(ctx, 1.0);",
                 f"eip = {next_eip};",
                 "continue;",
             ]
         if instruction.mnemonic == "fcom":
             operand = instruction.operands[0]
             return [
-                f"const float compare_value = {self._x87_float_operand_read(operand)};",
+                f"const double compare_value = {self._x87_float_operand_read(operand)};",
                 "ctx->fpu_status_word = b2r_fpu_compare_status(ctx->fpu_stack[0], compare_value, ctx->fpu_status_word);",
                 f"eip = {next_eip};",
                 "continue;",
@@ -7025,7 +7451,7 @@ class CppEmitter:
         if instruction.mnemonic == "fcomp":
             operand = instruction.operands[0]
             return [
-                f"const float compare_value = {self._x87_float_operand_read(operand)};",
+                f"const double compare_value = {self._x87_float_operand_read(operand)};",
                 "ctx->fpu_status_word = b2r_fpu_compare_status(ctx->fpu_stack[0], compare_value, ctx->fpu_status_word);",
                 "(void)b2r_fpu_pop(ctx);",
                 f"eip = {next_eip};",
@@ -7064,7 +7490,7 @@ class CppEmitter:
             operand = instruction.operands[0]
             operation = "+=" if instruction.mnemonic == "fiadd" else "*="
             return [
-                f"ctx->fpu_stack[0] {operation} static_cast<float>(static_cast<int32_t>("
+                f"ctx->fpu_stack[0] {operation} static_cast<double>(static_cast<int32_t>("
                 f"{self._operand_read(operand)}));",
                 f"eip = {next_eip};",
                 "continue;",
@@ -7072,7 +7498,7 @@ class CppEmitter:
         if instruction.mnemonic == "fisub":
             operand = instruction.operands[0]
             return [
-                "ctx->fpu_stack[0] -= static_cast<float>(static_cast<int32_t>("
+                "ctx->fpu_stack[0] -= static_cast<double>(static_cast<int32_t>("
                 f"{self._operand_read(operand)}));",
                 f"eip = {next_eip};",
                 "continue;",
@@ -7080,7 +7506,7 @@ class CppEmitter:
         if instruction.mnemonic == "fidiv":
             operand = instruction.operands[0]
             return [
-                "ctx->fpu_stack[0] /= static_cast<float>(static_cast<int32_t>("
+                "ctx->fpu_stack[0] /= static_cast<double>(static_cast<int32_t>("
                 f"{self._operand_read(operand)}));",
                 f"eip = {next_eip};",
                 "continue;",
@@ -7142,14 +7568,14 @@ class CppEmitter:
             ]
         if instruction.mnemonic == "ftst":
             return [
-                "ctx->fpu_status_word = b2r_fpu_compare_status(ctx->fpu_stack[0], 0.0f, ctx->fpu_status_word);",
+                "ctx->fpu_status_word = b2r_fpu_compare_status(ctx->fpu_stack[0], 0.0, ctx->fpu_status_word);",
                 f"eip = {next_eip};",
                 "continue;",
             ]
         if instruction.mnemonic == "fxch":
             index = self._x87_stack_index(instruction.operands[0])
             return [
-                "const float value = ctx->fpu_stack[0];",
+                "const double value = ctx->fpu_stack[0];",
                 f"ctx->fpu_stack[0] = ctx->fpu_stack[{index}u];",
                 f"ctx->fpu_stack[{index}u] = value;",
                 f"eip = {next_eip};",
@@ -8245,6 +8671,8 @@ def emit_cpp(
     callback_addresses: Iterable[int] = (),
     forwarded_callback_addresses: Iterable[int] = (),
     native_fast_paths: Mapping[int, NativeFastPath] | None = None,
+    registerize_guest_state: bool = True,
+    coalesce_memory_accesses: bool = False,
     synchronize_eip_for_callbacks: bool = False,
 ) -> str:
     return CppEmitter().emit(
@@ -8255,6 +8683,8 @@ def emit_cpp(
         callback_addresses=callback_addresses,
         forwarded_callback_addresses=forwarded_callback_addresses,
         native_fast_paths=native_fast_paths,
+        registerize_guest_state=registerize_guest_state,
+        coalesce_memory_accesses=coalesce_memory_accesses,
         synchronize_eip_for_callbacks=synchronize_eip_for_callbacks,
     )
 

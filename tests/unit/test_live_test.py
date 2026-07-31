@@ -98,6 +98,10 @@ class LiveTestTests(unittest.TestCase):
             manifest["configuration"]["runtime_process_model"],
             "embedded_single_process",
         )
+        self.assertEqual(
+            manifest["configuration"]["aot_optimization_mode"],
+            "fusion-only",
+        )
 
     def test_stale_presenter_is_rejected_before_process_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -247,7 +251,19 @@ class LiveTestTests(unittest.TestCase):
         args = self._args()
         self.assertNotIn("--profile-hot-paths", build_guest_command(args))
         args.profile_hot_paths = True
-        self.assertIn("--profile-hot-paths", build_guest_command(args))
+        command = build_guest_command(args)
+        self.assertIn("--profile-hot-paths", command)
+        self.assertEqual(
+            command[command.index("--aot-ab-mode") + 1],
+            "fusion-only",
+        )
+
+        args.aot_ab_mode = "combined"
+        command = build_guest_command(args)
+        self.assertEqual(
+            command[command.index("--aot-ab-mode") + 1],
+            "combined",
+        )
 
     def test_live_control_transport_is_shared_by_guest_and_presenter(self) -> None:
         args = self._args()
@@ -320,6 +336,26 @@ class LiveTestTests(unittest.TestCase):
         self.assertEqual(
             command[command.index("--build-manifest") + 1],
             "presenter.build.json",
+        )
+
+    def test_command_work_cache_trace_is_forwarded_to_presenter_modes(self) -> None:
+        args = self._args()
+        args.command_work_cache_trace = Path("cache-trace.jsonl")
+
+        process_command = build_presenter_command(args)
+        embedded_command = build_embedded_presenter_arguments(args)
+
+        self.assertEqual(
+            process_command[
+                process_command.index("--command-work-cache-trace") + 1
+            ],
+            "cache-trace.jsonl",
+        )
+        self.assertEqual(
+            embedded_command[
+                embedded_command.index("--command-work-cache-trace") + 1
+            ],
+            "cache-trace.jsonl",
         )
 
     def test_normal_gameplay_uses_embedded_presenter_arguments(self) -> None:

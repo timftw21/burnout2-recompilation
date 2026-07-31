@@ -44,16 +44,14 @@ std::vector<NativeVertex> VulkanPresenter::prepare_presented_vertices(
             feedback_specs.end(),
             [&](const RenderTargetFeedbackSpec& spec) {
                 return spec.offscreen_produced
-                    && nv2a_canonical_resource_address(
-                        spec.producer_address)
-                        == nv2a_canonical_resource_address(
-                            local_draw.surface_color_offset);
+                    && spec.producer_matches(
+                        local_draw.surface_color_offset);
             });
         if (!targets_presented
             && offscreen_spec == feedback_specs.end()) {
             continue;
         }
-        if (local_draw.primitive != 5u && local_draw.primitive != 6u) {
+        if (!native_pipeline_primitive_supported(local_draw.primitive)) {
             continue;
         }
         const bool use_gpu_vertex_program =
@@ -238,6 +236,13 @@ std::vector<NativeVertex> VulkanPresenter::prepare_presented_vertices(
             draw_diagnostics.final_v_bounds.include(vertex.v);
             draw_diagnostics.final_q_bounds.include(vertex.texture_q);
             draw_diagnostics.final_fog_bounds.include(vertex.fog);
+            for (uint32_t stage = 0u; stage < 4u; ++stage) {
+                for (uint32_t component = 0u; component < 4u; ++component) {
+                    draw_diagnostics.final_texture_coordinate_bounds[stage]
+                        [component].include(
+                            vertex.texture_coordinates[stage][component]);
+                }
+            }
             if ((local_draw.transform_execution_mode & 3u) == 0u) {
                 draw_diagnostics.fixed_function_vertices.push_back({
                     vertex.x,
@@ -251,7 +256,7 @@ std::vector<NativeVertex> VulkanPresenter::prepare_presented_vertices(
         }
         const uint32_t triangle_count = local_draw.primitive == 5u
             ? local_draw.vertex_count / 3u
-            : local_draw.vertex_count >= 3u
+            : local_draw.primitive == 6u && local_draw.vertex_count >= 3u
                 ? local_draw.vertex_count - 2u
                 : 0u;
         for (uint32_t triangle = 0;
@@ -298,12 +303,21 @@ std::vector<NativeVertex> VulkanPresenter::prepare_presented_vertices(
              ++vertex_index) {
             NativeVertex& vertex =
                 vertices[local_draw.first_vertex + vertex_index];
-            vertex.x = vertex.x * 2.0f
-                / static_cast<float>(target_width) - 1.0f;
+            const float screen_x = vertex.x;
+            const float screen_y = vertex.y;
+            if (vertex.program_position_valid) {
+                vertex.x = nv2a_screen_coordinate_to_vulkan_ndc(
+                    screen_x, target_width);
+                vertex.y = nv2a_screen_coordinate_to_vulkan_ndc(
+                    screen_y, target_height);
+            } else {
+                vertex.x = screen_x * 2.0f
+                    / static_cast<float>(target_width) - 1.0f;
+                vertex.y = screen_y * 2.0f
+                    / static_cast<float>(target_height) - 1.0f;
+            }
             // A positive-height Vulkan viewport maps NDC -1 to the top
             // edge, matching the guest's top-left screen coordinates.
-            vertex.y = vertex.y * 2.0f
-                / static_cast<float>(target_height) - 1.0f;
             if (vertex.program_position_valid) {
                 vertex.x *= vertex.w;
                 vertex.y *= vertex.w;
@@ -578,6 +592,7 @@ void VulkanPresenter::emit_presented_vertex_transform_diagnostics(bool emit_draw
             }
         }
         uint32_t enabled_texture_stage_count = 0u;
+        bool host_texture_stage_coverage_complete = true;
         const RecoveredTextureResource* recovered_texture = nullptr;
         uint32_t texture_producer_draw_count = 0u;
         uint32_t texture_raw_producer_draw_count = 0u;
@@ -592,6 +607,28 @@ void VulkanPresenter::emit_presented_vertex_transform_diagnostics(bool emit_draw
                     [](uint32_t control) {
                         return (control & (1u << 30u)) != 0u;
                     }));
+            for (uint32_t stage = 0u;
+                 stage < native_draw->texture_controls.size();
+                 ++stage) {
+                const uint32_t stage_mode =
+                    (native_draw->shader_stage_program >> (stage * 5u))
+                    & 0x1Fu;
+                if ((native_draw->texture_controls[stage] & (1u << 30u)) == 0u
+                    || stage_mode == 0u) {
+                    continue;
+                }
+                const bool mode_supported =
+                    stage_mode == 1u || stage_mode == 3u;
+                const bool resource_supported = std::any_of(
+                    host_textures_.begin(),
+                    host_textures_.end(),
+                    [&](const HostTexture& texture) {
+                        return host_texture_matches_stage(
+                            texture, *native_draw, stage);
+                    });
+                host_texture_stage_coverage_complete &=
+                    mode_supported && resource_supported;
+            }
             if (native_draw->texture_enabled) {
                 const auto texture_extent = nv2a_texture_extent(
                     native_draw->texture_formats[texture_stage],
@@ -715,7 +752,7 @@ void VulkanPresenter::emit_presented_vertex_transform_diagnostics(bool emit_draw
                 {"texture_projective", json_bool(texture_mode == 1u)},
                 {"texture_alpha_kill", native_draw != nullptr ? json_bool((native_draw->texture_controls[texture_stage] & (1u << 2u)) != 0u) : "null"},
                 {"enabled_texture_stage_count", native_draw != nullptr ? std::to_string(enabled_texture_stage_count) : "null"},
-                {"host_texture_stage_coverage_complete", native_draw != nullptr ? json_bool(enabled_texture_stage_count <= 1u) : "null"},
+                {"host_texture_stage_coverage_complete", native_draw != nullptr ? json_bool(host_texture_stage_coverage_complete) : "null"},
                 {"shader_stage_program", native_draw != nullptr ? std::to_string(native_draw->shader_stage_program) : "null"},
                 {"texture_offsets", native_draw != nullptr ? json_u32_array(native_draw->texture_offsets) : "null"},
                 {"texture_addresses", native_draw != nullptr ? json_u32_array(native_draw->texture_addresses) : "null"},
@@ -856,6 +893,14 @@ void VulkanPresenter::emit_presented_vertex_transform_diagnostics(bool emit_draw
                 {"texture_max_v", draw.final_v_bounds.valid ? json_float(draw.final_v_bounds.maximum) : "null"},
                 {"texture_min_q", draw.final_q_bounds.valid ? json_float(draw.final_q_bounds.minimum) : "null"},
                 {"texture_max_q", draw.final_q_bounds.valid ? json_float(draw.final_q_bounds.maximum) : "null"},
+                {"texture_stage1_min_x", draw.final_texture_coordinate_bounds[1][0].valid ? json_float(draw.final_texture_coordinate_bounds[1][0].minimum) : "null"},
+                {"texture_stage1_max_x", draw.final_texture_coordinate_bounds[1][0].valid ? json_float(draw.final_texture_coordinate_bounds[1][0].maximum) : "null"},
+                {"texture_stage1_min_y", draw.final_texture_coordinate_bounds[1][1].valid ? json_float(draw.final_texture_coordinate_bounds[1][1].minimum) : "null"},
+                {"texture_stage1_max_y", draw.final_texture_coordinate_bounds[1][1].valid ? json_float(draw.final_texture_coordinate_bounds[1][1].maximum) : "null"},
+                {"texture_stage1_min_z", draw.final_texture_coordinate_bounds[1][2].valid ? json_float(draw.final_texture_coordinate_bounds[1][2].minimum) : "null"},
+                {"texture_stage1_max_z", draw.final_texture_coordinate_bounds[1][2].valid ? json_float(draw.final_texture_coordinate_bounds[1][2].maximum) : "null"},
+                {"texture_stage1_min_w", draw.final_texture_coordinate_bounds[1][3].valid ? json_float(draw.final_texture_coordinate_bounds[1][3].minimum) : "null"},
+                {"texture_stage1_max_w", draw.final_texture_coordinate_bounds[1][3].valid ? json_float(draw.final_texture_coordinate_bounds[1][3].maximum) : "null"},
                 {"fog_factor_min", draw.final_fog_bounds.valid ? json_float(draw.final_fog_bounds.minimum) : "null"},
                 {"fog_factor_max", draw.final_fog_bounds.valid ? json_float(draw.final_fog_bounds.maximum) : "null"},
                 {"positive_area_triangle_count", std::to_string(draw.positive_area_triangle_count)},
@@ -1006,6 +1051,8 @@ void VulkanPresenter::emit_presented_render_state_diagnostics() {
     uint32_t fog_state_mismatch_draw_count = 0u;
     uint32_t multiple_texture_stage_draw_count = 0u;
     uint32_t texture_stage_coverage_mismatch_draw_count = 0u;
+    uint32_t cubemap_texture_stage_draw_count = 0u;
+    uint32_t cubemap_texture_stage_coverage_mismatch_draw_count = 0u;
     uint32_t zero_payload_textured_draw_count = 0u;
     uint32_t unproduced_zero_payload_texture_draw_count = 0u;
     uint32_t aliased_gpu_produced_texture_draw_count = 0u;
@@ -1053,8 +1100,37 @@ void VulkanPresenter::emit_presented_render_state_diagnostics() {
                 }));
         multiple_texture_stage_draw_count +=
             enabled_texture_stage_count > 1u ? 1u : 0u;
+        bool texture_stage_coverage_complete = true;
+        bool cubemap_stage_present = false;
+        for (uint32_t texture_stage = 0u;
+             texture_stage < draw.texture_controls.size();
+             ++texture_stage) {
+            const uint32_t texture_mode =
+                (draw.shader_stage_program >> (texture_stage * 5u)) & 0x1Fu;
+            if ((draw.texture_controls[texture_stage] & (1u << 30u)) == 0u
+                || texture_mode == 0u) {
+                continue;
+            }
+            const bool cubemap = nv2a_texture_format_is_cubemap(
+                draw.texture_formats[texture_stage]);
+            cubemap_stage_present |= cubemap;
+            const bool mode_supported =
+                texture_mode == 1u || texture_mode == 3u;
+            const bool resource_supported = std::any_of(
+                host_textures_.begin(),
+                host_textures_.end(),
+                [&](const HostTexture& texture) {
+                    return host_texture_matches_stage(
+                        texture, draw, texture_stage);
+                });
+            texture_stage_coverage_complete &=
+                mode_supported && resource_supported;
+        }
         texture_stage_coverage_mismatch_draw_count +=
-            enabled_texture_stage_count > 1u ? 1u : 0u;
+            texture_stage_coverage_complete ? 0u : 1u;
+        cubemap_texture_stage_draw_count += cubemap_stage_present ? 1u : 0u;
+        cubemap_texture_stage_coverage_mismatch_draw_count +=
+            cubemap_stage_present && !texture_stage_coverage_complete ? 1u : 0u;
         if (draw.texture_enabled) {
             ++textured_draw_count;
             ++texture_address_state_draw_count;
@@ -1238,6 +1314,8 @@ void VulkanPresenter::emit_presented_render_state_diagnostics() {
             {"fog_state_mismatch_draw_count", std::to_string(fog_state_mismatch_draw_count)},
             {"multiple_texture_stage_draw_count", std::to_string(multiple_texture_stage_draw_count)},
             {"texture_stage_coverage_mismatch_draw_count", std::to_string(texture_stage_coverage_mismatch_draw_count)},
+            {"cubemap_texture_stage_draw_count", std::to_string(cubemap_texture_stage_draw_count)},
+            {"cubemap_texture_stage_coverage_mismatch_draw_count", std::to_string(cubemap_texture_stage_coverage_mismatch_draw_count)},
             {"zero_payload_textured_draw_count", std::to_string(zero_payload_textured_draw_count)},
             {"unproduced_zero_payload_texture_draw_count", std::to_string(unproduced_zero_payload_texture_draw_count)},
             {"aliased_gpu_produced_texture_draw_count", std::to_string(aliased_gpu_produced_texture_draw_count)},
@@ -1247,6 +1325,41 @@ void VulkanPresenter::emit_presented_render_state_diagnostics() {
                 feedback_specs.size())},
             {"render_target_feedback_required_addresses",
                 feedback_addresses.str()},
+            {"clear_surface_method_count", std::to_string(
+                interpreted_stream_.clear_surface_method_count)},
+            {"last_clear_surface_method_count", std::to_string(
+                interpreted_stream_.last_clear_surface_method_count)},
+            {"presented_surface_clear_count", std::to_string(
+                interpreted_stream_.presented_surface_clears.size())},
+            {"presented_color_clear_count", std::to_string(
+                presented_surface_color_clear_count())},
+            {"latest_presented_surface_clear_address",
+                interpreted_stream_.presented_surface_clears.empty()
+                    ? "null"
+                    : std::to_string(interpreted_stream_
+                        .presented_surface_clears.back()
+                        .surface_color_offset)},
+            {"latest_presented_surface_clear_flags",
+                interpreted_stream_.presented_surface_clears.empty()
+                    ? "null"
+                    : std::to_string(interpreted_stream_
+                        .presented_surface_clears.back().flags)},
+            {"latest_presented_surface_clear_color_argb",
+                interpreted_stream_.presented_surface_clears.empty()
+                    ? "null"
+                    : std::to_string(interpreted_stream_
+                        .presented_surface_clears.back().color_argb)},
+            {"latest_presented_surface_clear_draw_index",
+                interpreted_stream_.presented_surface_clears.empty()
+                    ? "null"
+                    : std::to_string(interpreted_stream_
+                        .presented_surface_clears.back().draw_index)},
+            {"presented_draw_begin", std::to_string(
+                interpreted_stream_.presented_draw_begin)},
+            {"presented_draw_count", std::to_string(
+                interpreted_stream_.presented_draw_count)},
+            {"retained_presented_surface_available", json_bool(
+                presented_render_target_feedback_texture() != nullptr)},
             {"fixed_function_draw_count", std::to_string(fixed_function_draw_count)},
             {"fixed_function_transformed_draw_count", std::to_string(fixed_function_transformed_draw_count)},
             {"fixed_function_raw_fallback_draw_count", std::to_string(fixed_function_raw_fallback_draw_count)},

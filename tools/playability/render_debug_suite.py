@@ -433,6 +433,49 @@ def run_render_debug_suite(
             "state_history_complete": render_state_coverage.get(
                 "state_history_complete"
             ),
+            "clear_surface_method_count": render_state_coverage.get(
+                "clear_surface_method_count", 0
+            ),
+            "last_clear_surface_method_count": render_state_coverage.get(
+                "last_clear_surface_method_count", 0
+            ),
+            "presented_surface_clear_count": render_state_coverage.get(
+                "presented_surface_clear_count", 0
+            ),
+            "presented_color_clear_count": render_state_coverage.get(
+                "presented_color_clear_count", 0
+            ),
+            "latest_presented_surface_clear_address": (
+                render_state_coverage.get(
+                    "latest_presented_surface_clear_address"
+                )
+            ),
+            "latest_presented_surface_clear_flags": (
+                render_state_coverage.get(
+                    "latest_presented_surface_clear_flags"
+                )
+            ),
+            "latest_presented_surface_clear_color_argb": (
+                render_state_coverage.get(
+                    "latest_presented_surface_clear_color_argb"
+                )
+            ),
+            "latest_presented_surface_clear_draw_index": (
+                render_state_coverage.get(
+                    "latest_presented_surface_clear_draw_index"
+                )
+            ),
+            "presented_draw_begin": render_state_coverage.get(
+                "presented_draw_begin", 0
+            ),
+            "presented_draw_count": render_state_coverage.get(
+                "presented_draw_count", 0
+            ),
+            "retained_presented_surface_available": (
+                render_state_coverage.get(
+                    "retained_presented_surface_available"
+                )
+            ),
             "textured_presented_draw_count": render_state.get(
                 "textured_presented_draw_count", 0
             ),
@@ -507,6 +550,14 @@ def run_render_debug_suite(
             ),
             "texture_stage_coverage_mismatch_draw_count": render_state.get(
                 "texture_stage_coverage_mismatch_draw_count", 0
+            ),
+            "cubemap_texture_stage_draw_count": render_state.get(
+                "cubemap_texture_stage_draw_count", 0
+            ),
+            "cubemap_texture_stage_coverage_mismatch_draw_count": (
+                render_state.get(
+                    "cubemap_texture_stage_coverage_mismatch_draw_count", 0
+                )
             ),
             "zero_payload_textured_draw_count": render_state.get(
                 "zero_payload_textured_draw_count", 0

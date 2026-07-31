@@ -72,6 +72,10 @@ from tools.project_identity import (
     verify_supported_xbe,
     write_json_atomic,
 )
+from tools.recomp.native_executor import (
+    AOT_OPTIMIZATION_MODES,
+    DEFAULT_AOT_OPTIMIZATION_MODE,
+)
 DEFAULT_XBE = REPO_ROOT / "data" / "local" / "extracted" / "burnout_2_poi_usa" / "default.xbe"
 DEFAULT_EXTRACTED_ROOT = DEFAULT_XBE.parent
 DEFAULT_SAVE_DATA_ROOT = REPO_ROOT / "data" / "local" / "save-data"
@@ -92,6 +96,9 @@ DEFAULT_RENDER_DEBUG_REPORT = (
 )
 DEFAULT_PERFORMANCE_DEBUG_REPORT = (
     REPO_ROOT / "reports" / "local" / "playability" / "performance-debug-report.json"
+)
+DEFAULT_COMMAND_WORK_CACHE_TRACE = (
+    REPO_ROOT / "reports" / "local" / "playability" / "command-work-cache-trace.jsonl"
 )
 DEFAULT_RUN_MANIFEST = (
     REPO_ROOT / "reports" / "local" / "playability" / "run-manifest.json"
@@ -159,6 +166,18 @@ def build_guest_command(args: argparse.Namespace) -> list[str]:
         )
     if getattr(args, "profile_hot_paths", False):
         command.append("--profile-hot-paths")
+        command.extend(
+            [
+                "--aot-ab-mode",
+                str(
+                    getattr(
+                        args,
+                        "aot_ab_mode",
+                        DEFAULT_AOT_OPTIMIZATION_MODE,
+                    )
+                ),
+            ]
+        )
     if getattr(args, "developer_live_compile", False):
         command.append("--developer-live-compile")
     audit_world_matrix_address = getattr(args, "audit_world_matrix_address", None)
@@ -214,6 +233,11 @@ def build_presenter_command(args: argparse.Namespace) -> list[str]:
         command.append("--cpu-vertex-attributes")
     if getattr(args, "cpu_texture_conversion", False):
         command.append("--cpu-texture-conversion")
+    command_work_cache_trace = getattr(args, "command_work_cache_trace", None)
+    if command_work_cache_trace is not None:
+        command.extend(
+            ["--command-work-cache-trace", str(command_work_cache_trace)]
+        )
     requested_pipeline_depth = getattr(args, "presentation_pipeline_depth", None)
     presentation_pipeline_depth = (
         1
@@ -275,6 +299,7 @@ def build_embedded_presenter_arguments(args: argparse.Namespace) -> list[str]:
             else DEFAULT_HOTKEY_SCREENSHOT_DIR
         ),
         metrics_report_directory=DEFAULT_METRICS_REPORT_DIR,
+        command_work_cache_trace=getattr(args, "command_work_cache_trace", None),
         vertex_shader=DEFAULT_VERTEX_SPV,
         fragment_shader=DEFAULT_FRAGMENT_SPV,
         texture_convert_shader=DEFAULT_TEXTURE_CONVERT_SPV,
@@ -1433,6 +1458,16 @@ def _live_run_manifest(
             ),
             "diagnostics_enabled": not getattr(args, "no_diagnostics", False),
             "hot_path_profiling_enabled": getattr(args, "profile_hot_paths", False),
+            "command_work_cache_trace": (
+                str(args.command_work_cache_trace)
+                if getattr(args, "command_work_cache_trace", None) is not None
+                else None
+            ),
+            "aot_optimization_mode": getattr(
+                args,
+                "aot_ab_mode",
+                DEFAULT_AOT_OPTIMIZATION_MODE,
+            ),
             "developer_live_compilation_enabled": getattr(
                 args, "developer_live_compile", False
             ),
@@ -1696,6 +1731,14 @@ def main() -> int:
         help="Post-run guest throughput and hot-path report against the 60 FPS target.",
     )
     parser.add_argument(
+        "--command-work-cache-trace",
+        type=Path,
+        help=(
+            "Diagnostic-only presenter JSONL trace for offline command-work "
+            "cache capacity simulation."
+        ),
+    )
+    parser.add_argument(
         "--native-slice-steps",
         type=int,
         default=DEFAULT_NATIVE_SLICE_STEPS,
@@ -1725,6 +1768,16 @@ def main() -> int:
             "Arm an F10-controlled native capture window for exact module "
             "edges and exclusive dispatcher timing; use only for profiling "
             "runs because active capture adds diagnostic accounting."
+        ),
+    )
+    parser.add_argument(
+        "--aot-ab-mode",
+        choices=AOT_OPTIMIZATION_MODES,
+        default=DEFAULT_AOT_OPTIMIZATION_MODE,
+        help=(
+            "Developer profiling split for preferred AOT fusion and "
+            "registerized guest state; non-default modes require "
+            "--profile-hot-paths."
         ),
     )
     parser.add_argument(
@@ -1862,6 +1915,11 @@ def main() -> int:
         parser.error("--flip-audit-max-flips must not be negative")
     if args.flip_audit_health_interval < 0:
         parser.error("--flip-audit-health-interval must not be negative")
+    if (
+        args.aot_ab_mode != DEFAULT_AOT_OPTIMIZATION_MODE
+        and not args.profile_hot_paths
+    ):
+        parser.error("non-default --aot-ab-mode requires --profile-hot-paths")
     if args.lossless_flip_audit and args.presentation_pipeline_depth != 1:
         parser.error(
             "--presentation-pipeline-depth 2 cannot be combined with "
@@ -1875,6 +1933,7 @@ def main() -> int:
         parser.error("--flip-audit-max-flips requires --lossless-flip-audit")
     if args.no_diagnostics and (
         args.profile_hot_paths
+        or args.command_work_cache_trace is not None
         or args.audit_world_matrices
         or args.audit_world_matrix_address is not None
         or args.audit_traffic_meshes

@@ -12,6 +12,7 @@ from tools.playability.host_audio import (
     PcmClip,
     RWS_PCM16_CODEC_UUID,
     SdlPcmOutput,
+    _convert_pcm16_to_stereo_48k,
     _prepare_queued_playback,
     parse_rws_pcm,
     parse_rws_xbox_adpcm,
@@ -81,6 +82,21 @@ class HostAudioTests(unittest.TestCase):
         self.assertEqual(payload[:4], b"RIFF")
         self.assertEqual(payload[8:12], b"WAVE")
         self.assertIn(pcm, payload)
+
+    def test_pcm_conversion_linearly_interpolates_between_source_frames(
+        self,
+    ) -> None:
+        converted = _convert_pcm16_to_stereo_48k(
+            struct.pack("<hhh", 0, 1000, 2000),
+            sample_rate=24000,
+            channels=1,
+            bits_per_sample=16,
+        )
+
+        self.assertEqual(
+            struct.unpack("<12h", converted),
+            (0, 0, 500, 500, 1000, 1000, 1500, 1500, 2000, 2000, 2000, 2000),
+        )
 
     def test_parse_renderware_80d_streamed_xbox_adpcm(self) -> None:
         header_payload = bytearray(0xE8)

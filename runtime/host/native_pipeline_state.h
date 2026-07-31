@@ -5,6 +5,12 @@
 
 namespace b2r::host {
 
+inline bool native_pipeline_primitive_supported(uint32_t primitive) {
+    return primitive == 2u
+        || primitive == 5u
+        || primitive == 6u;
+}
+
 struct NativePipelineState {
     uint32_t primitive = 6u;
     uint32_t blend_enable = 0u;

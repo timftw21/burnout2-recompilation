@@ -1,15 +1,23 @@
 #version 450
 
-layout(set = 0, binding = 0) uniform sampler2D texture0;
+layout(set = 0, binding = 0) uniform sampler2D texture2d0;
+layout(set = 0, binding = 1) uniform sampler2D texture2d1;
+layout(set = 0, binding = 2) uniform sampler2D texture2d2;
+layout(set = 0, binding = 3) uniform sampler2D texture2d3;
+layout(set = 0, binding = 4) uniform samplerCube textureCube0;
+layout(set = 0, binding = 5) uniform samplerCube textureCube1;
+layout(set = 0, binding = 6) uniform samplerCube textureCube2;
+layout(set = 0, binding = 7) uniform samplerCube textureCube3;
 
 struct NativeFragmentState {
     uint alpha_test_enable;
     uint alpha_function;
     uint alpha_reference;
-    uint texture_mode;
-    uint texture_alpha_kill;
-    uint texture_opaque_alpha;
-    uint texture_stage;
+    uint texture_modes[4];
+    uint texture_alpha_kill_mask;
+    uint texture_opaque_alpha_mask;
+    uint texture_cubemap_mask;
+    uint reserved_texture;
     uint combiner_control;
     uint shader_stage_program;
     uint combiner_color_inputs[8];
@@ -26,7 +34,7 @@ struct NativeFragmentState {
     uint fog_enable;
 };
 
-layout(std430, set = 0, binding = 1) readonly buffer DrawStates {
+layout(std430, set = 0, binding = 8) readonly buffer DrawStates {
     NativeFragmentState states[];
 } draw_states;
 
@@ -38,6 +46,9 @@ layout(location = 0) in vec4 frag_color;
 layout(location = 1) in vec4 frag_uv;
 layout(location = 2) in vec4 frag_secondary_color;
 layout(location = 3) in float frag_fog;
+layout(location = 4) in vec4 frag_uv1;
+layout(location = 5) in vec4 frag_uv2;
+layout(location = 6) in vec4 frag_uv3;
 layout(location = 0) out vec4 out_color;
 
 vec4 unpackArgb(uint packed) {
@@ -54,6 +65,53 @@ vec4 unpackFogColor(uint packed) {
         float((packed >> 8u) & 255u),
         float((packed >> 16u) & 255u),
         float((packed >> 24u) & 255u)) / 255.0;
+}
+
+vec4 textureCoordinates(uint stage) {
+    if (stage == 0u) return frag_uv;
+    if (stage == 1u) return frag_uv1;
+    if (stage == 2u) return frag_uv2;
+    return frag_uv3;
+}
+
+vec4 sampleTexture2D(uint stage, vec2 coordinates) {
+    if (stage == 0u) return texture(texture2d0, coordinates);
+    if (stage == 1u) return texture(texture2d1, coordinates);
+    if (stage == 2u) return texture(texture2d2, coordinates);
+    return texture(texture2d3, coordinates);
+}
+
+vec4 sampleTexture2DProjective(uint stage, vec3 coordinates) {
+    if (stage == 0u) return textureProj(texture2d0, coordinates);
+    if (stage == 1u) return textureProj(texture2d1, coordinates);
+    if (stage == 2u) return textureProj(texture2d2, coordinates);
+    return textureProj(texture2d3, coordinates);
+}
+
+vec4 sampleTextureCube(uint stage, vec3 coordinates) {
+    if (stage == 0u) return texture(textureCube0, coordinates);
+    if (stage == 1u) return texture(textureCube1, coordinates);
+    if (stage == 2u) return texture(textureCube2, coordinates);
+    return texture(textureCube3, coordinates);
+}
+
+vec2 remapCubeTo2D(vec3 coordinates) {
+    vec3 absolute = abs(coordinates);
+    vec2 uv;
+    if (absolute.x > absolute.y && absolute.x > absolute.z) {
+        uv = coordinates.x > 0.0
+            ? vec2(-coordinates.z, coordinates.y) / absolute.x
+            : vec2(coordinates.z, coordinates.y) / absolute.x;
+    } else if (absolute.y > absolute.z) {
+        uv = coordinates.y > 0.0
+            ? vec2(coordinates.x, -coordinates.z) / absolute.y
+            : vec2(coordinates.x, coordinates.z) / absolute.y;
+    } else {
+        uv = coordinates.z > 0.0
+            ? vec2(coordinates.x, coordinates.y) / absolute.z
+            : vec2(-coordinates.x, coordinates.y) / absolute.z;
+    }
+    return uv * 0.5 + 0.5;
 }
 
 vec4 readRegister(
@@ -338,20 +396,38 @@ void main() {
     registers[4] = frag_color;
     registers[5] = frag_secondary_color;
 
-    vec4 sampled = vec4(0.0);
-    if (state.texture_mode != 0u) {
-        sampled = state.texture_mode == 1u
-            ? textureProj(texture0, frag_uv.xyw)
-            : texture(texture0, frag_uv.xy);
-        if (state.texture_opaque_alpha != 0u) {
+    for (uint stage = 0u; stage < 4u; ++stage) {
+        uint texture_mode = state.texture_modes[stage];
+        if (texture_mode == 0u) {
+            continue;
+        }
+        vec4 coordinates = textureCoordinates(stage);
+        bool cubemap = (state.texture_cubemap_mask & (1u << stage)) != 0u;
+        vec4 sampled;
+        if (texture_mode == 3u) {
+            sampled = cubemap
+                ? sampleTextureCube(stage, coordinates.xyz)
+                : sampleTexture2D(stage, remapCubeTo2D(coordinates.xyz));
+        } else if (texture_mode == 1u) {
+            sampled = cubemap
+                ? sampleTextureCube(
+                    stage,
+                    normalize(vec3(
+                        1.0,
+                        coordinates.y / coordinates.w,
+                        -coordinates.x / coordinates.w)))
+                : sampleTexture2DProjective(stage, coordinates.xyw);
+        } else {
+            sampled = sampleTexture2D(stage, coordinates.xy);
+        }
+        if ((state.texture_opaque_alpha_mask & (1u << stage)) != 0u) {
             sampled.a = 1.0;
         }
-        registers[8u + min(state.texture_stage, 3u)] = sampled;
-    }
-    if (state.texture_mode != 0u
-        && state.texture_alpha_kill != 0u
-        && sampled.a == 0.0) {
-        discard;
+        registers[8u + stage] = sampled;
+        if ((state.texture_alpha_kill_mask & (1u << stage)) != 0u
+            && sampled.a == 0.0) {
+            discard;
+        }
     }
     uint stage0_mode = state.shader_stage_program & 0x1Fu;
     registers[12].a = stage0_mode != 0u ? registers[8].a : 1.0;

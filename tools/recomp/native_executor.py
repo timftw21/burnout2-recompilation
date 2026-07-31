@@ -35,6 +35,13 @@ NATIVE_DISPATCH_EDGE_REPORT_LIMIT = NATIVE_DISPATCH_EDGE_CAPACITY_LIMIT
 NATIVE_TARGET_TIMING_SAMPLE_INTERVAL = 256
 NATIVE_PROFILE_EXECUTION_LANES = ("primary", "worker", "vblank")
 NATIVE_PROFILE_EXECUTION_LANE_COUNT = len(NATIVE_PROFILE_EXECUTION_LANES)
+AOT_OPTIMIZATION_MODES = (
+    "baseline",
+    "fusion-only",
+    "registerization-only",
+    "combined",
+)
+DEFAULT_AOT_OPTIMIZATION_MODE = "fusion-only"
 NATIVE_HOST_SERVICE_KIND_NAMES = {
     1: "return_constant",
     2: "performance_counter",
@@ -53,6 +60,18 @@ NATIVE_HOST_SERVICE_KIND_NAMES = {
     15: "bootstrap",
 }
 NATIVE_EMITTER_SOURCE_FILE = Path(emit_cpp.__code__.co_filename).resolve()
+
+
+def aot_optimization_features(mode: str) -> tuple[bool, bool]:
+    """Return preferred-fusion and guest-registerization feature switches."""
+    normalized = str(mode).strip().lower()
+    if normalized not in AOT_OPTIMIZATION_MODES:
+        choices = ", ".join(AOT_OPTIMIZATION_MODES)
+        raise ValueError(f"unknown AOT optimization mode {mode!r}; expected {choices}")
+    return (
+        normalized in {"fusion-only", "combined"},
+        normalized in {"registerization-only", "combined"},
+    )
 
 
 def _native_module_content_digest(module: LiftedFunction) -> str:
@@ -532,8 +551,9 @@ def _partition_instructions_for_call_fusion(
     base_maximum_count: int,
     maximum_count: int,
     isolated_addresses: Iterable[int] = (),
+    preferred_edges: Iterable[tuple[int, int]] = (),
 ) -> list[list[Any]]:
-    """Fuse stable chunks, except owners of latency-sensitive native entries."""
+    """Fuse stable chunks, prioritizing measured deterministic AOT edges."""
     if base_maximum_count <= 0 or maximum_count < base_maximum_count:
         raise ValueError("native call-fusion partition limits are invalid")
     base_modules = _partition_instructions_by_address(
@@ -553,6 +573,10 @@ def _partition_instructions_for_call_fusion(
         for address in isolated_addresses
         if address in owner_by_address
     }
+    component_isolated = [
+        module_index in isolated_owners
+        for module_index in range(len(base_modules))
+    ]
     edge_weights: Counter[tuple[int, int]] = Counter()
     for instruction in instructions:
         if instruction.mnemonic not in {"call", "jmp"}:
@@ -569,6 +593,21 @@ def _partition_instructions_for_call_fusion(
         edge_weights[tuple(sorted((source_owner, target_owner)))] += (
             4 if instruction.mnemonic == "call" else 1
         )
+    preferred_owner_edges: set[tuple[int, int]] = set()
+    for source, target in preferred_edges:
+        source_owner = owner_by_address.get(int(source) & 0xFFFFFFFF)
+        target_owner = owner_by_address.get(int(target) & 0xFFFFFFFF)
+        if (
+            source_owner is None
+            or target_owner is None
+            or source_owner == target_owner
+        ):
+            continue
+        owner_edge = tuple(sorted((source_owner, target_owner)))
+        preferred_owner_edges.add(owner_edge)
+        # Measured edges lead the generic static-call weights. Their source
+        # data is still deterministic build configuration, not runtime codegen.
+        edge_weights[owner_edge] += 1 << 30
 
     parents = list(range(len(base_modules)))
     member_counts = [len(module) for module in base_modules]
@@ -583,11 +622,15 @@ def _partition_instructions_for_call_fusion(
         edge_weights.items(),
         key=lambda item: (-item[1], item[0]),
     ):
+        preferred = (left, right) in preferred_owner_edges
         left_root = find(left)
         right_root = find(right)
         if left_root == right_root:
             continue
-        if left_root in isolated_owners or right_root in isolated_owners:
+        if (
+            not preferred
+            and (component_isolated[left_root] or component_isolated[right_root])
+        ):
             continue
         if member_counts[left_root] + member_counts[right_root] > maximum_count:
             continue
@@ -595,6 +638,9 @@ def _partition_instructions_for_call_fusion(
             left_root, right_root = right_root, left_root
         parents[right_root] = left_root
         member_counts[left_root] += member_counts[right_root]
+        component_isolated[left_root] = (
+            component_isolated[left_root] or component_isolated[right_root]
+        )
 
     fused: dict[int, list[Any]] = {}
     for module_index, module in enumerate(base_modules):
@@ -679,7 +725,7 @@ struct B2RContext {
     uint32_t mxcsr;
     uint32_t fpu_control_word;
     uint32_t fpu_status_word;
-    float fpu_stack[8];
+    double fpu_stack[8];
     uint32_t fpu_depth;
     B2RXmm xmm[8];
     uint64_t mmx[8];
@@ -932,7 +978,11 @@ struct B2RNativeControllerState {
 constexpr uint32_t B2R_NATIVE_SEMAPHORE_CAPACITY = 64u;
 constexpr uint32_t B2R_NATIVE_ALLOCATION_CAPACITY = 1024u;
 constexpr uint32_t B2R_NATIVE_FILE_CAPACITY = 128u;
+constexpr uint32_t B2R_NATIVE_FILESYSTEM_EVENT_CAPACITY = 256u;
+constexpr uint32_t B2R_NATIVE_PERSISTENCE_EVENT_CAPACITY = 256u;
 constexpr uint32_t B2R_NATIVE_TITLE_ASSET_STREAM_CAPACITY = 128u;
+constexpr uint32_t B2R_NATIVE_TITLE_ASSET_OPEN_EVENT_CAPACITY = 128u;
+constexpr uint32_t B2R_NATIVE_REPLAY_STATE_SAMPLE_CAPACITY = 4096u;
 constexpr uint32_t B2R_NATIVE_SERVICE_TRACE_CAPACITY = 4096u;
 constexpr uint32_t B2R_NATIVE_TRAFFIC_MESH_SAMPLE_CAPACITY = 1024u;
 
@@ -956,7 +1006,7 @@ struct B2RNativeFileEntry {
     uint64_t position;
     uint64_t host_file;
     uint32_t active;
-    uint32_t reserved;
+    uint32_t delete_pending;
     uint32_t directory_index;
     uint32_t directory_initialized;
     char guest_path[256];
@@ -964,12 +1014,76 @@ struct B2RNativeFileEntry {
     char directory_pattern[256];
 };
 
+struct B2RNativeFilesystemEvent {
+    uint64_t sequence;
+    uint32_t service_value;
+    uint32_t result;
+    uint32_t return_address;
+    uint32_t handle;
+    uint32_t arguments[10];
+    char guest_path[256];
+};
+
+struct B2RNativePersistenceEvent {
+    uint64_t sequence;
+    uint64_t steps;
+    uint32_t target;
+    uint32_t execution_lane;
+    uint32_t worker_handle;
+    uint32_t ui_state;
+    uint32_t ui_state_changed;
+    uint32_t registers[8];
+    uint32_t stack_words[8];
+    uint32_t save_manager_words[16];
+    uint32_t active_object_words[21];
+    uint32_t io_operation_words[16];
+};
+
 struct B2RNativeTitleAssetStreamEntry {
     uint32_t object;
     uint32_t payload;
     uint32_t payload_size;
+    uint32_t payload_capacity;
     uint32_t flags;
     uint32_t image_base;
+    uint32_t open_event_index_plus_one;
+};
+
+struct B2RNativeTitleAssetOpenEvent {
+    uint64_t flip_count;
+    uint32_t object;
+    uint32_t payload_size;
+    uint32_t failure_stage;
+    uint32_t flags;
+    uint32_t read_call_count;
+    uint32_t read_requested_bytes;
+    uint32_t read_returned_bytes;
+    uint32_t close_count;
+    uint32_t header_words[8];
+    char guest_path[512];
+};
+
+struct B2RNativeReplayStateSample {
+    uint64_t flip_count;
+    uint32_t record_count;
+    uint32_t record_index;
+    uint32_t loaded;
+    uint32_t mode;
+    uint32_t field_10;
+    uint32_t field_14;
+    uint32_t field_18;
+    uint32_t field_1c;
+    uint32_t buffer_begin;
+    uint32_t buffer_end;
+    uint32_t buffer_limit;
+    uint32_t replay_disabled;
+    uint32_t route_variant;
+    uint32_t game_state;
+    uint32_t route_value;
+    uint32_t demo_field_4;
+    uint32_t demo_field_8;
+    uint32_t demo_field_c;
+    uint32_t demo_enabled;
 };
 
 struct B2RNativeTrafficMeshSample {
@@ -1061,8 +1175,22 @@ struct B2RNativeHostServiceState {
     uint64_t title_asset_open_count;
     uint64_t title_asset_open_failure_count;
     uint64_t title_asset_payload_bytes;
+    uint64_t title_asset_close_count;
+    uint64_t title_asset_reuse_count;
+    uint64_t title_asset_payload_reallocation_count;
+    uint64_t title_asset_resident_payload_bytes;
+    uint32_t title_asset_active_stream_count;
+    uint32_t title_asset_peak_active_stream_count;
     B2RNativeTitleAssetStreamEntry title_asset_streams[
         B2R_NATIVE_TITLE_ASSET_STREAM_CAPACITY];
+    uint32_t title_asset_open_event_count;
+    uint32_t title_asset_open_event_overflow_count;
+    B2RNativeTitleAssetOpenEvent title_asset_open_events[
+        B2R_NATIVE_TITLE_ASSET_OPEN_EVENT_CAPACITY];
+    uint32_t replay_state_sample_count;
+    uint32_t replay_state_sample_overflow_count;
+    B2RNativeReplayStateSample replay_state_samples[
+        B2R_NATIVE_REPLAY_STATE_SAMPLE_CAPACITY];
     uint64_t title_track_pss_candidate_count;
     uint64_t title_track_pss_publication_count;
     uint64_t title_track_pss_validation_failure_count;
@@ -1075,6 +1203,15 @@ struct B2RNativeHostServiceState {
     B2RNativeFileEntry files[B2R_NATIVE_FILE_CAPACITY];
     uint32_t file_count;
     uint32_t file_overflow_count;
+    uint64_t filesystem_event_count;
+    B2RNativeFilesystemEvent filesystem_events[
+        B2R_NATIVE_FILESYSTEM_EVENT_CAPACITY];
+    uint64_t save_filesystem_event_count;
+    B2RNativeFilesystemEvent save_filesystem_events[
+        B2R_NATIVE_FILESYSTEM_EVENT_CAPACITY];
+    uint64_t persistence_event_count;
+    B2RNativePersistenceEvent persistence_events[
+        B2R_NATIVE_PERSISTENCE_EVENT_CAPACITY];
     uint32_t next_object_handle;
     uint32_t service_trace_count;
     uint32_t service_trace_overflow_count;
@@ -1193,9 +1330,15 @@ struct B2RNativeHostServiceState {
     uint64_t native_audio_buffer_frequency_count;
     uint64_t native_audio_buffer_play_count;
     uint64_t native_audio_buffer_repeated_play_count;
+    uint64_t native_audio_buffer_get_status_count;
     uint64_t native_audio_buffer_get_position_count;
     uint64_t native_audio_buffer_set_position_count;
     uint64_t native_audio_buffer_refresh_count;
+    uint64_t native_audio_buffer_completion_count;
+    uint64_t native_audio_buffer_loop_wrap_count;
+    uint64_t native_audio_stale_playing_repair_count;
+    uint64_t native_audio_linear_resampled_frame_count;
+    uint64_t native_audio_pitch_interpolated_frame_count;
     uint64_t native_audio_buffer_stop_count;
     uint64_t native_audio_stream_create_count;
     uint64_t native_audio_stream_process_count;
@@ -2269,7 +2412,7 @@ static B2RNativeFileEntry* b2r_register_native_file(
     file->host_file = static_cast<uint64_t>(
         reinterpret_cast<uintptr_t>(host_file));
     file->active = 1u;
-    file->reserved = 0u;
+    file->delete_pending = 0u;
     file->directory_index = 0u;
     file->directory_initialized = 0u;
     std::snprintf(
@@ -2913,6 +3056,60 @@ static B2RNativeTitleAssetStreamEntry* b2r_find_title_asset_stream(
     return stream->object == object ? stream : nullptr;
 }
 
+static B2RNativeTitleAssetOpenEvent* b2r_title_asset_open_event_for_stream(
+    B2RNativeHostServiceState* state,
+    B2RNativeTitleAssetStreamEntry* stream
+) {
+    if (state == nullptr || stream == nullptr ||
+        stream->open_event_index_plus_one == 0u) {
+        return nullptr;
+    }
+    const uint32_t index = stream->open_event_index_plus_one - 1u;
+    if (index >= state->title_asset_open_event_count ||
+        index >= B2R_NATIVE_TITLE_ASSET_OPEN_EVENT_CAPACITY) {
+        return nullptr;
+    }
+    return &state->title_asset_open_events[index];
+}
+
+static void b2r_capture_replay_state_sample(
+    B2RNativeHostServiceState* state
+) {
+    if (state == nullptr) { return; }
+    if (state->replay_state_sample_count >=
+        B2R_NATIVE_REPLAY_STATE_SAMPLE_CAPACITY) {
+        ++state->replay_state_sample_overflow_count;
+        return;
+    }
+    B2RNativeReplayStateSample* sample =
+        &state->replay_state_samples[state->replay_state_sample_count++];
+    const auto read = [state](uint32_t address) {
+        uint32_t value = 0xffffffffu;
+        b2r_native_service_try_read_u32(state, address, &value);
+        return value;
+    };
+    sample->flip_count = state->live_flip_count;
+    sample->record_count = read(0x002ffd68u);
+    sample->record_index = read(0x002ffd6cu);
+    sample->loaded = read(0x002ffd70u);
+    sample->mode = read(0x002ffd74u);
+    sample->field_10 = read(0x002ffd78u);
+    sample->field_14 = read(0x002ffd7cu);
+    sample->field_18 = read(0x002ffd80u);
+    sample->field_1c = read(0x002ffd84u);
+    sample->buffer_begin = read(0x00522358u);
+    sample->buffer_end = read(0x0052235cu);
+    sample->buffer_limit = read(0x00522360u);
+    sample->replay_disabled = read(0x004cd80cu);
+    sample->route_variant = read(0x00352720u);
+    sample->game_state = read(0x0034ab58u);
+    sample->route_value = read(0x004ccb04u);
+    sample->demo_field_4 = read(0x00303c10u);
+    sample->demo_field_8 = read(0x00303c14u);
+    sample->demo_field_c = read(0x00303c18u);
+    sample->demo_enabled = read(0x00303c1cu);
+}
+
 static bool b2r_publish_track_pss_image(
     B2RNativeHostServiceState* state,
     B2RNativeTitleAssetStreamEntry* stream
@@ -3085,6 +3282,10 @@ static uint32_t b2r_native_audio_buffer_get_position(
     uint32_t buffer,
     uint32_t play_cursor_output,
     uint32_t write_cursor_output);
+static uint32_t b2r_native_audio_buffer_get_status(
+    B2RNativeHostServiceState* state,
+    uint32_t buffer,
+    uint32_t status_output);
 static uint32_t b2r_native_audio_buffer_set_position(
     B2RNativeHostServiceState* state,
     uint32_t buffer,
@@ -3598,6 +3799,7 @@ static bool b2r_try_native_host_service(
             case 0x00000000u: eax = 0u; break;
             case 0xc000000fu: eax = 2u; break;
             case 0xc0000034u: eax = 2u; break;
+            case 0xc000003au: eax = 3u; break;
             case 0xc0000035u: eax = 183u; break;
             case 0xc0000022u: eax = 5u; break;
             case 0xc0000008u: eax = 6u; break;
@@ -3931,6 +4133,7 @@ static bool b2r_try_native_host_service(
         constexpr uint32_t kBufferSetFrequency = 14u;
         constexpr uint32_t kBufferGetPosition = 15u;
         constexpr uint32_t kBufferSetPosition = 16u;
+        constexpr uint32_t kBufferGetStatus = 17u;
         if (service->value == kDirectSoundEffectImage) {
             constexpr uint32_t kWorkspaceAddress = 0x31ff0000u;
             const uint32_t image_size = argument(1u);
@@ -3992,6 +4195,9 @@ static bool b2r_try_native_host_service(
         } else if (service->value == kBufferSetPosition) {
             eax = b2r_native_audio_buffer_set_position(
                 state, argument(0u), argument(1u));
+        } else if (service->value == kBufferGetStatus) {
+            eax = b2r_native_audio_buffer_get_status(
+                state, argument(0u), argument(1u));
         } else {
             return false;
         }
@@ -4003,7 +4209,7 @@ static bool b2r_try_native_host_service(
         constexpr uint32_t kAllocationListCount = 3u;
         constexpr uint32_t kGlobalListRegister = 4u;
         constexpr uint32_t kTextDraw = 5u;
-        constexpr uint32_t kAssetActivate = 6u;
+        constexpr uint32_t kAssetClose = 6u;
         constexpr uint32_t kAssetStatus = 7u;
         constexpr uint32_t kAssetRead = 8u;
         constexpr uint32_t kAssetSeek = 9u;
@@ -4105,16 +4311,11 @@ static bool b2r_try_native_host_service(
             constexpr uint32_t kObjectBase = 0x31f10000u;
             constexpr uint32_t kObjectStride = 0x1000u;
             constexpr uint32_t kVtable = 0x31f10100u;
-            constexpr uint32_t kActivateTarget = 0x31f10200u;
+            constexpr uint32_t kCloseTarget = 0x31f10200u;
             constexpr uint32_t kStatusTarget = 0x31f10300u;
             constexpr uint32_t kReadTarget = 0x31f10700u;
             constexpr uint32_t kSeekTarget = 0x31f10800u;
-            if (state->title_asset_stream_count >=
-                B2R_NATIVE_TITLE_ASSET_STREAM_CAPACITY) {
-                ++state->title_asset_open_failure_count;
-                eax = 0u;
-                break;
-            }
+            constexpr uint32_t kStreamActive = 0x10u;
             const uint32_t guest_path_address = argument(0u);
             char guest_path[512] = {};
             uint32_t guest_length = 0u;
@@ -4125,6 +4326,24 @@ static bool b2r_try_native_host_service(
                 guest_path[guest_length++] = static_cast<char>(value);
             }
             guest_path[guest_length] = '\0';
+            B2RNativeTitleAssetOpenEvent* open_event = nullptr;
+            uint32_t open_event_index = 0u;
+            if (state->title_asset_open_event_count <
+                B2R_NATIVE_TITLE_ASSET_OPEN_EVENT_CAPACITY) {
+                open_event_index = state->title_asset_open_event_count++;
+                open_event =
+                    &state->title_asset_open_events[open_event_index];
+                open_event->flip_count = state->live_flip_count;
+                open_event->failure_stage = 1u;
+                const uint32_t copy_length = std::min<uint32_t>(
+                    guest_length,
+                    static_cast<uint32_t>(sizeof(open_event->guest_path) - 1u));
+                std::memcpy(
+                    open_event->guest_path, guest_path, copy_length);
+                open_event->guest_path[copy_length] = '\0';
+            } else {
+                ++state->title_asset_open_event_overflow_count;
+            }
             uint32_t relative_start = 0u;
             if (guest_length >= 3u &&
                 ((guest_path[0] >= 'A' && guest_path[0] <= 'Z') ||
@@ -4153,6 +4372,9 @@ static bool b2r_try_native_host_service(
                      guest_path[index + 2u] == '/')) {
                     valid_path = false;
                 }
+            }
+            if (valid_path && open_event != nullptr) {
+                open_event->flags |= 1u;
             }
             char host_path[1536] = {};
             uint32_t host_length = 0u;
@@ -4189,20 +4411,80 @@ static bool b2r_try_native_host_service(
             }
             if (!payload_size_valid) {
                 if (file != nullptr) { std::fclose(file); }
+                if (open_event != nullptr) {
+                    open_event->failure_stage = 2u;
+                }
                 ++state->title_asset_open_failure_count;
                 eax = 0u;
                 break;
             }
-            if (state->title_asset_payload_next < 0x32000000u) {
-                state->title_asset_payload_next = 0x32000000u;
+            B2RNativeTitleAssetStreamEntry* stream = nullptr;
+            uint32_t stream_index = 0u;
+            uint32_t best_capacity = 0xffffffffu;
+            for (uint32_t index = 0u;
+                 index < state->title_asset_stream_count; ++index) {
+                B2RNativeTitleAssetStreamEntry* candidate =
+                    &state->title_asset_streams[index];
+                if ((candidate->flags & kStreamActive) == 0u &&
+                    candidate->payload_capacity >= payload_size &&
+                    candidate->payload_capacity < best_capacity) {
+                    stream = candidate;
+                    stream_index = index;
+                    best_capacity = candidate->payload_capacity;
+                }
             }
-            const uint32_t payload_address = b2r_align_up(
-                state->title_asset_payload_next, 0x1000u);
-            const uint64_t payload_end =
-                static_cast<uint64_t>(payload_address) + payload_size;
-            const bool allocated = payload_end <= 0x80000000ull &&
-                b2r_native_allocate_pages(
-                    state, payload_address, payload_size != 0u ? payload_size : 1u);
+            if (stream == nullptr) {
+                for (uint32_t index = 0u;
+                     index < state->title_asset_stream_count; ++index) {
+                    B2RNativeTitleAssetStreamEntry* candidate =
+                        &state->title_asset_streams[index];
+                    if ((candidate->flags & kStreamActive) == 0u) {
+                        stream = candidate;
+                        stream_index = index;
+                        break;
+                    }
+                }
+            }
+            bool new_stream = false;
+            if (stream == nullptr && state->title_asset_stream_count <
+                    B2R_NATIVE_TITLE_ASSET_STREAM_CAPACITY) {
+                stream_index = state->title_asset_stream_count;
+                stream = &state->title_asset_streams[stream_index];
+                new_stream = true;
+            }
+            if (stream == nullptr) {
+                std::fclose(file);
+                if (open_event != nullptr) {
+                    open_event->failure_stage = 3u;
+                }
+                ++state->title_asset_open_failure_count;
+                eax = 0u;
+                break;
+            }
+            uint32_t payload_address = stream->payload;
+            uint32_t payload_capacity = stream->payload_capacity;
+            bool allocated = true;
+            if (payload_address == 0u || payload_capacity < payload_size) {
+                if (state->title_asset_payload_next < 0x32000000u) {
+                    state->title_asset_payload_next = 0x32000000u;
+                }
+                payload_address = b2r_align_up(
+                    state->title_asset_payload_next, 0x1000u);
+                payload_capacity = payload_size != 0u ? payload_size : 1u;
+                const uint64_t payload_end =
+                    static_cast<uint64_t>(payload_address) + payload_capacity;
+                allocated = payload_end <= 0x80000000ull &&
+                    b2r_native_allocate_pages(
+                        state, payload_address, payload_capacity);
+                if (allocated) {
+                    state->title_asset_payload_next = b2r_align_up(
+                        payload_address + payload_capacity, 0x1000u);
+                    state->title_asset_resident_payload_bytes += payload_capacity;
+                    if (!new_stream && stream->payload != 0u) {
+                        ++state->title_asset_payload_reallocation_count;
+                    }
+                }
+            }
             uint32_t copied = 0u;
             while (allocated && copied < payload_size) {
                 const uint32_t address = payload_address + copied;
@@ -4227,30 +4509,48 @@ static bool b2r_try_native_host_service(
             }
             std::fclose(file);
             if (!allocated || copied != payload_size) {
+                if (open_event != nullptr) {
+                    open_event->failure_stage = 4u;
+                }
                 ++state->title_asset_open_failure_count;
                 eax = 0u;
                 break;
             }
-            const uint32_t object = kObjectBase +
-                state->title_asset_stream_count * kObjectStride;
-            B2RNativeTitleAssetStreamEntry* stream =
-                &state->title_asset_streams[state->title_asset_stream_count];
-            ++state->title_asset_stream_count;
+            const uint32_t object = kObjectBase + stream_index * kObjectStride;
+            if (new_stream) {
+                ++state->title_asset_stream_count;
+            } else {
+                ++state->title_asset_reuse_count;
+            }
             stream->object = object;
             stream->payload = payload_address;
             stream->payload_size = payload_size;
+            stream->payload_capacity = payload_capacity;
             stream->flags =
                 (b2r_path_is_track_pss(guest_path, guest_length) ? 1u : 0u) |
-                (b2r_path_is_traffic_tra(guest_path, guest_length) ? 8u : 0u);
+                (b2r_path_is_traffic_tra(guest_path, guest_length) ? 8u : 0u) |
+                kStreamActive;
             stream->image_base = 0u;
+            stream->open_event_index_plus_one =
+                open_event != nullptr ? open_event_index + 1u : 0u;
+            if (open_event != nullptr) {
+                open_event->object = object;
+                open_event->payload_size = payload_size;
+                open_event->failure_stage = 0u;
+                open_event->flags |= 2u;
+                for (uint32_t index = 0u;
+                     index < 8u && index * 4u < payload_size; ++index) {
+                    open_event->header_words[index] =
+                        b2r_native_service_read_u32(
+                            state, payload_address + index * 4u);
+                }
+            }
             if ((stream->flags & 1u) != 0u) {
                 ++state->title_track_pss_candidate_count;
             }
             if ((stream->flags & 8u) != 0u) {
                 ++state->title_traffic_tra_candidate_count;
             }
-            state->title_asset_payload_next = b2r_align_up(
-                payload_address + payload_size, 0x1000u);
             b2r_native_allocate_pages(state, object, kObjectStride);
             b2r_native_service_write_u32(state, object, kVtable);
             b2r_native_service_write_u32(state, object + 0x10u, payload_size);
@@ -4262,49 +4562,86 @@ static bool b2r_try_native_host_service(
                 state, object + 0x30u, payload_address);
             b2r_native_service_write_u32(state, object + 0x34u, payload_size);
             b2r_native_service_write_u32(state, object + 0x38u, 0u);
-            b2r_native_service_write_u32(state, kVtable + 4u, kActivateTarget);
+            b2r_native_service_write_u32(state, kVtable + 4u, kCloseTarget);
             b2r_native_service_write_u32(state, kVtable + 8u, kReadTarget);
             b2r_native_service_write_u32(state, kVtable + 0x10u, kSeekTarget);
             b2r_native_service_write_u32(state, kVtable + 0x1cu, kStatusTarget);
             ++state->title_asset_open_count;
             state->title_asset_payload_bytes += payload_size;
+            ++state->title_asset_active_stream_count;
+            if (state->title_asset_active_stream_count >
+                state->title_asset_peak_active_stream_count) {
+                state->title_asset_peak_active_stream_count =
+                    state->title_asset_active_stream_count;
+            }
             eax = object;
-        } else if (service->value == kAssetActivate) {
-            eax = 1u;
-        } else if (service->value == kAssetStatus) {
+        } else if (service->value == kAssetClose) {
+            constexpr uint32_t kStreamActive = 0x10u;
             const uint32_t object = *reinterpret_cast<uint32_t*>(
                 bytes + state->ecx_offset);
-            const uint32_t payload = object != 0u
+            B2RNativeTitleAssetStreamEntry* stream =
+                b2r_find_title_asset_stream(state, object);
+            if (stream != nullptr && (stream->flags & kStreamActive) != 0u) {
+                B2RNativeTitleAssetOpenEvent* open_event =
+                    b2r_title_asset_open_event_for_stream(state, stream);
+                if (open_event != nullptr) { ++open_event->close_count; }
+                stream->flags &= ~kStreamActive;
+                b2r_native_service_write_u32(state, object + 0x2cu, 0u);
+                ++state->title_asset_close_count;
+                if (state->title_asset_active_stream_count != 0u) {
+                    --state->title_asset_active_stream_count;
+                }
+            }
+            eax = 1u;
+        } else if (service->value == kAssetStatus) {
+            constexpr uint32_t kStreamActive = 0x10u;
+            const uint32_t object = *reinterpret_cast<uint32_t*>(
+                bytes + state->ecx_offset);
+            B2RNativeTitleAssetStreamEntry* stream =
+                b2r_find_title_asset_stream(state, object);
+            const bool active = stream != nullptr &&
+                (stream->flags & kStreamActive) != 0u;
+            const uint32_t payload = active
                 ? b2r_native_service_read_u32(state, object + 0x30u) : 0u;
-            eax = payload != 0u ? 1u : 3u;
+            eax = active ? 1u : 0u;
             if (payload != 0u) {
                 b2r_native_service_write_u32(state, object + 0x2cu, 1u);
             }
         } else if (service->value == kAssetRead) {
+            constexpr uint32_t kStreamActive = 0x10u;
             const uint32_t object = *reinterpret_cast<uint32_t*>(
                 bytes + state->ecx_offset);
             const uint32_t destination = argument(0u);
             const uint32_t requested = argument(1u);
-            const uint32_t payload = object != 0u
+            B2RNativeTitleAssetStreamEntry* stream =
+                b2r_find_title_asset_stream(state, object);
+            const bool active = stream != nullptr &&
+                (stream->flags & kStreamActive) != 0u;
+            const uint32_t payload = active
                 ? b2r_native_service_read_u32(state, object + 0x30u) : 0u;
-            const uint32_t payload_size = object != 0u
+            const uint32_t payload_size = active
                 ? b2r_native_service_read_u32(state, object + 0x34u) : 0u;
-            const uint32_t position = object != 0u
+            const uint32_t position = active
                 ? b2r_native_service_read_u32(state, object + 0x38u) : 0u;
             const uint32_t available = position < payload_size
                 ? payload_size - position : 0u;
             const uint32_t copied = requested < available ? requested : available;
+            B2RNativeTitleAssetOpenEvent* open_event =
+                b2r_title_asset_open_event_for_stream(state, stream);
+            if (open_event != nullptr) {
+                ++open_event->read_call_count;
+                open_event->read_requested_bytes += requested;
+                open_event->read_returned_bytes += copied;
+            }
             if (destination != 0u && payload != 0u && copied != 0u) {
                 b2r_native_service_copy_bytes(
                     state, destination, payload + position, copied);
             }
-            B2RNativeTitleAssetStreamEntry* stream =
-                b2r_find_title_asset_stream(state, object);
-            if (stream != nullptr) {
+            if (active) {
                 b2r_publish_track_pss_image(state, stream);
             }
             const uint32_t next_position = position + copied;
-            if (object != 0u) {
+            if (active) {
                 b2r_native_service_write_u32(
                     state, object + 0x18u, next_position);
                 b2r_native_service_write_u32(state, object + 0x1cu, 0u);
@@ -4314,15 +4651,20 @@ static bool b2r_try_native_host_service(
             }
             eax = copied;
         } else if (service->value == kAssetSeek) {
+            constexpr uint32_t kStreamActive = 0x10u;
             const uint32_t object = *reinterpret_cast<uint32_t*>(
                 bytes + state->ecx_offset);
+            B2RNativeTitleAssetStreamEntry* stream =
+                b2r_find_title_asset_stream(state, object);
+            const bool active = stream != nullptr &&
+                (stream->flags & kStreamActive) != 0u;
             const uint64_t offset_bits =
                 (static_cast<uint64_t>(argument(1u)) << 32u) | argument(0u);
             const int64_t offset = static_cast<int64_t>(offset_bits);
             const uint32_t origin = argument(2u);
-            const uint32_t payload_size = object != 0u
+            const uint32_t payload_size = active
                 ? b2r_native_service_read_u32(state, object + 0x34u) : 0u;
-            const uint32_t current = object != 0u
+            const uint32_t current = active
                 ? b2r_native_service_read_u32(state, object + 0x38u) : 0u;
             const int64_t base = origin == 0u
                 ? 0 : origin == 1u ? current : payload_size;
@@ -4332,7 +4674,7 @@ static bool b2r_try_native_host_service(
                 requested_position = payload_size;
             }
             const uint32_t position = static_cast<uint32_t>(requested_position);
-            if (object != 0u) {
+            if (active) {
                 b2r_native_service_write_u32(state, object + 0x18u, position);
                 b2r_native_service_write_u32(state, object + 0x1cu, 0u);
                 b2r_native_service_write_u32(state, object + 0x38u, position);
@@ -4525,6 +4867,8 @@ static bool b2r_try_native_host_service(
             eax = b2r_native_allocate_range(
                 state, argument(0u), 0x1000u, true);
         } else if (service->value == kNtClose) {
+            constexpr uint32_t kStatusAccessDenied = 0xc0000022u;
+            bool deletion_failed = false;
             B2RNativeSemaphoreEntry* semaphore = b2r_find_native_semaphore(
                 state, argument(0u));
             if (semaphore != nullptr) {
@@ -4539,9 +4883,16 @@ static bool b2r_try_native_host_service(
                     static_cast<uintptr_t>(file->host_file));
                 if (host_file != nullptr) { std::fclose(host_file); }
                 file->host_file = 0u;
+                if (file->delete_pending != 0u && file->host_path[0] != '\0') {
+                    std::error_code error;
+                    std::filesystem::remove(
+                        std::filesystem::path(file->host_path), error);
+                    deletion_failed = static_cast<bool>(error);
+                }
+                file->delete_pending = 0u;
                 file->active = 0u;
             }
-            eax = 0u;
+            eax = deletion_failed ? kStatusAccessDenied : 0u;
         } else if (service->value == kKeSetEvent) {
             const uint32_t event = argument(0u);
             const uint32_t previous = event != 0u
@@ -4556,6 +4907,7 @@ static bool b2r_try_native_host_service(
             constexpr uint32_t kStatusAccessDenied = 0xc0000022u;
             constexpr uint32_t kStatusObjectNameNotFound = 0xc0000034u;
             constexpr uint32_t kStatusObjectNameCollision = 0xc0000035u;
+            constexpr uint32_t kStatusObjectPathNotFound = 0xc000003au;
             const uint32_t output_handle = argument(0u);
             const uint32_t desired_access = argument(1u);
             const uint32_t object_attributes = argument(2u);
@@ -4568,6 +4920,8 @@ static bool b2r_try_native_host_service(
             char path[512] = {};
             char host_path[1536] = {};
             uint32_t path_length = 0u;
+            state->last_file_guest_path[0] = '\0';
+            state->last_file_host_path[0] = '\0';
             if (!b2r_native_decode_object_path(
                     state, object_attributes, path,
                     static_cast<uint32_t>(sizeof(path)), &path_length)) {
@@ -4583,7 +4937,6 @@ static bool b2r_try_native_host_service(
                 std::memcpy(
                     state->last_file_guest_path, path, recorded_guest_length);
                 state->last_file_guest_path[recorded_guest_length] = '\0';
-                state->last_file_host_path[0] = '\0';
                 const bool directory = (create_options & 1u) != 0u ||
                     path[path_length - 1u] == '\\' ||
                     b2r_native_path_ends_with(path, path_length, "cdrom0");
@@ -4634,12 +4987,28 @@ static bool b2r_try_native_host_service(
                             eax = kStatusObjectNameNotFound;
                         } else if (!existed && !writable_path) {
                             eax = kStatusAccessDenied;
-                        } else if (!existed &&
-                                   !std::filesystem::create_directories(
-                                       resolved, error) && error) {
-                            eax = kStatusInvalidParameter;
+                        } else if (!existed) {
+                            const std::filesystem::path parent =
+                                resolved.parent_path();
+                            const bool parent_exists =
+                                std::filesystem::exists(parent, error);
+                            if (error) {
+                                eax = kStatusInvalidParameter;
+                            } else if (!parent_exists ||
+                                       !std::filesystem::is_directory(
+                                           parent, error)) {
+                                eax = error
+                                    ? kStatusInvalidParameter
+                                    : kStatusObjectPathNotFound;
+                            } else if (!std::filesystem::create_directory(
+                                           resolved, error) && error) {
+                                eax = kStatusInvalidParameter;
+                            } else {
+                                io_information = 2u;
+                                eax = 0u;
+                            }
                         } else {
-                            io_information = existed ? 1u : 2u;
+                            io_information = 1u;
                             eax = 0u;
                         }
                     } else if (existed && std::filesystem::is_directory(
@@ -4660,23 +5029,39 @@ static bool b2r_try_native_host_service(
                             create_disposition == 0u ||
                             create_disposition == 4u ||
                             create_disposition == 5u;
+                        bool parent_exists = true;
                         if (!existed) {
-                            std::filesystem::create_directories(
-                                resolved.parent_path(), error);
+                            if (raw_partition) {
+                                std::filesystem::create_directories(
+                                    resolved.parent_path(), error);
+                                parent_exists = !error;
+                            } else {
+                                parent_exists = std::filesystem::exists(
+                                    resolved.parent_path(), error);
+                                if (!error && parent_exists) {
+                                    parent_exists =
+                                        std::filesystem::is_directory(
+                                            resolved.parent_path(), error);
+                                }
+                            }
                         }
-                        if (!error) {
+                        if (error) {
+                            eax = kStatusInvalidParameter;
+                        } else if (!parent_exists) {
+                            eax = kStatusObjectPathNotFound;
+                        } else {
                             host_file = std::fopen(
                                 host_path,
                                 wants_write
                                     ? (truncate || !existed ? "w+b" : "r+b")
                                     : "rb");
-                        }
-                        if (host_file == nullptr) {
-                            eax = kStatusInvalidParameter;
-                        } else {
-                            io_information = existed
-                                ? (truncate ? 3u : 1u) : 2u;
-                            eax = 0u;
+                            if (host_file == nullptr) {
+                                eax = kStatusInvalidParameter;
+                            } else {
+                                io_information = existed
+                                    ? (truncate ? 3u : 1u) : 2u;
+                                eax = 0u;
+                            }
                         }
                     }
                     if (eax == 0u && host_file != nullptr &&
@@ -5226,6 +5611,7 @@ static bool b2r_try_native_host_service(
         } else if (service->value == kNtSetInformationFile) {
             constexpr uint32_t kStatusInvalidHandle = 0xc0000008u;
             constexpr uint32_t kStatusInvalidParameter = 0xc000000du;
+            constexpr uint32_t kStatusAccessDenied = 0xc0000022u;
             B2RNativeFileEntry* file = b2r_find_native_file(
                 state, argument(0u));
             const uint32_t io_status = argument(1u);
@@ -5235,6 +5621,22 @@ static bool b2r_try_native_host_service(
             uint32_t consumed = 0u;
             if (file == nullptr || (file->flags & 4u) != 0u) {
                 eax = kStatusInvalidHandle;
+            } else if (information_class == 13u) {
+                if (source == 0u || source_length < 1u) {
+                    eax = kStatusInvalidParameter;
+                } else if (b2r_native_service_read_u8(state, source) != 0u &&
+                           !b2r_native_path_is_writable(
+                               file->guest_path,
+                               static_cast<uint32_t>(
+                                   std::strlen(file->guest_path)))) {
+                    eax = kStatusAccessDenied;
+                } else {
+                    file->delete_pending =
+                        b2r_native_service_read_u8(state, source) != 0u
+                        ? 1u : 0u;
+                    consumed = 1u;
+                    eax = 0u;
+                }
             } else if (information_class == 14u) {
                 if (source == 0u || source_length < 8u) {
                     eax = kStatusInvalidParameter;
@@ -5247,6 +5649,37 @@ static bool b2r_try_native_host_service(
                         file->position = position;
                         consumed = 8u;
                         eax = 0u;
+                    }
+                }
+            } else if (information_class == 20u) {
+                std::FILE* host_file = reinterpret_cast<std::FILE*>(
+                    static_cast<uintptr_t>(file->host_file));
+                if (source == 0u || source_length < 8u) {
+                    eax = kStatusInvalidParameter;
+                } else if (host_file == nullptr || (file->flags & 8u) == 0u) {
+                    eax = kStatusAccessDenied;
+                } else {
+                    const uint64_t end_of_file = b2r_native_service_read_u64(
+                        state, source);
+                    std::error_code error;
+                    if ((end_of_file & 0x8000000000000000ull) != 0u ||
+                        std::fflush(host_file) != 0) {
+                        eax = kStatusInvalidParameter;
+                    } else {
+                        std::filesystem::resize_file(
+                            std::filesystem::path(file->host_path),
+                            end_of_file,
+                            error);
+                        if (error) {
+                            eax = kStatusInvalidParameter;
+                        } else {
+                            file->size = end_of_file;
+                            if (file->position > end_of_file) {
+                                file->position = end_of_file;
+                            }
+                            consumed = 8u;
+                            eax = 0u;
+                        }
                     }
                 }
             } else {
@@ -5497,6 +5930,107 @@ static bool b2r_try_native_host_service(
     default:
         return false;
     }
+    bool filesystem_service = false;
+    if (service->kind == 15u) {
+        switch (service->value) {
+        case 9u:
+        case 11u:
+        case 12u:
+        case 13u:
+        case 14u:
+        case 15u:
+        case 16u:
+        case 20u:
+        case 21u:
+        case 22u:
+        case 23u:
+        case 32u:
+        case 33u:
+            filesystem_service = true;
+            break;
+        default:
+            break;
+        }
+    }
+    if (filesystem_service) {
+        const uint64_t sequence = state->filesystem_event_count++;
+        B2RNativeFilesystemEvent* event = &state->filesystem_events[
+            sequence % B2R_NATIVE_FILESYSTEM_EVENT_CAPACITY];
+        event->sequence = sequence;
+        event->service_value = service->value;
+        event->result = eax;
+        event->return_address = return_address;
+        const uint32_t argument_count = service->stack_cleanup_bytes / 4u < 10u
+            ? service->stack_cleanup_bytes / 4u : 10u;
+        for (uint32_t index = 0u; index < 10u; ++index) {
+            event->arguments[index] = index < argument_count
+                ? argument(index) : 0u;
+        }
+        event->handle = service->value == 11u || service->value == 12u
+            ? (eax == 0u && event->arguments[0] != 0u
+                   ? b2r_native_service_read_u32(state, event->arguments[0])
+                   : 0u)
+            : event->arguments[0];
+        const char* event_path = nullptr;
+        for (uint32_t index = 0u; index < state->file_count; ++index) {
+            if (state->files[index].handle == event->handle) {
+                event_path = state->files[index].guest_path;
+                break;
+            }
+        }
+        if (event_path == nullptr &&
+            (service->value == 11u || service->value == 12u)) {
+            event_path = state->last_file_guest_path;
+        }
+        std::snprintf(
+            event->guest_path,
+            sizeof(event->guest_path),
+            "%s",
+            event_path != nullptr ? event_path : "");
+        if (event_path != nullptr) {
+            const uint32_t event_path_length = static_cast<uint32_t>(
+                std::strlen(event_path));
+            const bool save_path =
+                b2r_native_path_starts_with(
+                    event_path, event_path_length,
+                    "\\Device\\Harddisk0\\Partition1\\") ||
+                b2r_native_path_starts_with(
+                    event_path, event_path_length, "\\??\\E:\\") ||
+                b2r_native_path_starts_with(
+                    event_path, event_path_length, "E:\\") ||
+                b2r_native_path_starts_with(
+                    event_path, event_path_length, "\\??\\U:\\") ||
+                b2r_native_path_starts_with(
+                    event_path, event_path_length, "U:\\") ||
+                b2r_native_path_starts_with(
+                    event_path, event_path_length, "\\??\\T:\\") ||
+                b2r_native_path_starts_with(
+                    event_path, event_path_length, "T:\\");
+            const bool save_root =
+                b2r_native_path_equals(
+                    event_path, event_path_length,
+                    "\\Device\\Harddisk0\\Partition1\\") ||
+                b2r_native_path_equals(
+                    event_path, event_path_length, "\\??\\E:\\") ||
+                b2r_native_path_equals(
+                    event_path, event_path_length, "E:\\") ||
+                b2r_native_path_equals(
+                    event_path, event_path_length, "\\??\\U:\\") ||
+                b2r_native_path_equals(
+                    event_path, event_path_length, "U:\\") ||
+                b2r_native_path_equals(
+                    event_path, event_path_length, "\\??\\T:\\") ||
+                b2r_native_path_equals(
+                    event_path, event_path_length, "T:\\");
+            if (save_path && !save_root) {
+                const uint64_t save_sequence =
+                    state->save_filesystem_event_count++;
+                state->save_filesystem_events[
+                    save_sequence % B2R_NATIVE_FILESYSTEM_EVENT_CAPACITY] =
+                    *event;
+            }
+        }
+    }
     if (state->service_trace_count < B2R_NATIVE_SERVICE_TRACE_CAPACITY) {
         const uint32_t index = state->service_trace_count++;
         state->service_trace_targets[index] = target;
@@ -5577,6 +6111,34 @@ static uint32_t b2r_native_dispatch_context(
     uint64_t* profile_bookkeeping_sample_time_ns,
     uint64_t* profile_bookkeeping_sample_count
 ) {
+    static constexpr uint32_t kPersistenceTargets[] = {
+        0x00053970u, 0x00053a80u, 0x00053c4cu, 0x00053c69u,
+        0x00053c92u,
+        0x000d6420u, 0x000d64c0u, 0x000d67b0u, 0x000d681cu,
+        0x000d6858u, 0x000d6980u, 0x000d6a4bu, 0x000d6f50u,
+        0x000d6f94u, 0x000d8d70u, 0x000d8ef4u, 0x000d9370u,
+        0x000d9529u,
+    };
+    static constexpr uint32_t kSaveManagerOffsets[] = {
+        0x000u, 0x034u, 0x038u, 0x03cu,
+        0x040u, 0x044u, 0x048u, 0x04cu,
+        0x050u, 0x054u, 0x058u, 0x05cu,
+        0xc80u, 0xc84u, 0xc88u, 0xc8cu,
+    };
+    static constexpr uint32_t kActiveObjectOffsets[] = {
+        0x000u, 0x004u, 0x008u, 0x00cu,
+        0x044u, 0x048u, 0x058u, 0x05cu,
+        0x068u, 0x130u, 0x134u, 0xbf8u,
+        0xc80u, 0xc84u, 0xc88u, 0xc8cu,
+        0x1084u, 0x1088u, 0x1090u, 0x1124u,
+        0x1128u,
+    };
+    static constexpr uint32_t kIoOperationOffsets[] = {
+        0x000u, 0x004u, 0x008u, 0x00cu,
+        0x130u, 0x134u, 0x138u, 0x13cu,
+        0x140u, 0x144u, 0x148u, 0x14cu,
+        0x150u, 0x154u, 0x158u, 0x15cu,
+    };
     for (;;) {
         if (native_host_services != nullptr) {
             native_host_services->profile_execution_lane = execution_lane;
@@ -5618,6 +6180,100 @@ static uint32_t b2r_native_dispatch_context(
         }
         const B2RNativeEntry entry = probe_count <= mask
             ? entries[slot] : nullptr;
+        if (native_host_services != nullptr &&
+            native_host_services->normal_runtime_enabled &&
+            entry != nullptr) {
+            const B2RContext* active_context =
+                static_cast<const B2RContext*>(context);
+            const uint32_t ui_state = b2r_native_service_read_u32(
+                native_host_services,
+                0x004cb6e0u + 0x1124u);
+            const uint32_t previous_ui_state =
+                native_host_services->persistence_event_count != 0u
+                ? native_host_services->persistence_events[
+                      (native_host_services->persistence_event_count - 1u) %
+                      B2R_NATIVE_PERSISTENCE_EVENT_CAPACITY].ui_state
+                : 0xffffffffu;
+            const bool ui_state_changed =
+                ui_state <= 7u && ui_state != previous_ui_state;
+            bool persistence_target = ui_state_changed;
+            for (uint32_t watched_target : kPersistenceTargets) {
+                if (target == watched_target) {
+                    persistence_target = true;
+                    break;
+                }
+            }
+            if ((target == 0x000d6f50u || target == 0x000d9370u) &&
+                !ui_state_changed &&
+                b2r_native_service_read_u32(
+                    native_host_services,
+                    0x00444328u + 0x044u) == 0u) {
+                persistence_target = false;
+            }
+            if (target == 0x00053a80u) {
+                const uint32_t active_ui_state = b2r_native_service_read_u32(
+                    native_host_services,
+                    active_context->ecx + 0x1124u);
+                persistence_target = ui_state_changed ||
+                    active_ui_state == 1u || active_ui_state == 2u;
+            }
+            if (persistence_target) {
+                const uint64_t sequence =
+                    native_host_services->persistence_event_count++;
+                B2RNativePersistenceEvent* event =
+                    &native_host_services->persistence_events[
+                        sequence % B2R_NATIVE_PERSISTENCE_EVENT_CAPACITY];
+                event->sequence = sequence;
+                event->steps = *steps;
+                event->target = target;
+                event->execution_lane = execution_lane;
+                event->worker_handle =
+                    native_host_services->current_worker_handle;
+                event->ui_state = ui_state;
+                event->ui_state_changed = ui_state_changed ? 1u : 0u;
+                const uint32_t register_values[8] = {
+                    active_context->eax, active_context->ecx,
+                    active_context->edx, active_context->ebx,
+                    active_context->esp, active_context->ebp,
+                    active_context->esi, active_context->edi,
+                };
+                std::memcpy(
+                    event->registers,
+                    register_values,
+                    sizeof(register_values));
+                for (uint32_t index = 0u; index < 8u; ++index) {
+                    event->stack_words[index] =
+                        b2r_native_service_read_u32(
+                            native_host_services,
+                            active_context->esp + index * 4u);
+                }
+                for (uint32_t index = 0u; index < 16u; ++index) {
+                    event->save_manager_words[index] =
+                        b2r_native_service_read_u32(
+                            native_host_services,
+                            0x00444328u + kSaveManagerOffsets[index]);
+                }
+                const uint32_t active_object_base = ui_state_changed
+                    ? 0x004cb6e0u : active_context->ecx;
+                for (uint32_t index = 0u; index < 21u; ++index) {
+                    event->active_object_words[index] =
+                        b2r_native_service_read_u32(
+                            native_host_services,
+                            active_object_base + kActiveObjectOffsets[index]);
+                }
+                const uint32_t io_operation =
+                    b2r_native_service_read_u32(
+                        native_host_services,
+                        0x00444390u + 0xbf8u);
+                for (uint32_t index = 0u; index < 16u; ++index) {
+                    event->io_operation_words[index] = io_operation != 0u
+                        ? b2r_native_service_read_u32(
+                              native_host_services,
+                              io_operation + kIoOperationOffsets[index])
+                        : 0u;
+                }
+            }
+        }
         bool compiled_host_call_target = false;
         if (entry != nullptr && host_call_keys != nullptr) {
             uint32_t host_slot = (target * 2654435761u) & host_call_mask;
@@ -5987,14 +6643,13 @@ static void b2r_schedule_native_d3d_vblank(
     if (now.QuadPart < state->native_d3d_vblank_next_deadline_qpc) {
         return;
     }
-    const uint64_t elapsed_vblanks = 1u + static_cast<uint64_t>(
-        (now.QuadPart - state->native_d3d_vblank_next_deadline_qpc) /
-        interval);
-    state->native_d3d_vblank_next_deadline_qpc +=
-        static_cast<int64_t>(elapsed_vblanks) * interval;
-    state->native_d3d_vblank_sequence +=
-        static_cast<uint32_t>(elapsed_vblanks);
-    state->native_d3d_vblank_tick_count += elapsed_vblanks;
+    // Guest-visible time must advance only when the corresponding callback is
+    // delivered.  Catching the counter up to host wall time skips simulation
+    // when the recompiler or presenter runs late, allowing guest timers to
+    // expire without any intervening game or render updates.
+    state->native_d3d_vblank_next_deadline_qpc = now.QuadPart + interval;
+    ++state->native_d3d_vblank_sequence;
+    ++state->native_d3d_vblank_tick_count;
     state->native_d3d_vblank_callback_address = callback_address;
     b2r_native_service_write_u32(
         state, B2R_D3D_VBLANK_DATA_ADDRESS,
@@ -7478,22 +8133,50 @@ static std::vector<int16_t> b2r_audio_normalize_pcm16(
     const size_t output_frames = static_cast<size_t>(output_frame_count);
     output.resize(output_frames * 2u);
     for (size_t frame = 0u; frame < output_frames; ++frame) {
+        const uint64_t source_position =
+            static_cast<uint64_t>(frame) * sample_rate;
         const size_t source_frame = std::min(
             frame_count - 1u,
-            static_cast<size_t>(
-                static_cast<uint64_t>(frame) * sample_rate / 48000u));
-        int16_t left = 0;
-        int16_t right = 0;
+            static_cast<size_t>(source_position / 48000u));
+        const size_t next_source_frame = std::min(
+            frame_count - 1u, source_frame + 1u);
+        const uint64_t fraction_q32 =
+            (source_position % 48000u) * (1ull << 32u) / 48000u;
+        int16_t left_start = 0;
+        int16_t left_end = 0;
+        int16_t right_start = 0;
+        int16_t right_end = 0;
         std::memcpy(
-            &left, payload + source_frame * channels * 2u, sizeof(left));
+            &left_start,
+            payload + source_frame * channels * 2u,
+            sizeof(left_start));
+        std::memcpy(
+            &left_end,
+            payload + next_source_frame * channels * 2u,
+            sizeof(left_end));
         if (channels == 2u) {
             std::memcpy(
-                &right,
+                &right_start,
                 payload + (source_frame * channels + 1u) * 2u,
-                sizeof(right));
+                sizeof(right_start));
+            std::memcpy(
+                &right_end,
+                payload + (next_source_frame * channels + 1u) * 2u,
+                sizeof(right_end));
         } else {
-            right = left;
+            right_start = left_start;
+            right_end = left_end;
         }
+        const int32_t left = static_cast<int32_t>(left_start) +
+            static_cast<int32_t>(
+                (static_cast<int64_t>(left_end - left_start) *
+                 static_cast<int64_t>(fraction_q32)) /
+                static_cast<int64_t>(1ull << 32u));
+        const int32_t right = static_cast<int32_t>(right_start) +
+            static_cast<int32_t>(
+                (static_cast<int64_t>(right_end - right_start) *
+                 static_cast<int64_t>(fraction_q32)) /
+                static_cast<int64_t>(1ull << 32u));
         output[frame * 2u] = static_cast<int16_t>(left / 2);
         output[frame * 2u + 1u] = static_cast<int16_t>(right / 2);
     }
@@ -7597,6 +8280,7 @@ static bool b2r_audio_decode_xbox_adpcm(
 static void b2r_audio_worker(B2RNativeNormalRuntimeState* runtime) {
     constexpr size_t kChunkSamples = 4800u;
     std::vector<int16_t> mixed(kChunkSamples);
+    std::vector<int32_t> mix_accumulator(kChunkSamples);
     for (;;) {
         std::unique_lock<std::mutex> lock(runtime->audio_mutex);
         runtime->audio_condition.wait(lock, [&]() {
@@ -7612,7 +8296,9 @@ static void b2r_audio_worker(B2RNativeNormalRuntimeState* runtime) {
             continue;
         }
         lock.lock();
-        std::fill(mixed.begin(), mixed.end(), 0);
+        std::fill(mix_accumulator.begin(), mix_accumulator.end(), 0);
+        uint64_t pitch_interpolated_frames = 0u;
+        uint64_t loop_wrap_count = 0u;
         for (auto& playback : runtime->audio_buffer_playbacks) {
             const size_t sample_frame_count = playback.samples.size() / 2u;
             for (size_t index = 0u; index + 1u < kChunkSamples; index += 2u) {
@@ -7631,17 +8317,43 @@ static void b2r_audio_worker(B2RNativeNormalRuntimeState* runtime) {
                         (source_frame - playback.loop_start_frame) % loop_frames;
                     playback.cursor_frame_q32 =
                         static_cast<uint64_t>(source_frame) << 32u;
+                    ++loop_wrap_count;
                 }
-                const int32_t left = static_cast<int32_t>(
-                    playback.samples[source_frame * 2u]) * playback.gain_q16 /
-                    (1 << 16u);
-                const int32_t right = static_cast<int32_t>(
-                    playback.samples[source_frame * 2u + 1u]) *
-                    playback.gain_q16 / (1 << 16u);
-                mixed[index] = b2r_audio_clamp_sample(
-                    static_cast<int32_t>(mixed[index]) + left);
-                mixed[index + 1u] = b2r_audio_clamp_sample(
-                    static_cast<int32_t>(mixed[index + 1u]) + right);
+                size_t next_source_frame = source_frame;
+                if (source_frame + 1u < playback_end) {
+                    next_source_frame = source_frame + 1u;
+                } else if (playback.loop &&
+                           playback.loop_start_frame < playback.loop_end_frame) {
+                    next_source_frame = playback.loop_start_frame;
+                }
+                const uint64_t fraction_q32 =
+                    playback.cursor_frame_q32 & 0xffffffffull;
+                const int32_t left_start = playback.samples[source_frame * 2u];
+                const int32_t left_end =
+                    playback.samples[next_source_frame * 2u];
+                const int32_t right_start =
+                    playback.samples[source_frame * 2u + 1u];
+                const int32_t right_end =
+                    playback.samples[next_source_frame * 2u + 1u];
+                const int32_t interpolated_left = left_start +
+                    static_cast<int32_t>(
+                        (static_cast<int64_t>(left_end - left_start) *
+                         static_cast<int64_t>(fraction_q32)) /
+                        static_cast<int64_t>(1ull << 32u));
+                const int32_t interpolated_right = right_start +
+                    static_cast<int32_t>(
+                        (static_cast<int64_t>(right_end - right_start) *
+                         static_cast<int64_t>(fraction_q32)) /
+                        static_cast<int64_t>(1ull << 32u));
+                if (fraction_q32 != 0u && next_source_frame != source_frame) {
+                    ++pitch_interpolated_frames;
+                }
+                const int32_t left =
+                    interpolated_left * playback.gain_q16 / (1 << 16u);
+                const int32_t right =
+                    interpolated_right * playback.gain_q16 / (1 << 16u);
+                mix_accumulator[index] += left;
+                mix_accumulator[index + 1u] += right;
                 playback.cursor_frame_q32 += playback.step_q32;
             }
         }
@@ -7660,10 +8372,15 @@ static void b2r_audio_worker(B2RNativeNormalRuntimeState* runtime) {
                                 break;
                             }
                         }
+                        ++runtime->host_state->native_audio_buffer_completion_count;
                     }
                     return finished;
                 }),
             runtime->audio_buffer_playbacks.end());
+        runtime->host_state->native_audio_buffer_loop_wrap_count +=
+            loop_wrap_count;
+        runtime->host_state->native_audio_pitch_interpolated_frame_count +=
+            pitch_interpolated_frames;
         for (auto& playback : runtime->audio_stream_playbacks) {
             for (size_t index = 0u; index < kChunkSamples;) {
                 while (!playback.packets.empty() &&
@@ -7673,9 +8390,7 @@ static void b2r_audio_worker(B2RNativeNormalRuntimeState* runtime) {
                 }
                 if (playback.packets.empty()) { break; }
                 const auto& packet = playback.packets.front();
-                mixed[index] = b2r_audio_clamp_sample(
-                    static_cast<int32_t>(mixed[index]) +
-                    packet[playback.cursor++]);
+                mix_accumulator[index] += packet[playback.cursor++];
                 ++index;
             }
         }
@@ -7687,6 +8402,9 @@ static void b2r_audio_worker(B2RNativeNormalRuntimeState* runtime) {
                     return playback.packets.empty();
                 }),
             runtime->audio_stream_playbacks.end());
+        for (size_t index = 0u; index < mixed.size(); ++index) {
+            mixed[index] = b2r_audio_clamp_sample(mix_accumulator[index]);
+        }
         runtime->host_state->native_audio_active_buffer_count =
             static_cast<uint32_t>(runtime->audio_buffer_playbacks.size());
         runtime->host_state->native_audio_active_stream_count =
@@ -7808,12 +8526,21 @@ static bool b2r_audio_decode_guest_payload(
     if (format.tag == 1u && format.bits_per_sample == 16u) {
         output = b2r_audio_normalize_pcm16(
             encoded.data(), encoded.size(), format.sample_rate, format.channels);
+        if (!output.empty() && format.sample_rate != 48000u) {
+            state->native_audio_linear_resampled_frame_count +=
+                output.size() / 2u;
+        }
         return !output.empty();
     }
     if (format.tag == 0x69u) {
-        return b2r_audio_decode_xbox_adpcm(
+        const bool decoded = b2r_audio_decode_xbox_adpcm(
             encoded.data(), encoded.size(), format.sample_rate,
             format.channels, output);
+        if (decoded && format.sample_rate != 48000u) {
+            state->native_audio_linear_resampled_frame_count +=
+                output.size() / 2u;
+        }
+        return decoded;
     }
     return false;
 }
@@ -8071,6 +8798,64 @@ static void b2r_native_audio_buffer_set_frequency(
     for (auto& playback : runtime->audio_buffer_playbacks) {
         if (playback.key == buffer) { playback.step_q32 = step_q32; }
     }
+}
+
+static uint32_t b2r_native_audio_buffer_get_status(
+    B2RNativeHostServiceState* state,
+    uint32_t buffer,
+    uint32_t status_output
+) {
+    constexpr uint32_t kSuccess = 0u;
+    constexpr uint32_t kFailure = 0x80004005u;
+    constexpr uint32_t kStatusPlaying = 0x00000001u;
+    constexpr uint32_t kStatusLooping = 0x00000004u;
+    constexpr uint32_t kVoicePointerOffset = 0x4u;
+    constexpr uint32_t kVoiceFlagsOffset = 0x12u;
+    constexpr uint16_t kVoicePlaying = 0x0002u;
+    if (state == nullptr || !state->normal_runtime_enabled || buffer == 0u ||
+        status_output == 0u) {
+        return kFailure;
+    }
+    ++state->native_audio_buffer_get_status_count;
+    B2RNativeNormalRuntimeState* runtime = b2r_get_normal_runtime_state(state);
+    b2r_audio_resolve_pending_buffer(state, runtime, buffer);
+    B2RNativeNormalRuntimeState::AudioBufferMirror* mirror =
+        b2r_audio_buffer_mirror(runtime, buffer, false);
+    if (runtime == nullptr || mirror == nullptr) { return kFailure; }
+    bool playing = false;
+    bool looping = false;
+    {
+        std::lock_guard<std::mutex> lock(runtime->audio_mutex);
+        for (const auto& playback : runtime->audio_buffer_playbacks) {
+            if (playback.key != buffer) { continue; }
+            playing = true;
+            looping = playback.loop;
+            break;
+        }
+        mirror->playing = playing;
+    }
+    const uint32_t voice = b2r_native_service_read_u32(
+        state, buffer + kVoicePointerOffset);
+    if (voice != 0u) {
+        const uint32_t voice_flags_address = voice + kVoiceFlagsOffset;
+        const uint16_t voice_flags = b2r_native_service_read_u16(
+            state, voice_flags_address);
+        if (!playing && (voice_flags & kVoicePlaying) != 0u) {
+            ++state->native_audio_stale_playing_repair_count;
+        }
+        const uint16_t synchronized_flags = playing
+            ? static_cast<uint16_t>(voice_flags | kVoicePlaying)
+            : static_cast<uint16_t>(voice_flags & ~kVoicePlaying);
+        if (synchronized_flags != voice_flags) {
+            b2r_native_service_write_u16(
+                state, voice_flags_address, synchronized_flags);
+        }
+    }
+    const uint32_t status =
+        (playing ? kStatusPlaying : 0u) |
+        (playing && looping ? kStatusLooping : 0u);
+    b2r_native_service_write_u32(state, status_output, status);
+    return kSuccess;
 }
 
 static uint32_t b2r_native_audio_buffer_get_position(
@@ -8342,13 +9127,12 @@ static uint32_t b2r_native_audio_buffer_play(
         ++state->native_audio_decode_failure_count;
         return kSuccess;
     }
-    bool was_playing = false;
+    bool has_playback = false;
     if (mirror != nullptr) {
         std::lock_guard<std::mutex> lock(runtime->audio_mutex);
-        was_playing = mirror->playing;
-        mirror->playing = true;
         for (auto& playback : runtime->audio_buffer_playbacks) {
             if (playback.key != buffer) { continue; }
+            has_playback = true;
             playback.step_q32 = b2r_audio_frequency_step_q32(
                 mirror->frequency, mirror->format.sample_rate);
             playback.loop_start_frame = loop_start_frame;
@@ -8357,8 +9141,12 @@ static uint32_t b2r_native_audio_buffer_play(
             playback.loop = loop;
             break;
         }
+        if (mirror->playing && !has_playback) {
+            ++state->native_audio_stale_playing_repair_count;
+        }
+        mirror->playing = has_playback;
     }
-    if (was_playing) {
+    if (has_playback) {
         ++state->native_audio_buffer_repeated_play_count;
         state->native_audio_buffer_play_stage = 6u;
         publish_debug();
@@ -8394,7 +9182,15 @@ static uint32_t b2r_native_audio_buffer_play(
             }),
         runtime->audio_buffer_playbacks.end());
     if (runtime->audio_buffer_playbacks.size() >= 64u) {
+        const uint32_t dropped_key =
+            runtime->audio_buffer_playbacks.front().key;
         runtime->audio_buffer_playbacks.pop_front();
+        for (auto& candidate : runtime->audio_buffer_mirrors) {
+            if (candidate.key == dropped_key) {
+                candidate.playing = false;
+                break;
+            }
+        }
         ++state->native_audio_dropped_buffer_count;
     }
     if (loop_end_frame > samples.size() / 2u) {
@@ -8416,6 +9212,7 @@ static uint32_t b2r_native_audio_buffer_play(
         mirror->format,
         b2r_audio_region_generation(state, selected_data, selected_size),
     });
+    mirror->playing = true;
     state->native_audio_active_buffer_count = static_cast<uint32_t>(
         runtime->audio_buffer_playbacks.size());
     runtime->audio_condition.notify_one();
@@ -8724,10 +9521,16 @@ static void b2r_live_append_resource(
         byte_count > 16u * 1024u * 1024u) {
         return;
     }
-    for (const B2RLiveResourceDescriptor& existing : resources) {
+    for (B2RLiveResourceDescriptor& existing : resources) {
         if (existing.address == address && existing.width == width &&
             existing.height == height &&
             std::strcmp(existing.format, format) == 0) {
+            if (byte_count > existing.byte_count) {
+                existing.stage = stage;
+                existing.source_address = b2r_live_resource_source_address(
+                    state, address);
+                existing.byte_count = byte_count;
+            }
             return;
         }
     }
@@ -8866,6 +9669,11 @@ static bool b2r_live_publish_resources(
             }
             mip_width = std::max(1u, mip_width / 2u);
             mip_height = std::max(1u, mip_height / 2u);
+        }
+        const bool cubemap = (format_raw & (1u << 2u)) != 0u;
+        if (cubemap) {
+            const uint64_t face_stride = (byte_count + 127u) & ~127ull;
+            byte_count = face_stride * 6u;
         }
         if (byte_count <= UINT32_MAX) {
             b2r_live_append_resource(
@@ -9281,6 +10089,7 @@ static uint32_t b2r_service_native_normal_runtime(
         ++state->live_published_span_count;
         if ((flags & 1u) != 0u) {
             ++state->live_flip_count;
+            b2r_capture_replay_state_sample(state);
             b2r_live_pace_video_frame(state);
             if (!b2r_live_publish_resources(
                     state, runtime->methods.data(), runtime->values.data(),
@@ -9479,13 +10288,14 @@ NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_VOLUME = 13
 NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_FREQUENCY = 14
 NATIVE_HOST_SERVICE_AUDIO_BUFFER_GET_POSITION = 15
 NATIVE_HOST_SERVICE_AUDIO_BUFFER_SET_POSITION = 16
+NATIVE_HOST_SERVICE_AUDIO_BUFFER_GET_STATUS = 17
 
 NATIVE_HOST_SERVICE_TITLE_HEAP_ALLOCATE = 1
 NATIVE_HOST_SERVICE_TITLE_HEAP_FREE = 2
 NATIVE_HOST_SERVICE_TITLE_ALLOCATION_LIST_COUNT = 3
 NATIVE_HOST_SERVICE_TITLE_GLOBAL_LIST_REGISTER = 4
 NATIVE_HOST_SERVICE_TITLE_TEXT_DRAW = 5
-NATIVE_HOST_SERVICE_TITLE_ASSET_ACTIVATE = 6
+NATIVE_HOST_SERVICE_TITLE_ASSET_CLOSE = 6
 NATIVE_HOST_SERVICE_TITLE_ASSET_STATUS = 7
 NATIVE_HOST_SERVICE_TITLE_ASSET_READ = 8
 NATIVE_HOST_SERVICE_TITLE_ASSET_SEEK = 9
@@ -9610,7 +10420,7 @@ class _NativeFileEntry(ctypes.Structure):
         ("position", ctypes.c_uint64),
         ("host_file", ctypes.c_uint64),
         ("active", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint32),
+        ("delete_pending", ctypes.c_uint32),
         ("directory_index", ctypes.c_uint32),
         ("directory_initialized", ctypes.c_uint32),
         ("guest_path", ctypes.c_char * 256),
@@ -9619,13 +10429,85 @@ class _NativeFileEntry(ctypes.Structure):
     ]
 
 
+class _NativeFilesystemEvent(ctypes.Structure):
+    _fields_ = [
+        ("sequence", ctypes.c_uint64),
+        ("service_value", ctypes.c_uint32),
+        ("result", ctypes.c_uint32),
+        ("return_address", ctypes.c_uint32),
+        ("handle", ctypes.c_uint32),
+        ("arguments", ctypes.c_uint32 * 10),
+        ("guest_path", ctypes.c_char * 256),
+    ]
+
+
+class _NativePersistenceEvent(ctypes.Structure):
+    _fields_ = [
+        ("sequence", ctypes.c_uint64),
+        ("steps", ctypes.c_uint64),
+        ("target", ctypes.c_uint32),
+        ("execution_lane", ctypes.c_uint32),
+        ("worker_handle", ctypes.c_uint32),
+        ("ui_state", ctypes.c_uint32),
+        ("ui_state_changed", ctypes.c_uint32),
+        ("registers", ctypes.c_uint32 * 8),
+        ("stack_words", ctypes.c_uint32 * 8),
+        ("save_manager_words", ctypes.c_uint32 * 16),
+        ("active_object_words", ctypes.c_uint32 * 21),
+        ("io_operation_words", ctypes.c_uint32 * 16),
+    ]
+
+
 class _NativeTitleAssetStreamEntry(ctypes.Structure):
     _fields_ = [
         ("object", ctypes.c_uint32),
         ("payload", ctypes.c_uint32),
         ("payload_size", ctypes.c_uint32),
+        ("payload_capacity", ctypes.c_uint32),
         ("flags", ctypes.c_uint32),
         ("image_base", ctypes.c_uint32),
+        ("open_event_index_plus_one", ctypes.c_uint32),
+    ]
+
+
+class _NativeTitleAssetOpenEvent(ctypes.Structure):
+    _fields_ = [
+        ("flip_count", ctypes.c_uint64),
+        ("object", ctypes.c_uint32),
+        ("payload_size", ctypes.c_uint32),
+        ("failure_stage", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("read_call_count", ctypes.c_uint32),
+        ("read_requested_bytes", ctypes.c_uint32),
+        ("read_returned_bytes", ctypes.c_uint32),
+        ("close_count", ctypes.c_uint32),
+        ("header_words", ctypes.c_uint32 * 8),
+        ("guest_path", ctypes.c_char * 512),
+    ]
+
+
+class _NativeReplayStateSample(ctypes.Structure):
+    _fields_ = [
+        ("flip_count", ctypes.c_uint64),
+        ("record_count", ctypes.c_uint32),
+        ("record_index", ctypes.c_uint32),
+        ("loaded", ctypes.c_uint32),
+        ("mode", ctypes.c_uint32),
+        ("field_10", ctypes.c_uint32),
+        ("field_14", ctypes.c_uint32),
+        ("field_18", ctypes.c_uint32),
+        ("field_1c", ctypes.c_uint32),
+        ("buffer_begin", ctypes.c_uint32),
+        ("buffer_end", ctypes.c_uint32),
+        ("buffer_limit", ctypes.c_uint32),
+        ("replay_disabled", ctypes.c_uint32),
+        ("route_variant", ctypes.c_uint32),
+        ("game_state", ctypes.c_uint32),
+        ("route_value", ctypes.c_uint32),
+        ("demo_field_4", ctypes.c_uint32),
+        ("demo_field_8", ctypes.c_uint32),
+        ("demo_field_c", ctypes.c_uint32),
+        ("demo_enabled", ctypes.c_uint32),
     ]
 
 
@@ -9813,7 +10695,19 @@ class NativeHostServiceState(ctypes.Structure):
         ("title_asset_open_count", ctypes.c_uint64),
         ("title_asset_open_failure_count", ctypes.c_uint64),
         ("title_asset_payload_bytes", ctypes.c_uint64),
+        ("title_asset_close_count", ctypes.c_uint64),
+        ("title_asset_reuse_count", ctypes.c_uint64),
+        ("title_asset_payload_reallocation_count", ctypes.c_uint64),
+        ("title_asset_resident_payload_bytes", ctypes.c_uint64),
+        ("title_asset_active_stream_count", ctypes.c_uint32),
+        ("title_asset_peak_active_stream_count", ctypes.c_uint32),
         ("title_asset_streams", _NativeTitleAssetStreamEntry * 128),
+        ("title_asset_open_event_count", ctypes.c_uint32),
+        ("title_asset_open_event_overflow_count", ctypes.c_uint32),
+        ("title_asset_open_events", _NativeTitleAssetOpenEvent * 128),
+        ("replay_state_sample_count", ctypes.c_uint32),
+        ("replay_state_sample_overflow_count", ctypes.c_uint32),
+        ("replay_state_samples", _NativeReplayStateSample * 4096),
         ("title_track_pss_candidate_count", ctypes.c_uint64),
         ("title_track_pss_publication_count", ctypes.c_uint64),
         ("title_track_pss_validation_failure_count", ctypes.c_uint64),
@@ -9826,6 +10720,12 @@ class NativeHostServiceState(ctypes.Structure):
         ("files", _NativeFileEntry * 128),
         ("file_count", ctypes.c_uint32),
         ("file_overflow_count", ctypes.c_uint32),
+        ("filesystem_event_count", ctypes.c_uint64),
+        ("filesystem_events", _NativeFilesystemEvent * 256),
+        ("save_filesystem_event_count", ctypes.c_uint64),
+        ("save_filesystem_events", _NativeFilesystemEvent * 256),
+        ("persistence_event_count", ctypes.c_uint64),
+        ("persistence_events", _NativePersistenceEvent * 256),
         ("next_object_handle", ctypes.c_uint32),
         ("service_trace_count", ctypes.c_uint32),
         ("service_trace_overflow_count", ctypes.c_uint32),
@@ -9961,9 +10861,15 @@ class NativeHostServiceState(ctypes.Structure):
         ("native_audio_buffer_frequency_count", ctypes.c_uint64),
         ("native_audio_buffer_play_count", ctypes.c_uint64),
         ("native_audio_buffer_repeated_play_count", ctypes.c_uint64),
+        ("native_audio_buffer_get_status_count", ctypes.c_uint64),
         ("native_audio_buffer_get_position_count", ctypes.c_uint64),
         ("native_audio_buffer_set_position_count", ctypes.c_uint64),
         ("native_audio_buffer_refresh_count", ctypes.c_uint64),
+        ("native_audio_buffer_completion_count", ctypes.c_uint64),
+        ("native_audio_buffer_loop_wrap_count", ctypes.c_uint64),
+        ("native_audio_stale_playing_repair_count", ctypes.c_uint64),
+        ("native_audio_linear_resampled_frame_count", ctypes.c_uint64),
+        ("native_audio_pitch_interpolated_frame_count", ctypes.c_uint64),
         ("native_audio_buffer_stop_count", ctypes.c_uint64),
         ("native_audio_stream_create_count", ctypes.c_uint64),
         ("native_audio_stream_process_count", ctypes.c_uint64),
@@ -10274,7 +11180,7 @@ _Context._fields_ = [
     ("mxcsr", ctypes.c_uint32),
     ("fpu_control_word", ctypes.c_uint32),
     ("fpu_status_word", ctypes.c_uint32),
-    ("fpu_stack", ctypes.c_float * 8),
+    ("fpu_stack", ctypes.c_double * 8),
     ("fpu_depth", ctypes.c_uint32),
     ("xmm", _Xmm * 8),
     ("mmx", ctypes.c_uint64 * 8),
@@ -10373,6 +11279,8 @@ class NativeResumableExecutor:
         memory_write_callback_addresses: Iterable[int] = (),
         memory_zero_read_callback_addresses: Iterable[int] = (),
         native_fast_paths: dict[int, NativeFastPath] | None = None,
+        preferred_fusion_edges: Iterable[tuple[int, int]] = (),
+        aot_optimization_mode: str = DEFAULT_AOT_OPTIMIZATION_MODE,
         synchronize_eip_for_callbacks: bool = False,
         module_functions: Iterable[LiftedFunction] | None = None,
         incremental_module_functions: Iterable[LiftedFunction] | None = None,
@@ -10380,7 +11288,17 @@ class NativeResumableExecutor:
         compile_worker_limit: int | None = None,
         low_priority_compilation: bool = False,
     ) -> None:
-        compile_profile = "clang-cl-o2-call-fused-v11-native-frame-resource-state"
+        aot_optimization_mode = str(aot_optimization_mode).strip().lower()
+        (
+            preferred_fusion_enabled,
+            registerized_guest_state_enabled,
+        ) = aot_optimization_features(aot_optimization_mode)
+        coalesced_memory_accesses_enabled = aot_optimization_mode in {
+            "fusion-only",
+            "registerization-only",
+            "combined",
+        }
+        compile_profile = f"clang-cl-o2-aot-targeted-v14-{aot_optimization_mode}"
         build_dir.mkdir(parents=True, exist_ok=True)
         compiler_path = compiler or shutil.which("clang-cl")
         if compiler_path is None:
@@ -10405,6 +11323,22 @@ class NativeResumableExecutor:
             int(address) & 0xFFFFFFFF: fast_path
             for address, fast_path in (native_fast_paths or {}).items()
         }
+        configured_preferred_fusion_edges = tuple(
+            sorted(
+                {
+                    (
+                        int(source) & 0xFFFFFFFF,
+                        int(target) & 0xFFFFFFFF,
+                    )
+                    for source, target in preferred_fusion_edges
+                }
+            )
+        )
+        preferred_fusion_edges = (
+            configured_preferred_fusion_edges
+            if preferred_fusion_enabled
+            else ()
+        )
         common_memory_callback_addresses = {
             int(address) for address in memory_callback_addresses
         }
@@ -10444,6 +11378,24 @@ class NativeResumableExecutor:
             base_maximum_count=self.BASE_INSTRUCTIONS_PER_MODULE,
             maximum_count=self.MAX_INSTRUCTIONS_PER_MODULE,
             isolated_addresses=native_fast_paths,
+            preferred_edges=preferred_fusion_edges,
+        )
+        base_chunk_owner_by_address = {
+            instruction.address: chunk_index
+            for chunk_index, chunk in enumerate(base_chunks)
+            for instruction in chunk
+        }
+        available_preferred_fusion_edges = tuple(
+            edge
+            for edge in preferred_fusion_edges
+            if edge[0] in base_chunk_owner_by_address
+            and edge[1] in base_chunk_owner_by_address
+        )
+        colocated_preferred_fusion_edges = tuple(
+            edge
+            for edge in available_preferred_fusion_edges
+            if base_chunk_owner_by_address[edge[0]]
+            == base_chunk_owner_by_address[edge[1]]
         )
         chunk_specs: list[tuple[list[Any], str, str]] = [
             (chunk, "base", "/O2") for chunk in base_chunks
@@ -10507,7 +11459,32 @@ class NativeResumableExecutor:
             "emitter": emitter_identity,
             "maximum_instructions_per_module": self.MAX_INSTRUCTIONS_PER_MODULE,
             "base_instructions_per_module": self.BASE_INSTRUCTIONS_PER_MODULE,
-            "partition_strategy": "weighted-direct-call-and-tail-call-fusion-v1",
+            "aot_optimization_mode": aot_optimization_mode,
+            "partition_strategy": (
+                "profile-guided-aot-superblocks-v2"
+                if preferred_fusion_enabled
+                else "weighted-direct-call-and-tail-call-fusion-v1"
+            ),
+            "guest_state_strategy": (
+                "module-local-gpr-flags-steps-v1"
+                if registerized_guest_state_enabled
+                else "context-resident-guest-state-v1"
+            ),
+            "step_budget_strategy": (
+                "direct-fallthrough-run-v1"
+                if registerized_guest_state_enabled
+                else "per-instruction-context-check-v1"
+            ),
+            "memory_callback_page_strategy": (
+                "same-page-early-reject-v1"
+                if coalesced_memory_accesses_enabled
+                else "per-byte-page-filter-v1"
+            ),
+            "memory_access_strategy": (
+                "same-page-coalesced-u16-u64-v1"
+                if coalesced_memory_accesses_enabled
+                else "scalar-u8-u32-v1"
+            ),
             "address_configuration": "partition-local-v1",
         }
         base_configuration_key = hashlib.sha256(
@@ -10530,6 +11507,11 @@ class NativeResumableExecutor:
                 instructions=tuple(chunk),
             )
             module_addresses = {instruction.address for instruction in chunk}
+            module_preferred_fusion_edges = [
+                edge
+                for edge in preferred_fusion_edges
+                if edge[0] in module_addresses and edge[1] in module_addresses
+            ]
             module_fast_paths = {
                 f"0x{address:08X}": native_fast_paths[address].to_dict()
                 for address in sorted(native_fast_paths)
@@ -10537,6 +11519,7 @@ class NativeResumableExecutor:
             }
             module_configuration = {
                 "base_configuration_key": base_configuration_key,
+                "preferred_fusion_edges": module_preferred_fusion_edges,
                 "native_fast_paths": module_fast_paths,
                 "observer_addresses": sorted(
                     module_addresses & observer_addresses
@@ -10630,6 +11613,8 @@ class NativeResumableExecutor:
                 callback_addresses=callback_addresses,
                 forwarded_callback_addresses=forwarded_callback_addresses,
                 native_fast_paths=native_fast_paths,
+                registerize_guest_state=registerized_guest_state_enabled,
+                coalesce_memory_accesses=coalesced_memory_accesses_enabled,
                 synchronize_eip_for_callbacks=synchronize_eip_for_callbacks,
             )
             source_path.write_text(source, encoding="utf-8", newline="\n")
@@ -10730,6 +11715,24 @@ class NativeResumableExecutor:
             "localized_address_configuration": True,
             "content_digest_mode": "marshal-ir-v1",
             "known_reachable_partition_count": len(modules),
+            "aot_optimization_mode": aot_optimization_mode,
+            "preferred_fusion_enabled": preferred_fusion_enabled,
+            "registerized_guest_state_enabled": (
+                registerized_guest_state_enabled
+            ),
+            "coalesced_memory_accesses_enabled": (
+                coalesced_memory_accesses_enabled
+            ),
+            "configured_preferred_fusion_edge_count": len(
+                configured_preferred_fusion_edges
+            ),
+            "preferred_fusion_edge_count": len(preferred_fusion_edges),
+            "available_preferred_fusion_edge_count": len(
+                available_preferred_fusion_edges
+            ),
+            "colocated_preferred_fusion_edge_count": len(
+                colocated_preferred_fusion_edges
+            ),
             "base_partition_count": sum(
                 item["module_kind"] == "base" for item in modules
             ),

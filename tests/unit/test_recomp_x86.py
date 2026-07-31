@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from tools.recomp.x86_lifter import (
+    CppEmitter,
     CpuState,
     DETERMINISTIC_TSC_STEP,
     SparseMemory,
@@ -1052,7 +1053,7 @@ class X86RecompPrototypeTests(unittest.TestCase):
         self.assertEqual(result.return_address, 0xDEADC0DE)
         self.assertIn("fpu_load_constant", operations)
         self.assertIn("fpu_y_log2_x", operations)
-        self.assertIn("0.30102999566f", emitted)
+        self.assertIn("0.30102999566398119521", emitted)
         self.assertIn("std::log2", emitted)
 
         fpu_tangent = lift_x86_function(
@@ -1197,7 +1198,7 @@ class X86RecompPrototypeTests(unittest.TestCase):
         self.assertEqual(struct.unpack("<f", memory.read(0x2008, 4))[0], -4.5)
         self.assertEqual(result.state.fpu_stack, [])
         self.assertEqual(result.return_address, 0xDEADC0DE)
-        self.assertIn("*= static_cast<float>(static_cast<int32_t>", emitted)
+        self.assertIn("*= static_cast<double>(static_cast<int32_t>", emitted)
 
         fpu_integer_divide = lift_x86_function(
             bytes.fromhex(
@@ -1238,7 +1239,7 @@ class X86RecompPrototypeTests(unittest.TestCase):
         self.assertEqual(struct.unpack("<f", memory.read(0x2008, 4))[0], 2.5)
         self.assertEqual(result.state.fpu_stack, [])
         self.assertEqual(result.return_address, 0xDEADC0DE)
-        self.assertIn("/= static_cast<float>(static_cast<int32_t>", emitted)
+        self.assertIn("/= static_cast<double>(static_cast<int32_t>", emitted)
 
         fld_scalar = lift_x86_function(
             bytes.fromhex(
@@ -1846,7 +1847,7 @@ class X86RecompPrototypeTests(unittest.TestCase):
         self.assertEqual(memory.read(0x2004, 2), struct.pack("<H", 0x0100))
         self.assertAlmostEqual(struct.unpack("<f", memory.read(0x2008, 4))[0], 2.5)
         self.assertEqual(result.return_address, 0xDEADC0DE)
-        self.assertIn("b2r_fpu_compare_status(ctx->fpu_stack[0], 0.0f", emitted)
+        self.assertIn("b2r_fpu_compare_status(ctx->fpu_stack[0], 0.0", emitted)
         self.assertIn("std::fabs(ctx->fpu_stack[0])", emitted)
 
     def test_observed_x87_stack_register_arithmetic_and_pop_forms(self) -> None:
@@ -2180,11 +2181,50 @@ class X86RecompPrototypeTests(unittest.TestCase):
             struct.unpack("<4f", memory.read(0x2010, 16)),
             (4.0, 0.0, 0.0, 0.0),
         )
-        self.assertAlmostEqual(struct.unpack("<f", memory.read(0x2020, 4))[0], 0.5)
-        self.assertEqual(result.state.get_xmm_register("xmm0")[0], 0.5)
+        self.assertEqual(memory.read_u32(0x2020), 0x3EFFF000)
+        self.assertEqual(
+            struct.unpack(
+                "<I",
+                struct.pack("<f", result.state.get_xmm_register("xmm0")[0]),
+            )[0],
+            0x3EFFF000,
+        )
         self.assertEqual(result.return_address, 0xDEADC0DE)
         self.assertIn("xmm_reciprocal_sqrt_scalar", operations)
         self.assertIn("b2r_rsqrtss", emitted)
+        self.assertIn("midpoint_bits", emitted)
+
+    def test_rsqrtss_matches_intel_approximation_and_special_values(self) -> None:
+        cases = (
+            (0x3F000000, 0x3FB4F800),  # 0.5
+            (0x3F800000, 0x3F7FF000),  # 1.0
+            (0x40000000, 0x3F34F800),  # 2.0
+            (0x00000000, 0x7F800000),  # +0.0 -> +infinity
+            (0x80000000, 0xFF800000),  # -0.0 -> -infinity
+            (0x00000001, 0x7F800000),  # positive denormal -> +infinity
+            (0xBF800000, 0xFFC00000),  # negative normal -> default quiet NaN
+            (0x7F800000, 0x00000000),  # +infinity -> +0.0
+            (0xFF800000, 0xFFC00000),  # -infinity -> default quiet NaN
+            (0x7F812345, 0x7FC12345),  # signaling NaN -> quiet NaN
+        )
+        for input_bits, expected_bits in cases:
+            with self.subTest(input_bits=f"0x{input_bits:08X}"):
+                function = lift_x86_function(
+                    bytes.fromhex("F30F100500200000F30F52C0F30F110504200000C3"),
+                    base_address=0x39A0,
+                    symbol="rsqrtss_intel_approximation",
+                )
+                state = CpuState.with_registers(esp=0x9000)
+                memory = SparseMemory(
+                    {
+                        0x2000: struct.pack("<I", input_bits),
+                        0x9000: 0xDEADC0DE,
+                    }
+                )
+
+                execute_lifted_function(function, state=state, memory=memory)
+
+                self.assertEqual(memory.read_u32(0x2004), expected_bits)
 
     def test_observed_cache_writeback_invalidate_decodes_as_noop(self) -> None:
         function = lift_x86_function(
@@ -2788,7 +2828,12 @@ class X86RecompPrototypeTests(unittest.TestCase):
             "pending_module_exit_reason = B2R_MODULE_EXIT_RETURN;",
             resumable,
         )
-        self.assertIn("b2r_begin_instruction(ctx, 0x00001000u)", resumable)
+        self.assertIn(
+            "b2r_begin_instruction(ctx, hot, 0x00001000u, 1u, "
+            "unchecked_step_count)",
+            resumable,
+        )
+        self.assertIn("++hot.steps", resumable)
         self.assertNotIn("--ctx->steps", resumable)
         self.assertIn("ctx->module_exit_reason", resumable)
         self.assertIn("B2R_MODULE_EXIT_CALL", resumable)
@@ -2904,6 +2949,89 @@ class X86RecompPrototypeTests(unittest.TestCase):
         )
         self.assertIn("ctx->timestamp_counter", timestamp)
         self.assertIn("ctx->edx = static_cast<uint32_t>(value >> 32)", timestamp)
+
+    def test_resumable_cpp_can_disable_registerized_guest_state(self) -> None:
+        function = lift_x86_function(
+            _sum_helper_bytes(),
+            base_address=0x1000,
+            symbol="sum_helper_legacy_state",
+        )
+
+        emitted = emit_cpp(
+            function,
+            exported_symbol="sum_helper_legacy_state",
+            resumable=True,
+            observer_addresses={function.base_address},
+            registerize_guest_state=False,
+        )
+
+        self.assertIn(
+            "sum_helper_legacy_state(B2RContext* ctx) {\n"
+            "    uint32_t eip",
+            emitted,
+        )
+        self.assertIn(
+            "b2r_begin_instruction(ctx, 0x00001000u)",
+            emitted,
+        )
+        self.assertNotIn(
+            "b2r_begin_instruction(ctx, hot, 0x00001000u",
+            emitted,
+        )
+        self.assertIn("++ctx->steps;", emitted)
+        self.assertNotIn("const uint32_t first = b2r_cache_address", emitted)
+        self.assertIn(
+            "if (ctx->observe != nullptr) { ctx->eip = 0x00001000u;",
+            emitted,
+        )
+
+        split_function = lift_x86_function(
+            bytes([0x90]) * (CppEmitter.MAX_RESUMABLE_SWITCH_INSTRUCTIONS + 1),
+            base_address=0x4000,
+            symbol="split_legacy_state",
+            max_instructions=CppEmitter.MAX_RESUMABLE_SWITCH_INSTRUCTIONS + 1,
+        )
+        split = emit_cpp(
+            split_function,
+            exported_symbol="split_legacy_state",
+            resumable=True,
+            registerize_guest_state=False,
+        )
+        self.assertIn(
+            "split_legacy_state_chunk_000(B2RContext* ctx, uint32_t eip, "
+            "bool* matched",
+            split,
+        )
+        self.assertIn(
+            "split_legacy_state_chunk_000(ctx, eip, &matched, ",
+            split,
+        )
+
+    def test_resumable_cpp_can_coalesce_same_page_memory_accesses(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex("668B016689028B018902C3"),
+            base_address=0x5000,
+            symbol="coalesced_memory_accesses",
+        )
+
+        emitted = emit_cpp(
+            function,
+            exported_symbol="coalesced_memory_accesses",
+            resumable=True,
+            registerize_guest_state=False,
+            coalesce_memory_accesses=True,
+        )
+
+        self.assertIn("const uint32_t first = b2r_cache_address", emitted)
+        self.assertIn(
+            "b2r_requires_read_memory_callback(ctx, address, 2u)",
+            emitted,
+        )
+        self.assertIn(
+            "b2r_requires_write_memory_callback(ctx, address, 8u)",
+            emitted,
+        )
+        self.assertIn("std::memcpy(&value, ctx->read_pages[page]", emitted)
 
     def test_reachable_coverage_batch_decodes_all_observed_forms(self) -> None:
         cases = {

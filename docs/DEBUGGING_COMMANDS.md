@@ -38,6 +38,13 @@ Normal live diagnostics write:
 - `reports/local/playability/render-debug-report.json`
 - `reports/local/playability/performance-debug-report.json`
 
+For Driver's Ed demonstration failures, `native-live.json` also retains
+`native_title_asset_open_events` (guest path, header words, read totals, and
+close count) and `native_replay_state_samples` (the replay controller state for
+each published guest flip). These native-only records correlate a `DReplay`
+load with the exact How to Play interval; an additional F12 capture is not
+needed when the guest's black clear and HUD-only draw set are already proven.
+
 Native-run summaries retain the first 8 and latest 56 entries. Edge collection
 and serialization retain every populated entry up to the 65,536-slot table
 capacity. Reports disclose table overflow instead of presenting a truncated
@@ -94,6 +101,18 @@ are `audio_last_buffer`, `audio_last_data`, `audio_last_size`, and
 `audio_last_sample_rate`. These fields occupy the reserved diagnostic header
 and do not publish controller input or alter guest execution.
 
+The post-run `normal_runtime.audio` summary also retains voice-lifetime and
+quality evidence. `buffer_get_status_count`, `buffer_completion_count`,
+`buffer_loop_wrap_count`, and `stale_playing_repair_count` distinguish a title
+stop from host retirement and stale guest voice state. The fixed conversion
+path reports `sample_rate_conversion` and `pitch_conversion` as
+`linear_interpolation`; `linear_resampled_frame_count` and
+`pitch_interpolated_frame_count` prove that the corresponding paths were
+exercised. `mixer_accumulation` is `int32_clamp_after_sum`, avoiding
+order-dependent per-voice saturation. A stale-playing repair is retained
+instead of allowing a completed or rejected voice to remain permanently
+playing in guest-visible status.
+
 Override the first-frame startup timeout:
 
 ```powershell
@@ -145,6 +164,36 @@ visible separately. The performance report rejects the sample if the window
 observes Python runtime callbacks, live compilation, frontier interpretation,
 native promotion, disabled native observer dispatch, or an empty/incomplete
 capture.
+
+To isolate the AOT dispatch and guest-state changes, add one explicit
+`--aot-ab-mode` value to the profiling command:
+
+```powershell
+# Pre-optimization emitter and generic static call fusion.
+python .\tools\playability\live_test.py --profile-hot-paths --aot-ab-mode baseline
+
+# Measured preferred superblocks with context-resident guest state; this is
+# the accepted default normal AOT configuration.
+python .\tools\playability\live_test.py --profile-hot-paths --aot-ab-mode fusion-only
+
+# Original partitioning with registerized guest state, run-level budget checks,
+# and same-page callback rejection.
+python .\tools\playability\live_test.py --profile-hot-paths --aot-ab-mode registerization-only
+
+# Both optimizations; retained to diagnose registerization regressions.
+python .\tools\playability\live_test.py --profile-hot-paths --aot-ab-mode combined
+```
+
+Each mode has a distinct native-module configuration identity. Launch each arm
+once to populate or adopt its AOT artifacts, exit after preparation, then
+launch the same command again for the measured warm capture. Use the same scene,
+input, and F10 duration for every arm. A warm arm reports zero compile/source
+emission time and a `warm_hit_count` equal to
+`known_reachable_partition_count`. The run manifest records
+`configuration.aot_optimization_mode`; the native cache summary also records
+the mode and the two resolved feature switches. Modes other than the
+`fusion-only` default are developer profiling diagnostics and require
+`--profile-hot-paths`.
 
 Lock-step pipeline comparison:
 
@@ -291,6 +340,12 @@ python .\tools\playability\render_debug_suite.py `
   --pretty
 ```
 
+For reflection and environment-map failures, inspect the report's
+`cubemap_texture_stage_draw_count`,
+`cubemap_texture_stage_coverage_mismatch_draw_count`, and
+`texture_stage_coverage_mismatch_draw_count` fields. A complete replay keeps
+the latter two at zero even when a draw uses multiple texture stages.
+
 Regenerate the aggregate render report without rerunning:
 
 ```powershell
@@ -325,6 +380,60 @@ The comparison normalizes guest modules by estimated native time per second,
 then reports per-flip deltas when both captures contain completed guest flips.
 `comparison.csv` is added to the tables directory.
 
+Presenter reload events also expose the item-4 command-work cache. Inspect
+`performance.presenter.method_interpretation.command_work_cache` for its
+cacheable reloads, whole-reload and reconstruction-window hit ratios, lookup
+time, materialized word count, builds, fallbacks, evictions, epoch changes, and
+bounded resident size. The adjacent
+method summary reports bulk state methods and exact no-op state writes. Command loading splits
+the shared-memory path into provenance, vector-resize, payload-copy, and
+record-validation timings. Cache entries are scoped to the command-stream
+generation. MMIO/backward-delimited reconstruction segments are partitioned
+into shift-invariant 16 KiB destination windows; current guest addresses and
+payload values are always read on a hit. The retained 256-plan lookup uses a
+normalized-hash collision bucket with exact structural comparison and a
+list-backed LRU; the 64 MiB byte cap remains authoritative.
+
+Capture the diagnostic-only structural cache trace during the same manual F10
+workload used for item-4 comparisons:
+
+```powershell
+python .\tools\playability\live_test.py `
+  --profile-hot-paths `
+  --command-work-cache-trace `
+    .\reports\local\playability\command-work-cache-trace.jsonl
+```
+
+The trace records normalized window layout IDs, actual retained plan byte
+sizes, LRU stack reuse distances, eviction ages, and the descriptor-only
+reconstruction segments needed for alternate window simulations. It contains
+no command payload values. Trace collection adds diagnostic work and is not a
+performance-acceptance run. Start and stop the workload with F10 manually; do
+not automate gameplay input.
+
+After closing the run, simulate the handoff matrix offline:
+
+```powershell
+python .\tools\playability\command_work_cache_trace.py `
+  --trace .\reports\local\playability\command-work-cache-trace.jsonl `
+  --presenter-events `
+    .\reports\local\playability\render-debug-events.jsonl `
+  --json-output `
+    .\reports\local\playability\command-work-cache-simulation.json `
+  --window-kib 4 8 16 32 `
+  --plan-limits 256 512 1024 `
+  --pretty
+```
+
+New traces carry the F10 state directly. `--presenter-events` supplies the
+equivalent scope for a trace captured before that field was added; omit it for
+new traces. The report includes captured plan-size/reuse-distance distributions and a
+collision-safe exact-layout LRU simulation for every requested window/limit
+pair under the existing 64 MiB byte cap. Use the simulation to decide whether
+the cache warrants a hash-indexed collision bucket plus LRU and a higher plan
+limit; validate any chosen runtime change in a separate trace-disabled warm
+`fusion-only` F10 run.
+
 Replay a frozen render stream:
 
 ```powershell
@@ -342,6 +451,20 @@ python .\tools\host\first_frame_smoke.py `
   --analyze-render-stream `
   --pretty
 ```
+
+For a large F12 capture, retain only complete command spans from its tail and
+pair them with the capture's interpreter bootstrap before running the analyzer:
+
+```powershell
+python .\tools\playability\render_capture_tail.py `
+  <capture-render.json> `
+  .\reports\local\playability\render-tail `
+  --tail-bytes 4194304
+```
+
+The generated `render.json` is suitable for the analysis command above. This
+keeps late-frame material state, including secondary texture-stage and cubemap
+bindings, without replaying the capture's complete command prefix.
 
 Strict resource/render validation:
 
@@ -386,6 +509,7 @@ Direct-probe-only diagnostic switches:
 | `--render-watchpoint-limit N` | Stop after retaining N D3D writes |
 | `--no-execute-entry` | Decode the entry prefix without executing |
 | `--profile-hot-paths` | F10-windowed exact native edges, sampled target timing, and profiling-cost estimate |
+| `--aot-ab-mode MODE` | Profile `baseline`, `fusion-only`, `registerization-only`, or `combined` AOT emission; modes other than the `fusion-only` default require `--profile-hot-paths` |
 | `--audit-traffic-meshes` | Native bounded world-mesh submission ring |
 | `--audit-world-matrices` | Broad world-matrix observer |
 | `--audit-world-matrix-address ADDRESS` | Exact matrix-write and shader-input audit |
@@ -415,16 +539,40 @@ same in-memory lifted IR on later AOT preparations. Inspect
 `prepared_snapshot_build_us` to distinguish snapshot loading from a rebuild.
 
 The native module manifest keys each partition by semantic lifted content and
-its module-local callback, observer, and fast-path configuration. A change to
-one address-sensitive hook therefore rebuilds only the owning partition. Exact
-generated-source matches can adopt an existing DLL even when conservative
-emitter identity changes. Resumable modules larger than 2,048 instructions are
-emitted as bounded internal functions in the same DLL, limiting Clang optimizer
-latency without adding a runtime compilation or cross-DLL dispatch boundary.
-Use `native_module_cache.warm_hit_count`, `equivalent_source_reuse_count`,
-`ahead_compiled_count`, `source_emit_us`, `compile_wall_us`, and
-`compiler_process_us` to separate cache lookup, emission, wall-clock build time,
-and summed parallel compiler work.
+its module-local callback, observer, fast-path, and preferred-superblock
+configuration. Measured deterministic edges can deliberately co-locate their
+owners even when an owner contains a native fast path; all other fast-path
+owners retain localized rebuilds. Exact generated-source matches can adopt an
+existing DLL even when conservative emitter identity changes. Resumable
+modules larger than 2,048 instructions are emitted as bounded internal
+functions in the same DLL, limiting Clang optimizer latency without adding a
+runtime compilation or cross-DLL dispatch boundary.
+
+Within a generated module, hot guest GPRs, flags, steps, and the step budget
+remain in module-local state. They are committed at module, callback, yield,
+fault, and host-ABI boundaries; memory-observation sites synchronize exact EIP
+and step provenance. Direct-fallthrough runs reserve their safe step allowance
+with one budget check instead of rereading the context for every instruction.
+The original registerization A/B capture also owned same-page callback
+rejection. The accepted post-split emitter now applies that independent check,
+plus coalesced same-page 16-bit and 64-bit accesses, without enabling guest-state
+registerization. `baseline` alone retains the prior per-byte callback-page and
+scalar memory path.
+
+The targeted hot-block package extends the preferred set to 11 measured edges.
+It co-locates the world-state continuation, indexed-state slow/return chain,
+and matrix finite-check call with their owners. Guarded native bodies cover the
+16-byte, 64-byte, and variable push-buffer copy routines, resource binding,
+the common deferred-state flush, and the finite-check leaf. Unsupported state,
+capacity pressure, callback-sensitive memory, and uncommon resource cleanup
+retain the generated guest path. The indexed-draw continuation also consumes
+the known wrapper leaf `ret` only when the step budget and yield state permit.
+Use `native_module_cache.preferred_fusion_edge_count`,
+`available_preferred_fusion_edge_count`, and
+`colocated_preferred_fusion_edge_count` to confirm AOT superblock coverage. Use
+`warm_hit_count`, `equivalent_source_reuse_count`, `ahead_compiled_count`,
+`source_emit_us`, `compile_wall_us`, and `compiler_process_us` to separate cache
+lookup, emission, wall-clock build time, and summed parallel compiler work.
 
 A guest that exits before the first frame is a failure even if its nested
 runner returned zero. Fatal entry or guest-thread execution also makes the

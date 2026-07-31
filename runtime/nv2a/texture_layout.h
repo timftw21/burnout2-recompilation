@@ -45,6 +45,25 @@ inline bool nv2a_texture_format_is_linear(uint32_t format_raw) {
     return color_format == 0x12u || color_format == 0x1Eu;
 }
 
+inline bool nv2a_texture_format_is_cubemap(uint32_t format_raw) {
+    return (format_raw & (1u << 2u)) != 0u;
+}
+
+inline uint32_t nv2a_texture_uncompressed_bytes_per_pixel(
+    uint32_t format_raw
+) {
+    switch ((format_raw >> 8u) & 0xFFu) {
+    case 0x05u: return 2u;
+    case 0x06u:
+    case 0x07u:
+    case 0x12u:
+    case 0x1Eu:
+        return 4u;
+    default:
+        return 0u;
+    }
+}
+
 inline std::pair<uint32_t, uint32_t> nv2a_texture_extent(
     uint32_t format_raw,
     uint32_t image_rect_raw

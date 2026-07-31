@@ -18,6 +18,29 @@ int VulkanPresenter::run() {
     log_.configure_live_mode(
         options_.live_render_stream && !options_.analyze_render_stream_only);
     log_.open(options_.debug_json);
+    if (!options_.command_work_cache_trace.empty()) {
+        if (options_.command_work_cache_trace.has_parent_path()) {
+            std::filesystem::create_directories(
+                options_.command_work_cache_trace.parent_path());
+        }
+        command_work_cache_trace_.open(
+            options_.command_work_cache_trace,
+            std::ios::out | std::ios::trunc);
+        if (!command_work_cache_trace_) {
+            throw std::runtime_error(
+                "failed to open command-work cache trace: "
+                + options_.command_work_cache_trace.string());
+        }
+        command_work_cache_.set_trace_enabled(true);
+        command_work_cache_trace_
+            << "{\"event\":\"command_work_cache_trace_start\","
+            << "\"schema_version\":1,\"runtime_window_bytes\":"
+            << (16u * 1024u) << ",\"runtime_plan_limit\":"
+            << CommandWorkCache::kPlanCapacity
+            << ",\"runtime_byte_limit\":"
+            << CommandWorkCache::kByteCapacity << "}\n";
+        command_work_cache_trace_.flush();
+    }
     log_.emit(
         "startup",
         {
@@ -268,8 +291,12 @@ bool VulkanPresenter::read_live_command_stream_delta(
     last_command_file_open_us_ = 0;
     last_command_file_read_us_ = 0;
     last_command_record_validation_us_ = 0;
+    last_command_transport_provenance_us_ = 0u;
+    last_command_transport_resize_us_ = 0u;
+    last_command_transport_copy_us_ = 0u;
     last_command_read_bytes_ = 0u;
     last_live_command_mmio_count_ = 0u;
+    live_command_span_descriptors_.clear();
     last_command_file_reused_ = path == live_command_file_path_
         && live_command_file_.is_open();
     if (first_record_count < snapshot_base_record_count
@@ -368,9 +395,13 @@ bool VulkanPresenter::read_live_command_span_stream_delta(
     last_command_file_open_us_ = 0;
     last_command_file_read_us_ = 0;
     last_command_record_validation_us_ = 0;
+    last_command_transport_provenance_us_ = 0u;
+    last_command_transport_resize_us_ = 0u;
+    last_command_transport_copy_us_ = 0u;
     last_command_read_bytes_ = 0u;
     last_live_command_mmio_count_ = 0u;
     last_native_command_span_count_ = 0u;
+    live_command_span_descriptors_.clear();
     last_command_file_reused_ = path == live_command_file_path_
         && live_command_file_.is_open();
     if (first_byte_count < snapshot_base_byte_count
@@ -434,40 +465,21 @@ bool VulkanPresenter::read_live_command_span_stream_delta(
     last_command_read_bytes_ = live_command_delta_bytes_.size();
     const auto validation_begin = std::chrono::steady_clock::now();
     uint64_t logical_write_count = 0u;
-    size_t cursor = 0u;
-    while (cursor < live_command_delta_bytes_.size()) {
-        if (live_command_delta_bytes_.size() - cursor
-            < kRecoveredD3DCommandSpanHeaderSize) {
-            live_command_delta_bytes_.clear();
-            return false;
-        }
-        const uint8_t* header = live_command_delta_bytes_.data() + cursor;
-        const uint8_t kind = header[0];
-        const uint8_t flags = header[1];
-        uint32_t payload_size = 0u;
-        uint32_t span_write_count = 0u;
-        std::memcpy(&payload_size, header + 8u, sizeof(payload_size));
-        std::memcpy(
-            &span_write_count,
-            header + 12u,
-            sizeof(span_write_count));
-        cursor += kRecoveredD3DCommandSpanHeaderSize;
-        if (kind > 1u || (flags & ~1u) != 0u || payload_size == 0u
-            || span_write_count == 0u
-            || payload_size > live_command_delta_bytes_.size() - cursor) {
-            live_command_delta_bytes_.clear();
-            return false;
-        }
-        last_live_command_mmio_count_ += static_cast<uint32_t>(kind == 0u);
-        logical_write_count += span_write_count;
-        ++last_native_command_span_count_;
-        cursor += payload_size;
+    if (!decode_command_span_descriptors(
+            live_command_delta_bytes_,
+            live_command_span_descriptors_,
+            &logical_write_count,
+            &last_live_command_mmio_count_)) {
+        live_command_delta_bytes_.clear();
+        return false;
     }
+    last_native_command_span_count_ = live_command_span_descriptors_.size();
     last_command_record_validation_us_ = std::chrono::duration_cast<
         std::chrono::microseconds>(
             std::chrono::steady_clock::now() - validation_begin).count();
     if (logical_write_count != expected_logical_write_count) {
         live_command_delta_bytes_.clear();
+        live_command_span_descriptors_.clear();
         return false;
     }
     last_native_command_read_count_ = static_cast<size_t>(logical_write_count);
@@ -483,16 +495,27 @@ bool VulkanPresenter::read_live_command_span_transport_delta(
     last_command_file_open_us_ = 0;
     last_command_file_read_us_ = 0;
     last_command_record_validation_us_ = 0;
+    last_command_transport_provenance_us_ = 0u;
+    last_command_transport_resize_us_ = 0u;
+    last_command_transport_copy_us_ = 0u;
     last_command_read_bytes_ = 0u;
     last_live_command_mmio_count_ = 0u;
     last_native_command_span_count_ = 0u;
+    live_command_span_descriptors_.clear();
     last_command_file_reused_ = true;
     last_native_command_read_count_ = 0u;
     const auto read_begin = std::chrono::steady_clock::now();
-    if (!transport_.read_command_bytes(
-            first_byte_count,
-            required_byte_count,
-            live_command_delta_bytes_)) {
+    LiveCommandReadTiming command_read_timing{};
+    const bool command_read = transport_.read_command_bytes(
+        first_byte_count,
+        required_byte_count,
+        live_command_delta_bytes_,
+        &command_read_timing);
+    last_command_transport_provenance_us_ =
+        command_read_timing.provenance_us;
+    last_command_transport_resize_us_ = command_read_timing.resize_us;
+    last_command_transport_copy_us_ = command_read_timing.copy_us;
+    if (!command_read) {
         return false;
     }
     last_command_file_read_us_ = std::chrono::duration_cast<
@@ -504,37 +527,21 @@ bool VulkanPresenter::read_live_command_span_transport_delta(
     }
     const auto validation_begin = std::chrono::steady_clock::now();
     uint64_t logical_write_count = 0u;
-    size_t cursor = 0u;
-    while (cursor < live_command_delta_bytes_.size()) {
-        if (live_command_delta_bytes_.size() - cursor
-            < kRecoveredD3DCommandSpanHeaderSize) {
-            live_command_delta_bytes_.clear();
-            return false;
-        }
-        const uint8_t* header = live_command_delta_bytes_.data() + cursor;
-        const uint8_t kind = header[0];
-        const uint8_t flags = header[1];
-        uint32_t payload_size = 0u;
-        uint32_t span_write_count = 0u;
-        std::memcpy(&payload_size, header + 8u, 4u);
-        std::memcpy(&span_write_count, header + 12u, 4u);
-        cursor += kRecoveredD3DCommandSpanHeaderSize;
-        if (kind > 1u || (flags & ~1u) != 0u || payload_size == 0u
-            || span_write_count == 0u
-            || payload_size > live_command_delta_bytes_.size() - cursor) {
-            live_command_delta_bytes_.clear();
-            return false;
-        }
-        last_live_command_mmio_count_ += static_cast<uint32_t>(kind == 0u);
-        logical_write_count += span_write_count;
-        ++last_native_command_span_count_;
-        cursor += payload_size;
+    if (!decode_command_span_descriptors(
+            live_command_delta_bytes_,
+            live_command_span_descriptors_,
+            &logical_write_count,
+            &last_live_command_mmio_count_)) {
+        live_command_delta_bytes_.clear();
+        return false;
     }
+    last_native_command_span_count_ = live_command_span_descriptors_.size();
     last_command_record_validation_us_ = std::chrono::duration_cast<
         std::chrono::microseconds>(
             std::chrono::steady_clock::now() - validation_begin).count();
     if (logical_write_count != expected_logical_write_count) {
         live_command_delta_bytes_.clear();
+        live_command_span_descriptors_.clear();
         return false;
     }
     const uint64_t capture_end = live_command_capture_base_byte_count_
@@ -1050,12 +1057,18 @@ bool VulkanPresenter::load_recovered_render_work(
             const uint64_t interpreted_delta =
                 interpret_recovered_d3d_span_append(
                     live_command_delta_bytes_,
-                    interpreted_stream_);
+                    interpreted_stream_,
+                    &command_work_cache_,
+                    live_command_generation_,
+                    &last_command_work_cache_us_,
+                    &live_command_span_descriptors_);
             if (interpreted_delta != expected_delta) {
                 throw std::runtime_error(
                     "bulk live command interpreter returned an incomplete delta");
             }
         } else {
+            last_command_work_cache_us_ = 0u;
+            command_work_cache_.mark_unused();
             if (expected_delta
                 != live_command_delta_bytes_.size()
                     / kRecoveredD3DCommandRecordSize) {
@@ -1071,6 +1084,8 @@ bool VulkanPresenter::load_recovered_render_work(
             target_command_count);
         interpreted_source_command_byte_count_ = target_command_byte_count;
     } else {
+        last_command_work_cache_us_ = 0u;
+        command_work_cache_.mark_unused();
         interpreted_stream_ = interpret_recovered_d3d_stream(
             recovered_source_.commands,
             recovered_source_.interpreter_bootstrap_source);
@@ -1116,7 +1131,109 @@ bool VulkanPresenter::load_recovered_render_work(
         live_render_write_time_ = std::filesystem::last_write_time(
             options_.render_stream_json, error);
     }
+    write_command_work_cache_trace();
     return true;
+}
+
+void VulkanPresenter::write_command_work_cache_trace() {
+    if (!command_work_cache_trace_) {
+        return;
+    }
+    const b2r::host::CommandWorkCacheTraceReload& trace =
+        command_work_cache_.trace();
+    if (trace.epoch.empty() && trace.segments.empty()
+        && trace.lookups.empty()) {
+        return;
+    }
+    auto layout_id = [](uint64_t value) {
+        std::ostringstream out;
+        out << std::hex << std::setfill('0') << std::setw(16) << value;
+        return out.str();
+    };
+    const uint32_t profile_state = transport_.active()
+        ? transport_.hot_path_profile_state()
+        : b2r::live_transport::kLiveHotPathProfileDisabled;
+    const char* profile_state_name = "disabled";
+    if (profile_state == b2r::live_transport::kLiveHotPathProfileArmed) {
+        profile_state_name = "armed";
+    } else if (profile_state
+               == b2r::live_transport::kLiveHotPathProfileActive) {
+        profile_state_name = "active";
+    } else if (profile_state
+               == b2r::live_transport::kLiveHotPathProfileComplete) {
+        profile_state_name = "complete";
+    }
+    command_work_cache_trace_
+        << "{\"event\":\"command_work_cache_reload\","
+        << "\"schema_version\":1,\"reload\":"
+        << ++command_work_cache_trace_reload_count_
+        << ",\"epoch\":" << json_string(trace.epoch)
+        << ",\"cacheable\":" << json_bool(trace.cacheable)
+        << ",\"epoch_changed\":" << json_bool(trace.epoch_changed)
+        << ",\"profile_capture_state\":"
+        << json_string(profile_state_name)
+        << ",\"segments\":[";
+    for (size_t segment_index = 0u;
+         segment_index < trace.segments.size();
+         ++segment_index) {
+        if (segment_index != 0u) {
+            command_work_cache_trace_ << ',';
+        }
+        command_work_cache_trace_ << '[';
+        const auto& segment = trace.segments[segment_index];
+        for (size_t descriptor_index = 0u;
+             descriptor_index < segment.descriptors.size();
+             ++descriptor_index) {
+            if (descriptor_index != 0u) {
+                command_work_cache_trace_ << ',';
+            }
+            const auto& descriptor = segment.descriptors[descriptor_index];
+            command_work_cache_trace_
+                << "{\"address\":" << descriptor.relative_address
+                << ",\"size\":" << descriptor.payload_size << '}';
+        }
+        command_work_cache_trace_ << ']';
+    }
+    command_work_cache_trace_ << "],\"windows\":[";
+    for (size_t lookup_index = 0u;
+         lookup_index < trace.lookups.size();
+         ++lookup_index) {
+        if (lookup_index != 0u) {
+            command_work_cache_trace_ << ',';
+        }
+        const auto& lookup = trace.lookups[lookup_index];
+        command_work_cache_trace_
+            << "{\"layout_id\":" << json_string(layout_id(lookup.layout_id))
+            << ",\"plan_bytes\":" << lookup.plan_bytes
+            << ",\"hit\":" << json_bool(lookup.hit)
+            << ",\"retained\":" << json_bool(lookup.retained)
+            << ",\"reuse_distance\":";
+        if (lookup.has_reuse_distance) {
+            command_work_cache_trace_ << lookup.reuse_distance;
+        } else {
+            command_work_cache_trace_ << "null";
+        }
+        command_work_cache_trace_ << ",\"evictions\":[";
+        for (size_t eviction_index = 0u;
+             eviction_index < lookup.evictions.size();
+             ++eviction_index) {
+            if (eviction_index != 0u) {
+                command_work_cache_trace_ << ',';
+            }
+            const auto& eviction = lookup.evictions[eviction_index];
+            command_work_cache_trace_
+                << "{\"layout_id\":"
+                << json_string(layout_id(eviction.layout_id))
+                << ",\"plan_bytes\":" << eviction.plan_bytes
+                << ",\"unused_lookups\":"
+                << eviction.unused_lookup_count << '}';
+        }
+        command_work_cache_trace_ << "]}";
+    }
+    command_work_cache_trace_ << "]}\n";
+    if (command_work_cache_trace_reload_count_ % 120u == 0u) {
+        command_work_cache_trace_.flush();
+    }
 }
 
 void VulkanPresenter::destroy_native_render_resources(
@@ -1328,6 +1445,7 @@ void VulkanPresenter::reload_live_render_work(bool publication_signaled) {
         presentation_ack_end = std::chrono::steady_clock::now();
     }
     ++live_render_reload_count_;
+    const auto& command_cache_metrics = command_work_cache_.metrics();
     log_.emit(
         "live_render_stream_reloaded",
         {
@@ -1367,6 +1485,12 @@ void VulkanPresenter::reload_live_render_work(bool publication_signaled) {
                 last_command_file_read_us_)},
             {"command_record_validation_us", std::to_string(
                 last_command_record_validation_us_)},
+            {"command_transport_provenance_us", std::to_string(
+                last_command_transport_provenance_us_)},
+            {"command_transport_resize_us", std::to_string(
+                last_command_transport_resize_us_)},
+            {"command_transport_copy_us", std::to_string(
+                last_command_transport_copy_us_)},
             {"interpreted_source_commands", std::to_string(interpreted_source_command_count_)},
             {"interpreted_command_delta", std::to_string(last_interpreted_command_delta_)},
             {"pending_method_packet", json_bool(interpreted_stream_.pending_method_packet)},
@@ -1436,6 +1560,42 @@ void VulkanPresenter::reload_live_render_work(bool publication_signaled) {
             {"source_load_us", std::to_string(last_source_load_us_)},
             {"interpret_us", std::to_string(last_interpret_us_)},
             {"method_interpret_us", std::to_string(last_method_interpret_us_)},
+            {"command_work_cache_us", std::to_string(
+                last_command_work_cache_us_)},
+            {"command_work_cache_hit", json_bool(
+                command_cache_metrics.last_hit)},
+            {"command_work_cacheable", json_bool(
+                command_cache_metrics.last_cacheable)},
+            {"command_work_cache_words", std::to_string(
+                command_cache_metrics.last_word_count)},
+            {"command_work_cache_segments", std::to_string(
+                command_cache_metrics.last_segment_count)},
+            {"command_work_cache_segment_hits", std::to_string(
+                command_cache_metrics.last_segment_hit_count)},
+            {"command_work_cache_segment_builds", std::to_string(
+                command_cache_metrics.last_segment_build_count)},
+            {"command_work_cache_windows", std::to_string(
+                command_cache_metrics.last_segment_count)},
+            {"command_work_cache_window_hits", std::to_string(
+                command_cache_metrics.last_segment_hit_count)},
+            {"command_work_cache_window_builds", std::to_string(
+                command_cache_metrics.last_segment_build_count)},
+            {"command_work_cache_lookups", std::to_string(
+                command_cache_metrics.lookup_count)},
+            {"command_work_cache_hits", std::to_string(
+                command_cache_metrics.hit_count)},
+            {"command_work_cache_builds", std::to_string(
+                command_cache_metrics.build_count)},
+            {"command_work_cache_fallbacks", std::to_string(
+                command_cache_metrics.fallback_count)},
+            {"command_work_cache_evictions", std::to_string(
+                command_cache_metrics.eviction_count)},
+            {"command_work_cache_epoch_changes", std::to_string(
+                command_cache_metrics.epoch_change_count)},
+            {"command_work_cache_resident_plans", std::to_string(
+                command_cache_metrics.resident_plan_count)},
+            {"command_work_cache_resident_bytes", std::to_string(
+                command_cache_metrics.resident_bytes)},
             {"push_buffer_collect_us", std::to_string(
                 interpreted_stream_.last_push_buffer_collect_us)},
             {"method_apply_us", std::to_string(
@@ -1448,6 +1608,10 @@ void VulkanPresenter::reload_live_render_work(bool publication_signaled) {
                 interpreted_stream_.last_bulk_indexed_method_count)},
             {"bulk_inline_method_delta", std::to_string(
                 interpreted_stream_.last_bulk_inline_method_count)},
+            {"bulk_state_method_delta", std::to_string(
+                interpreted_stream_.last_bulk_state_method_count)},
+            {"state_method_noop_delta", std::to_string(
+                interpreted_stream_.last_state_method_noop_count)},
             {"state_seed_updates_required", json_bool(
                 interpreted_stream_.state_seed_updates_required)},
             {"indexed_materialize_us", std::to_string(

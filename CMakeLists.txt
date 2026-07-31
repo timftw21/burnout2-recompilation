@@ -116,8 +116,11 @@ if(BUILD_TESTING)
     set(B2R_HOST_CORE_TEST_CASES
         transport_layout_and_sequences
         texture_layout_and_formats
+        native_pipeline_primitives
+        nv2a_raster_coordinates
         texture_unswizzle
         dirty_range_lifetime
+        command_work_cache_layout_reuse
         pipeline_key_and_fps_sampler
     )
     foreach(test_case IN LISTS B2R_HOST_CORE_TEST_CASES)

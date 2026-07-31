@@ -26,6 +26,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <unordered_map>
@@ -33,6 +34,7 @@
 #include <utility>
 #include <vector>
 
+#include "command_work_cache.h"
 #include "dirty_ranges.h"
 #include "frame_metrics.h"
 #include "live_presenter_transport.h"
@@ -42,6 +44,7 @@
 #include "presenter_metrics.h"
 #include "presenter_options.h"
 #include "vulkan_presenter.h"
+#include "../nv2a/raster_coordinates.h"
 #include "../nv2a/texture_layout.h"
 #include "../platform/sdl/sdl_platform.h"
 #include "nv2a_vertex_program.h"
@@ -49,11 +52,16 @@
 namespace b2r::host::vulkan_detail {
 
 using b2r::host::CompletedFlipFpsSampler;
+using b2r::host::CommandSpanDescriptor;
+using b2r::host::CommandWorkCache;
+using b2r::host::decode_command_span_descriptors;
 using b2r::host::DirtyRange;
 using b2r::host::NativePipelineState;
 using b2r::host::NativePipelineStateHash;
+using b2r::host::native_pipeline_primitive_supported;
 using DebugLog = b2r::host::PresenterDebugLog;
 using Options = b2r::host::PresenterOptions;
+using b2r::host::LiveCommandReadTiming;
 using b2r::host::LivePresenterTransport;
 using b2r::host::PresenterMetricsReporter;
 using b2r::host::PresenterMetricsSnapshot;
@@ -66,7 +74,9 @@ using b2r::host::append_dirty_range;
 using b2r::host::dirty_range_bytes;
 using namespace b2r::live_transport;
 using b2r::nv2a::nv2a_canonical_resource_address;
+using b2r::nv2a::nv2a_screen_coordinate_to_vulkan_ndc;
 using b2r::nv2a::nv2a_texture_extent;
+using b2r::nv2a::nv2a_texture_format_is_cubemap;
 using b2r::nv2a::nv2a_texture_format_is_linear;
 using b2r::nv2a::nv2a_texture_format_matches;
 using b2r::nv2a::nv2a_unswizzle_texture_2d;
@@ -209,6 +219,7 @@ struct NativeVertex {
     float v = 0.0f;
     float texture_r = 0.0f;
     float texture_q = 1.0f;
+    std::array<std::array<float, 4>, 4> texture_coordinates{};
     bool program_position_valid = false;
     bool program_inputs_valid = false;
     std::array<std::array<float, 4>, 16> program_inputs{};
@@ -476,6 +487,8 @@ struct PresentedDrawTransformDiagnostics {
     ScalarBounds final_v_bounds{};
     ScalarBounds final_q_bounds{};
     ScalarBounds final_fog_bounds{};
+    std::array<std::array<ScalarBounds, 4>, 4>
+        final_texture_coordinate_bounds{};
     uint32_t positive_area_triangle_count = 0;
     uint32_t negative_area_triangle_count = 0;
     uint32_t degenerate_triangle_count = 0;
@@ -509,6 +522,13 @@ struct RecoveredTextureResource {
     std::vector<uint8_t> payload;
 };
 
+struct NativeSurfaceClear {
+    uint32_t surface_color_offset = 0;
+    uint32_t flags = 0;
+    uint32_t color_argb = 0;
+    uint32_t draw_index = 0;
+};
+
 struct HostTexture {
     uint32_t guest_address = 0;
     uint32_t width = 0;
@@ -517,6 +537,7 @@ struct HostTexture {
     std::string content_hash;
     VkFormat image_format = VK_FORMAT_R8G8B8A8_UNORM;
     uint32_t mip_levels = 1;
+    bool cubemap = false;
     bool render_target_feedback = false;
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -563,13 +584,13 @@ struct NativeTextureConvertPushConstants {
 
 static_assert(sizeof(NativeTextureConvertPushConstants) == 32u);
 
-struct HostTextureBindingSpec {
+struct HostTextureStageBindingSpec {
     size_t texture_index = 0;
     uint32_t address = 0;
     uint32_t format = 0;
     uint32_t control = 0;
     uint32_t filter = 0;
-    bool operator==(const HostTextureBindingSpec& other) const {
+    bool operator==(const HostTextureStageBindingSpec& other) const {
         return texture_index == other.texture_index
             && address == other.address
             && format == other.format
@@ -578,15 +599,28 @@ struct HostTextureBindingSpec {
     }
 };
 
-struct HostTextureBinding {
+struct HostTextureBindingSpec {
+    std::array<HostTextureStageBindingSpec, 4> stages{};
+
+    bool operator==(const HostTextureBindingSpec& other) const {
+        return stages == other.stages;
+    }
+};
+
+struct HostTextureStageBinding {
     size_t texture_index = 0;
     uint32_t address = 0;
     uint32_t format = 0;
     uint32_t control = 0;
     uint32_t filter = 0;
     uint32_t texture_mip_levels = 0;
-    VkImageView texture_view = VK_NULL_HANDLE;
+    VkImageView texture_2d_view = VK_NULL_HANDLE;
+    VkImageView texture_cube_view = VK_NULL_HANDLE;
     VkSampler sampler = VK_NULL_HANDLE;
+};
+
+struct HostTextureBinding {
+    std::array<HostTextureStageBinding, 4> stages{};
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
 };
 
@@ -594,10 +628,11 @@ struct NativeFragmentState {
     uint32_t alpha_test_enable = 0;
     uint32_t alpha_function = 0x0207;
     uint32_t alpha_reference = 0;
-    uint32_t texture_mode = 0;
-    uint32_t texture_alpha_kill = 0;
-    uint32_t texture_opaque_alpha = 0;
-    uint32_t texture_stage = 0;
+    std::array<uint32_t, 4> texture_modes{};
+    uint32_t texture_alpha_kill_mask = 0;
+    uint32_t texture_opaque_alpha_mask = 0;
+    uint32_t texture_cubemap_mask = 0;
+    uint32_t reserved_texture = 0;
     uint32_t combiner_control = 0;
     uint32_t shader_stage_program = 0;
     std::array<uint32_t, 8> combiner_color_inputs{};
@@ -645,11 +680,14 @@ struct NativeVertexProgramState {
     uint32_t reserved1 = 0;
     uint32_t reserved2 = 0;
     uint32_t reserved3 = 0;
+    std::array<uint32_t, 4> texture_linears{};
+    std::array<uint32_t, 4> texture_widths{};
+    std::array<uint32_t, 4> texture_heights{};
 };
 
 static_assert(offsetof(NativeVertexProgramState, transform_program) == 64u);
 static_assert(offsetof(NativeVertexProgramState, raw_attribute_formats) == 5312u);
-static_assert(sizeof(NativeVertexProgramState) == 5712u);
+static_assert(sizeof(NativeVertexProgramState) == 5760u);
 
 struct RenderTargetFeedbackSpec {
     uint32_t address = 0;
@@ -658,6 +696,25 @@ struct RenderTargetFeedbackSpec {
     std::string format = "A8R8G8B8_LINEAR";
     uint32_t producer_address = 0;
     bool offscreen_produced = false;
+    bool cubemap = false;
+    std::array<uint32_t, 6> cubemap_face_producer_addresses{};
+
+    bool producer_matches(uint32_t candidate_address) const {
+        const uint32_t canonical_candidate =
+            nv2a_canonical_resource_address(candidate_address);
+        if (nv2a_canonical_resource_address(producer_address)
+            == canonical_candidate) {
+            return true;
+        }
+        return cubemap && std::any_of(
+            cubemap_face_producer_addresses.begin(),
+            cubemap_face_producer_addresses.end(),
+            [&](uint32_t address) {
+                return address != 0u
+                    && nv2a_canonical_resource_address(address)
+                        == canonical_candidate;
+            });
+    }
 
     bool operator==(const RenderTargetFeedbackSpec& other) const {
         return address == other.address
@@ -665,14 +722,21 @@ struct RenderTargetFeedbackSpec {
             && height == other.height
             && format == other.format
             && producer_address == other.producer_address
-            && offscreen_produced == other.offscreen_produced;
+            && offscreen_produced == other.offscreen_produced
+            && cubemap == other.cubemap
+            && cubemap_face_producer_addresses
+                == other.cubemap_face_producer_addresses;
     }
 };
 
 struct OffscreenRenderTarget {
     RenderTargetFeedbackSpec spec{};
+    uint32_t producer_address = 0;
+    uint32_t array_layer = 0;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
+    VkImage color_image = VK_NULL_HANDLE;
     VkImageView color_view = VK_NULL_HANDLE;
+    bool owns_color_view = false;
     VkImage depth_image = VK_NULL_HANDLE;
     VkDeviceMemory depth_memory = VK_NULL_HANDLE;
     VkImageView depth_view = VK_NULL_HANDLE;
@@ -681,6 +745,11 @@ struct OffscreenRenderTarget {
 bool host_texture_matches_draw(
     const HostTexture& texture,
     const NativeDraw& draw);
+
+bool host_texture_matches_stage(
+    const HostTexture& texture,
+    const NativeDraw& draw,
+    uint32_t stage);
 
 VkSamplerAddressMode nv2a_sampler_address_mode(uint32_t value);
 
@@ -763,9 +832,15 @@ struct InterpretedD3DStream {
     uint32_t interpreted_method_count = 0;
     uint32_t bulk_indexed_method_count = 0;
     uint32_t bulk_inline_method_count = 0;
+    uint32_t bulk_state_method_count = 0;
+    uint32_t state_method_noop_count = 0;
     uint32_t last_interpreted_method_count = 0;
     uint32_t last_bulk_indexed_method_count = 0;
     uint32_t last_bulk_inline_method_count = 0;
+    uint32_t last_bulk_state_method_count = 0;
+    uint32_t last_state_method_noop_count = 0;
+    uint32_t clear_surface_method_count = 0;
+    uint32_t last_clear_surface_method_count = 0;
     uint64_t last_push_buffer_collect_us = 0;
     uint64_t last_method_apply_us = 0;
     uint64_t last_method_finalize_us = 0;
@@ -783,6 +858,7 @@ struct InterpretedD3DStream {
     uint32_t pending_method_count = 0;
     uint32_t pending_method_index = 0;
     uint32_t pending_next_address = 0;
+    uint32_t pending_method_subchannel = 0;
     uint32_t unsupported_draw_arrays_count = 0;
     uint32_t indexed_array_draw_count = 0;
     uint32_t indexed_array_element_count = 0;
@@ -856,6 +932,8 @@ struct InterpretedD3DStream {
     uint32_t frame_draw_begin = 0;
     uint32_t presented_draw_begin = 0;
     uint32_t presented_draw_count = 0;
+    std::vector<NativeSurfaceClear> frame_surface_clears;
+    std::vector<NativeSurfaceClear> presented_surface_clears;
     uint32_t flip_count = 0;
     std::vector<uint32_t> inline_words;
     std::vector<uint32_t> active_vertex_indices;
@@ -1012,6 +1090,30 @@ inline VkClearValue color_from_d3d_argb(uint32_t argb) {
 }
 
 template <typename CommandAt>
+void account_recovered_d3d_commands(
+    size_t command_count,
+    CommandAt command_at,
+    InterpretedD3DStream& interpreted) {
+    for (size_t command_index = 0u;
+         command_index < command_count;
+         ++command_index) {
+        const auto command = command_at(command_index);
+        update_d3d_state_seed(interpreted, command.address);
+        update_d3d_state_seed(interpreted, command.value);
+        if (command.kind != RecoveredD3DCommandKind::MmioWrite) {
+            continue;
+        }
+        const uint32_t offset = command.address - 0xFED00000u;
+        if (offset == 0x0008u) {
+            ++interpreted.submission_kick_count;
+        } else if (offset == 0x0040u || offset == 0x0048u
+                   || offset == 0x004Cu || offset == 0x0050u) {
+            ++interpreted.mmio_setup_write_count;
+        }
+    }
+}
+
+template <typename CommandAt>
 void push_buffer_words_from_recovered_commands(
     size_t command_count,
     CommandAt command_at,
@@ -1034,17 +1136,6 @@ void push_buffer_words_from_recovered_commands(
          command_index < command_count;
          ++command_index) {
         const auto command = command_at(command_index);
-        update_d3d_state_seed(interpreted, command.address);
-        update_d3d_state_seed(interpreted, command.value);
-        if (command.kind == RecoveredD3DCommandKind::MmioWrite) {
-            const uint32_t offset = command.address - 0xFED00000u;
-            if (offset == 0x0008u) {
-                ++interpreted.submission_kick_count;
-            } else if (offset == 0x0040u || offset == 0x0048u
-                       || offset == 0x004Cu || offset == 0x0050u) {
-                ++interpreted.mmio_setup_write_count;
-            }
-        }
         if (command.kind != RecoveredD3DCommandKind::PushBufferWrite
             || command.address < kRecoveredPushBufferBase
             || command.address >= kRecoveredPushBufferEnd) {
@@ -1338,6 +1429,13 @@ void interpret_nv2a_method(
     uint32_t data,
     InterpretedD3DStream& interpreted);
 
+bool nv2a_method_is_batchable_state(uint32_t method);
+
+bool nv2a_state_method_is_unchanged(
+    uint32_t method,
+    uint32_t data,
+    const InterpretedD3DStream& interpreted);
+
 using Nv2aBootstrapMethod = std::pair<uint32_t, uint32_t>;
 
 std::vector<Nv2aBootstrapMethod> native_draw_interpreter_bootstrap_methods(
@@ -1369,11 +1467,16 @@ template <typename CommandAt>
 void interpret_recovered_d3d_command_append(
     size_t command_count,
     CommandAt command_at,
-    InterpretedD3DStream& interpreted) {
+    InterpretedD3DStream& interpreted,
+    bool push_buffer_words_precollected = false,
+    uint64_t precollect_us = 0u) {
     const auto collect_begin = std::chrono::steady_clock::now();
     interpreted.last_interpreted_method_count = 0u;
     interpreted.last_bulk_indexed_method_count = 0u;
     interpreted.last_bulk_inline_method_count = 0u;
+    interpreted.last_bulk_state_method_count = 0u;
+    interpreted.last_state_method_noop_count = 0u;
+    interpreted.last_clear_surface_method_count = 0u;
     interpreted.last_push_buffer_collect_us = 0u;
     interpreted.last_method_apply_us = 0u;
     interpreted.last_method_finalize_us = 0u;
@@ -1386,14 +1489,22 @@ void interpret_recovered_d3d_command_append(
     const uint32_t starting_flip_count = interpreted.flip_count;
     const uint32_t starting_method_count =
         interpreted.interpreted_method_count;
+    const uint32_t starting_clear_surface_method_count =
+        interpreted.clear_surface_method_count;
     const bool surface_payload_scan_required = !interpreted.clear_color_valid;
     std::vector<PushBufferWord>& words =
         interpreted.push_buffer_words_scratch;
-    push_buffer_words_from_recovered_commands(
-        command_count, command_at, interpreted, words);
+    account_recovered_d3d_commands(
+        command_count, command_at, interpreted);
+    if (!push_buffer_words_precollected) {
+        push_buffer_words_from_recovered_commands(
+            command_count, command_at, interpreted, words);
+    }
     const auto after_collect = std::chrono::steady_clock::now();
-    interpreted.last_push_buffer_collect_us = std::chrono::duration_cast<
-        std::chrono::microseconds>(after_collect - collect_begin).count();
+    interpreted.last_push_buffer_collect_us = precollect_us
+        + static_cast<uint64_t>(std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                after_collect - collect_begin).count());
     interpreted.push_buffer_word_count += static_cast<uint32_t>(words.size());
     size_t index = 0;
     interpret_pending_push_buffer_method_packet(words, index, interpreted);
@@ -1486,6 +1597,9 @@ void interpret_recovered_d3d_command_append(
     }
     interpreted.last_interpreted_method_count =
         interpreted.interpreted_method_count - starting_method_count;
+    interpreted.last_clear_surface_method_count =
+        interpreted.clear_surface_method_count
+        - starting_clear_surface_method_count;
     interpreted.last_method_finalize_us = std::chrono::duration_cast<
         std::chrono::microseconds>(
             std::chrono::steady_clock::now() - after_method_apply).count();
@@ -1524,48 +1638,50 @@ inline void interpret_recovered_d3d_packed_append(
 
 inline std::vector<RecoveredD3DCommandSpan> recovered_d3d_command_spans_from_packed(
     const std::vector<uint8_t>& packed_spans,
-    uint64_t* logical_write_count = nullptr) {
-    std::vector<RecoveredD3DCommandSpan> spans;
+    uint64_t* logical_write_count = nullptr,
+    std::vector<CommandSpanDescriptor>* descriptors = nullptr,
+    bool descriptors_validated = false) {
+    std::vector<CommandSpanDescriptor> local_descriptors;
+    std::vector<CommandSpanDescriptor>& decoded = descriptors != nullptr
+        ? *descriptors : local_descriptors;
     uint64_t writes = 0u;
-    size_t cursor = 0u;
-    while (cursor < packed_spans.size()) {
-        if (packed_spans.size() - cursor
-            < kRecoveredD3DCommandSpanHeaderSize) {
-            throw std::runtime_error("packed live command span header is truncated");
+    if (descriptors_validated) {
+        if (descriptors == nullptr) {
+            throw std::runtime_error(
+                "validated command spans require descriptors");
         }
-        const uint8_t* header = packed_spans.data() + cursor;
-        const uint8_t kind = header[0];
-        const uint8_t flags = header[1];
-        uint32_t address = 0u;
-        uint32_t payload_size = 0u;
-        uint32_t span_write_count = 0u;
-        std::memcpy(&address, header + 4u, sizeof(address));
-        std::memcpy(&payload_size, header + 8u, sizeof(payload_size));
-        std::memcpy(&span_write_count, header + 12u, sizeof(span_write_count));
-        cursor += kRecoveredD3DCommandSpanHeaderSize;
-        if (kind > 1u || (flags & ~1u) != 0u || payload_size == 0u
-            || span_write_count == 0u
-            || payload_size > packed_spans.size() - cursor) {
+        for (const CommandSpanDescriptor& descriptor : decoded) {
+            writes += descriptor.logical_write_count;
+        }
+    } else {
+        if (!decode_command_span_descriptors(
+                packed_spans, decoded, &writes)) {
             throw std::runtime_error("packed live command span is invalid");
         }
+    }
+    std::vector<RecoveredD3DCommandSpan> spans;
+    spans.reserve(decoded.size());
+    for (const CommandSpanDescriptor& descriptor : decoded) {
         uint32_t value = 0u;
         std::memcpy(
             &value,
-            packed_spans.data() + cursor,
-            std::min<size_t>(payload_size, sizeof(value)));
+            packed_spans.data() + descriptor.payload_offset,
+            std::min<size_t>(descriptor.payload_size, sizeof(value)));
         spans.push_back({
-            kind == 0u ? RecoveredD3DCommandKind::MmioWrite
-                       : RecoveredD3DCommandKind::PushBufferWrite,
-            address,
+            descriptor.kind == 0u
+                ? RecoveredD3DCommandKind::MmioWrite
+                : RecoveredD3DCommandKind::PushBufferWrite,
+            descriptor.address,
             value,
-            payload_size,
-            {packed_spans.data() + cursor, payload_size},
-            payload_size,
-            span_write_count,
-            flags,
+            descriptor.payload_size,
+            {
+                packed_spans.data() + descriptor.payload_offset,
+                descriptor.payload_size,
+            },
+            descriptor.payload_size,
+            descriptor.logical_write_count,
+            descriptor.flags,
         });
-        writes += span_write_count;
-        cursor += payload_size;
     }
     if (logical_write_count != nullptr) {
         *logical_write_count = writes;
@@ -1575,17 +1691,46 @@ inline std::vector<RecoveredD3DCommandSpan> recovered_d3d_command_spans_from_pac
 
 inline uint64_t interpret_recovered_d3d_span_append(
     const std::vector<uint8_t>& packed_spans,
-    InterpretedD3DStream& interpreted) {
+    InterpretedD3DStream& interpreted,
+    CommandWorkCache* command_work_cache = nullptr,
+    std::string_view command_epoch = {},
+    uint64_t* command_work_cache_us = nullptr,
+    const std::vector<CommandSpanDescriptor>* validated_descriptors = nullptr) {
     uint64_t logical_write_count = 0u;
+    std::vector<CommandSpanDescriptor> decoded_descriptors;
+    if (validated_descriptors != nullptr) {
+        decoded_descriptors = *validated_descriptors;
+    }
     const auto spans = recovered_d3d_command_spans_from_packed(
         packed_spans,
-        &logical_write_count);
+        &logical_write_count,
+        &decoded_descriptors,
+        validated_descriptors != nullptr);
+    const auto cache_begin = std::chrono::steady_clock::now();
+    const bool words_precollected = command_work_cache != nullptr
+        && command_work_cache->materialize(
+            command_epoch,
+            packed_spans,
+            decoded_descriptors,
+            kRecoveredPushBufferBase,
+            kRecoveredPushBufferEnd,
+            interpreted.push_buffer_words_scratch);
+    const uint64_t cache_us = command_work_cache != nullptr
+        ? static_cast<uint64_t>(std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - cache_begin).count())
+        : 0u;
+    if (command_work_cache_us != nullptr) {
+        *command_work_cache_us = cache_us;
+    }
     interpret_recovered_d3d_command_append(
         spans.size(),
         [&](size_t span_index) -> const RecoveredD3DCommandSpan& {
             return spans[span_index];
         },
-        interpreted);
+        interpreted,
+        words_precollected,
+        cache_us);
     return logical_write_count;
 }
 

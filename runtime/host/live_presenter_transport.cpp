@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -411,7 +412,12 @@ std::optional<std::string> LivePresenterTransport::read_manifest_file(
 bool LivePresenterTransport::read_command_bytes(
     uint64_t first_byte_count,
     uint64_t required_byte_count,
-    std::vector<uint8_t>& payload) const {
+    std::vector<uint8_t>& payload,
+    LiveCommandReadTiming* timing) const {
+    if (timing != nullptr) {
+        *timing = {};
+    }
+    const auto provenance_begin = std::chrono::steady_clock::now();
     payload.clear();
     if (!impl_->command_view
         || required_byte_count < first_byte_count
@@ -428,10 +434,22 @@ bool LivePresenterTransport::read_command_bytes(
         return false;
     }
     const uint64_t appended_byte_count = required_byte_count - first_byte_count;
+    const auto before_resize = std::chrono::steady_clock::now();
+    if (timing != nullptr) {
+        timing->provenance_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                before_resize - provenance_begin).count());
+    }
     if (appended_byte_count == 0u) {
         return true;
     }
     payload.resize(static_cast<size_t>(appended_byte_count));
+    const auto before_copy = std::chrono::steady_clock::now();
+    if (timing != nullptr) {
+        timing->resize_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                before_copy - before_resize).count());
+    }
     const uint64_t start = first_byte_count % impl_->command_capacity;
     const size_t first = static_cast<size_t>(std::min<uint64_t>(
         appended_byte_count, impl_->command_capacity - start));
@@ -445,10 +463,21 @@ bool LivePresenterTransport::read_command_bytes(
             impl_->command_view + kLiveCommandDataOffset,
             payload.size() - first);
     }
+    const auto after_copy = std::chrono::steady_clock::now();
+    if (timing != nullptr) {
+        timing->copy_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                after_copy - before_copy).count());
+    }
     MemoryBarrier();
     if (static_cast<uint64_t>(*write_cursor) < required_byte_count) {
         payload.clear();
         return false;
+    }
+    if (timing != nullptr) {
+        timing->provenance_us += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - after_copy).count());
     }
     return true;
 }
