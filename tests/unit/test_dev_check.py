@@ -26,7 +26,51 @@ class DevCheckTests(unittest.TestCase):
             }.issubset(selection.python_tests)
         )
         self.assertIn("aot_representative", selection.nodes)
+        self.assertIn("ia32_phase0", selection.nodes)
+        self.assertIn("ia32_phase1", selection.nodes)
+        self.assertIn("ia32_phase2", selection.nodes)
+        self.assertIn("ia32_phase3", selection.nodes)
+        self.assertIn("ia32_phase4", selection.nodes)
+        self.assertIn("ia32_phase5", selection.nodes)
+        self.assertIn("ia32_phase6", selection.nodes)
+        self.assertIn("ia32_phase7", selection.nodes)
         self.assertFalse(selection.all_python_tests)
+
+    def test_ia32_backend_selects_phase_contract_gates(self) -> None:
+        selection = select_checks(("tools/recomp/ia32_native_backend.py",))
+
+        self.assertIn("ia32_phase0", selection.nodes)
+        self.assertIn("ia32_phase1", selection.nodes)
+        self.assertIn("ia32_phase2", selection.nodes)
+        self.assertIn("ia32_phase3", selection.nodes)
+        self.assertIn("ia32_phase4", selection.nodes)
+        self.assertIn("ia32_phase5", selection.nodes)
+        self.assertIn("ia32_phase6", selection.nodes)
+        self.assertIn("ia32_phase7", selection.nodes)
+        self.assertIn("tests.unit.test_ia32_native_backend", selection.python_tests)
+        self.assertIn("tests.unit.test_ia32_proof_contract", selection.python_tests)
+        self.assertIn("tests.unit.test_ia32_persistent_worker", selection.python_tests)
+        self.assertIn(
+            "tests.unit.test_ia32_decoded_store_artifact",
+            selection.python_tests,
+        )
+        self.assertIn(
+            "tests.unit.test_ia32_architecture_memory",
+            selection.python_tests,
+        )
+        self.assertIn("tests.unit.test_ia32_host_abi", selection.python_tests)
+        self.assertIn("tests.unit.test_ia32_resident_scheduler", selection.python_tests)
+        self.assertIn("tests.unit.test_ia32_coverage_growth", selection.python_tests)
+        self.assertIn("tests.unit.test_ia32_launcher_cutover", selection.python_tests)
+
+    def test_phase2_xbe_fixture_selects_decoded_store_gate(self) -> None:
+        selection = select_checks(("tools/xbe/synthetic_fixture.py",))
+
+        self.assertIn("ia32_phase2", selection.nodes)
+        self.assertIn(
+            "tests.unit.test_ia32_decoded_store_artifact",
+            selection.python_tests,
+        )
 
     def test_unmapped_source_falls_back_to_all_python_tests(self) -> None:
         selection = select_checks(("tools/new_guest_semantics.py",))

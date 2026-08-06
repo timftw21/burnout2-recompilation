@@ -16,3 +16,6 @@ Clang/LLVM, Vulkan, SDL3, CMake, and Ninja remain governed by their own
 licenses and are not relicensed by this repository.
 
 See [docs/ASSET_POLICY.md](docs/ASSET_POLICY.md) for the contribution boundary.
+The maintainer-approved milestone screenshots under `docs/images/` are captured
+game output used only for project documentation; they are not covered by the
+MIT license.

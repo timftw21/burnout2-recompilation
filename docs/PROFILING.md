@@ -6,6 +6,12 @@ event, resource, pipeline, barrier, and pass-structure questions. The existing
 `--profile-hot-paths` counters are reserved for guest-semantic attribution that
 those tools cannot provide.
 
+The current Phase 7 static artifact does not yet reach the historical Lesson
+One performance workload: it stops at a fail-closed new-save coverage boundary.
+Until that path is restored, label static-backend captures as boot/frontend
+correctness evidence. Historical Lesson One captures remain useful baselines,
+but they are not measurements of the current artifact.
+
 The in-process profiler is native-clean and windowed. Start
 `live_test.py --profile-hot-paths`, navigate while the title
 shows `ARMED`, press F10 to begin the representative workload, press F10 again
@@ -66,9 +72,9 @@ The workflow searches `PATH`, the Windows Performance Toolkit, `%RENDERDOC_HOME%
 
 ## CPU and GPU scheduling capture
 
-First make one ordinary diagnostics-off run so the presenter and native-module
-caches are warm. Then open **PowerShell as Administrator**, change to the
-repository root, and run:
+First make one ordinary diagnostics-off run for the backend being measured so
+its presenter and native-module caches are warm. Then open **PowerShell as
+Administrator**, change to the repository root, and run:
 
 ```powershell
 python .\tools\profiling\system_profile.py capture-etw
@@ -82,11 +88,13 @@ then launches exactly:
 python .\tools\playability\live_test.py --no-diagnostics --skip-host-build
 ```
 
-Reach the same stable Lesson One segment used for the manual baseline, drive it
-for 20-30 seconds, and close the presenter normally. The wrapper stops and
-compresses the ETL in a `reports/local/profiling/etw-*` directory even when the
-live command fails. If WPR cannot stop cleanly, it cancels only the session it
-started and marks the capture incomplete.
+For a backend that can reach the historical stable Lesson One segment, drive
+that exact workload for 20-30 seconds and close the presenter normally. For the
+current static backend, capture only the reachable frontend and name that scope
+in the report. The wrapper stops and compresses the ETL in a
+`reports/local/profiling/etw-*` directory even when the live command fails. If
+WPR cannot stop cleanly, it cancels only the session it started and marks the
+capture incomplete.
 
 Each capture contains:
 
@@ -97,12 +105,16 @@ Each capture contains:
   process/thread context-switch CPU, process/thread/image identity, and trace
   loss statistics.
 
-Open the ETL in WPA and filter to the live Python process. The important threads
-are named `b2-guest-runtime` and `b2-presenter-vulkan`. Inspect:
+Open the ETL in WPA and select the processes for the backend under test. The
+static path uses `b2r-ia32-slice.exe` for the 32-bit guest and
+`b2_first_frame.exe` for the 64-bit presenter; Python is launch/report
+orchestration only. The diagnostic oracle may use a different native process
+layout. Prefer process IDs from the matching run manifest over names alone.
+Inspect:
 
 1. **CPU Usage (Sampled):** inclusive/exclusive stacks and modules on the guest
-   thread; distinguish generated native modules, dispatcher, Python, audio, and
-   presenter work.
+   thread; distinguish generated native modules, dispatcher, host services,
+   audio, presenter work, and any unexpected Python activity.
 2. **CPU Usage (Precise):** running, ready, and waiting time by thread, wait
    reason, and core. This decides whether the guest is compute-bound, blocked,
    or being descheduled.
@@ -112,11 +124,12 @@ are named `b2-guest-runtime` and `b2-presenter-vulkan`. Inspect:
 4. **Trace statistics:** reject a trace with lost sampled-profile, context-switch,
    or GPU events before making a performance claim.
 
-The first accepted capture is `etw-20260723-185742`. Its guest thread used
+The first accepted historical capture is `etw-20260723-185742`. Its guest thread used
 93.32% of one logical core while the Vulkan presenter maintained 58.44
 presents/s. Sample attribution concentrated in `python314.dll` with `_ctypes`
 on most inclusive stacks, so the next CPU question is inside the remaining
-Python/native boundary rather than the presenter or GPU queue.
+Python/native boundary rather than the presenter or GPU queue. This predates
+the current static IA-32 process seam and must not be presented as its profile.
 
 Open the same trace directly when needed:
 
@@ -141,11 +154,12 @@ doctor paths. Then run from a normal PowerShell:
 python .\tools\profiling\system_profile.py capture-renderdoc
 ```
 
-Reach the representative gameplay segment, press F12 once, then close the
-presenter. Diagnostics-off mode leaves the application's screenshot path
-disabled, so F12 is available to RenderDoc. The resulting `.rdc` files and the
-exact RenderDoc executable hash are recorded under
-`reports/local/profiling/renderdoc-*`.
+Reach the representative workload available to the selected backend, press F12
+once, then close the presenter. Diagnostics-off mode leaves the application's
+screenshot path disabled, so F12 is available to RenderDoc. The resulting
+`.rdc` files and exact RenderDoc executable hash are recorded under
+`reports/local/profiling/renderdoc-*`. A frontend-only static capture must be
+labeled as such.
 
 RenderDoc injection and capture alter pacing. Use the capture to inspect the
 event browser, render/compute passes, draw and dispatch population, barriers,

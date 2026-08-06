@@ -10,16 +10,37 @@ from tools.playability.replay_capsule import load_replay_capsule
 from tools.recomp.debug_metadata import (
     build_module_debug_metadata,
     generated_body,
+    guest_address_ranges,
     load_native_debug_index,
     lookup_guest_address,
     write_module_debug_metadata,
     write_native_debug_index,
 )
 from tools.recomp.native_executor import NativeResumableExecutor
-from tools.recomp.x86_lifter import CpuState, SparseMemory, emit_cpp, lift_x86_function
+from tools.recomp.x86_lifter import (
+    CpuState,
+    LiftedFunction,
+    SparseMemory,
+    X86Instruction,
+    emit_cpp,
+    lift_x86_function,
+)
 
 
 class NativeDebugMetadataTests(unittest.TestCase):
+    def test_alternate_instruction_entries_coalesce_into_one_owned_range(self) -> None:
+        function = LiftedFunction(
+            symbol="overlapping_entries",
+            base_address=0x11440,
+            code_size=6,
+            instructions=(
+                X86Instruction(0x11440, 6, "add"),
+                X86Instruction(0x11441, 1, "ret"),
+            ),
+        )
+
+        self.assertEqual(guest_address_ranges(function), ((0x11440, 0x11446),))
+
     def test_generated_cases_map_to_ir_blocks_and_source_lines(self) -> None:
         function = lift_x86_function(
             bytes.fromhex("40890500200000C3"),

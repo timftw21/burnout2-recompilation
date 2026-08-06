@@ -1,5 +1,6 @@
 #include "vulkan_presenter_runtime.h"
 #include "live_transport_layout.h"
+#include "../platform/sdl/sdl_audio.h"
 
 namespace b2r::host::vulkan_detail {
 
@@ -618,10 +619,16 @@ void VulkanPresenter::list_adapters() {
 void VulkanPresenter::create_window() {
     platform_.create_window(
         narrow(options_.title), options_.width, options_.height);
+    if (!options_.window_icon.empty()) {
+        platform_.set_window_icon(options_.window_icon);
+    }
     log_.emit(
         "window_created",
         {
             {"title", json_string(narrow(options_.title))},
+            {"window_icon", options_.window_icon.empty()
+                ? "null"
+                : json_string(options_.window_icon.string())},
             {"width", std::to_string(options_.width)},
             {"height", std::to_string(options_.height)},
         });
@@ -1133,6 +1140,35 @@ bool VulkanPresenter::load_recovered_render_work(
     }
     write_command_work_cache_trace();
     return true;
+}
+
+void VulkanPresenter::consume_live_audio() {
+    if (!transport_.read_audio_pcm(live_audio_payload_)) {
+        return;
+    }
+    auto& audio = b2r::platform::SdlAudioOutput::instance();
+    if (!audio.open() || !audio.queue(
+            live_audio_payload_.data(), live_audio_payload_.size())) {
+        const auto status = audio.status();
+        log_.emit(
+            "audio_submit_failed",
+            {
+                {"payload_bytes", std::to_string(live_audio_payload_.size())},
+                {"error", json_string(status.last_error)},
+            });
+        return;
+    }
+    ++live_audio_buffer_count_;
+    live_audio_byte_count_ += live_audio_payload_.size();
+    if (live_audio_buffer_count_ == 1u) {
+        log_.emit(
+            "audio_stream_opened",
+            {
+                {"sample_rate", "48000"},
+                {"channels", "2"},
+                {"format", json_string("s16")},
+            });
+    }
 }
 
 void VulkanPresenter::write_command_work_cache_trace() {
@@ -1906,6 +1942,7 @@ void VulkanPresenter::main_loop() {
         if (!running_) {
             break;
         }
+        consume_live_audio();
         const auto reload_dispatch_begin = std::chrono::steady_clock::now();
         reload_live_render_work();
         last_reload_dispatch_us_ = static_cast<uint64_t>(
@@ -2259,6 +2296,23 @@ uint32_t VulkanPresenter::handle_platform_result(PlatformPollResult result) {
         closed_by_user_ = true;
         running_ = false;
     }
+    if (result.request_replay_capture) {
+        const uint32_t state = transport_.request_replay_capture();
+        const bool requested =
+            state == b2r::live_transport::kLiveReplayCaptureRequested;
+        if (requested) {
+            platform_.set_window_title(
+                narrow(options_.title) + " | Replay capture REQUESTED");
+        }
+        log_.emit(
+            "replay_capture",
+            {
+                {"state", json_string(requested ? "requested" : "disabled")},
+                {"frame", std::to_string(frame_count_ + 1u)},
+                {"guest_flip_count", std::to_string(
+                    current_manifest_guest_flip_count_)},
+            });
+    }
     if (result.toggle_fps_counter) {
         toggle_fps_counter();
     }
@@ -2306,7 +2360,19 @@ void VulkanPresenter::initialize_live_control_transport() {
         return;
     }
     const auto info = transport_.open(options_.live_control_transport_name);
-    if (transport_.hot_path_profile_state()
+    if (transport_.replay_capture_state()
+        == b2r::live_transport::kLiveReplayCaptureArmed) {
+        platform_.set_window_title(
+            narrow(options_.title) + " | Replay capture ARMED (F8 to capture)");
+        log_.emit(
+            "replay_capture",
+            {
+                {"state", json_string("armed")},
+                {"frame", std::to_string(frame_count_)},
+                {"guest_flip_count", std::to_string(
+                    current_manifest_guest_flip_count_)},
+            });
+    } else if (transport_.hot_path_profile_state()
         == b2r::live_transport::kLiveHotPathProfileArmed) {
         platform_.set_window_title(
             narrow(options_.title) + " | Hot-path capture ARMED (F10 to start)");
@@ -2314,6 +2380,18 @@ void VulkanPresenter::initialize_live_control_transport() {
             "hot_path_profile_capture",
             {
                 {"state", json_string("armed")},
+                {"frame", std::to_string(frame_count_)},
+                {"guest_flip_count", std::to_string(
+                    current_manifest_guest_flip_count_)},
+            });
+    } else if (transport_.hot_path_profile_state()
+        == b2r::live_transport::kLiveHotPathProfileActive) {
+        platform_.set_window_title(
+            narrow(options_.title) + " | Hot-path capture ACTIVE (F10 to stop)");
+        log_.emit(
+            "hot_path_profile_capture",
+            {
+                {"state", json_string("active")},
                 {"frame", std::to_string(frame_count_)},
                 {"guest_flip_count", std::to_string(
                     current_manifest_guest_flip_count_)},

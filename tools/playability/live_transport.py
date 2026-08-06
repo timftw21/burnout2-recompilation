@@ -22,6 +22,11 @@ HOT_PATH_PROFILE_STATE_DISABLED = 0
 HOT_PATH_PROFILE_STATE_ARMED = 1
 HOT_PATH_PROFILE_STATE_ACTIVE = 2
 HOT_PATH_PROFILE_STATE_COMPLETE = 3
+_REPLAY_CAPTURE_STATE_OFFSET = 40
+REPLAY_CAPTURE_STATE_DISABLED = 0
+REPLAY_CAPTURE_STATE_ARMED = 1
+REPLAY_CAPTURE_STATE_REQUESTED = 2
+REPLAY_CAPTURE_STATE_COMPLETE = 3
 _CONTROLLER_SEQUENCE_OFFSET = 64
 _CONTROLLER_PAYLOAD_OFFSET = 68
 _CONTROLLER_PAYLOAD = struct.Struct("<HBBhhhhBBH")
@@ -31,6 +36,7 @@ _PRESENTATION_PAYLOAD = struct.Struct("<QQ")
 _MANIFEST_SEQUENCE_OFFSET = 256
 _MANIFEST_SIZE_OFFSET = 260
 _MANIFEST_PAYLOAD_OFFSET = 264
+_MANIFEST_PAYLOAD_CAPACITY = 8192 - _MANIFEST_PAYLOAD_OFFSET
 _MANIFEST_MAGIC = b"B2MAN001"
 _MANIFEST_HEADER = struct.Struct("<8sII")
 _MANIFEST_RECORD = struct.Struct("<HBBI")
@@ -181,10 +187,19 @@ class LiveControlTransport:
     def stop_requested(self) -> bool:
         return bool(_U32.unpack_from(self._mapping, _STOP_REQUESTED_OFFSET)[0])
 
-    def configure_hot_path_profile(self, enabled: bool) -> None:
-        """Arm a native profiling window without collecting navigation/boot work."""
+    def configure_hot_path_profile(
+        self,
+        enabled: bool,
+        *,
+        start_active: bool = False,
+    ) -> None:
+        """Arm profiling, optionally including boot from the first dispatch."""
         state = (
-            HOT_PATH_PROFILE_STATE_ARMED
+            (
+                HOT_PATH_PROFILE_STATE_ACTIVE
+                if start_active
+                else HOT_PATH_PROFILE_STATE_ARMED
+            )
             if enabled
             else HOT_PATH_PROFILE_STATE_DISABLED
         )
@@ -196,6 +211,32 @@ class LiveControlTransport:
                 self._mapping,
                 _HOT_PATH_PROFILE_STATE_OFFSET,
             )[0]
+        )
+
+    def configure_replay_capture(self, enabled: bool) -> None:
+        state = REPLAY_CAPTURE_STATE_ARMED if enabled else REPLAY_CAPTURE_STATE_DISABLED
+        _U32.pack_into(self._mapping, _REPLAY_CAPTURE_STATE_OFFSET, state)
+
+    def replay_capture_state(self) -> int:
+        return int(
+            _U32.unpack_from(
+                self._mapping,
+                _REPLAY_CAPTURE_STATE_OFFSET,
+            )[0]
+        )
+
+    def request_replay_capture(self) -> int:
+        state = self.replay_capture_state()
+        if state == REPLAY_CAPTURE_STATE_ARMED:
+            state = REPLAY_CAPTURE_STATE_REQUESTED
+            _U32.pack_into(self._mapping, _REPLAY_CAPTURE_STATE_OFFSET, state)
+        return state
+
+    def complete_replay_capture(self) -> None:
+        _U32.pack_into(
+            self._mapping,
+            _REPLAY_CAPTURE_STATE_OFFSET,
+            REPLAY_CAPTURE_STATE_COMPLETE,
         )
 
     def buffer_address(self) -> int:
@@ -346,7 +387,7 @@ class LiveControlTransport:
             )
         )
         payload.extend(records)
-        capacity = LIVE_CONTROL_SIZE - _MANIFEST_PAYLOAD_OFFSET
+        capacity = _MANIFEST_PAYLOAD_CAPACITY
         if len(payload) > capacity:
             raise LiveControlTransportError(
                 f"live manifest is too large: {len(payload)}/{capacity} bytes"
@@ -383,7 +424,7 @@ class LiveControlTransport:
             confirmed == sequence
             and not confirmed & 1
             and _MANIFEST_HEADER.size <= payload_size
-            <= LIVE_CONTROL_SIZE - _MANIFEST_PAYLOAD_OFFSET
+            <= _MANIFEST_PAYLOAD_CAPACITY
         )
 
     def read_manifest(self) -> dict[str, object] | None:
@@ -397,7 +438,7 @@ class LiveControlTransport:
         )[0]
         if not (
             _MANIFEST_HEADER.size <= payload_size
-            <= LIVE_CONTROL_SIZE - _MANIFEST_PAYLOAD_OFFSET
+            <= _MANIFEST_PAYLOAD_CAPACITY
         ):
             return None
         payload = bytes(
@@ -449,6 +490,7 @@ class LiveControlTransport:
         return {
             "stop_requested": int(self.stop_requested()),
             "hot_path_profile_state": self.hot_path_profile_state(),
+            "replay_capture_state": self.replay_capture_state(),
             "manifest_sequence": _U32.unpack_from(
                 self._mapping,
                 _MANIFEST_SEQUENCE_OFFSET,

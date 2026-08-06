@@ -10,6 +10,16 @@ from tools.playability import live_transport
 
 @unittest.skipUnless(os.name == "nt", "named pagefile mappings require Windows")
 class LiveControlTransportTests(unittest.TestCase):
+    def test_boot_profile_can_start_active_before_the_guest_opens_mapping(self) -> None:
+        name = live_transport.live_control_transport_name(str(uuid.uuid4()))
+        with live_transport.LiveControlTransport.create(name) as owner:
+            owner.configure_hot_path_profile(True, start_active=True)
+            with live_transport.LiveControlTransport.open(name) as guest:
+                self.assertEqual(
+                    guest.hot_path_profile_state(),
+                    live_transport.HOT_PATH_PROFILE_STATE_ACTIVE,
+                )
+
     def test_fixed_schema_carries_stop_controller_and_presentation_state(self) -> None:
         name = live_transport.live_control_transport_name(str(uuid.uuid4()))
         with live_transport.LiveControlTransport.create(name) as owner:
@@ -19,10 +29,32 @@ class LiveControlTransportTests(unittest.TestCase):
                     guest.hot_path_profile_state(),
                     live_transport.HOT_PATH_PROFILE_STATE_DISABLED,
                 )
+                self.assertEqual(
+                    guest.replay_capture_state(),
+                    live_transport.REPLAY_CAPTURE_STATE_DISABLED,
+                )
                 owner.configure_hot_path_profile(True)
+                owner.configure_replay_capture(True)
                 self.assertEqual(
                     guest.hot_path_profile_state(),
                     live_transport.HOT_PATH_PROFILE_STATE_ARMED,
+                )
+                self.assertEqual(
+                    guest.replay_capture_state(),
+                    live_transport.REPLAY_CAPTURE_STATE_ARMED,
+                )
+                self.assertEqual(
+                    owner.request_replay_capture(),
+                    live_transport.REPLAY_CAPTURE_STATE_REQUESTED,
+                )
+                self.assertEqual(
+                    guest.replay_capture_state(),
+                    live_transport.REPLAY_CAPTURE_STATE_REQUESTED,
+                )
+                owner.complete_replay_capture()
+                self.assertEqual(
+                    guest.replay_capture_state(),
+                    live_transport.REPLAY_CAPTURE_STATE_COMPLETE,
                 )
                 owner.request_stop()
                 self.assertTrue(guest.stop_requested())
@@ -76,6 +108,10 @@ class LiveControlTransportTests(unittest.TestCase):
                 self.assertEqual(
                     diagnostic["hot_path_profile_state"],
                     live_transport.HOT_PATH_PROFILE_STATE_ARMED,
+                )
+                self.assertEqual(
+                    diagnostic["replay_capture_state"],
+                    live_transport.REPLAY_CAPTURE_STATE_COMPLETE,
                 )
                 self.assertEqual(diagnostic["audio_buffer_play_stage"], 3)
                 self.assertEqual(diagnostic["audio_last_buffer"], 0x5000)

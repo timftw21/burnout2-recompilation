@@ -11,20 +11,26 @@ from tools.playability import live_test
 from tools.playability.live_test import (
     _finalize_diagnostics,
     _finalize_lossless_flip_audit,
+    _prepare_guest_backend,
     _startup_wait_status,
+    _validate_replay_capture_output,
     _wait_for_guest_shutdown,
     _uses_embedded_runtime,
     build_embedded_presenter_arguments,
     build_guest_command,
+    build_ia32_guest_command,
     build_lossless_flip_audit_report,
     build_presenter_command,
     run_live_test,
 )
+from tools.recomp.ia32_native_backend import Ia32BackendError, Ia32SliceArtifact
 
 
 class LiveTestTests(unittest.TestCase):
     def _args(self) -> argparse.Namespace:
         return argparse.Namespace(
+            guest_backend=live_test.GUEST_BACKEND_DIAGNOSTIC_ORACLE,
+            ia32_artifact=Path("build/ia32-live/manifest.json"),
             xbe=Path("game/default.xbe"),
             extracted_root=Path("game"),
             save_data_root=Path("save"),
@@ -56,6 +62,55 @@ class LiveTestTests(unittest.TestCase):
             allow_stale_artifacts=False,
             presentation_pipeline_depth=None,
         )
+
+    def test_ia32_guest_command_launches_verified_native_artifact_directly(self) -> None:
+        args = self._args()
+        args.guest_backend = live_test.GUEST_BACKEND_IA32
+        args.live_transport_name = "Local\\ia32-live-test"
+        args.no_diagnostics = False
+        args.ia32_live_artifact = Ia32SliceArtifact(
+            root=Path("artifact"),
+            executable=Path("artifact/b2r-ia32-live.exe"),
+            manifest_path=Path("artifact/manifest.json"),
+            manifest={"artifact_id": "artifact-id"},
+        )
+
+        command = build_ia32_guest_command(args)
+
+        self.assertEqual(command[0], "artifact\\b2r-ia32-live.exe")
+        self.assertEqual(command[1], "--normal-live")
+        self.assertEqual(
+            command[command.index("--live-control-transport") + 1],
+            "Local\\ia32-live-test",
+        )
+        self.assertIn("--summary-output", command)
+        self.assertNotIn("playability_probe.py", " ".join(command))
+
+    def test_ia32_backend_preflight_rejects_fixed_capsule_artifact(self) -> None:
+        args = self._args()
+        args.guest_backend = live_test.GUEST_BACKEND_IA32
+        fixed_artifact = Ia32SliceArtifact(
+            root=Path("artifact"),
+            executable=Path("artifact/b2r-ia32-slice.exe"),
+            manifest_path=Path("artifact/manifest.json"),
+            manifest={"normal_launcher_cutover": True},
+        )
+
+        with (
+            patch.object(live_test.os, "name", "nt"),
+            patch.object(
+                live_test,
+                "load_ia32_slice_artifact",
+                return_value=fixed_artifact,
+            ),
+            patch.object(
+                live_test,
+                "validate_ia32_normal_live_launch_artifact",
+                side_effect=Ia32BackendError("fixed replay-plan artifact"),
+            ),
+        ):
+            with self.assertRaisesRegex(Ia32BackendError, "fixed replay-plan"):
+                _prepare_guest_backend(args)
 
     def test_run_manifest_is_finalized_around_process_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -258,11 +313,71 @@ class LiveTestTests(unittest.TestCase):
             "fusion-only",
         )
 
+    def test_boot_path_profile_enables_native_profiling_from_startup(self) -> None:
+        args = self._args()
+        args.profile_boot_path = True
+
+        command = build_guest_command(args)
+
+        self.assertIn("--profile-hot-paths", command)
+
         args.aot_ab_mode = "combined"
         command = build_guest_command(args)
         self.assertEqual(
             command[command.index("--aot-ab-mode") + 1],
             "combined",
+        )
+
+    def test_manual_replay_capture_boundary_is_forwarded_to_guest(self) -> None:
+        args = self._args()
+        args.capture_replay_capsule = Path(
+            "reports/local/replay/indexed-draw-entry.b2rcap"
+        )
+        args.capture_replay_entry = 0x000C5550
+        args.capture_replay_scheduler_stop = None
+        args.capture_replay_scheduler_exit = "flip"
+
+        command = build_guest_command(args)
+
+        self.assertNotIn("--profile-hot-paths", command)
+        self.assertEqual(
+            command[command.index("--capture-replay-capsule") + 1],
+            "reports\\local\\replay\\indexed-draw-entry.b2rcap",
+        )
+        self.assertEqual(
+            command[command.index("--capture-replay-entry") + 1],
+            "0x000C5550",
+        )
+        self.assertNotIn("--capture-replay-scheduler-stop", command)
+        self.assertEqual(
+            command[command.index("--capture-replay-scheduler-exit") + 1],
+            "flip",
+        )
+
+    def test_phase7_capture_validation_rejects_a_missing_oracle(self) -> None:
+        args = self._args()
+        args.capture_replay_capsule = Path("capture.b2rcap")
+        args.capture_replay_scheduler_exit = "flip"
+        capsule = Mock(
+            capsule_id="capsule-id",
+            scheduler_state={"capture_steps": 7},
+            resources={},
+        )
+
+        with (
+            patch.object(Path, "is_file", return_value=True),
+            patch(
+                "tools.playability.replay_capsule.load_replay_capsule",
+                return_value=capsule,
+            ),
+        ):
+            validation = _validate_replay_capture_output(args)
+
+        self.assertIsNotNone(validation)
+        self.assertEqual(validation["status"], "rejected")
+        self.assertIn(
+            "flip capture is missing resident_scheduler state",
+            validation["problems"],
         )
 
     def test_live_control_transport_is_shared_by_guest_and_presenter(self) -> None:
@@ -360,12 +475,20 @@ class LiveTestTests(unittest.TestCase):
 
     def test_normal_gameplay_uses_embedded_presenter_arguments(self) -> None:
         args = self._args()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window_icon = Path(temp_dir) / "window-icon.png"
+            window_icon.touch()
+            with patch.object(live_test, "DEFAULT_WINDOW_ICON", window_icon):
+                command = build_embedded_presenter_arguments(args)
         with patch.object(live_test.os, "name", "nt"):
             self.assertTrue(_uses_embedded_runtime(args))
-        command = build_embedded_presenter_arguments(args)
 
         self.assertEqual(command[0], str(live_test.DEFAULT_DLL))
         self.assertIn("--live-render-stream-json", command)
+        self.assertEqual(
+            command[command.index("--window-icon") + 1],
+            str(window_icon),
+        )
         self.assertNotIn("--timeout-seconds", command)
         self.assertNotIn("--inject-input", command)
 
@@ -396,6 +519,41 @@ class LiveTestTests(unittest.TestCase):
                 _finalize_diagnostics(args)
 
         self.assertTrue(args.stale_artifact_rejected)
+        self.assertEqual(args.diagnostics_summary_status, "stale")
+        render.assert_not_called()
+        performance.assert_not_called()
+
+    def test_post_run_reports_classify_a_missing_summary_without_calling_it_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = self._args()
+            args.json_output = Path(temp_dir) / "missing-summary.json"
+            with (
+                patch.object(live_test, "_finalize_render_diagnostics") as render,
+                patch.object(live_test, "_finalize_performance_diagnostics") as performance,
+                patch("builtins.print") as print_message,
+            ):
+                _finalize_diagnostics(args)
+
+        self.assertFalse(args.stale_artifact_rejected)
+        self.assertEqual(args.diagnostics_summary_status, "missing")
+        self.assertIn("was not generated", print_message.call_args.args[0])
+        render.assert_not_called()
+        performance.assert_not_called()
+
+    def test_post_run_reports_classify_malformed_summary_as_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = self._args()
+            args.json_output = Path(temp_dir) / "invalid-summary.json"
+            args.json_output.write_text("{", encoding="utf-8")
+            with (
+                patch.object(live_test, "_finalize_render_diagnostics") as render,
+                patch.object(live_test, "_finalize_performance_diagnostics") as performance,
+                patch("builtins.print"),
+            ):
+                _finalize_diagnostics(args)
+
+        self.assertFalse(args.stale_artifact_rejected)
+        self.assertEqual(args.diagnostics_summary_status, "invalid")
         render.assert_not_called()
         performance.assert_not_called()
 

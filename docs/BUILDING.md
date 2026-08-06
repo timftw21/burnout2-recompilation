@@ -4,6 +4,11 @@ The supported native development host is Windows x86-64. Python 3.11 or newer
 drives the asset-free tools; all Python packages are exact-version locked in
 `requirements.lock` and `requirements-dev.lock`.
 
+The project is a work in progress. A successful build proves artifact and
+toolchain consistency; it does not imply that the current Phase 7 static path
+can complete the game. The latest normal-live artifact reaches Load/Save and
+then fails closed on an unverified new-save indirect call.
+
 ## Exact native inputs
 
 `tools/native_toolchain.lock.json` pins CMake 4.4.0, Ninja 1.13.0, Clang
@@ -147,6 +152,56 @@ same content-addressed module, object, sccache, and ThinLTO caches as title AOT
 preparation. Use it for iteration. Complete decoded-store preparation belongs
 only in explicit preflight/full validation before a gameplay handoff.
 
+## Building the Phase 7 normal-live artifact
+
+Normal-live generation is an ahead-of-time operation over local retained
+evidence. It requires:
+
+- the exact supported XBE;
+- the matching version-3 decoded block store;
+- a manually captured replay capsule used only as deterministic evidence; and
+- a closed normal-validation coverage profile.
+
+The retained local development command is:
+
+```powershell
+python -m tools.recomp.ia32_native_backend build-normal-live `
+  .\reports\local\replay\lesson-one-phase7-observed-run-4.b2rcap `
+  --xbe .\data\local\extracted\burnout_2_poi_usa\default.xbe `
+  --decoded-block-store .\build\native-guest-loop\decoded-blocks.sqlite3 `
+  --coverage-profile .\reports\local\replay\boot-to-lesson-one-coverage-profile.json `
+  --build-dir .\build\local\ia32-live `
+  --report .\reports\local\replay\boot-to-lesson-one-normal-live-build.json
+```
+
+Those capsule/profile paths are proprietary ignored inputs, not repository
+fixtures. A successful build writes a content-addressed artifact below
+`build/local/ia32-live/<artifact-id>/` and refreshes the stable local index at
+`build/local/ia32-live/manifest.json`.
+
+Before launching, inspect the manifest and indirect-target table. A usable
+static-clean artifact must report:
+
+- `normal_execution_eligible: true` and `coverage_closed: true`;
+- zero unknown targets, pending host services, frontier invocations/steps,
+  cross-backend exits, and Python runtime callbacks; and
+- runtime compilation, decoding, code patching, native promotion, and raw-XBE
+  execution disabled.
+
+Launch the exact artifact explicitly:
+
+```powershell
+python .\tools\playability\live_test.py `
+  --guest-backend same-isa-ia32 `
+  --ia32-artifact .\build\local\ia32-live\manifest.json `
+  --skip-host-build
+```
+
+Unknown executable targets are coverage gaps. Diagnose the guarded address,
+recover a finite evidence-backed family when possible, rebuild, and rerun.
+Never make `--developer-live-compile`, an interpreter, or automatic backend
+fallback part of the normal build/launch loop.
+
 ## Replay-oriented iteration
 
 Create and validate the asset-free replay checkpoint without building the
@@ -176,8 +231,9 @@ prunes the related `.cpp`, `.obj`, `.dll`, `.pdb`, and `.debug.json` files as a
 single cache entry.
 
 Debug, release, and sanitizer CTest presets run in Windows CI with the pinned
-compiler cache restored by compiler/target/flags/lock/source identity. The Python CI
-job runs the same default `tools/quality_gate.py` command used by pre-commit.
+compiler cache restored by compiler/target/flags/lock/source identity. The
+Python CI job runs the same default `tools/quality_gate.py` command used by
+pre-commit.
 The `--full` local form adds the debug native build and tests.
 
 Generated artifacts belong under `build/` and `reports/local/`. Inspect and

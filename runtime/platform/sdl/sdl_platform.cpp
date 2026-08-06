@@ -324,7 +324,9 @@ struct SdlPlatform::Impl {
         if (key.down && !key.repeat && key.key == SDLK_ESCAPE) {
             result.close_requested = true;
         }
-        if (key.down && !key.repeat && key.key == SDLK_F9) {
+        if (key.down && !key.repeat && key.key == SDLK_F8) {
+            result.request_replay_capture = true;
+        } else if (key.down && !key.repeat && key.key == SDLK_F9) {
             result.toggle_fps_counter = true;
         } else if (key.down && !key.repeat && key.key == SDLK_F10) {
             result.toggle_hot_path_profile = true;
@@ -411,6 +413,24 @@ void SdlPlatform::create_window(
     if (impl_->window == nullptr) {
         throw std::runtime_error(std::string("SDL window creation failed: ") + SDL_GetError());
     }
+}
+
+void SdlPlatform::set_window_icon(const std::filesystem::path& path) {
+    if (impl_->window == nullptr) {
+        throw std::runtime_error("SDL window icon requested before window creation");
+    }
+    SDL_Surface* icon = SDL_LoadSurface(path.u8string().c_str());
+    if (icon == nullptr) {
+        throw std::runtime_error(
+            std::string("SDL window icon loading failed: ") + SDL_GetError());
+    }
+    if (!SDL_SetWindowIcon(impl_->window, icon)) {
+        const std::string error = SDL_GetError();
+        SDL_DestroySurface(icon);
+        throw std::runtime_error(
+            std::string("SDL window icon update failed: ") + error);
+    }
+    SDL_DestroySurface(icon);
 }
 
 std::vector<const char*> SdlPlatform::vulkan_instance_extensions() const {

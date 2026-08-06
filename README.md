@@ -1,52 +1,80 @@
 # Burnout 2: Point of Impact Static Recompilation
 
-This repository explores static recompilation of the Xbox release of *Burnout
-2: Point of Impact*. It rehosts recovered IA-32 game code behind native
-services for graphics, audio, input, files, timing, threading, and memory while
-preserving guest-visible behavior.
+This repository is an experimental static recompilation of the Xbox release of
+*Burnout 2: Point of Impact*. It lifts recovered IA-32 guest code into
+deterministic native artifacts and rehosts the console boundaries for graphics,
+audio, input, files, timing, threading, and memory.
 
-The Xbox release is the base target because its x86 CPU makes it a practical
-static-recompilation candidate. This is reverse engineering, not a source port.
-Original game assets, executable data, trademarks, and copyrighted content
-remain owned by their rights holders.
+> **Work in progress:** this is reverse-engineering research, not a finished
+> source port or a ready-to-play release. The current Phase 7 IA-32 path is
+> deliberately fail-closed when ahead-of-time coverage is incomplete. Expect
+> missing features, guarded stops, correctness bugs, and performance below the
+> original 60 Hz target.
 
-## Project status
+## Development snapshots
 
-Updated: July 31, 2026.
-
-The supported Xbox build boots through a static, resumable native guest loop
-and is playable through the frontend and Lesson One. Vulkan output is close to
-the original console, and SDL3 audio, keyboard, and gamepad input are active.
-Performance is the main blocker: current gameplay is well below the 60 Hz
-simulation target. Autosave and controller rumble remain incomplete.
-
-| Area | Status |
+| Frontend milestone | Lesson One milestone |
 | --- | --- |
-| XBE inspection and loader | Complete for the current title |
-| Analysis database | Complete and reproducible |
-| Runtime ABI shims | Implemented for the currently reached path |
-| IA-32 execution | Static native boot, frontend, and Lesson One path running |
-| Vulkan presentation | Live completed-flip presentation with close visual parity |
-| Audio and input | Native PCM/Xbox ADPCM mixing and SDL3 submission/input; rumble pending |
-| Provenance | Exact supported-XBE gate and content-addressed build/run manifests |
-| Saves | Local storage works; autosave remains incomplete |
+| ![Single Player frontend rendered by b2_recomp](docs/images/frontend-single-player.jpg) | ![Lesson One rendered by b2_recomp](docs/images/lesson-one-start.jpg) |
 
-Detailed rendering coverage, retained measurements, and current limitations
-are maintained in [docs/VALIDATION.md](docs/VALIDATION.md).
+These maintainer-supplied screenshots document earlier visual milestones. They
+show what the broader development runtime has rendered; they do not imply that
+the current static-clean Phase 7 artifact can complete the same path today.
+Game content is not included in this repository. The screenshots are excluded
+from the MIT-licensed source and remain subject to their respective rights.
 
-## Ground rules
+## Current status
+
+Updated: August 6, 2026.
+
+The current static IA-32 artifact boots from the XBE entry point, renders the
+frontend, accepts controller input, and plays native menu music. Manual testing
+now reaches the Load/Save screen. Creating a new save slot stops at the next
+unverified indirect call, guest address `0x00045141`; that is an intentional AOT
+coverage guard, not a claim of completed save support.
+
+The default `live_test.py` backend remains the diagnostic oracle. The
+work-in-progress static backend must be selected explicitly with
+`--guest-backend same-isa-ia32` and a verified normal-live artifact. It never
+falls back to the oracle, an interpreter, a JIT, runtime compilation, or Python
+guest callbacks.
+
+| Area | Current state |
+| --- | --- |
+| XBE inspection and loader | Exact supported-build identity and deterministic mapping are implemented. |
+| Analysis and decoded block store | Reproducible for the currently observed target and coverage. |
+| Static IA-32 backend | Phase 7 in progress; boot and frontend work, new-save coverage is open at `0x00045141`. |
+| Host ABI and scheduling | Native primary, worker, vblank, filesystem, timing, memory, input, and reached service paths. |
+| Rendering | Vulkan frontend and prior Lesson One milestones render; current static-path gameplay revalidation is pending. |
+| Audio and input | Controller navigation and native menu music are manually confirmed; rumble and broader audio continuity remain open. |
+| Saves | Current static path reaches Load/Save but cannot yet create a new slot. Autosave and save-state support are incomplete. |
+| Performance | Historical measurements exist, but correctness and coverage take priority; no current 60 FPS claim. |
+
+The active correctness evidence and limitations are summarized in
+[docs/VALIDATION.md](docs/VALIDATION.md). The ignored local Phase 7 handoff
+contains address-level continuation details for developers working in the same
+workspace.
+
+## Project rules
 
 - Supply your own legally obtained Xbox copy.
-- Do not commit or distribute ISOs, extracted assets, XBE sections, SDK files,
-  symbols, generated title code/data, or proprietary local reports.
-- Keep extraction, analysis, lifting, patching, and build steps scripted.
-- Prefer observed behavior and ABI evidence over title-specific approximations.
-- Treat graphics, audio, input, files, timing, threading, and memory as explicit
-  host boundaries.
+- Do not commit or distribute disc images, extracted files, XBE sections, Xbox
+  SDK material, generated title code/data, render captures, or local reports.
+- The only screenshot exception is the small, maintainer-approved documentation
+  set under `docs/images/`; see [docs/ASSET_POLICY.md](docs/ASSET_POLICY.md).
+- Guest code used by normal execution must be decoded, lifted, and compiled
+  ahead of time. Unknown targets remain coverage gaps.
+- Normal gameplay must report zero Python runtime callbacks, frontier
+  interpretation, runtime decoding/compilation, native promotion, and automatic
+  cross-backend fallback.
+- Input used for title-path evidence is manual; repository tools must not
+  automate gameplay navigation.
+- Prefer observed behavior, exact ABI evidence, and bounded family recovery over
+  title-specific guesses or broad runtime fallbacks.
 
-The complete contribution boundary is documented in
-[docs/ASSET_POLICY.md](docs/ASSET_POLICY.md). Project-owned source is MIT
-licensed; third-party and proprietary inputs are excluded.
+Project-authored source is MIT licensed. Original game content, screenshots,
+trademarks, and third-party components are not. See [LICENSE](LICENSE),
+[NOTICE.md](NOTICE.md), and [docs/ASSET_POLICY.md](docs/ASSET_POLICY.md).
 
 ## Quick start
 
@@ -57,7 +85,7 @@ dependencies:
 python -m pip install --requirement .\requirements-dev.lock
 ```
 
-Install the extraction tool and extract your local image:
+Install the extraction tool and extract your legally obtained local image:
 
 ```powershell
 .\tools\extract\install_extract_xiso.ps1
@@ -65,104 +93,88 @@ python .\tools\extract\extract_disc.py `
   --iso ".\Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso"
 ```
 
-Run the changed-file-aware development gate, then launch normal live execution:
+Verify the target and run the changed-file-aware development gate:
 
 ```powershell
+python .\tools\project_identity.py `
+  .\data\local\extracted\burnout_2_poi_usa\default.xbe `
+  --pretty
 python .\tools\dev_check.py --explain
+```
+
+Launch the established diagnostic runtime:
+
+```powershell
 python .\tools\playability\live_test.py
 ```
 
-Use `python .\tools\dev_check.py --launch-closeout` to run the focused handoff
-gate and then start the exhaustive closeout matrix without blocking the edit
-loop. `tools/validation_closeout.py status <run-directory>` reports progress.
+After producing a verified normal-live artifact from local retained evidence,
+launch the work-in-progress static backend explicitly:
 
-The native presenter requires the pinned Vulkan/SDL3 toolchain. Initial native
-recovery can take substantially longer than a warm launch. Setup details,
-target verification, local paths, controls, and ordinary runtime options are in
-[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).
+```powershell
+python .\tools\playability\live_test.py `
+  --guest-backend same-isa-ia32 `
+  --ia32-artifact .\build\local\ia32-live\manifest.json `
+  --skip-host-build
+```
+
+Do not use `--developer-live-compile` for ordinary execution or validation.
+Setup, local paths, controls, and the exact distinction between the two launch
+modes are in [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).
+
+## Runtime model
+
+The Phase 7 static path uses three ownership layers:
+
+1. Python verifies local inputs, builds or selects deterministic artifacts,
+   launches native processes, and composes post-run diagnostics.
+2. A 32-bit native guest process owns AOT guest dispatch, scheduler lanes,
+   reached service bodies, dirty-memory ownership, controller consumption,
+   filesystem operations, render publication, and audio decode/mix/publication.
+3. A native 64-bit presenter process owns SDL3 window/input/audio integration
+   and Vulkan rendering. Versioned shared-memory records and native events carry
+   control, command, resource, and PCM publications.
+
+The normal static path does not execute guest code in Python. Developer audits
+and frozen replay tools may use isolated diagnostic paths, and their reports
+must identify that mode explicitly. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Documentation
 
 | Document | Purpose |
 | --- | --- |
-| [Getting started](docs/GETTING_STARTED.md) | Setup, local data, target identity, normal launch, and controls |
-| [Architecture](docs/ARCHITECTURE.md) | Runtime boundaries, ownership, and data flow |
-| [Building](docs/BUILDING.md) | Locked toolchain, native presets, quality gates, and artifact maintenance |
-| [Debugging commands](docs/DEBUGGING_COMMANDS.md) | Live diagnostics, exact audits, frozen replay, and direct probes |
-| [Profiling](docs/PROFILING.md) | ETW/WPA, GPUView, and RenderDoc capture protocol |
-| [Validation evidence](docs/VALIDATION.md) | Retained results, performance history, and known limitations |
-| [Asset policy](docs/ASSET_POLICY.md) | Legal and repository-content boundary |
+| [Getting started](docs/GETTING_STARTED.md) | Requirements, local data, target verification, launch modes, and controls |
+| [Architecture](docs/ARCHITECTURE.md) | Offline/static boundary, native ownership, transports, and fail-closed rules |
+| [Building](docs/BUILDING.md) | Locked toolchain, validation ladder, AOT artifact generation, and maintenance |
+| [Debugging commands](docs/DEBUGGING_COMMANDS.md) | Fault triage, manual capture, exact audits, replay, and address lookup |
+| [Profiling](docs/PROFILING.md) | ETW/WPA, GPUView, RenderDoc, and evidence-labeling protocol |
+| [Validation evidence](docs/VALIDATION.md) | Current acceptance, historical milestones, and open limitations |
+| [Asset policy](docs/ASSET_POLICY.md) | Proprietary-content boundary and documentation-screenshot exception |
 | [Contributing](CONTRIBUTING.md) | Change discipline and required checks |
-
-## Runtime overview
-
-Normal play keeps the guest dispatcher and Vulkan presenter in one process:
-
-1. The launcher verifies the exact XBE and presenter build identities.
-2. Native code owns resident guest dispatch, registered service ABI
-   continuation, primary/worker scheduling, allocation state, dirty-memory
-   ownership, reached kernel/title services, audio decode/mix/submission, and
-   render publication. Python prepares deterministic artifacts, validates
-   identity, launches the runtime, and materializes post-run diagnostics.
-3. A versioned shared-memory control record carries input, stop, and
-   completed-flip acknowledgements. A bounded command ring and immutable
-   resource slots publish NV2A work.
-4. SDL3 owns ordinary host-platform behavior, including windowing, events,
-   input, audio-device/stream management, DPI, and Vulkan surface creation.
-5. Direct Vulkan retains device, swapchain, resource, pipeline,
-   synchronization, presentation, and readback ownership.
-
-The native normal runtime decodes title-specific RenderWare PCM/ADPCM, applies
-gain and looping policy, mixes normalized PCM16, and submits it through the
-narrow SDL3 presenter ABI. Bounded probes, lossless audits, and frozen replays
-intentionally retain isolated Python diagnostic paths.
-
-Normal gameplay reports zero Python runtime callbacks, runtime compilation,
-native promotion, and frontier-interpreter activity. Python remains responsible
-for deterministic artifact preparation, launch, and post-run diagnostics. See
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the ownership model and
-[docs/VALIDATION.md](docs/VALIDATION.md) for retained run evidence.
-
-## Validation
-
-The current asset-free suite discovers 727 Python cases and 13 native CTest
-cases. The July 31 exhaustive closeout passed the asset-free gate, debug,
-release, sanitizer, and strict-presenter stages in 130.16 seconds. Validation
-uses changed-file selection, case-level sharding, content-addressed caches,
-runtime budgets, and bounded first-failure capsules. Run the focused gate while
-editing and reserve the exhaustive matrix for integration or handoff.
-
-Local evidence under `reports/local/` is ignored and must not be committed.
-Performance and compatibility claims must cite their exact run identity,
-configuration, cache state, sampling duration, and workload. Historical
-results and caveats live in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## Repository layout
 
 ```text
-docs/             Setup, architecture, building, debugging, and validation
+docs/             Project documentation and approved README images
 runtime/
-  host/          Presenter orchestration, Vulkan renderer, transport, diagnostics
-  nv2a/          Dependency-light NV2A texture and vertex-program support
-  platform/sdl/  SDL3 window, events, input, audio, and Vulkan surface
-  xbox/          Xbox runtime and hardware shims
+  host/           Presenter, Vulkan renderer, transports, and diagnostics
+  nv2a/           Dependency-light NV2A decoding and conversion support
+  platform/sdl/   SDL3 window, input, audio, and Vulkan-surface integration
+  xbox/           Xbox runtime and hardware shims
 tools/
-  analysis/      Project-owned analysis database
-  extract/       Local disc extraction
-  host/          Presenter build and smoke wrapper
-  loader/        XBE mapping and loader tools
-  playability/   Live launcher, probes, audits, and reports
-  profiling/     System-profiler orchestration
-  recomp/        IA-32 lifting, execution, coverage, and C++ emission
-  render/        D3D8/NV2A stream normalization
-  runtime/       Runtime smoke tools
-  xbe/           XBE inspection
-tests/unit/      Python unit and regression tests
-tests/native/    Asset-free C++/CTest regressions
+  analysis/       Project-owned analysis database
+  extract/        Local disc extraction
+  host/           Presenter build and smoke wrappers
+  loader/         XBE mapping and loader tools
+  playability/    Live launcher, probes, audits, and reports
+  profiling/      System-profiler orchestration
+  recomp/         IA-32 lifting, static artifacts, proofs, and execution
+  render/         D3D8/NV2A stream normalization
+  xbe/            XBE inspection
+tests/unit/       Python unit and regression tests
+tests/native/     Asset-free C++/CTest regressions
 ```
 
 `data/local/`, `reports/local/`, build/cache directories, extracted game
-content, generated C++, and recovered stream reports are ignored.
-
-See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md) for licensing and third-party
-notices.
+content, generated native modules, and recovered streams are local-only and
+ignored.

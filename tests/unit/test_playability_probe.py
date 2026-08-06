@@ -37,6 +37,9 @@ from tools.playability.playability_probe import (
     _register_stack_argument_code_pointer_targets,
     _recover_required_aot_callbacks,
     _file_backed_pointer_table_ranges,
+    _phase5_capture_service_registry,
+    _phase5_primary_scheduler_capture,
+    _replay_capture_requires_resident_state,
     _probe_execution_failure,
     _static_code_pointer_table_targets,
     _stack_argument_code_pointer_targets,
@@ -332,6 +335,82 @@ def _call_relative_bytes(base_address: int, target_address: int) -> bytes:
 
 
 class PlayabilityProbeTests(unittest.TestCase):
+    def test_phase7_full_flip_capture_does_not_require_a_guessed_stop_eip(
+        self,
+    ) -> None:
+        self.assertTrue(_replay_capture_requires_resident_state(None, "flip"))
+        self.assertFalse(
+            _replay_capture_requires_resident_state(None, "complete")
+        )
+
+    def test_phase5_manual_capture_builds_one_real_primary_step(self) -> None:
+        state = CpuState.with_registers(eax=7, esp=0x5000, fs_base=0x6000)
+        state.eip = 0x1000
+        memory = SparseMemory({0x6000: 0x5A})
+
+        captured_state, scheduler_state, overlays = (
+            _phase5_primary_scheduler_capture(
+                state,
+                memory,
+                stop_eip=0x1010,
+            )
+        )
+
+        resident = scheduler_state["resident_scheduler"]
+        self.assertEqual(resident["capture_mode"], "bounded-primary-slice")
+        self.assertEqual(
+            [lane["initial_state"] for lane in resident["lanes"]],
+            ["ready", "completed", "completed"],
+        )
+        self.assertEqual(resident["steps"][0]["entry_eip"], 0x1000)
+        self.assertEqual(resident["steps"][0]["next_eip"], 0x1010)
+        self.assertEqual(resident["steps"][0]["exit"], "complete")
+        self.assertEqual(captured_state.fs_base, 0x73030000)
+        self.assertEqual(overlays[0x73000000][0], 0x5A)
+        self.assertEqual(overlays[0x73030000][0], 0x5A)
+
+    def test_phase7_manual_capture_can_mark_a_full_flip_boundary(self) -> None:
+        state = CpuState.with_registers(esp=0x5000, fs_base=0x6000)
+        state.eip = 0x1000
+        memory = SparseMemory({0x6000: 0x5A})
+
+        _captured_state, scheduler_state, _overlays = (
+            _phase5_primary_scheduler_capture(
+                state,
+                memory,
+                stop_eip=0x2000,
+                exit_kind="flip",
+            )
+        )
+
+        resident = scheduler_state["resident_scheduler"]
+        self.assertEqual(resident["capture_mode"], "bounded-primary-flip")
+        self.assertEqual(resident["steps"][0]["exit"], "flip")
+        self.assertEqual(resident["steps"][1]["exit"], "complete")
+        self.assertEqual(resident["steps"][1]["entry_eip"], 0x2000)
+
+    def test_phase5_manual_capture_registers_only_exact_return_services(self) -> None:
+        class Entry:
+            def __init__(self, target: int, kind: int, cleanup: int, value: int):
+                self.target = target
+                self.kind = kind
+                self.stack_cleanup_bytes = cleanup
+                self.value = value
+
+        registry = _phase5_capture_service_registry(
+            [
+                Entry(0xC0001000, 1, 4, 0),
+                Entry(0xC0001010, 2, 4, 1),
+                Entry(0x00101010, 1, 4, 2),
+            ],
+            {0xC0001000: "RtlEnterCriticalSection"},
+            return_constant_kind=1,
+        )
+
+        self.assertEqual(len(registry), 1)
+        self.assertEqual(registry[0]["shim_name"], "RtlEnterCriticalSection")
+        self.assertEqual(registry[0]["argument_count"], 1)
+
     def test_pointer_table_ranges_include_file_backed_executable_data_islands(
         self,
     ) -> None:
@@ -2227,6 +2306,32 @@ class PlayabilityProbeTests(unittest.TestCase):
                 4,
                 is_write=True,
             )
+        )
+
+    def test_replay_capsule_snapshot_includes_native_only_pages(self) -> None:
+        class DummyArena:
+            regions = ()
+
+            def read(self, _address: int, size: int) -> bytes:
+                return bytes(size)
+
+        class DummyLoaded:
+            arena = DummyArena()
+
+        memory = XbeBackedSparseMemory(DummyLoaded())  # type: ignore[arg-type]
+        native_page = (ctypes.c_uint8 * 4096)()
+        native_page[:4] = bytes.fromhex("78563412")
+        page_table = (ctypes.c_void_p * 4)()
+        page_table[3] = ctypes.addressof(native_page)
+
+        snapshot = memory.replay_capsule_memory_snapshot_from_native_pages(
+            page_table
+        )
+
+        self.assertEqual(snapshot.read_u32(0x3000), 0x12345678)
+        self.assertEqual(
+            [page for page, _payload in snapshot.export_pages()],
+            [3],
         )
 
     def test_native_page_writeback_commits_exact_range_without_host_invalidation(self) -> None:
@@ -5945,6 +6050,14 @@ class PlayabilityProbeTests(unittest.TestCase):
         )
 
         self.assertNotIn("and not profile_hot_paths", source)
+
+    def test_replay_capture_keeps_native_normal_runtime_enabled(self) -> None:
+        source = Path("tools/playability/playability_probe.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertNotIn("and capture_replay_capsule_path is None", source)
+        self.assertIn("python_observer_address=(", source)
 
     def test_title_d3d_primitive_draw_fast_path_preserves_call_contract(self) -> None:
         base_address = 0x2500

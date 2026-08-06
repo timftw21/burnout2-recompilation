@@ -9,6 +9,7 @@ import ctypes
 import datetime as dt
 import json
 import os
+import struct
 import subprocess
 import sys
 import threading
@@ -30,6 +31,7 @@ from tools.host.first_frame_smoke import (
     DEFAULT_SOURCE,
     DEFAULT_TEXTURE_CONVERT_SPV,
     DEFAULT_VERTEX_SPV,
+    DEFAULT_WINDOW_ICON,
     FirstFrameSmokeError,
     build_presenter_arguments,
     compile_first_frame,
@@ -50,6 +52,7 @@ from tools.playability.performance_debug_report import (
     write_hot_path_tables,
     write_performance_debug_report,
 )
+from tools.playability.host_audio import DEFAULT_AUDIO_LIBRARY
 from tools.playability.live_transport import (
     LIVE_COMMAND_SIZE,
     LIVE_CONTROL_SCHEMA_VERSION,
@@ -76,14 +79,20 @@ from tools.recomp.native_executor import (
     AOT_OPTIMIZATION_MODES,
     DEFAULT_AOT_OPTIMIZATION_MODE,
 )
+from tools.recomp.ia32_native_backend import (
+    Ia32BackendError,
+    Ia32SliceArtifact,
+    load_ia32_slice_artifact,
+    validate_ia32_decoded_store_artifact_sources,
+    validate_ia32_normal_live_launch_artifact,
+)
+
 DEFAULT_XBE = REPO_ROOT / "data" / "local" / "extracted" / "burnout_2_poi_usa" / "default.xbe"
 DEFAULT_EXTRACTED_ROOT = DEFAULT_XBE.parent
 DEFAULT_SAVE_DATA_ROOT = REPO_ROOT / "data" / "local" / "save-data"
 DEFAULT_DASHBOARD_ROOT = REPO_ROOT / "data" / "local" / "dashboard-data"
 DEFAULT_CACHE_ROOT = REPO_ROOT / "data" / "local" / "cache-data"
-DEFAULT_DECODED_BLOCK_STORE = (
-    REPO_ROOT / "build" / "native-guest-loop" / "decoded-blocks.sqlite3"
-)
+DEFAULT_DECODED_BLOCK_STORE = REPO_ROOT / "build" / "native-guest-loop" / "decoded-blocks.sqlite3"
 DEFAULT_RENDER_STREAM = REPO_ROOT / "reports" / "local" / "live" / "render.json"
 DEFAULT_CONTROLLER_STATE = REPO_ROOT / "reports" / "local" / "live" / "controller.json"
 DEFAULT_PROBE_SUMMARY = REPO_ROOT / "reports" / "local" / "playability" / "native-live.json"
@@ -100,9 +109,7 @@ DEFAULT_PERFORMANCE_DEBUG_REPORT = (
 DEFAULT_COMMAND_WORK_CACHE_TRACE = (
     REPO_ROOT / "reports" / "local" / "playability" / "command-work-cache-trace.jsonl"
 )
-DEFAULT_RUN_MANIFEST = (
-    REPO_ROOT / "reports" / "local" / "playability" / "run-manifest.json"
-)
+DEFAULT_RUN_MANIFEST = REPO_ROOT / "reports" / "local" / "playability" / "run-manifest.json"
 DEFAULT_SCENE_RECORD_AUDIT_REPORT = (
     REPO_ROOT / "reports" / "local" / "playability" / "scene-record-audit.json"
 )
@@ -110,6 +117,77 @@ DEFAULT_AUDIT_ROOT = REPO_ROOT / "reports" / "local" / "flip-audit"
 DEFAULT_NATIVE_SLICE_STEPS = 100_000
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 1800.0
 DEFAULT_PRESENTATION_PIPELINE_DEPTH = 2
+DEFAULT_IA32_LIVE_ARTIFACT = REPO_ROOT / "build" / "local" / "ia32-live" / "manifest.json"
+GUEST_BACKEND_IA32 = "same-isa-ia32"
+GUEST_BACKEND_DIAGNOSTIC_ORACLE = "fusion-only-64-bit-diagnostic"
+
+
+def _guest_backend(args: argparse.Namespace) -> str:
+    return str(
+        getattr(
+            args,
+            "guest_backend",
+            GUEST_BACKEND_DIAGNOSTIC_ORACLE,
+        )
+    )
+
+
+def _prepare_guest_backend(args: argparse.Namespace) -> dict[str, object]:
+    backend = _guest_backend(args)
+    if backend == GUEST_BACKEND_DIAGNOSTIC_ORACLE:
+        validation: dict[str, object] = {
+            "status": "valid",
+            "backend": backend,
+            "purpose": "explicit-diagnostic-oracle",
+            "normal_runtime_python_callbacks": 0,
+        }
+        args.guest_backend_validation = validation
+        return validation
+    if backend != GUEST_BACKEND_IA32:
+        raise Ia32BackendError(f"unsupported live guest backend: {backend}")
+    incompatible_options = [
+        name
+        for name, active in (
+            ("--developer-live-compile", getattr(args, "developer_live_compile", False)),
+            ("--profile-hot-paths", getattr(args, "profile_hot_paths", False)),
+            ("--profile-boot-path", getattr(args, "profile_boot_path", False)),
+            ("--capture-replay-capsule", getattr(args, "capture_replay_capsule", None)),
+            ("--lossless-flip-audit", getattr(args, "lossless_flip_audit", False)),
+            ("--audit-world-matrices", getattr(args, "audit_world_matrices", False)),
+            ("--audit-traffic-meshes", getattr(args, "audit_traffic_meshes", False)),
+            ("--audit-scene-records", getattr(args, "audit_scene_records", False)),
+            ("--inject-confirm-after-flip", getattr(args, "inject_confirm_after_flip", None)),
+            ("--allow-unsupported-xbe", getattr(args, "allow_unsupported_xbe", False)),
+        )
+        if active
+    ]
+    if incompatible_options:
+        raise Ia32BackendError(
+            "IA-32 normal live launch does not accept diagnostic/oracle options: "
+            + ", ".join(incompatible_options)
+        )
+    if os.name != "nt":
+        raise Ia32BackendError("same-ISA IA-32 normal live launch requires Windows")
+    artifact_path = Path(
+        getattr(args, "ia32_artifact", DEFAULT_IA32_LIVE_ARTIFACT)
+    )
+    artifact = load_ia32_slice_artifact(artifact_path)
+    validation = validate_ia32_normal_live_launch_artifact(artifact)
+    validate_ia32_decoded_store_artifact_sources(
+        artifact,
+        xbe_path=args.xbe,
+        decoded_block_store_path=args.decoded_block_store,
+    )
+    args.ia32_live_artifact = artifact
+    validation.update(
+        {
+            "source_identity": "verified",
+            "xbe": str(args.xbe.resolve()),
+            "decoded_block_store": str(args.decoded_block_store.resolve()),
+        }
+    )
+    args.guest_backend_validation = validation
+    return validation
 
 
 def _live_transport_name(args: argparse.Namespace) -> str | None:
@@ -120,22 +198,71 @@ def _live_transport_name(args: argparse.Namespace) -> str | None:
     return live_control_transport_name(str(run_id)) if run_id else None
 
 
+def build_ia32_guest_command(args: argparse.Namespace) -> list[str]:
+    artifact = getattr(args, "ia32_live_artifact", None)
+    if not isinstance(artifact, Ia32SliceArtifact):
+        raise Ia32BackendError(
+            "the IA-32 normal-live artifact was not prepared before launch"
+        )
+    transport_name = _live_transport_name(args)
+    if transport_name is None:
+        raise Ia32BackendError("IA-32 normal-live launch requires a live transport name")
+    command = [
+        str(artifact.executable),
+        "--normal-live",
+        "--artifact-manifest",
+        str(artifact.manifest_path),
+        "--live-control-transport",
+        transport_name,
+        "--extracted-root",
+        str(args.extracted_root),
+        "--save-data-root",
+        str(args.save_data_root),
+        "--dashboard-root",
+        str(args.dashboard_root),
+        "--cache-root",
+        str(args.cache_root),
+        "--audio-library",
+        str(DEFAULT_AUDIO_LIBRARY),
+        "--scheduler-quantum",
+        str(args.native_slice_steps),
+        "--max-steps",
+        str(args.max_steps),
+        "--run-id",
+        str(args.run_id),
+    ]
+    if not getattr(args, "no_diagnostics", False):
+        command.extend(["--summary-output", str(args.json_output)])
+    return command
+
+
 def build_guest_command(args: argparse.Namespace) -> list[str]:
+    if _guest_backend(args) == GUEST_BACKEND_IA32:
+        return build_ia32_guest_command(args)
     command = [
         sys.executable,
         "-u",
         str(REPO_ROOT / "tools" / "playability" / "playability_probe.py"),
         str(args.xbe),
-        "--extracted-root", str(args.extracted_root),
-        "--save-data-root", str(args.save_data_root),
-        "--dashboard-root", str(args.dashboard_root),
-        "--cache-root", str(args.cache_root),
-        "--decoded-block-store", str(args.decoded_block_store),
+        "--extracted-root",
+        str(args.extracted_root),
+        "--save-data-root",
+        str(args.save_data_root),
+        "--dashboard-root",
+        str(args.dashboard_root),
+        "--cache-root",
+        str(args.cache_root),
+        "--decoded-block-store",
+        str(args.decoded_block_store),
         "--native-guest-loop",
-        "--native-slice-steps", str(args.native_slice_steps),
-        "--max-steps", str(args.max_steps),
-        "--live-render-stream", str(args.live_render_stream),
-        "--live-controller-state", str(args.live_controller_state),
+        "--native-slice-steps",
+        str(args.native_slice_steps),
+        "--max-steps",
+        str(args.max_steps),
+        "--live-render-stream",
+        str(args.live_render_stream),
+        "--live-controller-state",
+        str(args.live_controller_state),
         "--quiet",
         "--supported-targets",
         str(getattr(args, "supported_targets", DEFAULT_SUPPORTED_TARGETS)),
@@ -164,7 +291,11 @@ def build_guest_command(args: argparse.Namespace) -> list[str]:
                 str(getattr(args, "flip_audit_max_flips", 0)),
             ]
         )
-    if getattr(args, "profile_hot_paths", False):
+    if getattr(args, "profile_hot_paths", False) or getattr(
+        args,
+        "profile_boot_path",
+        False,
+    ):
         command.append("--profile-hot-paths")
         command.extend(
             [
@@ -178,6 +309,38 @@ def build_guest_command(args: argparse.Namespace) -> list[str]:
                 ),
             ]
         )
+    capture_replay_capsule = getattr(args, "capture_replay_capsule", None)
+    if capture_replay_capsule is not None:
+        command.extend(
+            [
+                "--capture-replay-capsule",
+                str(capture_replay_capsule),
+                "--capture-replay-entry",
+                f"0x{int(getattr(args, 'capture_replay_entry', 0x000C5550)):08X}",
+            ]
+        )
+        capture_scheduler_stop = getattr(
+            args,
+            "capture_replay_scheduler_stop",
+            None,
+        )
+        if capture_scheduler_stop is not None:
+            command.extend(
+                [
+                    "--capture-replay-scheduler-stop",
+                    f"0x{int(capture_scheduler_stop):08X}",
+                ]
+            )
+        capture_scheduler_exit = str(
+            getattr(args, "capture_replay_scheduler_exit", "complete")
+        )
+        if capture_scheduler_stop is not None or capture_scheduler_exit != "complete":
+            command.extend(
+                [
+                    "--capture-replay-scheduler-exit",
+                    capture_scheduler_exit,
+                ]
+            )
     if getattr(args, "developer_live_compile", False):
         command.append("--developer-live-compile")
     audit_world_matrix_address = getattr(args, "audit_world_matrix_address", None)
@@ -186,9 +349,7 @@ def build_guest_command(args: argparse.Namespace) -> list[str]:
     if getattr(args, "audit_traffic_meshes", False):
         command.append("--audit-traffic-meshes")
     if audit_world_matrix_address is not None:
-        command.extend(
-            ["--audit-world-matrix-address", f"0x{audit_world_matrix_address:08X}"]
-        )
+        command.extend(["--audit-world-matrix-address", f"0x{audit_world_matrix_address:08X}"])
     if getattr(args, "audit_scene_records", False):
         command.extend(
             [
@@ -204,11 +365,15 @@ def build_presenter_command(args: argparse.Namespace) -> list[str]:
     command = [
         sys.executable,
         str(REPO_ROOT / "tools" / "host" / "first_frame_smoke.py"),
-        "--max-frames", "0",
-        "--timeout-seconds", "0",
-        "--render-stream-json", str(args.live_render_stream),
+        "--max-frames",
+        "0",
+        "--timeout-seconds",
+        "0",
+        "--render-stream-json",
+        str(args.live_render_stream),
         "--live-render-stream",
-        "--controller-state-json", str(args.live_controller_state),
+        "--controller-state-json",
+        str(args.live_controller_state),
         "--no-inject-input",
         "--pretty",
     ]
@@ -235,14 +400,11 @@ def build_presenter_command(args: argparse.Namespace) -> list[str]:
         command.append("--cpu-texture-conversion")
     command_work_cache_trace = getattr(args, "command_work_cache_trace", None)
     if command_work_cache_trace is not None:
-        command.extend(
-            ["--command-work-cache-trace", str(command_work_cache_trace)]
-        )
+        command.extend(["--command-work-cache-trace", str(command_work_cache_trace)])
     requested_pipeline_depth = getattr(args, "presentation_pipeline_depth", None)
     presentation_pipeline_depth = (
         1
-        if getattr(args, "lossless_flip_audit", False)
-        and requested_pipeline_depth is None
+        if getattr(args, "lossless_flip_audit", False) and requested_pipeline_depth is None
         else requested_pipeline_depth or DEFAULT_PRESENTATION_PIPELINE_DEPTH
     )
     if presentation_pipeline_depth == 2:
@@ -251,19 +413,21 @@ def build_presenter_command(args: argparse.Namespace) -> list[str]:
         command.extend(
             [
                 "--strict-render-validation",
-                "--flip-audit-ack", str(args.flip_audit_ack),
-                "--flip-audit-frame-directory", str(args.flip_audit_frames),
-                "--debug-json", str(args.flip_audit_events),
-                "--summary-output", str(args.flip_audit_presenter_summary),
+                "--flip-audit-ack",
+                str(args.flip_audit_ack),
+                "--flip-audit-frame-directory",
+                str(args.flip_audit_frames),
+                "--debug-json",
+                str(args.flip_audit_events),
+                "--summary-output",
+                str(args.flip_audit_presenter_summary),
                 "--no-automatic-screenshot",
                 "--flip-audit-health-interval",
                 str(getattr(args, "flip_audit_health_interval", 30)),
             ]
         )
         if getattr(args, "flip_audit_max_flips", 0) > 0:
-            command.extend(
-                ["--flip-audit-max-flips", str(args.flip_audit_max_flips)]
-            )
+            command.extend(["--flip-audit-max-flips", str(args.flip_audit_max_flips)])
     elif not getattr(args, "no_diagnostics", False):
         command.extend(
             [
@@ -276,9 +440,7 @@ def build_presenter_command(args: argparse.Namespace) -> list[str]:
 
 def build_embedded_presenter_arguments(args: argparse.Namespace) -> list[str]:
     requested_pipeline_depth = getattr(args, "presentation_pipeline_depth", None)
-    presentation_pipeline_depth = (
-        requested_pipeline_depth or DEFAULT_PRESENTATION_PIPELINE_DEPTH
-    )
+    presentation_pipeline_depth = requested_pipeline_depth or DEFAULT_PRESENTATION_PIPELINE_DEPTH
     return build_presenter_arguments(
         program=DEFAULT_DLL,
         debug_json=(
@@ -294,12 +456,11 @@ def build_embedded_presenter_arguments(args: argparse.Namespace) -> list[str]:
         live_control_transport=_live_transport_name(args),
         screenshot=None,
         hotkey_screenshot_directory=(
-            None
-            if getattr(args, "no_diagnostics", False)
-            else DEFAULT_HOTKEY_SCREENSHOT_DIR
+            None if getattr(args, "no_diagnostics", False) else DEFAULT_HOTKEY_SCREENSHOT_DIR
         ),
         metrics_report_directory=DEFAULT_METRICS_REPORT_DIR,
         command_work_cache_trace=getattr(args, "command_work_cache_trace", None),
+        window_icon=(DEFAULT_WINDOW_ICON if DEFAULT_WINDOW_ICON.is_file() else None),
         vertex_shader=DEFAULT_VERTEX_SPV,
         fragment_shader=DEFAULT_FRAGMENT_SPV,
         texture_convert_shader=DEFAULT_TEXTURE_CONVERT_SPV,
@@ -315,6 +476,7 @@ def _uses_embedded_runtime(args: argparse.Namespace) -> bool:
     """Keep exact/bounded audit tools isolated; normal gameplay is one process."""
     return bool(
         os.name == "nt"
+        and _guest_backend(args) == GUEST_BACKEND_DIAGNOSTIC_ORACLE
         and getattr(args, "max_steps", 0) == 0
         and not getattr(args, "lossless_flip_audit", False)
         and not getattr(args, "audit_scene_records", False)
@@ -339,10 +501,7 @@ def _start_confirm_injector(
             if guest_flip < target_flip:
                 continue
             transport.publish_controller(buttons=0x1000)
-            print(
-                "Injected diagnostic confirm input at guest flip "
-                f"{guest_flip}."
-            )
+            print(f"Injected diagnostic confirm input at guest flip {guest_flip}.")
             stop.wait(0.15)
             transport.publish_controller(buttons=0)
             last_flip = guest_flip
@@ -350,8 +509,7 @@ def _start_confirm_injector(
             while not stop.wait(0.01):
                 next_manifest = transport.read_manifest()
                 next_flip = int(
-                    (next_manifest or {}).get("guest_flip_count", last_flip)
-                    or last_flip
+                    (next_manifest or {}).get("guest_flip_count", last_flip) or last_flip
                 )
                 if next_flip != last_flip:
                     last_flip = next_flip
@@ -379,14 +537,10 @@ def _set_current_windows_thread_description(name: str) -> None:
     if os.name != "nt":
         return
     try:
-        set_thread_description = ctypes.WinDLL(
-            "kernel32", use_last_error=True
-        ).SetThreadDescription
+        set_thread_description = ctypes.WinDLL("kernel32", use_last_error=True).SetThreadDescription
         set_thread_description.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p)
         set_thread_description.restype = ctypes.c_long
-        current_thread = ctypes.WinDLL(
-            "kernel32", use_last_error=True
-        ).GetCurrentThread
+        current_thread = ctypes.WinDLL("kernel32", use_last_error=True).GetCurrentThread
         current_thread.argtypes = ()
         current_thread.restype = ctypes.c_void_p
         set_thread_description(current_thread(), name)
@@ -427,8 +581,7 @@ class _InProcessGuest:
             raise subprocess.TimeoutExpired("embedded guest", timeout)
         if self._error is not None:
             raise RuntimeError(
-                "embedded guest failed: "
-                f"{type(self._error).__name__}: {self._error}"
+                f"embedded guest failed: {type(self._error).__name__}: {self._error}"
             ) from self._error
         return int(self._returncode or 0)
 
@@ -462,9 +615,7 @@ def build_lossless_flip_audit_report(
 ) -> dict[str, object]:
     ledger = _read_json_lines(ledger_path)
     events = read_debug_events(events_path)
-    host_audits = [
-        event for event in events if event.get("event") == "lossless_flip_audited"
-    ]
+    host_audits = [event for event in events if event.get("event") == "lossless_flip_audited"]
     producer_indices = [int(record["audit_flip_index"]) for record in ledger]
     selected_producer_indices = [
         int(record["audit_flip_index"])
@@ -478,19 +629,14 @@ def build_lossless_flip_audit_report(
     missing_issue_screenshots: list[int] = []
     for event in host_audits:
         flip_index = int(event["flip_index"])
-        health_checked = bool(
-            event.get("health_checked", event.get("readback_captured", False))
-        )
+        health_checked = bool(event.get("health_checked", event.get("readback_captured", False)))
         if health_checked and (
-            not bool(event.get("readback_captured", False))
-            or not event.get("pixel_fingerprint")
+            not bool(event.get("readback_captured", False)) or not event.get("pixel_fingerprint")
         ):
             missing_readbacks.append(flip_index)
         frame_path_text = str(event.get("frame_path", ""))
         frame_saved = bool(event.get("frame_saved", False))
-        if frame_saved and (
-            not frame_path_text or not Path(frame_path_text).is_file()
-        ):
+        if frame_saved and (not frame_path_text or not Path(frame_path_text).is_file()):
             missing_issue_screenshots.append(flip_index)
         pixel_count = int(event.get("pixel_count", 0))
         dominant_count = int(event.get("dominant_count", 0))
@@ -517,22 +663,14 @@ def build_lossless_flip_audit_report(
                 "pixel_fingerprint": event.get("pixel_fingerprint"),
                 "pixel_count": pixel_count,
                 "unique_colors": int(event.get("unique_colors", 0)),
-                "dominant_fraction": round(dominant_count / pixel_count, 6)
-                if pixel_count
-                else 0.0,
-                "bright_fraction": round(bright_count / pixel_count, 6)
-                if pixel_count
-                else 0.0,
-                "dark_fraction": round(dark_count / pixel_count, 6)
-                if pixel_count
-                else 0.0,
+                "dominant_fraction": round(dominant_count / pixel_count, 6) if pixel_count else 0.0,
+                "bright_fraction": round(bright_count / pixel_count, 6) if pixel_count else 0.0,
+                "dark_fraction": round(dark_count / pixel_count, 6) if pixel_count else 0.0,
                 "failure_reasons": failure_reasons,
                 "passed": not failure_reasons,
             }
         )
-    validation_events = [
-        event for event in events if event.get("event") == "render_validation"
-    ]
+    validation_events = [event for event in events if event.get("event") == "render_validation"]
     failed_validations = [
         event for event in validation_events if not bool(event.get("passed", False))
     ]
@@ -567,9 +705,7 @@ def build_lossless_flip_audit_report(
         "failed_strict_validation_count": len(failed_validations),
         "missing_frame_flips": missing_readbacks,
         "missing_issue_screenshot_flips": missing_issue_screenshots,
-        "saved_issue_screenshot_count": sum(
-            bool(frame["frame_saved"]) for frame in frame_reports
-        ),
+        "saved_issue_screenshot_count": sum(bool(frame["frame_saved"]) for frame in frame_reports),
         "health_checked_flip_count": len(selected_producer_indices),
         "health_skipped_flip_count": len(ledger) - len(selected_producer_indices),
         "distinct_pixel_frame_count": len(
@@ -770,9 +906,7 @@ def _request_presenter_close(process: subprocess.Popen[bytes]) -> bool:
             entry.dwSize = ctypes.sizeof(ProcessEntry32W)
             if kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
                 while True:
-                    parent_process_ids[int(entry.th32ProcessID)] = int(
-                        entry.th32ParentProcessID
-                    )
+                    parent_process_ids[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
                     if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
                         break
         finally:
@@ -838,12 +972,9 @@ def _finalize_lossless_flip_audit(args: argparse.Namespace, result: int) -> int:
     presenter_elapsed = getattr(args, "flip_audit_presenter_elapsed_seconds", None)
     total_elapsed = getattr(args, "flip_audit_total_elapsed_seconds", None)
     if presenter_elapsed is not None:
-        audit_report["presenter_elapsed_seconds"] = round(
-            float(presenter_elapsed), 6
-        )
+        audit_report["presenter_elapsed_seconds"] = round(float(presenter_elapsed), 6)
         audit_report["audited_flip_fps"] = round(
-            int(audit_report["acknowledged_flip_count"])
-            / max(float(presenter_elapsed), 1e-9),
+            int(audit_report["acknowledged_flip_count"]) / max(float(presenter_elapsed), 1e-9),
             3,
         )
     if total_elapsed is not None:
@@ -882,10 +1013,7 @@ def _finalize_render_diagnostics(args: argparse.Namespace) -> None:
             xbe_path=args.xbe,
         )
         write_render_debug_report(report, args.render_debug_report)
-        print(
-            "Render diagnostics: "
-            f"{report['status']}; report={args.render_debug_report}"
-        )
+        print(f"Render diagnostics: {report['status']}; report={args.render_debug_report}")
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         print(f"Could not finalize render diagnostics: {exc}")
 
@@ -898,35 +1026,53 @@ def _finalize_performance_diagnostics(args: argparse.Namespace) -> None:
         )
         write_performance_debug_report(report, args.performance_debug_report)
         hot_path_tables = []
-        if getattr(args, "profile_hot_paths", False):
+        if getattr(args, "profile_hot_paths", False) or getattr(
+            args,
+            "profile_boot_path",
+            False,
+        ):
             hot_path_tables = write_hot_path_tables(
                 report,
                 args.performance_debug_report.with_name("hot-path-tables"),
             )
         print(
-            "Performance diagnostics: "
-            f"{report['status']}; report={args.performance_debug_report}"
+            f"Performance diagnostics: {report['status']}; report={args.performance_debug_report}"
         )
         if hot_path_tables:
             print(f"Hot-path tables: {hot_path_tables[0].parent}")
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         print(f"Could not finalize performance diagnostics: {exc}")
 
+
 def _finalize_diagnostics(args: argparse.Namespace) -> None:
     if getattr(args, "no_diagnostics", False):
+        args.diagnostics_summary_status = "disabled"
         return
+    args.stale_artifact_rejected = False
     try:
         summary = json.loads(args.json_output.read_text(encoding="utf-8"))
-        actual_run_id = summary.get("identity", {}).get("run_id")
-        if actual_run_id != getattr(args, "run_id", None):
-            raise ProjectIdentityError(
-                f"probe summary run_id is {actual_run_id!r}; "
-                f"active run_id is {getattr(args, 'run_id', None)!r}"
-            )
-    except (OSError, TypeError, ValueError, json.JSONDecodeError, ProjectIdentityError) as exc:
-        args.stale_artifact_rejected = True
-        print(f"Rejected stale probe summary; post-run reports were not generated: {exc}")
+    except FileNotFoundError:
+        args.diagnostics_summary_status = "missing"
+        print(
+            "Native guest summary was not generated; post-run reports were skipped: "
+            f"{args.json_output}"
+        )
         return
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        args.diagnostics_summary_status = "invalid"
+        print(f"Native guest summary is invalid; post-run reports were skipped: {exc}")
+        return
+    actual_run_id = summary.get("identity", {}).get("run_id")
+    if actual_run_id != getattr(args, "run_id", None):
+        args.diagnostics_summary_status = "stale"
+        args.stale_artifact_rejected = True
+        print(
+            "Rejected stale probe summary; post-run reports were not generated: "
+            f"probe summary run_id is {actual_run_id!r}; "
+            f"active run_id is {getattr(args, 'run_id', None)!r}"
+        )
+        return
+    args.diagnostics_summary_status = "valid"
     _finalize_render_diagnostics(args)
     _finalize_performance_diagnostics(args)
 
@@ -1038,10 +1184,7 @@ def _request_current_process_window_close() -> bool:
         return True
 
     user32.EnumWindows(find_window, 0)
-    return any(
-        bool(user32.PostMessageW(hwnd, 0x0010, 0, 0))
-        for hwnd in window_handles
-    )
+    return any(bool(user32.PostMessageW(hwnd, 0x0010, 0, 0)) for hwnd in window_handles)
 
 
 def _run_live_test_embedded(args: argparse.Namespace) -> int:
@@ -1075,6 +1218,11 @@ def _run_live_test_embedded(args: argparse.Namespace) -> int:
     live_transport = LiveControlTransport.create(args.live_transport_name)
     live_transport.configure_hot_path_profile(
         getattr(args, "profile_hot_paths", False)
+        or getattr(args, "profile_boot_path", False),
+        start_active=getattr(args, "profile_boot_path", False),
+    )
+    live_transport.configure_replay_capture(
+        getattr(args, "capture_replay_capsule", None) is not None
     )
     live_command_transport = LiveCommandTransport.create(args.live_transport_name)
     live_resource_transport = LiveResourceTransport.create(args.live_transport_name)
@@ -1139,9 +1287,7 @@ def _run_live_test_embedded(args: argparse.Namespace) -> int:
 
         print("Starting embedded Vulkan presenter. Close the window or press Escape to stop.")
         monitor.start()
-        input_injector = _start_confirm_injector(
-            args, live_transport, monitor_stop
-        )
+        input_injector = _start_confirm_injector(args, live_transport, monitor_stop)
         presenter_returncode = run_embedded_presenter(
             build_embedded_presenter_arguments(args),
             library=DEFAULT_DLL,
@@ -1220,10 +1366,7 @@ def _run_live_test_processes(args: argparse.Namespace) -> int:
         ):
             if stale.exists():
                 stale.unlink()
-    if (
-        getattr(args, "audit_scene_records", False)
-        and args.scene_record_audit_output.exists()
-    ):
+    if getattr(args, "audit_scene_records", False) and args.scene_record_audit_output.exists():
         args.scene_record_audit_output.unlink()
     controller_consumed = args.live_controller_state.with_name(
         args.live_controller_state.name + ".consumed.json"
@@ -1238,13 +1381,14 @@ def _run_live_test_processes(args: argparse.Namespace) -> int:
     live_transport = LiveControlTransport.create(args.live_transport_name)
     live_transport.configure_hot_path_profile(
         getattr(args, "profile_hot_paths", False)
+        or getattr(args, "profile_boot_path", False),
+        start_active=getattr(args, "profile_boot_path", False),
     )
-    live_command_transport = LiveCommandTransport.create(
-        args.live_transport_name
+    live_transport.configure_replay_capture(
+        getattr(args, "capture_replay_capsule", None) is not None
     )
-    live_resource_transport = LiveResourceTransport.create(
-        args.live_transport_name
-    )
+    live_command_transport = LiveCommandTransport.create(args.live_transport_name)
+    live_resource_transport = LiveResourceTransport.create(args.live_transport_name)
     input_injector_stop = threading.Event()
     input_injector: threading.Thread | None = None
     runner_output = (
@@ -1313,12 +1457,12 @@ def _run_live_test_processes(args: argparse.Namespace) -> int:
             )
             if process_job is not None:
                 process_job.assign(presenter)
-            input_injector = _start_confirm_injector(
-                args, live_transport, input_injector_stop
-            )
+            input_injector = _start_confirm_injector(args, live_transport, input_injector_stop)
             scene_audit_run = getattr(args, "audit_scene_records", False)
-            bounded_guest_run = args.max_steps > 0 or (
-                args.lossless_flip_audit and args.flip_audit_max_flips > 0
+            bounded_guest_run = (
+                args.max_steps > 0
+                or (args.lossless_flip_audit and args.flip_audit_max_flips > 0)
+                or getattr(args, "capture_replay_capsule", None) is not None
             )
             if scene_audit_run:
                 while guest.poll() is None and presenter.poll() is None:
@@ -1338,9 +1482,7 @@ def _run_live_test_processes(args: argparse.Namespace) -> int:
                     guest_returncode, forced_guest_stop = _wait_for_guest_shutdown(guest)
                     if forced_guest_stop:
                         _finalize_diagnostics(args)
-                        args.flip_audit_total_elapsed_seconds = (
-                            time.monotonic() - run_started
-                        )
+                        args.flip_audit_total_elapsed_seconds = time.monotonic() - run_started
                         if presenter_started is not None:
                             args.flip_audit_presenter_elapsed_seconds = (
                                 time.monotonic() - presenter_started
@@ -1361,9 +1503,7 @@ def _run_live_test_processes(args: argparse.Namespace) -> int:
                 guest_returncode, forced_guest_stop = _wait_for_guest_shutdown(guest)
                 if forced_guest_stop:
                     _finalize_diagnostics(args)
-                    args.flip_audit_total_elapsed_seconds = (
-                        time.monotonic() - run_started
-                    )
+                    args.flip_audit_total_elapsed_seconds = time.monotonic() - run_started
                     if presenter_started is not None:
                         args.flip_audit_presenter_elapsed_seconds = (
                             time.monotonic() - presenter_started
@@ -1374,15 +1514,11 @@ def _run_live_test_processes(args: argparse.Namespace) -> int:
                 _finalize_diagnostics(args)
                 args.flip_audit_total_elapsed_seconds = time.monotonic() - run_started
                 if presenter_started is not None:
-                    args.flip_audit_presenter_elapsed_seconds = (
-                        time.monotonic() - presenter_started
-                    )
+                    args.flip_audit_presenter_elapsed_seconds = time.monotonic() - presenter_started
                 return _finalize_lossless_flip_audit(args, guest_returncode)
             args.flip_audit_total_elapsed_seconds = time.monotonic() - run_started
             if presenter_started is not None:
-                args.flip_audit_presenter_elapsed_seconds = (
-                    time.monotonic() - presenter_started
-                )
+                args.flip_audit_presenter_elapsed_seconds = time.monotonic() - presenter_started
             _finalize_diagnostics(args)
             _summarize_scene_record_audit(args)
             return _finalize_lossless_flip_audit(args, presenter_returncode)
@@ -1430,6 +1566,88 @@ def _native_cache_state(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
+def _validate_replay_capture_output(
+    args: argparse.Namespace,
+) -> dict[str, object] | None:
+    output = getattr(args, "capture_replay_capsule", None)
+    if output is None:
+        return None
+    path = Path(output)
+    validation: dict[str, object] = {
+        "path": str(path.resolve()),
+        "scheduler_exit": getattr(
+            args,
+            "capture_replay_scheduler_exit",
+            "complete",
+        ),
+        "status": "rejected",
+        "problems": [],
+    }
+    problems = validation["problems"]
+    assert isinstance(problems, list)
+    if not path.is_file():
+        problems.append("requested replay capsule was not written")
+        return validation
+    try:
+        from tools.playability.replay_capsule import load_replay_capsule
+
+        capsule = load_replay_capsule(path)
+    except Exception as exc:
+        problems.append(f"cannot load replay capsule: {exc}")
+        return validation
+    validation["capsule_id"] = capsule.capsule_id
+    if validation["scheduler_exit"] != "flip":
+        validation["status"] = "valid"
+        return validation
+    resident = capsule.scheduler_state.get("resident_scheduler")
+    if not isinstance(resident, dict):
+        problems.append("flip capture is missing resident_scheduler state")
+        return validation
+    if resident.get("capture_mode") != "observed-full-flip":
+        problems.append("flip capture is not an observed-full-flip window")
+    oracle = resident.get("full_flip_oracle")
+    if not isinstance(oracle, dict):
+        problems.append("flip capture is missing full_flip_oracle")
+        return validation
+    if oracle.get("format") != "b2-recomp-phase7-full-flip-oracle":
+        problems.append("flip capture has an unsupported oracle format")
+    if oracle.get("version") != 1:
+        problems.append("flip capture has an unsupported oracle version")
+    if not isinstance(oracle.get("actual_stop_eip"), int):
+        problems.append("flip capture is missing its observed terminal EIP")
+    if not isinstance(oracle.get("terminal_cpu_state"), dict):
+        problems.append("flip capture is missing terminal CPU state")
+    if int(oracle.get("completed_flips", 0)) < 1:
+        problems.append("flip capture did not complete a flip")
+    resource_name = oracle.get("terminal_memory_resource")
+    payload = (
+        capsule.resources.get(resource_name)
+        if isinstance(resource_name, str)
+        else None
+    )
+    if payload is None or len(payload) < struct.calcsize("<4sII"):
+        problems.append("flip capture is missing its terminal memory resource")
+    else:
+        magic, version, page_count = struct.unpack_from("<4sII", payload)
+        if magic != b"B2F7" or version != 1:
+            problems.append("flip capture has an invalid terminal memory resource")
+        elif len(payload) != struct.calcsize("<4sII") + page_count * (4 + 4096):
+            problems.append("flip capture terminal memory resource is truncated")
+        elif page_count != int(oracle.get("changed_page_count", -1)):
+            problems.append("flip capture terminal page count does not match its oracle")
+    if not problems:
+        validation.update(
+            {
+                "status": "valid",
+                "actual_stop_eip": int(oracle["actual_stop_eip"]),
+                "actual_stop_eip_hex": f"0x{int(oracle['actual_stop_eip']):08X}",
+                "completed_flips": int(oracle["completed_flips"]),
+                "changed_page_count": int(oracle["changed_page_count"]),
+            }
+        )
+    return validation
+
+
 def _live_run_manifest(
     args: argparse.Namespace,
     target_verification: dict[str, object],
@@ -1451,13 +1669,57 @@ def _live_run_manifest(
         "cache": _native_cache_state(args),
         "presenter_build": getattr(args, "presenter_build_validation", None),
         "configuration": {
+            "guest_backend": _guest_backend(args),
+            "guest_backend_validation": getattr(
+                args,
+                "guest_backend_validation",
+                None,
+            ),
             "runtime_process_model": (
                 "embedded_single_process"
                 if _uses_embedded_runtime(args)
-                else "isolated_diagnostic_processes"
+                else (
+                    "native_ia32_guest_and_native_x64_presenter"
+                    if _guest_backend(args) == GUEST_BACKEND_IA32
+                    else "isolated_diagnostic_processes"
+                )
             ),
             "diagnostics_enabled": not getattr(args, "no_diagnostics", False),
-            "hot_path_profiling_enabled": getattr(args, "profile_hot_paths", False),
+            "hot_path_profiling_enabled": getattr(args, "profile_hot_paths", False)
+            or getattr(args, "profile_boot_path", False),
+            "hot_path_profile_start": (
+                "xbe-entry"
+                if getattr(args, "profile_boot_path", False)
+                else "manual-f10"
+                if getattr(args, "profile_hot_paths", False)
+                else None
+            ),
+            "replay_capsule_capture": (
+                {
+                    "path": str(args.capture_replay_capsule),
+                    "entry": int(args.capture_replay_entry),
+                    "entry_hex": f"0x{int(args.capture_replay_entry):08X}",
+                    "scheduler_stop": getattr(
+                        args,
+                        "capture_replay_scheduler_stop",
+                        None,
+                    ),
+                    "scheduler_stop_hex": (
+                        f"0x{int(args.capture_replay_scheduler_stop):08X}"
+                        if getattr(args, "capture_replay_scheduler_stop", None)
+                        is not None
+                        else None
+                    ),
+                    "scheduler_exit": getattr(
+                        args,
+                        "capture_replay_scheduler_exit",
+                        "complete",
+                    ),
+                    "trigger": "f8_replay_capture",
+                }
+                if getattr(args, "capture_replay_capsule", None) is not None
+                else None
+            ),
             "command_work_cache_trace": (
                 str(args.command_work_cache_trace)
                 if getattr(args, "command_work_cache_trace", None) is not None
@@ -1468,9 +1730,7 @@ def _live_run_manifest(
                 "aot_ab_mode",
                 DEFAULT_AOT_OPTIMIZATION_MODE,
             ),
-            "developer_live_compilation_enabled": getattr(
-                args, "developer_live_compile", False
-            ),
+            "developer_live_compilation_enabled": getattr(args, "developer_live_compile", False),
             "live_control_transport": {
                 "format": "b2-recomp-live-control",
                 "schema_version": LIVE_CONTROL_SCHEMA_VERSION,
@@ -1489,12 +1749,8 @@ def _live_run_manifest(
             "cpu_vertex_programs": getattr(args, "cpu_vertex_programs", False),
             "cpu_vertex_attributes": getattr(args, "cpu_vertex_attributes", False),
             "cpu_texture_conversion": getattr(args, "cpu_texture_conversion", False),
-            "unsupported_xbe_override": bool(
-                getattr(args, "allow_unsupported_xbe", False)
-            ),
-            "stale_artifact_override": bool(
-                getattr(args, "allow_stale_artifacts", False)
-            ),
+            "unsupported_xbe_override": bool(getattr(args, "allow_unsupported_xbe", False)),
+            "stale_artifact_override": bool(getattr(args, "allow_stale_artifacts", False)),
         },
         "outputs": {
             "probe_summary": (
@@ -1504,8 +1760,7 @@ def _live_run_manifest(
             ),
             "runner_log": (
                 str(args.runner_log.resolve())
-                if not getattr(args, "no_diagnostics", False)
-                and not _uses_embedded_runtime(args)
+                if not getattr(args, "no_diagnostics", False) and not _uses_embedded_runtime(args)
                 else None
             ),
         },
@@ -1514,6 +1769,10 @@ def _live_run_manifest(
 
 def run_live_test(args: argparse.Namespace) -> int:
     started = time.monotonic()
+    args.stale_artifact_rejected = False
+    args.diagnostics_summary_status = (
+        "disabled" if getattr(args, "no_diagnostics", False) else "pending"
+    )
     try:
         target_verification = verify_supported_xbe(
             args.xbe,
@@ -1535,6 +1794,35 @@ def run_live_test(args: argparse.Namespace) -> int:
     args.presenter_build_manifest = (
         getattr(args, "presenter_build_manifest", None) or DEFAULT_BUILD_MANIFEST
     )
+    try:
+        _prepare_guest_backend(args)
+    except Ia32BackendError as exc:
+        args.guest_backend_validation = {
+            "status": "rejected",
+            "backend": _guest_backend(args),
+            "artifact": str(
+                Path(getattr(args, "ia32_artifact", DEFAULT_IA32_LIVE_ARTIFACT)).resolve()
+            ),
+            "problems": [str(exc)],
+        }
+        args.presenter_build_validation = {
+            "status": "not_started",
+            "valid": None,
+            "override_used": False,
+        }
+        manifest = _live_run_manifest(args, target_verification)
+        manifest.update(
+            {
+                "status": "rejected_guest_backend",
+                "returncode": 2,
+                "finished_utc": utc_now(),
+                "elapsed_seconds": round(time.monotonic() - started, 6),
+            }
+        )
+        write_json_atomic(args.run_manifest, manifest)
+        print(f"Guest backend rejected: {exc}", file=sys.stderr)
+        print(f"Run manifest: {args.run_manifest}")
+        return 2
     embedded_runtime = _uses_embedded_runtime(args)
     if not args.skip_host_build and embedded_runtime:
         toolchain = discover_toolchain()
@@ -1604,9 +1892,7 @@ def run_live_test(args: argparse.Namespace) -> int:
     write_json_atomic(args.run_manifest, manifest)
     try:
         result = (
-            _run_live_test_embedded(args)
-            if embedded_runtime
-            else _run_live_test_processes(args)
+            _run_live_test_embedded(args) if embedded_runtime else _run_live_test_processes(args)
         )
     except Exception as exc:
         manifest.update(
@@ -1620,8 +1906,22 @@ def run_live_test(args: argparse.Namespace) -> int:
         )
         write_json_atomic(args.run_manifest, manifest)
         raise
-    if getattr(args, "stale_artifact_rejected", False) and result == 0:
+    if (
+        getattr(args, "diagnostics_summary_status", "pending")
+        in {"missing", "invalid", "stale"}
+        and result == 0
+    ):
         result = 1
+    capture_validation = _validate_replay_capture_output(args)
+    if capture_validation is not None:
+        manifest["replay_capture_validation"] = capture_validation
+        if capture_validation["status"] != "valid" and result == 0:
+            result = 1
+            print(
+                "Replay capture rejected: "
+                + "; ".join(capture_validation["problems"]),
+                file=sys.stderr,
+            )
     manifest.update(
         {
             "status": "completed" if result == 0 else "failed",
@@ -1629,9 +1929,12 @@ def run_live_test(args: argparse.Namespace) -> int:
             "finished_utc": utc_now(),
             "elapsed_seconds": round(time.monotonic() - started, 6),
             "cache_after": _native_cache_state(args),
-            "stale_artifact_rejected": bool(
-                getattr(args, "stale_artifact_rejected", False)
+            "diagnostics_summary_status": getattr(
+                args,
+                "diagnostics_summary_status",
+                "pending",
             ),
+            "stale_artifact_rejected": bool(getattr(args, "stale_artifact_rejected", False)),
         }
     )
     try:
@@ -1658,6 +1961,24 @@ def main() -> int:
         description="Run the native guest and live Vulkan presenter together."
     )
     parser.add_argument("--xbe", type=Path, default=DEFAULT_XBE)
+    parser.add_argument(
+        "--guest-backend",
+        choices=(GUEST_BACKEND_IA32, GUEST_BACKEND_DIAGNOSTIC_ORACLE),
+        default=GUEST_BACKEND_DIAGNOSTIC_ORACLE,
+        help=(
+            "Guest execution backend. The explicit same-ISA IA-32 path fails "
+            "closed unless given a verified boot-entry normal-live artifact."
+        ),
+    )
+    parser.add_argument(
+        "--ia32-artifact",
+        type=Path,
+        default=DEFAULT_IA32_LIVE_ARTIFACT,
+        help=(
+            "Verified boot-entry normal-live IA-32 artifact manifest or directory. "
+            "Fixed replay-capsule artifacts are rejected."
+        ),
+    )
     parser.add_argument(
         "--supported-targets",
         type=Path,
@@ -1688,8 +2009,7 @@ def main() -> int:
         "--allow-stale-artifacts",
         action="store_true",
         help=(
-            "Developer-only override for stale presenter artifacts; marks the "
-            "run as unsupported."
+            "Developer-only override for stale presenter artifacts; marks the run as unsupported."
         ),
     )
     parser.add_argument("--extracted-root", type=Path, default=DEFAULT_EXTRACTED_ROOT)
@@ -1742,10 +2062,7 @@ def main() -> int:
         "--native-slice-steps",
         type=int,
         default=DEFAULT_NATIVE_SLICE_STEPS,
-        help=(
-            "Guest instructions per input exchange; completed flips still "
-            "yield immediately."
-        ),
+        help=("Guest instructions per input exchange; completed flips still yield immediately."),
     )
     parser.add_argument(
         "--max-steps",
@@ -1756,10 +2073,7 @@ def main() -> int:
     parser.add_argument(
         "--inject-confirm-after-flip",
         type=int,
-        help=(
-            "Developer diagnostic: inject one A/confirm pulse after the named "
-            "guest flip."
-        ),
+        help=("Developer diagnostic: inject one A/confirm pulse after the named guest flip."),
     )
     parser.add_argument(
         "--profile-hot-paths",
@@ -1768,6 +2082,45 @@ def main() -> int:
             "Arm an F10-controlled native capture window for exact module "
             "edges and exclusive dispatcher timing; use only for profiling "
             "runs because active capture adds diagnostic accounting."
+        ),
+    )
+    parser.add_argument(
+        "--profile-boot-path",
+        action="store_true",
+        help=(
+            "Developer diagnostic: begin native profiling at XBE entry, then "
+            "press F10 once after manually reaching Lesson One to seal the window."
+        ),
+    )
+    parser.add_argument(
+        "--capture-replay-capsule",
+        type=Path,
+        help=(
+            "Capture the first --capture-replay-entry reached after F8 requests "
+            "a replay checkpoint, write a local .b2rcap, and stop the run."
+        ),
+    )
+    parser.add_argument(
+        "--capture-replay-entry",
+        type=lambda value: int(value, 0),
+        default=0x000C5550,
+        help="Guest EIP for manual replay capture (default: 0x000C5550).",
+    )
+    parser.add_argument(
+        "--capture-replay-scheduler-stop",
+        type=lambda value: int(value, 0),
+        help=(
+            "Emit a Phase-5 bounded primary-lane scheduler capsule ending at "
+            "this decoded guest EIP."
+        ),
+    )
+    parser.add_argument(
+        "--capture-replay-scheduler-exit",
+        choices=("complete", "flip", "yield"),
+        default="complete",
+        help=(
+            "Observable exit represented by the captured scheduler slice; "
+            "use 'flip' for the Phase-7 full-flip gate."
         ),
     )
     parser.add_argument(
@@ -1901,14 +2254,38 @@ def main() -> int:
     args = parser.parse_args()
     if args.presentation_pipeline_depth is None:
         args.presentation_pipeline_depth = (
-            1
-            if args.lossless_flip_audit
-            else DEFAULT_PRESENTATION_PIPELINE_DEPTH
+            1 if args.lossless_flip_audit else DEFAULT_PRESENTATION_PIPELINE_DEPTH
         )
     if args.max_steps < 0:
         parser.error("--max-steps must not be negative")
     if args.native_slice_steps <= 0:
         parser.error("--native-slice-steps must be greater than zero")
+    if not 0 <= args.capture_replay_entry <= 0xFFFFFFFF:
+        parser.error("--capture-replay-entry must fit a 32-bit guest address")
+    if args.capture_replay_scheduler_stop is not None:
+        if args.capture_replay_capsule is None:
+            parser.error(
+                "--capture-replay-scheduler-stop requires --capture-replay-capsule"
+            )
+        if not 0 <= args.capture_replay_scheduler_stop <= 0xFFFFFFFF:
+            parser.error(
+                "--capture-replay-scheduler-stop must fit a 32-bit guest address"
+            )
+    if (
+        args.capture_replay_scheduler_exit != "complete"
+        and args.capture_replay_capsule is None
+    ):
+        parser.error(
+            "--capture-replay-scheduler-exit requires --capture-replay-capsule"
+        )
+    if (
+        args.capture_replay_scheduler_exit == "yield"
+        and args.capture_replay_scheduler_stop is None
+    ):
+        parser.error(
+            "--capture-replay-scheduler-exit yield requires "
+            "--capture-replay-scheduler-stop"
+        )
     if args.startup_timeout_seconds <= 0:
         parser.error("--startup-timeout-seconds must be greater than zero")
     if args.flip_audit_max_flips < 0:
@@ -1918,12 +2295,12 @@ def main() -> int:
     if (
         args.aot_ab_mode != DEFAULT_AOT_OPTIMIZATION_MODE
         and not args.profile_hot_paths
+        and not args.profile_boot_path
     ):
         parser.error("non-default --aot-ab-mode requires --profile-hot-paths")
     if args.lossless_flip_audit and args.presentation_pipeline_depth != 1:
         parser.error(
-            "--presentation-pipeline-depth 2 cannot be combined with "
-            "--lossless-flip-audit"
+            "--presentation-pipeline-depth 2 cannot be combined with --lossless-flip-audit"
         )
     if args.audit_world_matrix_address is not None and not (
         0 <= args.audit_world_matrix_address <= 0xFFFFFFC0
@@ -1933,6 +2310,7 @@ def main() -> int:
         parser.error("--flip-audit-max-flips requires --lossless-flip-audit")
     if args.no_diagnostics and (
         args.profile_hot_paths
+        or args.profile_boot_path
         or args.command_work_cache_trace is not None
         or args.audit_world_matrices
         or args.audit_world_matrix_address is not None
@@ -1952,9 +2330,7 @@ def main() -> int:
         args.flip_audit_frames = args.flip_audit_output_dir / "frames"
         args.flip_audit_events = args.flip_audit_output_dir / "presenter-events.jsonl"
         args.flip_audit_report = args.flip_audit_output_dir / "report.json"
-        args.flip_audit_presenter_summary = (
-            args.flip_audit_output_dir / "presenter-summary.json"
-        )
+        args.flip_audit_presenter_summary = args.flip_audit_output_dir / "presenter-summary.json"
     return run_live_test(args)
 
 

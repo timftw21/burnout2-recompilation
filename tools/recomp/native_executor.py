@@ -15,6 +15,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter, deque
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from tools.compiler_cache import cache_environment, resolve_compiler_cache, write_stats
@@ -39,7 +40,7 @@ from tools.recomp.x86_lifter import (
 NATIVE_MEMORY_CALLBACK_SAMPLE_INTERVAL = 1024
 NATIVE_MEMORY_CALLBACK_HOT_ADDRESS_LIMIT = 32
 NATIVE_MEMORY_CALLBACK_SAMPLE_KEY_LIMIT = 256
-NATIVE_DISPATCH_EDGE_CAPACITY_LIMIT = 1 << 16
+NATIVE_DISPATCH_EDGE_CAPACITY_LIMIT = 1 << 18
 NATIVE_DISPATCH_EDGE_REPORT_LIMIT = NATIVE_DISPATCH_EDGE_CAPACITY_LIMIT
 NATIVE_TARGET_TIMING_SAMPLE_INTERVAL = 256
 NATIVE_PROFILE_EXECUTION_LANES = ("primary", "worker", "vblank")
@@ -1447,6 +1448,9 @@ struct B2RNativeHostServiceState {
     bool live_frontend_text_pending;
     uint32_t normal_runtime_failure_code;
     uint32_t normal_runtime_failure_target;
+    bool replay_capture_pending;
+    uint64_t replay_capture_start_flip_count;
+    uint64_t replay_capture_completed_flip_count;
     bool normal_runtime_stop_requested;
     uint64_t presentation_event_handle;
     uint64_t publication_event_handle;
@@ -1515,6 +1519,10 @@ struct B2RNativeHostServiceState {
     uint32_t native_traffic_mesh_sample_cursor;
     B2RNativeTrafficMeshSample native_traffic_mesh_samples[
         B2R_NATIVE_TRAFFIC_MESH_SAMPLE_CAPACITY];
+    void* python_observer_user;
+    void (__cdecl *python_observer)(void*, B2RContext*);
+    uint32_t python_observer_address;
+    bool python_observer_enabled;
 };
 
 static uint32_t b2r_align_up(uint32_t value, uint32_t alignment) {
@@ -2892,6 +2900,12 @@ extern "C" __declspec(dllexport) void b2r_native_observe(
         static_cast<B2RNativeHostServiceState*>(opaque);
     B2RContext* context = static_cast<B2RContext*>(context_pointer);
     if (state == nullptr) { return; }
+    if (state->python_observer_enabled &&
+        state->python_observer != nullptr && context != nullptr &&
+        context->eip == state->python_observer_address) {
+        state->python_observer(state->python_observer_user, context);
+        return;
+    }
     ++state->native_observer_count;
     constexpr uint32_t kFrontendRecordTableScan = 0x00112873u;
     constexpr uint32_t kFrontendRecordTableMaxCount = 0x00010000u;
@@ -5002,6 +5016,9 @@ static bool b2r_try_native_host_service(
             state->performance_counter += argument(0u);
             eax = 0u;
         } else if (service->value == kMmClaimGpuInstanceMemory) {
+            if (argument(1u) != 0u) {
+                b2r_native_service_write_u32(state, argument(1u), 0u);
+            }
             eax = b2r_native_allocate_range(
                 state, argument(0u), 0x1000u, true);
         } else if (service->value == kNtClose) {
@@ -10238,6 +10255,14 @@ static uint32_t b2r_service_native_normal_runtime(
                 return state->normal_runtime_stop_requested ? 1u : 2u;
             }
             state->live_frontend_text_pending = false;
+            if (state->replay_capture_pending &&
+                state->live_flip_count > state->replay_capture_start_flip_count) {
+                state->replay_capture_pending = false;
+                ++state->replay_capture_completed_flip_count;
+                state->normal_runtime_stop_requested = true;
+                release_direct_observed_spans();
+                return 1u;
+            }
         }
     }
     release_direct_observed_spans();
@@ -10978,6 +11003,9 @@ class NativeHostServiceState(ctypes.Structure):
         ("live_frontend_text_pending", ctypes.c_bool),
         ("normal_runtime_failure_code", ctypes.c_uint32),
         ("normal_runtime_failure_target", ctypes.c_uint32),
+        ("replay_capture_pending", ctypes.c_bool),
+        ("replay_capture_start_flip_count", ctypes.c_uint64),
+        ("replay_capture_completed_flip_count", ctypes.c_uint64),
         ("normal_runtime_stop_requested", ctypes.c_bool),
         ("presentation_event_handle", ctypes.c_uint64),
         ("publication_event_handle", ctypes.c_uint64),
@@ -11045,6 +11073,10 @@ class NativeHostServiceState(ctypes.Structure):
         ("native_traffic_mesh_sample_count", ctypes.c_uint32),
         ("native_traffic_mesh_sample_cursor", ctypes.c_uint32),
         ("native_traffic_mesh_samples", _NativeTrafficMeshSample * 1024),
+        ("python_observer_user", ctypes.c_void_p),
+        ("python_observer", ctypes.c_void_p),
+        ("python_observer_address", ctypes.c_uint32),
+        ("python_observer_enabled", ctypes.c_bool),
     ]
 
     def __init__(self, entries: Iterable[NativeHostServiceEntry] = ()) -> None:
@@ -12527,7 +12559,7 @@ class NativeResumableExecutor:
         # per-entry counters above. Allocate their lossless profiling table
         # lazily so representative non-profiled runs pay no memory cost.
         self._dispatch_edge_capacity = min(
-            table_capacity * 2,
+            table_capacity * 8,
             NATIVE_DISPATCH_EDGE_CAPACITY_LIMIT,
         )
         self._dispatch_edge_keys: Any | None = None
@@ -12703,6 +12735,8 @@ class NativeResumableExecutor:
         provenance: Mapping[str, Any],
         resources: Mapping[str, bytes | Path] | None = None,
         events: Mapping[str, Sequence[Any]] | None = None,
+        memory_overlays: Mapping[int, bytes] | None = None,
+        instruction_bytes_reader: Callable[[int, int], bytes] | None = None,
     ) -> Path:
         """Capture an explicitly requested local checkpoint at a host boundary."""
 
@@ -12712,11 +12746,48 @@ class NativeResumableExecutor:
         )
 
         require_local_capsule_output(output, synthetic=False)
+        functions = self._capsule_functions
+        if instruction_bytes_reader is not None:
+            functions = tuple(
+                replace(
+                    function,
+                    instructions=tuple(
+                        replace(
+                            instruction,
+                            bytes_hex=instruction_bytes_reader(
+                                instruction.address,
+                                instruction.size,
+                            ).hex().upper(),
+                        )
+                        for instruction in function.instructions
+                    ),
+                )
+                for function in functions
+            )
+        native_memory_snapshot = getattr(
+            memory,
+            "replay_capsule_memory_snapshot_from_native_pages",
+            None,
+        )
+        memory_snapshot = getattr(memory, "replay_capsule_memory_snapshot", None)
+        if callable(native_memory_snapshot):
+            captured_memory = native_memory_snapshot(self._page_table)
+        elif callable(memory_snapshot):
+            captured_memory = memory_snapshot()
+        else:
+            captured_memory = memory
+        if memory_overlays:
+            if captured_memory is memory:
+                captured_memory = SparseMemory()
+                for page_number, payload in memory.export_pages():
+                    captured_memory.write(page_number * 4096, payload)
+            for address, payload in sorted(memory_overlays.items()):
+                captured_memory.write(int(address) & 0xFFFFFFFF, bytes(payload))
         return capture_replay_capsule(
             output,
             state=state,
-            memory=memory,
-            functions=self._capsule_functions,
+            memory=captured_memory,
+            functions=functions,
             scheduler_state=scheduler_state,
             service_state=service_state,
             provenance={**provenance, "manual_capture": True},
@@ -13045,9 +13116,18 @@ class NativeResumableExecutor:
         dispatch_host_calls_in_native: bool = False,
         native_host_services: NativeHostServiceState | None = None,
         dispatch_observers_in_native: bool = False,
+        python_observer_address: int | None = None,
     ) -> int:
         """Run until the step budget, an unhandled target, or callback exception."""
         run_started_ns = time.perf_counter_ns()
+        if python_observer_address is not None:
+            if not dispatch_observers_in_native:
+                raise ValueError(
+                    "a selective Python observer requires native observer dispatch"
+                )
+            if not 0 <= int(python_observer_address) <= 0xFFFFFFFF:
+                raise ValueError("Python observer address must fit a guest uint32")
+            python_observer_address = int(python_observer_address)
         if profile_hot_paths and self._dispatch_edge_keys is None:
             edge_capacity = self._dispatch_edge_capacity
             self._dispatch_edge_keys = (ctypes.c_uint64 * edge_capacity)()
@@ -14399,6 +14479,10 @@ class NativeResumableExecutor:
         )
         if native_host_services is not None:
             native_host_services.configure_hot_path_profile(profile_hot_paths)
+            native_host_services.python_observer_user = None
+            native_host_services.python_observer = None
+            native_host_services.python_observer_address = 0
+            native_host_services.python_observer_enabled = False
         native_host_service_start_count = (
             int(native_host_services.native_call_count)
             if native_host_services_enabled and native_host_services is not None
@@ -14451,6 +14535,15 @@ class NativeResumableExecutor:
                     ctypes.c_void_p,
                 )
                 context.observe = self._native_observe_callback
+                if python_observer_address is not None:
+                    native_host_services.python_observer = ctypes.cast(
+                        observe_callback,
+                        ctypes.c_void_p,
+                    ).value
+                    native_host_services.python_observer_address = (
+                        python_observer_address
+                    )
+                    native_host_services.python_observer_enabled = True
         else:
             context.native_memory_user = None
             context.native_read_u32 = None

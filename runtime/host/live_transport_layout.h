@@ -15,13 +15,25 @@ inline constexpr uint32_t kLiveHotPathProfileDisabled = 0u;
 inline constexpr uint32_t kLiveHotPathProfileArmed = 1u;
 inline constexpr uint32_t kLiveHotPathProfileActive = 2u;
 inline constexpr uint32_t kLiveHotPathProfileComplete = 3u;
+inline constexpr size_t kLiveReplayCaptureStateOffset = 40u;
+inline constexpr uint32_t kLiveReplayCaptureDisabled = 0u;
+inline constexpr uint32_t kLiveReplayCaptureArmed = 1u;
+inline constexpr uint32_t kLiveReplayCaptureRequested = 2u;
+inline constexpr uint32_t kLiveReplayCaptureComplete = 3u;
 inline constexpr size_t kLiveControllerSequenceOffset = 64u;
 inline constexpr size_t kLiveControllerPayloadOffset = 68u;
 inline constexpr size_t kLivePresentationSequenceOffset = 128u;
 inline constexpr size_t kLivePresentationPayloadOffset = 136u;
+inline constexpr size_t kLiveAudioSequenceOffset = 8192u;
+inline constexpr size_t kLiveAudioAcknowledgedSequenceOffset = 8196u;
+inline constexpr size_t kLiveAudioPayloadSizeOffset = 8200u;
+inline constexpr size_t kLiveAudioPayloadOffset = 8224u;
+inline constexpr size_t kLiveAudioPayloadCapacity = 16u * 1024u;
 inline constexpr size_t kLiveManifestSequenceOffset = 256u;
 inline constexpr size_t kLiveManifestSizeOffset = 260u;
 inline constexpr size_t kLiveManifestPayloadOffset = 264u;
+inline constexpr size_t kLiveManifestPayloadCapacity =
+    kLiveAudioSequenceOffset - kLiveManifestPayloadOffset;
 inline constexpr std::array<uint8_t, 8> kLiveManifestMagic = {
     'B', '2', 'M', 'A', 'N', '0', '0', '1'};
 inline constexpr uint8_t kLiveManifestTypeU64 = 1u;

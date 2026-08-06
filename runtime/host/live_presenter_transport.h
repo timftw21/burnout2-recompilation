@@ -41,6 +41,8 @@ public:
     uint64_t resource_slot_capacity() const;
     uint32_t hot_path_profile_state() const;
     uint32_t toggle_hot_path_profile();
+    uint32_t replay_capture_state() const;
+    uint32_t request_replay_capture();
 
     std::optional<std::string> read_manifest() const;
     std::optional<std::string> read_manifest_file(
@@ -57,6 +59,7 @@ public:
         uint64_t expected_size,
         const std::string& expected_generation,
         std::vector<uint8_t>& payload) const;
+    bool read_audio_pcm(std::vector<uint8_t>& payload);
     void publish_controller(const b2r::platform::ControllerState& controller);
     void publish_presentation(uint64_t generation, uint64_t guest_flip_count);
 

@@ -1,14 +1,43 @@
 # Validation evidence
 
 This document retains operational evidence and known limitations without
-turning the project entry point into a run log. Unless a row says otherwise,
-the evidence is from July 2026 and applies only to the exact supported XBE and
-recorded build/run identities.
+turning the project entry point into a run log. Dated evidence applies only to
+the exact supported XBE and recorded build/run identities.
+
+## Current Phase 7 checkpoint (August 6, 2026)
+
+The work-in-progress same-ISA IA-32 path now boots from the supported XBE,
+publishes the frontend, accepts manual controller input, plays menu music, and
+reaches Load/Save. Attempting to create a new slot currently stops at the
+deliberate unbound-indirect-call guard at guest `0x00045141`:
+
+```text
+0x00045138  mov ecx, [0x004CB364]
+0x0004513E  mov edx, [ecx]
+0x00045140  push eax
+0x00045141  call [edx+0x0C]
+```
+
+The retained artifact is
+`cf103314477d515bfb9adb67ad2af5fd97215375ba6aa6a5aaf644eb9ef51d1a`
+with PE SHA-256
+`fed62c53eaf37824e4bb0569b49f9fe93e1fb4e270ece1e67bdeb9bcce7dad87`.
+Run `87c03b0e-e64a-478f-a8d5-c920fbf52f71` reports exception
+`0x80000003` at `0x00045141` and zero Python runtime callbacks. This is a
+static-coverage stop, not accepted save creation or gameplay.
+
+The launcher requires an explicit `--guest-backend same-isa-ia32` selection
+for this path. The default `live_test.py` backend remains the diagnostic oracle. A
+static-clean run must keep developer live compilation and native promotion
+disabled and report zero frontier-interpreter invocations, frontier-interpreter
+steps, and Python runtime callbacks.
 
 ## Automated asset-free baseline
 
-The latest July 23 closeout run passed 548 Python tests and 10 native CTest
-cases. The native suite covers NV2A vertex-program behavior plus live-transport
+Run the current baseline through `python tools/dev_check.py --explain`; test
+counts grow as Phase 7 coverage is added. The retained July 23 closeout passed
+548 Python tests and 10 native CTest cases. The native suite covers NV2A
+vertex-program behavior plus live-transport
 seqlock/layout rules, texture layout and Morton unswizzling, dirty-range
 ownership/merging, pipeline identity/cache hashing, and completed-flip FPS
 sampling. Debug and strict release presenter builds passed locally; Windows CI
@@ -18,6 +47,239 @@ presets.
 The four-layer synthetic preflight creates ephemeral redistributable asset,
 render-stream, rendered-frame, and guest-health fixtures. It does not read
 proprietary local data.
+
+### Same-ISA IA-32 Phase-0 contract
+
+The August 1 asset-free Phase-0 gate independently rebuilds deterministic
+compute and `RtlEnterCriticalSection` replay capsules and 32-bit PE artifacts,
+then compares decoded-reference and hardware execution at the fixed slice
+boundary. It requires matching normalized CPU state and sparse memory, validates
+independent artifact identities, and reports the exact compiler/assembler/linker
+and Windows import-library content identity. The frozen execution-contract ID is
+`db1648476e03d88ab1c18a0ad7d04dddc7cd8b388754808c38467b2a6e72aae7`.
+
+The comparison masks reserved x87 control bits and reports MXCSR sticky-status
+bits separately because the decoded reference does not model those hardware
+flags yet. New Phase-0 inputs must have an empty x87 stack and zero MMX state.
+The old proprietary compute proof's MMX/x87 physical-alias representation is
+recorded as an explicit historical exclusion in its ignored local seal; the
+host-service proof requires no such exclusion. Failures use the differential
+replay diagnostic schema, including named register changes and bounded page
+diffs.
+
+### Same-ISA IA-32 Phase-1 resident worker
+
+The Phase-1 gate builds persistent generator-v14 artifacts for the same
+asset-free compute and host-service capsules. Each artifact is launched once,
+maps its verified guest pages and native thunks once, and accepts three
+`enter`, `resume`, or `service-return` dispatches before an acknowledged stop.
+Every dispatch must match the decoded reference, reuse the same process, and
+produce the same normalized state and page identities after resetting its
+inputs. The frozen worker-contract ID is
+`f47d8abe70f7b6c628692c93cccc048c9f5b9fb6795ff7c3bfc346a91798285f`.
+
+The transport has explicit ready, running, complete, stopped, fault, and
+protocol-error states. Startup and resident dispatch time are reported
+separately. Timeout, native-process crash, and protocol failures include the
+artifact identity and last published guest EIP. The worker contains no runtime
+decoder, compiler, raw-XBE path, or Python callback; Python only builds,
+launches, dispatches deterministic records, and composes diagnostics.
+
+### Same-ISA IA-32 Phase-2 decoded-store artifacts
+
+The Phase-2 gate consumes a deterministic XBE plus its version-3 SQLite
+decoded block store and emits a generator-v15 resident PE. Store identity is a
+canonical snapshot of the matching image's decoded records; mutable access
+counters, WAL layout, and prepared snapshots are deliberately excluded. Every
+instruction is rebound to bytes from a file-backed executable XBE section and
+freshly decoded before emission. Metadata/byte drift fails the build.
+
+Each artifact includes content-addressed `section-map.json`,
+`coverage-map.json`, `direct-edge-relocations.json`,
+`indirect-target-table.json`, and `rewrite-manifest.json` sidecars. Known direct
+edges retain their original fixed-address encoding. Missing direct or indirect
+targets and unimplemented privileged, MMIO, or TLS rewrites are named static
+coverage gaps; complete artifacts contain none. The frozen Phase-2 contract ID
+is `5831ed5424f7a3c3541f626d9a710d21ec64368c8ee3b823a9740d14c6be8651`.
+
+The strict loader verifies the XBE, semantic store snapshot, active locked
+toolchain, executable, manifest, and every sidecar. The asset-free proof rebuilds
+the same artifact after changing store bookkeeping, preserves a direct native
+call without runtime patching, and executes three matching dispatches in one
+resident worker. Its proof-set ID is
+`7eea35297bf9e4770d2a2ecc1a96c537bafa209e2d1d336d7c02035c4ad0bd66`.
+
+### Same-ISA IA-32 Phase-3 architecture and memory semantics
+
+The Phase-3 gate emits generator-v16 resident artifacts with exchange version
+3. FXSAVE input/output now carries logical x87 stack state, its physical MMX
+alias mode, XMM registers, and MXCSR. The architecture map records each static
+FS/TLS, physical-page alias, MMIO-shadow, and deterministic RDTSC rewrite;
+mapped pages also carry guest, renderer, or audio dirty ownership. The worker
+computes one dirty bit per page before publishing output, while the diagnostic
+composer reports the exact changed byte range. Cross-page writes must publish
+both pages.
+
+Four ordinary independently rebuilt capsules compare decoded-reference and hardware
+state/pages for x87, MMX/SSE, TLS, native call/return stack behavior, aliases,
+MMIO, cross-page dirty ownership, and deterministic timestamp state; the RDTSC
+case is built on the XBE-bound decoded-store artifact path. A fifth
+exceptional capsule publishes the same access-violation code, guest EIP, read
+address, and access kind twice from one resident PID. The architecture contract
+ID is `ae0efb70deea9c115cbe4fc78ffaa4d691127738f622c8809f62e0484e1395f6`;
+the frozen proof-set ID is
+`de4175d8991c9030063570b4927ca482ed38668726d59049e60ebab4ec3eca45`.
+
+Rewrites are deliberately narrow. Dynamic FS forms, dynamic high/MMIO/alias
+addresses, unsupported privileged instructions, conflicting alias input,
+self-modifying code, and newly executable memory fail before normal execution
+with the guest address and required rewrite. Phase-3 artifacts retain zero
+runtime decoding, compilation, code patching, native promotion, raw-XBE
+execution, and Python callbacks.
+
+### Same-ISA IA-32 Phase-4 native host ABI
+
+The Phase-4 gate emits generator-v20 artifacts with exchange version 4. Every
+reached service is bound at build time to a cdecl or stdcall descriptor and a
+five-byte fixed-address entry thunk. Isolated audited bodies preserve guest
+flags, volatile integer registers, and FPU/SIMD state while recording the exact
+call order, arguments, return value, stack delta, declared memory effect,
+callback state, boundary, and execution owner. The bounded native trace fails
+closed on overflow or an unregistered ABI.
+
+Cheap services remain in the resident IA-32 worker. Platform-facing scalar
+requests use named shared memory and native events to a separately built x64
+broker; it does not dereference guest pointers, and Python does not participate
+in service dispatch. The asset-free proof invokes four services spanning
+memory, title callback, render-broker, and input boundaries. It matches the
+decoded oracle's service records and declared memory state, restores the guest
+stack, re-enters one decoded callback, observes distinct worker and broker
+PIDs, and reproduces both executable identities. The host-ABI contract ID is
+`813b75d708756fb884bb03ea9199cebb458ddfc1908fc038ea841c9b78ac2542`;
+the frozen proof-set ID is
+`73bbca58fa82fe81d18e9aaa783eef4b6786c853787934244dbab067a95233b8`.
+The version-2 workload registry additionally freezes the exact native ABI for
+the 13 measured pool, contiguous-memory, timing, IRQL, semaphore, and title
+stream targets, including five-argument cleanup and the original `ECX` value.
+The report requires zero Python callbacks, runtime decoding, compilation,
+guest-code patching, native promotion, and raw-XBE execution.
+
+### Same-ISA IA-32 Phase-5 resident scheduling
+
+The Phase-5 gate emits generator-v21 artifacts with exchange version 5 and a
+content-addressed `resident-scheduler-map.json`. Primary, worker, and vblank
+lanes retain independent GPR, EFLAGS, complete FXSAVE, EIP, stack, and TLS
+state inside the 32-bit worker. The scheduler preserves the accepted normal
+runtime order—primary safe point, vblank, then runnable worker—and classifies
+yield, wait, flip, completion, wake, and fault transitions in a bounded native
+trace.
+
+The ordinary asset-free proof executes two scheduler cycles and matches the
+decoded oracle on lane/service order, all three final contexts, selected shared
+memory, two worker wakeups, one completed flip, and FNV-1a render/audio product
+hashes. Its TLS values independently advance to 103, 202, and 302. The fault
+proof raises a real vblank access violation, records code `0xC0000005`, guest
+EIP, and address `0x01000000`, then completes the worker and primary lanes
+without restarting the resident process. The scheduler contract ID is
+`46d3912dfeb6281b4e86399293f7ec728ecc7b9457bceaf4516ba28f0daa3a62`;
+the frozen proof-set ID is
+`6041247e49b60c22041010f2e5eba6bdb4cf12604e3655a5db1a542e20841c1c`.
+Both proofs require zero stranded contexts, unclassified exits, Python runtime
+callbacks, runtime decoding, compilation, guest-code patching, native
+promotion, and raw-XBE execution.
+
+### Same-ISA IA-32 Phase-6 measured coverage growth
+
+The Phase-6 gate emits generator-v22 artifacts and a content-addressed
+`coverage-growth-map.json` over the decoded-store, architecture, host-ABI, and
+resident-scheduler layers. Profiles assign reached executable targets to the
+Lesson One hot SCC, boot/frontend continuity, or worker/vblank/cold slice and
+record estimated native time, guest steps, module calls, transitions, and
+explicit service/render exits. SCC priority is measured heat plus unique
+outgoing frontier, with address used only as a deterministic tie-break.
+
+Normal validation is fail-closed: every observed executable target must
+already be decoded or registered, all reached static rewrites must be
+implemented, and frontier-interpreter invocations and steps must both be zero.
+Only `diagnostic-discovery` profiles may retain unknown targets; their report
+names `required_next_decoded_store_targets` and is never promotion eligible.
+The coverage-growth contract ID is
+`6a73b7ecac983f0b448e74f59241faf63de961a22ec62e891af19e0aa8f0b50c`;
+the frozen proof-set ID is
+`9a614ef70b5e5cd4ccc8eeffd662c2df15af504afba2d3bd0f36017b23e6727a`.
+The asset-free proof executes the full resident scheduler, proves non-address
+ranking and monotonic three-slice closure, records a diagnostic unknown target
+for the next store, rejects that target in normal mode, and reproduces the PE,
+broker, coverage map, and artifact identities. Manual workload builds use a
+detached fixed-VA guest mapping: the helper reserves the low title range before
+the Windows heap, places worker code above it, maps exchanges at verified high
+addresses, and copies the AOT spans for scheduler dispatches. The measured
+closure registers 13 native services plus the `0xB2D3D000` scheduler sentinel
+and resolves all 134 active static sites. The wider decoded store still reports
+its 2,644 out-of-scope unsupported sites separately; promotion applies only to
+the closed profiled supported workload.
+
+### Same-ISA IA-32 Phase-7 launcher cutover
+
+The Phase-7 gate emits generator-v23 artifacts with exchange version 6 and a
+content-addressed `launcher-cutover-map.json`. A verified closed artifact
+selects same-ISA IA-32 as its normal backend; the fusion-only 64-bit executor
+is named separately as an explicit diagnostic oracle. Missing, incomplete, or
+fallback-enabled artifacts fail before launch. Automatic cross-backend fallback
+is forbidden.
+
+Guest pages are seeded into the 32-bit worker once before it reports ready.
+Subsequent commands preserve native memory ownership and transfer only the CPU
+and scheduler/service control records plus pages explicitly republished by a
+host boundary. Native completion compares against the retained publication
+image and copies back only changed pages. The report distinguishes the initial
+seed, host publications, native dirty publications, bypassed pages, control
+bytes, and the eliminated legacy full-roundtrip byte count. Result summaries
+read the sparse-memory allocation count directly and do not export every
+capsule page.
+
+The asset-free proof runs two sequential full resident schedules plus one
+explicit host-page-publication schedule in one worker and matches the decoded
+oracle after each on CPU state, scheduler and service trace, selected shared
+memory, and render/audio products. The first command publishes 11 of 12 pages
+and the second publishes 5, while both bypass all input page copies; the third
+accepts exactly one 4 KiB host page and bypasses the other 11. Its
+launcher-cutover contract ID is
+`805369e7b1de0e116abaddc4ffb4f675d3d89f52a19552ce9d0c151609d591b0`;
+the frozen proof-set ID is
+`a7e5a5a845c50c5aacf49501ba9aadcf6cee632df3f03b96916795c14b29b412`.
+The proof requires reproducible artifacts and maps, one worker PID, zero
+cross-backend exits, Python callbacks, frontier-interpreter activity, runtime
+decoding/compilation/patching, native promotion, and raw-XBE execution.
+
+Retained manual artifact
+`21c094f86567336dad0ec3312174a73b8188ef6555365f5f4bbdc2fea51f2bda`
+replays the accepted Lesson One scheduler boundary twice. Its first dispatch
+matches the accepted Phase-6 CPU state, 202-page dirty set, service and
+scheduler traces, render hash `4237437745`, and audio hash `283550487`.
+The second warm dispatch republishes no host pages and returns four native-dirty
+pages: 0.026 MiB total command traffic including control, versus the retained
+1.774 MiB full-roundtrip comparator. The bounded replay is cutover evidence,
+not an end-to-end gameplay-throughput claim; a manually driven full workload
+still supplies the final live promotion measurement.
+
+Two independently captured observed Lesson One full-flip windows now pass two
+independent native validations apiece. Run-3 artifact
+`d184071d7b47fa91e872524c8dfeb5a8455391e3421d59ee526a6f6208f044f0`
+and run-4 artifact
+`39991b0e292057b40d9c2e2e5d66d23748ea5ac744e187d1b5dc7c1cbe4820ca`
+each reproduced byte-identical PEs across their two build directories. Every
+dispatch completed one flip with render hash `4237437745`, audio hash
+`283550487`, eight exact replayable native32 services, and zero faults,
+cross-backend exits, Python callbacks, frontier-interpreter activity, runtime
+decoding/compilation/patching, native promotion, or raw-XBE execution. The user
+confirmed correct picture and audio during the second independent capture.
+Resident full-flip time remains approximately 47 ms, so this is correctness and
+cutover evidence rather than achievement of the 60-flip/s target. The verified
+artifact runner selects IA-32 for compatible artifacts. The ordinary
+`live_test.py` launcher exposes an explicit fail-closed `same-isa-ia32` process
+seam and rejects fixed replay-plan artifacts before presenter startup; its
+default remains the diagnostic oracle while the static path is incomplete.
 
 ## Rendering and runtime coverage
 
@@ -34,12 +296,15 @@ cooperative workers. The decoded-store-seeded IA-32 audit contains 66,194
 reachable blocks and 392,161 instructions with no decoder gap in the observed
 set.
 
-Normal gameplay uses one process with resident native dispatch, native hot
-services and worker state, versioned shared-memory control, a bounded command
-ring, immutable resource slots, and a presenter loaded into that process.
-Bounded/lossless audit paths remain isolated by design.
+The Phase 7 static path uses a resident 32-bit guest process for native guest
+dispatch and host-ABI services plus a separate 64-bit presenter process for
+SDL3/Vulkan, controller, and audio integration. Versioned shared-memory control,
+a bounded command ring, and immutable resource slots connect those processes.
+Python prepares and launches deterministic artifacts and composes diagnostics;
+it is not part of normal guest execution. Bounded/lossless audit paths remain
+isolated by design.
 
-## Native migration acceptance
+## Historical diagnostic-oracle migration evidence
 
 The initial July 25 warm normal-play run
 `55d3d964-93d0-4494-a25b-c084333f02ff` completed in 23.855 seconds with 96
@@ -55,8 +320,9 @@ The sustained run returned with normal-runtime failure code zero. Python
 runtime ABI, handler, memory read/write, observer, and slice-yield callback
 counts were all zero. The frontier interpreter recorded zero invocations and
 zero steps; native promotion and developer live compilation were disabled.
-This is the normal-play acceptance evidence for the completed Python runtime
-migration, including high-frequency render transport.
+This accepted the July diagnostic-oracle migration boundary, including
+high-frequency render transport. It does not establish completion of the
+current same-ISA IA-32 launcher cutover.
 
 ### July 25 title-path regression repair
 
@@ -263,17 +529,18 @@ create, restart, load, and overwrite check.
 
 ### July 30 autosave investigation handoff
 
-Manual save/load remains functional, but autosave is not accepted. Native
-filesystem diagnostics first showed that metadata probes for a new save slot
-were recursively creating the missing container and leaving zero-byte
-artifacts. The native services now preserve Xbox/NT leaf-only creation,
+At that July diagnostic-oracle checkpoint, manual save/load was functional but
+autosave was not accepted. Native filesystem diagnostics first showed that
+metadata probes for a new save slot were recursively creating the missing
+container and leaving zero-byte artifacts. The native services now preserve
+Xbox/NT leaf-only creation,
 delete-on-close, disposition, and truncate semantics. A missing parent returns
 `STATUS_OBJECT_PATH_NOT_FOUND` without creating the container, and
 `RtlNtStatusToDosError` maps that status to `ERROR_PATH_NOT_FOUND` (3). Focused
 native regressions cover missing-parent probes, failed-container cleanup, and
 delete/recreate/truncate behavior without Python handlers.
 
-Those repairs were necessary but did not close autosave. Normal static run
+Those repairs were necessary but did not close autosave. Retained July run
 `0759728e-edf7-4356-bf7e-d755d9770b0a` still displayed `Autosave failed` after
 the user triggered an autosave. The retained native persistence trace records
 the lower I/O operation finishing with title error 9 after `save_file_open`
@@ -439,20 +706,20 @@ input was used; progression beyond retained run
 
 ## Known limitations
 
-- The native pacing repair still needs a manual gameplay acceptance run and a
-  longer workload-locked frame-time distribution.
+- Creating a new save slot currently reaches the deliberate INT3 coverage guard
+  at guest `0x00045141`; the lifetime-specific target behind global cell
+  `0x004CB364` has not yet been closed safely.
+- The static IA-32 path has not reached accepted gameplay, so it has no accepted
+  gameplay pacing or workload-locked frame-time distribution.
 - There is no complete save-state system.
 - Fifteen car draws use a second reflection/cubemap stage that is diagnosed but
   not yet replayed.
-- Corrected gameplay and Load/Save captures still need promotion into the
-  checked-in strict preflight suite.
-- Autosave still fails when creating a new autosave slot. Run
-  `0759728e-edf7-4356-bf7e-d755d9770b0a` reaches lower-layer error 9 but the
-  save manager surfaces error 13 and failure UI state 4; see the July 30
-  autosave investigation handoff above.
-- The Xbox DirectSound buffer `Play` forwarding stall is source-closed, but its
-  manual gameplay acceptance is pending. Sound-effect timing, gameplay music,
-  and long-run stream continuity remain unverified.
+- Controller input and menu music are manually confirmed on the current static
+  path. Gameplay sound effects, rumble, and long-run audio continuity remain
+  unverified there.
+- Load/Save progression still needs promotion into checked-in strict synthetic
+  coverage. Save creation, restart/load, overwrite, and autosave are not
+  accepted on the current static path.
 
 Local reports under `reports/local/` are evidence, not source artifacts, and
 must not be committed. Performance claims should cite their run identity,

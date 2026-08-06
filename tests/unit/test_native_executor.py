@@ -120,6 +120,107 @@ from tools.recomp.x86_lifter import (
 
 
 class NativeResumableExecutorTests(unittest.TestCase):
+    def test_manual_capsule_restores_verified_instruction_bytes(self) -> None:
+        function = lift_x86_function(b"\x40\xc3", base_address=0x1000)
+        executor = object.__new__(NativeResumableExecutor)
+        executor._capsule_functions = (function,)
+        output = Path("reports/local/replay/checkpoint.b2rcap")
+
+        with (
+            patch("tools.playability.replay_capsule.require_local_capsule_output"),
+            patch(
+                "tools.playability.replay_capsule.capture_replay_capsule",
+                return_value=output,
+            ) as capture,
+        ):
+            result = executor.capture_manual_replay_capsule(
+                output,
+                state=CpuState(),
+                memory=SparseMemory(),
+                scheduler_state={},
+                service_state={},
+                provenance={},
+                instruction_bytes_reader=lambda address, size: b"\x90" * size,
+            )
+
+        self.assertEqual(result, output)
+        captured = capture.call_args.kwargs["functions"]
+        self.assertEqual([item.bytes_hex for item in captured[0].instructions], ["90", "90"])
+
+    def test_manual_capsule_freezes_native_resident_memory(self) -> None:
+        class NativeResidentMemory(SparseMemory):
+            def __init__(self) -> None:
+                super().__init__()
+                self.snapshot = SparseMemory({0x3000: 0x5A})
+                self.captured_page_table = None
+
+            def replay_capsule_memory_snapshot(self) -> SparseMemory:
+                return self.snapshot
+
+            def replay_capsule_memory_snapshot_from_native_pages(
+                self,
+                page_table,
+            ) -> SparseMemory:
+                self.captured_page_table = page_table
+                return self.snapshot
+
+        function = lift_x86_function(b"\xc3", base_address=0x1000)
+        executor = object.__new__(NativeResumableExecutor)
+        executor._capsule_functions = (function,)
+        executor._page_table = object()
+        memory = NativeResidentMemory()
+
+        with (
+            patch("tools.playability.replay_capsule.require_local_capsule_output"),
+            patch(
+                "tools.playability.replay_capsule.capture_replay_capsule",
+                return_value=Path("reports/local/replay/checkpoint.b2rcap"),
+            ) as capture,
+        ):
+            executor.capture_manual_replay_capsule(
+                Path("reports/local/replay/checkpoint.b2rcap"),
+                state=CpuState(),
+                memory=memory,
+                scheduler_state={},
+                service_state={},
+                provenance={},
+                memory_overlays={0x7000: b"phase5"},
+            )
+
+        self.assertIs(capture.call_args.kwargs["memory"], memory.snapshot)
+        self.assertIs(memory.captured_page_table, executor._page_table)
+        self.assertEqual(memory.snapshot.read(0x7000, 6), b"phase5")
+
+    def test_manual_capsule_overlay_does_not_mutate_live_sparse_memory(self) -> None:
+        function = lift_x86_function(b"\xc3", base_address=0x1000)
+        executor = object.__new__(NativeResumableExecutor)
+        executor._capsule_functions = (function,)
+        executor._page_table = object()
+        memory = SparseMemory({0x7000: 0x11})
+
+        with (
+            patch("tools.playability.replay_capsule.require_local_capsule_output"),
+            patch(
+                "tools.playability.replay_capsule.capture_replay_capsule",
+                return_value=Path("reports/local/replay/checkpoint.b2rcap"),
+            ) as capture,
+        ):
+            executor.capture_manual_replay_capsule(
+                Path("reports/local/replay/checkpoint.b2rcap"),
+                state=CpuState(),
+                memory=memory,
+                scheduler_state={},
+                service_state={},
+                provenance={},
+                memory_overlays={0x7000: b"\x22"},
+            )
+
+        self.assertEqual(memory.read(0x7000, 1), b"\x11")
+        self.assertEqual(
+            capture.call_args.kwargs["memory"].read(0x7000, 1),
+            b"\x22",
+        )
+
     def test_aot_ab_modes_resolve_independent_features(self) -> None:
         expected = {
             "baseline": (False, False),
@@ -1241,6 +1342,13 @@ class NativeResumableExecutorTests(unittest.TestCase):
         self.assertLessEqual(
             edge_profile["table_capacity"],
             NATIVE_DISPATCH_EDGE_CAPACITY_LIMIT,
+        )
+        self.assertEqual(
+            edge_profile["table_capacity"],
+            min(
+                (executor._dispatch_mask + 1) * 8,
+                NATIVE_DISPATCH_EDGE_CAPACITY_LIMIT,
+            ),
         )
         self.assertEqual(edge_profile["classified_module_calls"], 3)
         self.assertEqual(edge_profile["unclassified_module_calls"], 0)
@@ -7922,6 +8030,41 @@ class NativeResumableExecutorTests(unittest.TestCase):
         self.assertEqual(performance["slice_yield_count"], 0)
         self.assertEqual(performance["handler_call_count"], 0)
 
+    def test_normal_runtime_selects_one_python_observer_boundary(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex("B801000000EBF9"),
+            base_address=0x1000,
+            symbol="native_normal_runtime_observer",
+        )
+        services = NativeHostServiceState()
+        services.enable_normal_runtime(scheduler_quantum=5)
+        observed: list[int] = []
+
+        def observe_boundary(state, _memory, _trace, _steps) -> None:
+            observed.append(state.eip)
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            executor = NativeResumableExecutor(
+                function,
+                build_dir=Path(temp_dir),
+                observer_addresses={0x1000, 0x1005},
+            )
+            executor.run(
+                CpuState.with_registers(esp=0x8000),
+                SparseMemory({0x8000: 0}),
+                step_observer=observe_boundary,
+                max_steps=20,
+                dispatch_host_calls_in_native=True,
+                native_host_services=services,
+                dispatch_observers_in_native=True,
+                python_observer_address=0x1000,
+            )
+            executor.shutdown_normal_runtime(services)
+
+        self.assertTrue(observed)
+        self.assertEqual(set(observed), {0x1000})
+        self.assertGreater(services.native_observer_count, 0)
+
     def test_normal_runtime_reports_unhandled_target_with_pending_span(self) -> None:
         base_address = 0x1000
         missing_target = 0xE0000630
@@ -8383,6 +8526,8 @@ class NativeResumableExecutorTests(unittest.TestCase):
             ]
         )
         services.enable_normal_runtime(scheduler_quantum=100)
+        services.replay_capture_pending = True
+        services.replay_capture_start_flip_count = 0
         name = live_transport.live_control_transport_name(str(uuid.uuid4()))
 
         with live_transport.LiveControlTransport.create(name) as control:
@@ -8469,7 +8614,10 @@ class NativeResumableExecutorTests(unittest.TestCase):
                         ]
                     )
 
-        self.assertEqual(returned_to, 0)
+        self.assertEqual(returned_to, base_address + len(program) - 1)
+        self.assertFalse(services.replay_capture_pending)
+        self.assertEqual(services.replay_capture_completed_flip_count, 1)
+        self.assertTrue(services.normal_runtime_stop_requested)
         self.assertEqual(generation, 1)
         self.assertTrue(manifest_available)
         _magic, _schema, manifest_record_count = (

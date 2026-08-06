@@ -69,8 +69,10 @@ uint32_t parse_u32(const std::wstring& value, const wchar_t* label) {
         << L"                          [--flip-audit-max-flips N]\n"
         << L"                          [--flip-audit-health-interval N]\n"
         << L"                          [--screenshot PATH] [--hotkey-screenshot-directory PATH]\n"
+        << L"                          [--window-icon PATH]\n"
         << L"                          [--metrics-report-directory PATH]\n"
         << L"                          [--command-work-cache-trace PATH]\n"
+        << L"  Press F8 to trigger an armed replay-capsule capture.\n"
         << L"  Press F9 to toggle the completed-guest-frame FPS counter.\n"
         << L"  Press F10 to start or stop an armed native hot-path capture.\n"
         << L"  Press F11 to write a metrics snapshot in the metrics report directory.\n"
@@ -169,6 +171,9 @@ PresenterOptions parse_presenter_options(const std::vector<std::wstring>& args) 
         } else if (arg == L"--hotkey-screenshot-directory") {
             options.hotkey_screenshot_directory = std::filesystem::path(
                 require_value(L"--hotkey-screenshot-directory"));
+        } else if (arg == L"--window-icon") {
+            options.window_icon = std::filesystem::path(
+                require_value(L"--window-icon"));
         } else if (arg == L"--metrics-report-directory") {
             options.metrics_report_directory = std::filesystem::path(
                 require_value(L"--metrics-report-directory"));

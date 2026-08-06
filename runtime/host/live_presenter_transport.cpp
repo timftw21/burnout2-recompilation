@@ -131,6 +131,7 @@ struct LivePresenterTransport::Impl {
     HANDLE resource_mapping = nullptr;
     uint8_t* resource_view = nullptr;
     uint64_t resource_slot_capacity = 0u;
+    uint32_t audio_read_sequence = 0u;
     mutable HANDLE manifest_file = INVALID_HANDLE_VALUE;
     mutable std::filesystem::path manifest_path;
 };
@@ -260,6 +261,7 @@ void LivePresenterTransport::close() {
     }
     impl_->command_capacity = 0u;
     impl_->resource_slot_capacity = 0u;
+    impl_->audio_read_sequence = 0u;
 }
 
 bool LivePresenterTransport::active() const {
@@ -302,6 +304,30 @@ uint32_t LivePresenterTransport::toggle_hot_path_profile() {
     return next;
 }
 
+uint32_t LivePresenterTransport::replay_capture_state() const {
+    if (!impl_->control_view) {
+        return kLiveReplayCaptureDisabled;
+    }
+    const auto* state = reinterpret_cast<volatile const LONG*>(
+        impl_->control_view + kLiveReplayCaptureStateOffset);
+    return static_cast<uint32_t>(*state);
+}
+
+uint32_t LivePresenterTransport::request_replay_capture() {
+    if (!impl_->control_view) {
+        return kLiveReplayCaptureDisabled;
+    }
+    auto* state = reinterpret_cast<volatile LONG*>(
+        impl_->control_view + kLiveReplayCaptureStateOffset);
+    const uint32_t current = static_cast<uint32_t>(*state);
+    if (current == kLiveReplayCaptureArmed) {
+        InterlockedExchange(
+            state, static_cast<LONG>(kLiveReplayCaptureRequested));
+        return kLiveReplayCaptureRequested;
+    }
+    return current;
+}
+
 std::optional<std::string> LivePresenterTransport::read_manifest() const {
     if (!impl_->control_view) {
         return std::nullopt;
@@ -317,7 +343,7 @@ std::optional<std::string> LivePresenterTransport::read_manifest() const {
     std::memcpy(
         &payload_size, impl_->control_view + kLiveManifestSizeOffset, 4u);
     if (payload_size < 16u
-        || payload_size > kLiveControlSize - kLiveManifestPayloadOffset) {
+        || payload_size > kLiveManifestPayloadCapacity) {
         return std::nullopt;
     }
     std::vector<uint8_t> payload(payload_size);
@@ -521,6 +547,45 @@ bool LivePresenterTransport::read_resource_slot(
     MemoryBarrier();
     return sequence_is_stable(
         published_sequence, static_cast<uint32_t>(*sequence));
+}
+
+bool LivePresenterTransport::read_audio_pcm(std::vector<uint8_t>& payload) {
+    payload.clear();
+    if (!active()) {
+        return false;
+    }
+    const auto* sequence = reinterpret_cast<const volatile LONG*>(
+        impl_->control_view + kLiveAudioSequenceOffset);
+    const uint32_t published_sequence = static_cast<uint32_t>(*sequence);
+    if (!sequence_is_published(published_sequence)
+        || published_sequence == impl_->audio_read_sequence) {
+        return false;
+    }
+    uint32_t payload_size = 0u;
+    std::memcpy(
+        &payload_size,
+        impl_->control_view + kLiveAudioPayloadSizeOffset,
+        sizeof(payload_size));
+    if (payload_size == 0u || payload_size > kLiveAudioPayloadCapacity
+        || payload_size % 4u != 0u) {
+        throw std::runtime_error("invalid live PCM audio payload");
+    }
+    payload.resize(payload_size);
+    std::memcpy(
+        payload.data(),
+        impl_->control_view + kLiveAudioPayloadOffset,
+        payload.size());
+    MemoryBarrier();
+    const uint32_t confirmed_sequence = static_cast<uint32_t>(*sequence);
+    if (!sequence_is_stable(published_sequence, confirmed_sequence)) {
+        payload.clear();
+        return false;
+    }
+    impl_->audio_read_sequence = confirmed_sequence;
+    auto* acknowledged = reinterpret_cast<volatile LONG*>(
+        impl_->control_view + kLiveAudioAcknowledgedSequenceOffset);
+    InterlockedExchange(acknowledged, static_cast<LONG>(confirmed_sequence));
+    return true;
 }
 
 void LivePresenterTransport::publish_controller(

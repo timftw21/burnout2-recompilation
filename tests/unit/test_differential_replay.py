@@ -8,6 +8,7 @@ from tools.playability.differential_replay import (
     ReplayObservation,
     bisect_first_divergence,
     compare_event_streams,
+    diagnose_observation_divergence,
     run_differential_replay,
 )
 from tools.playability.replay_capsule import build_synthetic_capsule, load_replay_capsule
@@ -92,6 +93,20 @@ class DifferentialReplayTests(unittest.TestCase):
         self.assertFalse(report["matches"])
         self.assertEqual(report["first_mismatch"], 1)
         self.assertEqual(report["accepted_event"]["kind"], "flip")
+
+    def test_compact_diagnostic_names_fpu_control_difference(self) -> None:
+        accepted = _FakeBackend("accepted").run_prefix(1)
+        experimental = _FakeBackend("experimental").run_prefix(1)
+        experimental.state.fpu_control_word ^= 1
+
+        report = diagnose_observation_divergence(accepted, experimental, compact=True)
+
+        self.assertIn(
+            "fpu_control_word",
+            [change["register"] for change in report["changed_registers"]],
+        )
+        self.assertNotIn("page_hashes", report["accepted"])
+        self.assertEqual(report["accepted"]["memory_page_count"], 1)
 
 
 if __name__ == "__main__":

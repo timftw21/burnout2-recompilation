@@ -1,18 +1,46 @@
 # Debugging command reference
 
-Run these commands from the repository root, `D:\b2_recomp`.
+Run these commands from the repository root.
 
 ```powershell
 $Xbe = '.\data\local\extracted\burnout_2_poi_usa\default.xbe'
 $Extracted = '.\data\local\extracted\burnout_2_poi_usa'
 ```
 
+## Current Phase 7 checkpoint
+
+The work-in-progress static artifact currently reaches the Load/Save screen and
+stops while creating a new slot. The native summary reports deliberate guard
+`0x80000003` at guest `0x00045141`, whose decoded sequence is:
+
+```text
+0x00045138  mov ecx,[0x004CB364]
+0x0004513E  mov edx,[ecx]
+0x00045140  push eax
+0x00045141  call [edx+0x0C]
+```
+
+Query the stable native metadata before attaching a debugger:
+
+```powershell
+python -m tools.recomp.debug_metadata 0x00045141 `
+  --build-dir .\build\native-guest-loop `
+  --context 20
+```
+
+Global cell `0x004CB364` is lifetime-dependent: other measured callers use
+different slot-C targets. Capture the live object, vtable, and target at this
+site, inspect adjacent callers, and recover only the finite lifetime-specific
+family. Do not bind every user of the global cell to one target.
+
 ## Choosing a workflow
 
 Use the smallest diagnostic mode that answers the current question:
 
-1. Reproduce the issue in a normal live run and press F12 on the first stable
-   bad frame. Treat the BMP, sibling `*-render-capture` directory,
+1. Reproduce the issue with manual input. If the guest stops, inspect
+   `native-live.json` before classifying the retained presenter frame as a
+   render freeze. For a visual defect, press F12 on the first stable bad frame
+   and treat the BMP, sibling `*-render-capture` directory,
    `native-live.json`, presenter event log, and generated reports as one
    evidence set.
 2. Run `render_debug_suite.py --skip-build --pretty`. It selects the newest
@@ -46,17 +74,45 @@ load with the exact How to Play interval; an additional F12 capture is not
 needed when the guest's black clear and HUD-only draw set are already proven.
 
 Native-run summaries retain the first 8 and latest 56 entries. Edge collection
-and serialization retain every populated entry up to the 65,536-slot table
+and serialization retain every populated entry up to the 262,144-slot table
 capacity. Reports disclose table overflow instead of presenting a truncated
 trace as exact.
 
 ## Live runtime and manual capture
 
-Normal diagnostic run:
+Default diagnostic-oracle run:
 
 ```powershell
 python .\tools\playability\live_test.py --skip-host-build
 ```
+
+Fail-closed IA-32 normal-live preflight/launch:
+
+```powershell
+python .\tools\playability\live_test.py `
+  --guest-backend same-isa-ia32 `
+  --ia32-artifact .\build\local\ia32-live\manifest.json `
+  --skip-host-build
+```
+
+This path accepts only a content-verified boot-entry artifact with a dynamic
+native scheduler and native control/command/resource/audio ownership. The
+retained Lesson One full-flip artifacts are fixed replay plans and are expected
+to fail this preflight; use the command only after producing a normal-live
+artifact. The default 64-bit path remains the diagnostic oracle during that
+bring-up and never becomes an automatic fallback from an IA-32 launch.
+
+If the static guest exits while the presenter keeps showing its last frame,
+read the dependency-free summary:
+
+```powershell
+Get-Content -Raw .\reports\local\playability\native-live.json
+```
+
+`0x80000003` at a guest instruction address normally identifies an unverified
+indirect transfer emitted as a fail-closed guard. Use `debug_metadata.py`, then
+an x86 CDB capture when live registers or object/vtable contents are required.
+Do not patch the normal artifact to continue past the site.
 
 Minimal-overhead baseline:
 
@@ -76,21 +132,9 @@ on the last frame until it is closed. Confirm `run-manifest.json` and
 `native-live.json` before classifying that display as a guest crash or wait.
 For manual play, omit `--max-steps`.
 
-Deterministic title-confirm injection for a bounded scheduler/render probe:
-
-```powershell
-python .\tools\playability\live_test.py `
-  --max-steps 100000000 `
-  --inject-confirm-after-flip 1200 `
-  --skip-host-build
-```
-
-The injector presses and releases guest A once the binary manifest reaches the
-requested completed-flip count. If publication then stops, it reports the live
-scheduler phase, worker/PC, step counters, semaphore/wait state, and registers.
-Phase 40 means the dispatcher is checking an uncompiled target; phase 41 means
-neither an AOT entry nor a native host service accepted it. Phase 5 is ordinary
-AOT module execution and, by itself, is not a missing-service diagnosis.
+Gameplay navigation for retained evidence is manual. Do not use input injection
+to move through the title. Bounded instruction limits and debugger breakpoints
+are acceptable when they do not synthesize game input.
 
 The fixed live scheduler snapshot also exposes the native DirectSound buffer
 `Play` stage and its last buffer metadata. `audio_buffer_play_stage` values 1-3
@@ -125,6 +169,7 @@ Presenter hotkeys during a normal diagnostic run:
 
 | Input | Function |
 | --- | --- |
+| F8 | Trigger an armed replay-capsule capture |
 | F9 | Toggle completed-guest-flip FPS in the title |
 | F10 | Start or stop an armed native hot-path capture |
 | F11 | Write a timestamped metrics snapshot |
@@ -164,6 +209,22 @@ visible separately. The performance report rejects the sample if the window
 observes Python runtime callbacks, live compilation, frontier interpretation,
 native promotion, disabled native observer dispatch, or an empty/incomplete
 capture.
+
+Full manual boot-to-Lesson-One coverage window:
+
+```powershell
+python .\tools\playability\live_test.py `
+  --profile-boot-path `
+  --skip-host-build
+```
+
+This diagnostic starts the native capture at XBE entry. Manually navigate
+through the frontend into Lesson One, press F10 once to seal the already-active
+window, then close with Escape. It batches boot targets, transitions, native
+services, lane attribution, render exits, and static-clean counters without
+injecting input. Use this wider trace to build the normal-live IA-32 artifact;
+do not use its whole-session timings as the steady Lesson One performance
+window.
 
 To isolate the AOT dispatch and guest-state changes, add one explicit
 `--aot-ab-mode` value to the profiling command:
@@ -229,17 +290,6 @@ python .\tools\playability\live_test.py `
   --cpu-texture-conversion `
   --skip-host-build
 ```
-
-Developer-only live frontier compilation:
-
-```powershell
-python .\tools\playability\live_test.py `
-  --developer-live-compile `
-  --skip-host-build
-```
-
-The last command materially changes runtime behavior and is unsuitable for a
-baseline.
 
 ## Exact guest/render audits
 
@@ -514,22 +564,21 @@ Direct-probe-only diagnostic switches:
 | `--audit-world-matrices` | Broad world-matrix observer |
 | `--audit-world-matrix-address ADDRESS` | Exact matrix-write and shader-input audit |
 | `--audit-scene-records` | Compact scene/source audit |
-| `--developer-live-compile` | Enable runtime frontier compilation |
+| `--developer-live-compile` | Diagnostic-only runtime frontier compilation; never use for normal evidence |
 
 Decoded blocks are stored as individually compressed records in
 `build/native-guest-loop/decoded-blocks.sqlite3`; a lookup decodes only the
-requested block. Normal runs persist new frontier information for the next AOT
-build without compiling it in the active process. A native transport-code-9
-stop records the exact executable target after the run has stopped and reports
-`native_normal_runtime_coverage_gap.status=decoded_for_next_aot`; rerun normally
-to consume the block in the next static build. Known callback tables are seeded
-as complete families during artifact preparation so adjacent members do not
-require one failing run apiece. Preparation also proves contiguous `.rdata` and
-`.data` code-pointer families plus embedded data islands in other file-backed
-XBE sections from raw return/alignment boundaries, retains the complete family,
-and rejects packed numeric runs. Headers and zero-fill tails are never scanned.
-Static data sections are not treated as code by jump-table closure or the IA-32
-coverage audit merely because their XBE section flags include execute.
+requested block. A normal run records an unknown executable target and stops;
+it does not decode or continue it. An explicit diagnostic-discovery run may
+persist the target to the decoded block store, after which the next static AOT
+build consumes it. Known callback tables are recovered as complete families
+during artifact preparation so adjacent members do not require one failing run
+apiece. Preparation also proves contiguous `.rdata` and `.data` code-pointer
+families plus embedded data islands in other file-backed XBE sections from raw
+return/alignment boundaries, retains the complete family, and rejects packed
+numeric runs. Headers and zero-fill tails are never scanned. Static data
+sections are not treated as code by jump-table closure or the IA-32 coverage
+audit merely because their XBE section flags include execute.
 
 After the canonical records for an image are materialized, the store keeps a
 versioned, interpreter-tagged prepared snapshot in compact chunks. The snapshot
@@ -693,11 +742,45 @@ the application screenshot handler.
 
 ### Deterministic replay capsules
 
-The user first reaches the desired gameplay boundary manually. A capture hook
-can then call `NativeResumableExecutor.capture_manual_replay_capsule(...)` at
-that host boundary, or serialize the same CPU,
-sparse-page, decoded-program, scheduler/service, resource, event, and provenance
-records for the packer:
+To capture the indexed-draw prototype boundary, start the live diagnostic run:
+
+```powershell
+python .\tools\playability\live_test.py `
+  --capture-replay-capsule .\reports\local\replay\scheduler-boundary.b2rcap `
+  --capture-replay-entry 0x000C5550 `
+  --capture-replay-scheduler-stop 0x000C5570
+```
+
+Navigate manually to the representative Lesson One scene. Press F8 once to
+request the replay checkpoint. The first subsequent execution of `0x000C5550`
+captures CPU state, sparse pages, the decoded program, native scheduler/service
+state, event/provenance records, and verified XBE instruction bytes, then stops
+the run. With `--capture-replay-scheduler-stop`, the capsule also contains a
+Phase-5 `resident_scheduler` plan for the real bounded primary slice. Any live
+worker/vblank contexts are retained as terminal snapshots; the capture does not
+invent wakeups or lane work that did not occur inside the boundary. Do not press
+F8 at the title/menu: the capture is intentionally scoped to the gameplay
+window, and no command automates input.
+
+For Phase-7 full-flip acceptance, capture the same entry through the measured
+Lesson One render boundary and classify that observed boundary as a flip:
+
+```powershell
+python .\tools\playability\live_test.py `
+  --capture-replay-capsule .\reports\local\replay\lesson-one-phase7-full-flip.b2rcap `
+  --capture-replay-entry 0x000C5550 `
+  --capture-replay-scheduler-exit flip
+```
+
+Navigate to the stable Lesson One workload and press F8 once. The run stops
+after the next completed flip and writes the capsule. This diagnostic mode
+retains the entry CPU/memory checkpoint, observes the real native scheduler
+through that flip, and stores its terminal CPU state and changed pages as the
+acceptance oracle. It does not synthesize a direct edge to the render module,
+invent worker/vblank execution, or automate gameplay.
+
+For an already serialized host-boundary checkpoint specification, the lower
+level packer remains available:
 
 ```powershell
 python .\tools\playability\replay_capsule.py capture `
@@ -708,9 +791,8 @@ python .\tools\playability\replay_capsule.py inspect `
 ```
 
 The spec must declare `provenance.manual_capture=true`. Proprietary output is
-accepted only below `reports/local/` or `data/local/`; no command automates
-input. To compare the accepted interpreter with native AOT and preserve a
-last-matching failure capsule:
+accepted only below `reports/local/` or `data/local/`. To compare the accepted
+interpreter with native AOT and preserve a last-matching failure capsule:
 
 ```powershell
 python .\tools\playability\differential_replay.py execute `
@@ -721,6 +803,322 @@ python .\tools\playability\differential_replay.py execute `
   --failure-capsule .\reports\local\replay\first-divergence.b2rcap `
   --report .\reports\local\replay\first-divergence.json
 ```
+
+Prototype the fixed-endpoint same-ISA IA-32 backend on a capsule that contains
+only the verified compute slice. For the first performance proof, capture with
+entry EIP `0x000C5550` and stop before `0x000C5570`:
+
+```powershell
+python .\tools\recomp\ia32_native_backend.py execute `
+  .\reports\local\replay\indexed-draw-slice.b2rcap `
+  --stop-eip 0x000C5570 `
+  --build-dir .\build\local\ia32 `
+  --report .\reports\local\replay\indexed-draw-ia32.json
+```
+
+This diagnostic command builds a content-addressed 32-bit PE before launching
+it, maps the declared sparse pages at their guest addresses, and executes only
+the capsule's verified instruction bytes. It rejects unpatched external or
+indirect transfers, privileged operations, high/MMIO accesses, FS/TLS state,
+and stack returns outside the selected stop boundary as named static rewrite
+gaps. It is not a normal-play fallback and performs no runtime decoding or
+compilation.
+
+Run the asset-free Phase-0 contract gate directly:
+
+```powershell
+python .\tools\recomp\ia32_proof_contract.py synthetic `
+  --build-dir .\build\local\ia32-phase0 `
+  --report .\build\local\ia32-phase0\phase0-proof-report.json
+```
+
+The gate independently rebuilds two deterministic capsules and IA-32 PE
+artifacts, then compares decoded-reference and hardware execution for a compute
+slice and an `RtlEnterCriticalSection` thunk. It freezes the exchange layout,
+entry/exit and host-service thunk ABIs, QPC timing interval, toolchain identity,
+and architectural comparison policy. Any mismatch uses the differential replay
+diagnostic format with register and bounded page differences. `dev_check.py`
+selects this node for IA-32, replay/differential, lifter, and toolchain changes.
+
+Seal the retained proprietary compute and host-service proofs with the `freeze`
+subcommand. Pass both capsule paths and both artifact directories, plus their
+expected capsule/artifact IDs, and write `--report` below `reports/local/` or
+`data/local/`. The report records the historical MMX/x87 alias exclusion and
+MXCSR sticky-status delta explicitly; neither is mislabeled as a reserved bit.
+The retained artifacts and report remain ignored local evidence.
+
+Run the Phase-1 resident-worker gate directly:
+
+```powershell
+python .\tools\recomp\ia32_proof_contract.py persistent `
+  --build-dir .\build\local\ia32-phase1 `
+  --report .\build\local\ia32-phase1\phase1-proof-report.json
+```
+
+This launches one 32-bit process per proof artifact and sends three versioned
+dispatch commands through it. The report separates worker startup from each
+resident dispatch and records process reuse, reset isolation, architectural
+hashes, and deterministic rebuild identity. A mismatch includes compact
+differential state/page diagnostics. Worker timeout, crash, and protocol
+failures identify the artifact and last published guest EIP.
+
+Run the Phase-2 decoded-store artifact gate directly:
+
+```powershell
+python .\tools\recomp\ia32_proof_contract.py decoded-store `
+  --build-dir .\build\local\ia32-phase2 `
+  --report .\build\local\ia32-phase2\phase2-proof-report.json
+```
+
+Build a complete artifact from a captured boundary, the matching XBE, and the
+normal decoded block store:
+
+```powershell
+python .\tools\recomp\ia32_native_backend.py build-store `
+  .\reports\local\replay\boundary.b2rcap `
+  --xbe .\data\local\extracted\burnout_2_poi_usa\default.xbe `
+  --decoded-block-store .\build\native-guest-loop\decoded-blocks.sqlite3 `
+  --stop-eip 0x000C5570 `
+  --build-dir .\build\local\ia32-phase2
+```
+
+The build fails closed on an XBE/store mismatch, decoded-byte drift, missing
+direct or indirect target, or unimplemented privileged/MMIO/TLS rewrite. A
+successful directory contains the PE, manifest, section and coverage maps,
+direct-edge and indirect-target records, and rewrite manifest. `run` requires
+the same `--xbe` and `--decoded-block-store` arguments for Phase-2 artifacts so
+the loader can revalidate external provenance before execution.
+
+Run the Phase-3 architecture and memory differential gate directly:
+
+```powershell
+python .\tools\recomp\ia32_proof_contract.py architecture `
+  --build-dir .\build\local\ia32-phase3 `
+  --report .\build\local\ia32-phase3\phase3-proof-report.json
+```
+
+The five capsules exercise full x87/MMX/SSE exchange state, static FS/TLS,
+native stack/call behavior, physical page aliases, deterministic MMIO shadows,
+cross-page renderer/audio dirty ownership, deterministic `RDTSC`, and a
+repeatable recoverable access violation. Inspect `architecture-map.json` for
+the exact guest address, mapped address, rewrite kind, page owner, and fault
+site. Differential failures retain compact register/page diagnostics; dynamic
+segment or high-address forms and executable-memory writes fail at build time
+with an address-named coverage message.
+
+Build the same Phase-3 layer over real Phase-2 decoded-store provenance with
+`build-architecture` (or build and dispatch once with `execute-architecture`):
+
+```powershell
+python .\tools\recomp\ia32_native_backend.py build-architecture `
+  .\reports\local\replay\boundary.b2rcap `
+  --xbe .\data\local\extracted\burnout_2_poi_usa\default.xbe `
+  --decoded-block-store .\build\native-guest-loop\decoded-blocks.sqlite3 `
+  --stop-eip 0x000C5570 `
+  --build-dir .\build\local\ia32-phase3
+```
+
+Optional repeated `--dirty-owner PAGE=OWNER`,
+`--recoverable-fault-page PAGE`, and
+`--mmio-shadow LOGICAL_PAGE=MAPPED_PAGE` arguments become content-addressed
+architecture-map inputs. Omitting one of `--xbe` or `--decoded-block-store` is
+an error; omitting both retains the capsule-only diagnostic builder.
+
+Run the Phase-4 native host-ABI differential gate directly:
+
+```powershell
+python .\tools\recomp\ia32_proof_contract.py host-abi `
+  --build-dir .\build\local\ia32-phase4 `
+  --report .\build\local\ia32-phase4\phase4-proof-report.json
+```
+
+The service-rich synthetic replay exercises registered cdecl and stdcall
+thunks, exact arguments and stack cleanup, native memory effects, guest
+callback re-entry, and a renderer-facing request handled by a separate 64-bit
+native broker. The bounded native trace records service order, arguments,
+return values, entry/return stack pointers, memory before/after values, callback
+state, and the execution owner. Any trace overflow or unregistered ABI fails
+closed, and the report requires zero Python runtime callbacks.
+
+Build or execute the same Phase-4 layer for a manually captured service-rich
+capsule:
+
+```powershell
+python .\tools\recomp\ia32_native_backend.py execute-host-abi `
+  .\reports\local\replay\service-boundary.b2rcap `
+  --stop-eip 0x000C5570 `
+  --build-dir .\build\local\ia32-phase4 `
+  --report .\reports\local\replay\service-boundary-ia32.json
+```
+
+Each reached service must have a `service_registry` descriptor in the capsule.
+The offline artifact contains `host-abi-map.json`, the IA-32 worker, and a
+content-identified x64 broker; normal execution performs no runtime decoding,
+compilation, guest-code patching, promotion, or raw-XBE execution.
+
+Run the Phase-5 resident scheduler gate directly:
+
+```powershell
+python .\tools\recomp\ia32_proof_contract.py scheduler `
+  --build-dir .\build\local\ia32-phase5 `
+  --report .\build\local\ia32-phase5\phase5-proof-report.json
+```
+
+The ordinary proof runs two native scheduler cycles in primary, vblank, worker
+order. It compares the decoded scheduler oracle with persistent IA-32 lane
+contexts, per-lane TLS, safe-point service ranges, two worker wakeups, one
+completed flip, and FNV-1a render/audio hashes. A second proof raises a real
+access violation in the vblank lane and requires the worker and primary lanes
+to finish in the same resident process with no stranded context or
+unclassified exit.
+
+Build or execute a manually captured bounded scheduler capsule with:
+
+```powershell
+python .\tools\recomp\ia32_native_backend.py execute-scheduler `
+  .\reports\local\replay\scheduler-boundary.b2rcap `
+  --stop-eip 0x000C5570 `
+  --build-dir .\build\local\ia32-phase5 `
+  --report .\reports\local\replay\scheduler-boundary-ia32.json
+```
+
+The capsule's `scheduler_state.resident_scheduler` record must declare the
+three lanes, static resume EIPs, TLS pages, waits/wakeups, and render/audio
+product ranges. `resident-scheduler-map.json` freezes those inputs into the
+artifact. Resident builds also record equal-size static rewrites for the
+accepted executor's no-effect `WBINVD` cache-publication boundary and observed
+`OUT` port writes; standalone Phase-3 builds continue to reject them. Capture
+input manually; the diagnostic command does not synthesize or automate
+gameplay input.
+
+Run the Phase-6 measured coverage-growth gate directly:
+
+```powershell
+python .\tools\recomp\ia32_proof_contract.py coverage `
+  --build-dir .\build\local\ia32-phase6 `
+  --report .\build\local\ia32-phase6\phase6-proof-report.json
+```
+
+The proof ranks decoded SCCs by measured native time, guest steps, module
+calls, and unique outgoing frontier. It promotes the Lesson One SCC with
+explicit service/render exits first, then boot/frontend continuity, then
+worker/vblank and cold coverage. A diagnostic-discovery profile may name an
+unknown target and its interpreter counts, but is never promotion eligible;
+normal validation requires those targets in the decoded block store and both
+frontier-interpreter counters at zero.
+
+Convert a completed capture from the upgraded performance-debug suite without
+transcribing target or transition counters:
+
+```powershell
+python .\tools\recomp\ia32_native_backend.py profile-coverage `
+  .\reports\local\playability\performance-debug-report.json `
+  --mode normal-validation `
+  --report .\reports\local\replay\lesson-one-coverage-profile.json
+```
+
+The converter selects the hottest measured multi-target SCC for Lesson One,
+uses reverse primary-lane reachability for boot/frontend continuity, assigns
+the remaining worker/vblank/cold targets to the final slice, and carries over
+the report's exact transition and frontier-interpreter counters. Incomplete
+edge data is accepted only with `--mode diagnostic-discovery`.
+
+Build or execute a manually captured closed profile with:
+
+```powershell
+python .\tools\recomp\ia32_native_backend.py execute-coverage `
+  .\reports\local\replay\scheduler-boundary.b2rcap `
+  --xbe .\data\local\extracted\burnout_2_poi_usa\default.xbe `
+  --decoded-block-store .\build\native-guest-loop\decoded-blocks.sqlite3 `
+  --coverage-profile .\reports\local\replay\lesson-one-coverage-profile.json `
+  --stop-eip 0x000C5570 `
+  --build-dir .\build\local\ia32-phase6 `
+  --report .\reports\local\replay\lesson-one-ia32.json
+```
+
+The profile uses format `b2-recomp-ia32-coverage-profile`, version 1. Every
+target declares its vertical slice, scheduler lane, and the three integer heat
+metrics; transitions and service/render boundary exits provide the measured
+frontier. `coverage-growth-map.json` binds that profile to the decoded-store
+coverage and rewrite identities. Missing targets, unresolved static rewrites,
+or nonzero frontier-interpreter activity stop the normal build before launch.
+
+Run the Phase-7 normal-launcher and persistent-memory gate directly:
+
+```powershell
+python .\tools\recomp\ia32_proof_contract.py cutover `
+  --build-dir .\build\local\ia32-phase7 `
+  --report .\build\local\ia32-phase7\phase7-proof-report.json
+```
+
+The proof starts one generator-v23 worker, seeds its verified pages once, and
+runs two complete resident schedules. Both schedules are compared against the
+decoded oracle in sequence. Warm commands publish only CPU/control records and
+explicit host-dirty pages into the worker; the response exposes only pages the
+native worker changed. The report records seed, host-publication,
+native-publication, bypassed-page, control-byte, and legacy full-roundtrip
+counters. It also proves that same-ISA IA-32 is selected by default only for a
+closed Phase-7 artifact, while the fusion-only executor requires the explicit
+diagnostic-oracle selection.
+
+Build and run the same cutover protocol over a manually captured, closed
+Phase-6 workload with:
+
+```powershell
+python .\tools\recomp\ia32_native_backend.py execute-cutover `
+  .\reports\local\replay\scheduler-boundary.b2rcap `
+  --xbe .\data\local\extracted\burnout_2_poi_usa\default.xbe `
+  --decoded-block-store .\build\native-guest-loop\decoded-blocks.sqlite3 `
+  --coverage-profile .\reports\local\replay\lesson-one-coverage-profile.json `
+  --stop-eip 0x000C5570 `
+  --dispatch-count 2 `
+  --build-dir .\build\local\ia32-phase7\manual-profile `
+  --report .\reports\local\replay\lesson-one-phase7-cutover.json
+```
+
+`execute-cutover` never discovers or compiles guest code at runtime and never
+falls back to another backend. A missing or ineligible artifact is a preflight
+failure. Use the existing Phase-6 execution report or a decoded differential
+replay as the first-dispatch oracle before attempting live promotion; input
+for any new capture remains manual.
+
+Validate a manually captured full-flip capsule twice with independent warm
+runs:
+
+```powershell
+python .\tools\recomp\ia32_native_backend.py execute-full-flip `
+  .\reports\local\replay\lesson-one-phase7-full-flip.b2rcap `
+  --xbe .\data\local\extracted\burnout_2_poi_usa\default.xbe `
+  --decoded-block-store .\build\native-guest-loop\decoded-blocks.sqlite3 `
+  --coverage-profile .\reports\local\replay\lesson-one-coverage-profile.json `
+  --dispatch-count 2 `
+  --build-dir .\build\local\ia32-phase7\full-flip-run-1 `
+  --report .\reports\local\replay\lesson-one-phase7-full-flip-run-1.json
+
+python .\tools\recomp\ia32_native_backend.py execute-full-flip `
+  .\reports\local\replay\lesson-one-phase7-full-flip.b2rcap `
+  --xbe .\data\local\extracted\burnout_2_poi_usa\default.xbe `
+  --decoded-block-store .\build\native-guest-loop\decoded-blocks.sqlite3 `
+  --coverage-profile .\reports\local\replay\lesson-one-coverage-profile.json `
+  --dispatch-count 2 `
+  --build-dir .\build\local\ia32-phase7\full-flip-run-2 `
+  --report .\reports\local\replay\lesson-one-phase7-full-flip-run-2.json
+```
+
+`execute-full-flip` fails closed unless the capsule contains a flip-classified
+resident scheduler plan and an observed terminal oracle. The command infers
+the native continuation EIP from that oracle. The first dispatch compares the
+captured primary-lane CPU state, replayable native32 service projection,
+declared render/audio products, live terminal stack, and scheduler TLS pages.
+The report names this scope and the x87/MMX physical-alias and sticky-status
+normalization explicitly; global worker/vblank trace traffic and dead stack or
+transient page bytes are not mislabeled as outputs of a primary-only plan. The
+complete changed-page resource remains identity-checked and drives explicit
+host publication before repeated dispatches. Repeats also require dirty-only
+persistent transport, zero scheduler faults/stranded contexts, and zero
+cross-backend exits. This is the full-flip cutover acceptance path; the
+ordinary interactive launcher remains unchanged until both independently
+captured live windows pass and presenter/audio observation is signed off.
 
 Compare old/new presenter traces at the typed packet boundary without running
 guest code:
@@ -848,5 +1246,11 @@ python .\tools\recomp\audit_x86_coverage.py `
 
 `--allow-unsupported-xbe` and `--allow-stale-artifacts` exist for unsupported
 research. Both conspicuously invalidate compatibility or performance evidence.
+
+`--developer-live-compile` also exists for narrow developer diagnostics. It
+changes the execution model by allowing runtime compilation and must never be
+used for ordinary gameplay, static-clean validation, or a compatibility or
+performance claim. Remove any diagnostic dependency on it before merging a
+runtime fix.
 
 There is not yet a Dear ImGui debugger or overlay; that remains P4.

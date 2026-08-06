@@ -106,6 +106,22 @@ class ReplayObservation:
             "event_hashes": self.event_hashes(),
         }
 
+    def compact_summary(self) -> dict[str, Any]:
+        return {
+            "backend": self.backend,
+            "prefix_steps": self.prefix_steps,
+            "steps_executed": self.steps_executed,
+            "exit_reason": self.exit_reason,
+            "status": self.status,
+            "error": self.error,
+            "architectural_hash": self.architectural_hash(),
+            "guest_eip": self.state.eip,
+            "guest_eip_hex": f"0x{self.state.eip:08X}",
+            "native_symbol": self.native_symbol,
+            "memory_page_count": len(self.memory.export_pages()),
+            "event_hashes": self.event_hashes(),
+        }
+
 
 class ReplayBackend(Protocol):
     name: str
@@ -286,7 +302,18 @@ def _changed_registers(
                     "experimental": experimental_value,
                 }
             )
-    for name in ("eip", "flags", "timestamp_counter", "mxcsr"):
+    for name in (
+        "eip",
+        "flags",
+        "fs_base",
+        "cs_selector",
+        "gdtr_base",
+        "gdtr_limit",
+        "timestamp_counter",
+        "mxcsr",
+        "fpu_control_word",
+        "fpu_status_word",
+    ):
         if left[name] != right[name]:
             changes.append(
                 {
@@ -341,13 +368,17 @@ def _page_diffs(
     return changes
 
 
-def _diagnose_divergence(
+def diagnose_observation_divergence(
     accepted: ReplayObservation,
     experimental: ReplayObservation,
+    *,
+    compact: bool = False,
 ) -> dict[str, Any]:
+    """Return the compact first-difference detail used by replay-based debuggers."""
+
     return {
-        "accepted": accepted.summary(),
-        "experimental": experimental.summary(),
+        "accepted": accepted.compact_summary() if compact else accepted.summary(),
+        "experimental": experimental.compact_summary() if compact else experimental.summary(),
         "changed_registers": _changed_registers(accepted, experimental),
         "page_diffs": _page_diffs(accepted, experimental),
         "event_streams": {
@@ -425,7 +456,7 @@ def run_differential_replay(
     if first_bad is None:
         report["final"] = accepted.summary()
         return report
-    report["divergence"] = _diagnose_divergence(accepted, experimental)
+    report["divergence"] = diagnose_observation_divergence(accepted, experimental)
     report["guest_eip"] = experimental.state.eip
     report["guest_eip_hex"] = f"0x{experimental.state.eip:08X}"
     report["native_symbol"] = experimental.native_symbol

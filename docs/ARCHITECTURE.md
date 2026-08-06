@@ -1,196 +1,168 @@
 # Architecture
 
-b2_recomp separates reproducible offline recovery from the native gameplay hot
-path. Python owns analysis, generation, orchestration, diagnostic reports, and
-exact audit tools. C++ owns resident guest dispatch, an expanding set of host
-services, worker lifecycle, shared-memory transport, SDL audio/input, and
-Vulkan presentation. The normal-play migration is complete through the
-currently reached path; Python remains the offline analysis, artifact,
-launcher, and post-run diagnostic layer rather than a guest-execution callback
-boundary.
+b2_recomp separates deterministic offline recovery from native runtime
+execution. Python analyzes the supported XBE, prepares content-addressed
+artifacts, launches native processes, and composes diagnostics. Normal Phase 7
+guest execution is intended to stay entirely inside ahead-of-time native code.
 
-## Normal runtime flow
+The architecture is still under active development. The current static IA-32
+artifact reaches the Load/Save frontend and then fails closed at an unverified
+indirect call while creating a new save slot. A historical renderer/runtime can
+reach Lesson One, but that does not make the current static path complete.
 
-1. The launcher validates the exact XBE and content-addressed presenter build.
-2. One native process hosts the persistent guest dispatcher and presenter.
-3. Native service routing handles registered calls and guest ABI continuation.
-   Reached normal-play service bodies do not cross into Python. Unknown guest
-   targets are rejected as AOT coverage gaps and persisted only by explicit
-   developer diagnostics for a subsequent deterministic build.
-4. A sequence-guarded control mapping publishes input, stop, acknowledgement,
-   and completed-flip metadata. A bounded SPSC ring publishes command deltas;
-   alternating immutable slots publish changed resource generations.
-5. The Vulkan presenter retains interpreter and GPU objects while their
-   identities remain valid and presents every completed guest flip.
+## Static recompilation boundary
 
-Bounded probes, lossless audits, and frozen replay deliberately retain isolated
-process/file paths because exact diagnostics are their product. They are not
-the shipping gameplay boundary.
+Guest code used by an ordinary run must be analyzed, decoded, lifted, and
+compiled before launch. The runtime may dispatch only to:
 
-## Runtime mechanics
+- decoded guest instruction starts included in the artifact;
+- verified finite indirect-target sets;
+- exact native host-service thunks; or
+- explicitly modeled scheduler-return sentinels and static hardware rewrites.
 
-### Resident guest execution
+An unknown executable target is an AOT coverage gap. The normal process records
+the address and stops. A separate developer diagnostic may gather evidence and
+add the target to the decoded block store, but the resulting code is consumed
+only by the next deterministic build.
 
-Normal execution keeps one native dispatch session across consecutive guest
-modules and registered host calls. The dispatcher owns routing, guest ABI
-continuation, measured clock/yield services, title input, cooperative cadence,
-and worker lifecycle state. Reached normal-play service bodies execute in
-native code; Python service callbacks remain limited to explicit diagnostic
-paths.
+Normal execution must not enable an interpreter, JIT, runtime decoding,
+runtime code generation, native promotion, automatic backend fallback, or
+Python guest callbacks. `--developer-live-compile` is diagnostic-only and
+invalidates normal-run evidence.
 
-Dirty guest pages remain in the bound native page view across service calls.
-Native per-page write generations make resource invalidation explicit and
-avoid full memory scans or unconditional copyback. An unknown executable target
-stops normal execution as an AOT coverage gap. Explicit developer diagnostics
-may interpret and persist that target for the next deterministic build;
-runtime native promotion is available only in the visibly nonrepresentative
-`--developer-live-compile` mode.
+## Phase 7 process model
 
-## Python runtime migration checkpoint (2026-07-24)
+The work-in-progress static path uses three cooperating ownership layers:
 
-| Audit poor-fit path | Current ownership |
-| --- | --- |
-| Per-slice scheduler and guest loop | Complete for normal play: the resident native coordinator owns primary and worker execution, lifecycle, waits/yields, cadence, and stop handling. |
-| ABI and call dispatch | Complete for normal play: registered services unwind and return in the dispatcher; validated bounded runs report zero Python ABI, handler, or cold-host callbacks. |
-| Dirty-memory synchronization | Complete for normal play: native page views, dirty ranges/lists, generations, and resource ownership stay resident. Python only materializes the final post-run diagnostic snapshot. |
-| Hot Xbox services | Complete for the currently reached normal path: allocation, persistence, save crypto, AV, threading/semaphores, timing, input, filesystem, offline PHY, and reached title services are native. Address-taken guest code remains an AOT-coverage concern. |
-| Audio callback/data movement | Native-owned for normal play: RWS PCM/Xbox ADPCM decode, DirectSound buffer/stream observation, mixing, buffering, and SDL3 ABI submission replace the former Python mix path. The reached buffer `Play` method now completes guest voice state, HRESULT, and stack cleanup in the native service dispatcher instead of forwarding into the Xbox SDK hardware body; manual gameplay acceptance remains pending. |
-| Runtime compilation and DLL promotion | Removed from normal execution. Developer live compilation remains an explicit diagnostic-only mode. |
-| High-frequency render transport | Complete for normal play: completed-flip detection, aperture-normalized command publication, immutable resource slots, named-event wakeups, and presentation waits are native/shared-memory. Bounded run `e0884dd7-5a27-403f-88c6-a4be1263df12` published and acknowledged 53 exact generations; the presenter applied 52 incremental reloads with zero Python callbacks or frontier-interpreter work. |
+1. **Python launcher and tooling** validates the XBE, decoded block store,
+   toolchain, artifact, and presenter identities; starts native processes; and
+   writes post-run reports.
+2. **32-bit native guest process** maps the verified Xbox address space and owns
+   AOT guest dispatch, primary/worker/vblank lanes, reached service bodies,
+   guest memory, dirty-page generations, filesystem state, controller
+   consumption, command/resource publication, and audio decode/mix/publication.
+3. **64-bit native presenter process** owns SDL3 windowing, host input and audio,
+   Vulkan device/swapchain/resources/pipelines, presentation, screenshots, and
+   render diagnostics.
 
-The former `sample.xsb` XACT failure is cleared. Warm runs pass the old
-8.355-million-instruction semaphore boundary and remain native-clean through
-20 million instructions; longer runs reach about 91 million instructions with
-frontend audio decoded and mixed natively. Static AOT closure resolves bounded
-absolute IA-32 jump tables, including the CRT `memcpy` family, and now includes
-the address-taken `0x00073150` and `0x00055970` targets. The initial July 25
-acceptance run was fully warm (96 native cache hits, no misses or compilation).
-The subsequent render acceptance run completed 2 million instructions, 53
-native manifest/resource publications, and 53 presentation acknowledgements
-with normal-runtime failure code zero.
+The native processes communicate through versioned shared-memory layouts and
+named events. Python does not mediate per-frame data or service calls.
 
-Native title streaming also owns Track PSS prelinked-image publication. The
-service validates the file-authored stream and scene-record tables, then copies
-the exact image into its encoded guest address during the first synchronous
-read. This preserves the absolute pointers consumed by level loading without a
-Python callback or runtime-generated guest code.
+## Runtime data flow
 
-An unknown native dispatch target terminates normal execution as transport code
-9. Post-run artifact preparation validates that the target is executable,
-decodes it into the SQLite decoded block store, and marks the diagnostic as
-requiring a static rebuild. The stopped run never interprets, compiles, or
-continues the discovered block; the next AOT build consumes it.
+1. The launcher verifies the exact supported XBE and selected normal-live
+   artifact. A fixed replay artifact or stale toolchain identity is rejected.
+2. The guest process maps the boot image, code spans, stacks, TLS, static
+   rewrites, host-service thunks, and shared transports at validated addresses.
+3. The resident scheduler runs the primary context and separately retained
+   worker/vblank contexts. Each lane owns GPRs, flags, FPU/SIMD state, EIP,
+   stack, and TLS.
+4. Native service dispatch preserves the declared Xbox ABI, including arguments,
+   stack cleanup, return values, flags, and bounded memory effects.
+5. Completed guest flips publish immutable command intervals and changed
+   resource generations. The presenter validates and acknowledges each consumed
+   generation before the producer reuses its slots.
+6. The presenter publishes controller state to the control mapping and consumes
+   normalized PCM16 publications through the dedicated audio slot.
+7. Closing the presenter sets the shared stop word. Native ownership writes one
+   dependency-free summary; the launcher then composes higher-level reports.
 
-Known address-taken callback families are recovered during deterministic
-artifact preparation rather than discovered one member per normal run. The
-currently reached level-loading table contributes 11 exact callback entries to
-the decoded store and therefore to the next static native build.
+## Native ownership by subsystem
 
-The normal scheduler also owns registered D3D vertical-blank delivery. It
-reads the title callback from the emulated D3D context, constructs the Xbox
-`D3DVBLANKDATA` payload, and dispatches it through a separate native AOT context
-at a wall-clock-paced 60 Hz. This preserves primary-thread registers while the
-callback advances guest frame state and asynchronous asset work; missing
-callback code remains a transport-code-9 AOT coverage gap rather than a runtime
-interpreter path.
+| Boundary | Native responsibility | Current status |
+| --- | --- | --- |
+| Guest dispatch | Fixed-address AOT modules, direct edges, verified indirect dispatch, and fail-closed guards | Active; coverage remains incomplete beyond the save frontend |
+| Scheduling | Primary, cooperative worker, and 60 Hz vblank contexts | Native in Phase 7 |
+| Memory | Fixed mappings, aliases, dirty ownership, architecture rewrites, and bounded device shadows | Native for the reached path |
+| Host ABI | Exact registered kernel/title services and x64 broker requests where required | Native for the reached path; unknown services fail closed |
+| Filesystem | Xbox path translation, persistent local storage, file/object tables, and reached save/cache operations | Native; current new-save path has not completed |
+| Input | SDL3 event/gamepad collection and IA-32 XInput consumption | Manually confirmed at the frontend |
+| Audio | Title RWS parsing, PCM/Xbox ADPCM conversion, mixing, PCM transport, and SDL3 submission | Menu music manually confirmed; broader continuity remains open |
+| Rendering | Native command/resource publication and retained Vulkan presentation | Frontend confirmed; current static gameplay revalidation remains open |
+| Diagnostics | Fault sidecar, transport events, render/performance reports, and local CDB metadata | Native/local tooling; not a gameplay dependency |
 
-The isolated process model used by bounded and audit runs assigns its guest and
-presenter children to a Windows kill-on-close job. Normal cleanup still requests
-guest stop and waits before forcing termination; if the launcher disappears
-entirely, closing its last job handle makes child cleanup a kernel-owned
-invariant. Unbounded normal gameplay remains the single embedded process.
+## Completed-flip publication
 
-### Completed-flip publication
+The guest canonicalizes the title's dynamic push ring into a stable command
+aperture. A bounded SPSC ring carries command deltas, and alternating immutable
+slots carry changed resource generations. Publication is protected by sequence
+guards; a consumer rejects odd or changing sequences and advances the read
+cursor only after copying and validating the complete record.
 
-Each completed NV097 flip publishes an immutable command interval and the
-resource generations it references. Normal live mode writes command deltas to
-a bounded SPSC shared-memory ring and changed resources to alternating
-immutable slots. The presenter copies and validates a delta before advancing
-the read cursor, and slots are reused only after the completed-flip
-acknowledgement makes that safe.
+The presenter acknowledges a completed generation before the producer retires
+its command prefix or reuses resource slots. Normal presentation does not skip
+guest flips or replace them with reduced render work. Lossless audits use a
+depth-one handshake; ordinary presentation may overlap guest production and
+presentation at depth two.
 
-The producer canonicalizes the title's dynamically allocated D3D ring into the
-renderer's stable `0x80000000` 16 MiB command aperture before publication. The
-binary manifest carries both named-event identities so every generation wakes
-the presenter and every acknowledgement releases the native guest wait.
+## Control and audio transport
 
-The producer retains append-only command history until at least 1,048,576
-completed records (16 MiB) can be retired at an exact flip boundary. Absolute
-base and record counts preserve continuation and diagnostic identity across an
-epoch change. Lossless audit mode deliberately retains cumulative snapshots so
-each audited flip remains a standalone replay.
+The control mapping contains versioned input, stop, acknowledgement, and guest
+summary records. SDL3 publishes controller state through a seqlock; the IA-32
+runtime consumes that state through exact XInput service bodies. Digital input
+is latched long enough to survive slow guest polling, but gameplay evidence is
+still collected through manual input.
 
-Normal presentation never skips completed guest flips or substitutes reduced
-render work. Guest execution and presentation overlap through the publication
-and acknowledgement handshake; lock-step depth one remains available for
-exact audits. Normal play consumes and acknowledges at most one publication at
-each 16.667 ms presenter boundary, so the completed guest-frame rate is capped
-at the title's 60 Hz output rate even on a higher-refresh host display.
+A separate bounded PCM slot prevents audio publication from colliding with the
+render manifest. The IA-32 mixer publishes normalized 48 kHz stereo S16 chunks;
+the presenter validates the sequence and submits them to the SDL3 audio stream.
 
-### Platform and control
+## Offline artifacts and provenance
 
-SDL3 owns the ordinary platform boundary: window lifecycle, events, keyboard,
-gamepads, DPI, audio device/stream, and Vulkan surface creation. Input, stop,
-and completed-flip acknowledgements use sequence-guarded records in one named
-mapping. Digital input is retained for at least 150 ms and two guest flips so
-short taps survive native slices and slow title polling. Direct tools without
-the mapping retain a legacy file fallback.
+The Phase 7 build composes several content-addressed layers:
 
-The launcher sets the shared stop flag when the presenter closes. Isolated
-diagnostic modes use bounded process-tree cleanup only when graceful shutdown
-fails.
+- XBE section and decoded-store snapshot identity;
+- direct-edge relocations and verified indirect-target sets;
+- architecture rewrites and memory ownership;
+- host-ABI and service maps;
+- resident scheduler and lane state;
+- measured coverage-growth profile; and
+- launcher/normal-live contracts, boot image, native executable, and sidecars.
+
+The loader verifies source, toolchain, executable, manifest, and sidecar hashes
+before launch. A warm run is static-clean only when the manifest and runtime
+summary both report zero frontier activity, Python callbacks, runtime
+compilation/decoding/patching, promotion, and cross-backend exits.
+
+## Diagnostics versus normal execution
+
+Frozen replay, differential comparison, render audits, CDB, ETW, and RenderDoc
+are developer tools. They may use separate processes, bounded instrumentation,
+or diagnostic-only oracles because evidence is their output. Every report must
+identify its mode and must not be presented as ordinary gameplay performance.
+
+The default `live_test.py` backend currently remains the diagnostic oracle. The
+static backend is selected explicitly with `--guest-backend same-isa-ia32` and
+a verified normal-live artifact. There is no automatic fallback between them.
 
 ## Source ownership
 
 | Area | Responsibility |
 | --- | --- |
-| `runtime/xbox/` | Guest ABI, hardware, scheduler, and service semantics |
-| `runtime/host/vulkan_first_frame.cpp` | Thin executable/DLL entry adapter |
-| `runtime/host/vulkan_presenter.cpp` | Presenter session, live reload, pacing, platform dispatch, and acknowledgement |
-| `runtime/host/vulkan_presenter_runtime.h` | Private presenter declaration and shared runtime state |
-| `runtime/host/vulkan_presenter_internal.h` | Renderer-private state and template-based stream interpretation |
-| `runtime/host/vulkan_renderer.cpp` | Vulkan instance/device/swapchain, pipelines, command recording, synchronization, and cleanup |
-| `runtime/host/vulkan_resources.cpp` | Texture conversion, host texture/binding caches, and offscreen render targets |
-| `runtime/host/presenter_diagnostics.cpp` | Presented-geometry diagnostics, metrics collection, readback, and screenshots |
-| `runtime/host/nv2a_command_processor.cpp` | NV2A command, draw-state, vertex, and recovered-resource processing |
-| `runtime/host/live_presenter_transport.*` | Live shared-memory transport and legacy diagnostic-file fallback |
-| `runtime/host/presenter_options.*` | Presenter command-line contract |
-| `runtime/host/presenter_debug_log.*` | Structured presenter event logging |
-| `runtime/host/presenter_metrics.*` | Immutable metrics snapshots and report output |
-| `runtime/platform/sdl/sdl_platform.*` | SDL3 window, events, keyboard/gamepads, hotkeys, and Vulkan surface |
-| `runtime/platform/sdl/sdl_audio*` | SDL3 playback device, audio stream, bounded queue, reset, shutdown, and C ABI bridge |
-| `runtime/host/live_transport_layout.h` | Versioned wire layout and seqlock publication rules |
-| `runtime/host/dirty_ranges.h` | Dirty-span normalization, merging, and accounting |
-| `runtime/host/frame_metrics.h` | Completed-flip FPS sampling |
-| `runtime/host/native_pipeline_state.h` | Pipeline identity and cache key semantics |
-| `runtime/nv2a/texture_layout.h` | NV2A texture format/layout and Morton unswizzle rules |
-| `tools/analysis/`, `tools/recomp/` | Offline recovery, lifting, generation, and coverage |
-| `tools/playability/` | Launch, bounded probes, strict audits, and report composition |
-
-Dependency-light renderer cores intentionally have no SDL window or Vulkan
-device dependency. This makes transport layout, dirty ranges, texture layout,
-pipeline identity, FPS sampling, and vertex-program behavior directly testable
-in CTest. The presenter is a composition root: SDL3 owns ordinary platform
-behavior—including the host audio device and stream—the transport module owns
-live mappings, and diagnostics own their output formats. The native runtime
-owns title-specific audio decoding and mix policy and submits normalized PCM16
-chunks through the presenter's narrow audio ABI. The renderer retains
-direct ownership of the Vulkan instance, device, swapchain, resources,
-synchronization, pipelines, and readback because those objects share one
-explicit GPU lifetime.
+| `tools/recomp/` | IA-32 lifting, decoded-store artifacts, proof contracts, static generation, and debug metadata |
+| `tools/playability/` | Launch orchestration, manual capture, replay/audit tools, and report composition |
+| `runtime/xbox/` | Xbox ABI, scheduler, hardware, and service semantics used by the broader runtime |
+| `runtime/host/live_presenter_transport.*` | Native shared-memory transport and diagnostic file fallback |
+| `runtime/host/live_transport_layout.h` | Versioned control/command/resource/audio wire layout |
+| `runtime/host/vulkan_presenter.cpp` | Presenter lifecycle, publication consumption, pacing, and platform orchestration |
+| `runtime/host/vulkan_renderer.cpp` | Vulkan device, swapchain, pipelines, command recording, synchronization, and cleanup |
+| `runtime/host/vulkan_resources.cpp` | Texture conversion, resource caches, and offscreen render targets |
+| `runtime/host/nv2a_command_processor.cpp` | NV2A command/state/vertex processing |
+| `runtime/host/presenter_diagnostics.cpp` | Metrics, readback, screenshots, and render reports |
+| `runtime/platform/sdl/` | SDL3 windowing, events, gamepads, audio stream, DPI, and Vulkan surface |
+| `runtime/nv2a/` | Dependency-light NV2A format/layout and shader support |
 
 ## Boundary rules
 
-- Python must not regain per-slice scheduling, filesystem polling, or normal
-  per-frame JSON/payload IPC.
-- Immutable completed-flip publication and sequence checks are correctness
-  boundaries; producer data is never read while its sequence is odd or changes.
-- Host resources are retained only under explicit identity/generation keys.
-  Overlapping writes invalidate or merge dirty spans before reuse.
-- Title-specific repairs need a supported-build guard, evidence, a named hook,
-  and a focused regression.
-- Diagnostic and audit paths are bounded and disclose truncation. Normal
-  gameplay keeps profiling, capture, and lossless materialization opt-in.
+- Do not optimize across a Python runtime callback; remove the callback first.
+- Do not make a dynamic target generally executable to clear one guarded call.
+- Recover finite object/vtable, callback, import, and jump-table families with
+  exact byte and provenance checks.
+- Preserve guest-visible ABI and state at every observable boundary.
+- Keep proprietary captures and generated title material in ignored local paths.
+- Treat screenshots and performance captures as scoped evidence, not completion
+  claims.
 
-See [BUILDING.md](BUILDING.md) for toolchain enforcement and
-[VALIDATION.md](VALIDATION.md) for retained evidence and known limitations.
+See [BUILDING.md](BUILDING.md) for artifact construction,
+[DEBUGGING_COMMANDS.md](DEBUGGING_COMMANDS.md) for guarded-call triage, and
+[VALIDATION.md](VALIDATION.md) for current evidence and limitations.

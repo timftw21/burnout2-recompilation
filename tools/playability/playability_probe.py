@@ -47,9 +47,14 @@ try:
     )
     from tools.playability.live_transport import (
         LIVE_CONTROL_SCHEMA_VERSION,
+        REPLAY_CAPTURE_STATE_REQUESTED,
         LiveCommandTransport,
         LiveControlTransport,
         LiveResourceTransport,
+    )
+    from tools.playability.replay_capsule import (
+        ReplayCapsuleError,
+        require_local_capsule_output,
     )
     from tools.project_identity import (
         DEFAULT_SUPPORTED_TARGETS,
@@ -110,9 +115,14 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
     )
     from tools.playability.live_transport import (
         LIVE_CONTROL_SCHEMA_VERSION,
+        REPLAY_CAPTURE_STATE_REQUESTED,
         LiveCommandTransport,
         LiveControlTransport,
         LiveResourceTransport,
+    )
+    from tools.playability.replay_capsule import (
+        ReplayCapsuleError,
+        require_local_capsule_output,
     )
     from tools.project_identity import (
         DEFAULT_SUPPORTED_TARGETS,
@@ -404,6 +414,7 @@ TITLE_FRONTEND_OBJECT_INITIALIZER_SUCCESS_ADDRESS = 0x0010A0BF
 TITLE_FRONTEND_OBJECT_AUDIO_CREATE_RESULT_ADDRESS = 0x0010AB78
 TITLE_FRONTEND_OBJECT_AUDIO_STATE_ALLOC_RESULT_ADDRESS = 0x0010AB93
 TITLE_FRONTEND_OBJECT_AUDIO_INIT_RESULT_ADDRESS = 0x0010ABB9
+
 TITLE_MAIN_LOOP_EXIT_FLAG_ADDRESS = 0x0034900C
 TITLE_MAIN_LOOP_ENTRY_ADDRESS = 0x00011000
 TITLE_MAIN_LOOP_FRAME_ADDRESS = 0x00011036
@@ -732,6 +743,17 @@ TITLE_AUDIO_DSP_RESET_READY_BIT = 0x00000100
 TITLE_AUDIO_DSP_VOICE_COMMAND_ADDRESSES = (0xFEC0011B, 0xFEC0017B)
 TITLE_AUDIO_DSP_VOICE_COMMAND_PENDING_BIT = 0x02
 TITLE_D3D_CONTEXT_GLOBAL_ADDRESS = 0x002256B8
+
+# Manual Phase-5 captures copy each live lane TLS page into a stable,
+# non-overlapping low user-address window. The IA-32 scheduler swaps these
+# snapshots through the active window without changing the live diagnostic run.
+PHASE5_CAPTURE_LANE_TLS_BASES = (0x73000000, 0x73010000, 0x73020000)
+PHASE5_CAPTURE_ACTIVE_TLS_BASE = 0x73030000
+PHASE5_CAPTURE_RENDER_PRODUCT = (TITLE_D3D_CONTEXT_GLOBAL_ADDRESS, 4)
+PHASE5_CAPTURE_AUDIO_PRODUCT = (
+    TITLE_FRONTEND_OBJECT_AUDIO_STATE_ALLOC_RESULT_ADDRESS,
+    4,
+)
 TITLE_D3D_PRESENT_OBSERVER_ADDRESSES = {
     0x002224A0,  # public Present entry
     0x00222506,  # immediate flip path
@@ -16646,6 +16668,41 @@ class XbeBackedSparseMemory(SparseMemory):
                 payload[offset] = overlay[source_offset]
         return bytes(payload)
 
+    def replay_capsule_memory_snapshot(self) -> SparseMemory:
+        """Freeze every native-resident and XBE-backed page for standalone replay."""
+
+        return self.replay_capsule_memory_snapshot_from_native_pages(None)
+
+    def replay_capsule_memory_snapshot_from_native_pages(
+        self,
+        page_table: Any | None,
+    ) -> SparseMemory:
+        """Also freeze pages allocated directly by native host services."""
+
+        pages = set(self.native_resident_page_indices())
+        if self._native_page_buffers_view is not None:
+            pages.update(int(page) for page in self._native_page_buffers_view)
+
+        native_pointers: dict[int, int] = {}
+        if page_table is not None:
+            native_pointers = {
+                page: int(pointer)
+                for page, pointer in enumerate(page_table)
+                if pointer
+            }
+            pages.update(native_pointers)
+
+        def snapshot_page(page: int) -> bytes:
+            pointer = native_pointers.get(page)
+            if pointer is not None:
+                return ctypes.string_at(pointer, self._PAGE_SIZE)
+            return self.native_page_snapshot(page << self._PAGE_BITS)
+
+        return SparseMemory.from_pages(
+            (page, snapshot_page(page))
+            for page in sorted(pages)
+        )
+
     def write(self, address: int, payload: bytes) -> None:
         self._commit_native_page_view_for_host_write(address, len(payload))
         self._observe_write(address, payload)
@@ -18290,6 +18347,10 @@ def build_playability_probe_summary(
     live_flip_audit_max_flips: int = 0,
     native_slice_steps: int = 100000,
     profile_hot_paths: bool = False,
+    capture_replay_capsule_path: Path | None = None,
+    capture_replay_entry: int = 0x000C5550,
+    capture_replay_scheduler_stop: int | None = None,
+    capture_replay_scheduler_exit: str = "complete",
     aot_optimization_mode: str = DEFAULT_AOT_OPTIMIZATION_MODE,
     developer_live_compile: bool = False,
     audit_title_main_loop_exit: bool = False,
@@ -18406,6 +18467,10 @@ def build_playability_probe_summary(
             live_flip_audit_max_flips=live_flip_audit_max_flips,
             native_slice_steps=native_slice_steps,
             profile_hot_paths=profile_hot_paths,
+            capture_replay_capsule_path=capture_replay_capsule_path,
+            capture_replay_entry=capture_replay_entry,
+            capture_replay_scheduler_stop=capture_replay_scheduler_stop,
+            capture_replay_scheduler_exit=capture_replay_scheduler_exit,
             aot_optimization_mode=aot_optimization_mode,
             developer_live_compile=developer_live_compile,
             audit_title_main_loop_exit=audit_title_main_loop_exit,
@@ -18544,6 +18609,10 @@ def _recover_entry_summary(
     live_flip_audit_max_flips: int,
     native_slice_steps: int,
     profile_hot_paths: bool,
+    capture_replay_capsule_path: Path | None,
+    capture_replay_entry: int,
+    capture_replay_scheduler_stop: int | None,
+    capture_replay_scheduler_exit: str,
     aot_optimization_mode: str,
     developer_live_compile: bool,
     audit_title_main_loop_exit: bool,
@@ -18637,6 +18706,10 @@ def _recover_entry_summary(
             live_flip_audit_max_flips=live_flip_audit_max_flips,
             native_slice_steps=native_slice_steps,
             profile_hot_paths=profile_hot_paths,
+            capture_replay_capsule_path=capture_replay_capsule_path,
+            capture_replay_entry=capture_replay_entry,
+            capture_replay_scheduler_stop=capture_replay_scheduler_stop,
+            capture_replay_scheduler_exit=capture_replay_scheduler_exit,
             aot_optimization_mode=aot_optimization_mode,
             developer_live_compile=developer_live_compile,
             audit_title_main_loop_exit=audit_title_main_loop_exit,
@@ -19127,6 +19200,178 @@ def _seed_guest_thread_fs_block(memory: SparseMemory, fs_base: int) -> None:
     memory.write_u32(_u32(fs_base + THREAD_FS_CALLBACK_TABLE_OFFSET), 0)
 
 
+def _phase5_capture_eflags(state: CpuState) -> int:
+    flags = 0x2
+    flags |= int(state.flags.cf) << 0
+    flags |= int(state.flags.pf) << 2
+    flags |= int(state.flags.af) << 4
+    flags |= int(state.flags.zf) << 6
+    flags |= int(state.flags.sf) << 7
+    flags |= int(state.flags.interrupt_enabled) << 9
+    flags |= int(state.flags.df) << 10
+    flags |= int(state.flags.of) << 11
+    return flags
+
+
+def _phase5_capture_lane(
+    name: str,
+    state: CpuState,
+    *,
+    tls_base: int,
+    initial_state: str,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "initial_eip": int(state.eip) & 0xFFFFFFFF,
+        "tls_base": tls_base,
+        "initial_state": initial_state,
+        "registers": {
+            name: state.get_register(name)
+            for name in ("eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi")
+        },
+        "eflags": _phase5_capture_eflags(state),
+    }
+
+
+def _replay_capture_requires_resident_state(
+    stop_eip: int | None,
+    exit_kind: str,
+) -> bool:
+    return stop_eip is not None or exit_kind == "flip"
+
+
+def _phase5_primary_scheduler_capture(
+    state: CpuState,
+    memory: SparseMemory,
+    *,
+    stop_eip: int,
+    exit_kind: str = "complete",
+    worker_state: CpuState | None = None,
+    vblank_state: CpuState | None = None,
+) -> tuple[CpuState, dict[str, Any], dict[int, bytes]]:
+    """Build a bounded scheduler checkpoint from a manual native boundary."""
+
+    if exit_kind not in {"complete", "flip", "yield"}:
+        raise ValueError(f"unsupported resident scheduler capture exit: {exit_kind}")
+
+    from tools.playability.replay_capsule import cpu_state_from_record, cpu_state_record
+
+    primary = cpu_state_from_record(cpu_state_record(state))
+    worker = cpu_state_from_record(cpu_state_record(worker_state or state))
+    vblank = cpu_state_from_record(cpu_state_record(vblank_state or state))
+    lane_states = (primary, worker, vblank)
+    overlays: dict[int, bytes] = {}
+    for lane, tls_base in zip(lane_states, PHASE5_CAPTURE_LANE_TLS_BASES):
+        source_tls = int(lane.fs_base) & 0xFFFFFFFF
+        overlays[tls_base] = (
+            memory.read(source_tls, 4096) if source_tls else bytes(4096)
+        )
+    overlays[PHASE5_CAPTURE_ACTIVE_TLS_BASE] = overlays[
+        PHASE5_CAPTURE_LANE_TLS_BASES[0]
+    ]
+    primary.fs_base = PHASE5_CAPTURE_ACTIVE_TLS_BASE
+    render_address, render_size = PHASE5_CAPTURE_RENDER_PRODUCT
+    audio_address, audio_size = PHASE5_CAPTURE_AUDIO_PRODUCT
+    scheduler_state = {
+        "resident_scheduler": {
+            "version": 1,
+            "capture_mode": (
+                "bounded-primary-flip"
+                if exit_kind == "flip"
+                else "bounded-primary-slice"
+            ),
+            "active_tls_base": PHASE5_CAPTURE_ACTIVE_TLS_BASE,
+            "lanes": [
+                _phase5_capture_lane(
+                    "primary",
+                    lane_states[0],
+                    tls_base=PHASE5_CAPTURE_LANE_TLS_BASES[0],
+                    initial_state="ready",
+                ),
+                _phase5_capture_lane(
+                    "worker",
+                    lane_states[1],
+                    tls_base=PHASE5_CAPTURE_LANE_TLS_BASES[1],
+                    initial_state="completed",
+                ),
+                _phase5_capture_lane(
+                    "vblank",
+                    lane_states[2],
+                    tls_base=PHASE5_CAPTURE_LANE_TLS_BASES[2],
+                    initial_state="completed",
+                ),
+            ],
+            "steps": [
+                {
+                    "sequence": 0,
+                    "lane": "primary",
+                    "entry_eip": int(state.eip) & 0xFFFFFFFF,
+                    "next_eip": int(stop_eip) & 0xFFFFFFFF,
+                    "exit": exit_kind,
+                },
+                *(
+                    [
+                        {
+                            "sequence": 1,
+                            "lane": "primary",
+                            "entry_eip": int(stop_eip) & 0xFFFFFFFF,
+                            "next_eip": int(stop_eip) & 0xFFFFFFFF,
+                            "exit": "complete",
+                        }
+                    ]
+                    if exit_kind != "complete"
+                    else []
+                ),
+            ],
+            "products": {
+                "render": {"address": render_address, "size": render_size},
+                "audio": {"address": audio_address, "size": audio_size},
+            },
+        }
+    }
+    return primary, scheduler_state, overlays
+
+
+def _phase5_capture_service_registry(
+    entries: Iterable[Any],
+    target_names: Mapping[int, str],
+    *,
+    return_constant_kind: int,
+) -> list[dict[str, Any]]:
+    """Encode only native services whose replay semantics are exact today."""
+
+    registry = []
+    for entry in entries:
+        target = int(entry.target) & 0xFFFFFFFF
+        cleanup = int(entry.stack_cleanup_bytes)
+        if (
+            int(entry.kind) != return_constant_kind
+            or target < 0xC0000000
+            or target & 0xF
+            or cleanup < 0
+            or cleanup > 16
+            or cleanup % 4
+        ):
+            continue
+        registry.append(
+            {
+                "target": target,
+                "shim_name": target_names.get(
+                    target,
+                    f"native_return_constant_{target:08X}",
+                ),
+                "kind": return_constant_kind,
+                "value": int(entry.value) & 0xFFFFFFFF,
+                "stack_cleanup_bytes": cleanup,
+                "calling_convention": "stdcall",
+                "argument_count": cleanup // 4,
+                "boundary": "synchronization",
+                "execution": "native32",
+            }
+        )
+    return registry
+
+
 def _execute_recovered_control_flow_frame(
     loaded: LoadedXbeImage,
     entry_function: LiftedFunction,
@@ -19151,6 +19396,10 @@ def _execute_recovered_control_flow_frame(
     live_flip_audit_max_flips: int,
     native_slice_steps: int,
     profile_hot_paths: bool,
+    capture_replay_capsule_path: Path | None,
+    capture_replay_entry: int,
+    capture_replay_scheduler_stop: int | None,
+    capture_replay_scheduler_exit: str,
     aot_optimization_mode: str,
     developer_live_compile: bool,
     audit_title_main_loop_exit: bool,
@@ -19786,6 +20035,16 @@ def _execute_recovered_control_flow_frame(
                 live_flip_audit_max_flips=live_flip_audit_max_flips,
             native_slice_steps=native_slice_steps,
             profile_hot_paths=profile_hot_paths,
+            capture_replay_capsule_path=(
+                capture_replay_capsule_path
+                if not thread_executions
+                else None
+            ),
+            capture_replay_entry=capture_replay_entry,
+            capture_replay_scheduler_stop=capture_replay_scheduler_stop,
+            capture_replay_scheduler_exit=capture_replay_scheduler_exit,
+            capture_image_sha256=image_sha256,
+            capture_decoded_block_store_path=decoded_block_store.path,
             aot_optimization_mode=aot_optimization_mode,
             developer_live_compile=developer_live_compile,
                 audit_title_main_loop_exit=audit_title_main_loop_exit,
@@ -20072,7 +20331,7 @@ def _initialize_guest_thread_state(
 def _guest_thread_requested_live_stop(execution: dict[str, Any]) -> bool:
     native_run = execution.get("native_run")
     return (
-        execution.get("status") == "live_stop"
+        execution.get("status") in {"live_stop", "replay_capsule_captured"}
         or (
             isinstance(native_run, dict)
             and native_run.get("reason") == "yield_handler_stop"
@@ -20115,6 +20374,12 @@ def _execute_guest_thread_start(
     live_flip_audit_max_flips: int = 0,
     native_slice_steps: int = 100000,
     profile_hot_paths: bool = False,
+    capture_replay_capsule_path: Path | None = None,
+    capture_replay_entry: int = 0x000C5550,
+    capture_replay_scheduler_stop: int | None = None,
+    capture_replay_scheduler_exit: str = "complete",
+    capture_image_sha256: str | None = None,
+    capture_decoded_block_store_path: Path | None = None,
     aot_optimization_mode: str = DEFAULT_AOT_OPTIMIZATION_MODE,
     developer_live_compile: bool = False,
     enable_title_repair_fallbacks: bool = False,
@@ -20310,6 +20575,8 @@ def _execute_guest_thread_start(
     pending_native_write_observations: list[tuple[int, bytes]] = []
     cooperative_scheduler_summary: dict[str, Any] | None = None
     native_host_services_summary: dict[str, Any] | None = None
+    captured_replay_capsule: dict[str, Any] = {}
+    pending_full_flip_capture: dict[str, Any] = {}
 
     def native_traffic_mesh_audit_summary() -> dict[str, Any]:
         sample_capacity = len(native_host_services.native_traffic_mesh_samples)
@@ -21092,12 +21359,386 @@ def _execute_guest_thread_start(
         else None
     )
 
+    def native_capture_memory_snapshot(
+        executor: Any,
+        observed_memory: SparseMemory,
+    ) -> SparseMemory:
+        snapshot = getattr(
+            observed_memory,
+            "replay_capsule_memory_snapshot_from_native_pages",
+            None,
+        )
+        if callable(snapshot):
+            return snapshot(executor._page_table)
+        return SparseMemory.from_pages(observed_memory.export_pages())
+
+    def full_flip_memory_oracle(
+        initial: SparseMemory,
+        terminal: SparseMemory,
+    ) -> tuple[bytes, int, str]:
+        initial_pages = {page: payload for page, payload in initial.export_pages()}
+        terminal_pages = {page: payload for page, payload in terminal.export_pages()}
+        changed = [
+            (page, terminal_pages.get(page, bytes(4096)))
+            for page in sorted(set(initial_pages) | set(terminal_pages))
+            if initial_pages.get(page, bytes(4096))
+            != terminal_pages.get(page, bytes(4096))
+        ]
+        payload = bytearray(struct.pack("<4sII", b"B2F7", 1, len(changed)))
+        digest = hashlib.sha256()
+        for page in sorted(terminal_pages):
+            digest.update(struct.pack("<I", page))
+            digest.update(terminal_pages[page])
+        for page, page_payload in changed:
+            payload.extend(struct.pack("<I", page))
+            payload.extend(page_payload)
+        return bytes(payload), len(changed), digest.hexdigest()
+
+    def complete_full_flip_capture(
+        cpu: CpuState,
+        observed_memory: SparseMemory,
+        steps: int,
+    ) -> bool:
+        if not pending_full_flip_capture:
+            return False
+        terminal_flip_count = max(
+            int(render_watchpoint.flip_count),
+            int(native_host_services.live_flip_count),
+        )
+        if terminal_flip_count <= int(pending_full_flip_capture["start_flip_count"]):
+            return False
+        executor = active_native_executor
+        if executor is None:
+            raise RuntimeError(
+                "full-flip capture reached completion without an active native executor"
+            )
+        from tools.playability.replay_capsule import cpu_state_record
+
+        initial_memory = pending_full_flip_capture["memory"]
+        terminal_memory = native_capture_memory_snapshot(executor, observed_memory)
+        oracle_payload, changed_page_count, terminal_memory_sha256 = (
+            full_flip_memory_oracle(initial_memory, terminal_memory)
+        )
+        terminal_services = native_host_service_failure_summary()
+        actual_stop_eip = int(cpu.eip) & 0xFFFFFFFF
+        (
+            captured_state,
+            resident_scheduler_state,
+            memory_overlays,
+        ) = _phase5_primary_scheduler_capture(
+            pending_full_flip_capture["state"],
+            initial_memory,
+            stop_eip=actual_stop_eip,
+            exit_kind="flip",
+            worker_state=pending_full_flip_capture.get("worker_state"),
+            vblank_state=pending_full_flip_capture.get("vblank_state"),
+        )
+        oracle = {
+            "format": "b2-recomp-phase7-full-flip-oracle",
+            "version": 1,
+            "requested_stop_eip": capture_replay_scheduler_stop,
+            "actual_stop_eip": actual_stop_eip,
+            "actual_stop_eip_hex": _hex32(actual_stop_eip),
+            "start_steps": int(pending_full_flip_capture["start_steps"]),
+            "terminal_steps": int(steps),
+            "step_delta": max(
+                0,
+                int(steps) - int(pending_full_flip_capture["start_steps"]),
+            ),
+            "completed_flips": (
+                terminal_flip_count
+                - int(pending_full_flip_capture["start_flip_count"])
+            ),
+            "terminal_cpu_state": cpu_state_record(cpu),
+            "terminal_memory_resource": "phase7/full-flip-pages.bin",
+            "terminal_memory_sha256": terminal_memory_sha256,
+            "changed_page_count": changed_page_count,
+            "service_trace": terminal_services.get("service_trace", []),
+            "service_trace_overflow_count": int(
+                terminal_services.get("service_trace_overflow_count", 0)
+            ),
+        }
+        resident_scheduler_state["resident_scheduler"]["capture_mode"] = (
+            "observed-full-flip"
+        )
+        resident_scheduler_state["resident_scheduler"]["full_flip_oracle"] = oracle
+        captured_scheduler_state = {
+            **pending_full_flip_capture["scheduler_state"],
+            **resident_scheduler_state,
+        }
+        captured_service_state = terminal_services
+        captured_service_state["service_registry"] = _phase5_capture_service_registry(
+            native_host_service_entries,
+            runtime_target_names,
+            return_constant_kind=NATIVE_HOST_SERVICE_RETURN_CONSTANT,
+        )
+        captured_path = pending_full_flip_capture[
+            "executor"
+        ].capture_manual_replay_capsule(
+            capture_replay_capsule_path,
+            state=captured_state,
+            memory=initial_memory,
+            scheduler_state=captured_scheduler_state,
+            service_state=captured_service_state,
+            provenance={
+                "source": "live-f8-native-full-flip-window",
+                "target_sha256": capture_image_sha256,
+                "capture_entry": int(capture_replay_entry),
+                "capture_entry_hex": _hex32(capture_replay_entry),
+                "capture_scheduler_stop": actual_stop_eip,
+                "capture_scheduler_stop_hex": _hex32(actual_stop_eip),
+                "requested_capture_scheduler_stop": capture_replay_scheduler_stop,
+                "capture_scheduler_exit": "flip",
+                "resident_scheduler_capture_mode": "observed-full-flip",
+                "capture_steps": int(steps),
+                "capture_step_delta": oracle["step_delta"],
+                "replay_capture_state": REPLAY_CAPTURE_STATE_REQUESTED,
+                "decoded_block_store": (
+                    str(capture_decoded_block_store_path.resolve())
+                    if capture_decoded_block_store_path is not None
+                    else None
+                ),
+            },
+            resources={"phase7/full-flip-pages.bin": oracle_payload},
+            events={
+                "service_sequence": oracle["service_trace"],
+                "render_events": [],
+                "audio_events": [],
+            },
+            memory_overlays=memory_overlays,
+            instruction_bytes_reader=loaded.arena.read,
+        )
+        captured_replay_capsule.update(
+            {
+                "path": str(captured_path.resolve()),
+                "entry": capture_replay_entry,
+                "entry_hex": _hex32(capture_replay_entry),
+                "scheduler_stop": actual_stop_eip,
+                "scheduler_stop_hex": _hex32(actual_stop_eip),
+                "requested_scheduler_stop": capture_replay_scheduler_stop,
+                "scheduler_exit": "flip",
+                "steps": steps,
+                "step_delta": oracle["step_delta"],
+                "changed_page_count": changed_page_count,
+                "trigger": "f8_to_completed_flip",
+            }
+        )
+        pending_full_flip_capture.clear()
+        if live_host_bridge is not None and live_host_bridge.live_control_transport is not None:
+            live_host_bridge.live_control_transport.complete_replay_capture()
+            live_host_bridge.live_control_transport.request_stop()
+        return True
+
     def observe_guest_thread_step(
         cpu: CpuState,
         observed_memory: SparseMemory,
         trace: ExecutionTrace,
         steps: int,
     ) -> None:
+        if (
+            capture_replay_capsule_path is not None
+            and cpu.eip == capture_replay_entry
+            and live_host_bridge is not None
+            and live_host_bridge.live_control_transport is not None
+            and live_host_bridge.live_control_transport.replay_capture_state()
+            == REPLAY_CAPTURE_STATE_REQUESTED
+        ):
+            if captured_replay_capsule:
+                live_host_bridge.live_control_transport.complete_replay_capture()
+                live_host_bridge.live_control_transport.request_stop()
+                return
+            if active_native_executor is None:
+                raise RuntimeError(
+                    "manual replay capture reached its boundary without an active "
+                    "native executor"
+                )
+            if pending_full_flip_capture:
+                return
+            lifecycle_entries = [
+                {
+                    field: int(getattr(native_worker_lifecycle.entries[index], field))
+                    for field, _field_type in native_worker_lifecycle.entries[
+                        index
+                    ]._fields_
+                }
+                for index in range(int(native_worker_lifecycle.entry_count))
+            ]
+            captured_service_state = native_host_service_failure_summary()
+            captured_state = cpu
+            memory_overlays = None
+            captured_scheduler_state = {
+                **native_worker_lifecycle.summary(),
+                "selection_cursor": int(native_worker_lifecycle.selection_cursor),
+                "current_worker_handle": int(
+                    native_host_services.current_worker_handle
+                ),
+                "capture_steps": int(steps),
+                "entries": lifecycle_entries,
+            }
+            if _replay_capture_requires_resident_state(
+                capture_replay_scheduler_stop,
+                capture_replay_scheduler_exit,
+            ):
+                from tools.playability.replay_capsule import (
+                    cpu_state_from_record,
+                    cpu_state_record,
+                )
+                from tools.recomp.native_executor import _Context, _state_from_context
+
+                if capture_replay_scheduler_stop is not None:
+                    decoded_addresses = {
+                        instruction.address
+                        for function in active_native_executor._capsule_functions
+                        for instruction in function.instructions
+                    }
+                    if capture_replay_scheduler_stop not in decoded_addresses:
+                        raise RuntimeError(
+                            "manual Phase-5 capture stop is not in the decoded block "
+                            f"store: {_hex32(capture_replay_scheduler_stop)}"
+                        )
+
+                def resident_state(pointer: int) -> CpuState | None:
+                    if pointer == 0:
+                        return None
+                    snapshot = cpu_state_from_record(cpu_state_record(cpu))
+                    native_context = ctypes.cast(
+                        pointer,
+                        ctypes.POINTER(_Context),
+                    ).contents
+                    _state_from_context(snapshot, native_context)
+                    return snapshot
+
+                worker_slots = [
+                    slot
+                    for slot in native_host_services.worker_execution
+                    if int(slot.context)
+                ]
+                current_worker_handle = int(
+                    native_host_services.current_worker_handle
+                )
+                worker_slots.sort(
+                    key=lambda slot: int(slot.handle) != current_worker_handle
+                )
+                worker_state = (
+                    resident_state(int(worker_slots[0].context))
+                    if worker_slots
+                    else None
+                )
+                vblank_state = resident_state(
+                    int(native_host_services.native_d3d_vblank_callback_context)
+                )
+                if capture_replay_scheduler_exit == "flip":
+                    initial_state = cpu_state_from_record(cpu_state_record(cpu))
+                    pending_full_flip_capture.update(
+                        {
+                            "executor": active_native_executor,
+                            "state": initial_state,
+                            "memory": native_capture_memory_snapshot(
+                                active_native_executor,
+                                observed_memory,
+                            ),
+                            "worker_state": worker_state,
+                            "vblank_state": vblank_state,
+                            "scheduler_state": captured_scheduler_state,
+                            "start_flip_count": max(
+                                int(render_watchpoint.flip_count),
+                                int(native_host_services.live_flip_count),
+                            ),
+                            "start_steps": int(steps),
+                        }
+                    )
+                    native_host_services.service_trace_count = 0
+                    native_host_services.service_trace_overflow_count = 0
+                    native_host_services.replay_capture_start_flip_count = int(
+                        native_host_services.live_flip_count
+                    )
+                    native_host_services.replay_capture_pending = True
+                    return
+                if capture_replay_scheduler_stop is not None:
+                    (
+                        captured_state,
+                        resident_scheduler_state,
+                        memory_overlays,
+                    ) = _phase5_primary_scheduler_capture(
+                        cpu,
+                        observed_memory,
+                        stop_eip=capture_replay_scheduler_stop,
+                        exit_kind=capture_replay_scheduler_exit,
+                        worker_state=worker_state,
+                        vblank_state=vblank_state,
+                    )
+                    captured_scheduler_state.update(resident_scheduler_state)
+                    captured_service_state["service_registry"] = (
+                        _phase5_capture_service_registry(
+                            native_host_service_entries,
+                            runtime_target_names,
+                            return_constant_kind=NATIVE_HOST_SERVICE_RETURN_CONSTANT,
+                        )
+                    )
+            captured_path = active_native_executor.capture_manual_replay_capsule(
+                capture_replay_capsule_path,
+                state=captured_state,
+                memory=observed_memory,
+                scheduler_state=captured_scheduler_state,
+                service_state=captured_service_state,
+                provenance={
+                    "source": "live-f8-native-boundary",
+                    "target_sha256": capture_image_sha256,
+                    "capture_entry": int(capture_replay_entry),
+                    "capture_entry_hex": _hex32(capture_replay_entry),
+                    "capture_scheduler_stop": capture_replay_scheduler_stop,
+                    "capture_scheduler_stop_hex": (
+                        _hex32(capture_replay_scheduler_stop)
+                        if capture_replay_scheduler_stop is not None
+                        else None
+                    ),
+                    "capture_scheduler_exit": capture_replay_scheduler_exit,
+                    "resident_scheduler_capture_mode": (
+                        (
+                            "bounded-primary-flip"
+                            if capture_replay_scheduler_exit == "flip"
+                            else "bounded-primary-slice"
+                        )
+                        if capture_replay_scheduler_stop is not None
+                        else None
+                    ),
+                    "capture_steps": int(steps),
+                    "replay_capture_state": REPLAY_CAPTURE_STATE_REQUESTED,
+                    "decoded_block_store": (
+                        str(capture_decoded_block_store_path.resolve())
+                        if capture_decoded_block_store_path is not None
+                        else None
+                    ),
+                },
+                events={
+                    "service_sequence": captured_service_state.get(
+                        "service_trace", []
+                    ),
+                    "render_events": [],
+                    "audio_events": [],
+                },
+                memory_overlays=memory_overlays,
+                instruction_bytes_reader=loaded.arena.read,
+            )
+            captured_replay_capsule.update(
+                {
+                    "path": str(captured_path.resolve()),
+                    "entry": capture_replay_entry,
+                    "entry_hex": _hex32(capture_replay_entry),
+                    "scheduler_stop": capture_replay_scheduler_stop,
+                    "scheduler_stop_hex": (
+                        _hex32(capture_replay_scheduler_stop)
+                        if capture_replay_scheduler_stop is not None
+                        else None
+                    ),
+                    "scheduler_exit": capture_replay_scheduler_exit,
+                    "steps": steps,
+                    "trigger": "f8_replay_capture",
+                }
+            )
+            live_host_bridge.live_control_transport.complete_replay_capture()
+            live_host_bridge.live_control_transport.request_stop()
+            return
         if audit_title_main_loop_exit and cpu.eip in TITLE_MAIN_LOOP_AUDIT_ADDRESSES:
             esp = cpu.get_register("esp")
             event = {
@@ -21990,6 +22631,11 @@ def _execute_guest_thread_start(
                     if audit_title_main_loop_exit
                     else set()
                 ),
+                *(
+                    {capture_replay_entry}
+                    if capture_replay_capsule_path is not None
+                    else set()
+                ),
             }
             dispatch_observers_in_native = bool(
                 live_host_bridge is not None
@@ -22589,6 +23235,12 @@ def _execute_guest_thread_start(
                             dispatch_observers_in_native=(
                                 dispatch_observers_in_native
                             ),
+                            python_observer_address=(
+                                capture_replay_entry
+                                if capture_replay_capsule_path is not None
+                                and dispatch_observers_in_native
+                                else None
+                            ),
                         )
                     except NativeExecutorError as exc:
                         session["status"] = "execution_failed"
@@ -22836,6 +23488,8 @@ def _execute_guest_thread_start(
                     if continue_running is False:
                         return False
                     synchronize_native_host_services()
+                    if complete_full_flip_capture(cpu, observed_memory, steps):
+                        return False
                 if active_native_executor is None:
                     return None
                 instruction_ticks, video_ticks = (
@@ -23052,11 +23706,26 @@ def _execute_guest_thread_start(
                         dispatch_observers_in_native=(
                             dispatch_observers_in_native
                         ),
+                        python_observer_address=(
+                            capture_replay_entry
+                            if capture_replay_capsule_path is not None
+                            and dispatch_observers_in_native
+                            else None
+                        ),
                     )
                 finally:
                     native_run_summary = native.last_run_summary
                 if native_run_summary is None:
                     break
+                if (
+                    pending_full_flip_capture
+                    and native_run_summary.get("reason") == "native_runtime_stop"
+                ):
+                    complete_full_flip_capture(
+                        state,
+                        memory,
+                        native_steps + int(native_run_summary["steps"]),
+                    )
                 completed_guest_invalidation_count += int(
                     native_run_summary.get("performance", {}).get(
                         "invalidated_page_count", 0
@@ -24197,13 +24866,16 @@ def _execute_guest_thread_start(
         (live_host_bridge is not None and live_host_bridge.stop_requested)
         or (
             native_run_summary is not None
-            and native_run_summary.get("reason") == "yield_handler_stop"
+            and native_run_summary.get("reason")
+            in {"yield_handler_stop", "native_runtime_stop"}
         )
     )
     return {
         **summary,
         "status": (
-            "live_stop"
+            "replay_capsule_captured"
+            if captured_replay_capsule
+            else "live_stop"
             if reached_live_stop
             else "step_budget"
             if reached_step_budget
@@ -24221,6 +24893,7 @@ def _execute_guest_thread_start(
         "state": result.state.to_dict(),
         "trace_event_count": len(trace_events),
         "trace_tail": _trace_tail(trace_events),
+        "replay_capsule": captured_replay_capsule or None,
         "render_command_stream": _snapshot_render_texture_resources(
             render_watchpoint.to_stream(),
             render_watchpoint.history_stream(),
@@ -26987,6 +27660,37 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--capture-replay-capsule",
+        type=Path,
+        help=(
+            "Diagnostic-only: after F8 requests a replay checkpoint, capture "
+            "the first requested guest boundary into a local .b2rcap and stop."
+        ),
+    )
+    parser.add_argument(
+        "--capture-replay-entry",
+        type=lambda value: int(value, 0),
+        default=0x000C5550,
+        help="Guest EIP that triggers --capture-replay-capsule (default: 0x000C5550).",
+    )
+    parser.add_argument(
+        "--capture-replay-scheduler-stop",
+        type=lambda value: int(value, 0),
+        help=(
+            "Make the manual checkpoint Phase-5 compatible by declaring one "
+            "bounded primary-lane slice ending at this decoded guest EIP."
+        ),
+    )
+    parser.add_argument(
+        "--capture-replay-scheduler-exit",
+        choices=("complete", "flip", "yield"),
+        default="complete",
+        help=(
+            "Observable exit represented by the bounded scheduler slice; "
+            "Phase-7 full-flip capture uses 'flip'."
+        ),
+    )
+    parser.add_argument(
         "--aot-ab-mode",
         choices=AOT_OPTIMIZATION_MODES,
         default=DEFAULT_AOT_OPTIMIZATION_MODE,
@@ -27091,6 +27795,44 @@ def main(argv: list[str] | None = None) -> int:
         and not args.profile_hot_paths
     ):
         parser.error("non-default --aot-ab-mode requires --profile-hot-paths")
+    if args.capture_replay_capsule is not None:
+        if not args.native_guest_loop:
+            parser.error("--capture-replay-capsule requires --native-guest-loop")
+        if args.live_control_transport is None:
+            parser.error("--capture-replay-capsule requires --live-control-transport")
+        try:
+            require_local_capsule_output(
+                args.capture_replay_capsule,
+                synthetic=False,
+            )
+        except ReplayCapsuleError as exc:
+            parser.error(str(exc))
+    if not 0 <= args.capture_replay_entry <= 0xFFFFFFFF:
+        parser.error("--capture-replay-entry must fit a 32-bit guest address")
+    if args.capture_replay_scheduler_stop is not None:
+        if args.capture_replay_capsule is None:
+            parser.error(
+                "--capture-replay-scheduler-stop requires --capture-replay-capsule"
+            )
+        if not 0 <= args.capture_replay_scheduler_stop <= 0xFFFFFFFF:
+            parser.error(
+                "--capture-replay-scheduler-stop must fit a 32-bit guest address"
+            )
+    if (
+        args.capture_replay_scheduler_exit != "complete"
+        and args.capture_replay_capsule is None
+    ):
+        parser.error(
+            "--capture-replay-scheduler-exit requires --capture-replay-capsule"
+        )
+    if (
+        args.capture_replay_scheduler_exit == "yield"
+        and args.capture_replay_scheduler_stop is None
+    ):
+        parser.error(
+            "--capture-replay-scheduler-exit yield requires "
+            "--capture-replay-scheduler-stop"
+        )
     if (args.live_render_stream is None) != (args.live_controller_state is None):
         parser.error("--live-render-stream and --live-controller-state must be used together")
     if args.live_control_transport is not None and args.live_render_stream is None:
@@ -27155,6 +27897,10 @@ def main(argv: list[str] | None = None) -> int:
         live_flip_audit_max_flips=args.live_flip_audit_max_flips,
         native_slice_steps=args.native_slice_steps,
         profile_hot_paths=args.profile_hot_paths,
+        capture_replay_capsule_path=args.capture_replay_capsule,
+        capture_replay_entry=args.capture_replay_entry,
+        capture_replay_scheduler_stop=args.capture_replay_scheduler_stop,
+        capture_replay_scheduler_exit=args.capture_replay_scheduler_exit,
         aot_optimization_mode=args.aot_ab_mode,
         developer_live_compile=args.developer_live_compile,
         audit_title_main_loop_exit=args.audit_title_main_loop_exit,

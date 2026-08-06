@@ -35,8 +35,11 @@ class NativeDebugMetadataError(RuntimeError):
 def guest_address_ranges(function: LiftedFunction) -> tuple[tuple[int, int], ...]:
     ranges: list[tuple[int, int]] = []
     for instruction in sorted(function.instructions, key=lambda item: item.address):
-        if ranges and ranges[-1][1] == instruction.address:
-            ranges[-1] = (ranges[-1][0], instruction.next_address)
+        if ranges and instruction.address <= ranges[-1][1]:
+            ranges[-1] = (
+                ranges[-1][0],
+                max(ranges[-1][1], instruction.next_address),
+            )
         else:
             ranges.append((instruction.address, instruction.next_address))
     return tuple(ranges)

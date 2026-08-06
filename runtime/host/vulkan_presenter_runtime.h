@@ -356,6 +356,7 @@ private:
 
     void initialize_live_control_transport();
     void publish_live_controller_state();
+    void consume_live_audio();
 
     void write_controller_state();
 
@@ -370,6 +371,9 @@ private:
     PresenterMetricsReporter metrics_reporter_;
     LivePresenterTransport transport_;
     SdlPlatform platform_;
+    std::vector<uint8_t> live_audio_payload_;
+    uint64_t live_audio_buffer_count_ = 0u;
+    uint64_t live_audio_byte_count_ = 0u;
     bool running_ = true;
     bool closed_by_user_ = false;
     bool input_injected_ = false;

@@ -19,7 +19,8 @@ struct PresenterOptions {
     uint32_t flip_audit_health_interval = 30u;
     bool inject_input = false;
     bool list_adapters_only = false;
-    std::wstring title = L"B2 Recomp";
+    std::wstring title = L"Burnout 2: Point of Impact";
+    std::filesystem::path window_icon;
     std::filesystem::path debug_json;
     std::filesystem::path render_stream_json;
     std::filesystem::path screenshot;

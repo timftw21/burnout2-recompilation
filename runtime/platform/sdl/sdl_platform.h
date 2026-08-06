@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -50,6 +51,7 @@ struct PlatformEvent {
 
 struct PlatformPollResult {
     bool close_requested = false;
+    bool request_replay_capture = false;
     bool toggle_fps_counter = false;
     bool toggle_hot_path_profile = false;
     bool write_metrics_report = false;
@@ -77,6 +79,7 @@ public:
 
     void initialize(bool enable_gamepads);
     void create_window(const std::string& title, uint32_t width, uint32_t height);
+    void set_window_icon(const std::filesystem::path& path);
     std::vector<const char*> vulkan_instance_extensions() const;
     VkSurfaceKHR create_vulkan_surface(VkInstance instance) const;
     PlatformPollResult poll(uint64_t guest_flip_count);

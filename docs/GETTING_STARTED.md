@@ -1,43 +1,57 @@
-# Getting started and normal operation
+# Getting started
 
-This guide covers initial setup, local data, an ordinary live run, and the
-presenter controls. Run commands from the repository root, `D:\b2_recomp`.
+This guide covers host setup, local game data, target verification, the stable
+diagnostic launcher, and the work-in-progress static IA-32 launcher. Run all
+commands from the repository root.
+
+> **Current limitation:** the Phase 7 static backend reaches the Load/Save
+> frontend but stops at an AOT coverage guard while creating a new save slot.
+> Use it for development and evidence gathering, not as a finished game build.
 
 ## Requirements
 
-The supported native development host is Windows x86-64. You need Python 3.11
-or newer, a C++17 compiler, and the pinned Vulkan SDK. The SDK supplies the
-Vulkan and SDL3 headers, import libraries, and runtime used by the presenter.
-See [BUILDING.md](BUILDING.md) for exact toolchain versions and validation.
+The supported native development host is Windows x86-64. You need:
 
-Install the locked development dependencies:
+- Python 3.11 or newer;
+- the exact locked Python packages;
+- the pinned CMake, Ninja, Clang, Vulkan SDK, and SDL3 toolchain; and
+- a legally obtained Xbox copy of *Burnout 2: Point of Impact*.
+
+Install Python dependencies:
 
 ```powershell
 python -m pip install --requirement .\requirements-dev.lock
 ```
 
+Validate the native toolchain:
+
+```powershell
+python .\tools\native_toolchain.py --build-tools-only --pretty
+python .\tools\native_toolchain.py --presenter-tools-only --pretty
+```
+
+See [BUILDING.md](BUILDING.md) for locked versions, compiler caching, native
+presets, and validation commands.
+
 ## Supply and extract the game
 
-Provide your own legally obtained Xbox copy. Install the pinned extraction tool:
+Install the pinned extraction tool:
 
 ```powershell
 .\tools\extract\install_extract_xiso.ps1
 ```
 
-Extract the local image:
+Extract your local image:
 
 ```powershell
 python .\tools\extract\extract_disc.py `
   --iso ".\Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso"
 ```
 
-Game content, recovered title code, SDK files, and local evidence must remain
-outside source control. The complete boundary is in
-[ASSET_POLICY.md](ASSET_POLICY.md).
+Game files, recovered title code, save data, SDK material, and local evidence
+must remain outside source control. See [ASSET_POLICY.md](ASSET_POLICY.md).
 
 ## Local paths
-
-Developer-owned inputs and generated outputs stay ignored:
 
 | Purpose | Default path |
 | --- | --- |
@@ -45,17 +59,17 @@ Developer-owned inputs and generated outputs stay ignored:
 | Extracted disc | `data/local/extracted/burnout_2_poi_usa/` |
 | Persistent save data | `data/local/save-data/` |
 | Dashboard/cache data | `data/local/dashboard-data/`, `data/local/cache-data/` |
-| Generated reports | `reports/local/` |
+| Generated reports and captures | `reports/local/` |
 | Native/host builds | `build/local/` |
-| Decoded-block store | `build/native-guest-loop/decoded-blocks.sqlite3` |
-| Native module manifest | `build/native-guest-loop/native-module-manifest.sqlite3` |
+| Decoded block store | `build/native-guest-loop/decoded-blocks.sqlite3` |
+| Native debug metadata | `build/native-guest-loop/native-debug-index.json` |
 | Presenter build manifest | `build/local/first-frame/b2_first_frame.build.json` |
 | Vulkan pipeline cache | `build/local/first-frame/vulkan-pipeline-cache.bin` |
 | Local third-party tools | `data/local/tools/` |
 
-## Verify the target
+## Verify the supported target
 
-Verify the XBE without starting the runtime:
+Verify the XBE before starting either backend:
 
 ```powershell
 python .\tools\project_identity.py `
@@ -63,91 +77,111 @@ python .\tools\project_identity.py `
   --pretty
 ```
 
-Normal execution requires an exact match in
-`tools/targets/supported_targets.json`. The identity gate covers the whole
-file, normalized loaded image, certificate, virtual layout, and actual and
-embedded section hashes. `--allow-unsupported-xbe` is a developer-only escape
-hatch; using it invalidates compatibility and performance claims.
-
-Presenter builds are also content-addressed. Their manifest records source,
-shader, compiler, import-library, runtime, executable, DLL, and SPIR-V hashes
-plus the exact compiler commands. `--skip-host-build` rejects a missing or
-stale manifest. `--allow-stale-artifacts` is likewise unsupported research
-mode.
+Normal evidence requires an exact match in
+`tools/targets/supported_targets.json`. `--allow-unsupported-xbe` and
+`--allow-stale-artifacts` are conspicuous research overrides; they invalidate
+compatibility and performance claims.
 
 Every live run writes `reports/local/playability/run-manifest.json` with the
-repository state, target and generated-code identities, configuration, cache
-state, host identity, result, and presenter build identity. Post-run reports
-are accepted only when their run ID matches the active manifest.
+repository state, target, backend, artifact, presenter build, cache state, and
+run identity. Reports are accepted only when their run ID matches that
+manifest.
 
-## Validate and launch
+## Validate before launching
 
-Run the complete asset-free gate:
+Use the changed-file-aware gate while editing:
+
+```powershell
+python .\tools\dev_check.py --explain
+```
+
+Use the detached closeout matrix before an integration handoff:
+
+```powershell
+python .\tools\dev_check.py --launch-closeout
+```
+
+The full foreground compatibility gate remains available when explicitly
+needed:
 
 ```powershell
 python .\tools\quality_gate.py --full
 ```
 
-Launch the normal live guest and Vulkan presenter:
+## Launch modes
+
+### Diagnostic oracle
+
+The default launcher uses the established diagnostic oracle:
 
 ```powershell
 python .\tools\playability\live_test.py
 ```
 
-The first launch after native-dispatch changes may rebuild hundreds of cached
-modules. The default startup allowance is 30 minutes. Use
-`--startup-timeout-seconds SECONDS` to change it, and use `--skip-host-build`
-only when the presenter manifest is current.
+Use this for broad compatibility work and historical comparisons. Its results
+must not be described as static IA-32 acceptance.
 
-Close the presenter or press Escape to stop the runtime. The launcher publishes
-the stop request through the same sequence-guarded control mapping used for
-input and completed-flip acknowledgements.
+### Work-in-progress static IA-32 backend
 
-## SDL3 input and presenter controls
+The static backend requires a verified XBE-entry normal-live artifact. Build
+one only from retained local capsule/profile evidence using the command in
+[BUILDING.md](BUILDING.md). Then launch it explicitly:
 
-SDL3 owns the window, event pump, keyboard, gamepads, high-DPI behavior, audio
-device/stream, and Vulkan surface. Direct Vulkan continues to own rendering.
+```powershell
+python .\tools\playability\live_test.py `
+  --guest-backend same-isa-ia32 `
+  --ia32-artifact .\build\local\ia32-live\manifest.json `
+  --skip-host-build
+```
 
-The platform layer accepts hot-plugged Xbox, PlayStation, Nintendo, virtual,
-and third-party controllers recognized by SDL's mapping database. Face buttons
-map by position to Xbox A/B/X/Y; shoulders map to White/Black. Start/Back, the
-D-pad, stick clicks, both sticks, and analog triggers are forwarded.
-DS4Windows is not required for a DualShock 4. An optional
-`gamecontrollerdb.txt` beside `b2_first_frame.exe` can extend SDL's mappings.
+This path fails closed if the artifact is missing, stale, fixed-replay-only, or
+coverage-incomplete for a reached transfer. It never falls back to the
+diagnostic oracle. Do not enable `--developer-live-compile` for ordinary runs.
 
-Keyboard controls map arrow keys, `S`, Backspace, Space/Enter, `B`, `X`, and
-`Y` to Xbox D-pad, Start, Back, A, and B/X/Y state. Short digital presses are
-latched for at least 150 ms and two completed guest flips so they survive slow
-guest polling.
+The first launch after AOT changes can spend several minutes generating and
+linking the large 32-bit module. A warm launch reuses the content-addressed
+artifact. `--skip-host-build` is valid only while the presenter manifest is
+current.
+
+## Manual input and controls
+
+SDL3 owns the window, event pump, keyboard, gamepads, host audio stream, and
+Vulkan surface. The platform layer accepts controllers recognized by SDL's
+mapping database. Face buttons map by position to Xbox A/B/X/Y; shoulders map
+to White/Black. Start/Back, D-pad, stick clicks, sticks, and triggers are
+forwarded. An optional `gamecontrollerdb.txt` beside the presenter executable
+can extend SDL mappings.
+
+Keyboard mappings include arrows, `S`, Backspace, Space/Enter, `B`, `X`, and
+`Y`. Short digital presses are latched to survive slow guest polling.
 
 | Input | Function |
 | --- | --- |
+| F8 | Trigger an armed manual replay-capsule capture |
 | F9 | Toggle completed-guest-flip FPS in the window title |
 | F10 | Start or stop an armed native hot-path capture |
 | F11 | Write a timestamped metrics snapshot under `reports/local/` |
 | F12 | Capture a BMP and standalone frozen render bundle |
-| Escape | Stop the runtime |
+| Escape | Request runtime stop |
 
-F9 reports guest flips, not 60 Hz presenter ticks. F11 includes guest and
-presenter FPS, native execution/cache counters, render work, upload/readback
-volume, and CPU/GPU/fence timing. F12 retains the exact command prefix,
-resource generation, and interpreter bootstrap needed for a frozen replay.
+Gameplay navigation used as evidence is manual. Do not add or use automated
+input to advance the title.
 
-## Representative and diagnostic runs
+## Stopping and classifying a frozen frame
 
-The default live command records a bounded diagnostic summary. For a
-minimal-overhead run without guest summaries, presenter events, screenshots,
-runner logs, or post-run reports:
+Closing the presenter or pressing Escape publishes the shared native stop word.
+If a frame appears frozen, inspect the backend summary before assuming a render
+deadlock. The static backend deliberately raises `0x80000003` at an unverified
+indirect transfer, and the presenter may continue displaying the last frame
+after the guest process has stopped.
 
-```powershell
-python .\tools\playability\live_test.py `
-  --no-diagnostics `
-  --skip-host-build
-```
+The key files are:
 
-Transport and provenance remain active in this mode because they are runtime
-correctness boundaries. Existing reports are not deleted.
+- `reports/local/playability/native-live.json`;
+- `reports/local/playability/native-live.log`;
+- `reports/local/playability/render-debug-events.jsonl`;
+- `reports/local/playability/render-debug-report.json`; and
+- `reports/local/playability/performance-debug-report.json`.
 
-For captures, exact audits, A/B modes, direct probes, and report regeneration,
-use [DEBUGGING_COMMANDS.md](DEBUGGING_COMMANDS.md). For profiler capture, use
-[PROFILING.md](PROFILING.md).
+Use [DEBUGGING_COMMANDS.md](DEBUGGING_COMMANDS.md) for exact fault triage and
+[PROFILING.md](PROFILING.md) for controlled performance captures.
