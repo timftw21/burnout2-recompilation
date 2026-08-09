@@ -31,6 +31,7 @@ struct PresenterMetricsSnapshot {
     uint64_t platform_poll_us = 0u;
     uint64_t controller_poll_us = 0u;
     uint64_t keyboard_latch_us = 0u;
+    uint64_t audio_submit_us = 0u;
     uint64_t reload_probe_us = 0u;
     uint64_t pre_render_unattributed_us = 0u;
     bool gpu_frame_time_valid = false;

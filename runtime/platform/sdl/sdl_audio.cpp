@@ -5,9 +5,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 
-#include <chrono>
 #include <limits>
-#include <thread>
 
 namespace b2r::platform {
 namespace {
@@ -17,7 +15,6 @@ constexpr int kChannelCount = 2;
 constexpr int kBytesPerSample = 2;
 constexpr int kMaximumQueuedBytes =
     kSampleRate * kChannelCount * kBytesPerSample / 4;
-constexpr auto kQueueWaitLimit = std::chrono::milliseconds(250);
 
 }  // namespace
 
@@ -82,41 +79,33 @@ bool SdlAudioOutput::queue(const void* payload, size_t byte_count) {
         return false;
     }
 
-    const auto deadline = std::chrono::steady_clock::now() + kQueueWaitLimit;
-    while (true) {
-        {
-            std::lock_guard lock(mutex_);
-            if (stream_ == nullptr) {
-                ++error_count_;
-                last_error_ = "SDL audio stream is not open";
-                return false;
-            }
-            const int queued_bytes = SDL_GetAudioStreamQueued(stream_);
-            if (queued_bytes < 0) {
-                set_error_locked("SDL audio queue query");
-                return false;
-            }
-            if (queued_bytes + static_cast<int>(byte_count)
-                <= kMaximumQueuedBytes) {
-                if (!SDL_PutAudioStreamData(
-                        stream_, payload, static_cast<int>(byte_count))) {
-                    set_error_locked("SDL audio queue submission");
-                    return false;
-                }
-                submitted_bytes_ += byte_count;
-                ++submitted_buffer_count_;
-                last_error_.clear();
-                return true;
-            }
-        }
-        if (std::chrono::steady_clock::now() >= deadline) {
-            std::lock_guard lock(mutex_);
-            ++dropped_buffer_count_;
-            last_error_ = "SDL audio queue remained full";
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::lock_guard lock(mutex_);
+    if (stream_ == nullptr) {
+        ++error_count_;
+        last_error_ = "SDL audio stream is not open";
+        return false;
     }
+    const int queued_bytes = SDL_GetAudioStreamQueued(stream_);
+    if (queued_bytes < 0) {
+        set_error_locked("SDL audio queue query");
+        return false;
+    }
+    // The mixer owns sample-clock pacing. Never turn host audio backpressure
+    // into presentation-thread pacing when the device queue is temporarily full.
+    if (queued_bytes + static_cast<int>(byte_count) > kMaximumQueuedBytes) {
+        ++dropped_buffer_count_;
+        last_error_ = "SDL audio queue is full";
+        return false;
+    }
+    if (!SDL_PutAudioStreamData(
+            stream_, payload, static_cast<int>(byte_count))) {
+        set_error_locked("SDL audio queue submission");
+        return false;
+    }
+    submitted_bytes_ += byte_count;
+    ++submitted_buffer_count_;
+    last_error_.clear();
+    return true;
 }
 
 bool SdlAudioOutput::clear() {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import shutil
 import sys
 import tempfile
@@ -12,11 +13,21 @@ from tools.recomp.ia32_native_backend import (
     HOST_ABI_EXCHANGE_VERSION,
     NATIVE_HOST_SERVICE_WORKLOAD_ABI,
     PHASE4_HOST_ABI_CONTRACT_ID,
+    PHASE7_NATIVE_AUDIO_LIFETIME_SERVICE_TARGETS,
+    PHASE7_NATIVE_BUFFER_CONFIGURATION_SERVICE_TARGETS,
+    PHASE7_NATIVE_XINPUT_CONTROL_SERVICE_TARGETS,
+    PHASE7_OFFLINE_BOUNDARY_OPTIMIZATIONS,
+    PHASE7_OFFLINE_KERNEL_SERVICE_SPECS,
     PHASE7_PROFILED_BOOT_SERVICE_SPECS,
     WORKLOAD_SERVICE_MEMORY,
     Ia32BackendError,
+    Ia32CoverageProfile,
     _capsule_host_service_thunks,
+    _normal_live_input_audio_c_source,
+    _normal_live_resource_publication_c_source,
     _phase4_c_source,
+    _phase6_host_service_thunks,
+    _phase7_normal_live_optimization_source,
     _phase7_native_workload_source,
     execute_ia32_slice_reference,
     ia32_host_abi_contract,
@@ -37,6 +48,171 @@ IA32_INTEGRATION_AVAILABLE = (
 
 
 class Ia32HostAbiTests(unittest.TestCase):
+    def test_offline_registry_closes_complete_native_kernel_service_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = build_asset_free_phase4_fixture(Path(temp_dir))
+        profile = Ia32CoverageProfile(
+            workload="unit-offline-kernel-services",
+            mode="normal-validation",
+            targets=(
+                {
+                    "address": 0x00001000,
+                    "slice": "boot-frontend-continuity",
+                    "lane": "primary",
+                },
+            ),
+        )
+
+        ordinary = _phase6_host_service_thunks(fixture.capsule, profile)
+        complete = _phase6_host_service_thunks(
+            fixture.capsule,
+            profile,
+            complete_offline_registry=True,
+        )
+
+        self.assertTrue(PHASE7_OFFLINE_KERNEL_SERVICE_SPECS.keys() <= complete.keys())
+        self.assertTrue(PHASE7_OFFLINE_KERNEL_SERVICE_SPECS.keys().isdisjoint(ordinary))
+        self.assertEqual(complete[0xE00002E0].stack_cleanup_bytes, 12)
+        self.assertEqual(complete[0xE0000680].runtime_value, 9)
+
+    def test_offline_kernel_service_bodies_are_native_and_bounded(self) -> None:
+        source = _phase7_native_workload_source(
+            _phase4_c_source(
+                page_addresses=(0x00001000,),
+                mapped_page_addresses=(0x00001000,),
+                guest_virtual_size=0x00002000,
+                code_spans=((0x00001000, b"\xC3"),),
+                stop_eip=0x00001001,
+            )
+        )
+
+        self.assertIn("matched + 4u <= length", source)
+        self.assertIn("service->runtime_value == 10u", source)
+        self.assertIn("*(U32*)(event + 4u) = 1u", source)
+
+    def test_offline_boundary_optimizations_have_compiled_runtime_paths(self) -> None:
+        source = "\n".join(
+            (
+                _normal_live_resource_publication_c_source(),
+                _normal_live_input_audio_c_source(),
+                inspect.getsource(_phase7_normal_live_optimization_source),
+            )
+        )
+        expected_ids = (
+            "phase7-sha256-direct-block-transform-v1",
+            "phase7-sha256-rolling-schedule-v1",
+            "phase7-vertex-range-sorted-merge-v1",
+            "phase7-audio-gain-memoization-v1",
+            "phase7-audio-idle-quantum-bypass-v1",
+            "phase7-audio-accumulator-wide-clear-v1",
+            "phase7-audio-unity-resample-fast-path-v1",
+            "phase7-allocation-page-direct-cache-v1",
+        )
+
+        self.assertEqual(
+            tuple(
+                str(record["id"])
+                for record in PHASE7_OFFLINE_BOUNDARY_OPTIMIZATIONS[-8:]
+            ),
+            expected_ids,
+        )
+        for snippet in (
+            "while (size >= 64u)",
+            "U32 words[16];",
+            "state->retained_vertex_range_ends[index] < start",
+            "g_live_audio_gain_cache_keys[cache_slot] == cache_key",
+            "g_live_audio_active_playback_masks[0] |",
+            "index += 8u",
+            "playback->step_q32 == (1ull << 32u)",
+            "g_workload_allocation_page_cache[slot]",
+        ):
+            self.assertIn(snippet, source)
+
+    def test_native_xinput_control_family_closes_observed_input_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = build_asset_free_phase4_fixture(Path(temp_dir))
+        services = _phase6_host_service_thunks(
+            fixture.capsule,
+            Ia32CoverageProfile(
+                workload="unit-xinput-control",
+                mode="normal-validation",
+                targets=(
+                    {
+                        "address": 0x00001000,
+                        "slice": "boot-frontend-continuity",
+                        "lane": "primary",
+                    },
+                ),
+                boundary_exits=(
+                    {
+                        "source": 0x00001000,
+                        "target": 0x0028CF40,
+                        "boundary": "input",
+                        "count": 1,
+                    },
+                ),
+            ),
+        )
+
+        self.assertTrue(PHASE7_NATIVE_XINPUT_CONTROL_SERVICE_TARGETS <= services.keys())
+        self.assertEqual(services[0x0028CF96].shim_name, "XInputClose")
+        self.assertEqual(services[0x0028D1EC].shim_name, "XInputSetState")
+
+    def test_native_audio_families_close_observed_audio_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = build_asset_free_phase4_fixture(Path(temp_dir))
+        services = _phase6_host_service_thunks(
+            fixture.capsule,
+            Ia32CoverageProfile(
+                workload="unit-audio-lifetime",
+                mode="normal-validation",
+                targets=(
+                    {
+                        "address": 0x00001000,
+                        "slice": "boot-frontend-continuity",
+                        "lane": "primary",
+                    },
+                ),
+                boundary_exits=(
+                    {
+                        "source": 0x00001000,
+                        "target": 0x0022F8EA,
+                        "boundary": "audio",
+                        "count": 1,
+                    },
+                ),
+            ),
+        )
+
+        self.assertTrue(
+            PHASE7_NATIVE_BUFFER_CONFIGURATION_SERVICE_TARGETS <= services.keys()
+        )
+        self.assertTrue(PHASE7_NATIVE_AUDIO_LIFETIME_SERVICE_TARGETS <= services.keys())
+        self.assertEqual(services[0x0022C11B].runtime_value, 29)
+        self.assertEqual(services[0x0022CC0B].runtime_value, 30)
+
+    def test_native_input_audio_families_do_not_leak_into_unrelated_fixture(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = build_asset_free_phase4_fixture(Path(temp_dir))
+        services = _phase6_host_service_thunks(
+            fixture.capsule,
+            Ia32CoverageProfile(
+                workload="unit-unrelated-service",
+                mode="normal-validation",
+                targets=(
+                    {
+                        "address": 0x00001000,
+                        "slice": "boot-frontend-continuity",
+                        "lane": "primary",
+                    },
+                ),
+            ),
+        )
+
+        self.assertTrue(PHASE7_NATIVE_BUFFER_CONFIGURATION_SERVICE_TARGETS.isdisjoint(services))
+        self.assertTrue(PHASE7_NATIVE_AUDIO_LIFETIME_SERVICE_TARGETS.isdisjoint(services))
+        self.assertTrue(PHASE7_NATIVE_XINPUT_CONTROL_SERVICE_TARGETS.isdisjoint(services))
+
     def test_phase4_contract_freezes_thunks_trace_and_native_broker(self) -> None:
         contract = ia32_host_abi_contract()
 

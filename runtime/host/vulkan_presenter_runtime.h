@@ -188,6 +188,10 @@ private:
     std::pair<uint32_t, uint32_t> draw_surface_extent(
         const NativeDraw& draw) const;
 
+    bool surface_extent_matches_presented(
+        uint32_t width,
+        uint32_t height) const;
+
     uint32_t select_presented_surface_color_offset() const;
 
     bool draw_surface_clip_is_subsurface_viewport(
@@ -251,9 +255,9 @@ private:
 
     VkDescriptorSet descriptor_for_draw(const NativeDraw& draw) const;
 
-    const HostTexture* presented_render_target_feedback_texture() const;
-
     uint32_t presented_surface_color_clear_count() const;
+
+    bool presented_render_target_feedback_available() const;
 
     bool record_render_target_feedback(
         VkCommandBuffer command_buffer,
@@ -650,6 +654,7 @@ private:
     uint64_t last_window_message_pump_us_ = 0u;
     uint64_t last_controller_poll_us_ = 0u;
     uint64_t last_keyboard_latch_us_ = 0u;
+    uint64_t last_audio_submit_us_ = 0u;
     uint64_t last_reload_probe_us_ = 0u;
     uint64_t last_reload_dispatch_us_ = 0u;
     uint64_t last_pre_render_unattributed_us_ = 0u;

@@ -1918,6 +1918,7 @@ void VulkanPresenter::main_loop() {
         last_window_message_pump_us_ = 0u;
         last_controller_poll_us_ = 0u;
         last_keyboard_latch_us_ = 0u;
+        last_audio_submit_us_ = 0u;
         last_reload_probe_us_ = 0u;
         last_reload_dispatch_us_ = 0u;
         last_pre_render_unattributed_us_ = 0u;
@@ -1942,7 +1943,12 @@ void VulkanPresenter::main_loop() {
         if (!running_) {
             break;
         }
+        const auto audio_submit_begin = std::chrono::steady_clock::now();
         consume_live_audio();
+        last_audio_submit_us_ = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now()
+                - audio_submit_begin).count());
         const auto reload_dispatch_begin = std::chrono::steady_clock::now();
         reload_live_render_work();
         last_reload_dispatch_us_ = static_cast<uint64_t>(
@@ -1973,6 +1979,7 @@ void VulkanPresenter::main_loop() {
             last_window_message_pump_us_
             + last_controller_poll_us_
             + last_keyboard_latch_us_
+            + last_audio_submit_us_
             + last_reload_dispatch_us_;
         last_pre_render_unattributed_us_ = pre_render_us
             > attributed_pre_render_us
@@ -2036,6 +2043,8 @@ void VulkanPresenter::main_loop() {
                     last_controller_poll_us_)},
                 {"keyboard_latch_us", std::to_string(
                     last_keyboard_latch_us_)},
+                {"audio_submit_us", std::to_string(
+                    last_audio_submit_us_)},
                 {"reload_probe_us", std::to_string(
                     last_reload_probe_us_)},
                 {"reload_dispatch_us", std::to_string(

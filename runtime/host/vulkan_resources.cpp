@@ -1474,6 +1474,14 @@ std::pair<uint32_t, uint32_t> VulkanPresenter::draw_surface_extent(
     return {width, height};
 }
 
+bool VulkanPresenter::surface_extent_matches_presented(
+    uint32_t width,
+    uint32_t height) const {
+    return width == swapchain_extent_.width
+        && (height == swapchain_extent_.height
+            || (swapchain_extent_.height == 480u && height == 448u));
+}
+
 uint32_t VulkanPresenter::select_presented_surface_color_offset() const {
     std::unordered_map<uint32_t, uint32_t> target_counts;
     const size_t first_draw = std::min<size_t>(
@@ -1488,8 +1496,7 @@ uint32_t VulkanPresenter::select_presented_surface_color_offset() const {
         const NativeDraw& draw = interpreted_stream_.draws[draw_index];
         const auto [width, height] = draw_surface_extent(draw);
         if (draw.surface_color_offset == 0u
-            || width != swapchain_extent_.width
-            || height != swapchain_extent_.height) {
+            || !surface_extent_matches_presented(width, height)) {
             continue;
         }
         const uint32_t count = ++target_counts[draw.surface_color_offset];
@@ -1635,7 +1642,11 @@ VulkanPresenter::presented_render_target_feedback_specs() const {
                 return existing.address == spec.address
                     && existing.width == spec.width
                     && existing.height == spec.height
-                    && existing.format == spec.format;
+                    && existing.cubemap == spec.cubemap
+                    && b2r::nv2a::
+                        nv2a_render_target_feedback_formats_compatible(
+                            existing.format,
+                            spec.format);
             });
         if (duplicate == specs.end()) {
             specs.push_back(std::move(spec));
@@ -1882,7 +1893,9 @@ bool VulkanPresenter::render_target_feedback_texture_matches_spec(
         && texture.guest_address == spec.address
         && texture.width == spec.width
         && texture.height == spec.height
-        && texture.format == spec.format
+        && b2r::nv2a::nv2a_render_target_feedback_formats_compatible(
+            texture.format,
+            spec.format)
         && texture.cubemap == spec.cubemap;
 }
 
@@ -1900,7 +1913,10 @@ void VulkanPresenter::cache_render_target_feedback_texture(HostTexture& texture)
             return cached.guest_address == texture.guest_address
                 && cached.width == texture.width
                 && cached.height == texture.height
-                && cached.format == texture.format
+                && b2r::nv2a::
+                    nv2a_render_target_feedback_formats_compatible(
+                        cached.format,
+                        texture.format)
                 && cached.cubemap == texture.cubemap;
         });
     if (duplicate != render_target_feedback_image_cache_.end()) {

@@ -6,11 +6,14 @@ event, resource, pipeline, barrier, and pass-structure questions. The existing
 `--profile-hot-paths` counters are reserved for guest-semantic attribution that
 those tools cannot provide.
 
-The current Phase 7 static artifact does not yet reach the historical Lesson
-One performance workload: it stops at a fail-closed new-save coverage boundary.
-Until that path is restored, label static-backend captures as boot/frontend
-correctness evidence. Historical Lesson One captures remain useful baselines,
-but they are not measurements of the current artifact.
+The current Phase 7 static artifact has zero guarded boundaries and retained
+artifacts have manually reached Lesson One. Artifact
+`ff8db42895b7970b554b9aa9fadaf62e82305e0946ca6f63b55b8ebd577936a4`
+also fixes the first-vblank control-thunk collision in the preceding zero-guard
+build. It has not yet produced a completed diagnostics-off Lesson One
+performance capture, so historical runs remain baselines rather than
+measurements of the current artifact. Select `same-isa-ia32` explicitly and
+retain the completed native summary before making a static-backend claim.
 
 The in-process profiler is native-clean and windowed. Start
 `live_test.py --profile-hot-paths`, navigate while the title

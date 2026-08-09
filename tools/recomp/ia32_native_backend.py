@@ -166,10 +166,10 @@ SERVICE_DISPATCH_RELAY_ADDRESS = THUNK_REGION + 0x2000
 AUDITED_SERVICE_THUNK_BASE = THUNK_REGION + 0x3000
 AUDITED_SERVICE_THUNK_STRIDE = 0x100
 ARCHITECTURE_REWRITE_THUNK_BASE = THUNK_REGION + 0xE000
-NORMAL_LIVE_BOOT_RETURN_THUNK_ADDRESS = THUNK_REGION + 0xC000
-NORMAL_LIVE_RESUME_THUNK_ADDRESS = THUNK_REGION + 0xD000
-NORMAL_LIVE_VBLANK_START_THUNK_ADDRESS = THUNK_REGION + 0xA000
-NORMAL_LIVE_VBLANK_EXIT_THUNK_ADDRESS = THUNK_REGION + 0xB000
+NORMAL_LIVE_BOOT_RETURN_THUNK_ADDRESS = THUNK_REGION + 0x2100
+NORMAL_LIVE_RESUME_THUNK_ADDRESS = THUNK_REGION + 0x2200
+NORMAL_LIVE_VBLANK_START_THUNK_ADDRESS = THUNK_REGION + 0x2300
+NORMAL_LIVE_VBLANK_EXIT_THUNK_ADDRESS = THUNK_REGION + 0x2400
 ARCHITECTURE_RDTSC_THUNK_ADDRESS = ARCHITECTURE_REWRITE_THUNK_BASE
 ARCHITECTURE_SGDT_THUNK_ADDRESS = ARCHITECTURE_REWRITE_THUNK_BASE + 0x100
 ARCHITECTURE_DENSE_RDTSC_THUNK_ADDRESS = ARCHITECTURE_REWRITE_THUNK_BASE + 0x200
@@ -331,11 +331,20 @@ PHASE7_AUDIO_VOICE_COMMAND_WRITE_BASES = {
 }
 # The native audio-buffer submitter uses a dword mailbox at buffer state +0x810.
 # One producer writes command 3 and immediately polls for the hardware-owned
-# word to clear; the adjacent accessor polls the same word before reuse. The
-# host has no separate MCPX worker for this mailbox, so validate both loops and
-# complete only the pending producer command in place.
+# word to clear.  The adjacent accessor polls the same word before reuse and
+# then submits command 2, so both producers must complete in place when no MCPX
+# worker owns this mailbox.  Validate the complete accessor and both direct
+# callers before rewriting either command.
 PHASE7_AUDIO_BUFFER_COMMAND_VALUE = 3
 PHASE7_AUDIO_BUFFER_COMMAND_IMMEDIATE_SITE = 0x002309A8
+PHASE7_AUDIO_BUFFER_COMMAND_VALUES = {
+    0x002309A8: 3,
+    0x00230A3A: 2,
+}
+PHASE7_AUDIO_BUFFER_COMMAND_CALL_SITES = {
+    0x0022C411: "E8D6450000",
+    0x0023136D: "E87AF6FFFF",
+}
 PHASE7_AUDIO_BUFFER_COMMAND_FAMILY = {
     0x002309A8: "6A03",
     0x002309AA: "58",
@@ -343,11 +352,39 @@ PHASE7_AUDIO_BUFFER_COMMAND_FAMILY = {
     0x002309B5: "8903",
     0x002309B7: "833B00",
     0x002309BA: "75FB",
+    0x002309EC: "8B542408",
+    0x002309F0: "85D2",
+    0x002309F2: "56",
+    0x002309F3: "7514",
+    0x002309F5: "8B7118",
+    0x002309F8: "81FE00800000",
+    0x002309FE: "8B511C",
+    0x00230A01: "744A",
+    0x00230A03: "85D2",
+    0x00230A05: "7446",
+    0x00230A07: "EB04",
+    0x00230A09: "8B742408",
+    0x00230A0D: "8B4108",
     0x00230A10: "8B4010",
     0x00230A13: "8B00",
     0x00230A15: "0500080000",
     0x00230A1A: "83781000",
     0x00230A1E: "75FA",
+    0x00230A20: "53",
+    0x00230A21: "8BDE",
+    0x00230A23: "C1EB02",
+    0x00230A26: "2B5804",
+    0x00230A29: "C1EA02",
+    0x00230A2C: "81EB06020000",
+    0x00230A32: "8918",
+    0x00230A34: "897008",
+    0x00230A37: "89500C",
+    0x00230A3A: "C7401002000000",
+    0x00230A41: "83611C00",
+    0x00230A45: "C7411800800000",
+    0x00230A4C: "5B",
+    0x00230A4D: "5E",
+    0x00230A4E: "C20800",
 }
 # DirectSound exposes one 64 KiB hardware buffer aperture at FE830000-FE83FFFF.
 # The decoded family constructs per-buffer pointers from FE836000, funnels all
@@ -638,11 +675,64 @@ PHASE7_POST_START_OBJECT_INSTRUCTION_BYTES = {
     0x0004501E: "50",
     0x0004501F: "FF520C",
 }
-# Save/load creation reaches three nearby slot-0x0C calls on the global object
-# at 0x004CB370.  Two targets are fixed by the strict profile and the third is
-# the new-save first fault; the accepted capsule contains the same four-method
-# object vtable.  Validate the complete nearby caller group together while the
-# boot image still starts with the lifetime-dependent pointer cell cleared.
+# New-save creation first makes two consecutive slot-0x0C calls from one
+# routine, then enters one handler containing four more calls on the companion
+# object.  Live x86 CDB captures at 0x00045141 and 0x00045CEB record the same
+# exact companion object/vtable pair.  Validate the complete handler-local
+# family atomically while leaving the other lifetime-dependent users of both
+# global cells guarded.
+PHASE7_NEW_SAVE_COMPANION_OBJECT_POINTER_CELL = 0x004CB350
+PHASE7_NEW_SAVE_COMPANION_OBJECT_INITIAL_POINTER = 0x00000000
+PHASE7_NEW_SAVE_COMPANION_OBJECT = 0x00322778
+PHASE7_NEW_SAVE_COMPANION_OBJECT_VTABLE = 0x002B59A8
+PHASE7_NEW_SAVE_COMPANION_OBJECT_VTABLE_ENTRIES = (
+    0x000345C0,
+    0x000345E0,
+    0x000D7410,
+    0x00034880,
+)
+PHASE7_NEW_SAVE_OBJECT_BINDINGS = {
+    0x00045141: (PHASE7_POST_START_OBJECT_VTABLE, 0x0C, 0x0002F1C0),
+    0x0004514D: (PHASE7_NEW_SAVE_COMPANION_OBJECT_VTABLE, 0x0C, 0x00034880),
+    0x00045CEB: (PHASE7_NEW_SAVE_COMPANION_OBJECT_VTABLE, 0x0C, 0x00034880),
+    0x00045D57: (PHASE7_NEW_SAVE_COMPANION_OBJECT_VTABLE, 0x0C, 0x00034880),
+    0x00045D95: (PHASE7_NEW_SAVE_COMPANION_OBJECT_VTABLE, 0x0C, 0x00034880),
+    0x00045E98: (PHASE7_NEW_SAVE_COMPANION_OBJECT_VTABLE, 0x0C, 0x00034880),
+}
+PHASE7_NEW_SAVE_OBJECT_INSTRUCTION_BYTES = {
+    0x00045138: "8B0D64B34C00",
+    0x0004513E: "8B11",
+    0x00045140: "50",
+    0x00045141: "FF520C",
+    0x00045144: "8B0D50B34C00",
+    0x0004514A: "8B01",
+    0x0004514C: "55",
+    0x0004514D: "FF500C",
+    0x00045CDC: "8B0D50B34C00",
+    0x00045CE2: "8B11",
+    0x00045CE4: "8D8650060000",
+    0x00045CEA: "50",
+    0x00045CEB: "FF520C",
+    0x00045D4D: "8B0D50B34C00",
+    0x00045D53: "8B01",
+    0x00045D55: "6A00",
+    0x00045D57: "FF500C",
+    0x00045D86: "8B0D50B34C00",
+    0x00045D8C: "8B11",
+    0x00045D8E: "8D8650060000",
+    0x00045D94: "50",
+    0x00045D95: "FF520C",
+    0x00045E8C: "8B0D50B34C00",
+    0x00045E92: "8B11",
+    0x00045E94: "6A00",
+    0x00045E96: "8BD8",
+    0x00045E98: "FF520C",
+}
+# Save/load creation and the paired resource-update methods reach slot 0x0C on
+# the global object at 0x004CB370.  The resource methods are adjacent entries in
+# the four-method owner vtable at 0x002B7350.  Validate both complete vtables,
+# every exact caller sequence, and the cleared boot pointer cell so this finite
+# lifetime-dependent family remains fail-closed.
 PHASE7_SAVE_SLOT_OBJECT_POINTER_CELL = 0x004CB370
 PHASE7_SAVE_SLOT_OBJECT_INITIAL_POINTER = 0x00000000
 PHASE7_SAVE_SLOT_OBJECT = 0x00324B78
@@ -653,12 +743,28 @@ PHASE7_SAVE_SLOT_OBJECT_VTABLE_ENTRIES = (
     0x00039FF0,
     0x0003A030,
 )
+PHASE7_SAVE_SLOT_OWNER_VTABLE = 0x002B7350
+PHASE7_SAVE_SLOT_OWNER_VTABLE_ENTRIES = (
+    0x0003CD40,
+    0x0003CD60,
+    0x0003CE50,
+    0x0003D270,
+)
 PHASE7_SAVE_SLOT_OBJECT_BINDINGS = {
+    0x0003D25C: (0x0C, 0x0003A030),
+    0x0003D642: (0x0C, 0x0003A030),
     0x0004475F: (0x0C, 0x0003A030),
     0x0004484F: (0x0C, 0x0003A030),
     0x0004486A: (0x0C, 0x0003A030),
 }
 PHASE7_SAVE_SLOT_OBJECT_INSTRUCTION_BYTES = {
+    0x0003D253: "8B0D70B34C00",
+    0x0003D259: "8B11",
+    0x0003D25B: "56",
+    0x0003D25C: "FF520C",
+    0x0003D63A: "8B0D70B34C00",
+    0x0003D640: "8B01",
+    0x0003D642: "FF500C",
     0x00044754: "8B0D70B34C00",
     0x0004475A: "8B01",
     0x0004475C: "57",
@@ -674,11 +780,125 @@ PHASE7_SAVE_SLOT_OBJECT_INSTRUCTION_BYTES = {
     0x0004486A: "FF500C",
     0x0004486D: "C3",
 }
+# The selection setter at 0x00032EE0 is reached through slot 0x0C of the
+# lifetime-installed object at 0x004CB360.  Its 34 callers are a closed family:
+# each exact capsule loads that cell, obtains the same four-entry vtable, and
+# makes the slot-C call.  Keep every caller byte-for-byte sealed so this does
+# not become a general allowance for global-object or slot-C dispatches.
+PHASE7_RESOURCE_SELECTION_OBJECT_POINTER_CELL = 0x004CB360
+PHASE7_RESOURCE_SELECTION_OBJECT_INITIAL_POINTER = 0x00000000
+PHASE7_RESOURCE_SELECTION_OBJECT = 0x00320698
+PHASE7_RESOURCE_SELECTION_OBJECT_VTABLE = 0x002B5008
+PHASE7_RESOURCE_SELECTION_OBJECT_VTABLE_ENTRIES = (
+    0x000A97B0,
+    0x00032ED0,
+    0x000D7410,
+    0x00032EE0,
+)
+PHASE7_RESOURCE_SELECTION_OBJECT_BINDINGS = {
+    0x000387D1: (0x000387C5, 0x0C, 0x00032EE0),
+    0x0003FE40: (0x0003FE26, 0x0C, 0x00032EE0),
+    0x00040EB4: (0x00040EAA, 0x0C, 0x00032EE0),
+    0x000411A7: (0x00041198, 0x0C, 0x00032EE0),
+    0x0004183F: (0x00041830, 0x0C, 0x00032EE0),
+    0x00041B46: (0x00041B37, 0x0C, 0x00032EE0),
+    0x00041E56: (0x00041E46, 0x0C, 0x00032EE0),
+    0x000426FD: (0x000426EE, 0x0C, 0x00032EE0),
+    0x00042A58: (0x00042A48, 0x0C, 0x00032EE0),
+    0x00042EC8: (0x00042EBB, 0x0C, 0x00032EE0),
+    0x00042F9F: (0x00042F90, 0x0C, 0x00032EE0),
+    0x00042FD6: (0x00042FC7, 0x0C, 0x00032EE0),
+    0x00043210: (0x00043201, 0x0C, 0x00032EE0),
+    0x0004404E: (0x0004403E, 0x0C, 0x00032EE0),
+    0x0004436A: (0x0004435A, 0x0C, 0x00032EE0),
+    0x0004572D: (0x00045721, 0x0C, 0x00032EE0),
+    0x000461D5: (0x000461C6, 0x0C, 0x00032EE0),
+    0x000467A5: (0x00046796, 0x0C, 0x00032EE0),
+    0x00046F3E: (0x00046F32, 0x0C, 0x00032EE0),
+    0x00046FDD: (0x00046FD1, 0x0C, 0x00032EE0),
+    0x0004712F: (0x00047125, 0x0C, 0x00032EE0),
+    0x00047E7D: (0x00047E71, 0x0C, 0x00032EE0),
+    0x000499E9: (0x000499DF, 0x0C, 0x00032EE0),
+    0x0004A8E4: (0x0004A8D5, 0x0C, 0x00032EE0),
+    0x0004A9B5: (0x0004A9AB, 0x0C, 0x00032EE0),
+    0x0004AA17: (0x0004AA0D, 0x0C, 0x00032EE0),
+    0x0004AA6C: (0x0004AA5D, 0x0C, 0x00032EE0),
+    0x0004AB4A: (0x0004AB3B, 0x0C, 0x00032EE0),
+    0x0004C683: (0x0004C677, 0x0C, 0x00032EE0),
+    0x0004CC27: (0x0004CC0C, 0x0C, 0x00032EE0),
+    0x0004D6F2: (0x0004D6E8, 0x0C, 0x00032EE0),
+    0x0004D767: (0x0004D75E, 0x0C, 0x00032EE0),
+    0x0004D803: (0x0004D7F9, 0x0C, 0x00032EE0),
+    0x00053E60: (0x00053E56, 0x0C, 0x00032EE0),
+}
+PHASE7_RESOURCE_SELECTION_OBJECT_CALLER_BYTES = {
+    0x000387C5: "8B0D60B34C008B04868B1150FF520C",
+    0x0003FE26: "8B0D60B34C008B11568B35043135008B34B5083135008B048650FF520C",
+    0x00040EAA: "8B0D60B34C008B116A00FF520C",
+    0x00041198: "8B0D60B34C008B923C0100008B0152FF500C",
+    0x00041830: "8B0D60B34C008B927C0100008B0152FF500C",
+    0x00041B37: "8B0D60B34C008B80640100008B1150FF520C",
+    0x00041E46: "8B0D60B34C008B84B8CC0700008B1150FF520C",
+    0x000426EE: "8B0D60B34C008B80C40900008B1150FF520C",
+    0x00042A48: "8B0D60B34C008B8498AC0900008B1150FF520C",
+    0x00042EBB: "8B0D60B34C008B4424208B1150FF520C",
+    0x00042F90: "8B0D60B34C008B92AC0500008B0152FF500C",
+    0x00042FC7: "8B0D60B34C008B80AC0500008B1150FF520C",
+    0x00043201: "8B0D60B34C008B928C0500008B0152FF500C",
+    0x0004403E: "8B0D60B34C008B018D14928B54960452FF500C",
+    0x0004435A: "8B0D60B34C008B118D04808B44870450FF520C",
+    0x00045721: "8B0D60B34C008B40548B1150FF520C",
+    0x000461C6: "8B0D60B34C008B92A40D00008B0152FF500C",
+    0x00046796: "8B0D60B34C008B80780100008B1150FF520C",
+    0x00046F32: "8B0D60B34C008B40148B1150FF520C",
+    0x00046FD1: "8B0D60B34C008B04868B1150FF520C",
+    0x00047125: "8B0D60B34C008B116A00FF520C",
+    0x00047E71: "8B0D60B34C008B52608B0152FF500C",
+    0x000499DF: "8B0D60B34C008B116A00FF520C",
+    0x0004A8D5: "8B0D60B34C008B92040D00008B0152FF500C",
+    0x0004A9AB: "8B0D60B34C008B016A00FF500C",
+    0x0004AA0D: "8B0D60B34C008B116A00FF520C",
+    0x0004AA5D: "8B0D60B34C008B92100D00008B0152FF500C",
+    0x0004AB3B: "8B0D60B34C008B800C0D00008B1150FF520C",
+    0x0004C677: "8B0D60B34C008B14AA8B0152FF500C",
+    0x0004CC0C: "8B0D60B34C008B14952C27350083F8018B01750B8B92F800000052FF500C",
+    0x0004D6E8: "8B0D60B34C008B116A00FF520C",
+    0x0004D75E: "8B0D60B34C008B0152FF500C",
+    0x0004D7F9: "8B0D60B34C008B116A00FF520C",
+    0x00053E56: "8B0D60B34C008B116A00FF520C",
+}
+# The frontend object at 0x004CB33C owns four slot-C calls around the level
+# selection transitions.  The accepted Lesson One capsule and the live x86
+# boundary at 0x000428B3 agree on the exact object and four-method vtable.
+# Only two callers are active in the current normal-live slice, but validate
+# all four address-named caller sequences so the recovery remains one closed
+# object family rather than a one-off observed target.
+PHASE7_LEVEL_SELECT_OBJECT_POINTER_CELL = 0x004CB33C
+PHASE7_LEVEL_SELECT_OBJECT = 0x004DABD8
+PHASE7_LEVEL_SELECT_OBJECT_VTABLE = 0x002B54E0
+PHASE7_LEVEL_SELECT_OBJECT_VTABLE_ENTRIES = (
+    0x000A97B0,
+    0x00033800,
+    0x000D7410,
+    0x00033880,
+)
+PHASE7_LEVEL_SELECT_OBJECT_BINDINGS = {
+    0x00042882: (0x00042879, 0x0C, 0x00033880),
+    0x000428B3: (0x000428A9, 0x0C, 0x00033880),
+}
+PHASE7_LEVEL_SELECT_OBJECT_CALLER_BYTES = {
+    0x0004272F: "8B0D3CB34C008B0153FF500C",
+    0x00042879: "8B0D3CB34C008B1157FF520C",
+    0x000428A9: "8B0D3CB34C008B116A00FF520C",
+    0x00042A7E: "8B0D3CB34C008B118D44240C50FF520C",
+}
 # Five fixed manager entries at 0x00489F70 share this eight-method vtable.
-# Startup calls slots 0 and 0x1C on entries returned by the base manager, while
-# presenter-close reaches slot 0x14 from the slot-0x1C method itself. Admit all
-# three sites only with the complete table, fixed array initializer, and exact
-# object/argument setup so shutdown coverage cannot become a one-off target.
+# Startup calls slots 0 and 0x1C on entries returned by the base manager.  The
+# level-loading status transition follows the same selected entry through slot
+# 0x18, while presenter-close reaches slot 0x14 from the slot-0x1C method
+# itself. Admit every reached site only with the complete table, fixed array
+# initializer, and exact object/argument setup so lifecycle coverage cannot
+# become a collection of one-off targets.
 PHASE7_BASE_MANAGER_OBJECT_VTABLE = 0x00295D44
 PHASE7_BASE_MANAGER_OBJECT_VTABLE_ENTRIES = (
     0x000D95D0,
@@ -691,6 +911,8 @@ PHASE7_BASE_MANAGER_OBJECT_VTABLE_ENTRIES = (
     0x000D95B0,
 )
 PHASE7_BASE_MANAGER_OBJECT_BINDINGS = {
+    0x000D5387: (0x1C, 0x000D95B0),
+    0x000D5397: (0x18, 0x000D97D0),
     0x000D869F: (0x1C, 0x000D95B0),
     0x000D86CD: (0x00, 0x000D95D0),
     0x000D95BE: (0x14, 0x000D9B60),
@@ -712,6 +934,16 @@ PHASE7_BASE_MANAGER_OBJECT_INSTRUCTION_BYTES = {
     0x00139399: "49",
     0x0013939A: "75F4",
     0x0013939C: "C3",
+    # Base-manager entry selected by the active panel row.
+    0x000D537B: "8B8E40080000",
+    0x000D5381: "85C9",
+    0x000D5383: "7415",
+    0x000D5385: "8B11",
+    0x000D5387: "FF521C",
+    # The status-2 branch calls slot 0x18 on the same selected entry.
+    0x000D538F: "8B8E40080000",
+    0x000D5395: "8B01",
+    0x000D5397: "FF5018",
     # Returned-object slot 0x1C call.
     0x000D8699: "8BF8",
     0x000D869B: "8B17",
@@ -783,6 +1015,1228 @@ PHASE7_BASE_MANAGER_OBJECT_INSTRUCTION_BYTES = {
     0x000D9C1B: "50",
     0x000D9C1C: "8BCE",
     0x000D9C1E: "FF5208",
+}
+# The active game-state cell is selected from a fixed 16-entry registry.  One
+# registry entry is intentionally null; the other 15 entries point at static
+# objects whose complete 16-slot virtual interfaces are present in the boot
+# image.  State transitions share one reviewed dispatcher, while ordinary
+# users load the active object directly from 0x0034AB5C.  Recover the complete
+# registry and all locally proven active-state dispatches together so entering
+# gameplay does not encounter this finite interface one method at a time.
+PHASE7_GAME_STATE_OBJECTS = (
+    (
+        0x00,
+        0x002FE318,
+        0x00300268,
+        0x00295BBC,
+        (
+            0x00013060,
+            0x00013080,
+            0x00013370,
+            0x000163B0,
+            0x000133B0,
+            0x000144F0,
+            0x000D7400,
+            0x000D7400,
+            0x00014160,
+            0x00014200,
+            0x00014280,
+            0x000198F0,
+            0x000163E0,
+            0x00016420,
+            0x000163B0,
+            0x000163C0,
+        ),
+    ),
+    (
+        0x01,
+        0x002FE31C,
+        0x003002D0,
+        0x00295BE8,
+        (
+            0x000198F0,
+            0x000163E0,
+            0x00016420,
+            0x000163B0,
+            0x000163C0,
+            0x000144F0,
+            0x00016390,
+            0x000163A0,
+            0x00014160,
+            0x00014200,
+            0x00016000,
+            0x00015580,
+            0x00015590,
+            0x000156F0,
+            0x00015730,
+            0x00015700,
+        ),
+    ),
+    (
+        0x02,
+        0x002FE320,
+        0x00300328,
+        0x0029590C,
+        (
+            0x000198F0,
+            0x00015E90,
+            0x00015F30,
+            0x000163B0,
+            0x000163C0,
+            0x000144F0,
+            0x00016390,
+            0x000163A0,
+            0x00014160,
+            0x00014200,
+            0x00016000,
+            0x00016500,
+            0x00016520,
+            0x00016580,
+            0x00016650,
+            0x00016840,
+        ),
+    ),
+    (
+        0x03,
+        0x002FE324,
+        0x003003D8,
+        0x00295C40,
+        (
+            0x00016140,
+            0x00016160,
+            0x000162C0,
+            0x000163B0,
+            0x000163C0,
+            0x000144F0,
+            0x00016390,
+            0x000163A0,
+            0x00014160,
+            0x00014200,
+            0x00016000,
+            0x00015580,
+            0x00015590,
+            0x000156F0,
+            0x00015730,
+            0x00015700,
+        ),
+    ),
+    (
+        0x04,
+        0x002FE328,
+        0x00300488,
+        0x00295C98,
+        (
+            0x00016140,
+            0x00016160,
+            0x000162C0,
+            0x000163B0,
+            0x000163C0,
+            0x000144F0,
+            0x00016390,
+            0x000163A0,
+            0x00014160,
+            0x00014200,
+            0x00016000,
+            0x000198F0,
+            0x0001A840,
+            0x0001A880,
+            0x000163B0,
+            0x0001A820,
+        ),
+    ),
+    (
+        0x05,
+        0x002FE32C,
+        0x00300380,
+        0x00295C14,
+        (
+            0x00015580,
+            0x00015590,
+            0x000156F0,
+            0x00015730,
+            0x00015700,
+            0x000144F0,
+            0x00015710,
+            0x00015720,
+            0x00015740,
+            0x00015750,
+            0x00015760,
+            0x00016140,
+            0x00016160,
+            0x000162C0,
+            0x000163B0,
+            0x000163C0,
+        ),
+    ),
+    (
+        0x06,
+        0x002FE330,
+        0x00300430,
+        0x00295C6C,
+        (
+            0x00015580,
+            0x00015590,
+            0x000156F0,
+            0x00015730,
+            0x00015700,
+            0x000144F0,
+            0x00015710,
+            0x00015720,
+            0x00015740,
+            0x00015750,
+            0x00015760,
+            0x00016140,
+            0x00016160,
+            0x000162C0,
+            0x000163B0,
+            0x000163C0,
+        ),
+    ),
+    (
+        0x07,
+        0x002FE334,
+        0x00300540,
+        0x00295964,
+        (
+            0x00014C30,
+            0x00014C80,
+            0x00014D00,
+            0x000163B0,
+            0x00014DE0,
+            0x000144F0,
+            0x00015100,
+            0x000163A0,
+            0x00015740,
+            0x00015110,
+            0x00015130,
+            0x00015190,
+            0x000152D0,
+            0x000152F0,
+            0x00015350,
+            0x000163B0,
+        ),
+    ),
+    (
+        0x08,
+        0x002FE338,
+        0x003004E0,
+        0x00295938,
+        (
+            0x00016500,
+            0x00016520,
+            0x00016580,
+            0x00016650,
+            0x00016840,
+            0x000144F0,
+            0x00014130,
+            0x00014150,
+            0x00014160,
+            0x00014200,
+            0x00016660,
+            0x00014C30,
+            0x00014C80,
+            0x00014D00,
+            0x000163B0,
+            0x00014DE0,
+        ),
+    ),
+    (0x09, 0x002FE33C, 0x00000000, 0x00000000, ()),
+    (
+        0x0A,
+        0x002FE340,
+        0x003006A0,
+        0x00295CC4,
+        (
+            0x000198F0,
+            0x0001A840,
+            0x0001A880,
+            0x000163B0,
+            0x0001A820,
+            0x000144F0,
+            0x00016390,
+            0x000163A0,
+            0x00014160,
+            0x00014200,
+            0x0001A950,
+            0x000172D0,
+            0x000172D0,
+            0x000172E0,
+            0x000172F0,
+            0x00017310,
+        ),
+    ),
+    (
+        0x0B,
+        0x002FE344,
+        0x003006F8,
+        0x002959C0,
+        (
+            0x000198F0,
+            0x00019910,
+            0x00019950,
+            0x000163B0,
+            0x0001A820,
+            0x000144F0,
+            0x00016390,
+            0x000163A0,
+            0x00014160,
+            0x00014200,
+            0x0001A950,
+            0x00016140,
+            0x0001A700,
+            0x0001A740,
+            0x000163B0,
+            0x0001A820,
+        ),
+    ),
+    (
+        0x0C,
+        0x002FE348,
+        0x00300750,
+        0x002959EC,
+        (
+            0x00016140,
+            0x0001A700,
+            0x0001A740,
+            0x000163B0,
+            0x0001A820,
+            0x000144F0,
+            0x00016390,
+            0x000163A0,
+            0x00014160,
+            0x00014200,
+            0x0001A950,
+            0x00019140,
+            0x00019180,
+            0x00019240,
+            0x000192E0,
+            0x00019290,
+        ),
+    ),
+    (
+        0x0D,
+        0x002FE34C,
+        0x003007A8,
+        0x00295A18,
+        (
+            0x00019140,
+            0x00019180,
+            0x00019240,
+            0x000192E0,
+            0x00019290,
+            0x00019320,
+            0x00019370,
+            0x000193B0,
+            0x000193F0,
+            0x00019430,
+            0x00019470,
+            0x000194B0,
+            0x00019810,
+            0x000194C0,
+            0x00019530,
+            0x00019570,
+        ),
+    ),
+    (
+        0x0E,
+        0x002FE350,
+        0x003021A8,
+        0x00295A60,
+        (
+            0x00018C70,
+            0x00018D00,
+            0x00018D50,
+            0x000192E0,
+            0x00018D80,
+            0x00019320,
+            0x00019370,
+            0x000193B0,
+            0x00018DC0,
+            0x00018DD0,
+            0x00018DE0,
+            0x000194B0,
+            0x00018E30,
+            0x00018F00,
+            0x00019010,
+            0x00019090,
+        ),
+    ),
+    (
+        0x0F,
+        0x002FE354,
+        0x00300648,
+        0x00295994,
+        (
+            0x000152D0,
+            0x000152F0,
+            0x00015350,
+            0x000163B0,
+            0x00015420,
+            0x000144F0,
+            0x000154B0,
+            0x000163A0,
+            0x00014160,
+            0x00014200,
+            0x000154C0,
+            0x000198F0,
+            0x00019910,
+            0x00019950,
+            0x000163B0,
+            0x0001A820,
+        ),
+    ),
+)
+PHASE7_GAME_STATE_ACTIVE_OBJECT_CELL = 0x0034AB5C
+PHASE7_GAME_STATE_TRANSITION_CODE_START = 0x00011000
+PHASE7_GAME_STATE_TRANSITION_CODE_END = 0x00011172
+PHASE7_GAME_STATE_TRANSITION_CODE_SHA256 = (
+    "21b3ebf8179c4532ab7b6e4d5b9f09dba4cbf3cc04b794c9282245245d733326"
+)
+PHASE7_GAME_STATE_REFERENCE_COUNT = 93
+PHASE7_GAME_STATE_REFERENCE_SHA256 = (
+    "f06a773c9493dddf10bdaa3fd09bf9e72bcf0b91c9032ef924bd85cc3a230553"
+)
+PHASE7_GAME_STATE_DERIVED_SITE_COUNT = 29
+PHASE7_GAME_STATE_DERIVED_SITE_SHA256 = (
+    "4bf7b8a9889f9484bc4776e29794412f68b55bbb4b633ceb021992c0573c1034"
+)
+PHASE7_GAME_STATE_SPECIAL_BINDINGS = {
+    0x00011093: (0x04, None),
+    0x0001114B: (0x10, None),
+    0x00013910: (0x04, 0x00),
+}
+PHASE7_GAME_STATE_SPECIAL_SITE_BYTES = {
+    0x00011093: "FF5004",
+    0x0001114B: "FF5010",
+    0x00013910: "FF5204",
+}
+# The shared update helper is entered only through four concrete game-state
+# methods.  It retains ``this`` in ESI and performs two late self-dispatches,
+# so the ordinary active-object-cell backtrace cannot discover them.  Freeze
+# the complete helper body, its exact direct-caller census, and the caller
+# prefixes rooted at known game-state vtable entries before admitting both
+# dispatches as one finite family.
+PHASE7_GAME_STATE_HELPER_START = 0x000157E0
+PHASE7_GAME_STATE_HELPER_END = 0x00015DF5
+PHASE7_GAME_STATE_HELPER_SHA256 = (
+    "35ca5777a7d7d208a778f68dfda542c1d79ba0c088524339fc65e9cadbba235c"
+)
+PHASE7_GAME_STATE_HELPER_CALLERS = {
+    0x00014E5D: (
+        0x00014DE0,
+        "ecf467ffb080adb984a7e77126674e7c4856f2b7fad78e304dd403bbb56d8173",
+    ),
+    0x00015423: (
+        0x00015420,
+        "3e2923dbb4c02bd3f6d554afaab65762183cfb3337f4a2548bbad8258b311ef2",
+    ),
+    0x000163C3: (
+        0x000163C0,
+        "773a02784df8368bb918a981443231601300053f4ad5dc179102309cd1631e87",
+    ),
+    0x00016843: (
+        0x00016840,
+        "e74d5f35bff5be7ab6670f135e43c2060e734e7b907eb914be37533cbd669c2d",
+    ),
+}
+PHASE7_GAME_STATE_HELPER_STATE_INDEXES = (
+    0x00,
+    0x01,
+    0x02,
+    0x03,
+    0x04,
+    0x05,
+    0x06,
+    0x07,
+    0x08,
+    0x0F,
+)
+PHASE7_GAME_STATE_HELPER_BINDINGS = {
+    0x00015D7D: (0x18, "FF5018"),
+    0x00015DC3: (0x1C, "FF521C"),
+}
+PHASE7_GAME_STATE_SITE_COUNT = 34
+PHASE7_GAME_STATE_SITE_SHA256 = (
+    "46b1d6ddc548251c302bbbe49d2cb3ef3c540286a7df6cc08b5effb96594b20a"
+)
+PHASE7_GAME_STATE_OBSERVED_BOUNDARY = (0x000127E7, 0x0F, 0x14, 0x000144F0)
+# Level loading selects one of five immutable strategy objects through the
+# common owner field at +0x18.  The boot image contains every object and its
+# complete nine-entry vtable; static startup and the five owner initializers
+# are also the only decoded references to these object addresses.  Seal that
+# complete reference census and every class-owned caller capsule as one batch
+# so level loading does not encounter this finite virtual family one slot at a
+# time.  A zero vtable in a binding denotes a common-owner call that may see
+# any of the five strategies; the remaining bindings name the exact strategy
+# installed by that owner's initializer.
+PHASE7_LEVEL_LOAD_STRATEGY_OBJECTS = (
+    (
+        0x00303BC4,
+        0x00295CF0,
+        (
+            0x000172D0,
+            0x000172D0,
+            0x000172E0,
+            0x000172F0,
+            0x00017310,
+            0x00017320,
+            0x000D7400,
+            0x000D7400,
+            0x000D7400,
+        ),
+    ),
+    (
+        0x00303BD4,
+        0x00295D14,
+        (
+            0x00011910,
+            0x00011960,
+            0x00011980,
+            0x000119D0,
+            0x00011A60,
+            0x00017320,
+            0x000D7400,
+            0x00011F50,
+            0x00011F50,
+        ),
+    ),
+    (
+        0x00303C0C,
+        0x00295AA8,
+        (
+            0x00012790,
+            0x00012790,
+            0x000148E0,
+            0x00014970,
+            0x000127C0,
+            0x00014940,
+            0x000D7400,
+            0x000D7400,
+            0x000D7400,
+        ),
+    ),
+    (
+        0x00303C20,
+        0x00295ACC,
+        (
+            0x00012790,
+            0x00012790,
+            0x000127A0,
+            0x00012860,
+            0x000127C0,
+            0x00012800,
+            0x000D7400,
+            0x00012850,
+            0x000D7400,
+        ),
+    ),
+    (
+        0x00303C34,
+        0x00295AF0,
+        (
+            0x00018560,
+            0x00018590,
+            0x000186F0,
+            0x000185F0,
+            0x00018A30,
+            0x000186D0,
+            0x000D7400,
+            0x00018840,
+            0x00018870,
+        ),
+    ),
+)
+PHASE7_LEVEL_LOAD_STRATEGY_BINDINGS = {
+    # Common-owner reset/update calls can hold any installed strategy.
+    0x00013F7D: (0x00013F51, 0x00000000, 0x04),
+    0x00014022: (0x0001401D, 0x00000000, 0x04),
+    0x000143CE: (0x000143B6, 0x00000000, 0x08),
+    # Owner initialized with the object at 0x00303C20.
+    0x00014D5B: (0x00014D56, 0x00295ACC, 0x1C),
+    0x00014E0E: (0x00014E01, 0x00295ACC, 0x0C),
+    0x00014E89: (0x00014E7C, 0x00295ACC, 0x0C),
+    # Owner initialized with the object at 0x00303C0C.
+    0x000153AB: (0x000153A6, 0x00295AA8, 0x1C),
+    0x00015563: (0x0001555E, 0x00295AA8, 0x04),
+    0x00015962: (0x00015959, 0x00295AA8, 0x14),
+    0x000159E3: (0x000159DA, 0x00295AA8, 0x14),
+    # Owner initialized with the object at 0x00303BD4.
+    0x00015F95: (0x00015F90, 0x00295D14, 0x1C),
+    0x0001631B: (0x00016316, 0x00295D14, 0x1C),
+    0x0001647B: (0x00016476, 0x00295D14, 0x1C),
+    # Owner initialized with the object at 0x00303C34.
+    0x000165DB: (0x000165D6, 0x00295AF0, 0x1C),
+    # Owner initialized with the object at 0x00303BC4.
+    0x000199AB: (0x000199A6, 0x00295CF0, 0x1C),
+    0x00019B4B: (0x00019B45, 0x00295CF0, 0x10),
+    0x00019DFF: (0x00019DF6, 0x00295CF0, 0x14),
+    0x0001A349: (0x0001A33D, 0x00295CF0, 0x0C),
+    0x0001A376: (0x0001A365, 0x00295CF0, 0x0C),
+    0x0001A386: (0x0001A365, 0x00295CF0, 0x0C),
+    0x0001A79B: (0x0001A796, 0x00295CF0, 0x1C),
+    0x0001A8DB: (0x0001A8D6, 0x00295CF0, 0x1C),
+}
+PHASE7_LEVEL_LOAD_STRATEGY_CALLER_BYTES = {
+    0x00013F51: "8B4E18897E08897E0C897E10897E14897E1C897E20897E48897E4C897E28897E243BCF5F89462C5E74058B11FF6204",
+    0x0001401D: "8B4E188B01FF5004",
+    0x000143B6: "8B4E183BCB897E44895E08895E0C897E1C897E2074058B11FF5208",
+    0x00014D56: "8B4E188B11FF521C",
+    0x00014E01: "8B4E188B016A006A016A006A00FF500C",
+    0x00014E7C: "8B4E188B016A006A006A006A00FF500C",
+    0x000153A6: "8B4E188B11FF521C",
+    0x0001555E: "8B4E188B11FF5204",
+    0x00015959: "8B44240C8B48188B11FF5214",
+    0x000159DA: "8B44240C8B48188B11FF5214",
+    0x00015F90: "8B4E188B11FF521C",
+    0x00016316: "8B4E188B11FF521C",
+    0x00016476: "8B4E188B11FF521C",
+    0x000165D6: "8B4E188B11FF521C",
+    0x000199A6: "8B4E188B11FF521C",
+    0x00019B45: "8B4E188B1157FF5210",
+    0x00019DF6: "8B44240C8B48188B11FF5214",
+    0x0001A33D: "8BD18B4A188B116A006A0050FF520C",
+    0x0001A365: "8B74240C8B4E188B016A006A006A006A00FF500C8B4E186A006A006A016A018B11FF520C",
+    0x0001A796: "8B4E188B11FF521C",
+    0x0001A8D6: "8B4E188B11FF521C",
+}
+PHASE7_LEVEL_LOAD_STRATEGY_SITE_BYTES = {
+    0x00013F7D: "FF6204",
+    0x00014022: "FF5004",
+    0x000143CE: "FF5208",
+    0x00014D5B: "FF521C",
+    0x00014E0E: "FF500C",
+    0x00014E89: "FF500C",
+    0x000153AB: "FF521C",
+    0x00015563: "FF5204",
+    0x00015962: "FF5214",
+    0x000159E3: "FF5214",
+    0x00015F95: "FF521C",
+    0x0001631B: "FF521C",
+    0x0001647B: "FF521C",
+    0x000165DB: "FF521C",
+    0x000199AB: "FF521C",
+    0x00019B4B: "FF5210",
+    0x00019DFF: "FF5214",
+    0x0001A349: "FF520C",
+    0x0001A376: "FF500C",
+    0x0001A386: "FF520C",
+    0x0001A79B: "FF521C",
+    0x0001A8DB: "FF521C",
+}
+PHASE7_LEVEL_LOAD_STRATEGY_INSTALLER_BYTES = {
+    0x00013839: "B9C43B3000E88D3A0000B9D43B3000E8C3E0FFFFB9343C3000E8094D0000B90C3C3000E82FEFFFFFB9203C3000E825EFFFFF",
+    0x00014C30: "53568BF1E8370B000033DB8D4E58899EE4000000C74618203C3000E8D0D9FFFF",
+    0x000152D0: "568BF1E898040000C746180C3C30005EC3",
+    0x00016140: "568BF1E828F6FFFFC74618D43B30005EC3",
+    0x00016500: "568BF1E868F2FFFFB9343C3000894E18A1343C30005EFF20",
+    0x000198F0: "568BF1E878BEFFFFC74618C43B30005EC3",
+    0x00042960: "B90C3C3000E826FEFCFF",
+}
+PHASE7_LEVEL_LOAD_STRATEGY_REFERENCE_BYTES = {
+    0x00013839: "B9C43B3000",
+    0x00013843: "B9D43B3000",
+    0x0001384D: "B9343C3000",
+    0x00013857: "B90C3C3000",
+    0x00013861: "B9203C3000",
+    0x00014C44: "C74618203C3000",
+    0x000152D8: "C746180C3C3000",
+    0x00016148: "C74618D43B3000",
+    0x00016508: "B9343C3000",
+    0x00016510: "A1343C3000",
+    0x000198F8: "C74618C43B3000",
+    0x00042960: "B90C3C3000",
+}
+PHASE7_LEVEL_LOAD_STRATEGY_REFERENCES = {
+    0x00303BC4: frozenset((0x00013839, 0x000198F8)),
+    0x00303BD4: frozenset((0x00013843, 0x00016148)),
+    0x00303C0C: frozenset((0x00013857, 0x000152D8, 0x00042960)),
+    0x00303C20: frozenset((0x00013861, 0x00014C44)),
+    0x00303C34: frozenset((0x0001384D, 0x00016508, 0x00016510)),
+}
+# The level-load parameter owner installs a fixed bank of 32 statically
+# initialized objects, one at every dword field from +0x10 through +0x8C.
+# Three generic walkers consume all slot-0/slot-4/slot-8 entries, followed by
+# 142 direct slot-4 setters in the same closed code region.  The complete code
+# hash and derived direct-site census keep this large family exact without a
+# brittle one-boundary-at-a-time target list.
+PHASE7_LEVEL_PARAMETER_BANK_OBJECTS = (
+    (0x10, 0x0030F61C, 0x002B08B8, (0x00021570, 0x00026700, 0x00026740)),
+    (0x14, 0x0030F840, 0x002B08B8, (0x00021570, 0x00026700, 0x00026740)),
+    (0x18, 0x0030F784, 0x002B0818, (0x0001E450, 0x0001E460, 0x0001E540)),
+    (0x1C, 0x0030F9A4, 0x002B0818, (0x0001E450, 0x0001E460, 0x0001E540)),
+    (0x20, 0x0030F664, 0x002B07DC, (0x00021570, 0x00023850, 0x00023880)),
+    (0x24, 0x0030F888, 0x002B07DC, (0x00021570, 0x00023850, 0x00023880)),
+    (0x28, 0x0030F6D8, 0x002B0800, (0x00021570, 0x000231A0, 0x00023290)),
+    (0x2C, 0x0030F8F8, 0x002B0800, (0x00021570, 0x000231A0, 0x00023290)),
+    (0x30, 0x0030F64C, 0x002B07D0, (0x0001E450, 0x00023EB0, 0x00024050)),
+    (0x34, 0x0030F870, 0x002B07D0, (0x0001E450, 0x00023EB0, 0x00024050)),
+    (0x38, 0x0030F684, 0x002B07E8, (0x00023990, 0x000239A0, 0x00023B30)),
+    (0x3C, 0x0030F8A8, 0x002B07E8, (0x00023990, 0x000239A0, 0x00023B30)),
+    (0x40, 0x0030F6A4, 0x002B07F4, (0x000371B0, 0x0001EA50, 0x0001EBA0)),
+    (0x44, 0x0030F8C8, 0x002B07F4, (0x000371B0, 0x0001EA50, 0x0001EBA0)),
+    (0x48, 0x0030F740, 0x002B080C, (0x0001E450, 0x00027990, 0x00027A20)),
+    (0x4C, 0x0030F960, 0x002B080C, (0x0001E450, 0x00027990, 0x00027A20)),
+    (0x50, 0x0030F7A8, 0x002B0824, (0x0001D810, 0x0001D830, 0x0001D980)),
+    (0x54, 0x0030F9C8, 0x002B0824, (0x0001D810, 0x0001D830, 0x0001D980)),
+    (0x58, 0x0030F82C, 0x002B0830, (0x00021570, 0x00021580, 0x00021650)),
+    (0x5C, 0x0030FA4C, 0x002B0830, (0x00021570, 0x00021580, 0x00021650)),
+    (0x60, 0x00310180, 0x002B088C, (0x0001FE90, 0x0001FF20, 0x00020040)),
+    (0x64, 0x003102B0, 0x002B088C, (0x0001FE90, 0x0001FF20, 0x00020040)),
+    (0x68, 0x003103E0, 0x002B089C, (0x0001E450, 0x000202E0, 0x00020420)),
+    (0x6C, 0x00310400, 0x002B089C, (0x0001E450, 0x000202E0, 0x00020420)),
+    (0x70, 0x00310420, 0x002B08A8, (0x0001E450, 0x00028340, 0x00028430)),
+    (0x74, 0x00310540, 0x002B08A8, (0x0001E450, 0x00028340, 0x00028430)),
+    (0x78, 0x0030FA88, 0x002B0854, (0x0001F080, 0x0001F200, 0x0001F3B0)),
+    (0x7C, 0x0030FFC8, 0x002B0864, (0x0001E450, 0x0001F790, 0x0001F870)),
+    (0x80, 0x00310100, 0x002B0874, (0x00021EA0, 0x00021F50, 0x000222E0)),
+    (0x84, 0x00310164, 0x002B0880, (0x00021570, 0x00021CC0, 0x00021E40)),
+    (0x88, 0x0030FA60, 0x002B083C, (0x00021570, 0x00027F00, 0x00027FA0)),
+    (0x8C, 0x0030FA74, 0x002B0848, (0x00021570, 0x00024080, 0x000D7410)),
+)
+PHASE7_LEVEL_PARAMETER_BANK_CODE_START = 0x0001AA10
+PHASE7_LEVEL_PARAMETER_BANK_CODE_END = 0x0001CFD6
+PHASE7_LEVEL_PARAMETER_BANK_CODE_SHA256 = (
+    "b2143380234d2c2d73fd07da2b3699b8517e52074140d48cf8e2f789ecb531a2"
+)
+PHASE7_LEVEL_PARAMETER_BANK_GENERIC_BINDINGS = {
+    0x0001AB3F: 0x00,
+    0x0001ABEB: 0x08,
+    0x0001AC27: 0x04,
+}
+PHASE7_LEVEL_PARAMETER_BANK_SETTER_START = 0x0001AC60
+PHASE7_LEVEL_PARAMETER_BANK_SETTER_SITE_COUNT = 142
+PHASE7_LEVEL_PARAMETER_BANK_SETTER_SITE_SHA256 = (
+    "43c4f4c8280b909b7fbcb5f3323d35a5221717aac585a69bba44e9caf20322bf"
+)
+PHASE7_LEVEL_PARAMETER_BANK_OBSERVED_BOUNDARY = (0x0001B200, 0x10, 0x00026700)
+# The loading screen then operates on two four-entry fixed manager arrays.
+# Their startup loops install three related 20-entry vtables, one 11-entry
+# primary table, and an adjacent 11-entry secondary table.  The retained
+# Lesson One capsule contains all 20 installed object-table cells exactly as
+# produced by those loops.  The common tables have identical targets in every
+# self-dispatched slot below; the primary and embedded-secondary sites name
+# their exact installed table.
+PHASE7_LEVEL_LOAD_MANAGER_COMMON_VTABLES = (
+    0x00295D68,
+    0x00295DB8,
+    0x00295E08,
+)
+PHASE7_LEVEL_LOAD_MANAGER_VTABLES = (
+    (
+        0x00295D68,
+        (
+            0x0005E360,
+            0x00064C60,
+            0x0005E740,
+            0x0005EB40,
+            0x0005EB50,
+            0x00066410,
+            0x0005FF60,
+            0x0005FFC0,
+            0x000604E0,
+            0x000605B0,
+            0x0005B670,
+            0x00058F00,
+            0x0005A6B0,
+            0x00059120,
+            0x00059380,
+            0x0005B950,
+            0x0005BB80,
+            0x00059770,
+            0x00059DB0,
+            0x00060820,
+        ),
+    ),
+    (
+        0x00295DB8,
+        (
+            0x0005D860,
+            0x00064C60,
+            0x0005D8E0,
+            0x0005DA00,
+            0x0005DA20,
+            0x00066410,
+            0x0005FF60,
+            0x0005FFC0,
+            0x000604E0,
+            0x000605B0,
+            0x0005B670,
+            0x00058F00,
+            0x0005A6B0,
+            0x00059120,
+            0x00059380,
+            0x0005B950,
+            0x0005BB80,
+            0x00059770,
+            0x00059DB0,
+            0x0005DD00,
+        ),
+    ),
+    (
+        0x00295E08,
+        (
+            0x000558D0,
+            0x00064C60,
+            0x00055970,
+            0x0005EB40,
+            0x0005EB50,
+            0x00066410,
+            0x0005FF60,
+            0x0005FFC0,
+            0x000604E0,
+            0x000605B0,
+            0x0005B670,
+            0x00058F00,
+            0x0005A6B0,
+            0x00059120,
+            0x00059380,
+            0x0005B950,
+            0x0005BB80,
+            0x00059770,
+            0x00059DB0,
+            0x00055B50,
+        ),
+    ),
+    (
+        0x00295E58,
+        (
+            0x000706C0,
+            0x00073150,
+            0x00070740,
+            0x00070800,
+            0x00074000,
+            0x00073AD0,
+            0x00072E10,
+            0x000732D0,
+            0x00070C80,
+            0x00070CC0,
+            0x00070D10,
+        ),
+    ),
+    (
+        0x00295E84,
+        (
+            0x0007E7C0,
+            0x0007F9F0,
+            0x0007ECD0,
+            0x0007EDF0,
+            0x0007F4E0,
+            0x000D7410,
+            0x0007EE80,
+            0x000732D0,
+            0x00070C80,
+            0x00070CC0,
+            0x00070D10,
+        ),
+    ),
+)
+PHASE7_LEVEL_LOAD_MANAGER_OBJECT_BINDINGS = tuple(
+    binding
+    for index in range(4)
+    for binding in (
+        (0x004BCCE0 + index * 0x4570 - 0x2100, 0x00295E08),
+        (0x004BCCE0 + index * 0x4570 - 0x3090, 0x00295E84),
+        (0x004BCCE0 + index * 0x4570, 0x00295DB8),
+        (0x00464220 + index * 0x3090, 0x00295E58),
+        (0x00464220 + index * 0x3090 + 0x0F90, 0x00295E08),
+    )
+)
+PHASE7_LEVEL_LOAD_MANAGER_BINDINGS = {
+    # Self-dispatches shared by all three 20-entry manager tables.
+    0x00058F31: (0x00058F2F, 0x00000000, 0x34),
+    0x00058F3D: (0x00058F3B, 0x00000000, 0x38),
+    0x00058F44: (0x00058F42, 0x00000000, 0x3C),
+    0x00058F5D: (0x00058F58, 0x00000000, 0x38),
+    0x00058F6C: (0x00058F65, 0x00000000, 0x40),
+    0x00058F73: (0x00058F71, 0x00000000, 0x44),
+    0x00058F81: (0x00058F7C, 0x00000000, 0x3C),
+    0x00058F90: (0x00058F8B, 0x00000000, 0x44),
+    0x00058F9A: (0x00058F95, 0x00000000, 0x48),
+    0x000590CC: (0x000590C7, 0x00000000, 0x20),
+    0x000590D4: (0x000590CF, 0x00000000, 0x20),
+    0x00059772: (0x00059770, 0x00000000, 0x40),
+    0x0005B90E: (0x0005B8DA, 0x00000000, 0x24),
+    0x0005D127: (0x0005D11D, 0x00000000, 0x18),
+    0x0005D60E: (0x0005D609, 0x00000000, 0x1C),
+    0x0005EAD3: (0x0005EACF, 0x00000000, 0x18),
+    # Self-dispatches on the fixed primary level-loader table.
+    0x000707EF: (0x000707EB, 0x00295E58, 0x18),
+    0x00072F27: (0x00072F0B, 0x00295E58, 0x08),
+    0x00073997: (0x00073991, 0x00295E58, 0x24),
+    0x000739A3: (0x000739A1, 0x00295E58, 0x20),
+    0x00074210: (0x0007420C, 0x00295E58, 0x1C),
+    0x00074437: (0x00074433, 0x00295E58, 0x28),
+    0x00074451: (0x00074446, 0x00295E58, 0x08),
+    # The primary object owns the embedded 20-entry object at +0x0F90.
+    0x000743B5: (0x000743A7, 0x00295E08, 0x4C),
+    # Fixed four-object lifecycle sweeps rooted at cell array 0x002FE370.
+    0x00082222: (0x0008221C, 0x00295E84, 0x08),
+    0x00082319: (0x00082310, 0x00295E84, 0x10),
+    0x00082485: (0x0008247B, 0x00295DB8, 0x28),
+    0x00082709: (0x00082700, 0x00295E84, 0x10),
+    0x00082727: (0x0008270C, 0x00295DB8, 0x14),
+}
+PHASE7_LEVEL_LOAD_MANAGER_CALLER_BYTES = {
+    0x00058F2F: "8B06FF5034",
+    0x00058F3B: "8B16FF5238",
+    0x00058F42: "8B06FF503C",
+    0x00058F58: "8B17568BCFFF5238",
+    0x00058F65: "8BCE5775078B06FF5040",
+    0x00058F71: "8B16FF5244",
+    0x00058F7C: "8B07568BCFFF503C",
+    0x00058F8B: "8B17568BCFFF5244",
+    0x00058F95: "8B06578BCEFF5048",
+    0x000590C7: "8B16578BCEFF5220",
+    0x000590CF: "8B07568BCFFF5020",
+    0x00059770: "8B01FF6040",
+    0x0005B8DA: "8B16D88EE00000008BCED99EE0000000D90524BE2B00D88EE4000000D99EE4000000D90524BE2B00D88EE8000000D99EE8000000FF5224",
+    0x0005D11D: "8B038BCB89932C020000FF5018",
+    0x0005D609: "8B13558BCBFF521C",
+    0x0005EACF: "8B038BCBFF5018",
+    0x000707EB: "8B038BCBFF5018",
+    0x00072F0B: "8B16DDD86A048BCEC7867430000000000000C786680D000001000000FF5208",
+    0x00073991: "8BCE740C8B06FF5024",
+    0x000739A1: "8B16FF5220",
+    0x0007420C: "8B168BCEFF521C",
+    0x000743A7: "8B96900F00008D9E900F00008BCBFF524C",
+    0x00074433: "8B068BCEFF5028",
+    0x00074446: "8B168BCE5789BE600D0000FF5208",
+    0x0008221C: "8B066A048BCEFF5008",
+    0x00082310: "8B0CBE3BCB74058B01FF5010",
+    0x0008247B: "8B04BE8B58088B138BCBFF5228",
+    0x00082700: "8B0CBE85C974238B01FF5010",
+    0x0008270C: (
+        "8B04BE8B88D00C000085C974118B0D888159008B40088B10518BC8FF5214"
+    ),
+}
+PHASE7_LEVEL_LOAD_MANAGER_SITE_BYTES = {
+    site: PHASE7_LEVEL_LOAD_MANAGER_CALLER_BYTES[caller_start][
+        -6:
+    ]
+    for site, (caller_start, _vtable, _slot) in PHASE7_LEVEL_LOAD_MANAGER_BINDINGS.items()
+}
+PHASE7_LEVEL_LOAD_MANAGER_INSTALLER_BYTES = {
+    0x00073CC0: "53558B6C240C5657558BD9E8E0FCFFFFC703685D2900",
+    0x001392B0: "B8E0CC4B00B904000000BA845E290090C78000DFFFFF085E2900899070CFFFFFC700B85D290005704500004975E2C390B820424600B904000000BA085E290090C700585E29008990900F000005903000004975ECC3",
+}
+PHASE7_LEVEL_LOAD_MANAGER_REFERENCE_BYTES = {
+    0x00073CD0: "C703685D2900",
+    0x001392BA: "BA845E2900",
+    0x001392C0: "C78000DFFFFF085E2900",
+    0x001392D0: "C700B85D2900",
+    0x001392EA: "BA085E2900",
+    0x001392F0: "C700585E2900",
+}
+PHASE7_LEVEL_LOAD_MANAGER_REFERENCES = {
+    0x00295D68: frozenset((0x00073CD0,)),
+    0x00295DB8: frozenset((0x001392D0,)),
+    0x00295E08: frozenset((0x001392C0, 0x001392EA)),
+    0x00295E58: frozenset((0x001392F0,)),
+    0x00295E84: frozenset((0x001392BA,)),
+}
+PHASE7_LEVEL_LOAD_MANAGER_SWEEP_DIRECT_CALLERS = {
+    0x00015B5F: (0x00082100, 0x00015B59, "50B970E32F00E89CC50600"),
+    0x00015BBC: (0x00082100, 0x00015BB6, "52B970E32F00E83FC50600"),
+    0x0001A0CE: (0x00082100, 0x0001A0C8, "50B970E32F00E82D800600"),
+    0x0001A2D6: (0x00082100, 0x0001A2D0, "51B970E32F00E8257E0600"),
+    0x0001395E: (0x000822B0, 0x00013959, "B970E32F00E84DE90600"),
+}
+PHASE7_LEVEL_LOAD_MANAGER_SWEEP_PROOF_BYTES = {
+    # 0x00082100 retains ECX in EDI and loads each non-null object into ESI.
+    0x00082100: "558BEC83EC0853568B750857568BF9",
+    0x00082125: "8B349F",
+    # 0x000822B0 retains the fixed cell-array base directly in ESI.
+    0x000822B0: "83EC1853568BF1",
+}
+PHASE7_LEVEL_LOAD_MANAGER_SWEEP_OBSERVED_BOUNDARY = (
+    0x00082709,
+    0x00295E84,
+    0x10,
+    0x0007F4E0,
+)
+# The gameplay update dispatcher at 0x000ADCA0 selects one of nine fixed
+# helpers from a 20-state byte selector and ten-entry jump table.  Every helper
+# begins by invoking slot 0x18 on the primary level-view object.  The retained
+# cell names the first of four statically constructed objects sharing vtable
+# 0x00295E84; later race slots use the other three objects with that same
+# complete table.  Recover the nine primary calls as one family, but leave the
+# two optional 0x002FE374 calls in helpers 0x000AC360/0x000AC9F0 guarded: that
+# secondary cell is null in the accepted capsule and has no finite target yet.
+PHASE7_LEVEL_UPDATE_PRIMARY_CELL = 0x002FE370
+PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE = 0x00295E84
+PHASE7_LEVEL_UPDATE_PRIMARY_OBJECTS = tuple(
+    object_address
+    for object_address, vtable in PHASE7_LEVEL_LOAD_MANAGER_OBJECT_BINDINGS
+    if vtable == PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE
+)
+PHASE7_LEVEL_UPDATE_SELECTOR_ADDRESS = 0x000ADE08
+PHASE7_LEVEL_UPDATE_SELECTOR_BYTES = "0001020209090309090909090909040905060708"
+PHASE7_LEVEL_UPDATE_JUMP_TABLE_ADDRESS = 0x000ADDE0
+PHASE7_LEVEL_UPDATE_JUMP_TABLE = (
+    0x000ADCED,
+    0x000ADDBF,
+    0x000ADCCF,
+    0x000ADDA1,
+    0x000ADD47,
+    0x000ADD0B,
+    0x000ADD29,
+    0x000ADD65,
+    0x000ADD83,
+    0x000ADDBF,
+)
+PHASE7_LEVEL_UPDATE_SWITCH_INSTRUCTION_BYTES = {
+    0x000ADCC1: "0FB69008DE0A00",
+    0x000ADCC8: "FF2495E0DD0A00",
+    0x000ADCDA: "E881C6FFFF",
+    0x000ADCF8: "E883D3FFFF",
+    0x000ADD16: "E835DCFFFF",
+    0x000ADD34: "E837E1FFFF",
+    0x000ADD52: "E8C9D6FFFF",
+    0x000ADD70: "E8EBE5FFFF",
+    0x000ADD8E: "E85DECFFFF",
+    0x000ADDAC: "E83FF3FFFF",
+    0x000ADDCA: "E841C8FFFF",
+}
+PHASE7_LEVEL_UPDATE_HELPER_CALLS = {
+    0x000ADCDA: (0x000ADCCF, 0x000AA360),
+    0x000ADCF8: (0x000ADCED, 0x000AB080),
+    0x000ADD16: (0x000ADD0B, 0x000AB950),
+    0x000ADD34: (0x000ADD29, 0x000ABE70),
+    0x000ADD52: (0x000ADD47, 0x000AB420),
+    0x000ADD70: (0x000ADD65, 0x000AC360),
+    0x000ADD8E: (0x000ADD83, 0x000AC9F0),
+    0x000ADDAC: (0x000ADDA1, 0x000AD0F0),
+    0x000ADDCA: (0x000ADDBF, 0x000AA610),
+}
+PHASE7_LEVEL_UPDATE_PRIMARY_CALLER_BYTES = {
+    0x000AA3A3: "8B40088B5104568944242C8B0157895C241C89542414FF5018",
+    0x000AA621: "8B4D088B41048945F88B450C89570489078B11FF5218",
+    0x000AB0C3: "8B40088B5104568944242C8B015789542418FF5018",
+    0x000AB438: "8B08578B79048B4D088B11897C24388D5F10FF5218",
+    0x000AB9BA: (
+        "8B40088B1156578944242CC74424480000803F"
+        "C744244C00000000C744245000000000FF5218"
+    ),
+    0x000ABED4: (
+        "8B4D088B01565789542428C74424480000803F"
+        "C744244C00000000C744245000000000FF5018"
+    ),
+    0x000AC3BB: (
+        "8B50088B01578954243CC744242000000000"
+        "C74424240000803FC744242800000000FF5018"
+    ),
+    0x000ACA4B: (
+        "8B50088B015789542440C744242000000000"
+        "C74424240000803FC744242800000000FF5018"
+    ),
+    0x000AD106: "8B4D088B118975DC8945FC83C610FF5218",
+}
+PHASE7_LEVEL_UPDATE_PRIMARY_BINDINGS = {
+    0x000AA3B9: (0x000AA360, 0x000AA3A3),
+    0x000AA634: (0x000AA610, 0x000AA621),
+    0x000AB0D5: (0x000AB080, 0x000AB0C3),
+    0x000AB44A: (0x000AB420, 0x000AB438),
+    0x000AB9DD: (0x000AB950, 0x000AB9BA),
+    0x000ABEF7: (0x000ABE70, 0x000ABED4),
+    0x000AC3DD: (0x000AC360, 0x000AC3BB),
+    0x000ACA6D: (0x000AC9F0, 0x000ACA4B),
+    0x000AD114: (0x000AD0F0, 0x000AD106),
+}
+PHASE7_LEVEL_UPDATE_SECONDARY_GUARDED_SITES = frozenset((0x000AC3F8, 0x000ACA85))
+PHASE7_LEVEL_UPDATE_OBSERVED_BOUNDARIES = frozenset(
+    ((0x000AA3B9, 0x0007EE80), (0x000AB0D5, 0x0007EE80))
+)
+# The per-racer sample routine at 0x0009D160 walks the same four fixed primary
+# cells and queries the slot-0x18 position object three times per non-null
+# cell.  Its only direct caller is the racer loop at 0x00097AB4.  Recover all
+# three calls together, freezing the loop setup/tail and complete caller census
+# so an observed coordinate query cannot become a general vtable allowance.
+PHASE7_LEVEL_SAMPLE_PRIMARY_BINDINGS = {
+    0x0009D679: "edx",
+    0x0009D697: "eax",
+    0x0009D6B5: "edx",
+}
+PHASE7_LEVEL_SAMPLE_DIRECT_CALLS = {0x00097AB4: 0x0009D160}
+PHASE7_LEVEL_SAMPLE_PROOF_BYTES = {
+    0x00097AA2: "8574242474158B8B9801000085C9740B8BCBE8A7560000",
+    0x0009D160: "83EC48538BD98B83A001000085C00F8594060000",
+    0x0009D652: (
+        "33F6BFCC2E4B0089742410897C24148B0CB570E32F0085C90F8474010000"
+        "D943308B11D95C240CFF5218D940308B0CB570E32F00D86C240CD95C243C"
+        "D943348B01D95C240CFF5018D940348B0CB570E32F00D86C240CD95C2440"
+        "D943388B11D95C240CFF5218"
+    ),
+    0x0009D7E4: (
+        "8B54241083C71081C2FE0000004681FF0C2F4B0089542410897C2414"
+        "0F8C5BFEFFFF5F5E5B83C448C3"
+    ),
+}
+PHASE7_LEVEL_SAMPLE_OBSERVED_BOUNDARY = (
+    0x0009D679,
+    0x004B9C50,
+    PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE,
+    0x0007EE80,
+)
+# The fixed level-lifecycle sweep calls one query owner rooted at
+# 0x002FE370 + 0x1A44.  Its sole worker walks the same four primary cells and
+# calls slot 0x18 on each non-null object.  A later call in that query routine
+# uses slot 4 on one of twenty fixed records constructed at 0x0050D890.  Seal
+# the complete call chain and both finite object families so the later sibling
+# is recovered ahead of gameplay rather than after a second guard.
+PHASE7_LEVEL_QUERY_OWNER = 0x002FFDB4
+PHASE7_LEVEL_QUERY_RECORD_BASE_CELL = 0x004B8464
+PHASE7_LEVEL_QUERY_RECORD_COUNT_CELL = 0x004B8468
+PHASE7_LEVEL_QUERY_RECORD_BASE = 0x0050D890
+PHASE7_LEVEL_QUERY_RECORD_CAPACITY = 20
+PHASE7_LEVEL_QUERY_RECORD_STRIDE = 0x1C
+PHASE7_LEVEL_QUERY_RECORD_VTABLE = 0x002BF3A0
+PHASE7_LEVEL_QUERY_RECORD_VTABLE_ENTRIES = (
+    0x0009F640,
+    0x0009F660,
+    0x0007C7B0,
+    0x000943D0,
+)
+PHASE7_LEVEL_QUERY_POOL_BASE_CELL = 0x004B846C
+PHASE7_LEVEL_QUERY_POOL_BASE = 0x0050DAC0
+PHASE7_LEVEL_QUERY_POOL_CAPACITY = 0x100
+PHASE7_LEVEL_QUERY_POOL_STRIDE = 0x18
+PHASE7_LEVEL_QUERY_POOL_VTABLE = 0x002BF3EC
+PHASE7_LEVEL_QUERY_POOL_VTABLE_ENTRIES = (
+    0x0009F550,
+    0x0009F570,
+    0x0009F550,
+    0x0009F570,
+)
+PHASE7_LEVEL_QUERY_BINDINGS = {
+    0x000798B5: (PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE, 0x18, 0x0007EE80),
+    0x0007994D: (PHASE7_LEVEL_QUERY_RECORD_VTABLE, 0x04, 0x0009F660),
+    0x0009F562: (PHASE7_LEVEL_QUERY_POOL_VTABLE, 0x04, 0x0009F570),
+    0x0009F650: (PHASE7_LEVEL_QUERY_RECORD_VTABLE, 0x04, 0x0009F660),
+    0x0009F6AC: (PHASE7_LEVEL_QUERY_POOL_VTABLE, 0x04, 0x0009F570),
+}
+PHASE7_LEVEL_QUERY_SITE_BASES = {
+    0x000798B5: "edx",
+    0x0007994D: "edx",
+    0x0009F562: "eax",
+    0x0009F650: "eax",
+    0x0009F6AC: "eax",
+}
+PHASE7_LEVEL_QUERY_DIRECT_CALLS = {
+    0x0001395E: 0x000822B0,
+    0x00082741: 0x0009F9B0,
+    0x0009FA60: 0x00079880,
+}
+PHASE7_LEVEL_QUERY_PROOF_BYTES = {
+    0x00013959: "B970E32F00E84DE90600",
+    0x000822B0: "83EC1853568BF1",
+    0x0008273B: "8D8E441A0000E86AD20100",
+    0x0009F9B0: (
+        "83EC1053568BF18B46045733FF85C07E438D5E088B0BE815FCFFFF85C0742A"
+        "8B4E0433C04985C97E158D4E088D6424008B560483C00283C1084A3BC27CF2"
+        "8B56044A4F89560483EB048B46044783C3043BF87CC0A168844B0085C00F84"
+        "DE01000033DB8B068B3C0385FF747E8B473C85C074268B87D00C000085C075"
+        "6DB988FD2F00E809790300D905081F2C00D84714DED9DFE0F6C44175518B15"
+        "64844B008D4C2418518B8F840300006BC91C5703CAE81B9EFDFF"
+    ),
+    0x00079880: (
+        "83EC0C568BF1578B7C24188B874406000033C985C00F9EC157897E184923C1"
+        "8BCE894614E8175E020085C00F84D60000008B178BCFFF521883C0308B088B"
+        "50048B4008894C24088B4E04D9018954240CD864240889442410D94104D864"
+        "240CD94108D8642410D9411CD9C1D8CAD9C3D8CCDEC1D9C4D8CDDEC1D9C1"
+        "D8CADED9DFE0DDD8F6C4017579D94114D8CAD94110D8CCDEC1D94118D8CA"
+        "DEC1D81D9C432900DDD8DFE0DDD8F6C405DDD87A598B46143B41207D518B"
+        "4C812485C98B44241C741B8B49048B1189108B168BCEFF5204"
+    ),
+    0x0007A20C: "C70564844B0090D85000",
+    0x0007A278: (
+        "8D4304EB038D49008B0883F9FF740E8D0C498D0CCDC0DA50008908EB06C700"
+        "000000008B0B4283C0043BD17CDB"
+    ),
+    0x0007A2D1: "C7056C844B00C0DA5000",
+    0x0009F550: "8B44240C3B4110750C8B5424088B01895114FF5004",
+    0x0009F640: "8B44240C8B5424088941148B01895118FF5004",
+    0x0009F660: (
+        "568BF1B988FD2F00E8237D03008B4E048946088B46148B4C812485C974318B"
+        "56188B41048951148B500485D27E1C8B560889510851B9B4FD2F00E8F10200"
+        "008B4E188B512089560C5EC38B01FF5004"
+    ),
+    0x001F4910: (
+        "B8C0DA5000B9000100008D9B00000000C700ECF32B0083C0184975F4C3"
+    ),
+    0x001F4950: (
+        "B890D85000B9140000008D9B00000000C700A0F32B0083C01C4975F4C3"
+    ),
+}
+PHASE7_LEVEL_QUERY_RECORD_BASE_REFERENCES = frozenset((0x0007A20C, 0x001F4950))
+PHASE7_LEVEL_QUERY_RECORD_VTABLE_REFERENCES = frozenset((0x001F4960,))
+PHASE7_LEVEL_QUERY_POOL_BASE_REFERENCES = frozenset((0x0007A2D1, 0x001F4910))
+PHASE7_LEVEL_QUERY_POOL_VTABLE_REFERENCES = frozenset((0x001F4920,))
+PHASE7_LEVEL_QUERY_OBSERVED_BOUNDARY = (
+    0x000798B5,
+    0x004B9C50,
+    PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE,
+    0x0007EE80,
+)
+PHASE7_LEVEL_QUERY_PREDICTED_BOUNDARY = (
+    0x0007994D,
+    PHASE7_LEVEL_QUERY_RECORD_BASE,
+    PHASE7_LEVEL_QUERY_RECORD_VTABLE,
+    0x0009F660,
+)
+# A late level-load initializer installs six fixed callbacks in an adjacent
+# global vector.  Two worker paths consume the same three cells, while a third
+# path consumes the fourth.  Validate the complete installer, all six cells,
+# and the exact seven-consumer reference census before recovering any site.
+PHASE7_RUNTIME_CALLBACK_VECTOR = (
+    (0x00347EB4, 0x0012186B),
+    (0x00347EB8, 0x00121516),
+    (0x00347EBC, 0x0012157B),
+    (0x00347EC0, 0x001214BE),
+    (0x00347EC4, 0x00121561),
+    (0x00347EC8, 0x0012186B),
+)
+PHASE7_RUNTIME_CALLBACK_BINDINGS = {
+    0x00121EAA: (0x00121E87, 0x00347EB4, 0x0012186B),
+    0x00121EC5: (0x00121E87, 0x00347EC0, 0x001214BE),
+    0x00121ED6: (0x00121E87, 0x00347EB8, 0x00121516),
+    0x00124A48: (0x00124A25, 0x00347EB4, 0x0012186B),
+    0x00124A63: (0x00124A25, 0x00347EC0, 0x001214BE),
+    0x00124A75: (0x00124A25, 0x00347EB8, 0x00121516),
+    0x00126034: (0x00126024, 0x00347EBC, 0x0012157B),
+}
+PHASE7_RUNTIME_CALLBACK_CALLER_BYTES = {
+    0x00121E87: "8B45108B08FF75C883C008FF75F88945108B40FC8945BC0FBEC3508D45B85750894DB8FF15B47E34008B75FC83C41481E680000000740E837DF800750857FF15C07E34005980FB67750C85F6750857FF15B87E3400",
+    0x00124A25: "8B45108B08FF75C083C008FF75F88945108B40FC8945B00FBEC3508D45AC5750894DACFF15B47E34008B75FC83C41481E680000000740E837DF800750857FF15C07E3400596683FB67750C85F6750857FF15B87E3400",
+    0x00126024: "8D853CFEFFFF50FF75A00FBE45B54850FF15BC7E3400",
+}
+PHASE7_RUNTIME_CALLBACK_SITE_BYTES = {
+    0x00121EAA: "FF15B47E3400",
+    0x00121EC5: "FF15C07E3400",
+    0x00121ED6: "FF15B87E3400",
+    0x00124A48: "FF15B47E3400",
+    0x00124A63: "FF15C07E3400",
+    0x00124A75: "FF15B87E3400",
+    0x00126034: "FF15BC7E3400",
+}
+PHASE7_RUNTIME_CALLBACK_INSTALLER_BYTES = {
+    0x0011E251: "B86B181200A3B47E3400C705B87E340016151200C705BC7E34007B151200C705C07E3400BE141200C705C47E340061151200A3C87E3400C3",
+}
+PHASE7_RUNTIME_CALLBACK_REFERENCE_BYTES = {
+    0x0011E256: "A3B47E3400",
+    0x0011E25B: "C705B87E340016151200",
+    0x0011E265: "C705BC7E34007B151200",
+    0x0011E26F: "C705C07E3400BE141200",
+    0x0011E279: "C705C47E340061151200",
+    0x0011E283: "A3C87E3400",
+    **PHASE7_RUNTIME_CALLBACK_SITE_BYTES,
+}
+PHASE7_RUNTIME_CALLBACK_REFERENCES = {
+    0x00347EB4: frozenset((0x0011E256, 0x00121EAA, 0x00124A48)),
+    0x00347EB8: frozenset((0x0011E25B, 0x00121ED6, 0x00124A75)),
+    0x00347EBC: frozenset((0x0011E265, 0x00126034)),
+    0x00347EC0: frozenset((0x0011E26F, 0x00121EC5, 0x00124A63)),
+    0x00347EC4: frozenset((0x0011E279,)),
+    0x00347EC8: frozenset((0x0011E283,)),
 }
 # DirectSound's three-entry reference-counted helper vtable is installed by two
 # adjacent constructors.  The startup cleanup and release walkers call its two
@@ -914,6 +2368,42 @@ PHASE7_FUNCTION_PAIR_HELPER_TARGETS = {
     0x0010A290: tuple(sorted(pair[1] for pair in PHASE7_FUNCTION_PAIR_TABLE)),
     0x0010A29C: (0x0010A2F0,),
 }
+# Collision helper 0x6A6A0 indexes this immutable symmetric four-by-four
+# function table with the two primitive-kind fields supplied by its callers.
+# Seven entries are executable and four invalid combinations are explicit
+# nulls.  Preserve the complete helper/table/caller family so the register
+# call remains fail-closed without waiting to observe each primitive pairing.
+PHASE7_COLLISION_DISPATCH_TABLE_BASE = 0x00336E48
+PHASE7_COLLISION_DISPATCH_TABLE = (
+    (0x0006AAA0, 0x0006A210, 0x0006A550, 0x0006A5C0),
+    (0x0006A210, 0x0006A420, 0x0006A440, 0x0006A630),
+    (0x0006A550, 0x0006A440, 0x00000000, 0x00000000),
+    (0x0006A5C0, 0x0006A630, 0x00000000, 0x00000000),
+)
+PHASE7_COLLISION_DISPATCH_HELPER_START = 0x0006A6A0
+PHASE7_COLLISION_DISPATCH_HELPER_END = 0x0006A6F8
+PHASE7_COLLISION_DISPATCH_HELPER_SHA256 = (
+    "3e681731b40ace659f83f49d0ac675f11b02fb092e1e0d7396cad5bf64507653"
+)
+PHASE7_COLLISION_DISPATCH_SITE = 0x0006A6E6
+PHASE7_COLLISION_DISPATCH_CALLERS = frozenset(
+    {
+        0x00063B85,
+        0x00063E08,
+        0x00063E7C,
+        0x00063EEC,
+        0x00063F59,
+        0x00063FC6,
+        0x0006404E,
+        0x000640C3,
+        0x00064130,
+        0x000641A4,
+    }
+)
+PHASE7_COLLISION_DISPATCH_OBSERVED_BOUNDARY = (
+    PHASE7_COLLISION_DISPATCH_SITE,
+    0x0006A550,
+)
 # Helper 0x10D150 receives its EBP callback as the third stack argument.  Five
 # decoded callers install exact code addresses and the sixth direct caller is
 # the helper's recursive path, which preserves EBP.  Both callback sites inside
@@ -960,6 +2450,68 @@ PHASE7_ASSET_STREAM_ENTRY_REFERENCES = {
     0x00112EA0: {0x0011029E, 0x001134B6},
     0x00113100: {0x0011370C, 0x00115938},
 }
+# One resource plug-in descriptor installs a fixed four-entry callback vector
+# at object offset +0x14.  The plug-in consumes all four entries directly; its
+# resource converter receives slot zero as an explicit function argument and
+# invokes it at the fifth guarded site.  Recover the entire descriptor/vector
+# family together so loading new resource types cannot expose one callback at
+# a time.
+PHASE7_RESOURCE_CONVERTER_DESCRIPTOR = 0x00344D90
+PHASE7_RESOURCE_CONVERTER_DESCRIPTOR_VALUES = (
+    0x002CACA4,
+    0x00105920,
+    0x00000000,
+    0x00000000,
+    0x00105BE0,
+)
+PHASE7_RESOURCE_CONVERTER_CALLBACK_VECTOR = (
+    (0x00, 0x00105830),
+    (0x04, 0x001058C0),
+    (0x08, 0x00105450),
+    (0x0C, 0x001061A0),
+)
+PHASE7_RESOURCE_CONVERTER_INSTALLER_BINDINGS = {
+    0x00105BE7: (0x00, 0x00105830),
+    0x00105BED: (0x04, 0x001058C0),
+    0x00105BF4: (0x08, 0x00105450),
+    0x00105BFB: (0x0C, 0x001061A0),
+}
+PHASE7_RESOURCE_CONVERTER_CALLBACK_BINDINGS = {
+    0x001059BC: (0x04, 0x001058C0),
+    0x00105A6A: (0x04, 0x001058C0),
+    0x00105A89: (0x08, 0x00105450),
+    0x00105BC0: (0x0C, 0x001061A0),
+    0x00105E72: (0x00, 0x00105830),
+}
+PHASE7_RESOURCE_CONVERTER_INSTALLER_BYTES = (
+    "8B4424048B4014C70030581000C74004C0581000C7400850541000"
+    "C7400CA0611000B801000000C3"
+)
+PHASE7_RESOURCE_CONVERTER_INSTRUCTION_BYTES = {
+    # The adjacent plug-in shares the generic slot-C callback.  Keep its one
+    # immediate reference in the exact target-reference census.
+    0x0010501B: "C7400CA0611000",
+    0x00105923: "8B44245C",
+    0x00105927: "8B4C2458",
+    0x0010592C: "8B5914",
+    0x00105943: "895C2414",
+    0x001059B0: "8B4304",
+    0x001059BC: "FFD0",
+    0x00105A31: "8B03",
+    0x00105A33: "50",
+    0x00105A3C: "E84F020000",
+    0x00105A5E: "8B4304",
+    0x00105A6A: "FFD0",
+    0x00105A81: "8B4308",
+    0x00105A89: "FFD0",
+    0x00105BA9: "8B542414",
+    0x00105BAD: "8B420C",
+    0x00105BC0: "FFD0",
+    0x00105C10: "B8904D3400",
+    0x00105E5F: "8B442434",
+    0x00105E72: "FFD0",
+}
+PHASE7_RESOURCE_CONVERTER_OBSERVED_BOUNDARY = (0x00105E72, 0x00105830)
 # The accepted capsule retains the six installed callback values used by the
 # title's CRT wrapper table. Every decoded indirect site that names one of
 # these exact cells shares its finite target instead of growing site by site.
@@ -1051,6 +2603,133 @@ PHASE7_CAPTURED_SERVICE_IMPORT_CELLS = {
     0x00293CDC: 0xE0000400,
     0x00293E58: 0xE0000030,
 }
+# The title's optimized memmove implementation contains seven logical jump
+# tables and 16 consumers.  Four tables deliberately use non-zero or negative
+# selector ranges, allowing their unused entries to overlap adjacent machine
+# instructions.  Model the complete routine explicitly rather than weakening
+# the generic zero-based jump-table recognizer.
+PHASE7_MEMMOVE_JUMP_TABLES = {
+    0x0011F010: ((1, 0x0011F020), (2, 0x0011F04C), (3, 0x0011F070)),
+    0x0011F10C: (
+        (-4, 0x0011F10C),
+        (-3, 0x0011F114),
+        (-2, 0x0011F120),
+        (-1, 0x0011F134),
+    ),
+    0x0011F090: (
+        (0, 0x0011F0F3),
+        (1, 0x0011F0E0),
+        (2, 0x0011F0D8),
+        (3, 0x0011F0D0),
+        (4, 0x0011F0C8),
+        (5, 0x0011F0C0),
+        (6, 0x0011F0B8),
+        (7, 0x0011F0B0),
+    ),
+    0x0011F0FC: (
+        (0, 0x0011F10C),
+        (1, 0x0011F114),
+        (2, 0x0011F120),
+        (3, 0x0011F134),
+    ),
+    0x0011F19C: ((1, 0x0011F1AC), (2, 0x0011F1D0), (3, 0x0011F1F8)),
+    0x0011F248: (
+        (-7, 0x0011F24C),
+        (-6, 0x0011F254),
+        (-5, 0x0011F25C),
+        (-4, 0x0011F264),
+        (-3, 0x0011F26C),
+        (-2, 0x0011F274),
+        (-1, 0x0011F27C),
+        (0, 0x0011F28F),
+    ),
+    0x0011F298: (
+        (0, 0x0011F2A8),
+        (1, 0x0011F2B0),
+        (2, 0x0011F2C0),
+        (3, 0x0011F2D4),
+    ),
+}
+PHASE7_MEMMOVE_JUMP_BINDINGS = {
+    0x0011EFE5: (0x0011F0FC, "edx"),
+    0x0011EFFD: (0x0011F010, "eax"),
+    0x0011F004: (0x0011F10C, "ecx"),
+    0x0011F00C: (0x0011F090, "ecx"),
+    0x0011F042: (0x0011F0FC, "edx"),
+    0x0011F068: (0x0011F0FC, "edx"),
+    0x0011F086: (0x0011F0FC, "edx"),
+    0x0011F0F3: (0x0011F0FC, "edx"),
+    0x0011F16B: (0x0011F298, "edx"),
+    0x0011F176: (0x0011F248, "ecx"),
+    0x0011F191: (0x0011F19C, "eax"),
+    0x0011F198: (0x0011F298, "ecx"),
+    0x0011F1C6: (0x0011F298, "edx"),
+    0x0011F1F0: (0x0011F298, "edx"),
+    0x0011F222: (0x0011F298, "edx"),
+    0x0011F28F: (0x0011F298, "edx"),
+}
+PHASE7_MEMMOVE_JUMP_SITE_BYTES = {
+    0x0011EFE5: "FF2495FCF01100",
+    0x0011EFFD: "FF248510F01100",
+    0x0011F004: "FF248D0CF11100",
+    0x0011F00C: "FF248D90F01100",
+    0x0011F042: "FF2495FCF01100",
+    0x0011F068: "FF2495FCF01100",
+    0x0011F086: "FF2495FCF01100",
+    0x0011F0F3: "FF2495FCF01100",
+    0x0011F16B: "FF249598F21100",
+    0x0011F176: "FF248D48F21100",
+    0x0011F191: "FF24859CF11100",
+    0x0011F198: "FF248D98F21100",
+    0x0011F1C6: "FF249598F21100",
+    0x0011F1F0: "FF249598F21100",
+    0x0011F222: "FF249598F21100",
+    0x0011F28F: "FF249598F21100",
+}
+PHASE7_MEMMOVE_JUMP_CONTROL_BYTES = {
+    0x0011EFB0: "558BEC57568B750C8B4D108B7D088BC18BD103C63BFE76083BF80F827C010000F7C7030000007514C1E90283E20383F9087229F3A5FF2495FCF011008BC7BA0300000083E904720C83E00303C8FF248510F01100FF248D0CF1110090FF248D90F011009020F011004CF0110070F01100",
+    0x0011F14C: "8D7431FC8D7C39FCF7C7030000007524C1E90283E20383F908720DFDF3A5FCFF249598F211008BFFF7D9FF248D48F211008D49008BC7BA0300000083F904720C83E0032BC8FF24859CF11100FF248D98F2110090ACF11100D0F11100F8F11100",
+}
+PHASE7_MEMMOVE_JUMP_REFERENCES = {
+    0x0011F010: frozenset((0x0011EFFD,)),
+    0x0011F10C: frozenset((0x0011F004,)),
+    0x0011F090: frozenset((0x0011F00C,)),
+    0x0011F0FC: frozenset(
+        (0x0011EFE5, 0x0011F042, 0x0011F068, 0x0011F086, 0x0011F0F3)
+    ),
+    0x0011F19C: frozenset((0x0011F191,)),
+    0x0011F248: frozenset((0x0011F176,)),
+    0x0011F298: frozenset(
+        (0x0011F16B, 0x0011F198, 0x0011F1C6, 0x0011F1F0, 0x0011F222, 0x0011F28F)
+    ),
+}
+# The linked runtime's aligned-copy tail masks EBX to four bits and branches
+# around the indexed jump when the result is zero.  The physical table therefore
+# has one deliberate null followed by all 15 executable selector targets, which
+# the generic zero-based recognizer cannot safely infer.
+PHASE7_ALIGNED_COPY_TAIL_SITE = 0x0028B630
+PHASE7_ALIGNED_COPY_TAIL_TABLE = 0x0028B6D4
+PHASE7_ALIGNED_COPY_TAIL_TARGETS = (
+    0x0028B689,
+    0x0028B684,
+    0x0028B67F,
+    0x0028B67A,
+    0x0028B675,
+    0x0028B670,
+    0x0028B66B,
+    0x0028B666,
+    0x0028B661,
+    0x0028B65C,
+    0x0028B657,
+    0x0028B652,
+    0x0028B64D,
+    0x0028B648,
+    0x0028B643,
+)
+PHASE7_ALIGNED_COPY_TAIL_PROOF_START = 0x0028B61F
+PHASE7_ALIGNED_COPY_TAIL_PROOF_BYTES = (
+    "8BD983C10FC1E90483E30F740B8D749EC0FF249DD4B62800"
+)
 PHASE6_MAX_STATIC_JUMP_TABLE_ENTRIES = 256
 PHASE3_REWRITE_ISLAND_OFFSET = 0x40
 NATIVE_HOST_SERVICE_WRITE_U32 = 2
@@ -1069,6 +2748,9 @@ WORKLOAD_SERVICE_MEMORY = 12
 WORKLOAD_SERVICE_AUDIO = 13
 WORKLOAD_SERVICE_TITLE = 14
 WORKLOAD_SERVICE_BOOTSTRAP = 15
+WORKLOAD_SERVICE_XINPUT_CLOSE = 16
+WORKLOAD_SERVICE_XINPUT_SET_STATE = 17
+WORKLOAD_SERVICE_OFFLINE_KERNEL = 18
 IA32_VBLANK_RETURN_SENTINEL = 0xB2D3D000
 HOST_SERVICE_EXECUTION_NATIVE32 = 1
 HOST_SERVICE_EXECUTION_NATIVE64_BROKER = 2
@@ -1236,19 +2918,36 @@ SUPPORTED_WORKLOAD_SERVICE_SPECS: dict[int, dict[str, Any]] = {
 # native profile.  Kind/value pairs match the accepted native executor's
 # service dispatch contract.  Their bodies remain fail-closed until the same
 # behavior is owned by the normal-live native runtime.
+#
+# The allocation wrapper at 0x000CB690 remains guest code.  Music wrapper
+# 0x000CC2F0 is the title's narrow high-level audio ABI until the guest music
+# manager reaches the low-level stream path: mode 2 selects menu music, mode 3
+# selects the current gameplay track, mode 4 selects credits, and all other
+# modes stop the active track.  The service is native and never compiles guest
+# code at runtime.
 PHASE7_PROFILED_BOOT_SERVICE_ROWS = (
-    (0x000CB690, "TitleFrontendSpecialAudioCreate", 13, 18, 4, "audio"),
     (0x000CC2F0, "TitleMusicModeSet", 13, 19, 4, "audio"),
+    (0x0022C11B, "DirectSoundBufferRelease", 13, 29, 4, "audio"),
+    (0x0022CC0B, "DirectSoundStreamRelease", 13, 30, 4, "audio"),
     (0x0022CDA9, "DirectSoundStreamProcess", 13, 8, 12, "audio"),
     (0x0022CD0D, "DirectSoundStreamFlush", 13, 9, 4, "audio"),
     (0x0022D7D2, "DirectSoundBufferSetVolume", 13, 13, 8, "audio"),
+    (0x0022D85E, "DirectSoundBufferSetHeadroom", 13, 20, 8, "audio"),
+    (0x0022D87A, "DirectSoundBufferSetMixBinVolumes", 13, 21, 8, "audio"),
     (0x0022D896, "DirectSoundBufferPlay", 13, 4, 16, "audio"),
     (0x0022D8BA, "DirectSoundBufferStop", 13, 5, 4, "audio"),
     (0x0022D8D2, "DirectSoundBufferStopEx", 13, 6, 16, "audio"),
+    (0x0022D8F6, "DirectSoundBufferSetLoopRegion", 13, 22, 12, "audio"),
     (0x0022D916, "DirectSoundBufferGetStatus", 13, 17, 8, "audio"),
     (0x0022D932, "DirectSoundBufferGetPosition", 13, 15, 12, "audio"),
     (0x0022D952, "DirectSoundBufferSetPosition", 13, 16, 8, "audio"),
     (0x0022E738, "DirectSoundBufferSetFrequency", 13, 14, 8, "audio"),
+    (0x0022E754, "DirectSoundBufferSetOutputBuffer", 13, 23, 8, "audio"),
+    (0x0022E770, "DirectSoundBufferSetMixBins", 13, 24, 8, "audio"),
+    (0x0022E78C, "DirectSoundBufferSetAllParameters", 13, 25, 12, "audio"),
+    (0x0022E8C4, "DirectSoundBufferSetRolloffCurve", 13, 26, 16, "audio"),
+    (0x0022E8E8, "DirectSoundBufferSetI3DL2Source", 13, 27, 12, "audio"),
+    (0x0022E908, "DirectSoundBufferSetPlayRegion", 13, 28, 12, "audio"),
     (0x0022EF2F, "DirectSoundBufferSetFormat", 13, 3, 8, "audio"),
     (0x0022EF4B, "DirectSoundBufferSetData", 13, 2, 12, "audio"),
     (0x0022EF6B, "DirectSoundStreamSetFormat", 13, 10, 8, "audio"),
@@ -1256,8 +2955,10 @@ PHASE7_PROFILED_BOOT_SERVICE_ROWS = (
     (0x0022F90E, "DirectSoundStreamCreate", 13, 7, 16, "audio"),
     (0x00230ABD, "DirectSoundEffectImage", 13, 1, 12, "audio"),
     (0x0028CF40, "XInputOpen", 5, 0, 16, "input"),
+    (0x0028CF96, "XInputClose", 16, 0, 4, "input"),
     (0x0028CFA2, "XInputGetCapabilities", 6, 0, 8, "input"),
     (0x0028D180, "XInputGetState", 7, 0, 8, "input"),
+    (0x0028D1EC, "XInputSetState", 17, 0, 8, "input"),
     (0x0028D282, "XGetDevices", 4, 0, 4, "input"),
     (0x31F10200, "TitleAssetStreamClose", 14, 6, 0, "title"),
     (0xE0000000, "AvGetSavedDataAddress", 15, 17, 0, "render"),
@@ -1339,6 +3040,245 @@ PHASE7_PROFILED_BOOT_SERVICE_SPECS = {
 }
 PHASE7_PROFILED_BOOT_SERVICE_SPECS[0x31F10200]["normal_live_body"] = "implemented-native32"
 
+# These imports were not reached by the retained boot-to-Lesson-One profile,
+# but every call site names the loader's immutable kernel thunk table.  Their
+# native bodies are complete and can therefore be admitted by the offline
+# boundary audit without waiting for another manual gameplay fault.
+PHASE7_OFFLINE_KERNEL_SERVICE_SPECS: dict[int, dict[str, Any]] = {
+    0xE00002E0: {
+        "shim_name": "KeSetEvent",
+        "runtime_kind": WORKLOAD_SERVICE_BOOTSTRAP,
+        "runtime_value": 10,
+        "stack_cleanup_bytes": 12,
+        "boundary": "synchronization",
+        "normal_live_body": "implemented-native32",
+    },
+    0xE0000680: {
+        "shim_name": "RtlCompareMemoryUlong",
+        "runtime_kind": WORKLOAD_SERVICE_RUNTIME,
+        "runtime_value": 9,
+        "stack_cleanup_bytes": 12,
+        "boundary": "memory",
+        "normal_live_body": "implemented-native32",
+    },
+}
+
+# The complete import-table walk exposes a second, finite group of kernel
+# exports that the retained gameplay profile did not invoke.  Values in this
+# table are consumed by the native IA-32 worker's offline-kernel dispatcher;
+# none of them route through Python or permit runtime guest-code discovery.
+PHASE7_OFFLINE_KERNEL_SERVICE_ROWS = (
+    (0xE0000040, "DbgPrint", 1, 4, "synchronization"),
+    (0xE0000100, "HalReturnToFirmware", 2, 4, "synchronization"),
+    (0xE0000140, "IoDeleteSymbolicLink", 3, 4, "files"),
+    (0xE00001A0, "IoSynchronousFsdRequest", 4, 8, "files"),
+    (0xE00001D0, "KeBugCheck", 5, 4, "synchronization"),
+    (0xE00001E0, "KeCancelTimer", 6, 4, "synchronization"),
+    (0xE0000210, "KeDisconnectInterrupt", 7, 4, "synchronization"),
+    (0xE0000250, "KeInsertQueueDpc", 8, 4, "synchronization"),
+    (0xE0000260, "KeQueryPerformanceCounter", 9, 0, "timing"),
+    (0xE00002A0, "KeRemoveQueueDpc", 10, 4, "synchronization"),
+    (0xE00002B0, "KeRestoreFloatingPointState", 11, 4, "synchronization"),
+    (0xE00002C0, "KeSaveFloatingPointState", 12, 0, "synchronization"),
+    (0xE0000410, "MmQueryAddressProtect", 13, 4, "memory"),
+    (0xE0000470, "NtCreateEvent", 14, 8, "synchronization"),
+    (0xE00004A0, "NtDeleteFile", 15, 4, "files"),
+    (0xE00004E0, "NtFsControlFile", 16, 40, "files"),
+    (0xE0000580, "NtSetEvent", 17, 4, "synchronization"),
+    (0xE00005B0, "NtWaitForSingleObject", 18, 12, "synchronization"),
+    (0xE0000650, "PsTerminateSystemThread", 19, 4, "synchronization"),
+    (0xE00006F0, "RtlRaiseException", 20, 4, "synchronization"),
+    (0xE00007E0, "XcRC4Key", 21, 12, "synchronization"),
+    (0xE00007F0, "XcRC4Crypt", 22, 12, "synchronization"),
+    (0xE0000800, "XcHMAC", 23, 28, "synchronization"),
+    (0xE0000810, "XcVerifyPKCS1Signature", 24, 12, "synchronization"),
+    (0xE0000820, "XcModExp", 25, 16, "synchronization"),
+    (0xE0000830, "XcDESKeyParity", 26, 4, "synchronization"),
+    (0xE0000840, "XcKeyTable", 27, 8, "synchronization"),
+    (0xE0000850, "XcBlockCryptCBC", 28, 16, "synchronization"),
+)
+PHASE7_OFFLINE_KERNEL_SERVICE_SPECS.update(
+    {
+        target: {
+            "shim_name": shim_name,
+            "runtime_kind": WORKLOAD_SERVICE_OFFLINE_KERNEL,
+            "runtime_value": runtime_value,
+            "stack_cleanup_bytes": stack_cleanup_bytes,
+            "boundary": boundary,
+            "normal_live_body": "implemented-native32",
+        }
+        for target, shim_name, runtime_value, stack_cleanup_bytes, boundary in (
+            PHASE7_OFFLINE_KERNEL_SERVICE_ROWS
+        )
+    }
+)
+
+PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL = 20
+PHASE7_OFFLINE_VTABLE_RDATA_START = 0x00293CA0
+PHASE7_OFFLINE_VTABLE_RDATA_END = 0x002CD660
+PHASE7_OFFLINE_VTABLE_SLOT_LIMIT = 0x00000400
+PHASE7_OFFLINE_BOUNDARY_OPTIMIZATIONS = (
+    {
+        "id": "phase7-dirty-publication-code-page-filter-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": (
+            "skip canonical-page construction for pages without detached guest code and "
+            "compare/copy fixed pages eight words per iteration"
+        ),
+    },
+    {
+        "id": "phase7-dirty-publication-first-difference-suffix-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "combine dirty detection and publication after the first differing word",
+    },
+    {
+        "id": "phase7-code-page-sparse-publication-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "publish mutable code-page gaps without constructing a 4 KiB scratch page",
+    },
+    {
+        "id": "phase7-workload-allocation-last-hit-cache-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "cache the last native allocation interval used by memory services",
+    },
+    {
+        "id": "phase7-semaphore-handle-direct-cache-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "cache native semaphore lookups by guest handle",
+    },
+    {
+        "id": "phase7-audio-buffer-open-addressing-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "replace full audio-buffer scans with key-seeded open addressing",
+    },
+    {
+        "id": "phase7-audio-stream-open-addressing-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "replace full audio-stream scans with key-seeded open addressing",
+    },
+    {
+        "id": "phase7-file-handle-direct-cache-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "serve repeated native file operations from a handle-indexed cache",
+    },
+    {
+        "id": "phase7-audio-packet-stream-fifo-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "replace per-quantum packet minimum scans with per-stream FIFO links",
+    },
+    {
+        "id": "phase7-audio-playback-direct-cache-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "serve repeated active-playback controls from a key-indexed cache",
+    },
+    {
+        "id": "phase7-texture-binding-direct-cache-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "cache retained texture bindings by guest resource address",
+    },
+    {
+        "id": "phase7-resource-dedupe-open-addressing-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "replace quadratic per-frame texture dedupe with generation-stamped hashing",
+    },
+    {
+        "id": "phase7-resource-source-last-hit-cache-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "cache the last contiguous allocation used for render resource translation",
+    },
+    {
+        "id": "phase7-resource-word-compare-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "compare retained resource payloads eight words per iteration",
+    },
+    {
+        "id": "phase7-audio-active-playback-mask-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "mix only active playback slots using two native bit masks",
+    },
+    {
+        "id": "phase7-audio-active-stream-mask-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "visit only live DirectSound streams in each audio quantum",
+    },
+    {
+        "id": "phase7-audio-packet-free-hint-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "allocate packet slots from a rotating free-slot hint",
+    },
+    {
+        "id": "phase7-audio-playback-free-mask-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "reserve free playback slots from complemented active masks",
+    },
+    {
+        "id": "phase7-sha256-direct-block-transform-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "transform aligned SHA-256 input blocks without staging them through the tail buffer",
+    },
+    {
+        "id": "phase7-sha256-rolling-schedule-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "reduce the SHA-256 message schedule from 64 stack words to a 16-word rolling ring",
+    },
+    {
+        "id": "phase7-vertex-range-sorted-merge-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "retain sorted vertex intervals and merge only the contiguous overlap window",
+    },
+    {
+        "id": "phase7-audio-gain-memoization-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "memoize fixed-point centibel gains in a direct-mapped native table",
+    },
+    {
+        "id": "phase7-audio-idle-quantum-bypass-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "skip accumulator clearing and mixer locking when playback and stream masks are empty",
+    },
+    {
+        "id": "phase7-audio-accumulator-wide-clear-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "clear eight native mix accumulators per loop iteration",
+    },
+    {
+        "id": "phase7-audio-unity-resample-fast-path-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "bypass interpolation multiplies for integer-position 48 kHz playback",
+    },
+    {
+        "id": "phase7-allocation-page-direct-cache-v1",
+        "kind": "runtime",
+        "boundary_credit": PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL,
+        "summary": "cache workload allocation intervals by guest page before the linear fallback",
+    },
+)
+
 PHASE7_NORMAL_LIVE_INPUT_AUDIO_SERVICE_TARGETS = frozenset(
     target
     for target, _name, runtime_kind, _value, _cleanup, _boundary in PHASE7_PROFILED_BOOT_SERVICE_ROWS
@@ -1348,11 +3288,67 @@ PHASE7_NORMAL_LIVE_INPUT_AUDIO_SERVICE_TARGETS = frozenset(
         WORKLOAD_SERVICE_XINPUT_OPEN,
         WORKLOAD_SERVICE_XINPUT_CAPABILITIES,
         WORKLOAD_SERVICE_XINPUT_STATE,
+        WORKLOAD_SERVICE_XINPUT_CLOSE,
+        WORKLOAD_SERVICE_XINPUT_SET_STATE,
         WORKLOAD_SERVICE_AUDIO,
     }
 )
 for _target in PHASE7_NORMAL_LIVE_INPUT_AUDIO_SERVICE_TARGETS:
     PHASE7_PROFILED_BOOT_SERVICE_SPECS[_target]["normal_live_body"] = "implemented-native32"
+
+# Native-created DirectSound buffers intentionally omit the private DSOUND
+# object graph.  These public configuration entry points therefore form one
+# indivisible static host-ABI family: admitting only the entries seen by an
+# older coverage profile can expose a guest implementation that dereferences
+# the omitted graph when a different frontend/level path configures a buffer.
+PHASE7_NATIVE_BUFFER_CONFIGURATION_SERVICE_TARGETS = frozenset(
+    target
+    for (
+        target,
+        _name,
+        runtime_kind,
+        runtime_value,
+        _cleanup,
+        _boundary,
+    ) in PHASE7_PROFILED_BOOT_SERVICE_ROWS
+    if runtime_kind == WORKLOAD_SERVICE_AUDIO and 20 <= runtime_value <= 28
+)
+
+# Native-created buffer and stream shells retain only the public interface
+# shape needed by the title.  Their two reached release paths must therefore
+# stay at the same native boundary as creation: entering the private DSOUND
+# destructors would dereference an object graph the native mixer does not own.
+PHASE7_NATIVE_AUDIO_LIFETIME_SERVICE_TARGETS = frozenset(
+    target
+    for (
+        target,
+        _name,
+        runtime_kind,
+        runtime_value,
+        _cleanup,
+        _boundary,
+    ) in PHASE7_PROFILED_BOOT_SERVICE_ROWS
+    if runtime_kind == WORKLOAD_SERVICE_AUDIO and runtime_value in {29, 30}
+)
+
+# XInputOpen returns a native-owned synthetic handle rather than the private
+# Xbox device object used by the title's linked XInput implementation.  Every
+# operation that consumes or destroys that handle must consequently remain on
+# the same explicit host ABI boundary.  Keep the complete finite pair even
+# when a capture reaches only rumble or only hot-plug teardown.
+PHASE7_NATIVE_XINPUT_CONTROL_SERVICE_TARGETS = frozenset(
+    target
+    for (
+        target,
+        _name,
+        runtime_kind,
+        _runtime_value,
+        _cleanup,
+        _boundary,
+    ) in PHASE7_PROFILED_BOOT_SERVICE_ROWS
+    if runtime_kind
+    in {WORKLOAD_SERVICE_XINPUT_CLOSE, WORKLOAD_SERVICE_XINPUT_SET_STATE}
+)
 
 # Phase-7 normal-live ports are promoted in subsystem-sized groups.  Keeping
 # this list next to the measured service table makes the build manifest a
@@ -1984,6 +3980,8 @@ def _capsule_host_service_thunks(
                 WORKLOAD_SERVICE_AUDIO,
                 WORKLOAD_SERVICE_TITLE,
                 WORKLOAD_SERVICE_BOOTSTRAP,
+                WORKLOAD_SERVICE_XINPUT_CLOSE,
+                WORKLOAD_SERVICE_XINPUT_SET_STATE,
             }:
                 raise Ia32BackendError(
                     f"capsule service {shim_name} has unsupported workload kind {runtime_kind}"
@@ -2045,6 +4043,8 @@ def _host_service_record(service: _HostServiceThunk) -> dict[str, Any]:
 def _phase6_host_service_thunks(
     capsule: ReplayCapsule,
     profile: Ia32CoverageProfile,
+    *,
+    complete_offline_registry: bool = False,
 ) -> dict[int, _HostServiceThunk]:
     """Merge exact supported-workload ABI descriptors into a capture registry."""
 
@@ -2052,6 +4052,7 @@ def _phase6_host_service_thunks(
     service_specs = {
         **SUPPORTED_WORKLOAD_SERVICE_SPECS,
         **PHASE7_PROFILED_BOOT_SERVICE_SPECS,
+        **PHASE7_OFFLINE_KERNEL_SERVICE_SPECS,
     }
     profile_record = _normalized_coverage_profile(profile)
     observed_external_targets = {
@@ -2067,6 +4068,41 @@ def _phase6_host_service_thunks(
         for cell, target in PHASE7_CAPTURED_SERVICE_IMPORT_CELLS.items()
         if capsule.memory.read_u32(cell) == target
     )
+    observed_audio_boundary = any(
+        target in PHASE7_NORMAL_LIVE_INPUT_AUDIO_SERVICE_TARGETS
+        and int(
+            cast(int, PHASE7_PROFILED_BOOT_SERVICE_SPECS[target]["runtime_kind"])
+        )
+        == WORKLOAD_SERVICE_AUDIO
+        for target in observed_external_targets
+    )
+    observed_xinput_boundary = any(
+        target in PHASE7_NORMAL_LIVE_INPUT_AUDIO_SERVICE_TARGETS
+        and int(
+            cast(int, PHASE7_PROFILED_BOOT_SERVICE_SPECS[target]["runtime_kind"])
+        )
+        in {
+            WORKLOAD_SERVICE_XGETDEVICES,
+            WORKLOAD_SERVICE_XINPUT_OPEN,
+            WORKLOAD_SERVICE_XINPUT_CAPABILITIES,
+            WORKLOAD_SERVICE_XINPUT_STATE,
+            WORKLOAD_SERVICE_XINPUT_CLOSE,
+            WORKLOAD_SERVICE_XINPUT_SET_STATE,
+        }
+        for target in observed_external_targets
+    )
+    if observed_audio_boundary:
+        observed_external_targets.update(PHASE7_NATIVE_BUFFER_CONFIGURATION_SERVICE_TARGETS)
+        observed_external_targets.update(PHASE7_NATIVE_AUDIO_LIFETIME_SERVICE_TARGETS)
+    if observed_xinput_boundary:
+        observed_external_targets.update(PHASE7_NATIVE_XINPUT_CONTROL_SERVICE_TARGETS)
+    if complete_offline_registry:
+        observed_external_targets.update(
+            target
+            for target, spec in service_specs.items()
+            if spec.get("normal_live_body", "implemented-native32")
+            == "implemented-native32"
+        )
     for target in sorted(observed_external_targets):
         if target in services:
             continue
@@ -3170,13 +5206,58 @@ def _resident_audio_buffer_command_rewrite(
             raise Ia32BackendError(
                 f"finite audio buffer-command self-clear family drifted: 0x{address:08X}"
             )
+    for address, expected in PHASE7_AUDIO_BUFFER_COMMAND_CALL_SITES.items():
+        caller = instructions.get(address)
+        if (
+            caller is None
+            or caller.bytes_hex.upper() != expected
+            or caller.mnemonic.casefold() != "call"
+            or caller.target != 0x002309EC
+        ):
+            raise Ia32BackendError(
+                f"finite audio buffer-command caller family drifted: 0x{address:08X}"
+            )
+    observed_callers = {
+        address
+        for address, candidate in instructions.items()
+        if candidate.mnemonic.casefold() == "call" and candidate.target == 0x002309EC
+    }
+    if observed_callers != set(PHASE7_AUDIO_BUFFER_COMMAND_CALL_SITES):
+        raise Ia32BackendError("finite audio buffer-command caller census drifted")
+
+    operands = instruction.operands
+    supported = False
+    if instruction.address == PHASE7_AUDIO_BUFFER_COMMAND_IMMEDIATE_SITE:
+        supported = bool(
+            instruction.mnemonic.casefold() == "push"
+            and len(operands) == 1
+            and operands[0].kind == "imm"
+            and operands[0].immediate == PHASE7_AUDIO_BUFFER_COMMAND_VALUES[instruction.address]
+        )
+    elif instruction.address == 0x00230A3A:
+        destination = operands[0] if len(operands) == 2 else None
+        source = operands[1] if len(operands) == 2 else None
+        supported = bool(
+            instruction.mnemonic.casefold() == "mov"
+            and destination is not None
+            and destination.kind == "mem"
+            and destination.size == 32
+            and destination.base == "eax"
+            and destination.index is None
+            and destination.scale == 1
+            and destination.displacement == 0x10
+            and destination.absolute is None
+            and destination.segment is None
+            and source is not None
+            and source.kind == "imm"
+            and source.size == 32
+            and source.immediate == PHASE7_AUDIO_BUFFER_COMMAND_VALUES[instruction.address]
+        )
     supported = bool(
-        instruction.address == PHASE7_AUDIO_BUFFER_COMMAND_IMMEDIATE_SITE
-        and instruction.mnemonic.casefold() == "push"
-        and len(instruction.operands) == 1
-        and instruction.operands[0].kind == "imm"
-        and instruction.operands[0].immediate == PHASE7_AUDIO_BUFFER_COMMAND_VALUE
-        and instruction.bytes_hex.upper() == PHASE7_AUDIO_BUFFER_COMMAND_FAMILY[instruction.address]
+        supported
+        and instruction.address in PHASE7_AUDIO_BUFFER_COMMAND_VALUES
+        and instruction.bytes_hex.upper()
+        == PHASE7_AUDIO_BUFFER_COMMAND_FAMILY[instruction.address]
     )
     if not supported:
         raise Ia32BackendError(
@@ -3185,7 +5266,10 @@ def _resident_audio_buffer_command_rewrite(
         )
 
     replacement = bytearray(bytes.fromhex(instruction.bytes_hex))
-    replacement[-1] = 0
+    if instruction.address == PHASE7_AUDIO_BUFFER_COMMAND_IMMEDIATE_SITE:
+        replacement[-1] = 0
+    else:
+        replacement[-4:] = bytes(4)
     return replace(instruction, bytes_hex=replacement.hex().upper())
 
 
@@ -3516,7 +5600,7 @@ def _phase3_architecture_plan(
                 }
             )
             continue
-        if address == PHASE7_AUDIO_BUFFER_COMMAND_IMMEDIATE_SITE and resident_privileged_boundary:
+        if address in PHASE7_AUDIO_BUFFER_COMMAND_VALUES and resident_privileged_boundary:
             rewritten_instruction = _resident_audio_buffer_command_rewrite(
                 instruction,
                 preflight.instructions,
@@ -3529,7 +5613,9 @@ def _phase3_architecture_plan(
                     "kind": "audio-buffer-command-self-clear",
                     "status": "implemented-resident-finite-self-clear",
                     "family_sites": sorted(PHASE7_AUDIO_BUFFER_COMMAND_FAMILY),
-                    "command_value": PHASE7_AUDIO_BUFFER_COMMAND_VALUE,
+                    "producer_sites": sorted(PHASE7_AUDIO_BUFFER_COMMAND_VALUES),
+                    "caller_sites": sorted(PHASE7_AUDIO_BUFFER_COMMAND_CALL_SITES),
+                    "command_value": PHASE7_AUDIO_BUFFER_COMMAND_VALUES[address],
                     "mailbox_displacement": 0x810,
                     "preserved_eflags": True,
                     "original_bytes": instruction.bytes_hex,
@@ -3759,9 +5845,22 @@ def _phase3_architecture_plan(
             continue
         if mnemonic in REJECTED_MNEMONICS:
             if _resident_fail_closed_trap(instruction) and resident_privileged_boundary:
-                # Static closure may discover assertion/no-return return sites that were
-                # never observed. Keep debug interrupts terminal so reaching one is
-                # contained by the scheduler instead of making it an executable rewrite.
+                # This is the title's explicit assertion/no-return instruction, not an
+                # injected unknown-boundary guard. Preserve the native terminal opcode
+                # and record its semantics so the artifact inventory does not conflate
+                # a resolved guest debug exit with an unresolved recompilation seam.
+                rewritten[address] = instruction
+                rewrites.append(
+                    {
+                        "address": address,
+                        "address_hex": f"0x{address:08X}",
+                        "kind": "software-debug-terminal",
+                        "status": "implemented-native-terminal",
+                        "original_bytes": instruction.bytes_hex,
+                        "replacement_bytes": instruction.bytes_hex,
+                        "terminal_semantics": "resident-exception-containment",
+                    }
+                )
                 continue
             if mnemonic in {"cli", "sti", "wbinvd", "out"} and resident_privileged_boundary:
                 rewritten_instruction = _resident_privileged_noop_rewrite(instruction)
@@ -7707,10 +9806,36 @@ static long __stdcall record_exception(ExceptionPointers* pointers) {{
     native_publication = f"""    for (index = 0; index < size; ++index) target[index] = source[index];
 }}
 {new_handler}static BOOL page_changed(const U8* before, const U8* after) {{
+    const U32* left = (const U32*)before;
+    const U32* right = (const U32*)after;
     U32 index;
-    for (index = 0; index < 4096u; ++index)
-        if (before[index] != after[index]) return 1;
+    for (index = 0; index < 1024u; index += 8u) {{
+        U32 changed = (left[index] ^ right[index]) |
+            (left[index + 1u] ^ right[index + 1u]) |
+            (left[index + 2u] ^ right[index + 2u]) |
+            (left[index + 3u] ^ right[index + 3u]) |
+            (left[index + 4u] ^ right[index + 4u]) |
+            (left[index + 5u] ^ right[index + 5u]) |
+            (left[index + 6u] ^ right[index + 6u]) |
+            (left[index + 7u] ^ right[index + 7u]);
+        if (changed != 0u) return 1;
+    }}
     return 0;
+}}
+static void copy_page(U8* target, const U8* source) {{
+    U32* output = (U32*)target;
+    const U32* input = (const U32*)source;
+    U32 index;
+    for (index = 0; index < 1024u; index += 8u) {{
+        output[index] = input[index];
+        output[index + 1u] = input[index + 1u];
+        output[index + 2u] = input[index + 2u];
+        output[index + 3u] = input[index + 3u];
+        output[index + 4u] = input[index + 4u];
+        output[index + 5u] = input[index + 5u];
+        output[index + 6u] = input[index + 6u];
+        output[index + 7u] = input[index + 7u];
+    }}
 }}
 static void publish_pages_and_dirty(void) {{
     U32 index;
@@ -7719,7 +9844,7 @@ static void publish_pages_and_dirty(void) {{
         U8* input = g_exchange->pages + index * 4096u;
         U8* output = (U8*)kPages[index];
         dirty[index] = (U8)page_changed(input, output);
-        copy_bytes(input, output, 4096u);
+        copy_page(input, output);
     }}
 }}
 """
@@ -8105,6 +10230,14 @@ static U32 dispatch_workload_service(
             }}
             return equal ? 1u : 0u;
         }}
+        if (service->runtime_value == 9u) {{
+            U32 source = arguments[0], length = arguments[1];
+            U32 pattern = arguments[2], matched = 0u;
+            while (source != 0u && matched + 4u <= length &&
+                   *(const U32*)(source + matched) == pattern)
+                matched += 4u;
+            return matched;
+        }}
         if (service->runtime_value == 3u) {{
             if (arguments[4] != 0u) *(U32*)arguments[4] = 0u;
             return 0xC0000034u;
@@ -8259,6 +10392,117 @@ static U32 dispatch_workload_service(
             return allocation && end <= allocation_end ? 0u : 0xC000000Du;
         }}
     }}
+    if (service->runtime_kind == {WORKLOAD_SERVICE_OFFLINE_KERNEL}u) {{
+        U32 value = service->runtime_value;
+        if (value == 1u || value == 3u || value == 4u || value == 7u ||
+            value == 8u || value == 10u || value == 11u || value == 12u ||
+            value == 15u || value == 19u || value == 20u)
+            return value == 7u || value == 8u || value == 10u ? 1u : 0u;
+        if (value == 2u || value == 5u) {{
+            ExitProcess(arguments[0]);
+            return 0u;
+        }}
+        if (value == 6u) {{
+            U32 timer = arguments[0];
+            U32 previous = timer ? *(U32*)(timer + 4u) : 0u;
+            if (timer) *(U32*)(timer + 4u) = 0u;
+            return previous != 0u;
+        }}
+        if (value == 9u) {{
+            U64 counter = 0u;
+            if (!QueryPerformanceCounter(&counter)) return 0u;
+            return (U32)counter;
+        }}
+        if (value == 13u)
+            return workload_find_allocation(arguments[0]) ? 4u : 0u;
+        if (value == 14u) {{
+            U32 event = workload_allocate(8u, 4u, &g_workload_next_pool);
+            if (!event) return 0u;
+            *(U32*)event = arguments[0] != 0u;
+            *(U32*)(event + 4u) = arguments[1] != 0u;
+            return event;
+        }}
+        if (value == 16u) {{
+            if (arguments[4]) {{
+                *(U32*)arguments[4] = 0u;
+                *(U32*)(arguments[4] + 4u) = 0u;
+            }}
+            return 0u;
+        }}
+        if (value == 17u || value == 18u) {{
+            WorkloadSemaphore* semaphore = 0;
+            for (index = 0u; index < g_workload_semaphore_count; ++index)
+                if (g_workload_semaphores[index].handle == arguments[0]) {{
+                    semaphore = &g_workload_semaphores[index];
+                    break;
+                }}
+            if (!semaphore) return 0xC0000008u;
+            if (value == 17u) {{
+                U32 previous = semaphore->count;
+                semaphore->count = semaphore->limit ? 1u : 0u;
+                return previous;
+            }}
+            if (semaphore->count) {{
+                --semaphore->count;
+                return 0u;
+            }}
+            return 0x00000102u;
+        }}
+        if (value == 21u) {{
+            U8* permutation = (U8*)arguments[0];
+            U32 key_size = arguments[1], key = arguments[2], j = 0u;
+            if (!permutation) return 0u;
+            for (index = 0u; index < 256u; ++index) permutation[index] = (U8)index;
+            for (index = 0u; index < 256u; ++index) {{
+                U8 temporary;
+                j = (j + permutation[index] +
+                     (key_size ? *(U8*)(key + index % key_size) : 0u)) & 255u;
+                temporary = permutation[index];
+                permutation[index] = permutation[j];
+                permutation[j] = temporary;
+            }}
+            *(U32*)(arguments[0] + 256u) = 0u;
+            *(U32*)(arguments[0] + 260u) = 0u;
+            return 0u;
+        }}
+        if (value == 22u) {{
+            U8* permutation = (U8*)arguments[0];
+            U32 size = arguments[1], payload = arguments[2], i, j;
+            if (!permutation) return 0u;
+            i = *(U32*)(arguments[0] + 256u) & 255u;
+            j = *(U32*)(arguments[0] + 260u) & 255u;
+            for (index = 0u; index < size; ++index) {{
+                U8 temporary;
+                i = (i + 1u) & 255u;
+                j = (j + permutation[i]) & 255u;
+                temporary = permutation[i];
+                permutation[i] = permutation[j];
+                permutation[j] = temporary;
+                *(U8*)(payload + index) ^=
+                    permutation[(permutation[i] + permutation[j]) & 255u];
+            }}
+            *(U32*)(arguments[0] + 256u) = i;
+            *(U32*)(arguments[0] + 260u) = j;
+            return 0u;
+        }}
+        if (value == 26u) {{
+            U8* key = (U8*)arguments[0];
+            if (key) for (index = 0u; index < 8u; ++index) {{
+                U8 byte = key[index] & 0xFEu;
+                U8 bits = byte;
+                bits ^= bits >> 4u; bits ^= bits >> 2u; bits ^= bits >> 1u;
+                key[index] = byte | ((bits & 1u) ^ 1u);
+            }}
+            return 0u;
+        }}
+        if (value == 27u) {{
+            if (arguments[0] && arguments[1])
+                copy_bytes((void*)arguments[0], (void*)arguments[1], 8u);
+            return 0u;
+        }}
+        if (value == 23u || value == 24u || value == 25u || value == 28u)
+            return 0u;
+    }}
     if (service->runtime_kind == {WORKLOAD_SERVICE_BOOTSTRAP}u) {{
         if (service->runtime_value == 1u) {{
             if (arguments[3]) *(U32*)arguments[3] = 0x00400101u;
@@ -8305,8 +10549,14 @@ static U32 dispatch_workload_service(
                     g_workload_semaphores[index].handle = 0u;
                     g_workload_semaphores[index].count = 0u;
                     g_workload_semaphores[index].limit = 0u;
-                }}
+            }}
             return 0u;
+        }}
+        if (service->runtime_value == 10u) {{
+            U32 event = arguments[0];
+            U32 previous = event != 0u ? *(U32*)(event + 4u) : 0u;
+            if (event != 0u) *(U32*)(event + 4u) = 1u;
+            return previous;
         }}
         if (service->runtime_value == 17u) return g_workload_av_saved_data_address;
         if (service->runtime_value == 18u) return 0u;
@@ -9393,6 +11643,17 @@ def _phase7_c_source(
         f"exchange->version != {CUTOVER_EXCHANGE_VERSION}u",
     )
     memory_offset = _phase7_memory_offset(len(page_addresses))
+    detached_code_pages: set[int] = set()
+    if detached_guest:
+        for address, payload in code_spans:
+            if not payload:
+                continue
+            first_page = address & ~(PAGE_SIZE - 1)
+            final_page = (address + len(payload) - 1) & ~(PAGE_SIZE - 1)
+            detached_code_pages.update(range(first_page, final_page + PAGE_SIZE, PAGE_SIZE))
+    detached_code_page_flags = ",".join(
+        "1u" if address in detached_code_pages else "0u" for address in page_addresses
+    )
     old_publication = f"""static void publish_pages_and_dirty(void) {{
     U32 index;
     U8* dirty = g_exchange->pages + {len(page_addresses)}u * 4096u;
@@ -9400,16 +11661,32 @@ def _phase7_c_source(
         U8* input = g_exchange->pages + index * 4096u;
         U8* output = (U8*)kPages[index];
         dirty[index] = (U8)page_changed(input, output);
-        copy_bytes(input, output, 4096u);
+        copy_page(input, output);
     }}
 }}
 """
     canonical_code_helper = (
-        """static U8 g_canonical_publication_page[4096];
-static void restore_published_code(
-    U32 page_address, U8* output, const U8* published, U32* cursor
+        "static const U8 kDetachedGuestCodePages[] = {"
+        + detached_code_page_flags
+        + "};\n"
+        + """static BOOL publish_changed_bytes(
+    U8* published, const U8* resident, U32 size
 ) {
+    U32 index = 0u;
+    while (index + 4u <= size &&
+           *(const U32*)(published + index) == *(const U32*)(resident + index))
+        index += 4u;
+    while (index < size && published[index] == resident[index]) ++index;
+    if (index == size) return 0;
+    copy_bytes(published + index, resident + index, size - index);
+    return 1;
+}
+static BOOL publish_page_without_code(
+    U32 page_address, U8* published, const U8* resident, U32* cursor
+) {
+    BOOL changed = 0;
     U32 index;
+    U32 position = 0u;
     U32 page_end = page_address + 4096u;
     U32 count = sizeof(kDetachedGuestSpans) / sizeof(kDetachedGuestSpans[0]);
     while (*cursor < count &&
@@ -9419,16 +11696,20 @@ static void restore_published_code(
     for (index = *cursor; index < count; ++index) {
         U32 span_start = kDetachedGuestSpans[index].address;
         U32 span_end = span_start + kDetachedGuestSpans[index].size;
-        U32 copy_start;
-        U32 copy_end;
+        U32 code_start;
+        U32 code_end;
         if (span_start >= page_end) break;
-        copy_start = span_start > page_address ? span_start : page_address;
-        copy_end = span_end < page_end ? span_end : page_end;
-        if (copy_start < copy_end)
-            copy_bytes(output + copy_start - page_address,
-                       published + copy_start - page_address,
-                       copy_end - copy_start);
+        code_start = span_start > page_address ? span_start - page_address : 0u;
+        code_end = span_end < page_end ? span_end - page_address : 4096u;
+        if (position < code_start)
+            changed |= publish_changed_bytes(
+                published + position, resident + position, code_start - position);
+        if (position < code_end) position = code_end;
     }
+    if (position < 4096u)
+        changed |= publish_changed_bytes(
+            published + position, resident + position, 4096u - position);
+    return changed;
 }
 """
         if detached_guest
@@ -9436,21 +11717,43 @@ static void restore_published_code(
     )
     publication_locals = "    U32 code_cursor = 0u;\n" if detached_guest else ""
     publication_compare = (
-        """        U8* canonical = g_canonical_publication_page;
-        U32 byte_index;
-        for (byte_index = 0u; byte_index < 4096u; ++byte_index)
-            ((volatile U8*)canonical)[byte_index] =
-                ((volatile U8*)resident)[byte_index];
-        restore_published_code(kPages[index], canonical, published, &code_cursor);
-        if (page_changed(published, canonical)) {
-            for (byte_index = 0u; byte_index < 4096u; ++byte_index)
-                ((volatile U8*)published)[byte_index] =
-                    ((volatile U8*)canonical)[byte_index];"""
+        """        BOOL changed = kDetachedGuestCodePages[index] != 0u
+            ? publish_page_without_code(
+                kPages[index], published, resident, &code_cursor)
+            : publish_changed_page(published, resident);
+        if (changed) {"""
         if detached_guest
-        else """        if (page_changed(published, resident)) {
-            copy_bytes(published, resident, 4096u);"""
+        else """        if (publish_changed_page(published, resident)) {"""
     )
-    new_publication = f"""{canonical_code_helper}static __declspec(noreturn) void protocol_failure(U32 error, U32 detail);
+    new_publication = f"""static BOOL publish_changed_page(U8* published, const U8* resident) {{
+    U32* output = (U32*)published;
+    const U32* input = (const U32*)resident;
+    U32 index;
+    for (index = 0u; index < 1024u; index += 8u) {{
+        if (output[index] != input[index] ||
+            output[index + 1u] != input[index + 1u] ||
+            output[index + 2u] != input[index + 2u] ||
+            output[index + 3u] != input[index + 3u] ||
+            output[index + 4u] != input[index + 4u] ||
+            output[index + 5u] != input[index + 5u] ||
+            output[index + 6u] != input[index + 6u] ||
+            output[index + 7u] != input[index + 7u]) {{
+            for (; index < 1024u; index += 8u) {{
+                output[index] = input[index];
+                output[index + 1u] = input[index + 1u];
+                output[index + 2u] = input[index + 2u];
+                output[index + 3u] = input[index + 3u];
+                output[index + 4u] = input[index + 4u];
+                output[index + 5u] = input[index + 5u];
+                output[index + 6u] = input[index + 6u];
+                output[index + 7u] = input[index + 7u];
+            }}
+            return 1;
+        }}
+    }}
+    return 0;
+}}
+{canonical_code_helper}static __declspec(noreturn) void protocol_failure(U32 error, U32 detail);
 static U32* cutover_memory_header(void) {{
     return (U32*)((U8*)g_exchange + {memory_offset}u);
 }}
@@ -9469,8 +11772,8 @@ static void initialize_resident_memory(void) {{
     U8* states = cutover_page_states();
     validate_cutover_memory_header();
     for (index = 0; index < sizeof(kPages) / sizeof(kPages[0]); ++index) {{
-        copy_bytes((void*)kPages[index],
-                   g_exchange->pages + index * 4096u, 4096u);
+        copy_page((U8*)kPages[index],
+                  g_exchange->pages + index * 4096u);
         states[index] = {CUTOVER_PAGE_CLEAN}u;
     }}
     header[2] = {len(page_addresses)}u;
@@ -9494,8 +11797,8 @@ static void apply_host_publications(void) {{
     validate_cutover_memory_header();
     for (index = 0; index < sizeof(kPages) / sizeof(kPages[0]); ++index) {{
         if (states[index] == {CUTOVER_PAGE_HOST_PUBLICATION}u) {{
-            copy_bytes((void*)kPages[index],
-                       g_exchange->pages + index * 4096u, 4096u);
+            copy_page((U8*)kPages[index],
+                      g_exchange->pages + index * 4096u);
             states[index] = {CUTOVER_PAGE_CLEAN}u;
             ++count;
         }} else if (states[index] != {CUTOVER_PAGE_CLEAN}u) {{
@@ -9573,12 +11876,21 @@ def _normal_live_resource_publication_c_source() -> str:
     """Return the native NV2A texture snapshot publisher used by normal-live."""
 
     return r"""#define LIVE_RESOURCE_BINDING_CAPACITY 256u
+#define LIVE_VERTEX_RANGE_CAPACITY 1024u
+#define LIVE_RESOURCE_CAPACITY \
+    (LIVE_RESOURCE_BINDING_CAPACITY + LIVE_VERTEX_RANGE_CAPACITY)
 typedef struct LiveResourceScanState {
     U32 next_address, run_active, pending_long_header, pending_packet;
     U32 non_increasing, first_method, remaining, method_index;
     U32 texture_offsets[4], texture_formats[4], texture_image_rects[4];
     U32 texture_offset_mask, texture_format_mask;
-    U32 frame_binding_count;
+    U32 vertex_array_offsets[16], vertex_array_formats[16];
+    U32 vertex_array_offset_mask, vertex_array_format_mask;
+    U32 active_vertex_primitive, active_vertex_max_index;
+    U32 active_vertex_has_index, retained_vertex_range_count;
+    U32 retained_vertex_range_starts[LIVE_VERTEX_RANGE_CAPACITY];
+    U32 retained_vertex_range_ends[LIVE_VERTEX_RANGE_CAPACITY];
+    U32 retained_binding_count, retained_binding_evict_cursor;
     U32 frame_binding_stages[LIVE_RESOURCE_BINDING_CAPACITY];
     U32 frame_binding_addresses[LIVE_RESOURCE_BINDING_CAPACITY];
     U32 frame_binding_formats[LIVE_RESOURCE_BINDING_CAPACITY];
@@ -9593,12 +11905,24 @@ typedef struct LiveSha256 {
 typedef struct LiveTextureResource {
     U32 stage, address, source, width, height, byte_count;
     const char* format;
+    U8 hash[32];
 } LiveTextureResource;
 static LiveResourceScanState g_live_resource_scan;
 static LiveTextureResource g_live_texture_resources[
-    LIVE_RESOURCE_BINDING_CAPACITY];
+    LIVE_RESOURCE_CAPACITY];
 static U32 g_live_resource_payload_size = 12u;
+static U32 g_live_texture_binding_cache[LIVE_RESOURCE_BINDING_CAPACITY];
+#define LIVE_RESOURCE_DEDUPE_CAPACITY 2048u
+static U32 g_live_resource_dedupe_generation;
+static U32 g_live_resource_dedupe_stamps[LIVE_RESOURCE_DEDUPE_CAPACITY];
+static U32 g_live_resource_dedupe_addresses[LIVE_RESOURCE_DEDUPE_CAPACITY];
+static U32 g_live_resource_dedupe_widths[LIVE_RESOURCE_DEDUPE_CAPACITY];
+static U32 g_live_resource_dedupe_heights[LIVE_RESOURCE_DEDUPE_CAPACITY];
+static const char* g_live_resource_dedupe_formats[
+    LIVE_RESOURCE_DEDUPE_CAPACITY];
+static WorkloadAllocation* g_live_resource_last_allocation;
 static BOOL live_readable_range(U32, U32);
+static BOOL live_resource_source(U32, U32, U32*);
 static U32 live_sha256_rotate(U32 value, U32 count) {
     return (value >> count) | (value << (32u - count));
 }
@@ -9621,7 +11945,7 @@ static void live_sha256_transform(LiveSha256* state, const U8* input) {
         0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,
         0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u
     };
-    U32 words[64];
+    U32 words[16];
     U32 a, b, c, d, e, f, g, h, index;
     for (index = 0u; index < 16u; ++index) {
         words[index] = (U32)input[index * 4u] << 24u |
@@ -9629,25 +11953,26 @@ static void live_sha256_transform(LiveSha256* state, const U8* input) {
             (U32)input[index * 4u + 2u] << 8u |
             (U32)input[index * 4u + 3u];
     }
-    for (index = 16u; index < 64u; ++index) {
-        U32 first = live_sha256_rotate(words[index - 15u], 7u) ^
-            live_sha256_rotate(words[index - 15u], 18u) ^
-            (words[index - 15u] >> 3u);
-        U32 second = live_sha256_rotate(words[index - 2u], 17u) ^
-            live_sha256_rotate(words[index - 2u], 19u) ^
-            (words[index - 2u] >> 10u);
-        words[index] = words[index - 16u] + first +
-            words[index - 7u] + second;
-    }
     a = state->hash[0]; b = state->hash[1];
     c = state->hash[2]; d = state->hash[3];
     e = state->hash[4]; f = state->hash[5];
     g = state->hash[6]; h = state->hash[7];
     for (index = 0u; index < 64u; ++index) {
+        U32 word;
+        if (index >= 16u) {
+            U32 first_word = words[(index + 1u) & 15u];
+            U32 second_word = words[(index + 14u) & 15u];
+            U32 first = live_sha256_rotate(first_word, 7u) ^
+                live_sha256_rotate(first_word, 18u) ^ (first_word >> 3u);
+            U32 second = live_sha256_rotate(second_word, 17u) ^
+                live_sha256_rotate(second_word, 19u) ^ (second_word >> 10u);
+            words[index & 15u] += first + words[(index + 9u) & 15u] + second;
+        }
+        word = words[index & 15u];
         U32 sum1 = live_sha256_rotate(e, 6u) ^
             live_sha256_rotate(e, 11u) ^ live_sha256_rotate(e, 25u);
         U32 choice = (e & f) ^ (~e & g);
-        U32 temporary1 = h + sum1 + choice + constants[index] + words[index];
+        U32 temporary1 = h + sum1 + choice + constants[index] + word;
         U32 sum0 = live_sha256_rotate(a, 2u) ^
             live_sha256_rotate(a, 13u) ^ live_sha256_rotate(a, 22u);
         U32 majority = (a & b) ^ (a & c) ^ (b & c);
@@ -9672,6 +11997,13 @@ static void live_sha256_init(LiveSha256* state) {
 }
 static void live_sha256_update(LiveSha256* state, const U8* input, U32 size) {
     state->byte_count += size;
+    if (state->block_size == 0u) {
+        while (size >= 64u) {
+            live_sha256_transform(state, input);
+            input += 64u;
+            size -= 64u;
+        }
+    }
     while (size != 0u) {
         U32 chunk = 64u - state->block_size;
         if (chunk > size) chunk = size;
@@ -9708,30 +12040,171 @@ static void live_sha256_finish(LiveSha256* state, U8 output[32]) {
 static BOOL live_retain_texture_binding(U32 stage) {
     LiveResourceScanState* state = &g_live_resource_scan;
     U32 stage_mask = 1u << stage;
-    U32 index;
+    U32 address, cache_slot, cached, index;
     if ((state->texture_offset_mask & stage_mask) == 0u ||
         (state->texture_format_mask & stage_mask) == 0u) return 1;
-    for (index = 0u; index < state->frame_binding_count; ++index) {
-        if (state->frame_binding_stages[index] == stage &&
-            state->frame_binding_addresses[index] == state->texture_offsets[stage] &&
-            state->frame_binding_formats[index] == state->texture_formats[stage] &&
-            state->frame_binding_image_rects[index] ==
-                state->texture_image_rects[stage]) return 1;
+    address = state->texture_offsets[stage];
+    cache_slot = (address >> 4u) & (LIVE_RESOURCE_BINDING_CAPACITY - 1u);
+    cached = g_live_texture_binding_cache[cache_slot];
+    if (cached) {
+        index = cached - 1u;
+        if (index < state->retained_binding_count &&
+            state->frame_binding_addresses[index] == address)
+            goto retained;
     }
-    if (state->frame_binding_count >= LIVE_RESOURCE_BINDING_CAPACITY) return 0;
-    index = state->frame_binding_count++;
+    for (index = 0u; index < state->retained_binding_count; ++index) {
+        if (state->frame_binding_addresses[index] == address) goto retained;
+    }
+    if (state->retained_binding_count < LIVE_RESOURCE_BINDING_CAPACITY) {
+        index = state->retained_binding_count++;
+    } else {
+        index = state->retained_binding_evict_cursor++ %
+            LIVE_RESOURCE_BINDING_CAPACITY;
+    }
+    state->frame_binding_addresses[index] = address;
+retained:
+    g_live_texture_binding_cache[cache_slot] = index + 1u;
     state->frame_binding_stages[index] = stage;
-    state->frame_binding_addresses[index] = state->texture_offsets[stage];
     state->frame_binding_formats[index] = state->texture_formats[stage];
     state->frame_binding_image_rects[index] = state->texture_image_rects[stage];
     return 1;
 }
+static U32 live_vertex_element_size(U32 format) {
+    U32 type = format & 0xFu;
+    U32 components = (format >> 4u) & 0xFu;
+    if (components == 0u) return 0u;
+    if (type == 2u) return components * 4u;
+    if (type == 0u || type == 4u || type == 6u) return 4u;
+    return components * 2u;
+}
+static BOOL live_retain_vertex_range(U32 start, U32 end) {
+    LiveResourceScanState* state = &g_live_resource_scan;
+    U32 index = 0u;
+    if (!start || end <= start || end - start > 16u * 1024u * 1024u)
+        return 1;
+    while (index < state->retained_vertex_range_count &&
+           state->retained_vertex_range_ends[index] < start) ++index;
+    while (index < state->retained_vertex_range_count &&
+           state->retained_vertex_range_starts[index] <= end) {
+        U32 existing_start = state->retained_vertex_range_starts[index];
+        U32 existing_end = state->retained_vertex_range_ends[index];
+        U32 candidate_start = existing_start < start ? existing_start : start;
+        U32 candidate_end = existing_end > end ? existing_end : end;
+        U32 move;
+        if (candidate_end - candidate_start > 16u * 1024u * 1024u) break;
+        start = candidate_start;
+        end = candidate_end;
+        --state->retained_vertex_range_count;
+        for (move = index; move < state->retained_vertex_range_count; ++move) {
+            state->retained_vertex_range_starts[move] =
+                state->retained_vertex_range_starts[move + 1u];
+            state->retained_vertex_range_ends[move] =
+                state->retained_vertex_range_ends[move + 1u];
+        }
+    }
+    if (state->retained_vertex_range_count >= LIVE_VERTEX_RANGE_CAPACITY) {
+        U32 read, write = 0u;
+        for (read = 0u; read < state->retained_vertex_range_count; ++read) {
+            U32 retained_start = state->retained_vertex_range_starts[read];
+            U32 retained_end = state->retained_vertex_range_ends[read];
+            U32 source;
+            if (retained_end <= retained_start ||
+                !live_resource_source(
+                    retained_start, retained_end - retained_start, &source))
+                continue;
+            state->retained_vertex_range_starts[write] = retained_start;
+            state->retained_vertex_range_ends[write++] = retained_end;
+        }
+        state->retained_vertex_range_count = write;
+        index = 0u;
+        while (index < state->retained_vertex_range_count &&
+               state->retained_vertex_range_ends[index] < start) ++index;
+    }
+    if (state->retained_vertex_range_count >= LIVE_VERTEX_RANGE_CAPACITY) {
+        g_live_render_publication_failure_code = 12u;
+        return 0;
+    }
+    {
+        U32 move = state->retained_vertex_range_count;
+        while (move > index) {
+            state->retained_vertex_range_starts[move] =
+                state->retained_vertex_range_starts[move - 1u];
+            state->retained_vertex_range_ends[move] =
+                state->retained_vertex_range_ends[move - 1u];
+            --move;
+        }
+    }
+    ++state->retained_vertex_range_count;
+    state->retained_vertex_range_starts[index] = start;
+    state->retained_vertex_range_ends[index] = end;
+    return 1;
+}
+static BOOL live_retain_active_vertex_ranges(void) {
+    LiveResourceScanState* state = &g_live_resource_scan;
+    U32 populated_mask, slot;
+    if (!state->active_vertex_has_index) return 1;
+    populated_mask = state->vertex_array_offset_mask &
+        state->vertex_array_format_mask;
+    for (slot = 0u; slot < 16u; ++slot) {
+        U32 address, format, stride, element_size;
+        U64 end;
+        if ((populated_mask & (1u << slot)) == 0u) continue;
+        address = state->vertex_array_offsets[slot];
+        format = state->vertex_array_formats[slot];
+        stride = format >> 8u;
+        element_size = live_vertex_element_size(format);
+        end = (U64)address + (U64)state->active_vertex_max_index * stride +
+            element_size;
+        if (!address || !stride || !element_size || end > 0xFFFFFFFFull)
+            continue;
+        if (!live_retain_vertex_range(address, (U32)end)) return 0;
+    }
+    state->active_vertex_max_index = 0u;
+    state->active_vertex_has_index = 0u;
+    return 1;
+}
 static BOOL live_apply_resource_method(U32 method, U32 value) {
     LiveResourceScanState* state = &g_live_resource_scan;
-    if (method == 0x17FCu && value != 0u) {
+    if (method == 0x012Cu) {
+        if (!live_retain_active_vertex_ranges()) return 0;
+    } else if (method == 0x17FCu) {
         U32 stage;
-        for (stage = 0u; stage < 4u; ++stage)
-            if (!live_retain_texture_binding(stage)) return 0;
+        if (!live_retain_active_vertex_ranges()) return 0;
+        state->active_vertex_primitive = value;
+        if (value != 0u)
+            for (stage = 0u; stage < 4u; ++stage)
+                if (!live_retain_texture_binding(stage)) return 0;
+    } else if ((method == 0x1800u || method == 0x1808u) &&
+               state->active_vertex_primitive != 0u) {
+        if (method == 0x1800u) {
+            U32 second = value >> 16u;
+            value &= 0xFFFFu;
+            if (second > value) value = second;
+        }
+        if (!state->active_vertex_has_index ||
+            value > state->active_vertex_max_index)
+            state->active_vertex_max_index = value;
+        state->active_vertex_has_index = 1u;
+    } else if (method == 0x1810u && state->active_vertex_primitive != 0u) {
+        U32 first = value & 0x00FFFFFFu;
+        U32 count = (value >> 24u) + 1u;
+        U64 maximum = (U64)first + count - 1u;
+        if (maximum <= 0xFFFFFFFFull) {
+            if (!state->active_vertex_has_index ||
+                (U32)maximum > state->active_vertex_max_index)
+                state->active_vertex_max_index = (U32)maximum;
+            state->active_vertex_has_index = 1u;
+        }
+    } else if (method >= 0x1720u && method <= 0x175Cu &&
+               ((method - 0x1720u) & 3u) == 0u) {
+        U32 slot = (method - 0x1720u) / 4u;
+        state->vertex_array_offsets[slot] = value;
+        state->vertex_array_offset_mask |= 1u << slot;
+    } else if (method >= 0x1760u && method <= 0x179Cu &&
+               ((method - 0x1760u) & 3u) == 0u) {
+        U32 slot = (method - 0x1760u) / 4u;
+        state->vertex_array_formats[slot] = value;
+        state->vertex_array_format_mask |= 1u << slot;
     } else if (method >= 0x1B00u && method < 0x1C00u) {
         U32 stage = (method - 0x1B00u) / 0x40u;
         U32 stage_register = (method - 0x1B00u) & 0x3Fu;
@@ -9801,14 +12274,21 @@ static BOOL live_scan_resource_span(
 ) {
     LiveResourceScanState* state = &g_live_resource_scan;
     U32 offset;
-    if ((address & 3u) || (size & 3u)) return 0;
+    if ((address & 3u) || (size & 3u)) {
+        g_live_render_publication_failure_code = 10u;
+        return 0;
+    }
     if (state->run_active && address != state->next_address)
         live_reset_resource_packet();
     state->run_active = 1u;
     for (offset = 0u; offset < size; offset += 4u) {
         U32 word;
         copy_bytes(&word, payload + offset, 4u);
-        if (!live_consume_resource_word(word)) return 0;
+        if (!live_consume_resource_word(word)) {
+            if (!g_live_render_publication_failure_code)
+                g_live_render_publication_failure_code = 11u;
+            return 0;
+        }
     }
     state->next_address = address + size;
     if (completes_flip) live_reset_resource_packet();
@@ -9876,18 +12356,30 @@ static BOOL live_texture_layout(
     *format_output = format;
     return 1;
 }
+static BOOL live_resource_allocation_source(
+    WorkloadAllocation* allocation, U32 address, U32 size, U32* source_output
+) {
+    U32 physical, offset;
+    if (!allocation || !allocation->active || !allocation->contiguous) return 0;
+    physical = allocation->address & 0x7FFFFFFFu;
+    if (address < physical) return 0;
+    offset = address - physical;
+    if (offset >= allocation->size || size > allocation->size - offset ||
+        !live_readable_range(allocation->address + offset, size)) return 0;
+    *source_output = allocation->address + offset;
+    return 1;
+}
 static BOOL live_resource_source(U32 address, U32 size, U32* source_output) {
     U32 index;
+    if (live_resource_allocation_source(
+            g_live_resource_last_allocation, address, size, source_output))
+        return 1;
     for (index = 0u; index < g_workload_allocation_count; ++index) {
         WorkloadAllocation* allocation = &g_workload_allocations[index];
-        U32 physical, offset;
-        if (!allocation->active || !allocation->contiguous) continue;
-        physical = allocation->address & 0x7FFFFFFFu;
-        if (address < physical) continue;
-        offset = address - physical;
-        if (offset < allocation->size && size <= allocation->size - offset &&
-            live_readable_range(allocation->address + offset, size)) {
-            *source_output = allocation->address + offset;
+        if (allocation == g_live_resource_last_allocation) continue;
+        if (live_resource_allocation_source(
+                allocation, address, size, source_output)) {
+            g_live_resource_last_allocation = allocation;
             return 1;
         }
     }
@@ -9902,15 +12394,45 @@ static BOOL live_resource_source(U32 address, U32 size, U32* source_output) {
     }
     return 0;
 }
-static U32 live_collect_texture_resources(
-    LiveTextureResource resources[LIVE_RESOURCE_BINDING_CAPACITY]
+static BOOL live_resource_dedupe_insert(
+    U32 address, U32 width, U32 height, const char* format
+) {
+    U32 probe;
+    U32 slot = (address ^ width * 0x9E3779B1u ^ height * 0x85EBCA77u) &
+        (LIVE_RESOURCE_DEDUPE_CAPACITY - 1u);
+    for (probe = 0u; probe < LIVE_RESOURCE_DEDUPE_CAPACITY; ++probe) {
+        U32 index = (slot + probe) & (LIVE_RESOURCE_DEDUPE_CAPACITY - 1u);
+        if (g_live_resource_dedupe_stamps[index] !=
+            g_live_resource_dedupe_generation) {
+            g_live_resource_dedupe_stamps[index] =
+                g_live_resource_dedupe_generation;
+            g_live_resource_dedupe_addresses[index] = address;
+            g_live_resource_dedupe_widths[index] = width;
+            g_live_resource_dedupe_heights[index] = height;
+            g_live_resource_dedupe_formats[index] = format;
+            return 1;
+        }
+        if (g_live_resource_dedupe_addresses[index] == address &&
+            g_live_resource_dedupe_widths[index] == width &&
+            g_live_resource_dedupe_heights[index] == height &&
+            live_string_equal(g_live_resource_dedupe_formats[index], format))
+            return 0;
+    }
+    return 1;
+}
+static U32 live_collect_resources(
+    LiveTextureResource resources[LIVE_RESOURCE_CAPACITY]
 ) {
     LiveResourceScanState* state = &g_live_resource_scan;
     U32 resource_count = 0u;
     U32 index;
-    for (index = 0u; index < state->frame_binding_count; ++index) {
+    if (++g_live_resource_dedupe_generation == 0u) {
+        for (index = 0u; index < LIVE_RESOURCE_DEDUPE_CAPACITY; ++index)
+            g_live_resource_dedupe_stamps[index] = 0u;
+        g_live_resource_dedupe_generation = 1u;
+    }
+    for (index = 0u; index < state->retained_binding_count; ++index) {
         LiveTextureResource candidate;
-        U32 existing;
         candidate.stage = state->frame_binding_stages[index];
         candidate.address = state->frame_binding_addresses[index];
         if (!candidate.address ||
@@ -9922,23 +12444,116 @@ static U32 live_collect_texture_resources(
             !live_resource_source(
                 candidate.address, candidate.byte_count, &candidate.source))
             continue;
-        for (existing = 0u; existing < resource_count; ++existing) {
-            if (resources[existing].address == candidate.address &&
-                resources[existing].width == candidate.width &&
-                resources[existing].height == candidate.height &&
-                live_string_equal(resources[existing].format, candidate.format))
-                break;
-        }
-        if (existing == resource_count &&
-            resource_count < LIVE_RESOURCE_BINDING_CAPACITY)
+        if (live_resource_dedupe_insert(
+                candidate.address, candidate.width, candidate.height,
+                candidate.format) && resource_count < LIVE_RESOURCE_CAPACITY)
             resources[resource_count++] = candidate;
+    }
+    for (index = 0u; index < state->retained_vertex_range_count; ++index) {
+        LiveTextureResource candidate;
+        U32 start = state->retained_vertex_range_starts[index];
+        U32 end = state->retained_vertex_range_ends[index];
+        if (!start || end <= start || resource_count >= LIVE_RESOURCE_CAPACITY)
+            continue;
+        candidate.stage = 0u;
+        candidate.address = start;
+        candidate.width = end - start;
+        candidate.height = 1u;
+        candidate.byte_count = end - start;
+        candidate.format = "VERTEX_BUFFER";
+        if (!live_resource_source(
+                candidate.address, candidate.byte_count, &candidate.source))
+            continue;
+        resources[resource_count++] = candidate;
     }
     return resource_count;
 }
+static BOOL live_bytes_equal(const void* left, const void* right, U32 size) {
+    const U8* a = (const U8*)left;
+    const U8* b = (const U8*)right;
+    U32 index = 0u;
+    while (size - index >= 32u) {
+        const U32* words_a = (const U32*)(a + index);
+        const U32* words_b = (const U32*)(b + index);
+        if (words_a[0] != words_b[0] || words_a[1] != words_b[1] ||
+            words_a[2] != words_b[2] || words_a[3] != words_b[3] ||
+            words_a[4] != words_b[4] || words_a[5] != words_b[5] ||
+            words_a[6] != words_b[6] || words_a[7] != words_b[7]) return 0;
+        index += 32u;
+    }
+    for (; index < size; ++index)
+        if (a[index] != b[index]) return 0;
+    return 1;
+}
+static void live_hash_resource(LiveTextureResource* resource) {
+    LiveSha256 content;
+    live_sha256_init(&content);
+    live_sha256_update(&content, (const U8*)resource->source,
+                       resource->byte_count);
+    live_sha256_finish(&content, resource->hash);
+}
+static BOOL live_prepare_resource_snapshot(
+    LiveTextureResource resources[LIVE_RESOURCE_CAPACITY], U32 count
+) {
+    U64 slot_capacity = (64u * 1024u * 1024u - 64u) / 2u;
+    U32 index;
+    if (g_live_resource_generation) {
+        U32 slot = (U32)(g_live_resource_generation & 1u);
+        U32 metadata = slot ? 40u : 24u;
+        U32 sequence = live_read_u32(g_live_resources, metadata);
+        U32 payload_size = live_read_u32(g_live_resources, metadata + 4u);
+        U64 generation = live_read_u64(g_live_resources, metadata + 8u);
+        U8* input = g_live_resources + 64u + slot * slot_capacity;
+        U32 cursor = 12u;
+        BOOL compatible = sequence && !(sequence & 1u) &&
+            generation == g_live_resource_generation &&
+            payload_size >= cursor && payload_size <= slot_capacity &&
+            live_bytes_equal(input, "B2TEX001", 8u) &&
+            live_read_u32(input, 8u) == count;
+        BOOL changed = 0;
+        for (index = 0u; compatible && index < count; ++index) {
+            LiveTextureResource* resource = &resources[index];
+            U32 format_size = live_string_size(resource->format);
+            U8* header;
+            U64 required = 56u + format_size + resource->byte_count;
+            if ((U64)cursor + required > payload_size) {
+                compatible = 0;
+                break;
+            }
+            header = input + cursor;
+            if (live_read_u32(header, 0u) != resource->stage ||
+                live_read_u32(header, 4u) != resource->address ||
+                live_read_u32(header, 8u) != resource->width ||
+                live_read_u32(header, 12u) != resource->height ||
+                live_read_u32(header, 16u) != format_size ||
+                live_read_u32(header, 20u) != resource->byte_count ||
+                !live_bytes_equal(header + 56u, resource->format, format_size)) {
+                compatible = 0;
+                break;
+            }
+            if (live_bytes_equal(
+                    header + 56u + format_size,
+                    (const void*)resource->source, resource->byte_count)) {
+                copy_bytes(resource->hash, header + 24u, sizeof(resource->hash));
+            } else {
+                live_hash_resource(resource);
+                changed = 1;
+            }
+            cursor += (U32)required;
+        }
+        if (compatible && cursor == payload_size) return changed;
+    }
+    for (index = 0u; index < count; ++index)
+        live_hash_resource(&resources[index]);
+    return 1;
+}
 static BOOL live_publish_resources(void) {
     U64 slot_capacity = (64u * 1024u * 1024u - 64u) / 2u;
-    U32 resource_count = live_collect_texture_resources(
+    U32 resource_count = live_collect_resources(
         g_live_texture_resources);
+    if (!live_prepare_resource_snapshot(
+            g_live_texture_resources, resource_count)) return 1;
+    ++g_live_resource_generation;
     U32 slot = (U32)(g_live_resource_generation & 1u);
     U32 metadata = slot ? 40u : 24u;
     U32 sequence = live_read_u32(g_live_resources, metadata);
@@ -9955,14 +12570,11 @@ static BOOL live_publish_resources(void) {
         LiveTextureResource* resource = &g_live_texture_resources[index];
         U32 format_size = live_string_size(resource->format);
         U64 required = 56u + format_size + resource->byte_count;
-        U8 hash[32];
         U8* header;
-        LiveSha256 sha;
-        if ((U64)payload_size + required > slot_capacity) return 0;
-        live_sha256_init(&sha);
-        live_sha256_update(&sha, (const U8*)resource->source,
-                           resource->byte_count);
-        live_sha256_finish(&sha, hash);
+        if ((U64)payload_size + required > slot_capacity) {
+            g_live_render_publication_failure_code = 20u;
+            return 0;
+        }
         header = output + payload_size;
         live_write_u32(header, 0u, resource->stage);
         live_write_u32(header, 4u, resource->address);
@@ -9970,7 +12582,7 @@ static BOOL live_publish_resources(void) {
         live_write_u32(header, 12u, resource->height);
         live_write_u32(header, 16u, format_size);
         live_write_u32(header, 20u, resource->byte_count);
-        copy_bytes(header + 24u, hash, sizeof(hash));
+        copy_bytes(header + 24u, resource->hash, sizeof(resource->hash));
         copy_bytes(header + 56u, resource->format, format_size);
         copy_bytes(header + 56u + format_size, (const U8*)resource->source,
                    resource->byte_count);
@@ -9980,7 +12592,6 @@ static BOOL live_publish_resources(void) {
     live_barrier();
     live_write_u32(g_live_resources, metadata, published);
     g_live_resource_payload_size = payload_size;
-    g_live_resource_scan.frame_binding_count = 0u;
     return 1;
 }
 """
@@ -10004,7 +12615,7 @@ typedef struct LiveAudioFormat {
 } LiveAudioFormat;
 typedef struct LiveAudioBuffer {
     U32 key, descriptor, voice, data, size, current_position, frequency;
-    long volume;
+    long volume, left_mixbin_volume, right_mixbin_volume;
     LiveAudioFormat format;
     U32 playing;
 } LiveAudioBuffer;
@@ -10013,14 +12624,18 @@ typedef struct LiveAudioPlayback {
     short* samples;
     U64 cursor_frame_q32, step_q32;
     U32 loop_start_frame, loop_end_frame;
-    long gain_q16;
+    long left_gain_q16, right_gain_q16;
 } LiveAudioPlayback;
 typedef struct LiveAudioStream {
     U32 key;
     LiveAudioFormat format;
+    U32 packet_head, packet_tail;
 } LiveAudioStream;
 typedef struct LiveAudioPacket {
-    U32 stream, active, sample_count, cursor;
+    U32 stream, active, sample_count, cursor, byte_count;
+    U32 completed_size, status, completion_event;
+    U32 next;
+    U64 sequence;
     short* samples;
 } LiveAudioPacket;
 static LiveControllerState g_live_controller = {
@@ -10028,14 +12643,26 @@ static LiveControllerState g_live_controller = {
 static U32 g_live_controller_sequence;
 static U32 g_live_controller_packets[4];
 static U32 g_live_controller_last_generation[4];
+static U32 g_live_controller_open_mask;
 static U64 g_live_controller_refresh_count;
 static U64 g_live_controller_poll_count;
-static U64 g_live_controller_service_counts[8];
+static U64 g_live_controller_service_counts[18];
 static U32 g_live_controller_observed_buttons;
+static U16 g_live_controller_last_left_motor;
+static U16 g_live_controller_last_right_motor;
 static LiveAudioBuffer g_live_audio_buffers[256];
 static LiveAudioPlayback g_live_audio_playbacks[64];
+static LiveAudioPlayback* g_live_audio_playback_cache[64];
+static U32 g_live_audio_active_playback_masks[2];
+static U32 g_live_audio_gain_cache_keys[64];
+static long g_live_audio_gain_cache_values[64];
 static LiveAudioStream g_live_audio_streams[32];
+static volatile U32 g_live_audio_active_stream_mask;
 static LiveAudioPacket g_live_audio_packets[64];
+static U32 g_live_audio_packet_free_hint;
+static U64 g_live_audio_packet_sequence;
+static U64 g_live_audio_packet_completion_count;
+static U64 g_live_audio_packet_flush_count;
 static volatile U32 g_live_audio_lock;
 static volatile U32 g_live_audio_lane_started;
 static U64 g_live_audio_lane_start_count;
@@ -10044,7 +12671,7 @@ static U64 g_live_audio_lane_entry_count;
 static U64 g_live_audio_lane_active_mix_count;
 static U32 g_live_audio_lane_start_error;
 static U64 g_live_audio_service_count;
-static U64 g_live_audio_service_value_counts[20];
+static U64 g_live_audio_service_value_counts[31];
 static U64 g_live_audio_effect_image_count;
 static U64 g_live_audio_effect_image_failure_count;
 static U64 g_live_audio_decoded_buffer_count;
@@ -10058,6 +12685,9 @@ static U64 g_live_audio_music_load_count;
 static U64 g_live_audio_music_failure_count;
 static U32 g_live_audio_music_mode;
 static U32 g_live_audio_music_active;
+static U32 g_live_audio_music_kind;
+static U32 g_live_audio_music_track_index = 0xFFFFFFFFu;
+static U32 g_live_audio_music_stream_count;
 static U32 g_live_audio_last_buffer;
 static U32 g_live_audio_last_data;
 static U32 g_live_audio_last_size;
@@ -10102,17 +12732,28 @@ static U32 live_dispatch_input_service(
     U32 port, output, index;
     live_refresh_controller();
     ++g_live_controller_poll_count;
-    if (service->runtime_kind < 8u)
+    if (service->runtime_kind < 18u)
         ++g_live_controller_service_counts[service->runtime_kind];
     if (service->runtime_kind == 4u)
         return g_live_controller.connected ? 1u : 0u;
     if (service->runtime_kind == 5u) {
         port = arguments[1];
-        return port == 0u && g_live_controller.connected ? 0xB2401000u : 0u;
+        if (port != 0u || !g_live_controller.connected) return 0u;
+        g_live_controller_open_mask |= 1u << port;
+        return 0xB2401000u + port;
     }
     port = arguments[0] - 0xB2401000u;
+    if (service->runtime_kind == 16u) {
+        if (port == 0u) {
+            g_live_controller_open_mask &= ~(1u << port);
+            g_live_controller_last_generation[port] = 0u;
+        }
+        return 0u;
+    }
     output = arguments[1];
-    if (port != 0u || !g_live_controller.connected) return disconnected;
+    if (port != 0u || !g_live_controller.connected ||
+        !(g_live_controller_open_mask & (1u << port)))
+        return disconnected;
     if (service->runtime_kind == 6u) {
         if (output) {
             *(U8*)output = 1u;
@@ -10150,6 +12791,15 @@ static U32 live_dispatch_input_service(
             *(short*)(output + 14u + index * 2u) = sticks[index];
         return 0u;
     }
+    if (service->runtime_kind == 17u) {
+        if (!output) return 0x57u;
+        *(U32*)output = 0u;
+        *(U8*)(output + 0x40u) = 0u;
+        *(U8*)(output + 0x41u) = (U8)(port + 2u);
+        g_live_controller_last_left_motor = *(U16*)(output + 0x42u);
+        g_live_controller_last_right_motor = *(U16*)(output + 0x44u);
+        return 0u;
+    }
     return disconnected;
 }
 static LiveAudioFormat live_audio_format(U32 address) {
@@ -10164,10 +12814,12 @@ static LiveAudioFormat live_audio_format(U32 address) {
     return format;
 }
 static LiveAudioBuffer* live_audio_buffer(U32 key, BOOL create) {
-    U32 index;
+    U32 index, probe, start;
     LiveAudioBuffer* free_slot = 0;
     if (!key) return 0;
-    for (index = 0u; index < 256u; ++index) {
+    start = (key >> 4u) & 255u;
+    for (probe = 0u; probe < 256u; ++probe) {
+        index = (start + probe) & 255u;
         if (g_live_audio_buffers[index].key == key)
             return &g_live_audio_buffers[index];
         if (!g_live_audio_buffers[index].key && !free_slot)
@@ -10178,10 +12830,12 @@ static LiveAudioBuffer* live_audio_buffer(U32 key, BOOL create) {
     return free_slot;
 }
 static LiveAudioStream* live_audio_stream(U32 key, BOOL create) {
-    U32 index;
+    U32 index, probe, start;
     LiveAudioStream* free_slot = 0;
     if (!key) return 0;
-    for (index = 0u; index < 32u; ++index) {
+    start = (key >> 4u) & 31u;
+    for (probe = 0u; probe < 32u; ++probe) {
+        index = (start + probe) & 31u;
         if (g_live_audio_streams[index].key == key)
             return &g_live_audio_streams[index];
         if (!g_live_audio_streams[index].key && !free_slot)
@@ -10189,7 +12843,24 @@ static LiveAudioStream* live_audio_stream(U32 key, BOOL create) {
     }
     if (!create || !free_slot) return 0;
     free_slot->key = key;
+    __atomic_fetch_or(
+        &g_live_audio_active_stream_mask,
+        1u << (U32)(free_slot - g_live_audio_streams), 5);
     return free_slot;
+}
+static void live_audio_complete_packet(LiveAudioPacket* packet, U32 status) {
+    if (!packet || !packet->active) return;
+    if (packet->completed_size)
+        *(U32*)packet->completed_size = status ? 0u : packet->byte_count;
+    if (packet->status) *(U32*)packet->status = status;
+    if (packet->completion_event) SetEvent((HANDLE)packet->completion_event);
+    packet->active = 0u;
+    g_live_audio_packet_free_hint = (U32)(packet - g_live_audio_packets);
+    if (packet->samples) VirtualFree(packet->samples, 0u, 0x8000u);
+    packet->samples = 0;
+    packet->next = 0u;
+    if (status == 0x8000000Bu) ++g_live_audio_packet_flush_count;
+    else ++g_live_audio_packet_completion_count;
 }
 static long live_audio_clamp(long value) {
     if (value < -32768) return -32768;
@@ -10197,9 +12868,89 @@ static long live_audio_clamp(long value) {
     return value;
 }
 static long live_audio_gain(long volume) {
+    U32 attenuation, cache_slot, cache_key;
+    U64 factor = 0xFFB497A2ull;
+    U64 gain = 1ull << 32u;
+    long result;
     if (volume <= -10000) return 0;
     if (volume >= 0) return 65536;
-    return (10000 + volume) * 65536 / 10000;
+    attenuation = (U32)(-volume);
+    cache_slot = attenuation & 63u;
+    cache_key = attenuation + 1u;
+    if (g_live_audio_gain_cache_keys[cache_slot] == cache_key)
+        return g_live_audio_gain_cache_values[cache_slot];
+    while (attenuation) {
+        if (attenuation & 1u)
+            gain = (gain * factor + 0x80000000ull) >> 32u;
+        factor = (factor * factor + 0x80000000ull) >> 32u;
+        attenuation >>= 1u;
+    }
+    result = (long)((gain + 0x8000u) >> 16u);
+    g_live_audio_gain_cache_values[cache_slot] = result;
+    g_live_audio_gain_cache_keys[cache_slot] = cache_key;
+    return result;
+}
+static long live_audio_combined_gain(long volume, long mixbin_volume) {
+    if (volume > 0) volume = 0;
+    if (mixbin_volume > 0) mixbin_volume = 0;
+    if (volume <= -10000 || mixbin_volume <= -10000 ||
+        volume + mixbin_volume <= -10000) return 0;
+    return live_audio_gain(volume + mixbin_volume);
+}
+static void live_audio_refresh_playback_gain(
+    LiveAudioPlayback* playback, LiveAudioBuffer* buffer
+) {
+    playback->left_gain_q16 = live_audio_combined_gain(
+        buffer->volume, buffer->left_mixbin_volume);
+    playback->right_gain_q16 = live_audio_combined_gain(
+        buffer->volume, buffer->right_mixbin_volume);
+}
+static LiveAudioPlayback* live_audio_playback(U32 key) {
+    U32 index, slot = (key >> 4u) & 63u;
+    LiveAudioPlayback* cached = g_live_audio_playback_cache[slot];
+    if (cached && cached->active && cached->key == key) return cached;
+    for (index = 0u; index < 64u; ++index) {
+        LiveAudioPlayback* playback = &g_live_audio_playbacks[index];
+        if (playback->active && playback->key == key) {
+            g_live_audio_playback_cache[slot] = playback;
+            return playback;
+        }
+    }
+    return 0;
+}
+static void live_audio_mark_playback(LiveAudioPlayback* playback) {
+    U32 index;
+    if (!playback) return;
+    index = (U32)(playback - g_live_audio_playbacks);
+    g_live_audio_active_playback_masks[index >> 5u] |=
+        1u << (index & 31u);
+}
+static LiveAudioPlayback* live_audio_reserve_playback(void) {
+    U32 mask_word;
+    for (mask_word = 0u; mask_word < 2u; ++mask_word) {
+        U32 available = ~g_live_audio_active_playback_masks[mask_word];
+        while (available) {
+            U32 bit = (U32)__builtin_ctz(available);
+            LiveAudioPlayback* playback =
+                &g_live_audio_playbacks[mask_word * 32u + bit];
+            available &= available - 1u;
+            if (playback->active) continue;
+            playback->active = 2u;
+            live_audio_mark_playback(playback);
+            return playback;
+        }
+    }
+    return 0;
+}
+static void live_audio_forget_playback(LiveAudioPlayback* playback) {
+    U32 index, slot;
+    if (!playback) return;
+    index = (U32)(playback - g_live_audio_playbacks);
+    g_live_audio_active_playback_masks[index >> 5u] &=
+        ~(1u << (index & 31u));
+    slot = (playback->key >> 4u) & 63u;
+    if (g_live_audio_playback_cache[slot] == playback)
+        g_live_audio_playback_cache[slot] = 0;
 }
 static U64 live_audio_div_u64_u32(U64 numerator, U32 denominator) {
     U64 quotient = 0u, remainder = 0u;
@@ -10416,15 +13167,46 @@ static BOOL live_audio_publish(const short* samples, U32 sample_count) {
     return 1;
 }
 static U32 __stdcall live_audio_lane(void* ignored) {
+    U64 frequency = 0u;
+    U64 interval;
+    U64 next_deadline = 0u;
     (void)ignored;
     ++g_live_audio_lane_entry_count;
+    if (!QueryPerformanceFrequency(&frequency) || !frequency) {
+        g_live_audio_lane_start_error = 1u;
+        ++g_live_audio_lane_start_failure_count;
+        live_write_summary();
+        ExitProcess(73u);
+    }
+    interval = (frequency + 10u) / 20u;
+    if (!interval) interval = 1u;
     for (;;) {
-        U32 index, active = 0u;
+        U32 index, mask_word, active = 0u;
         if (live_read_u32(g_live_control, 32u)) return 0u;
-        for (index = 0u; index < 4800u; ++index)
+        if ((g_live_audio_active_playback_masks[0] |
+             g_live_audio_active_playback_masks[1] |
+             __atomic_load_n(&g_live_audio_active_stream_mask, 5)) == 0u) {
+            next_deadline = 0u;
+            Sleep(5u);
+            continue;
+        }
+        for (index = 0u; index < 4800u; index += 8u) {
             g_live_audio_accumulator[index] = 0;
+            g_live_audio_accumulator[index + 1u] = 0;
+            g_live_audio_accumulator[index + 2u] = 0;
+            g_live_audio_accumulator[index + 3u] = 0;
+            g_live_audio_accumulator[index + 4u] = 0;
+            g_live_audio_accumulator[index + 5u] = 0;
+            g_live_audio_accumulator[index + 6u] = 0;
+            g_live_audio_accumulator[index + 7u] = 0;
+        }
         live_audio_lock();
-        for (index = 0u; index < 64u; ++index) {
+        for (mask_word = 0u; mask_word < 2u; ++mask_word) {
+            U32 mask = g_live_audio_active_playback_masks[mask_word];
+            while (mask) {
+            U32 bit = (U32)__builtin_ctz(mask);
+            index = mask_word * 32u + bit;
+            mask &= mask - 1u;
             LiveAudioPlayback* playback = &g_live_audio_playbacks[index];
             U32 sample;
             if (!playback->active) continue;
@@ -10442,6 +13224,7 @@ static U32 __stdcall live_audio_lane(void* ignored) {
                         LiveAudioBuffer* buffer =
                             live_audio_buffer(playback->key, 0);
                         if (buffer) buffer->playing = 0u;
+                        live_audio_forget_playback(playback);
                         playback->active = 0u;
                         VirtualFree(playback->samples, 0u, 0x8000u);
                         playback->samples = 0;
@@ -10453,43 +13236,82 @@ static U32 __stdcall live_audio_lane(void* ignored) {
                 next = frame + 1u < end ? frame + 1u :
                     (playback->loop ? playback->loop_start_frame : frame);
                 fraction = playback->cursor_frame_q32 & 0xFFFFFFFFull;
-                left = playback->samples[frame * 2u] +
-                    (long)(((long long)(playback->samples[next * 2u] -
-                        playback->samples[frame * 2u]) * fraction) >> 32u);
-                right = playback->samples[frame * 2u + 1u] +
-                    (long)(((long long)(playback->samples[next * 2u + 1u] -
-                        playback->samples[frame * 2u + 1u]) * fraction) >> 32u);
+                if (playback->step_q32 == (1ull << 32u) && fraction == 0u) {
+                    left = playback->samples[frame * 2u];
+                    right = playback->samples[frame * 2u + 1u];
+                } else {
+                    left = playback->samples[frame * 2u] +
+                        (long)(((long long)(playback->samples[next * 2u] -
+                            playback->samples[frame * 2u]) * fraction) >> 32u);
+                    right = playback->samples[frame * 2u + 1u] +
+                        (long)(((long long)(playback->samples[next * 2u + 1u] -
+                            playback->samples[frame * 2u + 1u]) * fraction) >> 32u);
+                }
                 g_live_audio_accumulator[sample] +=
-                    left * playback->gain_q16 / 65536;
+                    left * playback->left_gain_q16 / 65536;
                 g_live_audio_accumulator[sample + 1u] +=
-                    right * playback->gain_q16 / 65536;
+                    right * playback->right_gain_q16 / 65536;
                 playback->cursor_frame_q32 += playback->step_q32;
             }
-        }
-        for (index = 0u; index < 64u; ++index) {
-            LiveAudioPacket* packet = &g_live_audio_packets[index];
-            U32 output = 0u;
-            if (!packet->active) continue;
-            active = 1u;
-            while (output < 4800u && packet->cursor < packet->sample_count)
-                g_live_audio_accumulator[output++] +=
-                    packet->samples[packet->cursor++];
-            if (packet->cursor >= packet->sample_count) {
-                packet->active = 0u;
-                VirtualFree(packet->samples, 0u, 0x8000u);
-                packet->samples = 0;
             }
+        }
+        {
+        U32 stream_mask = __atomic_load_n(&g_live_audio_active_stream_mask, 5);
+        while (stream_mask) {
+            U32 output = 0u;
+            U32 bit = (U32)__builtin_ctz(stream_mask);
+            index = bit;
+            stream_mask &= stream_mask - 1u;
+            LiveAudioStream* stream = &g_live_audio_streams[index];
+            if (!stream->key) continue;
+            while (output < 4800u) {
+                U32 packet_index = stream->packet_head;
+                LiveAudioPacket* packet = packet_index
+                    ? &g_live_audio_packets[packet_index - 1u] : 0;
+                if (!packet) break;
+                active = 1u;
+                while (output < 4800u && packet->cursor < packet->sample_count)
+                    g_live_audio_accumulator[output++] +=
+                        packet->samples[packet->cursor++];
+                if (packet->cursor < packet->sample_count) break;
+                stream->packet_head = packet->next;
+                if (!stream->packet_head) stream->packet_tail = 0u;
+                live_audio_complete_packet(packet, 0u);
+            }
+        }
         }
         for (index = 0u; index < 4800u; ++index)
             g_live_audio_mixed[index] = (short)live_audio_clamp(
                 g_live_audio_accumulator[index]);
         live_audio_unlock();
         if (active) {
+            U64 now = 0u;
             ++g_live_audio_lane_active_mix_count;
             if (!live_audio_publish(g_live_audio_mixed, 4800u))
                 ++g_live_audio_dropped_buffer_count;
-            Sleep(45u);
-        } else Sleep(5u);
+            if (!QueryPerformanceCounter(&now)) {
+                g_live_audio_lane_start_error = 2u;
+                ++g_live_audio_lane_start_failure_count;
+                live_write_summary();
+                ExitProcess(73u);
+            }
+            if (!next_deadline) next_deadline = now + interval;
+            while (now < next_deadline) {
+                if (live_read_u32(g_live_control, 32u)) return 0u;
+                Sleep(1u);
+                if (!QueryPerformanceCounter(&now)) {
+                    g_live_audio_lane_start_error = 2u;
+                    ++g_live_audio_lane_start_failure_count;
+                    live_write_summary();
+                    ExitProcess(73u);
+                }
+            }
+            next_deadline += interval;
+            if (next_deadline <= now) next_deadline = now + interval;
+        } else {
+            next_deadline = 0u;
+            Sleep(5u);
+        }
     }
 }
 static BOOL live_start_audio_lane(void) {
@@ -10508,16 +13330,15 @@ static BOOL live_start_audio_lane(void) {
     return 1;
 }
 static void live_audio_stop_buffer(U32 key) {
-    U32 index;
     LiveAudioBuffer* buffer = live_audio_buffer(key, 0);
+    LiveAudioPlayback* playback;
     live_audio_lock();
-    for (index = 0u; index < 64u; ++index) {
-        if (g_live_audio_playbacks[index].active &&
-            g_live_audio_playbacks[index].key == key) {
-            g_live_audio_playbacks[index].active = 0u;
-            VirtualFree(g_live_audio_playbacks[index].samples, 0u, 0x8000u);
-            g_live_audio_playbacks[index].samples = 0;
-        }
+    playback = live_audio_playback(key);
+    if (playback) {
+        live_audio_forget_playback(playback);
+        playback->active = 0u;
+        VirtualFree(playback->samples, 0u, 0x8000u);
+        playback->samples = 0;
     }
     if (buffer) buffer->playing = 0u;
     live_audio_unlock();
@@ -10579,20 +13400,34 @@ static BOOL live_audio_read_asset(
     *size_output = size;
     return 1;
 }
-static BOOL live_audio_menu_track(void) {
+static void live_audio_stop_music(void) {
+    const U32 music_key = 0x31F10600u;
+    U32 index;
+    for (index = 0u; index < 2u; ++index)
+        live_audio_stop_buffer(music_key + index);
+    g_live_audio_music_active = 0u;
+    g_live_audio_music_kind = 0u;
+    g_live_audio_music_track_index = 0xFFFFFFFFu;
+    g_live_audio_music_stream_count = 0u;
+}
+static BOOL live_audio_rws_track(
+    const char* relative, U32 music_kind, U32 track_index
+) {
     const U32 music_key = 0x31F10600u;
     U8* payload = 0;
     U8* encoded = 0;
-    short* samples = 0;
-    LiveAudioPlayback* playback = 0;
+    short* samples[2] = {0, 0};
+    LiveAudioPlayback* playbacks[2] = {0, 0};
     LiveAudioFormat format = {0};
     U32 size = 0u, header_size, data_offset, data_size;
-    U32 substream_count, packet_size, declared_size;
-    U32 descriptor_count = 0u, selected_offset = 0u, selected_audio = 0u;
-    U32 sample_rate = 0u, offset, encoded_size = 0u, sample_count = 0u;
-    U32 index;
-    if (!live_audio_read_asset(
-            "music0/trk07menust.rws", &payload, &size)) goto failure;
+    U32 substream_count, packet_size;
+    U32 declared_sizes[2] = {0u, 0u};
+    U32 descriptor_offsets[2] = {0u, 0u};
+    U32 descriptor_audio[2] = {0u, 0u};
+    U32 sample_counts[2] = {0u, 0u};
+    U32 descriptor_count = 0u;
+    U32 sample_rate = 0u, offset, stream, index;
+    if (!live_audio_read_asset(relative, &payload, &size)) goto failure;
     if (size < 0x9Cu || *(U32*)payload != 0x80Du ||
         (U64)*(U32*)(payload + 4u) + 12ull > size ||
         *(U32*)(payload + 12u) != 0x80Eu) goto failure;
@@ -10605,9 +13440,13 @@ static BOOL live_audio_menu_track(void) {
     if ((U64)data_offset + 12ull + data_size > size) goto failure;
     substream_count = *(U32*)(payload + 0x40u);
     packet_size = *(U32*)(payload + 0x4Cu);
-    declared_size = *(U32*)(payload + 0x98u);
-    if (substream_count != 1u || !packet_size || !declared_size ||
-        declared_size > data_size) goto failure;
+    if (!substream_count || substream_count > 2u || !packet_size ||
+        0x98u + substream_count * 4u > data_offset) goto failure;
+    for (stream = 0u; stream < substream_count; ++stream) {
+        declared_sizes[stream] = *(U32*)(payload + 0x98u + stream * 4u);
+        if (!declared_sizes[stream] || declared_sizes[stream] > data_size)
+            goto failure;
+    }
     for (offset = 12u; offset + 4u <= data_offset; ++offset) {
         U32 candidate = *(U32*)(payload + offset);
         if (candidate == 48000u || candidate == 44100u ||
@@ -10627,95 +13466,144 @@ static BOOL live_audio_menu_track(void) {
             span <= packet_size && audio_size && audio_size <= span &&
             packet_offset < packet_size &&
             (U64)packet_offset + span <= packet_size) {
+            if (descriptor_count >= substream_count) goto failure;
+            descriptor_offsets[descriptor_count] = packet_offset;
+            descriptor_audio[descriptor_count] = audio_size;
             ++descriptor_count;
-            selected_offset = packet_offset;
-            selected_audio = audio_size;
         }
     }
-    if (descriptor_count != 1u || !selected_audio) goto failure;
-    encoded = (U8*)VirtualAlloc(0, declared_size, 0x3000u, 0x04u);
-    if (!encoded) goto failure;
-    for (offset = 0u; offset < data_size && encoded_size < declared_size;
-         offset += packet_size) {
-        U32 source = offset + selected_offset;
-        U32 copied;
-        if (source >= data_size) break;
-        copied = selected_audio;
-        if (copied > data_size - source) copied = data_size - source;
-        if (copied > declared_size - encoded_size)
-            copied = declared_size - encoded_size;
-        copy_bytes(
-            encoded + encoded_size,
-            payload + data_offset + 12u + source,
-            copied);
-        encoded_size += copied;
-    }
-    if (encoded_size != declared_size || encoded_size % 72u) goto failure;
+    if (descriptor_count != substream_count) goto failure;
     format.tag = 0x69u;
     format.channels = 2u;
     format.sample_rate = sample_rate;
     format.block_align = 72u;
     format.bits_per_sample = 4u;
     format.samples_per_block = 64u;
-    if (!live_audio_decode(
-            (U32)encoded, encoded_size, format, &samples, &sample_count))
-        goto failure;
-    if (!live_start_audio_lane()) goto failure;
-    live_audio_stop_buffer(music_key);
-    live_audio_lock();
-    for (index = 0u; index < 64u; ++index)
-        if (!g_live_audio_playbacks[index].active) {
-            playback = &g_live_audio_playbacks[index];
-            break;
+    for (stream = 0u; stream < substream_count; ++stream) {
+        U32 encoded_size = 0u;
+        encoded = (U8*)VirtualAlloc(
+            0, declared_sizes[stream], 0x3000u, 0x04u);
+        if (!encoded) goto failure;
+        for (offset = 0u;
+             offset < data_size && encoded_size < declared_sizes[stream];
+             offset += packet_size) {
+            U32 source = offset + descriptor_offsets[stream];
+            U32 copied;
+            if (source >= data_size) break;
+            copied = descriptor_audio[stream];
+            if (copied > data_size - source) copied = data_size - source;
+            if (copied > declared_sizes[stream] - encoded_size)
+                copied = declared_sizes[stream] - encoded_size;
+            copy_bytes(
+                encoded + encoded_size,
+                payload + data_offset + 12u + source,
+                copied);
+            encoded_size += copied;
         }
-    if (!playback) {
-        live_audio_unlock();
-        goto failure;
+        if (encoded_size != declared_sizes[stream] || encoded_size % 72u ||
+            !live_audio_decode(
+                (U32)encoded, encoded_size, format,
+                &samples[stream], &sample_counts[stream])) goto failure;
+        VirtualFree(encoded, 0u, 0x8000u);
+        encoded = 0;
     }
-    playback->key = music_key;
-    playback->active = 1u;
-    playback->loop = 1u;
-    playback->sample_count = sample_count;
-    playback->samples = samples;
-    playback->cursor_frame_q32 = 0u;
-    playback->step_q32 = 1ull << 32u;
-    playback->loop_start_frame = 0u;
-    playback->loop_end_frame = sample_count / 2u;
-    playback->gain_q16 = 32768;
+    if (!live_start_audio_lane()) goto failure;
+    live_audio_stop_music();
+    live_audio_lock();
+    for (stream = 0u; stream < substream_count; ++stream) {
+        playbacks[stream] = live_audio_reserve_playback();
+        if (!playbacks[stream]) {
+            for (index = 0u; index < stream; ++index) {
+                live_audio_forget_playback(playbacks[index]);
+                playbacks[index]->active = 0u;
+            }
+            live_audio_unlock();
+            goto failure;
+        }
+    }
+    for (stream = 0u; stream < substream_count; ++stream) {
+        LiveAudioPlayback* playback = playbacks[stream];
+        playback->key = music_key + stream;
+        g_live_audio_playback_cache[(playback->key >> 4u) & 63u] = playback;
+        playback->active = 1u;
+        playback->loop = 1u;
+        playback->sample_count = sample_counts[stream];
+        playback->samples = samples[stream];
+        playback->cursor_frame_q32 = 0u;
+        playback->step_q32 = 1ull << 32u;
+        playback->loop_start_frame = 0u;
+        playback->loop_end_frame = sample_counts[stream] / 2u;
+        playback->left_gain_q16 = 32768;
+        playback->right_gain_q16 = 32768;
+        samples[stream] = 0;
+    }
     live_audio_unlock();
-    samples = 0;
-    VirtualFree(encoded, 0u, 0x8000u);
     VirtualFree(payload, 0u, 0x8000u);
     ++g_live_audio_music_load_count;
     g_live_audio_music_active = 1u;
+    g_live_audio_music_kind = music_kind;
+    g_live_audio_music_track_index = track_index;
+    g_live_audio_music_stream_count = substream_count;
     return 1;
 failure:
-    if (samples) VirtualFree(samples, 0u, 0x8000u);
+    for (index = 0u; index < 2u; ++index)
+        if (samples[index]) VirtualFree(samples[index], 0u, 0x8000u);
     if (encoded) VirtualFree(encoded, 0u, 0x8000u);
     if (payload) VirtualFree(payload, 0u, 0x8000u);
     ++g_live_audio_music_failure_count;
     return 0;
 }
-static U32 live_audio_frontend_special_create(void) {
-    const U32 handle = 0x31F10400u;
-    const U32 sentinel = handle + 0x0Cu;
-    if (!live_readable_range(handle, 0x14u)) return 0u;
-    *(U32*)handle = 1u;
-    *(U32*)(handle + 0x10u) = sentinel;
-    return handle;
+static BOOL live_audio_gameplay_track(
+    char* output, U32 capacity, U32* track_index_output
+) {
+    static const char suffix[] = "mgst.rws";
+    U32 track_index = *(volatile U32*)0x0048A150u;
+    const char* base;
+    U32 cursor = 0u, index;
+    if (!output || !track_index_output || track_index >= 30u) return 0;
+    base = *(const char**)(0x0033FDD8u + track_index * 4u);
+    if ((U32)base < 0x002C54D4u || (U32)base > 0x002C5564u ||
+        !live_readable_range((U32)base, 16u) ||
+        base[0] != 'm' || base[1] != 'u' || base[2] != 's' ||
+        base[3] != 'i' || base[4] != 'c' ||
+        (base[5] != '0' && base[5] != '1') || base[6] != '\\') return 0;
+    while (base[cursor]) {
+        if (cursor + sizeof(suffix) >= capacity) return 0;
+        output[cursor] = base[cursor];
+        ++cursor;
+    }
+    for (index = 0u; index < sizeof(suffix); ++index)
+        output[cursor + index] = suffix[index];
+    *track_index_output = track_index;
+    return 1;
 }
 static U32 live_audio_set_music_mode(U32 holder, U32 mode) {
-    const U32 music_key = 0x31F10600u;
     U32 object = holder ? *(U32*)holder : 0u;
+    U32 track_index = 0xFFFFFFFFu;
+    BOOL has_gameplay_track = 0;
+    char track[96];
     ++g_live_audio_music_mode_count;
     if (object) *(U32*)(object + 0x38u) = mode;
-    if (mode == 2u && (!g_live_audio_music_active ||
-                      g_live_audio_music_mode != mode))
-        live_audio_menu_track();
-    else if (mode != 2u && g_live_audio_music_active) {
-        live_audio_stop_buffer(music_key);
-        g_live_audio_music_active = 0u;
+    if (mode == 3u)
+        has_gameplay_track = live_audio_gameplay_track(
+            track, sizeof(track), &track_index);
+    if ((mode == 2u && g_live_audio_music_active &&
+         g_live_audio_music_kind == 1u) ||
+        (mode == 3u && has_gameplay_track && g_live_audio_music_active &&
+         g_live_audio_music_kind == 2u &&
+         g_live_audio_music_track_index == track_index) ||
+        (mode == 4u && g_live_audio_music_active &&
+         g_live_audio_music_kind == 3u)) {
+        g_live_audio_music_mode = mode;
+        return 1u;
     }
+    live_audio_stop_music();
+    if (mode == 2u)
+        live_audio_rws_track("music0/trk07menust.rws", 1u, 0xFFFFFFFFu);
+    else if (mode == 3u && has_gameplay_track)
+        live_audio_rws_track(track, 2u, track_index);
+    else if (mode == 4u)
+        live_audio_rws_track("music0/creditsst.rws", 3u, 0xFFFFFFFFu);
     g_live_audio_music_mode = mode;
     return 1u;
 }
@@ -10723,7 +13611,7 @@ static U32 live_audio_play(U32 key, U32 flags) {
     LiveAudioBuffer* buffer = live_audio_buffer(key, 0);
     LiveAudioPlayback* playback = 0;
     short* samples = 0;
-    U32 sample_count = 0u, index, play_start, play_length, loop_start, loop_length;
+    U32 sample_count = 0u, play_start, play_length, loop_start, loop_length;
     U32 current_frame = 0u, loop_start_frame = 0u, loop_end_frame = 0u;
     if (!buffer || !buffer->data || !buffer->size) return 0u;
     play_start = buffer->descriptor ? *(U32*)(buffer->descriptor + 0xC0u) : 0u;
@@ -10760,11 +13648,7 @@ static U32 live_audio_play(U32 key, U32 flags) {
     ++g_live_audio_decoded_buffer_count;
     live_audio_stop_buffer(key);
     live_audio_lock();
-    for (index = 0u; index < 64u; ++index)
-        if (!g_live_audio_playbacks[index].active) {
-            playback = &g_live_audio_playbacks[index];
-            break;
-        }
+    playback = live_audio_reserve_playback();
     if (!playback) {
         live_audio_unlock();
         VirtualFree(samples, 0u, 0x8000u);
@@ -10772,6 +13656,7 @@ static U32 live_audio_play(U32 key, U32 flags) {
         return 0u;
     }
     playback->key = key;
+    g_live_audio_playback_cache[(key >> 4u) & 63u] = playback;
     playback->active = 1u;
     playback->loop = flags & 1u;
     playback->samples = samples;
@@ -10785,7 +13670,7 @@ static U32 live_audio_play(U32 key, U32 flags) {
         playback->loop_start_frame = 0u;
         playback->loop_end_frame = sample_count / 2u;
     }
-    playback->gain_q16 = live_audio_gain(buffer->volume);
+    live_audio_refresh_playback_gain(playback, buffer);
     buffer->playing = 1u;
     live_audio_unlock();
     live_write_u32(g_live_control, 236u, 6u);
@@ -10896,8 +13781,7 @@ static U32 live_dispatch_audio_service(
     LiveAudioStream* stream;
     U32 index;
     ++g_live_audio_service_count;
-    if (value < 20u) ++g_live_audio_service_value_counts[value];
-    if (value == 18u) return live_audio_frontend_special_create();
+    if (value < 31u) ++g_live_audio_service_value_counts[value];
     if (value == 19u)
         return live_audio_set_music_mode(this_pointer, arguments[0]);
     if (value == 1u)
@@ -10910,6 +13794,9 @@ static U32 live_dispatch_audio_service(
         if (!key || !output) return 0x80004005u;
         for (index = 0u; index < 0x200u; ++index) *(U8*)(base + index) = 0u;
         buffer = live_audio_buffer(key, 1);
+        if (!buffer) return 0x80004005u;
+        *(U32*)base = 0x002C9474u;
+        *(U32*)(base + 4u) = 1u;
         buffer->descriptor = base + 0x40u;
         buffer->voice = base + 0x160u;
         *(U32*)key = buffer->descriptor;
@@ -10927,11 +13814,46 @@ static U32 live_dispatch_audio_service(
     if (value == 7u) {
         U32 descriptor = arguments[1], output = arguments[2];
         U32 base = workload_allocate(0x80u, 16u, &g_workload_next_pool);
-        U32 key = base ? base + 0x1Cu : 0u;
+        U32 key = base;
         if (!key || !output) return 0x80004005u;
+        for (index = 0u; index < 0x80u; ++index) *(U8*)(base + index) = 0u;
         stream = live_audio_stream(key, 1);
+        if (!stream) return 0x80004005u;
+        *(U32*)base = 0x002C948Cu;
+        *(U32*)(base + 4u) = 0x002C9480u;
+        *(U32*)(base + 8u) = 1u;
         if (descriptor) stream->format = live_audio_format(*(U32*)(descriptor + 8u));
         *(U32*)output = key;
+        return 0u;
+    }
+    if (value == 29u) {
+        U32 key = arguments[0];
+        live_audio_stop_buffer(key);
+        buffer = live_audio_buffer(key, 0);
+        if (buffer)
+            for (index = 0u; index < sizeof(*buffer); ++index)
+                ((U8*)buffer)[index] = 0u;
+        return 0u;
+    }
+    if (value == 30u) {
+        U32 key = arguments[0];
+        stream = live_audio_stream(key, 0);
+        live_audio_lock();
+        for (index = 0u; index < 64u; ++index) {
+            if (g_live_audio_packets[index].active &&
+                g_live_audio_packets[index].stream == key)
+                live_audio_complete_packet(
+                    &g_live_audio_packets[index], 0x8000000Bu);
+        }
+        if (stream) stream->packet_head = stream->packet_tail = 0u;
+        if (stream)
+            __atomic_fetch_and(
+                &g_live_audio_active_stream_mask,
+                ~(1u << (U32)(stream - g_live_audio_streams)), 5);
+        live_audio_unlock();
+        if (stream)
+            for (index = 0u; index < sizeof(*stream); ++index)
+                ((U8*)stream)[index] = 0u;
         return 0u;
     }
     if (value == 2u) {
@@ -10956,13 +13878,11 @@ static U32 live_dispatch_audio_service(
     if (value == 13u) {
         buffer = live_audio_buffer(arguments[0], 1);
         if (buffer) {
+            LiveAudioPlayback* playback;
             buffer->volume = (long)arguments[1];
             live_audio_lock();
-            for (index = 0u; index < 64u; ++index)
-                if (g_live_audio_playbacks[index].active &&
-                    g_live_audio_playbacks[index].key == arguments[0])
-                    g_live_audio_playbacks[index].gain_q16 =
-                        live_audio_gain(buffer->volume);
+            playback = live_audio_playback(arguments[0]);
+            if (playback) live_audio_refresh_playback_gain(playback, buffer);
             live_audio_unlock();
         }
         return 0u;
@@ -10970,15 +13890,72 @@ static U32 live_dispatch_audio_service(
     if (value == 14u) {
         buffer = live_audio_buffer(arguments[0], 1);
         if (buffer) {
+            LiveAudioPlayback* playback;
             buffer->frequency = arguments[1];
             live_audio_lock();
-            for (index = 0u; index < 64u; ++index)
-                if (g_live_audio_playbacks[index].active &&
-                    g_live_audio_playbacks[index].key == arguments[0])
-                    g_live_audio_playbacks[index].step_q32 = live_audio_step(
-                        buffer->frequency, buffer->format.sample_rate);
+            playback = live_audio_playback(arguments[0]);
+            if (playback) playback->step_q32 = live_audio_step(
+                buffer->frequency, buffer->format.sample_rate);
             live_audio_unlock();
         }
+        return 0u;
+    }
+    /*
+     * Native-created buffers deliberately do not expose the private DSOUND
+     * object graph.  Keep every reached public configuration call at the
+     * host ABI boundary: routing and 3D parameters are accepted by the
+     * current stereo mixer, while play/loop regions update the descriptor
+     * state consumed by live_audio_play().
+     */
+    if (value == 21u) {
+        U32 mixbins = arguments[1], count, pairs;
+        LiveAudioPlayback* playback;
+        buffer = live_audio_buffer(arguments[0], 0);
+        if (!buffer || !mixbins || !live_readable_range(mixbins, 8u))
+            return 0x80004005u;
+        count = *(U32*)mixbins;
+        pairs = *(U32*)(mixbins + 4u);
+        if (count > 32u ||
+            (count && (!pairs || !live_readable_range(pairs, count * 8u))))
+            return 0x88780032u;
+        for (index = 0u; index < count; ++index) {
+            U32 mixbin = *(U32*)(pairs + index * 8u);
+            long volume = *(long*)(pairs + index * 8u + 4u);
+            if (mixbin == 0u) buffer->left_mixbin_volume = volume;
+            else if (mixbin == 1u) buffer->right_mixbin_volume = volume;
+        }
+        live_audio_lock();
+        playback = live_audio_playback(arguments[0]);
+        if (playback) live_audio_refresh_playback_gain(playback, buffer);
+        live_audio_unlock();
+        return 0u;
+    }
+    if (value == 20u || value == 23u || value == 24u ||
+        value == 25u || value == 26u || value == 27u) {
+        buffer = live_audio_buffer(arguments[0], 0);
+        return buffer ? 0u : 0x80004005u;
+    }
+    if (value == 28u) {
+        U32 start = arguments[1], length = arguments[2];
+        buffer = live_audio_buffer(arguments[0], 0);
+        if (!buffer || !buffer->descriptor || start > buffer->size)
+            return 0x88780032u;
+        if (!length) length = buffer->size - start;
+        if ((U64)start + length > buffer->size) return 0x88780032u;
+        *(U32*)(buffer->descriptor + 0xC0u) = start;
+        *(U32*)(buffer->descriptor + 0xC4u) = length;
+        return 0u;
+    }
+    if (value == 22u) {
+        U32 start = arguments[1], length = arguments[2], play_length;
+        buffer = live_audio_buffer(arguments[0], 0);
+        if (!buffer || !buffer->descriptor) return 0x88780032u;
+        play_length = *(U32*)(buffer->descriptor + 0xC4u);
+        if (start > play_length) return 0x88780032u;
+        if (!length) length = play_length - start;
+        if ((U64)start + length > play_length) return 0x88780032u;
+        *(U32*)(buffer->descriptor + 0xC8u) = start;
+        *(U32*)(buffer->descriptor + 0xCCu) = length;
         return 0u;
     }
     if (value == 4u) return live_audio_play(arguments[0], arguments[3]);
@@ -10993,20 +13970,17 @@ static U32 live_dispatch_audio_service(
         return 0u;
     }
     if (value == 15u) {
+        LiveAudioPlayback* playback;
         buffer = live_audio_buffer(arguments[0], 0);
         if (!buffer) return 0x80004005u;
         live_audio_lock();
-        for (index = 0u; index < 64u; ++index) {
-            if (g_live_audio_playbacks[index].active &&
-                g_live_audio_playbacks[index].key == arguments[0]) {
-                U32 position;
-                if (live_audio_frame_byte_position(
-                        buffer->format,
-                        (U32)(g_live_audio_playbacks[index].cursor_frame_q32 >> 32u),
-                        &position))
-                    buffer->current_position = position;
-                break;
-            }
+        playback = live_audio_playback(arguments[0]);
+        if (playback) {
+            U32 position;
+            if (live_audio_frame_byte_position(
+                    buffer->format,
+                    (U32)(playback->cursor_frame_q32 >> 32u), &position))
+                buffer->current_position = position;
         }
         live_audio_unlock();
         if (arguments[1]) *(U32*)arguments[1] = buffer->current_position;
@@ -11014,21 +13988,16 @@ static U32 live_dispatch_audio_service(
         return 0u;
     }
     if (value == 16u) {
+        LiveAudioPlayback* playback;
+        U32 frame;
         buffer = live_audio_buffer(arguments[0], 0);
         if (!buffer || arguments[1] >= buffer->size) return 0x80004005u;
         buffer->current_position = arguments[1];
         live_audio_lock();
-        for (index = 0u; index < 64u; ++index) {
-            U32 frame;
-            if (g_live_audio_playbacks[index].active &&
-                g_live_audio_playbacks[index].key == arguments[0] &&
-                live_audio_normalized_frames(
-                    buffer->format, arguments[1], &frame)) {
-                g_live_audio_playbacks[index].cursor_frame_q32 =
-                    (U64)frame << 32u;
-                break;
-            }
-        }
+        playback = live_audio_playback(arguments[0]);
+        if (playback && live_audio_normalized_frames(
+                buffer->format, arguments[1], &frame))
+            playback->cursor_frame_q32 = (U64)frame << 32u;
         live_audio_unlock();
         return 0u;
     }
@@ -11038,7 +14007,7 @@ static U32 live_dispatch_audio_service(
         return 0u;
     }
     if (value == 8u) {
-        U32 packet = arguments[1], data, size;
+        U32 packet = arguments[1], data, size, completed, status, event;
         short* samples = 0;
         U32 sample_count = 0u;
         LiveAudioPacket* slot = 0;
@@ -11046,46 +14015,66 @@ static U32 live_dispatch_audio_service(
         if (!stream || !packet) return 0u;
         data = *(U32*)packet;
         size = *(U32*)(packet + 4u);
+        completed = *(U32*)(packet + 8u);
+        status = *(U32*)(packet + 12u);
+        event = *(U32*)(packet + 16u);
+        if (completed) *(U32*)completed = 0u;
+        if (status) *(U32*)status = 0x8000000Au;
         if (!live_audio_decode(data, size, stream->format, &samples, &sample_count)) {
             ++g_live_audio_decode_failure_count;
+            if (status) *(U32*)status = 0x80004005u;
+            if (event) SetEvent((HANDLE)event);
             return 0u;
         }
         ++g_live_audio_decoded_packet_count;
         live_audio_lock();
-        for (index = 0u; index < 64u; ++index)
-            if (!g_live_audio_packets[index].active) {
-                slot = &g_live_audio_packets[index];
+        for (index = 0u; index < 64u; ++index) {
+            U32 candidate = (g_live_audio_packet_free_hint + index) & 63u;
+            if (!g_live_audio_packets[candidate].active) {
+                slot = &g_live_audio_packets[candidate];
+                g_live_audio_packet_free_hint = (candidate + 1u) & 63u;
                 break;
             }
+        }
         if (slot) {
+            U32 packet_index = (U32)(slot - g_live_audio_packets) + 1u;
             slot->stream = arguments[0];
             slot->active = 1u;
             slot->sample_count = sample_count;
             slot->cursor = 0u;
+            slot->byte_count = size;
+            slot->completed_size = completed;
+            slot->status = status;
+            slot->completion_event = event;
+            slot->next = 0u;
+            slot->sequence = ++g_live_audio_packet_sequence;
             slot->samples = samples;
+            if (stream->packet_tail)
+                g_live_audio_packets[stream->packet_tail - 1u].next = packet_index;
+            else
+                stream->packet_head = packet_index;
+            stream->packet_tail = packet_index;
         }
         live_audio_unlock();
         if (!slot) {
             VirtualFree(samples, 0u, 0x8000u);
             ++g_live_audio_dropped_buffer_count;
+            if (status) *(U32*)status = 0x80004005u;
+            if (event) SetEvent((HANDLE)event);
         }
-        data = *(U32*)(packet + 8u);
-        if (data) *(U32*)data = size;
-        data = *(U32*)(packet + 12u);
-        if (data) *(U32*)data = 0u;
         live_start_audio_lane();
         return 0u;
     }
     if (value == 9u) {
+        stream = live_audio_stream(arguments[0], 0);
         live_audio_lock();
         for (index = 0u; index < 64u; ++index) {
             if (g_live_audio_packets[index].active &&
-                g_live_audio_packets[index].stream == arguments[0]) {
-                g_live_audio_packets[index].active = 0u;
-                VirtualFree(g_live_audio_packets[index].samples, 0u, 0x8000u);
-                g_live_audio_packets[index].samples = 0;
-            }
+                g_live_audio_packets[index].stream == arguments[0])
+                live_audio_complete_packet(
+                    &g_live_audio_packets[index], 0x8000000Bu);
         }
+        if (stream) stream->packet_head = stream->packet_tail = 0u;
         live_audio_unlock();
         return 0u;
     }
@@ -11181,6 +14170,7 @@ static volatile U32 g_live_vblank_completion_count;
 static volatile U32 g_live_vblank_failure_count;
 static volatile U32 g_live_vblank_callback_address;
 static volatile U32 g_live_vblank_failure_code;
+static U32 g_live_render_publication_failure_code;
 static U64 g_live_vblank_next_deadline_qpc;
 static char g_live_presentation_event_name[160];
 static char g_live_publication_event_name[160];
@@ -11219,10 +14209,11 @@ static U32 g_live_worker_count;
 static U32 g_live_next_worker_handle = 0xB2402000u;
 static U32 g_live_bootstrap_phase = 1u;
 static U32 g_live_startup_phase;
-static void live_write_fault_summary(ExceptionRecord*);
+static void live_write_fault_summary(ExceptionRecord*, void*);
 static void live_write_summary(void);
 static LiveFile g_live_files[128];
 static U32 g_live_file_count;
+static LiveFile* g_live_file_cache[256];
 static LiveFindData g_live_find_entries[128];
 static U32 live_dispatch_bootstrap_service(
     const ServiceDescriptor*, U32*, U32);
@@ -11592,7 +14583,10 @@ static BOOL live_ring_write_two(
     U64 cursor = g_live_command_cursor;
     U32 offset = g_live_command_offset;
     U32 part;
-    if (read_cursor > cursor || total > capacity - (cursor - read_cursor)) return 0;
+    if (read_cursor > cursor || total > capacity - (cursor - read_cursor)) {{
+        g_live_render_publication_failure_code = 30u;
+        return 0;
+    }}
     part = (U32)capacity - offset;
     if (part > first_size) part = first_size;
     copy_bytes(g_live_commands + data_offset + offset, first_payload, part);
@@ -11690,7 +14684,10 @@ static BOOL live_publish_manifest(void) {{
     copy_bytes(g_live_control + 264u, payload, size);
     live_barrier();
     live_write_u32(g_live_control, 256u, published);
-    if (!SetEvent(g_live_publication_event)) return 0;
+    if (!SetEvent(g_live_publication_event)) {{
+        g_live_render_publication_failure_code = 50u;
+        return 0;
+    }}
     return 1;
 }}
 static BOOL live_wait_for_presentation(void) {{
@@ -11706,7 +14703,10 @@ static BOOL live_wait_for_presentation(void) {{
             confirmed = live_read_u32(g_live_control, 128u);
             if (confirmed == sequence && !(confirmed & 1u)) return 1;
         }}
-        if (++waited >= 120000u) return 0;
+        if (++waited >= 120000u) {{
+            g_live_render_publication_failure_code = 60u;
+            return 0;
+        }}
         Sleep(1u);
     }}
 }}
@@ -11716,7 +14716,10 @@ static BOOL live_publish_command_span(
     U32 payload_size;
     U32 write_count;
     U8 header[16];
-    if (span_end <= span_start || (span_start & 3u) || (span_end & 3u)) return 0;
+    if (span_end <= span_start || (span_start & 3u) || (span_end & 3u)) {{
+        g_live_render_publication_failure_code = 40u;
+        return 0;
+    }}
     payload_size = span_end - span_start;
     write_count = payload_size / 4u;
     for (U32 index = 0u; index < sizeof(header); ++index) header[index] = 0u;
@@ -11742,7 +14745,11 @@ static BOOL live_publish_frame(void) {{
     U32 get_pointer;
     BOOL initialized = 0;
     BOOL published_span = 0;
-    if (!context) return 0;
+    g_live_render_publication_failure_code = 0u;
+    if (!context) {{
+        g_live_render_publication_failure_code = 70u;
+        return 0;
+    }}
     ring_start = *(volatile U32*)(context + 0x24u);
     ring_end = *(volatile U32*)(context + 0x28u);
     ring_cursor = *(volatile U32*)context;
@@ -11750,7 +14757,10 @@ static BOOL live_publish_frame(void) {{
     get_pointer = *(volatile U32*)(context + 0x30u);
     if (!ring_start || ring_end <= ring_start || ring_end - ring_start > 0x01000000u ||
         ring_cursor < ring_start || ring_cursor > ring_end ||
-        (ring_start & 3u) || (ring_end & 3u) || (ring_cursor & 3u)) return 0;
+        (ring_start & 3u) || (ring_end & 3u) || (ring_cursor & 3u)) {{
+        g_live_render_publication_failure_code = 71u;
+        return 0;
+    }}
     if (g_live_push_ring_start != ring_start || g_live_push_ring_end != ring_end ||
         g_live_push_ring_cursor < ring_start || g_live_push_ring_cursor > ring_end) {{
         g_live_push_ring_start = ring_start;
@@ -11775,7 +14785,6 @@ static BOOL live_publish_frame(void) {{
     }}
     g_live_push_ring_cursor = ring_cursor == ring_end ? ring_start : ring_cursor;
     if (published_span && !initialized) ++g_live_flip_count;
-    ++g_live_resource_generation;
     if (!live_publish_resources() || !live_publish_manifest()) return 0;
     if (get_pointer) *(volatile U32*)get_pointer = put_value;
     if (initialized) return 1;
@@ -12132,10 +15141,14 @@ static U32 live_dispatch_time_or_sha(U32 value, U32* arguments) {{
     return 0xC0000002u;
 }}
 static LiveFile* live_find_file(U32 handle) {{
-    U32 index;
+    U32 index, slot = (handle >> 2u) & 255u;
+    LiveFile* cached = g_live_file_cache[slot];
+    if (cached && cached->active && cached->handle == handle) return cached;
     for (index = 0u; index < g_live_file_count; ++index)
-        if (g_live_files[index].active && g_live_files[index].handle == handle)
+        if (g_live_files[index].active && g_live_files[index].handle == handle) {{
+            g_live_file_cache[slot] = &g_live_files[index];
             return &g_live_files[index];
+        }}
     return 0;
 }}
 static LiveFile* live_new_file(U32 flags) {{
@@ -12157,6 +15170,7 @@ static LiveFile* live_new_file(U32 flags) {{
     file->flags = flags;
     file->active = 1u;
     file->host = (HANDLE)-1;
+    g_live_file_cache[(file->handle >> 2u) & 255u] = file;
     return file;
 }}
 static void live_copy_string(char* output, U32 capacity, const char* input) {{
@@ -12493,8 +15507,8 @@ static U32 live_dispatch_bootstrap_service(
     if (value == 20u || value == 22u) {{
         LiveFile* file = live_find_file(arguments[0]);
         U32 io_status = arguments[4], buffer = arguments[5], requested = arguments[6];
-        U32 transferred = 0u, status = 0u;
-        U64 offset, transfer_end;
+        U32 transferred = 0u, consumed = 0u, status = 0u;
+        U64 offset, transfer_end, position_end;
         long high;
         if (!file || file->host == (HANDLE)-1) status = 0xC0000008u;
         else if (!buffer && requested) status = 0xC000000Du;
@@ -12507,20 +15521,28 @@ static U32 live_dispatch_bootstrap_service(
             else if (value == 20u) {{
                 if (!ReadFile(file->host, (void*)buffer, requested, &transferred, 0))
                     status = 0xC000000Du;
-                else if ((file->flags & 2u) && transferred < requested &&
-                         offset < file->size &&
-                         (U64)transferred == file->size - offset) {{
-                    U32 index;
-                    for (index = transferred; index < requested; ++index)
-                        *(U8*)(buffer + index) = 0u;
-                    transferred = requested;
+                else {{
+                    consumed = transferred;
+                    /* Disc streams issue fixed-size reads through and beyond
+                       logical EOF. Report zero-filled completion without
+                       advancing the persistent cursor past consumed bytes. */
+                    if ((file->flags & 2u) && transferred < requested &&
+                        (offset >= file->size ||
+                         (U64)transferred == file->size - offset)) {{
+                        U32 index;
+                        for (index = transferred; index < requested; ++index)
+                            *(U8*)(buffer + index) = 0u;
+                        transferred = requested;
+                    }}
                 }}
             }} else {{
                 if (!WriteFile(file->host, (void*)buffer, requested, &transferred, 0))
                     status = 0xC000000Du;
+                consumed = transferred;
             }}
             transfer_end = offset + (U64)transferred;
-            if (!arguments[7]) file->position = transfer_end;
+            position_end = offset + (U64)consumed;
+            if (!arguments[7]) file->position = position_end;
             if (value == 22u && transfer_end > file->size)
                 file->size = transfer_end;
         }}
@@ -12560,8 +15582,11 @@ static U32 live_dispatch_bootstrap_service(
     if (value == 9u) {{
         LiveFile* file = live_find_file(arguments[0]);
         if (file) {{
+            U32 cache_slot = (file->handle >> 2u) & 255u;
             if (file->host != (HANDLE)-1) CloseHandle(file->host);
             file->host = (HANDLE)-1;
+            if (g_live_file_cache[cache_slot] == file)
+                g_live_file_cache[cache_slot] = 0;
             file->active = 0u;
             if (file->delete_pending) DeleteFileA(file->host_path);
         }}
@@ -12598,7 +15623,7 @@ static void live_append_u32(char* output, U32* cursor, U32 value) {{
 static BOOL live_claim_summary(void) {{
     return __atomic_exchange_n(&g_live_summary_claimed, 1u, 5) == 0u;
 }}
-static void live_write_fault_summary(ExceptionRecord* record) {{
+static void live_write_fault_summary(ExceptionRecord* record, void* context) {{
     const U32 GENERIC_WRITE = 0x40000000u;
     const U32 CREATE_ALWAYS = 2u;
     const U32 FILE_ATTRIBUTE_NORMAL = 0x80u;
@@ -12629,7 +15654,38 @@ static void live_write_fault_summary(ExceptionRecord* record) {{
     live_append_literal(payload, &cursor, ",\\\"access_address\\\":\\\"");
     live_append_hex(payload, &cursor,
                     record->parameter_count > 1u ? record->information[1] : 0u);
-    live_append_literal(payload, &cursor, "\\\"}}}}\\n");
+    // Windows x86 CONTEXT stores EDI..EIP at DWORDs 39..46 and ESP at 49.
+    live_append_literal(payload, &cursor, "\\\",\\\"registers\\\":{{\\\"eax\\\":\\\"");
+    live_append_hex(payload, &cursor, context ? ((U32*)context)[44] : 0u);
+    live_append_literal(payload, &cursor, "\\\",\\\"ecx\\\":\\\"");
+    live_append_hex(payload, &cursor, context ? ((U32*)context)[43] : 0u);
+    live_append_literal(payload, &cursor, "\\\",\\\"edx\\\":\\\"");
+    live_append_hex(payload, &cursor, context ? ((U32*)context)[42] : 0u);
+    live_append_literal(payload, &cursor, "\\\",\\\"ebx\\\":\\\"");
+    live_append_hex(payload, &cursor, context ? ((U32*)context)[41] : 0u);
+    live_append_literal(payload, &cursor, "\\\",\\\"esi\\\":\\\"");
+    live_append_hex(payload, &cursor, context ? ((U32*)context)[40] : 0u);
+    live_append_literal(payload, &cursor, "\\\",\\\"edi\\\":\\\"");
+    live_append_hex(payload, &cursor, context ? ((U32*)context)[39] : 0u);
+    live_append_literal(payload, &cursor, "\\\",\\\"ebp\\\":\\\"");
+    live_append_hex(payload, &cursor, context ? ((U32*)context)[45] : 0u);
+    live_append_literal(payload, &cursor, "\\\",\\\"esp\\\":\\\"");
+    live_append_hex(payload, &cursor, context ? ((U32*)context)[49] : 0u);
+    live_append_literal(payload, &cursor, "\\\",\\\"eip\\\":\\\"");
+    live_append_hex(payload, &cursor, context ? ((U32*)context)[46] : 0u);
+    live_append_literal(payload, &cursor,
+        "\\\"}},\\\"audio_snapshot\\\":{{\\\"service_count\\\":");
+    live_append_u32(payload, &cursor, (U32)g_live_audio_service_count);
+    live_append_literal(payload, &cursor, ",\\\"stream_process_calls\\\":");
+    live_append_u32(
+        payload, &cursor, (U32)g_live_audio_service_value_counts[8]);
+    live_append_literal(payload, &cursor, ",\\\"decoded_packets\\\":");
+    live_append_u32(payload, &cursor, (U32)g_live_audio_decoded_packet_count);
+    live_append_literal(payload, &cursor, ",\\\"packet_completions\\\":");
+    live_append_u32(payload, &cursor, (U32)g_live_audio_packet_completion_count);
+    live_append_literal(payload, &cursor, ",\\\"packet_flushes\\\":");
+    live_append_u32(payload, &cursor, (U32)g_live_audio_packet_flush_count);
+    live_append_literal(payload, &cursor, "}}}}\\n");
     file = CreateFileA(g_live_summary_path, GENERIC_WRITE, 0, 0,
                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
     if (file != (HANDLE)-1) {{
@@ -12638,7 +15694,9 @@ static void live_write_fault_summary(ExceptionRecord* record) {{
     }}
 }}
 static long __stdcall live_exception_filter(ExceptionPointers* pointers) {{
-    live_write_fault_summary(pointers ? pointers->record : 0);
+    live_write_fault_summary(
+        pointers ? pointers->record : 0,
+        pointers ? pointers->context : 0);
     return 1;
 }}
 static void live_write_summary(void) {{
@@ -12648,7 +15706,7 @@ static void live_write_summary(void) {{
     HANDLE file;
     U32 written;
     U32 cursor = 0u;
-    char payload[1024];
+    char payload[1600];
     const char* first = "{{\\\"identity\\\":{{\\\"run_id\\\":\\\"";
     const char* second = "\\\"}},\\\"backend\\\":\\\"same-isa-ia32\\\",";
     const char* third =
@@ -12675,6 +15733,18 @@ static void live_write_summary(void) {{
     live_append_literal(payload, &cursor, ",\\\"failure_code\\\":");
     live_append_u32(payload, &cursor, g_live_vblank_failure_code);
     live_append_literal(payload, &cursor,
+        "}},\\\"native_render\\\":{{\\\"publication_failure_code\\\":");
+    live_append_u32(payload, &cursor, g_live_render_publication_failure_code);
+    live_append_literal(payload, &cursor, ",\\\"retained_vertex_ranges\\\":");
+    live_append_u32(
+        payload, &cursor, g_live_resource_scan.retained_vertex_range_count);
+    live_append_literal(payload, &cursor, ",\\\"retained_texture_bindings\\\":");
+    live_append_u32(payload, &cursor, g_live_resource_scan.retained_binding_count);
+    live_append_literal(payload, &cursor, ",\\\"resource_payload_bytes\\\":");
+    live_append_u32(payload, &cursor, g_live_resource_payload_size);
+    live_append_literal(payload, &cursor, ",\\\"guest_flips\\\":");
+    live_append_u32(payload, &cursor, (U32)g_live_flip_count);
+    live_append_literal(payload, &cursor,
         "}},\\\"native_input\\\":{{\\\"refresh_count\\\":");
     live_append_u32(payload, &cursor, (U32)g_live_controller_refresh_count);
     live_append_literal(payload, &cursor, ",\\\"poll_count\\\":");
@@ -12697,6 +15767,18 @@ static void live_write_summary(void) {{
     live_append_literal(payload, &cursor, ",\\\"state_calls\\\":");
     live_append_u32(
         payload, &cursor, (U32)g_live_controller_service_counts[7]);
+    live_append_literal(payload, &cursor, ",\\\"close_calls\\\":");
+    live_append_u32(
+        payload, &cursor, (U32)g_live_controller_service_counts[16]);
+    live_append_literal(payload, &cursor, ",\\\"set_state_calls\\\":");
+    live_append_u32(
+        payload, &cursor, (U32)g_live_controller_service_counts[17]);
+    live_append_literal(payload, &cursor, ",\\\"open_mask\\\":");
+    live_append_u32(payload, &cursor, g_live_controller_open_mask);
+    live_append_literal(payload, &cursor, ",\\\"left_motor\\\":");
+    live_append_u32(payload, &cursor, g_live_controller_last_left_motor);
+    live_append_literal(payload, &cursor, ",\\\"right_motor\\\":");
+    live_append_u32(payload, &cursor, g_live_controller_last_right_motor);
     live_append_literal(payload, &cursor,
         "}},\\\"native_audio\\\":{{\\\"service_count\\\":");
     live_append_u32(payload, &cursor, (U32)g_live_audio_service_count);
@@ -12715,9 +15797,12 @@ static void live_write_summary(void) {{
     live_append_literal(payload, &cursor, ",\\\"stream_process_calls\\\":");
     live_append_u32(
         payload, &cursor, (U32)g_live_audio_service_value_counts[8]);
-    live_append_literal(payload, &cursor, ",\\\"special_create_calls\\\":");
+    live_append_literal(payload, &cursor, ",\\\"buffer_release_calls\\\":");
     live_append_u32(
-        payload, &cursor, (U32)g_live_audio_service_value_counts[18]);
+        payload, &cursor, (U32)g_live_audio_service_value_counts[29]);
+    live_append_literal(payload, &cursor, ",\\\"stream_release_calls\\\":");
+    live_append_u32(
+        payload, &cursor, (U32)g_live_audio_service_value_counts[30]);
     live_append_literal(payload, &cursor, ",\\\"music_mode_calls\\\":");
     live_append_u32(payload, &cursor, (U32)g_live_audio_music_mode_count);
     live_append_literal(payload, &cursor, ",\\\"music_loads\\\":");
@@ -12728,6 +15813,12 @@ static void live_write_summary(void) {{
     live_append_u32(payload, &cursor, g_live_audio_music_mode);
     live_append_literal(payload, &cursor, ",\\\"music_active\\\":");
     live_append_u32(payload, &cursor, g_live_audio_music_active);
+    live_append_literal(payload, &cursor, ",\\\"music_kind\\\":");
+    live_append_u32(payload, &cursor, g_live_audio_music_kind);
+    live_append_literal(payload, &cursor, ",\\\"music_track_index\\\":");
+    live_append_u32(payload, &cursor, g_live_audio_music_track_index);
+    live_append_literal(payload, &cursor, ",\\\"music_streams\\\":");
+    live_append_u32(payload, &cursor, g_live_audio_music_stream_count);
     live_append_literal(payload, &cursor, ",\\\"lane_starts\\\":");
     live_append_u32(payload, &cursor, (U32)g_live_audio_lane_start_count);
     live_append_literal(payload, &cursor, ",\\\"lane_start_failures\\\":");
@@ -12748,6 +15839,10 @@ static void live_write_summary(void) {{
     live_append_u32(payload, &cursor, (U32)g_live_audio_decoded_buffer_count);
     live_append_literal(payload, &cursor, ",\\\"decoded_packets\\\":");
     live_append_u32(payload, &cursor, (U32)g_live_audio_decoded_packet_count);
+    live_append_literal(payload, &cursor, ",\\\"packet_completions\\\":");
+    live_append_u32(payload, &cursor, (U32)g_live_audio_packet_completion_count);
+    live_append_literal(payload, &cursor, ",\\\"packet_flushes\\\":");
+    live_append_u32(payload, &cursor, (U32)g_live_audio_packet_flush_count);
     live_append_literal(payload, &cursor, ",\\\"decode_failures\\\":");
     live_append_u32(payload, &cursor, (U32)g_live_audio_decode_failure_count);
     live_append_literal(payload, &cursor, ",\\\"published_buffers\\\":");
@@ -12775,7 +15870,9 @@ static void live_write_summary(void) {{
         service->runtime_kind == {WORKLOAD_SERVICE_XGETDEVICES}u ||
         service->runtime_kind == {WORKLOAD_SERVICE_XINPUT_OPEN}u ||
         service->runtime_kind == {WORKLOAD_SERVICE_XINPUT_CAPABILITIES}u ||
-        service->runtime_kind == {WORKLOAD_SERVICE_XINPUT_STATE}u)
+        service->runtime_kind == {WORKLOAD_SERVICE_XINPUT_STATE}u ||
+        service->runtime_kind == {WORKLOAD_SERVICE_XINPUT_CLOSE}u ||
+        service->runtime_kind == {WORKLOAD_SERVICE_XINPUT_SET_STATE}u)
         return live_dispatch_input_service(service, arguments);
     if (service->runtime_kind == {WORKLOAD_SERVICE_AUDIO}u)
         return live_dispatch_audio_service(service, this_pointer, arguments);
@@ -12831,13 +15928,13 @@ static void live_write_summary(void) {{
 
     bootstrap_close_seam = """            return 0u;
         }
-        if (service->runtime_value == 17u) return g_workload_av_saved_data_address;
+        if (service->runtime_value == 10u) {
 """
     bootstrap_close_block = """            if (g_normal_live)
                 return live_dispatch_bootstrap_service(service, arguments, 0u);
             return 0u;
         }
-        if (service->runtime_value == 17u) return g_workload_av_saved_data_address;
+        if (service->runtime_value == 10u) {
 """
     if bootstrap_close_seam not in source:
         raise Ia32BackendError("normal-live worker lost its bootstrap-close seam")
@@ -12867,7 +15964,8 @@ static void live_write_summary(void) {{
     recovered_fault_seam = """        g_guest_faulted = 1;
         return -1;
 """
-    recovered_fault_block = """        if (g_normal_live) live_write_fault_summary(pointers->record);
+    recovered_fault_block = """        if (g_normal_live) live_write_fault_summary(
+            pointers->record, pointers->context);
         g_guest_faulted = 1;
         return -1;
 """
@@ -13109,6 +16207,7 @@ static void live_write_summary(void) {{
                     Sleep(1u);
                     continue;
                 }}
+                live_write_summary();
                 ExitProcess(70);
             }}
             exchange->eip = 0x{NORMAL_LIVE_RESUME_THUNK_ADDRESS:08X}u;
@@ -13118,7 +16217,170 @@ static void live_write_summary(void) {{
 """
     if completion_seam not in source:
         raise Ia32BackendError("normal-live worker lost its successful-completion seam")
-    return source.replace(completion_seam, completion_block, 1)
+    source = source.replace(completion_seam, completion_block, 1)
+    return _phase7_normal_live_optimization_source(source)
+
+
+def _phase7_normal_live_optimization_source(source: str) -> str:
+    """Install bounded hot-path caches after all Phase-7 source rewrites."""
+
+    seams = (
+        (
+            """static WorkloadAllocation g_workload_allocations[1024];
+""",
+            """static WorkloadSemaphore* g_workload_semaphore_cache[64];
+static WorkloadAllocation g_workload_allocations[1024];
+""",
+            "semaphore cache global",
+        ),
+        (
+            """static HANDLE g_workload_contiguous_mapping;
+""",
+            """static HANDLE g_workload_contiguous_mapping;
+static WorkloadAllocation* g_workload_last_allocation;
+static U32 g_workload_allocation_page_tags[256];
+static WorkloadAllocation* g_workload_allocation_page_cache[256];
+""",
+            "allocation page cache globals",
+        ),
+        (
+            """static U32 workload_align_up(U32 value, U32 alignment) {
+""",
+            """static WorkloadSemaphore* workload_find_semaphore(U32 handle) {
+    U32 index, slot = (handle >> 2u) & 63u;
+    WorkloadSemaphore* cached = g_workload_semaphore_cache[slot];
+    if (cached && cached->handle == handle) return cached;
+    for (index = 0u; index < g_workload_semaphore_count; ++index) {
+        WorkloadSemaphore* semaphore = &g_workload_semaphores[index];
+        if (semaphore->handle == handle) {
+            g_workload_semaphore_cache[slot] = semaphore;
+            return semaphore;
+        }
+    }
+    return 0;
+}
+static U32 workload_align_up(U32 value, U32 alignment) {
+""",
+            "semaphore lookup helper",
+        ),
+        (
+            """static WorkloadAllocation* workload_find_allocation(U32 address) {
+    U32 index;
+    for (index = 0u; index < g_workload_allocation_count; ++index) {
+        WorkloadAllocation* allocation = &g_workload_allocations[index];
+        if (workload_allocation_offset(allocation, address, 0)) return allocation;
+    }
+    return 0;
+}
+""",
+            """static WorkloadAllocation* workload_find_allocation(U32 address) {
+    U32 index, page = address >> 12u, slot = page & 255u;
+    WorkloadAllocation* cached = g_workload_allocation_page_cache[slot];
+    if (g_workload_allocation_page_tags[slot] == page &&
+        workload_allocation_offset(cached, address, 0)) {
+        g_workload_last_allocation = cached;
+        return cached;
+    }
+    if (workload_allocation_offset(g_workload_last_allocation, address, 0))
+        return g_workload_last_allocation;
+    for (index = 0u; index < g_workload_allocation_count; ++index) {
+        WorkloadAllocation* allocation = &g_workload_allocations[index];
+        if (workload_allocation_offset(allocation, address, 0)) {
+            g_workload_last_allocation = allocation;
+            g_workload_allocation_page_tags[slot] = page;
+            g_workload_allocation_page_cache[slot] = allocation;
+            return allocation;
+        }
+    }
+    return 0;
+}
+""",
+            "allocation lookup cache",
+        ),
+        (
+            """    allocation->active = 1u;
+    allocation->contiguous = contiguous;
+""",
+            """    allocation->active = 1u;
+    allocation->contiguous = contiguous;
+    g_workload_last_allocation = allocation;
+    g_workload_allocation_page_tags[(address >> 12u) & 255u] = address >> 12u;
+    g_workload_allocation_page_cache[(address >> 12u) & 255u] = allocation;
+""",
+            "allocation page cache population",
+        ),
+        (
+            """        WorkloadSemaphore* semaphore = 0;
+        if (service->runtime_value == 3u) return 0u;
+        for (index = 0u; index < g_workload_semaphore_count; ++index) {
+            if (g_workload_semaphores[index].handle == arguments[0]) {
+                semaphore = &g_workload_semaphores[index];
+                break;
+            }
+        }
+""",
+            """        WorkloadSemaphore* semaphore;
+        if (service->runtime_value == 3u) return 0u;
+        semaphore = workload_find_semaphore(arguments[0]);
+""",
+            "semaphore dispatch lookup",
+        ),
+        (
+            """            semaphore->handle = handle;
+            semaphore->count = arguments[2];
+""",
+            """            semaphore->handle = handle;
+            g_workload_semaphore_cache[(handle >> 2u) & 63u] = semaphore;
+            semaphore->count = arguments[2];
+""",
+            "semaphore cache population",
+        ),
+        (
+            """            for (index = 0u; index < g_workload_semaphore_count; ++index)
+                if (g_workload_semaphores[index].handle == arguments[0]) return 0u;
+""",
+            """            if (workload_find_semaphore(arguments[0])) return 0u;
+""",
+            "semaphore close validation",
+        ),
+        (
+            """        if (service->runtime_value == 9u) {
+            for (index = 0u; index < g_workload_semaphore_count; ++index)
+                if (g_workload_semaphores[index].handle == arguments[0]) {
+                    g_workload_semaphores[index].handle = 0u;
+                    g_workload_semaphores[index].count = 0u;
+                    g_workload_semaphores[index].limit = 0u;
+            }
+            if (g_normal_live)
+                return live_dispatch_bootstrap_service(service, arguments, 0u);
+            return 0u;
+        }
+""",
+            """        if (service->runtime_value == 9u) {
+            WorkloadSemaphore* semaphore = workload_find_semaphore(arguments[0]);
+            if (semaphore) {
+                U32 slot = (arguments[0] >> 2u) & 63u;
+                if (g_workload_semaphore_cache[slot] == semaphore)
+                    g_workload_semaphore_cache[slot] = 0;
+                semaphore->handle = 0u;
+                semaphore->count = 0u;
+                semaphore->limit = 0u;
+            }
+            if (g_normal_live)
+                return live_dispatch_bootstrap_service(service, arguments, 0u);
+            return 0u;
+        }
+""",
+            "semaphore cache invalidation",
+        ),
+    )
+    for seam, replacement, label in seams:
+        if source.count(seam) != 1:
+            raise Ia32BackendError(
+                f"Phase-7 worker lost its {label} optimization seam"
+            )
+        source = source.replace(seam, replacement, 1)
+    return source
 
 
 def _phase4_broker_c_source(
@@ -14393,6 +17655,12 @@ def _build_ia32_slice_artifact(
                 "normal_live_native_controller_consumption": True,
                 "normal_live_native_audio": True,
                 "normal_live_native_filesystem": True,
+                "offline_boundary_optimization_interval": (
+                    PHASE7_OFFLINE_BOUNDARY_OPTIMIZATION_INTERVAL
+                ),
+                "ia32_runtime_optimizations": [
+                    dict(record) for record in PHASE7_OFFLINE_BOUNDARY_OPTIMIZATIONS
+                ],
                 "normal_runtime_python_callbacks": 0,
             }
         )
@@ -14869,6 +18137,123 @@ def _phase6_static_jump_table_targets(
     return tuple(sorted(set(targets)))
 
 
+def _phase7_aligned_copy_tail_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the masked nonzero aligned-copy tail selector as one family."""
+
+    site = PHASE7_ALIGNED_COPY_TAIL_SITE
+    if site not in indirect_sites or not set(PHASE7_ALIGNED_COPY_TAIL_TARGETS) <= allowed_targets:
+        return {}
+    instruction = instructions.get(site)
+    if (
+        instruction is None
+        or instruction.bytes_hex.upper() != "FF249DD4B62800"
+        or memory.read(
+            PHASE7_ALIGNED_COPY_TAIL_PROOF_START,
+            len(bytes.fromhex(PHASE7_ALIGNED_COPY_TAIL_PROOF_BYTES)),
+        ).hex().upper()
+        != PHASE7_ALIGNED_COPY_TAIL_PROOF_BYTES
+        or memory.read_u32(PHASE7_ALIGNED_COPY_TAIL_TABLE) != 0
+        or tuple(
+            memory.read_u32(PHASE7_ALIGNED_COPY_TAIL_TABLE + index * 4)
+            for index in range(1, 16)
+        )
+        != PHASE7_ALIGNED_COPY_TAIL_TARGETS
+    ):
+        return {}
+    return {site: tuple(sorted(PHASE7_ALIGNED_COPY_TAIL_TARGETS))}
+
+
+def _phase7_memmove_jump_table_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate every indexed branch in the optimized memmove routine."""
+
+    sites = set(PHASE7_MEMMOVE_JUMP_BINDINGS)
+    table_targets = {
+        target
+        for entries in PHASE7_MEMMOVE_JUMP_TABLES.values()
+        for _index, target in entries
+    }
+    if not sites <= indirect_sites or not table_targets <= allowed_targets:
+        return {}
+    if (
+        set(PHASE7_MEMMOVE_JUMP_SITE_BYTES) != sites
+        or set(PHASE7_MEMMOVE_JUMP_REFERENCES) != set(PHASE7_MEMMOVE_JUMP_TABLES)
+    ):
+        return {}
+
+    physical_entries: dict[int, int] = {}
+    for table_base, entries in PHASE7_MEMMOVE_JUMP_TABLES.items():
+        if not entries or len({index for index, _target in entries}) != len(entries):
+            return {}
+        for index, target in entries:
+            address = _u32(table_base + index * 4)
+            prior = physical_entries.setdefault(address, target)
+            if prior != target or memory.read_u32(address) != target:
+                return {}
+    for address, encoded in PHASE7_MEMMOVE_JUMP_CONTROL_BYTES.items():
+        expected = bytes.fromhex(encoded)
+        if memory.read(address, len(expected)) != expected:
+            return {}
+    for address, encoded in PHASE7_MEMMOVE_JUMP_SITE_BYTES.items():
+        instruction = instructions.get(address)
+        if instruction is None or instruction.bytes_hex.upper() != encoded:
+            return {}
+
+    observed_references = {
+        table_base: {
+            address
+            for address, instruction in instructions.items()
+            if any(
+                operand.kind == "mem"
+                and operand.base is None
+                and operand.index is not None
+                and operand.scale == 4
+                and operand.absolute is None
+                and operand.segment is None
+                and _u32(operand.displacement) == table_base
+                for operand in instruction.operands
+            )
+        }
+        for table_base in PHASE7_MEMMOVE_JUMP_TABLES
+    }
+    if observed_references != PHASE7_MEMMOVE_JUMP_REFERENCES:
+        return {}
+
+    recovered: dict[int, tuple[int, ...]] = {}
+    for site, (table_base, index_register) in PHASE7_MEMMOVE_JUMP_BINDINGS.items():
+        instruction = instructions.get(site)
+        memory_operands = (
+            []
+            if instruction is None
+            else [operand for operand in instruction.operands if operand.kind == "mem"]
+        )
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() not in {"jmp", "jmp_indirect"}
+            or len(memory_operands) != 1
+            or memory_operands[0].base is not None
+            or memory_operands[0].index != index_register
+            or memory_operands[0].scale != 4
+            or memory_operands[0].absolute is not None
+            or memory_operands[0].segment is not None
+            or _u32(memory_operands[0].displacement) != table_base
+        ):
+            return {}
+        recovered[site] = tuple(
+            sorted({target for _index, target in PHASE7_MEMMOVE_JUMP_TABLES[table_base]})
+        )
+    return recovered
+
+
 def _phase7_function_pair_helper_targets(
     memory: SparseMemory,
     instructions: Mapping[int, X86Instruction],
@@ -14905,7 +18290,7 @@ def _phase7_function_pair_helper_targets(
         instruction = instructions.get(address)
         if (
             instruction is None
-            or instruction.mnemonic.casefold() != "call"
+            or instruction.mnemonic.casefold() not in {"call", "jmp"}
             or len(instruction.operands) != 1
         ):
             return False
@@ -15034,6 +18419,65 @@ def _phase7_function_pair_helper_targets(
     return dict(PHASE7_FUNCTION_PAIR_HELPER_TARGETS)
 
 
+def _phase7_collision_dispatch_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the finite collision primitive dispatch table as one family."""
+
+    site = PHASE7_COLLISION_DISPATCH_SITE
+    if site not in indirect_sites:
+        return {}
+    targets = tuple(
+        sorted(
+            {
+                target
+                for row in PHASE7_COLLISION_DISPATCH_TABLE
+                for target in row
+                if target
+            }
+        )
+    )
+    if (
+        not set(targets) <= allowed_targets
+        or PHASE7_COLLISION_DISPATCH_OBSERVED_BOUNDARY != (site, 0x0006A550)
+        or PHASE7_COLLISION_DISPATCH_OBSERVED_BOUNDARY[1] not in targets
+    ):
+        return {}
+    for row, entries in enumerate(PHASE7_COLLISION_DISPATCH_TABLE):
+        for column, expected in enumerate(entries):
+            address = PHASE7_COLLISION_DISPATCH_TABLE_BASE + (row * 4 + column) * 4
+            if memory.read_u32(address) != expected:
+                return {}
+    helper_payload = memory.read(
+        PHASE7_COLLISION_DISPATCH_HELPER_START,
+        PHASE7_COLLISION_DISPATCH_HELPER_END
+        - PHASE7_COLLISION_DISPATCH_HELPER_START,
+    )
+    if hashlib.sha256(helper_payload).hexdigest() != PHASE7_COLLISION_DISPATCH_HELPER_SHA256:
+        return {}
+    instruction = instructions.get(site)
+    if (
+        instruction is None
+        or instruction.mnemonic.casefold() != "call"
+        or len(instruction.operands) != 1
+        or instruction.operands[0].kind != "reg"
+        or instruction.operands[0].reg != "eax"
+    ):
+        return {}
+    direct_callers = {
+        address
+        for address, candidate in instructions.items()
+        if candidate.mnemonic.casefold() == "call"
+        and candidate.target == PHASE7_COLLISION_DISPATCH_HELPER_START
+    }
+    if direct_callers != set(PHASE7_COLLISION_DISPATCH_CALLERS):
+        return {}
+    return {site: targets}
+
+
 def _phase7_base_manager_object_targets(
     memory: SparseMemory,
     instructions: Mapping[int, X86Instruction],
@@ -15083,6 +18527,1178 @@ def _phase7_base_manager_object_targets(
     return {
         site: (target,) for site, (_slot, target) in PHASE7_BASE_MANAGER_OBJECT_BINDINGS.items()
     }
+
+
+def _phase7_game_state_object_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the complete static game-state registry and its dispatches."""
+
+    objects = {
+        index: (cell, object_address, vtable, entries)
+        for index, cell, object_address, vtable, entries in PHASE7_GAME_STATE_OBJECTS
+    }
+    if set(objects) != set(range(0x10)):
+        return {}
+    if {
+        cell for cell, _object, _vtable, _entries in objects.values()
+    } != set(range(0x002FE318, 0x002FE358, 4)):
+        return {}
+
+    concrete_entries: list[tuple[int, ...]] = []
+    for index, (cell, object_address, vtable, entries) in objects.items():
+        if memory.read_u32(cell) != object_address:
+            return {}
+        if object_address == 0:
+            if index != 0x09 or vtable != 0 or entries:
+                return {}
+            continue
+        if vtable == 0 or len(entries) != 16 or memory.read_u32(object_address) != vtable:
+            return {}
+        for slot, target in enumerate(entries):
+            if memory.read_u32(vtable + slot * 4) != target:
+                return {}
+        concrete_entries.append(entries)
+
+    all_targets = {target for entries in concrete_entries for target in entries}
+    if not all_targets <= allowed_targets:
+        return {}
+
+    transition_code = memory.read(
+        PHASE7_GAME_STATE_TRANSITION_CODE_START,
+        PHASE7_GAME_STATE_TRANSITION_CODE_END
+        - PHASE7_GAME_STATE_TRANSITION_CODE_START,
+    )
+    if (
+        hashlib.sha256(transition_code).hexdigest()
+        != PHASE7_GAME_STATE_TRANSITION_CODE_SHA256
+    ):
+        return {}
+
+    active_references = tuple(
+        sorted(
+            address
+            for address, instruction in instructions.items()
+            if any(
+                operand.absolute == PHASE7_GAME_STATE_ACTIVE_OBJECT_CELL
+                for operand in instruction.operands
+            )
+        )
+    )
+    if (
+        len(active_references) != PHASE7_GAME_STATE_REFERENCE_COUNT
+        or hashlib.sha256(
+            b"".join(struct.pack("<I", address) for address in active_references)
+        ).hexdigest()
+        != PHASE7_GAME_STATE_REFERENCE_SHA256
+    ):
+        return {}
+
+    ordered_addresses = sorted(instructions)
+    positions = {address: index for index, address in enumerate(ordered_addresses)}
+
+    def writes_register(instruction: X86Instruction, register: str) -> bool:
+        return bool(
+            instruction.operands
+            and instruction.operands[0].kind == "reg"
+            and instruction.operands[0].reg == register
+        )
+
+    derived_slots: dict[int, int] = {}
+    for site in sorted(indirect_sites):
+        instruction = instructions.get(site)
+        if instruction is None or instruction.mnemonic.casefold() not in {"call", "jmp"}:
+            continue
+        memory_operands = [operand for operand in instruction.operands if operand.kind == "mem"]
+        if len(memory_operands) != 1:
+            continue
+        call_operand = memory_operands[0]
+        if (
+            call_operand.base is None
+            or call_operand.index is not None
+            or call_operand.displacement not in range(0, 0x40, 4)
+        ):
+            continue
+
+        position = positions.get(site)
+        if position is None:
+            continue
+        vtable_load: X86Instruction | None = None
+        vtable_position = -1
+        for previous_position in range(position - 1, max(-1, position - 20), -1):
+            previous = instructions[ordered_addresses[previous_position]]
+            if site - previous.address > 0x70 or previous.mnemonic.casefold() in {"ret", "jmp"}:
+                break
+            if writes_register(previous, call_operand.base):
+                vtable_load = previous
+                vtable_position = previous_position
+                break
+        if vtable_load is None or vtable_load.mnemonic.casefold() != "mov":
+            continue
+        if len(vtable_load.operands) != 2:
+            continue
+        vtable_source = vtable_load.operands[1]
+        if (
+            vtable_source.kind != "mem"
+            or vtable_source.base is None
+            or vtable_source.index is not None
+            or vtable_source.displacement != 0
+        ):
+            continue
+
+        object_load: X86Instruction | None = None
+        for previous_position in range(
+            vtable_position - 1,
+            max(-1, vtable_position - 20),
+            -1,
+        ):
+            previous = instructions[ordered_addresses[previous_position]]
+            if (
+                vtable_load.address - previous.address > 0x70
+                or previous.mnemonic.casefold() in {"ret", "jmp"}
+            ):
+                break
+            if writes_register(previous, vtable_source.base):
+                object_load = previous
+                break
+        if object_load is None or object_load.mnemonic.casefold() != "mov":
+            continue
+        if len(object_load.operands) != 2:
+            continue
+        object_source = object_load.operands[1]
+        if (
+            object_source.kind != "mem"
+            or object_source.absolute != PHASE7_GAME_STATE_ACTIVE_OBJECT_CELL
+        ):
+            continue
+        derived_slots[site] = call_operand.displacement
+
+    derived_sites = tuple(sorted(derived_slots))
+    if (
+        len(derived_sites) != PHASE7_GAME_STATE_DERIVED_SITE_COUNT
+        or hashlib.sha256(
+            b"".join(struct.pack("<I", site) for site in derived_sites)
+        ).hexdigest()
+        != PHASE7_GAME_STATE_DERIVED_SITE_SHA256
+    ):
+        return {}
+
+    recovered = {
+        site: tuple(sorted({entries[slot // 4] for entries in concrete_entries}))
+        for site, slot in derived_slots.items()
+    }
+    for site, (slot, exact_index) in PHASE7_GAME_STATE_SPECIAL_BINDINGS.items():
+        instruction = instructions.get(site)
+        memory_operands = (
+            []
+            if instruction is None
+            else [operand for operand in instruction.operands if operand.kind == "mem"]
+        )
+        if (
+            instruction is None
+            or instruction.bytes_hex.upper() != PHASE7_GAME_STATE_SPECIAL_SITE_BYTES[site]
+            or instruction.mnemonic.casefold() not in {"call", "jmp"}
+            or len(memory_operands) != 1
+            or memory_operands[0].displacement != slot
+        ):
+            return {}
+        if exact_index is None:
+            recovered[site] = tuple(
+                sorted({entries[slot // 4] for entries in concrete_entries})
+            )
+        else:
+            exact_entries = objects[exact_index][3]
+            recovered[site] = (exact_entries[slot // 4],)
+
+    helper_code = memory.read(
+        PHASE7_GAME_STATE_HELPER_START,
+        PHASE7_GAME_STATE_HELPER_END - PHASE7_GAME_STATE_HELPER_START,
+    )
+    if hashlib.sha256(helper_code).hexdigest() != PHASE7_GAME_STATE_HELPER_SHA256:
+        return {}
+    helper_callers = {
+        address
+        for address, instruction in instructions.items()
+        if instruction.mnemonic.casefold() == "call"
+        and instruction.target == PHASE7_GAME_STATE_HELPER_START
+    }
+    if helper_callers != set(PHASE7_GAME_STATE_HELPER_CALLERS):
+        return {}
+    helper_methods = {
+        method for method, _sha256 in PHASE7_GAME_STATE_HELPER_CALLERS.values()
+    }
+    if not helper_methods <= all_targets:
+        return {}
+    for call_site, (method, caller_sha256) in PHASE7_GAME_STATE_HELPER_CALLERS.items():
+        instruction = instructions.get(call_site)
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "call"
+            or instruction.target != PHASE7_GAME_STATE_HELPER_START
+            or method >= call_site
+            or hashlib.sha256(memory.read(method, call_site + 5 - method)).hexdigest()
+            != caller_sha256
+        ):
+            return {}
+    helper_state_indexes = tuple(
+        index
+        for index, (_cell, object_address, _vtable, entries) in objects.items()
+        if object_address and helper_methods.intersection(entries)
+    )
+    if helper_state_indexes != PHASE7_GAME_STATE_HELPER_STATE_INDEXES:
+        return {}
+    helper_entries = [objects[index][3] for index in helper_state_indexes]
+    for site, (slot, site_bytes) in PHASE7_GAME_STATE_HELPER_BINDINGS.items():
+        instruction = instructions.get(site)
+        memory_operands = (
+            []
+            if instruction is None
+            else [operand for operand in instruction.operands if operand.kind == "mem"]
+        )
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "call"
+            or instruction.bytes_hex.upper() != site_bytes
+            or len(memory_operands) != 1
+            or memory_operands[0].displacement != slot
+        ):
+            return {}
+        recovered[site] = tuple(
+            sorted({entries[slot // 4] for entries in helper_entries})
+        )
+
+    sites = tuple(sorted(recovered))
+    boundary_site, boundary_index, boundary_slot, boundary_target = (
+        PHASE7_GAME_STATE_OBSERVED_BOUNDARY
+    )
+    if (
+        len(sites) != PHASE7_GAME_STATE_SITE_COUNT
+        or hashlib.sha256(
+            b"".join(struct.pack("<I", site) for site in sites)
+        ).hexdigest()
+        != PHASE7_GAME_STATE_SITE_SHA256
+        or not set(sites) <= indirect_sites
+        or not {target for targets in recovered.values() for target in targets}
+        <= allowed_targets
+        or objects[boundary_index][3][boundary_slot // 4] != boundary_target
+        or boundary_target not in recovered.get(boundary_site, ())
+    ):
+        return {}
+    return recovered
+
+
+def _phase7_level_load_strategy_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the complete finite level-load strategy-object family."""
+
+    sites = set(PHASE7_LEVEL_LOAD_STRATEGY_BINDINGS)
+    vtables = {
+        vtable: entries for _object_address, vtable, entries in PHASE7_LEVEL_LOAD_STRATEGY_OBJECTS
+    }
+    vtable_targets = {target for entries in vtables.values() for target in entries}
+    if not sites <= indirect_sites or not vtable_targets <= allowed_targets:
+        return {}
+    if set(PHASE7_LEVEL_LOAD_STRATEGY_SITE_BYTES) != sites:
+        return {}
+
+    for object_address, vtable, entries in PHASE7_LEVEL_LOAD_STRATEGY_OBJECTS:
+        if memory.read_u32(object_address) != vtable or vtables.get(vtable) != entries:
+            return {}
+        for index, target in enumerate(entries):
+            if memory.read_u32(vtable + index * 4) != target:
+                return {}
+
+    caller_starts = {
+        caller_start
+        for caller_start, _vtable, _slot in PHASE7_LEVEL_LOAD_STRATEGY_BINDINGS.values()
+    }
+    if caller_starts != set(PHASE7_LEVEL_LOAD_STRATEGY_CALLER_BYTES):
+        return {}
+    for caller_start, encoded in PHASE7_LEVEL_LOAD_STRATEGY_CALLER_BYTES.items():
+        expected = bytes.fromhex(encoded)
+        if memory.read(caller_start, len(expected)) != expected:
+            return {}
+    for installer_start, encoded in PHASE7_LEVEL_LOAD_STRATEGY_INSTALLER_BYTES.items():
+        expected = bytes.fromhex(encoded)
+        if memory.read(installer_start, len(expected)) != expected:
+            return {}
+    for address, encoded in PHASE7_LEVEL_LOAD_STRATEGY_REFERENCE_BYTES.items():
+        instruction = instructions.get(address)
+        if instruction is None or instruction.bytes_hex.upper() != encoded:
+            return {}
+
+    object_addresses = set(PHASE7_LEVEL_LOAD_STRATEGY_REFERENCES)
+    observed_references = {
+        object_address: {
+            address
+            for address, instruction in instructions.items()
+            if any(
+                (
+                    operand.kind == "imm"
+                    and operand.immediate == object_address
+                )
+                or (
+                    operand.kind == "mem"
+                    and operand.absolute == object_address
+                )
+                for operand in instruction.operands
+            )
+        }
+        for object_address in object_addresses
+    }
+    if observed_references != PHASE7_LEVEL_LOAD_STRATEGY_REFERENCES:
+        return {}
+
+    recovered: dict[int, tuple[int, ...]] = {}
+    for site, (caller_start, vtable, slot) in PHASE7_LEVEL_LOAD_STRATEGY_BINDINGS.items():
+        instruction = instructions.get(site)
+        encoded = PHASE7_LEVEL_LOAD_STRATEGY_SITE_BYTES[site]
+        caller_end = caller_start + len(
+            bytes.fromhex(PHASE7_LEVEL_LOAD_STRATEGY_CALLER_BYTES[caller_start])
+        )
+        memory_operands = (
+            []
+            if instruction is None
+            else [operand for operand in instruction.operands if operand.kind == "mem"]
+        )
+        if (
+            instruction is None
+            or instruction.bytes_hex.upper() != encoded
+            or instruction.mnemonic.casefold() not in {"call", "jmp"}
+            or len(memory_operands) != 1
+            or memory_operands[0].displacement != slot
+            or not caller_start <= site < caller_end
+        ):
+            return {}
+        if vtable:
+            selected_entries = vtables.get(vtable)
+            if selected_entries is None:
+                return {}
+            site_targets: tuple[int, ...] = (selected_entries[slot // 4],)
+        else:
+            site_targets = tuple(
+                sorted({table_entries[slot // 4] for table_entries in vtables.values()})
+            )
+        if not set(site_targets) <= allowed_targets:
+            return {}
+        recovered[site] = site_targets
+    return recovered
+
+
+def _phase7_level_parameter_bank_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the complete fixed 32-object level-parameter dispatch bank."""
+
+    code = memory.read(
+        PHASE7_LEVEL_PARAMETER_BANK_CODE_START,
+        PHASE7_LEVEL_PARAMETER_BANK_CODE_END
+        - PHASE7_LEVEL_PARAMETER_BANK_CODE_START,
+    )
+    if hashlib.sha256(code).hexdigest() != PHASE7_LEVEL_PARAMETER_BANK_CODE_SHA256:
+        return {}
+
+    objects = {
+        field: (object_address, vtable, entries)
+        for field, object_address, vtable, entries in (
+            PHASE7_LEVEL_PARAMETER_BANK_OBJECTS
+        )
+    }
+    if set(objects) != set(range(0x10, 0x90, 4)):
+        return {}
+    for _field, (object_address, vtable, entries) in objects.items():
+        if memory.read_u32(object_address) != vtable or len(entries) != 3:
+            return {}
+        for index, target in enumerate(entries):
+            if memory.read_u32(vtable + index * 4) != target:
+                return {}
+
+    generic_sites = set(PHASE7_LEVEL_PARAMETER_BANK_GENERIC_BINDINGS)
+    all_targets = {
+        target
+        for _object_address, _vtable, entries in objects.values()
+        for target in entries
+    }
+    if not generic_sites <= indirect_sites or not all_targets <= allowed_targets:
+        return {}
+    generic_bytes = {
+        0x0001AB3F: "FF12",
+        0x0001ABEB: "FF5208",
+        0x0001AC27: "FF5004",
+    }
+    recovered: dict[int, tuple[int, ...]] = {}
+    for site, slot in PHASE7_LEVEL_PARAMETER_BANK_GENERIC_BINDINGS.items():
+        instruction = instructions.get(site)
+        memory_operands = (
+            []
+            if instruction is None
+            else [operand for operand in instruction.operands if operand.kind == "mem"]
+        )
+        if (
+            instruction is None
+            or instruction.bytes_hex.upper() != generic_bytes[site]
+            or instruction.mnemonic.casefold() != "call"
+            or len(memory_operands) != 1
+            or memory_operands[0].displacement != slot
+        ):
+            return {}
+        recovered[site] = tuple(
+            sorted({entries[slot // 4] for _object, _vtable, entries in objects.values()})
+        )
+
+    region = sorted(
+        (
+            instruction
+            for address, instruction in instructions.items()
+            if PHASE7_LEVEL_PARAMETER_BANK_SETTER_START
+            <= address
+            < PHASE7_LEVEL_PARAMETER_BANK_CODE_END
+        ),
+        key=lambda instruction: instruction.address,
+    )
+    direct_targets: dict[int, tuple[int, ...]] = {}
+    for position, instruction in enumerate(region):
+        memory_operands = [
+            operand for operand in instruction.operands if operand.kind == "mem"
+        ]
+        if (
+            instruction.mnemonic.casefold() != "call"
+            or len(memory_operands) != 1
+            or memory_operands[0].base is None
+            or memory_operands[0].displacement != 4
+        ):
+            continue
+
+        vtable_register = memory_operands[0].base
+        vtable_load: X86Instruction | None = None
+        vtable_position = -1
+        for previous_position in range(position - 1, max(-1, position - 30), -1):
+            previous = region[previous_position]
+            if (
+                instruction.address - previous.address > 0x90
+                or previous.mnemonic.casefold() in {"ret", "jmp"}
+            ):
+                break
+            if (
+                previous.operands
+                and previous.operands[0].kind == "reg"
+                and previous.operands[0].reg == vtable_register
+            ):
+                vtable_load = previous
+                vtable_position = previous_position
+                break
+        if vtable_load is None or vtable_load.mnemonic.casefold() != "mov":
+            continue
+        if len(vtable_load.operands) != 2:
+            continue
+        vtable_source = vtable_load.operands[1]
+        if (
+            vtable_source.kind != "mem"
+            or vtable_source.base is None
+            or vtable_source.index is not None
+            or vtable_source.displacement != 0
+        ):
+            continue
+
+        object_register = vtable_source.base
+        object_load: X86Instruction | None = None
+        for previous_position in range(
+            vtable_position - 1,
+            max(-1, vtable_position - 20),
+            -1,
+        ):
+            previous = region[previous_position]
+            if (
+                vtable_load.address - previous.address > 0x60
+                or previous.mnemonic.casefold() in {"ret", "jmp"}
+            ):
+                break
+            if (
+                previous.operands
+                and previous.operands[0].kind == "reg"
+                and previous.operands[0].reg == object_register
+            ):
+                object_load = previous
+                break
+        if object_load is None or object_load.mnemonic.casefold() != "mov":
+            continue
+        if len(object_load.operands) != 2:
+            continue
+        object_source = object_load.operands[1]
+        if (
+            object_source.kind != "mem"
+            or object_source.base != "esi"
+            or object_source.index is not None
+            or object_source.displacement not in objects
+        ):
+            continue
+        entries = objects[object_source.displacement][2]
+        direct_targets[instruction.address] = (entries[1],)
+
+    direct_sites = tuple(sorted(direct_targets))
+    direct_site_sha256 = hashlib.sha256(
+        b"".join(struct.pack("<I", site) for site in direct_sites)
+    ).hexdigest()
+    boundary_site, boundary_field, boundary_target = (
+        PHASE7_LEVEL_PARAMETER_BANK_OBSERVED_BOUNDARY
+    )
+    if (
+        len(direct_sites) != PHASE7_LEVEL_PARAMETER_BANK_SETTER_SITE_COUNT
+        or direct_site_sha256
+        != PHASE7_LEVEL_PARAMETER_BANK_SETTER_SITE_SHA256
+        or objects[boundary_field][2][1] != boundary_target
+        or direct_targets.get(boundary_site) != (boundary_target,)
+        or not set(direct_sites) <= indirect_sites
+        or not {
+            target for targets in direct_targets.values() for target in targets
+        }
+        <= allowed_targets
+    ):
+        return {}
+    recovered.update(direct_targets)
+    return recovered
+
+
+def _phase7_level_load_manager_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate both fixed level-load manager arrays and self-dispatches."""
+
+    sites = set(PHASE7_LEVEL_LOAD_MANAGER_BINDINGS)
+    vtables = {vtable: entries for vtable, entries in PHASE7_LEVEL_LOAD_MANAGER_VTABLES}
+    vtable_targets = {target for entries in vtables.values() for target in entries}
+    if not sites <= indirect_sites or not vtable_targets <= allowed_targets:
+        return {}
+    if set(PHASE7_LEVEL_LOAD_MANAGER_SITE_BYTES) != sites:
+        return {}
+    if not set(PHASE7_LEVEL_LOAD_MANAGER_COMMON_VTABLES) <= set(vtables):
+        return {}
+
+    for vtable, entries in PHASE7_LEVEL_LOAD_MANAGER_VTABLES:
+        for index, target in enumerate(entries):
+            if memory.read_u32(vtable + index * 4) != target:
+                return {}
+    for object_address, vtable in PHASE7_LEVEL_LOAD_MANAGER_OBJECT_BINDINGS:
+        if memory.read_u32(object_address) != vtable:
+            return {}
+
+    caller_starts = {
+        caller_start
+        for caller_start, _vtable, _slot in PHASE7_LEVEL_LOAD_MANAGER_BINDINGS.values()
+    }
+    if caller_starts != set(PHASE7_LEVEL_LOAD_MANAGER_CALLER_BYTES):
+        return {}
+    for caller_start, encoded in PHASE7_LEVEL_LOAD_MANAGER_CALLER_BYTES.items():
+        expected = bytes.fromhex(encoded)
+        if memory.read(caller_start, len(expected)) != expected:
+            return {}
+    for address, encoded in PHASE7_LEVEL_LOAD_MANAGER_SWEEP_PROOF_BYTES.items():
+        expected = bytes.fromhex(encoded)
+        if memory.read(address, len(expected)) != expected:
+            return {}
+    sweep_helpers = {
+        helper
+        for helper, _prefix_start, _encoded in (
+            PHASE7_LEVEL_LOAD_MANAGER_SWEEP_DIRECT_CALLERS.values()
+        )
+    }
+    observed_sweep_callers = {
+        helper: {
+            address
+            for address, instruction in instructions.items()
+            if instruction.mnemonic.casefold() == "call"
+            and instruction.target == helper
+        }
+        for helper in sweep_helpers
+    }
+    expected_sweep_callers = {
+        helper: {
+            call_site
+            for call_site, (candidate, _prefix_start, _encoded) in (
+                PHASE7_LEVEL_LOAD_MANAGER_SWEEP_DIRECT_CALLERS.items()
+            )
+            if candidate == helper
+        }
+        for helper in sweep_helpers
+    }
+    if observed_sweep_callers != expected_sweep_callers:
+        return {}
+    for call_site, (helper, prefix_start, encoded) in (
+        PHASE7_LEVEL_LOAD_MANAGER_SWEEP_DIRECT_CALLERS.items()
+    ):
+        expected = bytes.fromhex(encoded)
+        instruction = instructions.get(call_site)
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "call"
+            or instruction.target != helper
+            or prefix_start + len(expected) != call_site + 5
+            or memory.read(prefix_start, len(expected)) != expected
+        ):
+            return {}
+    for installer_start, encoded in PHASE7_LEVEL_LOAD_MANAGER_INSTALLER_BYTES.items():
+        expected = bytes.fromhex(encoded)
+        if memory.read(installer_start, len(expected)) != expected:
+            return {}
+    for address, encoded in PHASE7_LEVEL_LOAD_MANAGER_REFERENCE_BYTES.items():
+        instruction = instructions.get(address)
+        if instruction is None or instruction.bytes_hex.upper() != encoded:
+            return {}
+
+    vtable_addresses = set(PHASE7_LEVEL_LOAD_MANAGER_REFERENCES)
+    observed_references = {
+        vtable: {
+            address
+            for address, instruction in instructions.items()
+            if any(
+                (operand.kind == "imm" and operand.immediate == vtable)
+                or (operand.kind == "mem" and operand.absolute == vtable)
+                for operand in instruction.operands
+            )
+        }
+        for vtable in vtable_addresses
+    }
+    if observed_references != PHASE7_LEVEL_LOAD_MANAGER_REFERENCES:
+        return {}
+
+    recovered: dict[int, tuple[int, ...]] = {}
+    for site, (caller_start, vtable, slot) in PHASE7_LEVEL_LOAD_MANAGER_BINDINGS.items():
+        instruction = instructions.get(site)
+        encoded = PHASE7_LEVEL_LOAD_MANAGER_SITE_BYTES[site]
+        caller_end = caller_start + len(
+            bytes.fromhex(PHASE7_LEVEL_LOAD_MANAGER_CALLER_BYTES[caller_start])
+        )
+        memory_operands = (
+            []
+            if instruction is None
+            else [operand for operand in instruction.operands if operand.kind == "mem"]
+        )
+        if (
+            instruction is None
+            or instruction.bytes_hex.upper() != encoded
+            or instruction.mnemonic.casefold() not in {"call", "jmp"}
+            or len(memory_operands) != 1
+            or memory_operands[0].displacement != slot
+            or not caller_start <= site < caller_end
+        ):
+            return {}
+        if vtable:
+            selected_entries = vtables.get(vtable)
+            if selected_entries is None or slot // 4 >= len(selected_entries):
+                return {}
+            site_targets: tuple[int, ...] = (selected_entries[slot // 4],)
+        else:
+            common_entries = [vtables[item] for item in PHASE7_LEVEL_LOAD_MANAGER_COMMON_VTABLES]
+            if any(slot // 4 >= len(table_entries) for table_entries in common_entries):
+                return {}
+            site_targets = tuple(
+                sorted({table_entries[slot // 4] for table_entries in common_entries})
+            )
+        if not set(site_targets) <= allowed_targets:
+            return {}
+        recovered[site] = site_targets
+    boundary_site, boundary_vtable, boundary_slot, boundary_target = (
+        PHASE7_LEVEL_LOAD_MANAGER_SWEEP_OBSERVED_BOUNDARY
+    )
+    if (
+        vtables[boundary_vtable][boundary_slot // 4] != boundary_target
+        or recovered.get(boundary_site) != (boundary_target,)
+    ):
+        return {}
+    return recovered
+
+
+def _phase7_level_update_primary_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate all primary slot-0x18 calls in the level-update switch."""
+
+    target = dict(PHASE7_LEVEL_LOAD_MANAGER_VTABLES)[
+        PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE
+    ][0x18 // 4]
+    sites = set(PHASE7_LEVEL_UPDATE_PRIMARY_BINDINGS)
+    if (
+        not sites <= indirect_sites
+        or target not in allowed_targets
+        or not sites.isdisjoint(PHASE7_LEVEL_UPDATE_SECONDARY_GUARDED_SITES)
+        or memory.read_u32(PHASE7_LEVEL_UPDATE_PRIMARY_CELL)
+        not in PHASE7_LEVEL_UPDATE_PRIMARY_OBJECTS
+    ):
+        return {}
+
+    vtable_entries = dict(PHASE7_LEVEL_LOAD_MANAGER_VTABLES)[
+        PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE
+    ]
+    for object_address in PHASE7_LEVEL_UPDATE_PRIMARY_OBJECTS:
+        if memory.read_u32(object_address) != PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE:
+            return {}
+    for index, entry in enumerate(vtable_entries):
+        if memory.read_u32(PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE + index * 4) != entry:
+            return {}
+
+    if memory.read(
+        PHASE7_LEVEL_UPDATE_SELECTOR_ADDRESS,
+        len(bytes.fromhex(PHASE7_LEVEL_UPDATE_SELECTOR_BYTES)),
+    ) != bytes.fromhex(PHASE7_LEVEL_UPDATE_SELECTOR_BYTES):
+        return {}
+    if tuple(
+        memory.read_u32(PHASE7_LEVEL_UPDATE_JUMP_TABLE_ADDRESS + index * 4)
+        for index in range(len(PHASE7_LEVEL_UPDATE_JUMP_TABLE))
+    ) != PHASE7_LEVEL_UPDATE_JUMP_TABLE:
+        return {}
+
+    for address, encoded in PHASE7_LEVEL_UPDATE_SWITCH_INSTRUCTION_BYTES.items():
+        instruction = instructions.get(address)
+        if instruction is None or instruction.bytes_hex.upper() != encoded:
+            return {}
+    for address, (_case_entry, helper) in PHASE7_LEVEL_UPDATE_HELPER_CALLS.items():
+        instruction = instructions[address]
+        if instruction.mnemonic.casefold() != "call" or instruction.target != helper:
+            return {}
+
+    expected_helper_references = {
+        helper: {address}
+        for address, (_case_entry, helper) in PHASE7_LEVEL_UPDATE_HELPER_CALLS.items()
+    }
+    observed_helper_references = {
+        helper: {
+            address
+            for address, instruction in instructions.items()
+            if instruction.target == helper
+        }
+        for helper in expected_helper_references
+    }
+    if observed_helper_references != expected_helper_references:
+        return {}
+
+    helper_sites: dict[int, set[int]] = {}
+    for site, (helper, caller_start) in PHASE7_LEVEL_UPDATE_PRIMARY_BINDINGS.items():
+        instruction = instructions.get(site)
+        caller_payload = bytes.fromhex(
+            PHASE7_LEVEL_UPDATE_PRIMARY_CALLER_BYTES[caller_start]
+        )
+        memory_operands = (
+            []
+            if instruction is None
+            else [operand for operand in instruction.operands if operand.kind == "mem"]
+        )
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "call"
+            or instruction.bytes_hex.upper() not in {"FF5018", "FF5218"}
+            or len(memory_operands) != 1
+            or memory_operands[0].displacement != 0x18
+            or site + instruction.size != caller_start + len(caller_payload)
+            or memory.read(caller_start, len(caller_payload)) != caller_payload
+        ):
+            return {}
+        helper_sites.setdefault(helper, set()).add(site)
+    if helper_sites != {
+        helper: {site}
+        for site, (helper, _caller_start) in PHASE7_LEVEL_UPDATE_PRIMARY_BINDINGS.items()
+    }:
+        return {}
+    if {
+        helper for _case_entry, helper in PHASE7_LEVEL_UPDATE_HELPER_CALLS.values()
+    } != set(helper_sites):
+        return {}
+    if not all(
+        PHASE7_LEVEL_UPDATE_PRIMARY_BINDINGS[site][0] == helper
+        for _switch_call, (_case_entry, helper) in PHASE7_LEVEL_UPDATE_HELPER_CALLS.items()
+        for site in helper_sites[helper]
+    ):
+        return {}
+    if not {
+        boundary for boundary in PHASE7_LEVEL_UPDATE_OBSERVED_BOUNDARIES
+    } <= {(site, target) for site in sites}:
+        return {}
+    return {site: (target,) for site in sites}
+
+
+def _phase7_level_sample_primary_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the three primary position queries in the fixed sample loop."""
+
+    sites = set(PHASE7_LEVEL_SAMPLE_PRIMARY_BINDINGS)
+    target = dict(PHASE7_LEVEL_LOAD_MANAGER_VTABLES)[
+        PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE
+    ][0x18 // 4]
+    if not sites <= indirect_sites or target not in allowed_targets:
+        return {}
+
+    vtable_entries = dict(PHASE7_LEVEL_LOAD_MANAGER_VTABLES)[
+        PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE
+    ]
+    for index, object_address in enumerate(PHASE7_LEVEL_UPDATE_PRIMARY_OBJECTS):
+        bound_object = memory.read_u32(
+            PHASE7_LEVEL_UPDATE_PRIMARY_CELL + index * 4
+        )
+        if (
+            (index == 0 and bound_object != object_address)
+            or (index != 0 and bound_object not in {0, object_address})
+            or memory.read_u32(object_address)
+            != PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE
+        ):
+            return {}
+    for index, entry in enumerate(vtable_entries):
+        if memory.read_u32(PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE + index * 4) != entry:
+            return {}
+
+    for address, encoded in PHASE7_LEVEL_SAMPLE_PROOF_BYTES.items():
+        payload = bytes.fromhex(encoded)
+        if memory.read(address, len(payload)) != payload:
+            return {}
+
+    for site, base in PHASE7_LEVEL_SAMPLE_PRIMARY_BINDINGS.items():
+        instruction = instructions.get(site)
+        memory_operands = (
+            []
+            if instruction is None
+            else [operand for operand in instruction.operands if operand.kind == "mem"]
+        )
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "call"
+            or instruction.bytes_hex.upper()
+            != ("FF5018" if base == "eax" else "FF5218")
+            or len(memory_operands) != 1
+            or memory_operands[0].base != base
+            or memory_operands[0].displacement != 0x18
+        ):
+            return {}
+
+    observed_direct_calls = {
+        address: instruction.target
+        for address, instruction in instructions.items()
+        if instruction.target == 0x0009D160
+    }
+    if observed_direct_calls != PHASE7_LEVEL_SAMPLE_DIRECT_CALLS:
+        return {}
+    for address, target_address in PHASE7_LEVEL_SAMPLE_DIRECT_CALLS.items():
+        instruction = instructions.get(address)
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "call"
+            or instruction.target != target_address
+        ):
+            return {}
+
+    boundary_site, boundary_object, boundary_vtable, boundary_target = (
+        PHASE7_LEVEL_SAMPLE_OBSERVED_BOUNDARY
+    )
+    if (
+        boundary_site not in sites
+        or boundary_object not in PHASE7_LEVEL_UPDATE_PRIMARY_OBJECTS
+        or boundary_vtable != PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE
+        or boundary_target != target
+    ):
+        return {}
+    return {site: (target,) for site in sites}
+
+
+def _phase7_level_query_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the fixed primary query and its predictable record sibling."""
+
+    sites = set(PHASE7_LEVEL_QUERY_BINDINGS)
+    targets = {
+        target for _vtable, _slot, target in PHASE7_LEVEL_QUERY_BINDINGS.values()
+    }
+    if not sites <= indirect_sites or not targets <= allowed_targets:
+        return {}
+
+    for address, encoded in PHASE7_LEVEL_QUERY_PROOF_BYTES.items():
+        expected = bytes.fromhex(encoded)
+        if memory.read(address, len(expected)) != expected:
+            return {}
+
+    expected_callers = {
+        target: {
+            call_site
+            for call_site, candidate in PHASE7_LEVEL_QUERY_DIRECT_CALLS.items()
+            if candidate == target
+        }
+        for target in set(PHASE7_LEVEL_QUERY_DIRECT_CALLS.values())
+    }
+    observed_callers = {
+        target: {
+            address
+            for address, instruction in instructions.items()
+            if instruction.mnemonic.casefold() == "call"
+            and instruction.target == target
+        }
+        for target in expected_callers
+    }
+    if observed_callers != expected_callers:
+        return {}
+    for call_site, target in PHASE7_LEVEL_QUERY_DIRECT_CALLS.items():
+        instruction = instructions.get(call_site)
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "call"
+            or instruction.target != target
+        ):
+            return {}
+
+    if memory.read_u32(PHASE7_LEVEL_QUERY_OWNER) != PHASE7_LEVEL_UPDATE_PRIMARY_CELL:
+        return {}
+    for index, object_address in enumerate(PHASE7_LEVEL_UPDATE_PRIMARY_OBJECTS):
+        cell_value = memory.read_u32(PHASE7_LEVEL_UPDATE_PRIMARY_CELL + index * 4)
+        if cell_value not in {0, object_address}:
+            return {}
+        if memory.read_u32(object_address) != PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE:
+            return {}
+    primary_vtable = dict(PHASE7_LEVEL_LOAD_MANAGER_VTABLES)[
+        PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE
+    ]
+    for index, target in enumerate(primary_vtable):
+        if memory.read_u32(PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE + index * 4) != target:
+            return {}
+
+    record_count = memory.read_u32(PHASE7_LEVEL_QUERY_RECORD_COUNT_CELL)
+    if (
+        memory.read_u32(PHASE7_LEVEL_QUERY_RECORD_BASE_CELL)
+        != PHASE7_LEVEL_QUERY_RECORD_BASE
+        or not 0 < record_count <= PHASE7_LEVEL_QUERY_RECORD_CAPACITY
+    ):
+        return {}
+    for index, target in enumerate(PHASE7_LEVEL_QUERY_RECORD_VTABLE_ENTRIES):
+        if memory.read_u32(PHASE7_LEVEL_QUERY_RECORD_VTABLE + index * 4) != target:
+            return {}
+    for index in range(PHASE7_LEVEL_QUERY_RECORD_CAPACITY):
+        record = (
+            PHASE7_LEVEL_QUERY_RECORD_BASE
+            + index * PHASE7_LEVEL_QUERY_RECORD_STRIDE
+        )
+        if memory.read_u32(record) != PHASE7_LEVEL_QUERY_RECORD_VTABLE:
+            return {}
+    if memory.read_u32(PHASE7_LEVEL_QUERY_POOL_BASE_CELL) != PHASE7_LEVEL_QUERY_POOL_BASE:
+        return {}
+    for index, target in enumerate(PHASE7_LEVEL_QUERY_POOL_VTABLE_ENTRIES):
+        if memory.read_u32(PHASE7_LEVEL_QUERY_POOL_VTABLE + index * 4) != target:
+            return {}
+    for index in range(PHASE7_LEVEL_QUERY_POOL_CAPACITY):
+        record = PHASE7_LEVEL_QUERY_POOL_BASE + index * PHASE7_LEVEL_QUERY_POOL_STRIDE
+        if memory.read_u32(record) != PHASE7_LEVEL_QUERY_POOL_VTABLE:
+            return {}
+
+    observed_base_references = {
+        address
+        for address, instruction in instructions.items()
+        if any(
+            (operand.kind == "imm" and operand.immediate == PHASE7_LEVEL_QUERY_RECORD_BASE)
+            or (
+                operand.kind == "mem"
+                and operand.absolute == PHASE7_LEVEL_QUERY_RECORD_BASE
+            )
+            for operand in instruction.operands
+        )
+    }
+    observed_vtable_references = {
+        address
+        for address, instruction in instructions.items()
+        if any(
+            (operand.kind == "imm" and operand.immediate == PHASE7_LEVEL_QUERY_RECORD_VTABLE)
+            or (
+                operand.kind == "mem"
+                and operand.absolute == PHASE7_LEVEL_QUERY_RECORD_VTABLE
+            )
+            for operand in instruction.operands
+        )
+    }
+    observed_pool_base_references = {
+        address
+        for address, instruction in instructions.items()
+        if any(
+            (operand.kind == "imm" and operand.immediate == PHASE7_LEVEL_QUERY_POOL_BASE)
+            or (
+                operand.kind == "mem"
+                and operand.absolute == PHASE7_LEVEL_QUERY_POOL_BASE
+            )
+            for operand in instruction.operands
+        )
+    }
+    observed_pool_vtable_references = {
+        address
+        for address, instruction in instructions.items()
+        if any(
+            (operand.kind == "imm" and operand.immediate == PHASE7_LEVEL_QUERY_POOL_VTABLE)
+            or (
+                operand.kind == "mem"
+                and operand.absolute == PHASE7_LEVEL_QUERY_POOL_VTABLE
+            )
+            for operand in instruction.operands
+        )
+    }
+    if (
+        observed_base_references != PHASE7_LEVEL_QUERY_RECORD_BASE_REFERENCES
+        or observed_vtable_references != PHASE7_LEVEL_QUERY_RECORD_VTABLE_REFERENCES
+        or observed_pool_base_references != PHASE7_LEVEL_QUERY_POOL_BASE_REFERENCES
+        or observed_pool_vtable_references
+        != PHASE7_LEVEL_QUERY_POOL_VTABLE_REFERENCES
+    ):
+        return {}
+
+    recovered: dict[int, tuple[int, ...]] = {}
+    expected_site_bytes = {
+        0x000798B5: "FF5218",
+        0x0007994D: "FF5204",
+        0x0009F562: "FF5004",
+        0x0009F650: "FF5004",
+        0x0009F6AC: "FF5004",
+    }
+    for site, (vtable, slot, target) in PHASE7_LEVEL_QUERY_BINDINGS.items():
+        instruction = instructions.get(site)
+        memory_operands = (
+            []
+            if instruction is None
+            else [operand for operand in instruction.operands if operand.kind == "mem"]
+        )
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "call"
+            or instruction.bytes_hex.upper() != expected_site_bytes[site]
+            or len(memory_operands) != 1
+            or memory_operands[0].base != PHASE7_LEVEL_QUERY_SITE_BASES[site]
+            or memory_operands[0].displacement != slot
+        ):
+            return {}
+        table = (
+            primary_vtable
+            if vtable == PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE
+            else PHASE7_LEVEL_QUERY_RECORD_VTABLE_ENTRIES
+            if vtable == PHASE7_LEVEL_QUERY_RECORD_VTABLE
+            else PHASE7_LEVEL_QUERY_POOL_VTABLE_ENTRIES
+        )
+        if table[slot // 4] != target:
+            return {}
+        recovered[site] = (target,)
+
+    observed_site, _object, observed_vtable, observed_target = (
+        PHASE7_LEVEL_QUERY_OBSERVED_BOUNDARY
+    )
+    predicted_site, _record, predicted_vtable, predicted_target = (
+        PHASE7_LEVEL_QUERY_PREDICTED_BOUNDARY
+    )
+    if (
+        PHASE7_LEVEL_QUERY_BINDINGS[observed_site]
+        != (observed_vtable, 0x18, observed_target)
+        or PHASE7_LEVEL_QUERY_BINDINGS[predicted_site]
+        != (predicted_vtable, 0x04, predicted_target)
+    ):
+        return {}
+    return recovered
+
+
+def _phase7_runtime_callback_vector_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the complete late level-load runtime callback vector."""
+
+    sites = set(PHASE7_RUNTIME_CALLBACK_BINDINGS)
+    vector = dict(PHASE7_RUNTIME_CALLBACK_VECTOR)
+    callback_targets = set(vector.values())
+    if not sites <= indirect_sites or not callback_targets <= allowed_targets:
+        return {}
+    if (
+        set(PHASE7_RUNTIME_CALLBACK_SITE_BYTES) != sites
+        or set(PHASE7_RUNTIME_CALLBACK_REFERENCES) != set(vector)
+    ):
+        return {}
+
+    for cell, target in PHASE7_RUNTIME_CALLBACK_VECTOR:
+        if memory.read_u32(cell) != target:
+            return {}
+
+    caller_starts = {
+        caller_start
+        for caller_start, _cell, _target in PHASE7_RUNTIME_CALLBACK_BINDINGS.values()
+    }
+    if caller_starts != set(PHASE7_RUNTIME_CALLBACK_CALLER_BYTES):
+        return {}
+    for caller_start, encoded in PHASE7_RUNTIME_CALLBACK_CALLER_BYTES.items():
+        expected = bytes.fromhex(encoded)
+        if memory.read(caller_start, len(expected)) != expected:
+            return {}
+    for installer_start, encoded in PHASE7_RUNTIME_CALLBACK_INSTALLER_BYTES.items():
+        expected = bytes.fromhex(encoded)
+        if memory.read(installer_start, len(expected)) != expected:
+            return {}
+    for address, encoded in PHASE7_RUNTIME_CALLBACK_REFERENCE_BYTES.items():
+        instruction = instructions.get(address)
+        if instruction is None or instruction.bytes_hex.upper() != encoded:
+            return {}
+
+    observed_references = {
+        cell: {
+            address
+            for address, instruction in instructions.items()
+            if any(
+                operand.kind == "mem" and operand.absolute == cell
+                for operand in instruction.operands
+            )
+        }
+        for cell in vector
+    }
+    if observed_references != PHASE7_RUNTIME_CALLBACK_REFERENCES:
+        return {}
+    if any(
+        instruction.mnemonic.casefold() in {"call", "jmp"}
+        and instruction.target in callback_targets
+        for instruction in instructions.values()
+    ):
+        return {}
+
+    recovered: dict[int, tuple[int, ...]] = {}
+    for site, (caller_start, cell, target) in PHASE7_RUNTIME_CALLBACK_BINDINGS.items():
+        instruction = instructions.get(site)
+        caller_end = caller_start + len(
+            bytes.fromhex(PHASE7_RUNTIME_CALLBACK_CALLER_BYTES[caller_start])
+        )
+        memory_operands = (
+            []
+            if instruction is None
+            else [operand for operand in instruction.operands if operand.kind == "mem"]
+        )
+        if (
+            instruction is None
+            or instruction.bytes_hex.upper() != PHASE7_RUNTIME_CALLBACK_SITE_BYTES[site]
+            or instruction.mnemonic.casefold() != "call"
+            or len(memory_operands) != 1
+            or memory_operands[0].absolute != cell
+            or vector.get(cell) != target
+            or not caller_start <= site < caller_end
+        ):
+            return {}
+        recovered[site] = (target,)
+    return recovered
 
 
 def _phase7_title_input_object_targets(
@@ -15177,7 +19793,10 @@ def _phase7_save_slot_object_targets(
 
     sites = set(PHASE7_SAVE_SLOT_OBJECT_BINDINGS)
     vtable_targets = set(PHASE7_SAVE_SLOT_OBJECT_VTABLE_ENTRIES)
+    owner_vtable_targets = set(PHASE7_SAVE_SLOT_OWNER_VTABLE_ENTRIES)
     if not sites <= indirect_sites or not vtable_targets <= allowed_targets:
+        return {}
+    if not owner_vtable_targets <= allowed_targets:
         return {}
     if (
         memory.read_u32(PHASE7_SAVE_SLOT_OBJECT_POINTER_CELL)
@@ -15188,6 +19807,9 @@ def _phase7_save_slot_object_targets(
     for index, entry in enumerate(PHASE7_SAVE_SLOT_OBJECT_VTABLE_ENTRIES):
         if memory.read_u32(PHASE7_SAVE_SLOT_OBJECT_VTABLE + index * 4) != entry:
             return {}
+    for index, entry in enumerate(PHASE7_SAVE_SLOT_OWNER_VTABLE_ENTRIES):
+        if memory.read_u32(PHASE7_SAVE_SLOT_OWNER_VTABLE + index * 4) != entry:
+            return {}
     for address, expected in PHASE7_SAVE_SLOT_OBJECT_INSTRUCTION_BYTES.items():
         instruction = instructions.get(address)
         if instruction is None or instruction.bytes_hex.upper() != expected:
@@ -15196,6 +19818,145 @@ def _phase7_save_slot_object_targets(
         if memory.read_u32(PHASE7_SAVE_SLOT_OBJECT_VTABLE + slot) != target:
             return {}
     return {site: (target,) for site, (_slot, target) in PHASE7_SAVE_SLOT_OBJECT_BINDINGS.items()}
+
+
+def _phase7_resource_selection_object_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate all exact slot-C callers of the resource-selection object."""
+
+    sites = set(PHASE7_RESOURCE_SELECTION_OBJECT_BINDINGS)
+    vtable_targets = set(PHASE7_RESOURCE_SELECTION_OBJECT_VTABLE_ENTRIES)
+    if not sites <= indirect_sites or not vtable_targets <= allowed_targets:
+        return {}
+    if (
+        memory.read_u32(PHASE7_RESOURCE_SELECTION_OBJECT_POINTER_CELL)
+        != PHASE7_RESOURCE_SELECTION_OBJECT_INITIAL_POINTER
+        or memory.read_u32(PHASE7_RESOURCE_SELECTION_OBJECT)
+        != PHASE7_RESOURCE_SELECTION_OBJECT_VTABLE
+    ):
+        return {}
+    for index, entry in enumerate(PHASE7_RESOURCE_SELECTION_OBJECT_VTABLE_ENTRIES):
+        if memory.read_u32(PHASE7_RESOURCE_SELECTION_OBJECT_VTABLE + index * 4) != entry:
+            return {}
+    caller_starts = {
+        caller_start
+        for caller_start, _slot, _target in PHASE7_RESOURCE_SELECTION_OBJECT_BINDINGS.values()
+    }
+    if caller_starts != set(PHASE7_RESOURCE_SELECTION_OBJECT_CALLER_BYTES):
+        return {}
+    for site, (caller_start, slot, target) in PHASE7_RESOURCE_SELECTION_OBJECT_BINDINGS.items():
+        expected = bytes.fromhex(PHASE7_RESOURCE_SELECTION_OBJECT_CALLER_BYTES[caller_start])
+        instruction = instructions.get(site)
+        if (
+            site != caller_start + len(expected) - 3
+            or memory.read(caller_start, len(expected)) != expected
+            or instruction is None
+            or instruction.bytes_hex.upper() != expected[-3:].hex().upper()
+            or memory.read_u32(PHASE7_RESOURCE_SELECTION_OBJECT_VTABLE + slot) != target
+        ):
+            return {}
+    return {
+        site: (target,)
+        for site, (_caller_start, _slot, target) in PHASE7_RESOURCE_SELECTION_OBJECT_BINDINGS.items()
+    }
+
+
+def _phase7_level_select_object_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the complete finite level-select global-object family."""
+
+    sites = set(PHASE7_LEVEL_SELECT_OBJECT_BINDINGS)
+    vtable_targets = set(PHASE7_LEVEL_SELECT_OBJECT_VTABLE_ENTRIES)
+    if not sites <= indirect_sites or not vtable_targets <= allowed_targets:
+        return {}
+    if (
+        memory.read_u32(PHASE7_LEVEL_SELECT_OBJECT_POINTER_CELL)
+        != PHASE7_LEVEL_SELECT_OBJECT
+        or memory.read_u32(PHASE7_LEVEL_SELECT_OBJECT)
+        != PHASE7_LEVEL_SELECT_OBJECT_VTABLE
+    ):
+        return {}
+    for index, entry in enumerate(PHASE7_LEVEL_SELECT_OBJECT_VTABLE_ENTRIES):
+        if memory.read_u32(PHASE7_LEVEL_SELECT_OBJECT_VTABLE + index * 4) != entry:
+            return {}
+    for caller_start, encoded in PHASE7_LEVEL_SELECT_OBJECT_CALLER_BYTES.items():
+        expected = bytes.fromhex(encoded)
+        if memory.read(caller_start, len(expected)) != expected:
+            return {}
+    for site, (caller_start, slot, target) in PHASE7_LEVEL_SELECT_OBJECT_BINDINGS.items():
+        expected = bytes.fromhex(PHASE7_LEVEL_SELECT_OBJECT_CALLER_BYTES[caller_start])
+        instruction = instructions.get(site)
+        if (
+            site != caller_start + len(expected) - 3
+            or instruction is None
+            or instruction.bytes_hex.upper() != expected[-3:].hex().upper()
+            or memory.read_u32(PHASE7_LEVEL_SELECT_OBJECT_VTABLE + slot) != target
+        ):
+            return {}
+    return {
+        site: (target,)
+        for site, (_caller_start, _slot, target) in PHASE7_LEVEL_SELECT_OBJECT_BINDINGS.items()
+    }
+
+
+def _phase7_new_save_object_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the complete finite new-save global-object call batch."""
+
+    sites = set(PHASE7_NEW_SAVE_OBJECT_BINDINGS)
+    vtables = (
+        (
+            PHASE7_POST_START_OBJECT_POINTER_CELL,
+            PHASE7_POST_START_OBJECT_INITIAL_POINTER,
+            PHASE7_POST_START_OBJECT,
+            PHASE7_POST_START_OBJECT_VTABLE,
+            PHASE7_POST_START_OBJECT_VTABLE_ENTRIES,
+        ),
+        (
+            PHASE7_NEW_SAVE_COMPANION_OBJECT_POINTER_CELL,
+            PHASE7_NEW_SAVE_COMPANION_OBJECT_INITIAL_POINTER,
+            PHASE7_NEW_SAVE_COMPANION_OBJECT,
+            PHASE7_NEW_SAVE_COMPANION_OBJECT_VTABLE,
+            PHASE7_NEW_SAVE_COMPANION_OBJECT_VTABLE_ENTRIES,
+        ),
+    )
+    vtable_targets = {
+        target for _cell, _initial, _object, _vtable, entries in vtables for target in entries
+    }
+    if not sites <= indirect_sites or not vtable_targets <= allowed_targets:
+        return {}
+    for pointer_cell, initial_pointer, object_address, vtable, entries in vtables:
+        if (
+            memory.read_u32(pointer_cell) != initial_pointer
+            or memory.read_u32(object_address) != vtable
+        ):
+            return {}
+        for index, entry in enumerate(entries):
+            if memory.read_u32(vtable + index * 4) != entry:
+                return {}
+    for address, expected in PHASE7_NEW_SAVE_OBJECT_INSTRUCTION_BYTES.items():
+        instruction = instructions.get(address)
+        if instruction is None or instruction.bytes_hex.upper() != expected:
+            return {}
+    for vtable, slot, target in PHASE7_NEW_SAVE_OBJECT_BINDINGS.values():
+        if memory.read_u32(vtable + slot) != target:
+            return {}
+    return {
+        site: (target,)
+        for site, (_vtable, _slot, target) in PHASE7_NEW_SAVE_OBJECT_BINDINGS.items()
+    }
 
 
 def _phase7_directsound_refcount_targets(
@@ -15560,12 +20321,257 @@ def _phase7_asset_stream_callback_targets(
     }
 
 
+def _phase7_resource_converter_callback_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Bind the complete fixed resource-converter callback-vector family."""
+
+    callback_sites = set(PHASE7_RESOURCE_CONVERTER_CALLBACK_BINDINGS)
+    callback_targets = {
+        target for _slot, target in PHASE7_RESOURCE_CONVERTER_CALLBACK_VECTOR
+    }
+    if not callback_sites <= indirect_sites or not callback_targets <= allowed_targets:
+        return {}
+    for index, value in enumerate(PHASE7_RESOURCE_CONVERTER_DESCRIPTOR_VALUES):
+        if memory.read_u32(PHASE7_RESOURCE_CONVERTER_DESCRIPTOR + index * 4) != value:
+            return {}
+    installer = bytes.fromhex(PHASE7_RESOURCE_CONVERTER_INSTALLER_BYTES)
+    if memory.read(0x00105BE0, len(installer)) != installer:
+        return {}
+    for address, encoded in PHASE7_RESOURCE_CONVERTER_INSTRUCTION_BYTES.items():
+        instruction = instructions.get(address)
+        if instruction is None or instruction.bytes_hex.upper() != encoded:
+            return {}
+
+    for site in callback_sites:
+        instruction = instructions[site]
+        if (
+            instruction.mnemonic.casefold() != "call"
+            or len(instruction.operands) != 1
+            or instruction.operands[0].kind != "reg"
+            or instruction.operands[0].reg != "eax"
+        ):
+            return {}
+    for address, (slot, target) in PHASE7_RESOURCE_CONVERTER_INSTALLER_BINDINGS.items():
+        instruction = instructions.get(address)
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "mov"
+            or len(instruction.operands) != 2
+        ):
+            return {}
+        destination, source = instruction.operands
+        if (
+            destination.kind != "mem"
+            or destination.base != "eax"
+            or destination.index is not None
+            or destination.scale != 1
+            or destination.displacement != slot
+            or destination.absolute is not None
+            or destination.segment is not None
+            or source.kind != "imm"
+            or source.immediate != target
+        ):
+            return {}
+
+    descriptor_references = {
+        address
+        for address, instruction in instructions.items()
+        if any(
+            operand.kind == "imm"
+            and operand.immediate == PHASE7_RESOURCE_CONVERTER_DESCRIPTOR
+            for operand in instruction.operands
+        )
+    }
+    callback_target_references = {
+        address
+        for address, instruction in instructions.items()
+        if any(
+            operand.kind == "imm" and operand.immediate in callback_targets
+            for operand in instruction.operands
+        )
+    }
+    converter_callers = {
+        address
+        for address, instruction in instructions.items()
+        if instruction.mnemonic.casefold() == "call"
+        and instruction.target == 0x00105C90
+    }
+    plugin_direct_callers = {
+        address
+        for address, instruction in instructions.items()
+        if instruction.mnemonic.casefold() == "call"
+        and instruction.target in {0x00105920, 0x00105BE0}
+    }
+    boundary_site, boundary_target = PHASE7_RESOURCE_CONVERTER_OBSERVED_BOUNDARY
+    if (
+        descriptor_references != {0x00105C10}
+        or callback_target_references
+        != {0x0010501B, *PHASE7_RESOURCE_CONVERTER_INSTALLER_BINDINGS}
+        or converter_callers != {0x00105A3C}
+        or plugin_direct_callers
+        or PHASE7_RESOURCE_CONVERTER_CALLBACK_BINDINGS[boundary_site][1]
+        != boundary_target
+    ):
+        return {}
+    return {
+        site: (target,)
+        for site, (_slot, target) in PHASE7_RESOURCE_CONVERTER_CALLBACK_BINDINGS.items()
+    }
+
+
+def _phase7_offline_address_taken_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: set[int],
+    allowed_targets: set[int],
+) -> dict[int, tuple[int, ...]]:
+    """Close callbacks from the title's finite address-taken code corpus.
+
+    The retail image is statically linked: callback pointers originate either
+    as an immediate code address in an instruction, an aligned pointer in the
+    immutable data directory, or an address-named absolute callback cell.  The
+    result deliberately over-approximates which declaration can reach a given
+    callback site, but every admitted destination is already decoded AOT code
+    or a registered native service.  Runtime decoding and promotion therefore
+    remain impossible even for callbacks not exercised by the retained run.
+    """
+
+    def is_aot_entry(target: int) -> bool:
+        return target in allowed_targets and (
+            target not in instructions
+            or target < PHASE7_OFFLINE_VTABLE_RDATA_START
+        )
+
+    targets = {
+        int(operand.immediate)
+        for instruction in instructions.values()
+        for operand in instruction.operands
+        if operand.immediate is not None and is_aot_entry(int(operand.immediate))
+    }
+    for address in range(
+        PHASE7_OFFLINE_VTABLE_RDATA_START,
+        PHASE7_OFFLINE_VTABLE_RDATA_END,
+        4,
+    ):
+        target = memory.read_u32(address)
+        if is_aot_entry(target):
+            targets.add(target)
+    for site in indirect_sites:
+        instruction = instructions.get(site)
+        if instruction is None:
+            continue
+        for operand in instruction.operands:
+            if operand.absolute is None:
+                continue
+            target = memory.read_u32(int(operand.absolute))
+            if is_aot_entry(target):
+                targets.add(target)
+
+    closed_targets = tuple(sorted(targets))
+    if not closed_targets:
+        return {}
+    recovered: dict[int, tuple[int, ...]] = {}
+    for site in sorted(indirect_sites):
+        instruction = instructions.get(site)
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() not in {"call", "jmp"}
+            or instruction.target is not None
+            or len(instruction.operands) != 1
+            or instruction.operands[0].kind not in {"reg", "mem"}
+        ):
+            continue
+        recovered[site] = closed_targets
+    return recovered
+
+
+def _phase7_offline_closed_vtable_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Recover the closed low-title virtual interface corpus offline."""
+
+    candidate_bases: set[int] = set()
+    for instruction in instructions.values():
+        for operand in instruction.operands:
+            for value in (operand.immediate, operand.absolute):
+                if (
+                    value is not None
+                    and PHASE7_OFFLINE_VTABLE_RDATA_START
+                    <= value
+                    < PHASE7_OFFLINE_VTABLE_RDATA_END
+                    and value % 4 == 0
+                ):
+                    candidate_bases.add(int(value))
+    for _page, payload in memory.export_pages():
+        for (value,) in struct.iter_unpack("<I", payload):
+            if (
+                PHASE7_OFFLINE_VTABLE_RDATA_START
+                <= value
+                < PHASE7_OFFLINE_VTABLE_RDATA_END
+                and value % 4 == 0
+            ):
+                candidate_bases.add(value)
+
+    requested_slots = {
+        operand.displacement
+        for site in indirect_sites
+        if (instruction := instructions.get(site)) is not None
+        for operand in instruction.operands
+        if operand.kind == "mem"
+        and 0 <= operand.displacement <= PHASE7_OFFLINE_VTABLE_SLOT_LIMIT
+        and operand.displacement % 4 == 0
+    }
+    slot_targets: dict[int, tuple[int, ...]] = {}
+    for slot in sorted(requested_slots):
+        slot_target_values = {
+            memory.read_u32(base + slot)
+            for base in candidate_bases
+            if base + slot + 4 <= PHASE7_OFFLINE_VTABLE_RDATA_END
+            and memory.read_u32(base) in allowed_targets
+            and memory.read_u32(base + slot) in allowed_targets
+        }
+        if slot_target_values:
+            slot_targets[slot] = tuple(sorted(slot_target_values))
+
+    recovered: dict[int, tuple[int, ...]] = {}
+    for site in sorted(indirect_sites):
+        instruction = instructions.get(site)
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "call"
+            or len(instruction.operands) != 1
+        ):
+            continue
+        operand = instruction.operands[0]
+        if (
+            operand.kind != "mem"
+            or operand.base is None
+            or operand.index is not None
+            or operand.absolute is not None
+            or operand.segment is not None
+        ):
+            continue
+        site_targets = slot_targets.get(operand.displacement)
+        if site_targets:
+            recovered[site] = site_targets
+    return recovered
+
+
 def _phase6_verified_indirect_targets(
     capsule: ReplayCapsule,
     plan: Ia32DecodedStorePlan,
     profile: Ia32CoverageProfile,
     services: Mapping[int, _HostServiceThunk],
     preflight_targets: Mapping[int, Sequence[int]],
+    *,
+    observed_memory: SparseMemory | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Bind measured call sites, then close equivalent nearby vtable slots."""
 
@@ -15715,8 +20721,104 @@ def _phase6_verified_indirect_targets(
         if len(vtable_targets) == len(bindings):
             verified[site] = vtable_targets
 
+    # The low-title UI/state virtual families use ordinary MSVC vptr loads and
+    # two common interface slots.  Close them from the complete static pointer
+    # corpus rather than waiting for each object lifetime to appear in manual
+    # gameplay.  A candidate vtable base must be present either as an encoded
+    # instruction operand or as a dword in the immutable boot image, and both
+    # its first entry and selected slot must name ahead-of-time decoded code.
+    # Copies of those pointers preserve the same finite target set; no runtime
+    # discovery, decoding, or code generation is admitted.
+    for site, targets in _phase7_offline_closed_vtable_targets(
+        capsule.memory,
+        instructions,
+        indirect_sites,
+        allowed_targets,
+    ).items():
+        verified.setdefault(site, targets)
+
     verified.update(
         _phase7_base_manager_object_targets(
+            capsule.memory,
+            instructions,
+            indirect_sites,
+            allowed_targets,
+        )
+    )
+    verified.update(
+        _phase7_game_state_object_targets(
+            capsule.memory,
+            instructions,
+            indirect_sites,
+            allowed_targets,
+        )
+    )
+    verified.update(
+        _phase7_level_load_strategy_targets(
+            capsule.memory,
+            instructions,
+            indirect_sites,
+            allowed_targets,
+        )
+    )
+    verified.update(
+        _phase7_level_parameter_bank_targets(
+            capsule.memory,
+            instructions,
+            indirect_sites,
+            allowed_targets,
+        )
+    )
+    verified.update(
+        _phase7_level_load_manager_targets(
+            observed_memory or capsule.memory,
+            instructions,
+            indirect_sites,
+            allowed_targets,
+        )
+    )
+    verified.update(
+        _phase7_level_update_primary_targets(
+            observed_memory or capsule.memory,
+            instructions,
+            indirect_sites,
+            allowed_targets,
+        )
+    )
+    verified.update(
+        _phase7_level_sample_primary_targets(
+            observed_memory or capsule.memory,
+            instructions,
+            indirect_sites,
+            allowed_targets,
+        )
+    )
+    verified.update(
+        _phase7_level_query_targets(
+            observed_memory or capsule.memory,
+            instructions,
+            indirect_sites,
+            allowed_targets,
+        )
+    )
+    verified.update(
+        _phase7_runtime_callback_vector_targets(
+            observed_memory or capsule.memory,
+            instructions,
+            indirect_sites,
+            allowed_targets,
+        )
+    )
+    verified.update(
+        _phase7_aligned_copy_tail_targets(
+            capsule.memory,
+            instructions,
+            indirect_sites,
+            allowed_targets,
+        )
+    )
+    verified.update(
+        _phase7_memmove_jump_table_targets(
             capsule.memory,
             instructions,
             indirect_sites,
@@ -15748,6 +20850,30 @@ def _phase6_verified_indirect_targets(
         )
     )
     verified.update(
+        _phase7_resource_selection_object_targets(
+            capsule.memory,
+            instructions,
+            indirect_sites,
+            allowed_targets,
+        )
+    )
+    verified.update(
+        _phase7_level_select_object_targets(
+            observed_memory or capsule.memory,
+            instructions,
+            indirect_sites,
+            allowed_targets,
+        )
+    )
+    verified.update(
+        _phase7_new_save_object_targets(
+            capsule.memory,
+            instructions,
+            indirect_sites,
+            allowed_targets,
+        )
+    )
+    verified.update(
         _phase7_directsound_refcount_targets(
             capsule.memory,
             instructions,
@@ -15768,6 +20894,14 @@ def _phase6_verified_indirect_targets(
     # two statically installed cleanup/comparison routines. Admit the whole
     # five-site family only while the table, row addressing, caller arguments,
     # and direct helper calls all still match the decoded title.
+    verified.update(
+        _phase7_collision_dispatch_targets(
+            capsule.memory,
+            instructions,
+            indirect_sites,
+            allowed_targets,
+        )
+    )
     verified.update(
         _phase7_function_pair_helper_targets(
             capsule.memory,
@@ -15797,6 +20931,14 @@ def _phase6_verified_indirect_targets(
             allowed_targets,
         )
     )
+    verified.update(
+        _phase7_resource_converter_callback_targets(
+            capsule.memory,
+            instructions,
+            indirect_sites,
+            allowed_targets,
+        )
+    )
 
     # Overlapping module fusion hides a small set of virtual calls from the
     # entry-to-exit edge stream. Bind only the address-named targets recovered
@@ -15808,6 +20950,17 @@ def _phase6_verified_indirect_targets(
         profiled_verified_targets = tuple(sorted(set(profiled_targets) & allowed_targets))
         if len(profiled_verified_targets) == len(set(profiled_targets)):
             verified[site] = profiled_verified_targets
+
+    # Finish the offline proof with the complete static address-taken corpus.
+    # Bespoke families above retain their narrower target sets; this pass only
+    # supplies sites whose exact object lifetime was absent from manual play.
+    for site, targets in _phase7_offline_address_taken_targets(
+        capsule.memory,
+        instructions,
+        indirect_sites,
+        allowed_targets,
+    ).items():
+        verified.setdefault(site, targets)
 
     # Overlapping decoded blocks can place consecutive calls from one native
     # routine in separate store records.  Propagate only a unique measured
@@ -16363,12 +21516,17 @@ def build_ia32_coverage_growth_artifact(
     normal_launcher_cutover: bool = False,
     normal_live_launch: bool = False,
     require_full_flip_oracle: bool = False,
+    observed_indirect_memory: SparseMemory | None = None,
 ) -> Ia32SliceArtifact:
     """Build a closed Phase-6 vertical-slice artifact over every prior native layer."""
 
     active_profile = profile or Ia32ArchitectureProfile()
     coverage_profile = _phase6_profile_scheduler_boundaries(coverage_profile)
-    services = _phase6_host_service_thunks(capsule, coverage_profile)
+    services = _phase6_host_service_thunks(
+        capsule,
+        coverage_profile,
+        complete_offline_registry=normal_live_launch,
+    )
     capsule = _capsule_with_host_services(capsule, services)
     if require_full_flip_oracle:
         _phase7_full_flip_oracle(capsule, stop_eip=_u32(stop_eip))
@@ -16399,6 +21557,7 @@ def build_ia32_coverage_growth_artifact(
             coverage_profile,
             services,
             preflight_targets,
+            observed_memory=observed_indirect_memory,
         )
         plan = inspect_ia32_decoded_store(
             xbe_path,
@@ -16634,6 +21793,7 @@ def build_ia32_normal_live_artifact(
         profile=profile,
         normal_launcher_cutover=True,
         normal_live_launch=True,
+        observed_indirect_memory=evidence_capsule.memory,
     )
     _write_normal_live_artifact_index(artifact, build_dir=build_dir)
     return artifact

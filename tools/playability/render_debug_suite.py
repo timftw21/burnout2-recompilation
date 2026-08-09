@@ -40,6 +40,9 @@ DEFAULT_ANALYSIS_SUMMARY = (
     / "playability"
     / "render-stream-analysis-summary.json"
 )
+DEFAULT_RENDER_ANALYSIS_EXE = DEFAULT_EXE.with_name(
+    f"{DEFAULT_EXE.stem}_render_analysis{DEFAULT_EXE.suffix}"
+)
 
 APPEND_ONLY_COMMAND_MAGIC = b"B2APPND1"
 APPEND_ONLY_COMMAND_HEADER_SIZE = 8
@@ -333,7 +336,7 @@ def run_render_debug_suite(
     analysis_summary: Path = DEFAULT_ANALYSIS_SUMMARY,
     report_output: Path = DEFAULT_REPORT,
     xbe_path: Path | None = DEFAULT_XBE,
-    executable: Path = DEFAULT_EXE,
+    executable: Path = DEFAULT_RENDER_ANALYSIS_EXE,
     source: Path = DEFAULT_SOURCE,
     skip_build: bool = False,
     timeout_seconds: int = 30,
@@ -730,7 +733,7 @@ def main() -> int:
     parser.add_argument("--analysis-summary", type=Path, default=DEFAULT_ANALYSIS_SUMMARY)
     parser.add_argument("--report-output", type=Path, default=DEFAULT_REPORT)
     parser.add_argument("--xbe", type=Path, default=DEFAULT_XBE)
-    parser.add_argument("--exe", type=Path, default=DEFAULT_EXE)
+    parser.add_argument("--exe", type=Path, default=DEFAULT_RENDER_ANALYSIS_EXE)
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--clangxx", type=Path)
     parser.add_argument("--vulkan-sdk", type=Path)

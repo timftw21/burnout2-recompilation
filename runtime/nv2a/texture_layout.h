@@ -40,6 +40,44 @@ inline bool nv2a_texture_format_matches(
     }
 }
 
+inline bool nv2a_render_target_feedback_formats_compatible(
+    std::string_view left,
+    std::string_view right
+) {
+    if (left == right) {
+        return true;
+    }
+    const bool left_argb32 = left == "A8R8G8B8" || left == "X8R8G8B8";
+    const bool right_argb32 = right == "A8R8G8B8" || right == "X8R8G8B8";
+    const bool left_linear_argb32 = left == "A8R8G8B8_LINEAR"
+        || left == "X8R8G8B8_LINEAR";
+    const bool right_linear_argb32 = right == "A8R8G8B8_LINEAR"
+        || right == "X8R8G8B8_LINEAR";
+    return (left_argb32 && right_argb32)
+        || (left_linear_argb32 && right_linear_argb32);
+}
+
+inline bool nv2a_render_target_feedback_format_matches(
+    std::string_view format,
+    uint32_t format_raw
+) {
+    if (nv2a_texture_format_matches(format, format_raw)) {
+        return true;
+    }
+    switch ((format_raw >> 8u) & 0xFFu) {
+    case 0x06u:
+    case 0x07u:
+        return nv2a_render_target_feedback_formats_compatible(
+            format, "A8R8G8B8");
+    case 0x12u:
+    case 0x1Eu:
+        return nv2a_render_target_feedback_formats_compatible(
+            format, "A8R8G8B8_LINEAR");
+    default:
+        return false;
+    }
+}
+
 inline bool nv2a_texture_format_is_linear(uint32_t format_raw) {
     const uint32_t color_format = (format_raw >> 8u) & 0xFFu;
     return color_format == 0x12u || color_format == 0x1Eu;

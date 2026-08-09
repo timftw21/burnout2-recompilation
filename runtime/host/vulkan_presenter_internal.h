@@ -1518,9 +1518,23 @@ void interpret_recovered_d3d_command_append(
             interpret_long_non_increasing_packet(words, index, interpreted);
         } else if ((word & 0xE0000003u) == 0x20000000u || (word & 0x3u) == 0x1u ||
                    (word & 0x3u) == 0x2u || word == 0x00020000u) {
+            const bool jump = (word & 0xE0000003u) == 0x20000000u
+                || (word & 0x3u) == 0x1u;
+            const uint32_t run_id = words[index].run_id;
             ++interpreted.control_flow_packet_count;
             update_d3d_state_seed(interpreted, word);
             ++index;
+            // The native capture publishes the written tail and head of the
+            // circular push buffer as separate runs. A jump at the end of the
+            // tail transfers execution to the head; bytes after the jump are
+            // stale ring contents, not another packet stream. Do not decode
+            // those vertex payloads as persistent NV2A state.
+            if (jump) {
+                while (index < words.size()
+                       && words[index].run_id == run_id) {
+                    ++index;
+                }
+            }
         } else {
             ++interpreted.unknown_packet_count;
             update_d3d_state_seed(interpreted, word);

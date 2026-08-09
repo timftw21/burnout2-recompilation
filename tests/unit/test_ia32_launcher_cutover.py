@@ -28,6 +28,7 @@ from tools.recomp.ia32_native_backend import (
     NORMAL_LIVE_PRIMARY_TLS_BASE,
     NORMAL_LIVE_PRIMARY_TLS_DATA,
     NORMAL_LIVE_PRIMARY_TLS_VECTOR,
+    NORMAL_LIVE_RESUME_THUNK_ADDRESS,
     NORMAL_LIVE_VBLANK_CALLBACK_ADDRESS,
     NORMAL_LIVE_VBLANK_CONTEXT_GLOBAL,
     NORMAL_LIVE_VBLANK_DATA_ADDRESS,
@@ -104,6 +105,19 @@ def _vblank_callback_family_instructions() -> dict[int, X86Instruction]:
 
 
 class Ia32LauncherCutoverTests(unittest.TestCase):
+    def test_normal_live_control_thunks_do_not_overlap_service_bodies(self) -> None:
+        addresses = (
+            NORMAL_LIVE_BOOT_RETURN_THUNK_ADDRESS,
+            NORMAL_LIVE_RESUME_THUNK_ADDRESS,
+            NORMAL_LIVE_VBLANK_START_THUNK_ADDRESS,
+            NORMAL_LIVE_VBLANK_EXIT_THUNK_ADDRESS,
+        )
+
+        self.assertEqual(len(set(addresses)), len(addresses))
+        for address in addresses:
+            self.assertGreaterEqual(address, THUNK_REGION + 0x2100)
+            self.assertLess(address, THUNK_REGION + 0x3000)
+
     def test_normal_live_vblank_callback_family_is_finite(self) -> None:
         instructions = _vblank_callback_family_instructions()
 
@@ -638,10 +652,15 @@ class Ia32LauncherCutoverTests(unittest.TestCase):
             detached_guest=True,
         )
         self.assertIn("initialize_resident_memory();", source)
-        self.assertIn("restore_published_code", source)
-        self.assertIn("g_canonical_publication_page[4096]", source)
-        self.assertIn("volatile U8*)canonical", source)
-        self.assertIn("page_changed(published, canonical)", source)
+        self.assertIn("kDetachedGuestCodePages[]", source)
+        self.assertIn("publish_changed_page", source)
+        self.assertIn("publish_page_without_code", source)
+        self.assertIn("publish_changed_bytes", source)
+        self.assertIn("? publish_page_without_code(", source)
+        self.assertIn(": publish_changed_page(published, resident)", source)
+        self.assertNotIn("g_canonical_publication_page[4096]", source)
+        self.assertIn("for (index = 0; index < 1024u; index += 8u)", source)
+        self.assertNotIn("byte_index < 4096u", source)
         self.assertEqual(source.count("apply_host_publications();"), 2)
         self.assertIn("states[index] = 1u;", source)
         self.assertNotIn(
@@ -691,6 +710,12 @@ class Ia32LauncherCutoverTests(unittest.TestCase):
             source,
         )
         self.assertIn(
+            "live_write_fault_summary(ExceptionRecord* record, void* context)",
+            source,
+        )
+        self.assertIn("context ? ((U32*)context)[40] : 0u", source)
+        self.assertIn(',\\\"eip\\\":\\\"', source)
+        self.assertIn(
             "g_live_control_thread = CreateThread(\n"
             "            0, 0u, live_control_watcher, 0, 0u, 0);",
             source,
@@ -735,9 +760,12 @@ class Ia32LauncherCutoverTests(unittest.TestCase):
             "                    Sleep(1u);\n"
             "                    continue;\n"
             "                }\n"
+            "                live_write_summary();\n"
             "                ExitProcess(70);",
             source,
         )
+        self.assertIn("\\\"publication_failure_code\\\"", source)
+        self.assertIn("\\\"retained_vertex_ranges\\\"", source)
         self.assertIn(
             f"(void*)0x{NORMAL_LIVE_VBLANK_EXIT_THUNK_ADDRESS:08X}u",
             source,
@@ -802,7 +830,60 @@ class Ia32LauncherCutoverTests(unittest.TestCase):
         ]
         self.assertIn("g_live_texture_resources);", resources)
         self.assertIn("allocation->contiguous", resources)
-        self.assertIn("live_sha256_finish(&sha, hash)", resources)
+        self.assertIn("g_live_texture_binding_cache", resources)
+        self.assertIn("g_live_resource_dedupe_stamps", resources)
+        self.assertIn("g_live_resource_last_allocation", resources)
+        self.assertIn(
+            "live_sha256_finish(&content, resource->hash)", resources
+        )
+        self.assertIn("generation == g_live_resource_generation", resources)
+        self.assertIn(
+            "copy_bytes(resource->hash, header + 24u, sizeof(resource->hash))",
+            resources,
+        )
+        self.assertIn(
+            "(const void*)resource->source, resource->byte_count))", resources
+        )
+        self.assertIn("words_a[7] != words_b[7]", resources)
+        self.assertIn("else {\n                live_hash_resource(resource);", resources)
+        self.assertIn("retained_binding_count", resources)
+        self.assertIn("retained_binding_evict_cursor", resources)
+        self.assertIn("vertex_array_offsets[16]", resources)
+        self.assertIn("vertex_array_formats[16]", resources)
+        self.assertIn("live_retain_active_vertex_ranges()", resources)
+        self.assertIn(
+            "state->retained_vertex_range_count >= LIVE_VERTEX_RANGE_CAPACITY",
+            resources,
+        )
+        self.assertIn(
+            "candidate_end - candidate_start > 16u * 1024u * 1024u",
+            resources,
+        )
+        self.assertIn(
+            "start = candidate_start;\n        end = candidate_end;",
+            resources,
+        )
+        self.assertNotIn(
+            "if (end - start > 16u * 1024u * 1024u) return 0;",
+            resources,
+        )
+        self.assertIn(
+            "live_resource_source(\n"
+            "                    retained_start, retained_end - retained_start, &source)",
+            resources,
+        )
+        self.assertIn("method == 0x1800u || method == 0x1808u", resources)
+        self.assertIn("method == 0x1810u", resources)
+        self.assertIn('candidate.format = "VERTEX_BUFFER"', resources)
+        self.assertIn("live_collect_resources(", resources)
+        self.assertNotIn("g_live_resource_scan.frame_binding_count = 0u", resources)
+        self.assertIn(
+            "if (!live_prepare_resource_snapshot(\n"
+            "            g_live_texture_resources, resource_count)) return 1;\n"
+            "    ++g_live_resource_generation;",
+            resources,
+        )
+        self.assertNotIn("++g_live_resource_generation", frame)
         self.assertIn('copy_bytes(output, "B2TEX001", 8u)', resources)
         self.assertIn("g_live_resource_payload_size = payload_size", resources)
         self.assertNotIn("live_write_u32(output, 8u, 0u)", resources)
@@ -817,19 +898,25 @@ class Ia32LauncherCutoverTests(unittest.TestCase):
             source,
         )
         self.assertIn(
-            "else if ((file->flags & 2u) && transferred < requested &&\n"
-            "                         offset < file->size &&\n"
-            "                         (U64)transferred == file->size - offset)",
+            "if ((file->flags & 2u) && transferred < requested &&\n"
+            "                        (offset >= file->size ||\n"
+            "                         (U64)transferred == file->size - offset))",
+            source,
+        )
+        self.assertIn(
+            "Report zero-filled completion without\n"
+            "                       advancing the persistent cursor past consumed bytes.",
             source,
         )
         self.assertIn(
             "for (index = transferred; index < requested; ++index)\n"
-            "                        *(U8*)(buffer + index) = 0u;",
+            "                            *(U8*)(buffer + index) = 0u;",
             source,
         )
         self.assertIn(
             "transfer_end = offset + (U64)transferred;\n"
-            "            if (!arguments[7]) file->position = transfer_end;",
+            "            position_end = offset + (U64)consumed;\n"
+            "            if (!arguments[7]) file->position = position_end;",
             source,
         )
         self.assertIn(
@@ -848,6 +935,19 @@ class Ia32LauncherCutoverTests(unittest.TestCase):
         self.assertIn("g_live_controller_service_counts[service->runtime_kind]", source)
         self.assertIn("\\\"device_queries\\\"", source)
         self.assertIn("\\\"state_calls\\\"", source)
+        self.assertIn("\\\"close_calls\\\"", source)
+        self.assertIn("\\\"set_state_calls\\\"", source)
+        self.assertIn("g_live_controller_open_mask", source)
+        self.assertIn("*(U32*)output = 0u;", source)
+        self.assertIn("*(U8*)(output + 0x41u) = (U8)(port + 2u);", source)
+        self.assertIn(
+            "g_live_controller_last_left_motor = *(U16*)(output + 0x42u);",
+            source,
+        )
+        self.assertIn(
+            "g_live_controller_last_right_motor = *(U16*)(output + 0x44u);",
+            source,
+        )
         self.assertIn("static U32 live_dispatch_audio_service(", source)
         self.assertIn(
             "static U32 live_audio_effect_image(\n"
@@ -868,16 +968,53 @@ class Ia32LauncherCutoverTests(unittest.TestCase):
         )
         self.assertIn("effect_image_failures", source)
         self.assertIn("g_live_audio_service_value_counts[value]", source)
+        self.assertIn("g_live_audio_service_value_counts[31]", source)
+        self.assertIn("*(U32*)base = 0x002C9474u;", source)
+        self.assertIn("*(U32*)(base + 4u) = 1u;", source)
+        self.assertIn("U32 key = base;", source)
+        self.assertIn("*(U32*)base = 0x002C948Cu;", source)
+        self.assertIn("*(U32*)(base + 4u) = 0x002C9480u;", source)
+        self.assertIn("if (value == 29u) {", source)
+        self.assertIn("live_audio_stop_buffer(key);", source)
+        self.assertIn("if (value == 30u) {", source)
+        self.assertIn("g_live_audio_packets[index].stream == key", source)
+        self.assertIn("\\\"buffer_release_calls\\\"", source)
+        self.assertIn("\\\"stream_release_calls\\\"", source)
+        self.assertIn("if (value == 28u) {", source)
+        self.assertIn("*(U32*)(buffer->descriptor + 0xC0u) = start;", source)
+        self.assertIn("if (value == 22u) {", source)
+        self.assertIn("*(U32*)(buffer->descriptor + 0xC8u) = start;", source)
+        self.assertIn(
+            "value == 25u || value == 26u || value == 27u", source
+        )
+        self.assertIn("U64 factor = 0xFFB497A2ull;", source)
+        self.assertIn(
+            "gain = (gain * factor + 0x80000000ull) >> 32u;", source
+        )
+        self.assertIn("if (value == 21u) {", source)
+        self.assertIn("if (mixbin == 0u) buffer->left_mixbin_volume", source)
+        self.assertIn("else if (mixbin == 1u) buffer->right_mixbin_volume", source)
+        self.assertIn("live_audio_refresh_playback_gain(", source)
         self.assertIn("\\\"buffer_create_calls\\\"", source)
         self.assertIn("\\\"stream_process_calls\\\"", source)
-        self.assertIn('"music0/trk07menust.rws"', source)
-        self.assertIn("*(U32*)payload != 0x80Du", source)
-        self.assertIn("format.tag = 0x69u;", source)
-        self.assertIn("if (format.sample_rate == 48000u)", source)
-        self.assertIn("playback->loop = 1u;", source)
-        self.assertIn("live_audio_set_music_mode(this_pointer, arguments[0])", source)
-        self.assertIn("\\\"music_loads\\\"", source)
-        self.assertIn("\\\"music_failures\\\"", source)
+        self.assertNotIn("live_audio_frontend_special_create", source)
+        self.assertIn(
+            "live_audio_set_music_mode(this_pointer, arguments[0])", source
+        )
+        self.assertIn("if (mode == 3u)", source)
+        self.assertIn("else if (mode == 3u && has_gameplay_track)", source)
+        self.assertIn("live_audio_stop_music();", source)
+        self.assertNotIn("queued->sequence < sequence", source)
+        self.assertIn("U32 packet_index = stream->packet_head;", source)
+        self.assertIn("stream->packet_head = packet->next;", source)
+        self.assertIn("stream->packet_tail = packet_index;", source)
+        self.assertIn("slot->sequence = ++g_live_audio_packet_sequence", source)
+        self.assertIn("*(U32*)status = 0x8000000Au;", source)
+        self.assertIn("live_audio_complete_packet(packet, 0u);", source)
+        self.assertIn("0x8000000Bu", source)
+        self.assertIn("SetEvent((HANDLE)packet->completion_event)", source)
+        self.assertIn("\\\"packet_completions\\\"", source)
+        self.assertIn("\\\"packet_flushes\\\"", source)
         self.assertIn("\\\"lane_start_failures\\\"", source)
         self.assertIn(
             "0, 64u * 1024u, live_audio_lane, 0, 0x00010000u, 0", source
@@ -888,10 +1025,22 @@ class Ia32LauncherCutoverTests(unittest.TestCase):
         self.assertIn("copy_bytes(g_live_control + 8224u, samples, byte_count);", source)
         self.assertIn("live_write_u32(g_live_control, 8192u, published);", source)
         self.assertIn("service->runtime_kind == 4u ||", source)
-        self.assertIn("service->runtime_kind == 7u)", source)
+        self.assertIn("service->runtime_kind == 7u ||", source)
+        self.assertIn("service->runtime_kind == 16u ||", source)
+        self.assertIn("service->runtime_kind == 17u)", source)
         self.assertIn("if (service->runtime_kind == 13u)", source)
         self.assertIn("native_input", source)
         self.assertIn("native_audio", source)
+        self.assertIn("g_workload_last_allocation", source)
+        self.assertIn("g_workload_semaphore_cache[64]", source)
+        self.assertIn("g_live_file_cache[256]", source)
+        self.assertIn("g_live_audio_playback_cache[64]", source)
+        self.assertIn("g_live_audio_active_playback_masks[2]", source)
+        self.assertIn("g_live_audio_active_stream_mask", source)
+        self.assertIn("g_live_audio_packet_free_hint", source)
+        self.assertIn("live_audio_reserve_playback()", source)
+        self.assertIn("__builtin_ctz(available)", source)
+        self.assertIn("playback = live_audio_playback(arguments[0]);", source)
         self.assertEqual(source.count("install_host_service_thunks();"), 2)
         reinstall = source[
             source.index("static void install_host_service_thunks") :

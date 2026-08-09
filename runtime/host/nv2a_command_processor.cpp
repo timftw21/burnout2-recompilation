@@ -176,7 +176,11 @@ bool host_texture_matches_stage(
     return texture.width == width
         && texture.height == height
         && texture.cubemap == nv2a_texture_format_is_cubemap(format_raw)
-        && nv2a_texture_format_matches(texture.format, format_raw);
+        && (nv2a_texture_format_matches(texture.format, format_raw)
+            || (texture.render_target_feedback
+                && b2r::nv2a::nv2a_render_target_feedback_format_matches(
+                    texture.format,
+                    format_raw)));
 }
 
 
@@ -1302,7 +1306,8 @@ std::vector<RecoveredD3DCommand> load_recovered_d3d_binary_stream(
                 &logical_write_count,
                 header.data() + 12u,
                 sizeof(logical_write_count));
-            if (payload_size == 0u || logical_write_count == 0u) {
+            if (payload_size == 0u || payload_size % sizeof(uint32_t) != 0u
+                || logical_write_count != payload_size / sizeof(uint32_t)) {
                 throw std::runtime_error("invalid live command span size");
             }
             std::vector<uint8_t> payload(payload_size);
@@ -1312,8 +1317,10 @@ std::vector<RecoveredD3DCommand> load_recovered_d3d_binary_stream(
             if (!file) {
                 throw std::runtime_error("truncated live command span payload");
             }
-            for (size_t offset = 0u; offset < payload.size(); offset += 8u) {
-                const size_t size = std::min<size_t>(8u, payload.size() - offset);
+            for (size_t offset = 0u;
+                 offset < payload.size();
+                 offset += sizeof(uint32_t)) {
+                const size_t size = sizeof(uint32_t);
                 uint32_t value = 0u;
                 std::memcpy(
                     &value,
@@ -1600,6 +1607,116 @@ std::vector<RecoveredTextureResource> load_recovered_texture_resources_bytes(
     std::vector<RecoveredTextureResource>* reusable_resources,
     uint64_t* reused_resource_count,
     uint64_t* reused_payload_bytes) {
+    if (bytes.size() >= 8u
+        && std::memcmp(bytes.data(), "B2TEX001", 8u) == 0) {
+        if (reused_resource_count != nullptr) {
+            *reused_resource_count = 0u;
+        }
+        if (reused_payload_bytes != nullptr) {
+            *reused_payload_bytes = 0u;
+        }
+        size_t cursor = 8u;
+        const auto read_u32 = [&bytes, &cursor]() {
+            if (cursor > bytes.size() || bytes.size() - cursor < 4u) {
+                throw std::runtime_error(
+                    "truncated binary live texture resource");
+            }
+            uint32_t value = 0u;
+            std::memcpy(&value, bytes.data() + cursor, sizeof(value));
+            cursor += sizeof(value);
+            return value;
+        };
+        const uint32_t resource_count = read_u32();
+        if (resource_count > (bytes.size() - cursor) / 56u) {
+            throw std::runtime_error(
+                "invalid binary live texture resource count");
+        }
+        std::unordered_map<uint32_t, std::vector<size_t>> reusable_by_address;
+        std::vector<bool> reusable_claimed;
+        if (reusable_resources != nullptr) {
+            reusable_claimed.resize(reusable_resources->size());
+            for (size_t index = 0u; index < reusable_resources->size(); ++index) {
+                reusable_by_address[(*reusable_resources)[index].address]
+                    .push_back(index);
+            }
+        }
+        std::vector<RecoveredTextureResource> resources;
+        resources.reserve(resource_count);
+        for (uint32_t index = 0u; index < resource_count; ++index) {
+            const uint32_t stage = read_u32();
+            const uint32_t address = read_u32();
+            const uint32_t width = read_u32();
+            const uint32_t height = read_u32();
+            const uint32_t format_size = read_u32();
+            const uint32_t payload_size = read_u32();
+            if (format_size == 0u || format_size > 32u
+                || payload_size > 256u * 1024u * 1024u
+                || cursor > bytes.size()
+                || bytes.size() - cursor < 32u + format_size
+                || bytes.size() - cursor - 32u - format_size < payload_size) {
+                throw std::runtime_error(
+                    "invalid binary live texture resource header");
+            }
+            constexpr char kHexDigits[] = "0123456789ABCDEF";
+            std::string hash(64u, '0');
+            for (size_t byte_index = 0u; byte_index < 32u; ++byte_index) {
+                const uint8_t byte = bytes[cursor + byte_index];
+                hash[byte_index * 2u] = kHexDigits[byte >> 4u];
+                hash[byte_index * 2u + 1u] = kHexDigits[byte & 0xFu];
+            }
+            cursor += 32u;
+            std::string format(
+                reinterpret_cast<const char*>(bytes.data() + cursor),
+                format_size);
+            cursor += format_size;
+
+            RecoveredTextureResource resource{};
+            resource.address = address;
+            resource.width = width;
+            resource.height = height;
+            resource.format = std::move(format);
+            resource.content_hash = std::move(hash);
+            bool reused_payload = false;
+            const auto candidates = reusable_by_address.find(address);
+            if (candidates != reusable_by_address.end()) {
+                for (const size_t candidate_index : candidates->second) {
+                    RecoveredTextureResource& candidate =
+                        (*reusable_resources)[candidate_index];
+                    if (reusable_claimed[candidate_index]
+                        || candidate.width != width
+                        || candidate.height != height
+                        || candidate.format != resource.format
+                        || candidate.content_hash != resource.content_hash
+                        || candidate.payload.size() != payload_size) {
+                        continue;
+                    }
+                    resource.payload = std::move(candidate.payload);
+                    reusable_claimed[candidate_index] = true;
+                    reused_payload = true;
+                    if (reused_resource_count != nullptr) {
+                        ++*reused_resource_count;
+                    }
+                    if (reused_payload_bytes != nullptr) {
+                        *reused_payload_bytes += payload_size;
+                    }
+                    break;
+                }
+            }
+            if (!reused_payload) {
+                resource.payload.resize(payload_size);
+                if (payload_size != 0u) {
+                    std::memcpy(
+                        resource.payload.data(),
+                        bytes.data() + cursor,
+                        payload_size);
+                }
+            }
+            cursor += payload_size;
+            resources.push_back(std::move(resource));
+            (void)stage;
+        }
+        return resources;
+    }
     std::istringstream stream(
         std::string(
             reinterpret_cast<const char*>(bytes.data()),

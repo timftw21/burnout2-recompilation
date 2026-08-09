@@ -10,6 +10,11 @@ from tools.recomp.ia32_native_backend import (
     DETACHED_GUEST_RESERVATION_START,
     IA32_VBLANK_RETURN_SENTINEL,
     PHASE6_COVERAGE_GROWTH_CONTRACT_ID,
+    PHASE7_ALIGNED_COPY_TAIL_PROOF_BYTES,
+    PHASE7_ALIGNED_COPY_TAIL_PROOF_START,
+    PHASE7_ALIGNED_COPY_TAIL_SITE,
+    PHASE7_ALIGNED_COPY_TAIL_TABLE,
+    PHASE7_ALIGNED_COPY_TAIL_TARGETS,
     PHASE7_ASSET_STREAM_CALLBACK_BINDINGS,
     PHASE7_ASSET_STREAM_CALLBACK_RECORD_SLOTS,
     PHASE7_ASSET_STREAM_ENTRY_REFERENCES,
@@ -22,6 +27,11 @@ from tools.recomp.ia32_native_backend import (
     PHASE7_CAPTURED_REGISTER_IMPORT_BINDINGS,
     PHASE7_CAPTURED_SERVICE_IMPORT_CELLS,
     PHASE7_CAPTURED_VTABLE_SLOT_BINDINGS,
+    PHASE7_COLLISION_DISPATCH_CALLERS,
+    PHASE7_COLLISION_DISPATCH_HELPER_START,
+    PHASE7_COLLISION_DISPATCH_SITE,
+    PHASE7_COLLISION_DISPATCH_TABLE,
+    PHASE7_COLLISION_DISPATCH_TABLE_BASE,
     PHASE7_BB0_CALLBACK_CALLER,
     PHASE7_BB0_CALLBACK_INSTALL,
     PHASE7_BB0_CALLBACK_SITE,
@@ -38,6 +48,109 @@ from tools.recomp.ia32_native_backend import (
     PHASE7_FUNCTION_PAIR_HELPER_TARGETS,
     PHASE7_FUNCTION_PAIR_TABLE,
     PHASE7_FUNCTION_PAIR_TABLE_BASE,
+    PHASE7_GAME_STATE_DERIVED_SITE_COUNT,
+    PHASE7_GAME_STATE_DERIVED_SITE_SHA256,
+    PHASE7_GAME_STATE_HELPER_BINDINGS,
+    PHASE7_GAME_STATE_HELPER_CALLERS,
+    PHASE7_GAME_STATE_HELPER_END,
+    PHASE7_GAME_STATE_HELPER_SHA256,
+    PHASE7_GAME_STATE_HELPER_START,
+    PHASE7_GAME_STATE_HELPER_STATE_INDEXES,
+    PHASE7_GAME_STATE_OBJECTS,
+    PHASE7_GAME_STATE_OBSERVED_BOUNDARY,
+    PHASE7_GAME_STATE_REFERENCE_COUNT,
+    PHASE7_GAME_STATE_REFERENCE_SHA256,
+    PHASE7_GAME_STATE_SITE_COUNT,
+    PHASE7_GAME_STATE_SITE_SHA256,
+    PHASE7_GAME_STATE_SPECIAL_BINDINGS,
+    PHASE7_GAME_STATE_TRANSITION_CODE_END,
+    PHASE7_GAME_STATE_TRANSITION_CODE_SHA256,
+    PHASE7_GAME_STATE_TRANSITION_CODE_START,
+    PHASE7_LEVEL_SELECT_OBJECT,
+    PHASE7_LEVEL_SELECT_OBJECT_BINDINGS,
+    PHASE7_LEVEL_SELECT_OBJECT_CALLER_BYTES,
+    PHASE7_LEVEL_SELECT_OBJECT_POINTER_CELL,
+    PHASE7_LEVEL_SELECT_OBJECT_VTABLE,
+    PHASE7_LEVEL_SELECT_OBJECT_VTABLE_ENTRIES,
+    PHASE7_LEVEL_LOAD_STRATEGY_BINDINGS,
+    PHASE7_LEVEL_LOAD_STRATEGY_CALLER_BYTES,
+    PHASE7_LEVEL_LOAD_STRATEGY_INSTALLER_BYTES,
+    PHASE7_LEVEL_LOAD_STRATEGY_OBJECTS,
+    PHASE7_LEVEL_LOAD_STRATEGY_REFERENCE_BYTES,
+    PHASE7_LEVEL_LOAD_STRATEGY_SITE_BYTES,
+    PHASE7_LEVEL_LOAD_MANAGER_BINDINGS,
+    PHASE7_LEVEL_LOAD_MANAGER_CALLER_BYTES,
+    PHASE7_LEVEL_LOAD_MANAGER_INSTALLER_BYTES,
+    PHASE7_LEVEL_LOAD_MANAGER_OBJECT_BINDINGS,
+    PHASE7_LEVEL_LOAD_MANAGER_REFERENCE_BYTES,
+    PHASE7_LEVEL_LOAD_MANAGER_SITE_BYTES,
+    PHASE7_LEVEL_LOAD_MANAGER_SWEEP_DIRECT_CALLERS,
+    PHASE7_LEVEL_LOAD_MANAGER_SWEEP_OBSERVED_BOUNDARY,
+    PHASE7_LEVEL_LOAD_MANAGER_SWEEP_PROOF_BYTES,
+    PHASE7_LEVEL_LOAD_MANAGER_VTABLES,
+    PHASE7_LEVEL_QUERY_BINDINGS,
+    PHASE7_LEVEL_QUERY_DIRECT_CALLS,
+    PHASE7_LEVEL_QUERY_OBSERVED_BOUNDARY,
+    PHASE7_LEVEL_QUERY_OWNER,
+    PHASE7_LEVEL_QUERY_PREDICTED_BOUNDARY,
+    PHASE7_LEVEL_QUERY_PROOF_BYTES,
+    PHASE7_LEVEL_QUERY_POOL_BASE,
+    PHASE7_LEVEL_QUERY_POOL_BASE_CELL,
+    PHASE7_LEVEL_QUERY_POOL_CAPACITY,
+    PHASE7_LEVEL_QUERY_POOL_STRIDE,
+    PHASE7_LEVEL_QUERY_POOL_VTABLE,
+    PHASE7_LEVEL_QUERY_POOL_VTABLE_ENTRIES,
+    PHASE7_LEVEL_QUERY_RECORD_BASE,
+    PHASE7_LEVEL_QUERY_RECORD_BASE_CELL,
+    PHASE7_LEVEL_QUERY_RECORD_CAPACITY,
+    PHASE7_LEVEL_QUERY_RECORD_COUNT_CELL,
+    PHASE7_LEVEL_QUERY_RECORD_STRIDE,
+    PHASE7_LEVEL_QUERY_RECORD_VTABLE,
+    PHASE7_LEVEL_QUERY_RECORD_VTABLE_ENTRIES,
+    PHASE7_LEVEL_SAMPLE_DIRECT_CALLS,
+    PHASE7_LEVEL_SAMPLE_OBSERVED_BOUNDARY,
+    PHASE7_LEVEL_SAMPLE_PRIMARY_BINDINGS,
+    PHASE7_LEVEL_SAMPLE_PROOF_BYTES,
+    PHASE7_LEVEL_UPDATE_HELPER_CALLS,
+    PHASE7_LEVEL_UPDATE_JUMP_TABLE,
+    PHASE7_LEVEL_UPDATE_JUMP_TABLE_ADDRESS,
+    PHASE7_LEVEL_UPDATE_OBSERVED_BOUNDARIES,
+    PHASE7_LEVEL_UPDATE_PRIMARY_BINDINGS,
+    PHASE7_LEVEL_UPDATE_PRIMARY_CALLER_BYTES,
+    PHASE7_LEVEL_UPDATE_PRIMARY_CELL,
+    PHASE7_LEVEL_UPDATE_PRIMARY_OBJECTS,
+    PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE,
+    PHASE7_LEVEL_UPDATE_SECONDARY_GUARDED_SITES,
+    PHASE7_LEVEL_UPDATE_SELECTOR_ADDRESS,
+    PHASE7_LEVEL_UPDATE_SELECTOR_BYTES,
+    PHASE7_LEVEL_UPDATE_SWITCH_INSTRUCTION_BYTES,
+    PHASE7_LEVEL_PARAMETER_BANK_CODE_END,
+    PHASE7_LEVEL_PARAMETER_BANK_CODE_SHA256,
+    PHASE7_LEVEL_PARAMETER_BANK_CODE_START,
+    PHASE7_LEVEL_PARAMETER_BANK_GENERIC_BINDINGS,
+    PHASE7_LEVEL_PARAMETER_BANK_OBSERVED_BOUNDARY,
+    PHASE7_LEVEL_PARAMETER_BANK_OBJECTS,
+    PHASE7_LEVEL_PARAMETER_BANK_SETTER_SITE_COUNT,
+    PHASE7_LEVEL_PARAMETER_BANK_SETTER_SITE_SHA256,
+    PHASE7_MEMMOVE_JUMP_BINDINGS,
+    PHASE7_MEMMOVE_JUMP_CONTROL_BYTES,
+    PHASE7_MEMMOVE_JUMP_SITE_BYTES,
+    PHASE7_MEMMOVE_JUMP_TABLES,
+    PHASE7_RUNTIME_CALLBACK_BINDINGS,
+    PHASE7_RUNTIME_CALLBACK_CALLER_BYTES,
+    PHASE7_RUNTIME_CALLBACK_INSTALLER_BYTES,
+    PHASE7_RUNTIME_CALLBACK_REFERENCE_BYTES,
+    PHASE7_RUNTIME_CALLBACK_VECTOR,
+    PHASE7_NEW_SAVE_COMPANION_OBJECT,
+    PHASE7_NEW_SAVE_COMPANION_OBJECT_INITIAL_POINTER,
+    PHASE7_NEW_SAVE_COMPANION_OBJECT_POINTER_CELL,
+    PHASE7_NEW_SAVE_COMPANION_OBJECT_VTABLE,
+    PHASE7_NEW_SAVE_COMPANION_OBJECT_VTABLE_ENTRIES,
+    PHASE7_NEW_SAVE_OBJECT_BINDINGS,
+    PHASE7_NEW_SAVE_OBJECT_INSTRUCTION_BYTES,
+    PHASE7_NATIVE_AUDIO_LIFETIME_SERVICE_TARGETS,
+    PHASE7_NATIVE_BUFFER_CONFIGURATION_SERVICE_TARGETS,
+    PHASE7_NATIVE_XINPUT_CONTROL_SERVICE_TARGETS,
     PHASE7_PROFILED_BOOT_SERVICE_SPECS,
     PHASE7_POST_START_OBJECT,
     PHASE7_POST_START_OBJECT_BINDINGS,
@@ -53,6 +166,23 @@ from tools.recomp.ia32_native_backend import (
     PHASE7_SAVE_SLOT_OBJECT_POINTER_CELL,
     PHASE7_SAVE_SLOT_OBJECT_VTABLE,
     PHASE7_SAVE_SLOT_OBJECT_VTABLE_ENTRIES,
+    PHASE7_SAVE_SLOT_OWNER_VTABLE,
+    PHASE7_SAVE_SLOT_OWNER_VTABLE_ENTRIES,
+    PHASE7_RESOURCE_SELECTION_OBJECT,
+    PHASE7_RESOURCE_SELECTION_OBJECT_BINDINGS,
+    PHASE7_RESOURCE_SELECTION_OBJECT_CALLER_BYTES,
+    PHASE7_RESOURCE_SELECTION_OBJECT_INITIAL_POINTER,
+    PHASE7_RESOURCE_SELECTION_OBJECT_POINTER_CELL,
+    PHASE7_RESOURCE_SELECTION_OBJECT_VTABLE,
+    PHASE7_RESOURCE_SELECTION_OBJECT_VTABLE_ENTRIES,
+    PHASE7_RESOURCE_CONVERTER_CALLBACK_BINDINGS,
+    PHASE7_RESOURCE_CONVERTER_CALLBACK_VECTOR,
+    PHASE7_RESOURCE_CONVERTER_DESCRIPTOR,
+    PHASE7_RESOURCE_CONVERTER_DESCRIPTOR_VALUES,
+    PHASE7_RESOURCE_CONVERTER_INSTALLER_BINDINGS,
+    PHASE7_RESOURCE_CONVERTER_INSTALLER_BYTES,
+    PHASE7_RESOURCE_CONVERTER_INSTRUCTION_BYTES,
+    PHASE7_RESOURCE_CONVERTER_OBSERVED_BOUNDARY,
     PHASE7_TITLE_INPUT_OBJECT,
     PHASE7_TITLE_INPUT_OBJECT_BINDINGS,
     PHASE7_TITLE_INPUT_OBJECT_INSTRUCTION_BYTES,
@@ -64,18 +194,34 @@ from tools.recomp.ia32_native_backend import (
     Ia32CoverageProfile,
     Ia32DecodedStorePlan,
     _detached_guest_reservation_assembly,
+    _normal_live_input_audio_c_source,
     _persistent_c_source,
     _phase6_profile_scheduler_boundaries,
     _phase6_static_jump_table_targets,
     _phase7_base_manager_object_targets,
     _phase7_asset_stream_callback_targets,
+    _phase7_aligned_copy_tail_targets,
     _phase7_bb0_callback_targets,
+    _phase7_collision_dispatch_targets,
     _phase7_d150_callback_targets,
     _phase7_directsound_refcount_targets,
     _phase7_directsound_voice_targets,
     _phase7_function_pair_helper_targets,
+    _phase7_game_state_object_targets,
+    _phase7_level_select_object_targets,
+    _phase7_level_load_strategy_targets,
+    _phase7_level_load_manager_targets,
+    _phase7_level_query_targets,
+    _phase7_level_sample_primary_targets,
+    _phase7_level_update_primary_targets,
+    _phase7_level_parameter_bank_targets,
+    _phase7_memmove_jump_table_targets,
+    _phase7_runtime_callback_vector_targets,
+    _phase7_new_save_object_targets,
     _phase7_post_start_object_targets,
     _phase7_save_slot_object_targets,
+    _phase7_resource_selection_object_targets,
+    _phase7_resource_converter_callback_targets,
     _phase7_title_input_object_targets,
     coverage_profile_from_performance_debug_report,
     ia32_coverage_growth_contract_id,
@@ -141,6 +287,325 @@ def _base_manager_object_memory(*, corrupt_slot: int | None = None) -> SparseMem
     )
 
 
+def _level_load_strategy_instructions() -> dict[int, X86Instruction]:
+    encoded = {
+        **PHASE7_LEVEL_LOAD_STRATEGY_REFERENCE_BYTES,
+        **PHASE7_LEVEL_LOAD_STRATEGY_SITE_BYTES,
+    }
+    return {
+        address: lift_x86_function(
+            bytes.fromhex(payload),
+            base_address=address,
+            symbol=f"level_load_strategy_{address:08x}",
+        ).instructions[0]
+        for address, payload in encoded.items()
+    }
+
+
+def _level_load_strategy_memory(
+    *,
+    corrupt_object: int | None = None,
+    corrupt_vtable: int | None = None,
+    corrupt_slot: int | None = None,
+    corrupt_caller: int | None = None,
+    corrupt_installer: int | None = None,
+) -> SparseMemory:
+    values: dict[int, bytes | int] = {}
+    for object_address, vtable, entries in PHASE7_LEVEL_LOAD_STRATEGY_OBJECTS:
+        values[object_address] = vtable ^ (1 if object_address == corrupt_object else 0)
+        for index, target in enumerate(entries):
+            values[vtable + index * 4] = (
+                target ^ 1
+                if vtable == corrupt_vtable and index == corrupt_slot
+                else target
+            )
+    for address, encoded in PHASE7_LEVEL_LOAD_STRATEGY_CALLER_BYTES.items():
+        payload = bytearray.fromhex(encoded)
+        if address == corrupt_caller:
+            payload[0] ^= 1
+        values[address] = bytes(payload)
+    for address, encoded in PHASE7_LEVEL_LOAD_STRATEGY_INSTALLER_BYTES.items():
+        payload = bytearray.fromhex(encoded)
+        if address == corrupt_installer:
+            payload[0] ^= 1
+        values[address] = bytes(payload)
+    return SparseMemory(values)
+
+
+def _level_load_manager_instructions() -> dict[int, X86Instruction]:
+    encoded = {
+        **PHASE7_LEVEL_LOAD_MANAGER_REFERENCE_BYTES,
+        **PHASE7_LEVEL_LOAD_MANAGER_SITE_BYTES,
+    }
+    for call_site, (_helper, prefix_start, payload) in (
+        PHASE7_LEVEL_LOAD_MANAGER_SWEEP_DIRECT_CALLERS.items()
+    ):
+        caller = bytes.fromhex(payload)
+        offset = call_site - prefix_start
+        encoded[call_site] = caller[offset : offset + 5].hex().upper()
+    return {
+        address: lift_x86_function(
+            bytes.fromhex(payload),
+            base_address=address,
+            symbol=f"level_load_manager_{address:08x}",
+        ).instructions[0]
+        for address, payload in encoded.items()
+    }
+
+
+def _level_load_manager_memory(
+    *,
+    corrupt_object: int | None = None,
+    corrupt_vtable: int | None = None,
+    corrupt_slot: int | None = None,
+    corrupt_caller: int | None = None,
+    corrupt_installer: int | None = None,
+) -> SparseMemory:
+    values: dict[int, bytes | int] = {}
+    for vtable, entries in PHASE7_LEVEL_LOAD_MANAGER_VTABLES:
+        for index, target in enumerate(entries):
+            values[vtable + index * 4] = (
+                target ^ 1
+                if vtable == corrupt_vtable and index == corrupt_slot
+                else target
+            )
+    for object_address, vtable in PHASE7_LEVEL_LOAD_MANAGER_OBJECT_BINDINGS:
+        values[object_address] = vtable ^ (1 if object_address == corrupt_object else 0)
+    for address, encoded in PHASE7_LEVEL_LOAD_MANAGER_CALLER_BYTES.items():
+        payload = bytearray.fromhex(encoded)
+        if address == corrupt_caller:
+            payload[0] ^= 1
+        values[address] = bytes(payload)
+    for address, encoded in PHASE7_LEVEL_LOAD_MANAGER_SWEEP_PROOF_BYTES.items():
+        values[address] = bytes.fromhex(encoded)
+    for _call_site, (_helper, prefix_start, encoded) in (
+        PHASE7_LEVEL_LOAD_MANAGER_SWEEP_DIRECT_CALLERS.items()
+    ):
+        values[prefix_start] = bytes.fromhex(encoded)
+    for address, encoded in PHASE7_LEVEL_LOAD_MANAGER_INSTALLER_BYTES.items():
+        payload = bytearray.fromhex(encoded)
+        if address == corrupt_installer:
+            payload[0] ^= 1
+        values[address] = bytes(payload)
+    return SparseMemory(values)
+
+
+def _level_update_primary_instructions() -> dict[int, X86Instruction]:
+    encoded = dict(PHASE7_LEVEL_UPDATE_SWITCH_INSTRUCTION_BYTES)
+    for site, (_helper, caller_start) in PHASE7_LEVEL_UPDATE_PRIMARY_BINDINGS.items():
+        caller = bytes.fromhex(PHASE7_LEVEL_UPDATE_PRIMARY_CALLER_BYTES[caller_start])
+        offset = site - caller_start
+        encoded[site] = caller[offset : offset + 3].hex().upper()
+    return {
+        address: lift_x86_function(
+            bytes.fromhex(payload),
+            base_address=address,
+            symbol=f"level_update_primary_{address:08x}",
+        ).instructions[0]
+        for address, payload in encoded.items()
+    }
+
+
+def _level_update_primary_memory(
+    *,
+    corrupt_cell: bool = False,
+    corrupt_selector: bool = False,
+    corrupt_jump_table: bool = False,
+    corrupt_caller: int | None = None,
+) -> SparseMemory:
+    memory = _level_load_manager_memory()
+    memory.write_u32(
+        PHASE7_LEVEL_UPDATE_PRIMARY_CELL,
+        0 if corrupt_cell else PHASE7_LEVEL_UPDATE_PRIMARY_OBJECTS[0],
+    )
+    selector = bytearray.fromhex(PHASE7_LEVEL_UPDATE_SELECTOR_BYTES)
+    if corrupt_selector:
+        selector[0] ^= 1
+    memory.write(PHASE7_LEVEL_UPDATE_SELECTOR_ADDRESS, bytes(selector))
+    for index, case_entry in enumerate(PHASE7_LEVEL_UPDATE_JUMP_TABLE):
+        memory.write_u32(
+            PHASE7_LEVEL_UPDATE_JUMP_TABLE_ADDRESS + index * 4,
+            case_entry ^ (1 if corrupt_jump_table and index == 0 else 0),
+        )
+    for caller_start, encoded in PHASE7_LEVEL_UPDATE_PRIMARY_CALLER_BYTES.items():
+        payload = bytearray.fromhex(encoded)
+        if caller_start == corrupt_caller:
+            payload[0] ^= 1
+        memory.write(caller_start, bytes(payload))
+    return memory
+
+
+def _level_sample_primary_instructions() -> dict[int, X86Instruction]:
+    encoded = {
+        0x00097AB4: "E8A7560000",
+        0x0009D679: "FF5218",
+        0x0009D697: "FF5018",
+        0x0009D6B5: "FF5218",
+    }
+    return {
+        address: lift_x86_function(
+            bytes.fromhex(payload),
+            base_address=address,
+            symbol=f"level_sample_primary_{address:08x}",
+        ).instructions[0]
+        for address, payload in encoded.items()
+    }
+
+
+def _level_sample_primary_memory(
+    *,
+    corrupt_cell: int | None = None,
+    corrupt_proof: int | None = None,
+    corrupt_vtable_slot: int | None = None,
+) -> SparseMemory:
+    memory = _level_load_manager_memory(
+        corrupt_vtable=PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE
+        if corrupt_vtable_slot is not None
+        else None,
+        corrupt_slot=corrupt_vtable_slot,
+    )
+    for index, object_address in enumerate(PHASE7_LEVEL_UPDATE_PRIMARY_OBJECTS):
+        memory.write_u32(
+            PHASE7_LEVEL_UPDATE_PRIMARY_CELL + index * 4,
+            object_address ^ (1 if corrupt_cell == index else 0),
+        )
+    for address, encoded in PHASE7_LEVEL_SAMPLE_PROOF_BYTES.items():
+        payload = bytearray.fromhex(encoded)
+        if address == corrupt_proof:
+            payload[0] ^= 1
+        memory.write(address, bytes(payload))
+    return memory
+
+
+def _level_query_instructions() -> dict[int, X86Instruction]:
+    encoded = {
+        0x0001395E: "E84DE90600",
+        0x00082741: "E86AD20100",
+        0x0009FA60: "E81B9EFDFF",
+        0x000798B5: "FF5218",
+        0x0007994D: "FF5204",
+        0x0009F562: "FF5004",
+        0x0009F650: "FF5004",
+        0x0009F6AC: "FF5004",
+        0x0007A20C: "C70564844B0090D85000",
+        0x0007A2D1: "C7056C844B00C0DA5000",
+        0x001F4910: "B8C0DA5000",
+        0x001F4920: "C700ECF32B00",
+        0x001F4950: "B890D85000",
+        0x001F4960: "C700A0F32B00",
+    }
+    return {
+        address: lift_x86_function(
+            bytes.fromhex(payload),
+            base_address=address,
+            symbol=f"level_query_{address:08x}",
+        ).instructions[0]
+        for address, payload in encoded.items()
+    }
+
+
+def _level_query_memory() -> SparseMemory:
+    values: dict[int, bytes | int] = {
+        address: bytes.fromhex(encoded)
+        for address, encoded in PHASE7_LEVEL_QUERY_PROOF_BYTES.items()
+    }
+    primary_vtable = dict(PHASE7_LEVEL_LOAD_MANAGER_VTABLES)[
+        PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE
+    ]
+    for index, target in enumerate(primary_vtable):
+        values[PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE + index * 4] = target
+    for index, object_address in enumerate(PHASE7_LEVEL_UPDATE_PRIMARY_OBJECTS):
+        values[object_address] = PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE
+        values[PHASE7_LEVEL_UPDATE_PRIMARY_CELL + index * 4] = (
+            object_address if index == 0 else 0
+        )
+    values[PHASE7_LEVEL_QUERY_OWNER] = PHASE7_LEVEL_UPDATE_PRIMARY_CELL
+    values[PHASE7_LEVEL_QUERY_RECORD_BASE_CELL] = PHASE7_LEVEL_QUERY_RECORD_BASE
+    values[PHASE7_LEVEL_QUERY_RECORD_COUNT_CELL] = 2
+    for index, target in enumerate(PHASE7_LEVEL_QUERY_RECORD_VTABLE_ENTRIES):
+        values[PHASE7_LEVEL_QUERY_RECORD_VTABLE + index * 4] = target
+    for index in range(PHASE7_LEVEL_QUERY_RECORD_CAPACITY):
+        values[
+            PHASE7_LEVEL_QUERY_RECORD_BASE
+            + index * PHASE7_LEVEL_QUERY_RECORD_STRIDE
+        ] = PHASE7_LEVEL_QUERY_RECORD_VTABLE
+    values[PHASE7_LEVEL_QUERY_POOL_BASE_CELL] = PHASE7_LEVEL_QUERY_POOL_BASE
+    for index, target in enumerate(PHASE7_LEVEL_QUERY_POOL_VTABLE_ENTRIES):
+        values[PHASE7_LEVEL_QUERY_POOL_VTABLE + index * 4] = target
+    for index in range(PHASE7_LEVEL_QUERY_POOL_CAPACITY):
+        values[
+            PHASE7_LEVEL_QUERY_POOL_BASE + index * PHASE7_LEVEL_QUERY_POOL_STRIDE
+        ] = PHASE7_LEVEL_QUERY_POOL_VTABLE
+    return SparseMemory(values)
+
+
+def _runtime_callback_vector_instructions() -> dict[int, X86Instruction]:
+    return {
+        address: lift_x86_function(
+            bytes.fromhex(encoded),
+            base_address=address,
+            symbol=f"runtime_callback_vector_{address:08x}",
+        ).instructions[0]
+        for address, encoded in PHASE7_RUNTIME_CALLBACK_REFERENCE_BYTES.items()
+    }
+
+
+def _runtime_callback_vector_memory(
+    *,
+    corrupt_cell: int | None = None,
+    corrupt_caller: int | None = None,
+    corrupt_installer: int | None = None,
+) -> SparseMemory:
+    values: dict[int, bytes | int] = {
+        cell: target ^ (1 if cell == corrupt_cell else 0)
+        for cell, target in PHASE7_RUNTIME_CALLBACK_VECTOR
+    }
+    for address, encoded in PHASE7_RUNTIME_CALLBACK_CALLER_BYTES.items():
+        payload = bytearray.fromhex(encoded)
+        if address == corrupt_caller:
+            payload[0] ^= 1
+        values[address] = bytes(payload)
+    for address, encoded in PHASE7_RUNTIME_CALLBACK_INSTALLER_BYTES.items():
+        payload = bytearray.fromhex(encoded)
+        if address == corrupt_installer:
+            payload[0] ^= 1
+        values[address] = bytes(payload)
+    return SparseMemory(values)
+
+
+def _memmove_jump_table_instructions() -> dict[int, X86Instruction]:
+    return {
+        address: lift_x86_function(
+            bytes.fromhex(encoded),
+            base_address=address,
+            symbol=f"memmove_jump_table_{address:08x}",
+        ).instructions[0]
+        for address, encoded in PHASE7_MEMMOVE_JUMP_SITE_BYTES.items()
+    }
+
+
+def _memmove_jump_table_memory(
+    *,
+    corrupt_control: int | None = None,
+    corrupt_entry: tuple[int, int] | None = None,
+) -> SparseMemory:
+    values: dict[int, bytes | int] = {}
+    for address, encoded in PHASE7_MEMMOVE_JUMP_CONTROL_BYTES.items():
+        payload = bytearray.fromhex(encoded)
+        if address == corrupt_control:
+            payload[0] ^= 1
+        values[address] = bytes(payload)
+    physical_entries: dict[int, int] = {}
+    for table_base, entries in PHASE7_MEMMOVE_JUMP_TABLES.items():
+        for index, target in entries:
+            physical_entries[table_base + index * 4] = target
+    if corrupt_entry is not None:
+        table_base, index = corrupt_entry
+        physical_entries[table_base + index * 4] ^= 1
+    values.update(physical_entries)
+    return SparseMemory(values)
+
+
 def _title_input_object_instructions() -> dict[int, X86Instruction]:
     return {
         address: lift_x86_function(
@@ -195,6 +660,50 @@ def _post_start_object_memory(*, corrupt_slot: int | None = None) -> SparseMemor
     return SparseMemory(values)
 
 
+def _new_save_object_instructions() -> dict[int, X86Instruction]:
+    return {
+        address: lift_x86_function(
+            bytes.fromhex(encoded),
+            base_address=address,
+            symbol=f"new_save_object_{address:08x}",
+        ).instructions[0]
+        for address, encoded in PHASE7_NEW_SAVE_OBJECT_INSTRUCTION_BYTES.items()
+    }
+
+
+def _new_save_object_memory(
+    *,
+    corrupt_vtable: int | None = None,
+    corrupt_slot: int | None = None,
+) -> SparseMemory:
+    values = {
+        PHASE7_POST_START_OBJECT_POINTER_CELL: PHASE7_POST_START_OBJECT_INITIAL_POINTER,
+        PHASE7_POST_START_OBJECT: PHASE7_POST_START_OBJECT_VTABLE,
+        PHASE7_NEW_SAVE_COMPANION_OBJECT_POINTER_CELL: (
+            PHASE7_NEW_SAVE_COMPANION_OBJECT_INITIAL_POINTER
+        ),
+        PHASE7_NEW_SAVE_COMPANION_OBJECT: PHASE7_NEW_SAVE_COMPANION_OBJECT_VTABLE,
+    }
+    for vtable, entries in (
+        (PHASE7_POST_START_OBJECT_VTABLE, PHASE7_POST_START_OBJECT_VTABLE_ENTRIES),
+        (
+            PHASE7_NEW_SAVE_COMPANION_OBJECT_VTABLE,
+            PHASE7_NEW_SAVE_COMPANION_OBJECT_VTABLE_ENTRIES,
+        ),
+    ):
+        values.update(
+            {
+                vtable + index * 4: (
+                    target ^ 1
+                    if vtable == corrupt_vtable and index == corrupt_slot
+                    else target
+                )
+                for index, target in enumerate(entries)
+            }
+        )
+    return SparseMemory(values)
+
+
 def _save_slot_object_instructions() -> dict[int, X86Instruction]:
     return {
         address: lift_x86_function(
@@ -206,7 +715,11 @@ def _save_slot_object_instructions() -> dict[int, X86Instruction]:
     }
 
 
-def _save_slot_object_memory(*, corrupt_slot: int | None = None) -> SparseMemory:
+def _save_slot_object_memory(
+    *,
+    corrupt_slot: int | None = None,
+    corrupt_owner_slot: int | None = None,
+) -> SparseMemory:
     values = {
         PHASE7_SAVE_SLOT_OBJECT_POINTER_CELL: PHASE7_SAVE_SLOT_OBJECT_INITIAL_POINTER,
         PHASE7_SAVE_SLOT_OBJECT: PHASE7_SAVE_SLOT_OBJECT_VTABLE,
@@ -219,6 +732,92 @@ def _save_slot_object_memory(*, corrupt_slot: int | None = None) -> SparseMemory
             for index, target in enumerate(PHASE7_SAVE_SLOT_OBJECT_VTABLE_ENTRIES)
         }
     )
+    values.update(
+        {
+            PHASE7_SAVE_SLOT_OWNER_VTABLE + index * 4: (
+                target ^ 1 if index == corrupt_owner_slot else target
+            )
+            for index, target in enumerate(PHASE7_SAVE_SLOT_OWNER_VTABLE_ENTRIES)
+        }
+    )
+    return SparseMemory(values)
+
+
+def _resource_selection_object_instructions() -> dict[int, X86Instruction]:
+    return {
+        site: lift_x86_function(
+            bytes.fromhex(PHASE7_RESOURCE_SELECTION_OBJECT_CALLER_BYTES[caller_start])[-3:],
+            base_address=site,
+            symbol=f"resource_selection_object_{site:08x}",
+        ).instructions[0]
+        for site, (caller_start, _slot, _target) in (
+            PHASE7_RESOURCE_SELECTION_OBJECT_BINDINGS.items()
+        )
+    }
+
+
+def _resource_selection_object_memory(
+    *,
+    corrupt_vtable_slot: int | None = None,
+    corrupt_caller: int | None = None,
+) -> SparseMemory:
+    values: dict[int, bytes | int] = {
+        PHASE7_RESOURCE_SELECTION_OBJECT_POINTER_CELL: (
+            PHASE7_RESOURCE_SELECTION_OBJECT_INITIAL_POINTER
+        ),
+        PHASE7_RESOURCE_SELECTION_OBJECT: PHASE7_RESOURCE_SELECTION_OBJECT_VTABLE,
+    }
+    values.update(
+        {
+            PHASE7_RESOURCE_SELECTION_OBJECT_VTABLE + index * 4: (
+                target ^ 1 if index == corrupt_vtable_slot else target
+            )
+            for index, target in enumerate(
+                PHASE7_RESOURCE_SELECTION_OBJECT_VTABLE_ENTRIES
+            )
+        }
+    )
+    for address, encoded in PHASE7_RESOURCE_SELECTION_OBJECT_CALLER_BYTES.items():
+        payload = bytearray.fromhex(encoded)
+        if address == corrupt_caller:
+            payload[0] ^= 1
+        values[address] = bytes(payload)
+    return SparseMemory(values)
+
+
+def _level_select_object_instructions() -> dict[int, X86Instruction]:
+    return {
+        site: lift_x86_function(
+            bytes.fromhex(PHASE7_LEVEL_SELECT_OBJECT_CALLER_BYTES[caller_start])[-3:],
+            base_address=site,
+            symbol=f"level_select_object_{site:08x}",
+        ).instructions[0]
+        for site, (caller_start, _slot, _target) in PHASE7_LEVEL_SELECT_OBJECT_BINDINGS.items()
+    }
+
+
+def _level_select_object_memory(
+    *,
+    corrupt_vtable_slot: int | None = None,
+    corrupt_caller: int | None = None,
+) -> SparseMemory:
+    values: dict[int, bytes | int] = {
+        PHASE7_LEVEL_SELECT_OBJECT_POINTER_CELL: PHASE7_LEVEL_SELECT_OBJECT,
+        PHASE7_LEVEL_SELECT_OBJECT: PHASE7_LEVEL_SELECT_OBJECT_VTABLE,
+    }
+    values.update(
+        {
+            PHASE7_LEVEL_SELECT_OBJECT_VTABLE + index * 4: (
+                target ^ 1 if index == corrupt_vtable_slot else target
+            )
+            for index, target in enumerate(PHASE7_LEVEL_SELECT_OBJECT_VTABLE_ENTRIES)
+        }
+    )
+    for address, encoded in PHASE7_LEVEL_SELECT_OBJECT_CALLER_BYTES.items():
+        payload = bytearray.fromhex(encoded)
+        if address == corrupt_caller:
+            payload[0] ^= 1
+        values[address] = bytes(payload)
     return SparseMemory(values)
 
 
@@ -357,7 +956,131 @@ def _asset_stream_callback_instructions() -> dict[int, X86Instruction]:
     return instructions
 
 
+def _resource_converter_callback_memory() -> SparseMemory:
+    memory = SparseMemory(
+        {
+            PHASE7_RESOURCE_CONVERTER_DESCRIPTOR + index * 4: value
+            for index, value in enumerate(
+                PHASE7_RESOURCE_CONVERTER_DESCRIPTOR_VALUES
+            )
+        }
+    )
+    memory.write(
+        0x00105BE0,
+        bytes.fromhex(PHASE7_RESOURCE_CONVERTER_INSTALLER_BYTES),
+    )
+    return memory
+
+
+def _resource_converter_callback_instructions() -> dict[int, X86Instruction]:
+    encoded = dict(PHASE7_RESOURCE_CONVERTER_INSTRUCTION_BYTES)
+    encoded.update(
+        {
+            0x00105BE7: "C70030581000",
+            0x00105BED: "C74004C0581000",
+            0x00105BF4: "C7400850541000",
+            0x00105BFB: "C7400CA0611000",
+        }
+    )
+    return {
+        address: lift_x86_function(
+            bytes.fromhex(payload),
+            base_address=address,
+            symbol=f"resource_converter_callback_{address:08x}",
+        ).instructions[0]
+        for address, payload in encoded.items()
+    }
+
+
+def _collision_dispatch_memory(
+    *, corrupt_helper: bool = False, corrupt_table: bool = False
+) -> SparseMemory:
+    helper = bytearray.fromhex(
+        "8B4424088B4C24103BC18D04818B0485486E3300"
+        "C70590224F0001000000C70594224F0001000000"
+        "7D0E85C074278B4C240C8B542404EB0C85C07419"
+        "8B4C24048B54240C5152FFD083C40885C07406B8"
+        "01000000C333C0C3"
+    )
+    table = bytearray(
+        b"".join(
+            target.to_bytes(4, "little")
+            for row in PHASE7_COLLISION_DISPATCH_TABLE
+            for target in row
+        )
+    )
+    if corrupt_helper:
+        helper[0] ^= 1
+    if corrupt_table:
+        table[0] ^= 1
+    return SparseMemory(
+        {
+            PHASE7_COLLISION_DISPATCH_HELPER_START: bytes(helper),
+            PHASE7_COLLISION_DISPATCH_TABLE_BASE: bytes(table),
+        }
+    )
+
+
+def _aligned_copy_tail_memory(
+    *, corrupt_proof: bool = False, corrupt_table: bool = False
+) -> SparseMemory:
+    proof = bytearray.fromhex(PHASE7_ALIGNED_COPY_TAIL_PROOF_BYTES)
+    table = bytearray(
+        b"\0\0\0\0"
+        + b"".join(
+            target.to_bytes(4, "little")
+            for target in PHASE7_ALIGNED_COPY_TAIL_TARGETS
+        )
+    )
+    if corrupt_proof:
+        proof[0] ^= 1
+    if corrupt_table:
+        table[4] ^= 1
+    return SparseMemory(
+        {
+            PHASE7_ALIGNED_COPY_TAIL_PROOF_START: bytes(proof),
+            PHASE7_ALIGNED_COPY_TAIL_TABLE: bytes(table),
+        }
+    )
+
+
+def _aligned_copy_tail_instructions() -> dict[int, X86Instruction]:
+    return {
+        PHASE7_ALIGNED_COPY_TAIL_SITE: lift_x86_function(
+            bytes.fromhex("FF249DD4B62800"),
+            base_address=PHASE7_ALIGNED_COPY_TAIL_SITE,
+            symbol="aligned_copy_tail_site",
+        ).instructions[0]
+    }
+
+
+def _collision_dispatch_instructions() -> dict[int, X86Instruction]:
+    instructions = {
+        PHASE7_COLLISION_DISPATCH_SITE: lift_x86_function(
+            bytes.fromhex("FFD0"),
+            base_address=PHASE7_COLLISION_DISPATCH_SITE,
+            symbol="collision_dispatch_site",
+        ).instructions[0]
+    }
+    for caller in PHASE7_COLLISION_DISPATCH_CALLERS:
+        displacement = (PHASE7_COLLISION_DISPATCH_HELPER_START - (caller + 5)) & 0xFFFFFFFF
+        instructions[caller] = lift_x86_function(
+            b"\xe8" + displacement.to_bytes(4, "little"),
+            base_address=caller,
+            symbol=f"collision_dispatch_caller_{caller:08x}",
+        ).instructions[0]
+    return instructions
+
+
 class Ia32CoverageGrowthTests(unittest.TestCase):
+    def test_normal_live_audio_lane_uses_sample_clock_pacing(self) -> None:
+        source = _normal_live_input_audio_c_source()
+
+        self.assertIn("QueryPerformanceFrequency(&frequency)", source)
+        self.assertIn("interval = (frequency + 10u) / 20u", source)
+        self.assertIn("next_deadline += interval", source)
+        self.assertNotIn("Sleep(45u)", source)
+
     def setUp(self) -> None:
         functions = tuple(
             lift_x86_function(b"\x90\xc3", base_address=address, symbol=f"target_{index}")
@@ -458,6 +1181,139 @@ class Ia32CoverageGrowthTests(unittest.TestCase):
         )
 
         self.assertEqual(recovered, tuple(sorted(targets)))
+
+    def test_aligned_copy_tail_recovers_all_nonzero_masked_targets(self) -> None:
+        recovered = _phase7_aligned_copy_tail_targets(
+            _aligned_copy_tail_memory(),
+            _aligned_copy_tail_instructions(),
+            {PHASE7_ALIGNED_COPY_TAIL_SITE},
+            set(PHASE7_ALIGNED_COPY_TAIL_TARGETS),
+        )
+
+        self.assertEqual(
+            recovered,
+            {
+                PHASE7_ALIGNED_COPY_TAIL_SITE: tuple(
+                    sorted(PHASE7_ALIGNED_COPY_TAIL_TARGETS)
+                )
+            },
+        )
+        self.assertEqual(len(recovered[PHASE7_ALIGNED_COPY_TAIL_SITE]), 15)
+
+    def test_aligned_copy_tail_fails_closed_on_evidence_drift(self) -> None:
+        instructions = _aligned_copy_tail_instructions()
+        targets = set(PHASE7_ALIGNED_COPY_TAIL_TARGETS)
+        wrong_site = {
+            PHASE7_ALIGNED_COPY_TAIL_SITE: lift_x86_function(
+                bytes.fromhex("FF2495D4B62800"),
+                base_address=PHASE7_ALIGNED_COPY_TAIL_SITE,
+                symbol="aligned_copy_tail_wrong_index",
+            ).instructions[0]
+        }
+        cases = (
+            (_aligned_copy_tail_memory(corrupt_proof=True), instructions, targets),
+            (_aligned_copy_tail_memory(corrupt_table=True), instructions, targets),
+            (_aligned_copy_tail_memory(), wrong_site, targets),
+            (_aligned_copy_tail_memory(), instructions, targets - {min(targets)}),
+        )
+        for memory, candidate_instructions, allowed_targets in cases:
+            with self.subTest(target_count=len(allowed_targets)):
+                self.assertEqual(
+                    _phase7_aligned_copy_tail_targets(
+                        memory,
+                        candidate_instructions,
+                        {PHASE7_ALIGNED_COPY_TAIL_SITE},
+                        allowed_targets,
+                    ),
+                    {},
+                )
+
+    def test_collision_dispatch_recovers_complete_finite_target_family(self) -> None:
+        targets = {
+            target
+            for row in PHASE7_COLLISION_DISPATCH_TABLE
+            for target in row
+            if target
+        }
+
+        recovered = _phase7_collision_dispatch_targets(
+            _collision_dispatch_memory(),
+            _collision_dispatch_instructions(),
+            {PHASE7_COLLISION_DISPATCH_SITE},
+            targets,
+        )
+
+        self.assertEqual(
+            recovered,
+            {PHASE7_COLLISION_DISPATCH_SITE: tuple(sorted(targets))},
+        )
+        self.assertEqual(len(recovered[PHASE7_COLLISION_DISPATCH_SITE]), 7)
+
+    def test_collision_dispatch_fails_closed_on_evidence_drift(self) -> None:
+        targets = {
+            target
+            for row in PHASE7_COLLISION_DISPATCH_TABLE
+            for target in row
+            if target
+        }
+        instructions = _collision_dispatch_instructions()
+        wrong_register = dict(instructions)
+        wrong_register[PHASE7_COLLISION_DISPATCH_SITE] = lift_x86_function(
+            bytes.fromhex("FFD1"),
+            base_address=PHASE7_COLLISION_DISPATCH_SITE,
+            symbol="collision_dispatch_wrong_register",
+        ).instructions[0]
+        missing_caller = dict(instructions)
+        del missing_caller[next(iter(PHASE7_COLLISION_DISPATCH_CALLERS))]
+        cases = (
+            (
+                _collision_dispatch_memory(corrupt_helper=True),
+                instructions,
+                {PHASE7_COLLISION_DISPATCH_SITE},
+                targets,
+            ),
+            (
+                _collision_dispatch_memory(corrupt_table=True),
+                instructions,
+                {PHASE7_COLLISION_DISPATCH_SITE},
+                targets,
+            ),
+            (
+                _collision_dispatch_memory(),
+                wrong_register,
+                {PHASE7_COLLISION_DISPATCH_SITE},
+                targets,
+            ),
+            (
+                _collision_dispatch_memory(),
+                missing_caller,
+                {PHASE7_COLLISION_DISPATCH_SITE},
+                targets,
+            ),
+            (
+                _collision_dispatch_memory(),
+                instructions,
+                set(),
+                targets,
+            ),
+            (
+                _collision_dispatch_memory(),
+                instructions,
+                {PHASE7_COLLISION_DISPATCH_SITE},
+                targets - {min(targets)},
+            ),
+        )
+        for memory, candidate_instructions, sites, allowed_targets in cases:
+            with self.subTest(site_count=len(sites), target_count=len(allowed_targets)):
+                self.assertEqual(
+                    _phase7_collision_dispatch_targets(
+                        memory,
+                        candidate_instructions,
+                        sites,
+                        allowed_targets,
+                    ),
+                    {},
+                )
 
     def test_function_pair_helper_family_recovers_all_five_sites_as_one_batch(
         self,
@@ -666,6 +1522,888 @@ class Ia32CoverageGrowthTests(unittest.TestCase):
                     {},
                 )
 
+    def test_game_state_registry_freezes_complete_expansive_family(self) -> None:
+        objects = {
+            index: (cell, object_address, vtable, entries)
+            for index, cell, object_address, vtable, entries in PHASE7_GAME_STATE_OBJECTS
+        }
+
+        self.assertEqual(set(objects), set(range(0x10)))
+        self.assertEqual(
+            {cell for cell, _object, _vtable, _entries in objects.values()},
+            set(range(0x002FE318, 0x002FE358, 4)),
+        )
+        self.assertEqual(objects[0x09], (0x002FE33C, 0, 0, ()))
+        self.assertEqual(
+            sum(
+                bool(object_address)
+                for _cell, object_address, _vtable, _entries in objects.values()
+            ),
+            15,
+        )
+        self.assertTrue(
+            all(
+                len(entries) == 16
+                for _cell, object_address, _vtable, entries in objects.values()
+                if object_address
+            )
+        )
+        self.assertEqual(PHASE7_GAME_STATE_REFERENCE_COUNT, 93)
+        self.assertEqual(
+            PHASE7_GAME_STATE_REFERENCE_SHA256,
+            "f06a773c9493dddf10bdaa3fd09bf9e72bcf0b91c9032ef924bd85cc3a230553",
+        )
+        self.assertEqual(PHASE7_GAME_STATE_DERIVED_SITE_COUNT, 29)
+        self.assertEqual(
+            PHASE7_GAME_STATE_DERIVED_SITE_SHA256,
+            "4bf7b8a9889f9484bc4776e29794412f68b55bbb4b633ceb021992c0573c1034",
+        )
+        self.assertEqual(
+            PHASE7_GAME_STATE_SPECIAL_BINDINGS,
+            {
+                0x00011093: (0x04, None),
+                0x0001114B: (0x10, None),
+                0x00013910: (0x04, 0x00),
+            },
+        )
+        self.assertEqual(PHASE7_GAME_STATE_HELPER_START, 0x000157E0)
+        self.assertEqual(PHASE7_GAME_STATE_HELPER_END, 0x00015DF5)
+        self.assertEqual(
+            PHASE7_GAME_STATE_HELPER_SHA256,
+            "35ca5777a7d7d208a778f68dfda542c1d79ba0c088524339fc65e9cadbba235c",
+        )
+        self.assertEqual(
+            set(PHASE7_GAME_STATE_HELPER_CALLERS),
+            {0x00014E5D, 0x00015423, 0x000163C3, 0x00016843},
+        )
+        self.assertEqual(
+            PHASE7_GAME_STATE_HELPER_STATE_INDEXES,
+            (0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x0F),
+        )
+        self.assertEqual(
+            PHASE7_GAME_STATE_HELPER_BINDINGS,
+            {
+                0x00015D7D: (0x18, "FF5018"),
+                0x00015DC3: (0x1C, "FF521C"),
+            },
+        )
+        self.assertEqual(PHASE7_GAME_STATE_SITE_COUNT, 34)
+        self.assertEqual(
+            PHASE7_GAME_STATE_SITE_SHA256,
+            "46b1d6ddc548251c302bbbe49d2cb3ef3c540286a7df6cc08b5effb96594b20a",
+        )
+        self.assertEqual(
+            PHASE7_GAME_STATE_TRANSITION_CODE_END
+            - PHASE7_GAME_STATE_TRANSITION_CODE_START,
+            370,
+        )
+        self.assertEqual(
+            PHASE7_GAME_STATE_TRANSITION_CODE_SHA256,
+            "21b3ebf8179c4532ab7b6e4d5b9f09dba4cbf3cc04b794c9282245245d733326",
+        )
+        self.assertEqual(
+            PHASE7_GAME_STATE_OBSERVED_BOUNDARY,
+            (0x000127E7, 0x0F, 0x14, 0x000144F0),
+        )
+        self.assertEqual(objects[0x0F][3][0x14 // 4], 0x000144F0)
+        self.assertEqual(
+            _phase7_game_state_object_targets(SparseMemory({}), {}, set(), set()),
+            {},
+        )
+
+    def test_level_load_strategy_vtables_recover_complete_22_site_family(self) -> None:
+        targets = {
+            target
+            for _object_address, _vtable, entries in PHASE7_LEVEL_LOAD_STRATEGY_OBJECTS
+            for target in entries
+        }
+        recovered = _phase7_level_load_strategy_targets(
+            _level_load_strategy_memory(),
+            _level_load_strategy_instructions(),
+            set(PHASE7_LEVEL_LOAD_STRATEGY_BINDINGS),
+            targets,
+        )
+        vtables = {
+            vtable: entries
+            for _object_address, vtable, entries in PHASE7_LEVEL_LOAD_STRATEGY_OBJECTS
+        }
+        expected = {}
+        for site, (_caller_start, vtable, slot) in (
+            PHASE7_LEVEL_LOAD_STRATEGY_BINDINGS.items()
+        ):
+            expected[site] = (
+                (vtables[vtable][slot // 4],)
+                if vtable
+                else tuple(sorted({entries[slot // 4] for entries in vtables.values()}))
+            )
+
+        self.assertEqual(recovered, expected)
+        self.assertEqual(len(recovered), 22)
+        self.assertEqual(
+            recovered[0x00013F7D],
+            (0x00011960, 0x00012790, 0x000172D0, 0x00018590),
+        )
+        self.assertEqual(
+            recovered[0x000143CE],
+            (0x00011980, 0x000127A0, 0x000148E0, 0x000172E0, 0x000186F0),
+        )
+
+    def test_level_load_strategy_vtables_fail_closed_on_family_drift(self) -> None:
+        instructions = _level_load_strategy_instructions()
+        targets = {
+            target
+            for _object_address, _vtable, entries in PHASE7_LEVEL_LOAD_STRATEGY_OBJECTS
+            for target in entries
+        }
+        wrong_call = dict(instructions)
+        wrong_call[0x00014D5B] = lift_x86_function(
+            bytes.fromhex("FF5218"),
+            base_address=0x00014D5B,
+            symbol="wrong_level_load_strategy_slot",
+        ).instructions[0]
+        added_reference = dict(instructions)
+        added_reference[0x00140000] = lift_x86_function(
+            bytes.fromhex("B9C43B3000"),
+            base_address=0x00140000,
+            symbol="added_level_load_strategy_reference",
+        ).instructions[0]
+        first_object, first_vtable, _first_entries = PHASE7_LEVEL_LOAD_STRATEGY_OBJECTS[0]
+
+        for memory, candidate, sites, candidate_targets in (
+            (
+                _level_load_strategy_memory(corrupt_object=first_object),
+                instructions,
+                set(PHASE7_LEVEL_LOAD_STRATEGY_BINDINGS),
+                targets,
+            ),
+            (
+                _level_load_strategy_memory(
+                    corrupt_vtable=first_vtable,
+                    corrupt_slot=1,
+                ),
+                instructions,
+                set(PHASE7_LEVEL_LOAD_STRATEGY_BINDINGS),
+                targets,
+            ),
+            (
+                _level_load_strategy_memory(corrupt_caller=0x0001A365),
+                instructions,
+                set(PHASE7_LEVEL_LOAD_STRATEGY_BINDINGS),
+                targets,
+            ),
+            (
+                _level_load_strategy_memory(corrupt_installer=0x00016500),
+                instructions,
+                set(PHASE7_LEVEL_LOAD_STRATEGY_BINDINGS),
+                targets,
+            ),
+            (
+                _level_load_strategy_memory(),
+                wrong_call,
+                set(PHASE7_LEVEL_LOAD_STRATEGY_BINDINGS),
+                targets,
+            ),
+            (
+                _level_load_strategy_memory(),
+                added_reference,
+                set(PHASE7_LEVEL_LOAD_STRATEGY_BINDINGS),
+                targets,
+            ),
+            (
+                _level_load_strategy_memory(),
+                instructions,
+                {0x00013F7D},
+                targets,
+            ),
+            (
+                _level_load_strategy_memory(),
+                instructions,
+                set(PHASE7_LEVEL_LOAD_STRATEGY_BINDINGS),
+                targets - {0x00018590},
+            ),
+        ):
+            with self.subTest(
+                instruction_count=len(candidate),
+                site_count=len(sites),
+                target_count=len(candidate_targets),
+            ):
+                self.assertEqual(
+                    _phase7_level_load_strategy_targets(
+                        memory,
+                        candidate,
+                        sites,
+                        candidate_targets,
+                    ),
+                    {},
+                )
+
+    def test_level_parameter_bank_freezes_complete_expansive_family(self) -> None:
+        fields = {
+            field: (object_address, vtable, entries)
+            for field, object_address, vtable, entries in (
+                PHASE7_LEVEL_PARAMETER_BANK_OBJECTS
+            )
+        }
+
+        self.assertEqual(set(fields), set(range(0x10, 0x90, 4)))
+        self.assertEqual(len(fields), 32)
+        self.assertEqual(len({vtable for _object, vtable, _entries in fields.values()}), 19)
+        self.assertEqual(
+            PHASE7_LEVEL_PARAMETER_BANK_GENERIC_BINDINGS,
+            {0x0001AB3F: 0x00, 0x0001ABEB: 0x08, 0x0001AC27: 0x04},
+        )
+        self.assertEqual(PHASE7_LEVEL_PARAMETER_BANK_SETTER_SITE_COUNT, 142)
+        self.assertEqual(
+            PHASE7_LEVEL_PARAMETER_BANK_SETTER_SITE_SHA256,
+            "43c4f4c8280b909b7fbcb5f3323d35a5221717aac585a69bba44e9caf20322bf",
+        )
+        self.assertEqual(
+            PHASE7_LEVEL_PARAMETER_BANK_CODE_END
+            - PHASE7_LEVEL_PARAMETER_BANK_CODE_START,
+            9670,
+        )
+        self.assertEqual(
+            PHASE7_LEVEL_PARAMETER_BANK_CODE_SHA256,
+            "b2143380234d2c2d73fd07da2b3699b8517e52074140d48cf8e2f789ecb531a2",
+        )
+        self.assertEqual(
+            PHASE7_LEVEL_PARAMETER_BANK_OBSERVED_BOUNDARY,
+            (0x0001B200, 0x10, 0x00026700),
+        )
+        self.assertEqual(fields[0x10][2][1], 0x00026700)
+        self.assertTrue(
+            {0x0001ADF7, 0x0001AF38, 0x0001B128}.isdisjoint(
+                PHASE7_LEVEL_LOAD_STRATEGY_BINDINGS
+            )
+        )
+        self.assertEqual(
+            _phase7_level_parameter_bank_targets(
+                SparseMemory({}),
+                {},
+                set(),
+                set(),
+            ),
+            {},
+        )
+
+    def test_level_load_manager_vtables_recover_complete_29_site_family(self) -> None:
+        targets = {
+            target
+            for _vtable, entries in PHASE7_LEVEL_LOAD_MANAGER_VTABLES
+            for target in entries
+        }
+        recovered = _phase7_level_load_manager_targets(
+            _level_load_manager_memory(),
+            _level_load_manager_instructions(),
+            set(PHASE7_LEVEL_LOAD_MANAGER_BINDINGS),
+            targets,
+        )
+        vtables = dict(PHASE7_LEVEL_LOAD_MANAGER_VTABLES)
+        expected = {}
+        for site, (_caller_start, vtable, slot) in (
+            PHASE7_LEVEL_LOAD_MANAGER_BINDINGS.items()
+        ):
+            expected[site] = (
+                (vtables[vtable][slot // 4],)
+                if vtable
+                else (vtables[0x00295D68][slot // 4],)
+            )
+
+        self.assertEqual(recovered, expected)
+        self.assertEqual(len(recovered), 29)
+        self.assertEqual(recovered[0x0005EAD3], (0x0005FF60,))
+        self.assertEqual(recovered[0x000743B5], (0x00055B50,))
+        self.assertEqual(recovered[0x00082222], (0x0007ECD0,))
+        self.assertEqual(recovered[0x00082319], (0x0007F4E0,))
+        self.assertEqual(recovered[0x00082485], (0x0005B670,))
+        self.assertEqual(recovered[0x00082709], (0x0007F4E0,))
+        self.assertEqual(recovered[0x00082727], (0x00066410,))
+        self.assertEqual(
+            PHASE7_LEVEL_LOAD_MANAGER_SWEEP_OBSERVED_BOUNDARY,
+            (0x00082709, 0x00295E84, 0x10, 0x0007F4E0),
+        )
+        self.assertEqual(len(PHASE7_LEVEL_LOAD_MANAGER_OBJECT_BINDINGS), 20)
+
+    def test_level_load_manager_vtables_fail_closed_on_family_drift(self) -> None:
+        instructions = _level_load_manager_instructions()
+        targets = {
+            target
+            for _vtable, entries in PHASE7_LEVEL_LOAD_MANAGER_VTABLES
+            for target in entries
+        }
+        wrong_call = dict(instructions)
+        wrong_call[0x0005EAD3] = lift_x86_function(
+            bytes.fromhex("FF501C"),
+            base_address=0x0005EAD3,
+            symbol="wrong_level_load_manager_slot",
+        ).instructions[0]
+        added_reference = dict(instructions)
+        added_reference[0x00140000] = lift_x86_function(
+            bytes.fromhex("B8B85D2900"),
+            base_address=0x00140000,
+            symbol="added_level_load_manager_reference",
+        ).instructions[0]
+        first_object, _first_object_vtable = PHASE7_LEVEL_LOAD_MANAGER_OBJECT_BINDINGS[0]
+        first_vtable, _first_entries = PHASE7_LEVEL_LOAD_MANAGER_VTABLES[0]
+
+        for memory, candidate, sites, candidate_targets in (
+            (
+                _level_load_manager_memory(corrupt_object=first_object),
+                instructions,
+                set(PHASE7_LEVEL_LOAD_MANAGER_BINDINGS),
+                targets,
+            ),
+            (
+                _level_load_manager_memory(
+                    corrupt_vtable=first_vtable,
+                    corrupt_slot=6,
+                ),
+                instructions,
+                set(PHASE7_LEVEL_LOAD_MANAGER_BINDINGS),
+                targets,
+            ),
+            (
+                _level_load_manager_memory(corrupt_caller=0x0005B8DA),
+                instructions,
+                set(PHASE7_LEVEL_LOAD_MANAGER_BINDINGS),
+                targets,
+            ),
+            (
+                _level_load_manager_memory(corrupt_installer=0x001392B0),
+                instructions,
+                set(PHASE7_LEVEL_LOAD_MANAGER_BINDINGS),
+                targets,
+            ),
+            (
+                _level_load_manager_memory(),
+                wrong_call,
+                set(PHASE7_LEVEL_LOAD_MANAGER_BINDINGS),
+                targets,
+            ),
+            (
+                _level_load_manager_memory(),
+                added_reference,
+                set(PHASE7_LEVEL_LOAD_MANAGER_BINDINGS),
+                targets,
+            ),
+            (
+                _level_load_manager_memory(),
+                instructions,
+                {0x0005EAD3},
+                targets,
+            ),
+            (
+                _level_load_manager_memory(),
+                instructions,
+                set(PHASE7_LEVEL_LOAD_MANAGER_BINDINGS),
+                targets - {0x0005FF60},
+            ),
+        ):
+            with self.subTest(
+                instruction_count=len(candidate),
+                site_count=len(sites),
+                target_count=len(candidate_targets),
+            ):
+                self.assertEqual(
+                    _phase7_level_load_manager_targets(
+                        memory,
+                        candidate,
+                        sites,
+                        candidate_targets,
+                    ),
+                    {},
+                )
+
+    def test_level_update_switch_recovers_all_nine_primary_helpers(self) -> None:
+        recovered = _phase7_level_update_primary_targets(
+            _level_update_primary_memory(),
+            _level_update_primary_instructions(),
+            set(PHASE7_LEVEL_UPDATE_PRIMARY_BINDINGS)
+            | set(PHASE7_LEVEL_UPDATE_SECONDARY_GUARDED_SITES),
+            {0x0007EE80},
+        )
+
+        self.assertEqual(
+            recovered,
+            {site: (0x0007EE80,) for site in PHASE7_LEVEL_UPDATE_PRIMARY_BINDINGS},
+        )
+        self.assertEqual(len(recovered), 9)
+        self.assertEqual(
+            PHASE7_LEVEL_UPDATE_PRIMARY_OBJECTS,
+            (0x004B9C50, 0x004BE1C0, 0x004C2730, 0x004C6CA0),
+        )
+        self.assertEqual(PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE, 0x00295E84)
+        self.assertEqual(
+            PHASE7_LEVEL_UPDATE_OBSERVED_BOUNDARIES,
+            {(0x000AA3B9, 0x0007EE80), (0x000AB0D5, 0x0007EE80)},
+        )
+        self.assertTrue(
+            set(recovered).isdisjoint(PHASE7_LEVEL_UPDATE_SECONDARY_GUARDED_SITES)
+        )
+        self.assertEqual(
+            {helper for _case, helper in PHASE7_LEVEL_UPDATE_HELPER_CALLS.values()},
+            {helper for helper, _caller in PHASE7_LEVEL_UPDATE_PRIMARY_BINDINGS.values()},
+        )
+
+    def test_level_update_switch_fails_closed_on_family_drift(self) -> None:
+        instructions = _level_update_primary_instructions()
+        wrong_switch = dict(instructions)
+        wrong_switch[0x000ADCDA] = lift_x86_function(
+            bytes.fromhex("E800000000"),
+            base_address=0x000ADCDA,
+            symbol="wrong_level_update_switch_helper",
+        ).instructions[0]
+        wrong_slot = dict(instructions)
+        wrong_slot[0x000AA3B9] = lift_x86_function(
+            bytes.fromhex("FF501C"),
+            base_address=0x000AA3B9,
+            symbol="wrong_level_update_primary_slot",
+        ).instructions[0]
+        sites = set(PHASE7_LEVEL_UPDATE_PRIMARY_BINDINGS)
+
+        for memory, candidate, candidate_sites, targets in (
+            (_level_update_primary_memory(corrupt_cell=True), instructions, sites, {0x7EE80}),
+            (
+                _level_update_primary_memory(corrupt_selector=True),
+                instructions,
+                sites,
+                {0x7EE80},
+            ),
+            (
+                _level_update_primary_memory(corrupt_jump_table=True),
+                instructions,
+                sites,
+                {0x7EE80},
+            ),
+            (
+                _level_update_primary_memory(corrupt_caller=0x000AB0C3),
+                instructions,
+                sites,
+                {0x7EE80},
+            ),
+            (_level_update_primary_memory(), wrong_switch, sites, {0x7EE80}),
+            (_level_update_primary_memory(), wrong_slot, sites, {0x7EE80}),
+            (_level_update_primary_memory(), instructions, {0x000AB0D5}, {0x7EE80}),
+            (_level_update_primary_memory(), instructions, sites, set()),
+        ):
+            with self.subTest(
+                instruction_count=len(candidate),
+                site_count=len(candidate_sites),
+                target_count=len(targets),
+            ):
+                self.assertEqual(
+                    _phase7_level_update_primary_targets(
+                        memory,
+                        candidate,
+                        candidate_sites,
+                        targets,
+                    ),
+                    {},
+                )
+
+    def test_level_sample_loop_recovers_all_three_primary_queries(self) -> None:
+        recovered = _phase7_level_sample_primary_targets(
+            _level_sample_primary_memory(),
+            _level_sample_primary_instructions(),
+            set(PHASE7_LEVEL_SAMPLE_PRIMARY_BINDINGS),
+            {0x0007EE80},
+        )
+
+        self.assertEqual(
+            recovered,
+            {
+                site: (0x0007EE80,)
+                for site in PHASE7_LEVEL_SAMPLE_PRIMARY_BINDINGS
+            },
+        )
+        self.assertEqual(len(recovered), 3)
+        self.assertEqual(
+            PHASE7_LEVEL_SAMPLE_DIRECT_CALLS,
+            {0x00097AB4: 0x0009D160},
+        )
+        self.assertEqual(
+            PHASE7_LEVEL_SAMPLE_OBSERVED_BOUNDARY,
+            (0x0009D679, 0x004B9C50, 0x00295E84, 0x0007EE80),
+        )
+
+    def test_level_sample_loop_fails_closed_on_family_drift(self) -> None:
+        instructions = _level_sample_primary_instructions()
+        sites = set(PHASE7_LEVEL_SAMPLE_PRIMARY_BINDINGS)
+        wrong_slot = dict(instructions)
+        wrong_slot[0x0009D679] = lift_x86_function(
+            bytes.fromhex("FF521C"),
+            base_address=0x0009D679,
+            symbol="wrong_level_sample_slot",
+        ).instructions[0]
+        added_direct_caller = dict(instructions)
+        added_direct_caller[0x00140000] = lift_x86_function(
+            bytes.fromhex("E85BD1F5FF"),
+            base_address=0x00140000,
+            symbol="added_level_sample_direct_caller",
+        ).instructions[0]
+
+        for memory, candidate, candidate_sites, targets in (
+            (_level_sample_primary_memory(corrupt_cell=3), instructions, sites, {0x7EE80}),
+            (
+                _level_sample_primary_memory(corrupt_proof=0x0009D652),
+                instructions,
+                sites,
+                {0x7EE80},
+            ),
+            (
+                _level_sample_primary_memory(corrupt_vtable_slot=6),
+                instructions,
+                sites,
+                {0x7EE80},
+            ),
+            (_level_sample_primary_memory(), wrong_slot, sites, {0x7EE80}),
+            (
+                _level_sample_primary_memory(),
+                added_direct_caller,
+                sites,
+                {0x7EE80},
+            ),
+            (_level_sample_primary_memory(), instructions, {0x0009D679}, {0x7EE80}),
+            (_level_sample_primary_memory(), instructions, sites, set()),
+        ):
+            with self.subTest(
+                instruction_count=len(candidate),
+                site_count=len(candidate_sites),
+                target_count=len(targets),
+            ):
+                self.assertEqual(
+                    _phase7_level_sample_primary_targets(
+                        memory,
+                        candidate,
+                        candidate_sites,
+                        targets,
+                    ),
+                    {},
+                )
+
+    def test_level_query_recovers_observed_and_predicted_sibling(self) -> None:
+        recovered = _phase7_level_query_targets(
+            _level_query_memory(),
+            _level_query_instructions(),
+            set(PHASE7_LEVEL_QUERY_BINDINGS),
+            {0x0007EE80, 0x0009F570, 0x0009F660},
+        )
+
+        self.assertEqual(
+            recovered,
+            {
+                0x000798B5: (0x0007EE80,),
+                0x0007994D: (0x0009F660,),
+                0x0009F562: (0x0009F570,),
+                0x0009F650: (0x0009F660,),
+                0x0009F6AC: (0x0009F570,),
+            },
+        )
+        self.assertEqual(
+            PHASE7_LEVEL_QUERY_OBSERVED_BOUNDARY,
+            (0x000798B5, 0x004B9C50, 0x00295E84, 0x0007EE80),
+        )
+        self.assertEqual(
+            PHASE7_LEVEL_QUERY_PREDICTED_BOUNDARY,
+            (0x0007994D, 0x0050D890, 0x002BF3A0, 0x0009F660),
+        )
+        self.assertEqual(
+            PHASE7_LEVEL_QUERY_DIRECT_CALLS,
+            {
+                0x0001395E: 0x000822B0,
+                0x00082741: 0x0009F9B0,
+                0x0009FA60: 0x00079880,
+            },
+        )
+        self.assertEqual(PHASE7_LEVEL_QUERY_RECORD_CAPACITY, 20)
+        self.assertEqual(PHASE7_LEVEL_QUERY_POOL_CAPACITY, 256)
+
+    def test_level_query_fails_closed_on_family_drift(self) -> None:
+        instructions = _level_query_instructions()
+        sites = set(PHASE7_LEVEL_QUERY_BINDINGS)
+        targets = {0x0007EE80, 0x0009F570, 0x0009F660}
+
+        wrong_slot = dict(instructions)
+        wrong_slot[0x000798B5] = lift_x86_function(
+            bytes.fromhex("FF521C"),
+            base_address=0x000798B5,
+            symbol="wrong_level_query_primary_slot",
+        ).instructions[0]
+        missing_direct_caller = dict(instructions)
+        missing_direct_caller.pop(0x0009FA60)
+        added_vtable_reference = dict(instructions)
+        added_vtable_reference[0x00140000] = lift_x86_function(
+            bytes.fromhex("B8A0F32B00"),
+            base_address=0x00140000,
+            symbol="added_level_query_record_vtable_reference",
+        ).instructions[0]
+
+        corrupt_proof = _level_query_memory()
+        corrupt_proof.write(0x0009F9B0, b"\x82")
+        corrupt_owner = _level_query_memory()
+        corrupt_owner.write_u32(PHASE7_LEVEL_QUERY_OWNER, 0)
+        corrupt_record_base = _level_query_memory()
+        corrupt_record_base.write_u32(PHASE7_LEVEL_QUERY_RECORD_BASE_CELL, 0)
+        empty_record_bank = _level_query_memory()
+        empty_record_bank.write_u32(PHASE7_LEVEL_QUERY_RECORD_COUNT_CELL, 0)
+        oversized_record_bank = _level_query_memory()
+        oversized_record_bank.write_u32(
+            PHASE7_LEVEL_QUERY_RECORD_COUNT_CELL,
+            PHASE7_LEVEL_QUERY_RECORD_CAPACITY + 1,
+        )
+        corrupt_record = _level_query_memory()
+        corrupt_record.write_u32(
+            PHASE7_LEVEL_QUERY_RECORD_BASE
+            + (PHASE7_LEVEL_QUERY_RECORD_CAPACITY - 1)
+            * PHASE7_LEVEL_QUERY_RECORD_STRIDE,
+            0,
+        )
+        corrupt_record_slot = _level_query_memory()
+        corrupt_record_slot.write_u32(
+            PHASE7_LEVEL_QUERY_RECORD_VTABLE + 4,
+            0,
+        )
+        corrupt_pool_base = _level_query_memory()
+        corrupt_pool_base.write_u32(PHASE7_LEVEL_QUERY_POOL_BASE_CELL, 0)
+        corrupt_pool = _level_query_memory()
+        corrupt_pool.write_u32(
+            PHASE7_LEVEL_QUERY_POOL_BASE
+            + (PHASE7_LEVEL_QUERY_POOL_CAPACITY - 1)
+            * PHASE7_LEVEL_QUERY_POOL_STRIDE,
+            0,
+        )
+        corrupt_pool_slot = _level_query_memory()
+        corrupt_pool_slot.write_u32(PHASE7_LEVEL_QUERY_POOL_VTABLE + 4, 0)
+
+        for memory, candidate, candidate_sites, candidate_targets in (
+            (corrupt_proof, instructions, sites, targets),
+            (corrupt_owner, instructions, sites, targets),
+            (corrupt_record_base, instructions, sites, targets),
+            (empty_record_bank, instructions, sites, targets),
+            (oversized_record_bank, instructions, sites, targets),
+            (corrupt_record, instructions, sites, targets),
+            (corrupt_record_slot, instructions, sites, targets),
+            (corrupt_pool_base, instructions, sites, targets),
+            (corrupt_pool, instructions, sites, targets),
+            (corrupt_pool_slot, instructions, sites, targets),
+            (_level_query_memory(), wrong_slot, sites, targets),
+            (_level_query_memory(), missing_direct_caller, sites, targets),
+            (_level_query_memory(), added_vtable_reference, sites, targets),
+            (_level_query_memory(), instructions, {0x000798B5}, targets),
+            (_level_query_memory(), instructions, sites, {0x0007EE80}),
+        ):
+            with self.subTest(
+                instruction_count=len(candidate),
+                site_count=len(candidate_sites),
+                target_count=len(candidate_targets),
+            ):
+                self.assertEqual(
+                    _phase7_level_query_targets(
+                        memory,
+                        candidate,
+                        candidate_sites,
+                        candidate_targets,
+                    ),
+                    {},
+                )
+
+    def test_runtime_callback_vector_recovers_complete_seven_site_family(self) -> None:
+        targets = {target for _cell, target in PHASE7_RUNTIME_CALLBACK_VECTOR}
+        recovered = _phase7_runtime_callback_vector_targets(
+            _runtime_callback_vector_memory(),
+            _runtime_callback_vector_instructions(),
+            set(PHASE7_RUNTIME_CALLBACK_BINDINGS),
+            targets,
+        )
+
+        self.assertEqual(
+            recovered,
+            {
+                site: (target,)
+                for site, (_caller_start, _cell, target) in (
+                    PHASE7_RUNTIME_CALLBACK_BINDINGS.items()
+                )
+            },
+        )
+        self.assertEqual(len(recovered), 7)
+        self.assertEqual(len(PHASE7_RUNTIME_CALLBACK_VECTOR), 6)
+        self.assertEqual(recovered[0x00121EAA], (0x0012186B,))
+        self.assertEqual(recovered[0x00126034], (0x0012157B,))
+
+    def test_runtime_callback_vector_fails_closed_on_family_drift(self) -> None:
+        instructions = _runtime_callback_vector_instructions()
+        sites = set(PHASE7_RUNTIME_CALLBACK_BINDINGS)
+        targets = {target for _cell, target in PHASE7_RUNTIME_CALLBACK_VECTOR}
+        wrong_call = dict(instructions)
+        wrong_call[0x00121EAA] = lift_x86_function(
+            bytes.fromhex("FF15B87E3400"),
+            base_address=0x00121EAA,
+            symbol="wrong_runtime_callback_cell",
+        ).instructions[0]
+        wrong_installer_reference = dict(instructions)
+        wrong_installer_reference[0x0011E256] = lift_x86_function(
+            bytes.fromhex("A3C87E3400"),
+            base_address=0x0011E256,
+            symbol="wrong_runtime_callback_installer_cell",
+        ).instructions[0]
+        added_reference = dict(instructions)
+        added_reference[0x00140000] = lift_x86_function(
+            bytes.fromhex("A1B47E3400"),
+            base_address=0x00140000,
+            symbol="added_runtime_callback_reference",
+        ).instructions[0]
+
+        for memory, candidate, candidate_sites, candidate_targets in (
+            (
+                _runtime_callback_vector_memory(corrupt_cell=0x00347EB4),
+                instructions,
+                sites,
+                targets,
+            ),
+            (
+                _runtime_callback_vector_memory(corrupt_caller=0x00121E87),
+                instructions,
+                sites,
+                targets,
+            ),
+            (
+                _runtime_callback_vector_memory(corrupt_installer=0x0011E251),
+                instructions,
+                sites,
+                targets,
+            ),
+            (_runtime_callback_vector_memory(), wrong_call, sites, targets),
+            (
+                _runtime_callback_vector_memory(),
+                wrong_installer_reference,
+                sites,
+                targets,
+            ),
+            (_runtime_callback_vector_memory(), added_reference, sites, targets),
+            (
+                _runtime_callback_vector_memory(),
+                instructions,
+                {0x00121EAA},
+                targets,
+            ),
+            (
+                _runtime_callback_vector_memory(),
+                instructions,
+                sites,
+                targets - {0x0012186B},
+            ),
+        ):
+            with self.subTest(
+                instruction_count=len(candidate),
+                site_count=len(candidate_sites),
+                target_count=len(candidate_targets),
+            ):
+                self.assertEqual(
+                    _phase7_runtime_callback_vector_targets(
+                        memory,
+                        candidate,
+                        candidate_sites,
+                        candidate_targets,
+                    ),
+                    {},
+                )
+
+    def test_memmove_jump_tables_recover_complete_16_site_family(self) -> None:
+        targets = {
+            target
+            for entries in PHASE7_MEMMOVE_JUMP_TABLES.values()
+            for _index, target in entries
+        }
+        recovered = _phase7_memmove_jump_table_targets(
+            _memmove_jump_table_memory(),
+            _memmove_jump_table_instructions(),
+            set(PHASE7_MEMMOVE_JUMP_BINDINGS),
+            targets,
+        )
+
+        self.assertEqual(len(recovered), 16)
+        self.assertEqual(
+            recovered[0x0011EFFD],
+            (0x0011F020, 0x0011F04C, 0x0011F070),
+        )
+        self.assertEqual(
+            recovered[0x0011F004],
+            (0x0011F10C, 0x0011F114, 0x0011F120, 0x0011F134),
+        )
+        self.assertEqual(
+            recovered[0x0011F176],
+            tuple(0x0011F24C + offset for offset in range(0, 0x38, 8))
+            + (0x0011F28F,),
+        )
+        self.assertEqual(
+            recovered[0x0011F191],
+            (0x0011F1AC, 0x0011F1D0, 0x0011F1F8),
+        )
+
+    def test_memmove_jump_tables_fail_closed_on_family_drift(self) -> None:
+        instructions = _memmove_jump_table_instructions()
+        sites = set(PHASE7_MEMMOVE_JUMP_BINDINGS)
+        targets = {
+            target
+            for entries in PHASE7_MEMMOVE_JUMP_TABLES.values()
+            for _index, target in entries
+        }
+        wrong_index = dict(instructions)
+        wrong_index[0x0011F191] = lift_x86_function(
+            bytes.fromhex("FF248D9CF11100"),
+            base_address=0x0011F191,
+            symbol="wrong_memmove_jump_index",
+        ).instructions[0]
+        added_reference = dict(instructions)
+        added_reference[0x00140000] = lift_x86_function(
+            bytes.fromhex("8B048D9CF11100"),
+            base_address=0x00140000,
+            symbol="added_memmove_table_reference",
+        ).instructions[0]
+
+        for memory, candidate, candidate_sites, candidate_targets in (
+            (
+                _memmove_jump_table_memory(corrupt_control=0x0011EFB0),
+                instructions,
+                sites,
+                targets,
+            ),
+            (
+                _memmove_jump_table_memory(corrupt_entry=(0x0011F19C, 1)),
+                instructions,
+                sites,
+                targets,
+            ),
+            (_memmove_jump_table_memory(), wrong_index, sites, targets),
+            (_memmove_jump_table_memory(), added_reference, sites, targets),
+            (
+                _memmove_jump_table_memory(),
+                instructions,
+                {0x0011F191},
+                targets,
+            ),
+            (
+                _memmove_jump_table_memory(),
+                instructions,
+                sites,
+                targets - {0x0011F1AC},
+            ),
+        ):
+            with self.subTest(
+                instruction_count=len(candidate),
+                site_count=len(candidate_sites),
+                target_count=len(candidate_targets),
+            ):
+                self.assertEqual(
+                    _phase7_memmove_jump_table_targets(
+                        memory,
+                        candidate,
+                        candidate_sites,
+                        candidate_targets,
+                    ),
+                    {},
+                )
+
     def test_title_input_object_vtable_recovers_start_slot_as_one_batch(self) -> None:
         recovered = _phase7_title_input_object_targets(
             _title_input_object_memory(),
@@ -810,12 +2548,13 @@ class Ia32CoverageGrowthTests(unittest.TestCase):
                     {},
                 )
 
-    def test_save_slot_object_vtable_recovers_three_slot_c_sites(self) -> None:
+    def test_save_slot_object_vtables_recover_complete_five_site_family(self) -> None:
         recovered = _phase7_save_slot_object_targets(
             _save_slot_object_memory(),
             _save_slot_object_instructions(),
             set(PHASE7_SAVE_SLOT_OBJECT_BINDINGS),
-            set(PHASE7_SAVE_SLOT_OBJECT_VTABLE_ENTRIES),
+            set(PHASE7_SAVE_SLOT_OBJECT_VTABLE_ENTRIES)
+            | set(PHASE7_SAVE_SLOT_OWNER_VTABLE_ENTRIES),
         )
 
         self.assertEqual(
@@ -823,19 +2562,259 @@ class Ia32CoverageGrowthTests(unittest.TestCase):
             {site: (target,) for site, (_slot, target) in PHASE7_SAVE_SLOT_OBJECT_BINDINGS.items()},
         )
 
+    def test_new_save_object_vtables_recover_complete_call_batch(self) -> None:
+        recovered = _phase7_new_save_object_targets(
+            _new_save_object_memory(),
+            _new_save_object_instructions(),
+            set(PHASE7_NEW_SAVE_OBJECT_BINDINGS),
+            set(PHASE7_POST_START_OBJECT_VTABLE_ENTRIES)
+            | set(PHASE7_NEW_SAVE_COMPANION_OBJECT_VTABLE_ENTRIES),
+        )
+
+        self.assertEqual(
+            recovered,
+            {
+                site: (target,)
+                for site, (_vtable, _slot, target) in PHASE7_NEW_SAVE_OBJECT_BINDINGS.items()
+            },
+        )
+
+    def test_resource_selection_object_recovers_all_34_exact_callers(self) -> None:
+        recovered = _phase7_resource_selection_object_targets(
+            _resource_selection_object_memory(),
+            _resource_selection_object_instructions(),
+            set(PHASE7_RESOURCE_SELECTION_OBJECT_BINDINGS),
+            set(PHASE7_RESOURCE_SELECTION_OBJECT_VTABLE_ENTRIES),
+        )
+
+        self.assertEqual(
+            recovered,
+            {
+                site: (target,)
+                for site, (_caller_start, _slot, target) in (
+                    PHASE7_RESOURCE_SELECTION_OBJECT_BINDINGS.items()
+                )
+            },
+        )
+
+    def test_level_select_object_recovers_both_active_slot_c_callers(self) -> None:
+        recovered = _phase7_level_select_object_targets(
+            _level_select_object_memory(),
+            _level_select_object_instructions(),
+            set(PHASE7_LEVEL_SELECT_OBJECT_BINDINGS),
+            set(PHASE7_LEVEL_SELECT_OBJECT_VTABLE_ENTRIES),
+        )
+
+        self.assertEqual(
+            recovered,
+            {
+                site: (target,)
+                for site, (_caller_start, _slot, target) in (
+                    PHASE7_LEVEL_SELECT_OBJECT_BINDINGS.items()
+                )
+            },
+        )
+
+    def test_level_select_object_fails_closed_on_family_drift(self) -> None:
+        instructions = _level_select_object_instructions()
+        targets = set(PHASE7_LEVEL_SELECT_OBJECT_VTABLE_ENTRIES)
+        wrong_call = dict(instructions)
+        wrong_call[0x000428B3] = lift_x86_function(
+            bytes.fromhex("FF5208"),
+            base_address=0x000428B3,
+            symbol="wrong_level_select_object_slot",
+        ).instructions[0]
+
+        for memory, candidate, sites, candidate_targets in (
+            (
+                _level_select_object_memory(corrupt_vtable_slot=3),
+                instructions,
+                set(PHASE7_LEVEL_SELECT_OBJECT_BINDINGS),
+                targets,
+            ),
+            (
+                _level_select_object_memory(corrupt_caller=0x00042A7E),
+                instructions,
+                set(PHASE7_LEVEL_SELECT_OBJECT_BINDINGS),
+                targets,
+            ),
+            (
+                _level_select_object_memory(),
+                wrong_call,
+                set(PHASE7_LEVEL_SELECT_OBJECT_BINDINGS),
+                targets,
+            ),
+            (
+                _level_select_object_memory(),
+                instructions,
+                {0x000428B3},
+                targets,
+            ),
+            (
+                _level_select_object_memory(),
+                instructions,
+                set(PHASE7_LEVEL_SELECT_OBJECT_BINDINGS),
+                targets - {0x00033880},
+            ),
+        ):
+            with self.subTest(
+                instruction_count=len(candidate),
+                site_count=len(sites),
+                target_count=len(candidate_targets),
+            ):
+                self.assertEqual(
+                    _phase7_level_select_object_targets(
+                        memory,
+                        candidate,
+                        sites,
+                        candidate_targets,
+                    ),
+                    {},
+                )
+
+    def test_resource_selection_object_fails_closed_on_family_drift(self) -> None:
+        instructions = _resource_selection_object_instructions()
+        targets = set(PHASE7_RESOURCE_SELECTION_OBJECT_VTABLE_ENTRIES)
+        wrong_call = dict(instructions)
+        wrong_call[0x0004436A] = lift_x86_function(
+            bytes.fromhex("FF5208"),
+            base_address=0x0004436A,
+            symbol="wrong_resource_selection_slot",
+        ).instructions[0]
+
+        for memory, candidate, sites, candidate_targets in (
+            (
+                _resource_selection_object_memory(corrupt_vtable_slot=3),
+                instructions,
+                set(PHASE7_RESOURCE_SELECTION_OBJECT_BINDINGS),
+                targets,
+            ),
+            (
+                _resource_selection_object_memory(corrupt_caller=0x0004435A),
+                instructions,
+                set(PHASE7_RESOURCE_SELECTION_OBJECT_BINDINGS),
+                targets,
+            ),
+            (
+                _resource_selection_object_memory(),
+                wrong_call,
+                set(PHASE7_RESOURCE_SELECTION_OBJECT_BINDINGS),
+                targets,
+            ),
+            (
+                _resource_selection_object_memory(),
+                instructions,
+                {0x0004436A},
+                targets,
+            ),
+            (
+                _resource_selection_object_memory(),
+                instructions,
+                set(PHASE7_RESOURCE_SELECTION_OBJECT_BINDINGS),
+                targets - {0x00032EE0},
+            ),
+        ):
+            with self.subTest(
+                instruction_count=len(candidate),
+                site_count=len(sites),
+                target_count=len(candidate_targets),
+            ):
+                self.assertEqual(
+                    _phase7_resource_selection_object_targets(
+                        memory,
+                        candidate,
+                        sites,
+                        candidate_targets,
+                    ),
+                    {},
+                )
+
+    def test_new_save_object_vtables_fail_closed_on_family_drift(self) -> None:
+        instructions = _new_save_object_instructions()
+        targets = set(PHASE7_POST_START_OBJECT_VTABLE_ENTRIES) | set(
+            PHASE7_NEW_SAVE_COMPANION_OBJECT_VTABLE_ENTRIES
+        )
+        wrong_call = dict(instructions)
+        wrong_call[0x00045E98] = lift_x86_function(
+            bytes.fromhex("FF5208"),
+            base_address=0x00045E98,
+            symbol="wrong_new_save_companion_slot",
+        ).instructions[0]
+
+        for memory, candidate, sites, candidate_targets in (
+            (
+                _new_save_object_memory(
+                    corrupt_vtable=PHASE7_POST_START_OBJECT_VTABLE,
+                    corrupt_slot=3,
+                ),
+                instructions,
+                set(PHASE7_NEW_SAVE_OBJECT_BINDINGS),
+                targets,
+            ),
+            (
+                _new_save_object_memory(
+                    corrupt_vtable=PHASE7_NEW_SAVE_COMPANION_OBJECT_VTABLE,
+                    corrupt_slot=3,
+                ),
+                instructions,
+                set(PHASE7_NEW_SAVE_OBJECT_BINDINGS),
+                targets,
+            ),
+            (
+                _new_save_object_memory(),
+                wrong_call,
+                set(PHASE7_NEW_SAVE_OBJECT_BINDINGS),
+                targets,
+            ),
+            (
+                _new_save_object_memory(),
+                instructions,
+                {0x00045141},
+                targets,
+            ),
+            (
+                _new_save_object_memory(),
+                instructions,
+                set(PHASE7_NEW_SAVE_OBJECT_BINDINGS),
+                targets - {0x00034880},
+            ),
+        ):
+            with self.subTest(
+                instruction_count=len(candidate),
+                site_count=len(sites),
+                target_count=len(candidate_targets),
+            ):
+                self.assertEqual(
+                    _phase7_new_save_object_targets(
+                        memory,
+                        candidate,
+                        sites,
+                        candidate_targets,
+                    ),
+                    {},
+                )
+
     def test_save_slot_object_vtable_fails_closed_on_family_drift(self) -> None:
         instructions = _save_slot_object_instructions()
-        targets = set(PHASE7_SAVE_SLOT_OBJECT_VTABLE_ENTRIES)
+        targets = set(PHASE7_SAVE_SLOT_OBJECT_VTABLE_ENTRIES) | set(
+            PHASE7_SAVE_SLOT_OWNER_VTABLE_ENTRIES
+        )
         wrong_call = dict(instructions)
-        wrong_call[0x0004486A] = lift_x86_function(
-            bytes.fromhex("FF5008"),
-            base_address=0x0004486A,
+        wrong_call[0x0003D25C] = lift_x86_function(
+            bytes.fromhex("FF5208"),
+            base_address=0x0003D25C,
             symbol="wrong_save_slot_object_slot",
         ).instructions[0]
 
         for memory, candidate, sites, candidate_targets in (
             (
                 _save_slot_object_memory(corrupt_slot=3),
+                instructions,
+                set(PHASE7_SAVE_SLOT_OBJECT_BINDINGS),
+                targets,
+            ),
+            (
+                _save_slot_object_memory(corrupt_owner_slot=3),
                 instructions,
                 set(PHASE7_SAVE_SLOT_OBJECT_BINDINGS),
                 targets,
@@ -1211,6 +3190,82 @@ class Ia32CoverageGrowthTests(unittest.TestCase):
                     {},
                 )
 
+    def test_resource_converter_callback_binds_complete_five_site_family(self) -> None:
+        targets = {
+            target for _slot, target in PHASE7_RESOURCE_CONVERTER_CALLBACK_VECTOR
+        }
+
+        recovered = _phase7_resource_converter_callback_targets(
+            _resource_converter_callback_memory(),
+            _resource_converter_callback_instructions(),
+            set(PHASE7_RESOURCE_CONVERTER_CALLBACK_BINDINGS),
+            targets,
+        )
+
+        self.assertEqual(
+            recovered,
+            {
+                site: (target,)
+                for site, (_slot, target) in (
+                    PHASE7_RESOURCE_CONVERTER_CALLBACK_BINDINGS.items()
+                )
+            },
+        )
+        self.assertEqual(
+            set(PHASE7_RESOURCE_CONVERTER_INSTALLER_BINDINGS.values()),
+            set(PHASE7_RESOURCE_CONVERTER_CALLBACK_VECTOR),
+        )
+        self.assertEqual(
+            PHASE7_RESOURCE_CONVERTER_OBSERVED_BOUNDARY,
+            (0x00105E72, 0x00105830),
+        )
+
+    def test_resource_converter_callback_fails_closed_on_provenance_drift(self) -> None:
+        memory = _resource_converter_callback_memory()
+        instructions = _resource_converter_callback_instructions()
+        sites = set(PHASE7_RESOURCE_CONVERTER_CALLBACK_BINDINGS)
+        targets = {
+            target for _slot, target in PHASE7_RESOURCE_CONVERTER_CALLBACK_VECTOR
+        }
+        wrong_descriptor = _resource_converter_callback_memory()
+        wrong_descriptor.write_u32(PHASE7_RESOURCE_CONVERTER_DESCRIPTOR, 0)
+        wrong_site = dict(instructions)
+        wrong_site[0x00105E72] = lift_x86_function(
+            bytes.fromhex("FFD1"),
+            base_address=0x00105E72,
+            symbol="wrong_resource_converter_callback_register",
+        ).instructions[0]
+        extra_converter_caller = dict(instructions)
+        address = 0x00120000
+        displacement = (0x00105C90 - (address + 5)) & 0xFFFFFFFF
+        extra_converter_caller[address] = lift_x86_function(
+            b"\xe8" + displacement.to_bytes(4, "little"),
+            base_address=address,
+            symbol="unexpected_resource_converter_caller",
+        ).instructions[0]
+
+        for candidate_memory, candidate_instructions, candidate_sites, candidate_targets in (
+            (wrong_descriptor, instructions, sites, targets),
+            (memory, wrong_site, sites, targets),
+            (memory, extra_converter_caller, sites, targets),
+            (memory, instructions, sites - {0x00105A89}, targets),
+            (memory, instructions, sites, targets - {0x00105450}),
+        ):
+            with self.subTest(
+                instruction_count=len(candidate_instructions),
+                site_count=len(candidate_sites),
+                target_count=len(candidate_targets),
+            ):
+                self.assertEqual(
+                    _phase7_resource_converter_callback_targets(
+                        candidate_memory,
+                        candidate_instructions,
+                        candidate_sites,
+                        candidate_targets,
+                    ),
+                    {},
+                )
+
     def test_supported_workload_registry_covers_exact_measured_abi_targets(self) -> None:
         self.assertEqual(
             set(SUPPORTED_WORKLOAD_SERVICE_SPECS),
@@ -1230,7 +3285,105 @@ class Ia32CoverageGrowthTests(unittest.TestCase):
                 0xE00005C0,
             },
         )
-        self.assertEqual(len(PHASE7_PROFILED_BOOT_SERVICE_SPECS), 81)
+        self.assertEqual(len(PHASE7_PROFILED_BOOT_SERVICE_SPECS), 93)
+        self.assertNotIn(0x000CB690, PHASE7_PROFILED_BOOT_SERVICE_SPECS)
+        self.assertEqual(
+            PHASE7_PROFILED_BOOT_SERVICE_SPECS[0x000CC2F0],
+            {
+                "shim_name": "TitleMusicModeSet",
+                "runtime_kind": 13,
+                "runtime_value": 19,
+                "stack_cleanup_bytes": 4,
+                "boundary": "audio",
+                "normal_live_body": "implemented-native32",
+            },
+        )
+        self.assertEqual(
+            PHASE7_NATIVE_BUFFER_CONFIGURATION_SERVICE_TARGETS,
+            {
+                0x0022D85E,
+                0x0022D87A,
+                0x0022D8F6,
+                0x0022E754,
+                0x0022E770,
+                0x0022E78C,
+                0x0022E8C4,
+                0x0022E8E8,
+                0x0022E908,
+            },
+        )
+        self.assertEqual(
+            PHASE7_NATIVE_AUDIO_LIFETIME_SERVICE_TARGETS,
+            {0x0022C11B, 0x0022CC0B},
+        )
+        self.assertEqual(
+            PHASE7_NATIVE_XINPUT_CONTROL_SERVICE_TARGETS,
+            {0x0028CF96, 0x0028D1EC},
+        )
+        self.assertEqual(
+            {
+                target: (
+                    PHASE7_PROFILED_BOOT_SERVICE_SPECS[target]["shim_name"],
+                    PHASE7_PROFILED_BOOT_SERVICE_SPECS[target][
+                        "stack_cleanup_bytes"
+                    ],
+                )
+                for target in PHASE7_NATIVE_XINPUT_CONTROL_SERVICE_TARGETS
+            },
+            {
+                0x0028CF96: ("XInputClose", 4),
+                0x0028D1EC: ("XInputSetState", 8),
+            },
+        )
+        self.assertEqual(
+            {
+                target: (
+                    PHASE7_PROFILED_BOOT_SERVICE_SPECS[target]["shim_name"],
+                    PHASE7_PROFILED_BOOT_SERVICE_SPECS[target]["runtime_value"],
+                    PHASE7_PROFILED_BOOT_SERVICE_SPECS[target][
+                        "stack_cleanup_bytes"
+                    ],
+                )
+                for target in PHASE7_NATIVE_AUDIO_LIFETIME_SERVICE_TARGETS
+            },
+            {
+                0x0022C11B: ("DirectSoundBufferRelease", 29, 4),
+                0x0022CC0B: ("DirectSoundStreamRelease", 30, 4),
+            },
+        )
+        self.assertEqual(
+            {
+                target: (
+                    PHASE7_PROFILED_BOOT_SERVICE_SPECS[target]["shim_name"],
+                    PHASE7_PROFILED_BOOT_SERVICE_SPECS[target]["runtime_value"],
+                    PHASE7_PROFILED_BOOT_SERVICE_SPECS[target][
+                        "stack_cleanup_bytes"
+                    ],
+                )
+                for target in {
+                    0x0022D85E,
+                    0x0022D87A,
+                    0x0022D8F6,
+                    0x0022E754,
+                    0x0022E770,
+                    0x0022E78C,
+                    0x0022E8C4,
+                    0x0022E8E8,
+                    0x0022E908,
+                }
+            },
+            {
+                0x0022D85E: ("DirectSoundBufferSetHeadroom", 20, 8),
+                0x0022D87A: ("DirectSoundBufferSetMixBinVolumes", 21, 8),
+                0x0022D8F6: ("DirectSoundBufferSetLoopRegion", 22, 12),
+                0x0022E754: ("DirectSoundBufferSetOutputBuffer", 23, 8),
+                0x0022E770: ("DirectSoundBufferSetMixBins", 24, 8),
+                0x0022E78C: ("DirectSoundBufferSetAllParameters", 25, 12),
+                0x0022E8C4: ("DirectSoundBufferSetRolloffCurve", 26, 16),
+                0x0022E8E8: ("DirectSoundBufferSetI3DL2Source", 27, 12),
+                0x0022E908: ("DirectSoundBufferSetPlayRegion", 28, 12),
+            },
+        )
         self.assertEqual(
             PHASE7_CAPTURED_SERVICE_IMPORT_CELLS,
             {0x293CDC: 0xE0000400, 0x293E58: 0xE0000030},

@@ -1359,7 +1359,7 @@ void VulkanPresenter::emit_presented_render_state_diagnostics() {
             {"presented_draw_count", std::to_string(
                 interpreted_stream_.presented_draw_count)},
             {"retained_presented_surface_available", json_bool(
-                presented_render_target_feedback_texture() != nullptr)},
+                presented_render_target_feedback_available())},
             {"fixed_function_draw_count", std::to_string(fixed_function_draw_count)},
             {"fixed_function_transformed_draw_count", std::to_string(fixed_function_transformed_draw_count)},
             {"fixed_function_raw_fallback_draw_count", std::to_string(fixed_function_raw_fallback_draw_count)},
@@ -1737,6 +1737,7 @@ PresenterMetricsSnapshot VulkanPresenter::collect_metrics_snapshot() const {
     snapshot.platform_poll_us = last_window_message_pump_us_;
     snapshot.controller_poll_us = last_controller_poll_us_;
     snapshot.keyboard_latch_us = last_keyboard_latch_us_;
+    snapshot.audio_submit_us = last_audio_submit_us_;
     snapshot.reload_probe_us = last_reload_probe_us_;
     snapshot.pre_render_unattributed_us = last_pre_render_unattributed_us_;
     snapshot.gpu_frame_time_valid = gpu_frame_time_valid_;

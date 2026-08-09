@@ -13,13 +13,18 @@ from tools.playability.render_debug_report import (
     build_render_debug_report,
 )
 from tools.playability.render_debug_suite import (
+    DEFAULT_RENDER_ANALYSIS_EXE,
     inspect_render_snapshot_integrity,
     latest_retained_render_manifest,
     run_render_debug_suite,
 )
+from tools.host.first_frame_smoke import DEFAULT_EXE
 
 
 class RenderDebugReportTests(unittest.TestCase):
+    def test_debug_suite_uses_a_dedicated_analysis_executable(self) -> None:
+        self.assertNotEqual(DEFAULT_RENDER_ANALYSIS_EXE, DEFAULT_EXE)
+
     def test_profile_capture_window_selects_only_events_between_f10_edges(
         self,
     ) -> None:

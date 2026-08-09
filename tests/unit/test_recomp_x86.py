@@ -3076,12 +3076,29 @@ class X86RecompPrototypeTests(unittest.TestCase):
             "EC": "in",
             "EA2C6D0E000800": "jmp_far",
             "F00FC102": "xadd",
+            "0FB111": "cmpxchg",
             "0F5F0570635A00": "maxps",
             "0F5D05E0303400": "minps",
             "0F7F01": "movq",
+            "0F2B0447": "movntps",
+            "0F2DC8": "cvtps2pi",
+            "0F6E45E4": "movd",
+            "0F61E5": "punpcklwd",
+            "0F62C4": "punpckldq",
+            "0F69F5": "punpckhwd",
+            "0F6ACC": "punpckhdq",
+            "0F700406D8": "pshufw",
+            "0F71E50F": "psraw",
+            "0F72F001": "pslld",
+            "0F72D010": "psrld",
+            "0FFECA": "paddd",
+            "0F6BCB": "packssdw",
             "0F1000": "movups",
             "D1D8": "rcr",
             "C1C910": "ror",
+            "C1C707": "rol",
+            "9C": "pushfd",
+            "9D": "popfd",
             "9E": "sahf",
             "1CFF": "sbb",
             "0F01442406": "sgdt",
@@ -3203,6 +3220,64 @@ class X86RecompPrototypeTests(unittest.TestCase):
         )
         self.assertEqual(round_result.state.get_register("eax"), 3)
 
+    def test_audited_mmx_and_sse_packed_frontiers_execute(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex(
+                "0F6E0500200000"  # movd mm0, dword [0x2000]
+                "0F7E0504200000"  # movd dword [0x2004], mm0
+                "0F61C1"  # punpcklwd mm0, mm1
+                "0F69D3"  # punpckhwd mm2, mm3
+                "0F62E5"  # punpckldq mm4, mm5
+                "0F6AF7"  # punpckhdq mm6, mm7
+                "0FFEC2"  # paddd mm0, mm2
+                "0F6BE6"  # packssdw mm4, mm6
+                "0F70CB1B"  # pshufw mm1, mm3, 0x1b
+                "0F71E208"  # psraw mm2, 8
+                "0F72F501"  # pslld mm5, 1
+                "0F72D710"  # psrld mm7, 16
+                "0F2DD8"  # cvtps2pi mm3, xmm0
+                "0F2B0D20200000"  # movntps [0x2020], xmm1
+                "C3"
+            ),
+            base_address=0x6280,
+            symbol="audited_packed_frontiers",
+        )
+        state = CpuState.with_registers(esp=0x8000)
+        state.set_mmx_register("mm1", 0x4444333322221111)
+        state.set_mmx_register("mm2", 0x4444333322221111)
+        state.set_mmx_register("mm3", 0x8888777766665555)
+        state.set_mmx_register("mm4", 0x2222222211111111)
+        state.set_mmx_register("mm5", 0x4444444433333333)
+        state.set_mmx_register("mm6", 0x6666666655555555)
+        state.set_mmx_register("mm7", 0x8888888877777777)
+        state.set_xmm_register("xmm0", (2.5, -3.5, 0.0, 0.0))
+        state.set_xmm_register("xmm1", (1.0, 2.0, 3.0, 4.0))
+        memory = SparseMemory(
+            {
+                0x2000: 0x89ABCDEF,
+                0x2004: bytes(4),
+                0x2020: bytes(16),
+                0x8000: 0xDEADC0DE,
+            }
+        )
+
+        result = execute_lifted_function(function, state=state, memory=memory)
+        emitted = emit_cpp(function, exported_symbol="audited_packed_frontiers")
+
+        self.assertEqual(memory.read_u32(0x2004), 0x89ABCDEF)
+        self.assertEqual(result.state.get_mmx_register("mm0"), 0xAAAACDEF88890122)
+        self.assertEqual(result.state.get_mmx_register("mm1"), 0x5555666677778888)
+        self.assertEqual(result.state.get_mmx_register("mm2"), 0xFF88004400770033)
+        self.assertEqual(result.state.get_mmx_register("mm3"), 0xFFFFFFFC00000002)
+        self.assertEqual(result.state.get_mmx_register("mm4"), 0x80007FFF7FFF7FFF)
+        self.assertEqual(result.state.get_mmx_register("mm5"), 0x8888888866666666)
+        self.assertEqual(result.state.get_mmx_register("mm7"), 0x0000888800007777)
+        self.assertEqual(memory.read(0x2020, 16), struct.pack("<4f", 1.0, 2.0, 3.0, 4.0))
+        self.assertEqual(result.return_address, 0xDEADC0DE)
+        self.assertIn("b2r_mmx_unpack", emitted)
+        self.assertIn("b2r_mmx_packssdw", emitted)
+        self.assertIn("b2r_cvtps2pi", emitted)
+
     def test_batched_integer_string_and_system_frontiers_execute(self) -> None:
         reverse_copy = lift_x86_function(
             bytes.fromhex("FDF3A5FCC3"),
@@ -3256,6 +3331,84 @@ class X86RecompPrototypeTests(unittest.TestCase):
         self.assertEqual(arithmetic_result.state.get_register("ecx"), 0x56781234)
         self.assertEqual(arithmetic_result.state.get_register("eax"), 0xD55DEEE6)
         self.assertFalse(arithmetic_result.state.flags.cf)
+
+        rotate_left = lift_x86_function(
+            bytes.fromhex("C1C707C3"),
+            base_address=0x6480,
+            symbol="rotate_left",
+        )
+        rotate_left_state = CpuState.with_registers(edi=0x12345678, esp=0x8180)
+        rotate_left_result = execute_lifted_function(
+            rotate_left,
+            state=rotate_left_state,
+            memory=SparseMemory({0x8180: 0xDEADC0DE}),
+        )
+        self.assertEqual(rotate_left_result.state.get_register("edi"), 0x1A2B3C09)
+        self.assertTrue(rotate_left_result.state.flags.cf)
+
+        compare_exchange = lift_x86_function(
+            bytes.fromhex("0FB111C3"),
+            base_address=0x6490,
+            symbol="compare_exchange",
+        )
+        success_state = CpuState.with_registers(
+            eax=5,
+            ecx=0x5100,
+            edx=9,
+            esp=0x8190,
+        )
+        success_memory = SparseMemory({0x5100: 5, 0x8190: 0xDEADC0DE})
+        success_result = execute_lifted_function(
+            compare_exchange,
+            state=success_state,
+            memory=success_memory,
+        )
+        self.assertEqual(success_memory.read_u32(0x5100), 9)
+        self.assertEqual(success_result.state.get_register("eax"), 5)
+        self.assertTrue(success_result.state.flags.zf)
+
+        failure_state = CpuState.with_registers(
+            eax=4,
+            ecx=0x5200,
+            edx=9,
+            esp=0x81A0,
+        )
+        failure_memory = SparseMemory({0x5200: 5, 0x81A0: 0xDEADC0DE})
+        failure_result = execute_lifted_function(
+            compare_exchange,
+            state=failure_state,
+            memory=failure_memory,
+        )
+        self.assertEqual(failure_memory.read_u32(0x5200), 5)
+        self.assertEqual(failure_result.state.get_register("eax"), 5)
+        self.assertFalse(failure_result.state.flags.zf)
+
+        flags_round_trip = lift_x86_function(
+            bytes.fromhex("9C5868D70800009DC3"),
+            base_address=0x64A0,
+            symbol="flags_round_trip",
+        )
+        flags_state = CpuState.with_registers(esp=0x81B0)
+        flags_result = execute_lifted_function(
+            flags_round_trip,
+            state=flags_state,
+            memory=SparseMemory({0x81B0: 0xDEADC0DE}),
+        )
+        self.assertEqual(flags_result.state.get_register("eax"), 0x00000202)
+        self.assertTrue(flags_result.state.flags.cf)
+        self.assertTrue(flags_result.state.flags.pf)
+        self.assertTrue(flags_result.state.flags.af)
+        self.assertTrue(flags_result.state.flags.zf)
+        self.assertTrue(flags_result.state.flags.sf)
+        self.assertFalse(flags_result.state.flags.interrupt_enabled)
+        self.assertFalse(flags_result.state.flags.df)
+        self.assertTrue(flags_result.state.flags.of)
+
+        emitted = emit_cpp(
+            compare_exchange,
+            exported_symbol="compare_exchange",
+        )
+        self.assertIn("b2r_sub_flags(ctx, accumulator, destination", emitted)
 
         exchange_add = lift_x86_function(
             bytes.fromhex("F00FC102C3"),

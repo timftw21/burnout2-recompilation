@@ -2458,37 +2458,6 @@ VkDescriptorSet VulkanPresenter::descriptor_for_draw(const NativeDraw& draw) con
     return host_texture_bindings_.front().descriptor_set;
 }
 
-const HostTexture* VulkanPresenter::presented_render_target_feedback_texture() const {
-    const uint32_t selected_address = presented_surface_color_offset_;
-    const size_t first_draw = std::min<size_t>(
-        interpreted_stream_.presented_draw_begin,
-        interpreted_stream_.draws.size());
-    const size_t end_draw = std::min<size_t>(
-        first_draw + interpreted_stream_.presented_draw_count,
-        interpreted_stream_.draws.size());
-    for (size_t draw_index = first_draw; draw_index < end_draw; ++draw_index) {
-        const uint32_t address =
-            interpreted_stream_.draws[draw_index].surface_color_offset;
-        if (selected_address != 0u && address != selected_address) {
-            continue;
-        }
-        const auto match = std::find_if(
-            host_textures_.begin(),
-            host_textures_.end(),
-            [&](const HostTexture& texture) {
-                return texture.render_target_feedback
-                    && texture.guest_address == address
-                    && texture.width == swapchain_extent_.width
-                    && texture.height == swapchain_extent_.height
-                    && texture.image_format == swapchain_format_;
-            });
-        if (match != host_textures_.end()) {
-            return &*match;
-        }
-    }
-    return nullptr;
-}
-
 uint32_t VulkanPresenter::presented_surface_color_clear_count() const {
     return static_cast<uint32_t>(std::count_if(
         interpreted_stream_.presented_surface_clears.begin(),
@@ -2502,14 +2471,49 @@ uint32_t VulkanPresenter::presented_surface_color_clear_count() const {
         }));
 }
 
+bool VulkanPresenter::presented_render_target_feedback_available() const {
+    return presented_surface_color_offset_ != 0u
+        && std::any_of(
+            host_textures_.begin(),
+            host_textures_.end(),
+            [&](const HostTexture& texture) {
+                return texture.render_target_feedback
+                    && !texture.cubemap
+                    && texture.image_format == swapchain_format_
+                    && nv2a_canonical_resource_address(
+                        texture.guest_address)
+                        == nv2a_canonical_resource_address(
+                            presented_surface_color_offset_)
+                    && surface_extent_matches_presented(
+                        texture.width,
+                        texture.height);
+            });
+}
+
 bool VulkanPresenter::record_render_target_feedback(
     VkCommandBuffer command_buffer,
     VkImage swapchain_image) const {
-    const HostTexture* target =
-        presented_render_target_feedback_texture();
-    if (target == nullptr) {
+    if (presented_surface_color_offset_ == 0u) {
         return false;
     }
+    const auto match = std::find_if(
+        host_textures_.begin(),
+        host_textures_.end(),
+        [&](const HostTexture& texture) {
+            return texture.render_target_feedback
+                && !texture.cubemap
+                && texture.image_format == swapchain_format_
+                && nv2a_canonical_resource_address(texture.guest_address)
+                    == nv2a_canonical_resource_address(
+                        presented_surface_color_offset_)
+                && surface_extent_matches_presented(
+                    texture.width,
+                    texture.height);
+        });
+    if (match == host_textures_.end()) {
+        return false;
+    }
+    const HostTexture& target = *match;
     VkImageMemoryBarrier to_transfer{};
     to_transfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     to_transfer.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -2518,7 +2522,7 @@ bool VulkanPresenter::record_render_target_feedback(
     to_transfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     to_transfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     to_transfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_transfer.image = target->image;
+    to_transfer.image = target.image;
     to_transfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     to_transfer.subresourceRange.levelCount = 1;
     to_transfer.subresourceRange.layerCount = 1;
@@ -2535,24 +2539,52 @@ bool VulkanPresenter::record_render_target_feedback(
         1,
         &to_transfer);
 
-    VkImageCopy copy{};
-    copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    copy.srcSubresource.layerCount = 1;
-    copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    copy.dstSubresource.layerCount = 1;
-    copy.extent = {
-        swapchain_extent_.width,
-        swapchain_extent_.height,
-        1u,
-    };
-    vkCmdCopyImage(
-        command_buffer,
-        swapchain_image,
-        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        target->image,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        1,
-        &copy);
+    if (target.width == swapchain_extent_.width
+        && target.height == swapchain_extent_.height) {
+        VkImageCopy copy{};
+        copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.srcSubresource.layerCount = 1;
+        copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.dstSubresource.layerCount = 1;
+        copy.extent = {
+            swapchain_extent_.width,
+            swapchain_extent_.height,
+            1u,
+        };
+        vkCmdCopyImage(
+            command_buffer,
+            swapchain_image,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            target.image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &copy);
+    } else {
+        VkImageBlit blit{};
+        blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.srcSubresource.layerCount = 1;
+        blit.srcOffsets[1] = {
+            static_cast<int32_t>(swapchain_extent_.width),
+            static_cast<int32_t>(swapchain_extent_.height),
+            1,
+        };
+        blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.dstSubresource.layerCount = 1;
+        blit.dstOffsets[1] = {
+            static_cast<int32_t>(target.width),
+            static_cast<int32_t>(target.height),
+            1,
+        };
+        vkCmdBlitImage(
+            command_buffer,
+            swapchain_image,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            target.image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &blit,
+            VK_FILTER_LINEAR);
+    }
 
     VkImageMemoryBarrier to_shader = to_transfer;
     to_shader.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;

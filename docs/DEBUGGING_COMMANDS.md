@@ -9,29 +9,58 @@ $Extracted = '.\data\local\extracted\burnout_2_poi_usa'
 
 ## Current Phase 7 checkpoint
 
-The work-in-progress static artifact currently reaches the Load/Save screen and
-stops while creating a new slot. The native summary reports deliberate guard
-`0x80000003` at guest `0x00045141`, whose decoded sequence is:
+The stable static artifact is
+`ff8db42895b7970b554b9aa9fadaf62e82305e0946ca6f63b55b8ebd577936a4`.
+Its exact manifest has zero guarded boundaries, 140 registered native services,
+zero pending services/frontier activity/Python callbacks, and no runtime
+compilation, decoding, patching, promotion, raw-XBE execution, or automatic
+fallback. The offline audit resolves 170 baseline guards, adds none, and leaves
+zero while passing the eight-optimization budget.
 
-```text
-0x00045138  mov ecx,[0x004CB364]
-0x0004513E  mov edx,[ecx]
-0x00045140  push eax
-0x00045141  call [edx+0x0C]
-```
+The earlier zero-guard artifact could open a black presenter window and exit
+with Windows code `3221225477` (`0xC0000005`). Its normal-live vblank
+start/exit thunks overlapped audited service-body slots 112 and 128; the
+scheduler's service-table reinstall replaced the first 44 bytes of both context
+switches. Normal-live control thunks now occupy isolated slots
+`0x50002100-0x50002400` in the reserved relay page, below the service-body
+region at `0x50003000`. A layout regression test prevents recurrence.
 
-Query the stable native metadata before attaching a debugger:
+The replacement artifact was manually confirmed to render and continue beyond
+the former first-vblank crash. The user stopped that diagnostic run, so it is
+correctness evidence rather than a completed native-clean performance report.
+The next check remains a manual diagnostics-off gameplay/performance run using
+the stable index, followed by regeneration of `performance-debug-report.json`.
+Do not automate input or infer an FPS gain from the static audit alone.
+
+## Offline Phase 7 boundary sweep
+
+Inventory and re-resolve the complete normal-live guard set from the retained
+capsule, decoded block store, XBE import table, and coverage profile without
+launching the game:
 
 ```powershell
-python -m tools.recomp.debug_metadata 0x00045141 `
-  --build-dir .\build\native-guest-loop `
-  --context 20
+python -m tools.recomp.audit_ia32_boundaries `
+  .\reports\local\replay\lesson-one-phase7-observed-run-4.b2rcap `
+  --xbe .\data\local\extracted\burnout_2_poi_usa\default.xbe `
+  --decoded-block-store .\build\native-guest-loop\decoded-blocks.sqlite3 `
+  --coverage-profile .\reports\local\replay\boot-to-lesson-one-coverage-profile.json `
+  --baseline-manifest .\build\local\ia32-live\f1f79ee62ed881dee662c60f67b380ccc292825f26b7a3cd0a07ea9cd0dda8f7\manifest.json `
+  --candidate-manifest .\build\local\ia32-live\manifest.json `
+  --report .\reports\local\replay\phase7-offline-boundary-audit.json
 ```
 
-Global cell `0x004CB364` is lifetime-dependent: other measured callers use
-different slot-C targets. Capture the live object, vtable, and target at this
-site, inspect adjacent callers, and recover only the finite lifetime-specific
-family. Do not bind every user of the global cell to one target.
+The report names every resolved site and proof source, groups any remaining
+sites into finite work batches (kernel import, callback register, indexed
+table, virtual slot, or direct edge), and never injects input or executes guest code. The
+candidate manifest is required for acceptance because its complete recursive
+guard inventory includes downstream direct exits exposed by the new target
+closure. The audit also enforces the Phase 7 performance budget: each complete
+batch of 20 newly resolved guards requires another credited native runtime
+optimization present in that exact artifact. An audit fails instead of
+recording target coverage when that budget is not met.
+
+The latest accepted report records 170 resolved guards, zero added, zero
+remaining, and eight newly credited generated-runtime optimizations.
 
 ## Choosing a workflow
 

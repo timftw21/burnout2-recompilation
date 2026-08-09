@@ -27,7 +27,10 @@ except ModuleNotFoundError:  # pragma: no cover - direct script fallback
     from tools.xbe.xbe_info import parse_xbe_file
 
 
-DEFAULT_MAX_BLOCKS = 65536
+# The supported title's decoded-store-seeded closure currently exceeds 65,536
+# blocks.  Keep the ordinary documented audit complete by default while
+# retaining an explicit caller override for smaller diagnostic probes.
+DEFAULT_MAX_BLOCKS = 131072
 DEFAULT_MAX_BLOCK_BYTES = 4096
 STATIC_EXECUTABLE_DATA_SECTIONS = {".rdata", ".data"}
 
@@ -181,6 +184,8 @@ def audit_x86_coverage(
         "source": {"kind": "xbe", "name": xbe_path.name},
         "decoded_block_store_record_count": store_record_count,
         "seed_count": len(initial_seeds),
+        "max_blocks": max_blocks,
+        "max_block_bytes": max_block_bytes,
         "visited_block_count": len(visited_blocks),
         "visited_instruction_count": len(visited_instructions),
         "direct_target_count": len(direct_targets),

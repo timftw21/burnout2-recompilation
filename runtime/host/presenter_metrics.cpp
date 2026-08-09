@@ -107,6 +107,8 @@ std::filesystem::path PresenterMetricsReporter::write(
            << static_cast<double>(snapshot.controller_poll_us) / 1000.0 << '\n'
            << "keyboard latch ms: "
            << static_cast<double>(snapshot.keyboard_latch_us) / 1000.0 << '\n'
+           << "audio submit ms: "
+           << static_cast<double>(snapshot.audio_submit_us) / 1000.0 << '\n'
            << "reload probe ms: "
            << static_cast<double>(snapshot.reload_probe_us) / 1000.0 << '\n'
            << "pre-render unattributed ms: "

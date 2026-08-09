@@ -19,9 +19,11 @@ from tools.recomp.ia32_native_backend import (
     ARCHITECTURE_TIMESTAMP_COUNTER_ADDRESS,
     DETERMINISTIC_TSC_STEP,
     PHASE3_ARCHITECTURE_CONTRACT_ID,
+    PHASE7_AUDIO_BUFFER_COMMAND_CALL_SITES,
     PHASE7_AUDIO_BUFFER_COMMAND_FAMILY,
     PHASE7_AUDIO_BUFFER_COMMAND_IMMEDIATE_SITE,
     PHASE7_AUDIO_BUFFER_COMMAND_VALUE,
+    PHASE7_AUDIO_BUFFER_COMMAND_VALUES,
     PHASE7_AUDIO_BUFFER_COPY_CALL_SITES,
     PHASE7_AUDIO_BUFFER_COPY_TARGET,
     PHASE7_AUDIO_BUFFER_MMIO_END,
@@ -87,7 +89,10 @@ def _audio_buffer_command_instructions():
             base_address=address,
             symbol=f"audio_buffer_command_{address:08x}",
         ).instructions[0]
-        for address, encoded in PHASE7_AUDIO_BUFFER_COMMAND_FAMILY.items()
+        for address, encoded in {
+            **PHASE7_AUDIO_BUFFER_COMMAND_FAMILY,
+            **PHASE7_AUDIO_BUFFER_COMMAND_CALL_SITES,
+        }.items()
     }
 
 
@@ -264,7 +269,20 @@ class Ia32ArchitectureMemoryTests(unittest.TestCase):
                     )
                     guards = _guarded_static_boundaries(plan.instructions, stop_eip)
 
-                    self.assertEqual(plan.rewrites, ())
+                    self.assertEqual(len(plan.rewrites), 1)
+                    rewrite = plan.rewrites[0]
+                    self.assertEqual(rewrite["address"], 0x000C0000)
+                    self.assertEqual(rewrite["kind"], "software-debug-terminal")
+                    self.assertEqual(
+                        rewrite["status"], "implemented-native-terminal"
+                    )
+                    self.assertEqual(
+                        rewrite["terminal_semantics"],
+                        "resident-exception-containment",
+                    )
+                    self.assertEqual(
+                        rewrite["original_bytes"], rewrite["replacement_bytes"]
+                    )
                     self.assertIn("fail-closed terminal trap", guards[0x000C0000])
 
     def test_resident_scheduler_guards_unverified_dense_rdtsc(self) -> None:
@@ -854,16 +872,28 @@ class Ia32ArchitectureMemoryTests(unittest.TestCase):
 
     def test_resident_audio_buffer_command_self_clears_as_one_family(self) -> None:
         instructions = _audio_buffer_command_instructions()
-        original = instructions[PHASE7_AUDIO_BUFFER_COMMAND_IMMEDIATE_SITE]
+        expected_rewrites = {
+            PHASE7_AUDIO_BUFFER_COMMAND_IMMEDIATE_SITE: "6A00",
+            0x00230A3A: "C7401000000000",
+        }
 
-        rewritten = _resident_audio_buffer_command_rewrite(
-            original,
-            instructions,
+        for site, expected in expected_rewrites.items():
+            with self.subTest(site=f"0x{site:08X}"):
+                original = instructions[site]
+                rewritten = _resident_audio_buffer_command_rewrite(
+                    original,
+                    instructions,
+                )
+                self.assertEqual(
+                    original.operands[-1].immediate,
+                    PHASE7_AUDIO_BUFFER_COMMAND_VALUES[site],
+                )
+                self.assertEqual(rewritten.bytes_hex, expected)
+                self.assertEqual(len(rewritten.bytes_hex), len(original.bytes_hex))
+        self.assertEqual(
+            PHASE7_AUDIO_BUFFER_COMMAND_VALUES[PHASE7_AUDIO_BUFFER_COMMAND_IMMEDIATE_SITE],
+            PHASE7_AUDIO_BUFFER_COMMAND_VALUE,
         )
-
-        self.assertEqual(original.operands[0].immediate, PHASE7_AUDIO_BUFFER_COMMAND_VALUE)
-        self.assertEqual(rewritten.bytes_hex, "6A00")
-        self.assertEqual(len(rewritten.bytes_hex), len(original.bytes_hex))
 
     def test_resident_audio_buffer_command_rejects_family_drift(self) -> None:
         instructions = _audio_buffer_command_instructions()
@@ -875,12 +905,30 @@ class Ia32ArchitectureMemoryTests(unittest.TestCase):
         ).instructions[0]
         missing_poll = dict(instructions)
         del missing_poll[0x00230A1A]
+        wrong_caller = dict(instructions)
+        wrong_caller[0x0022C411] = lift_x86_function(
+            bytes.fromhex("E8D7450000"),
+            base_address=0x0022C411,
+            symbol="wrong_audio_buffer_command_caller",
+        ).instructions[0]
+        added_caller = dict(instructions)
+        added_caller_address = 0x00140000
+        added_caller[added_caller_address] = lift_x86_function(
+            b"\xE8"
+            + (0x002309EC - (added_caller_address + 5)).to_bytes(
+                4,
+                "little",
+                signed=True,
+            ),
+            base_address=added_caller_address,
+            symbol="added_audio_buffer_command_caller",
+        ).instructions[0]
 
-        for candidate in (wrong_poll, missing_poll):
+        for candidate in (wrong_poll, missing_poll, wrong_caller, added_caller):
             with self.subTest(instruction_count=len(candidate)):
                 with self.assertRaisesRegex(
                     Ia32BackendError,
-                    "finite audio buffer-command self-clear family drifted",
+                    "finite audio buffer-command .*drifted",
                 ):
                     _resident_audio_buffer_command_rewrite(
                         instructions[PHASE7_AUDIO_BUFFER_COMMAND_IMMEDIATE_SITE],

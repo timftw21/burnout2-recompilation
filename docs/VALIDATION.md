@@ -4,33 +4,47 @@ This document retains operational evidence and known limitations without
 turning the project entry point into a run log. Dated evidence applies only to
 the exact supported XBE and recorded build/run identities.
 
-## Current Phase 7 checkpoint (August 6, 2026)
+## Current Phase 7 checkpoint (August 9, 2026)
 
-The work-in-progress same-ISA IA-32 path now boots from the supported XBE,
-publishes the frontend, accepts manual controller input, plays menu music, and
-reaches Load/Save. Attempting to create a new slot currently stops at the
-deliberate unbound-indirect-call guard at guest `0x00045141`:
+The retained same-ISA IA-32 analysis closes the complete normal-live boundary
+inventory offline. Against baseline
+`f1f79ee62ed881dee662c60f67b380ccc292825f26b7a3cd0a07ea9cd0dda8f7`,
+the exact candidate audit resolves 170 guarded boundaries, adds none, and
+leaves zero. The 140 registered native services and 91,252-record decoded store
+cover the resulting ahead-of-time artifact. The decoded instruction audit has
+zero unsupported instructions.
 
-```text
-0x00045138  mov ecx, [0x004CB364]
-0x0004513E  mov edx, [ecx]
-0x00045140  push eax
-0x00045141  call [edx+0x0C]
-```
-
-The retained artifact is
-`cf103314477d515bfb9adb67ad2af5fd97215375ba6aa6a5aaf644eb9ef51d1a`
+The current artifact is
+`ff8db42895b7970b554b9aa9fadaf62e82305e0946ca6f63b55b8ebd577936a4`
 with PE SHA-256
-`fed62c53eaf37824e4bb0569b49f9fe93e1fb4e270ece1e67bdeb9bcce7dad87`.
-Run `87c03b0e-e64a-478f-a8d5-c920fbf52f71` reports exception
-`0x80000003` at `0x00045141` and zero Python runtime callbacks. This is a
-static-coverage stop, not accepted save creation or gameplay.
+`5a55f35340b84aa3c5bb58dc60a2f7f8889a8feb761b194b18926869455f93a0`.
+Its manifest reports zero guarded boundaries, pending services, unknown
+targets, frontier-interpreter invocations/steps, and Python runtime callbacks.
+Runtime decoding, compilation, guest-code patching, native promotion,
+raw-XBE execution, and automatic cross-backend fallback are disabled.
+
+The preceding zero-guard artifact exposed a separate native layout defect: its
+vblank start/exit thunks shared `0x5000A000`/`0x5000B000` with audited service
+bodies 112/128. Reinstalling the service table overwrote the first 44 bytes of
+each context switch and caused a first-vblank `0xC0000005` with a black retained
+frame. The four normal-live control thunks now occupy isolated slots
+`0x50002100-0x50002400`, below the service-body region at `0x50003000`, and a
+focused regression freezes the separation. The replacement manually rendered
+and continued beyond the former fault before the user closed the diagnostic.
 
 The launcher requires an explicit `--guest-backend same-isa-ia32` selection
 for this path. The default `live_test.py` backend remains the diagnostic oracle. A
 static-clean run must keep developer live compilation and native promotion
 disabled and report zero frontier-interpreter invocations, frontier-interpreter
 steps, and Python runtime callbacks.
+
+The boundary audit also enforces one substantive generated-runtime
+optimization for every complete 20-guard batch. Eight optimizations are
+credited for the 170-to-zero closure: direct and rolling-schedule SHA-256,
+sorted-window vertex-range merging, centibel-gain memoization, idle audio
+quantum bypass, eight-wide accumulator clearing, unity-rate resampling, and a
+page-indexed allocation cache. These are static implementation evidence, not a
+replacement for the pending diagnostics-off gameplay performance capture.
 
 ## Automated asset-free baseline
 
@@ -706,20 +720,17 @@ input was used; progression beyond retained run
 
 ## Known limitations
 
-- Creating a new save slot currently reaches the deliberate INT3 coverage guard
-  at guest `0x00045141`; the lifetime-specific target behind global cell
-  `0x004CB364` has not yet been closed safely.
-- The static IA-32 path has not reached accepted gameplay, so it has no accepted
-  gameplay pacing or workload-locked frame-time distribution.
+- The zero-guard static IA-32 path has reached manually observed gameplay, but
+  the current replacement artifact does not yet have a completed
+  diagnostics-off gameplay summary or workload-locked frame-time distribution.
 - There is no complete save-state system.
 - Fifteen car draws use a second reflection/cubemap stage that is diagnosed but
   not yet replayed.
-- Controller input and menu music are manually confirmed on the current static
-  path. Gameplay sound effects, rumble, and long-run audio continuity remain
-  unverified there.
-- Load/Save progression still needs promotion into checked-in strict synthetic
-  coverage. Save creation, restart/load, overwrite, and autosave are not
-  accepted on the current static path.
+- Controller input, menu/gameplay music, visible 3D, and corrected gameplay SFX
+  attenuation are manually confirmed on retained static artifacts. Rumble and
+  long-run audio continuity remain unverified.
+- Load/Save guarded boundaries are closed ahead of time, but save creation,
+  restart/load, overwrite, and autosave are not accepted end to end.
 
 Local reports under `reports/local/` are evidence, not source artifacts, and
 must not be committed. Performance claims should cite their run identity,

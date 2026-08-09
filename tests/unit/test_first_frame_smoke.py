@@ -905,6 +905,18 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("publication_event_", source)
         self.assertIn('"B2TEX001"', source)
         self.assertIn("reusable_by_address", source)
+        binary_loader = source.index(
+            "std::vector<RecoveredTextureResource> "
+            "load_recovered_texture_resources_bytes("
+        )
+        stream_fallback = source.index("std::istringstream stream(", binary_loader)
+        direct_loader = source[binary_loader:stream_fallback]
+        self.assertIn(
+            'std::memcmp(bytes.data(), "B2TEX001", 8u) == 0',
+            direct_loader,
+        )
+        self.assertIn("resource.payload.resize(payload_size)", direct_loader)
+        self.assertNotIn("std::istringstream", direct_loader)
         self.assertIn('"resource_snapshot_reused_bytes"', source)
         self.assertIn("texture_content_identity", source)
         self.assertIn("retain_matching", source)
@@ -1062,6 +1074,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn('"window_message_pump_us"', source)
         self.assertIn('"controller_poll_us"', source)
         self.assertIn('"keyboard_latch_us"', source)
+        self.assertIn('"audio_submit_us"', source)
         self.assertIn('"reload_probe_us"', source)
         self.assertIn('"pre_render_unattributed_us"', source)
         self.assertIn('"acquire_us"', source)
@@ -1130,6 +1143,13 @@ class FirstFrameSmokeTests(unittest.TestCase):
             source,
         )
 
+    def test_native_replay_discards_stale_ring_tail_after_jump(self) -> None:
+        source = presenter_source_text()
+
+        self.assertIn("const bool jump =", source)
+        self.assertIn("words[index].run_id == run_id", source)
+        self.assertIn("stale ring contents", source)
+
     def test_native_replay_preserves_current_attributes_for_disabled_arrays(
         self,
     ) -> None:
@@ -1191,6 +1211,14 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn("render_target_feedback", source)
         self.assertIn("record_render_target_feedback", source)
         self.assertIn("render_target_feedback_texture_matches_spec", source)
+        self.assertIn(
+            "nv2a_render_target_feedback_formats_compatible",
+            source,
+        )
+        self.assertIn(
+            "nv2a_render_target_feedback_format_matches",
+            source,
+        )
         self.assertIn("active_count != specs.size()", source)
         self.assertIn("|| texture.render_target_feedback", source)
         self.assertIn("const bool already_retained", source)
@@ -1198,6 +1226,11 @@ class FirstFrameSmokeTests(unittest.TestCase):
         self.assertIn('"render_target_feedback_missing"', source)
         self.assertIn('"render_target_feedback_required_addresses"', source)
         self.assertIn("vkCmdCopyImage(", source)
+        self.assertIn("vkCmdBlitImage(", source)
+        self.assertIn(
+            "swapchain_extent_.height == 480u && height == 448u",
+            source,
+        )
         self.assertIn("VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT", source)
         self.assertIn("VK_IMAGE_USAGE_TRANSFER_SRC_BIT", source)
 
@@ -1408,6 +1441,7 @@ class FirstFrameSmokeTests(unittest.TestCase):
             "window message pump ms:",
             "controller poll ms:",
             "keyboard latch ms:",
+            "audio submit ms:",
             "reload probe ms:",
             "pre-render unattributed ms:",
             "GPU frame ms:",

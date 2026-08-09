@@ -58,6 +58,9 @@ class HostAudioTests(unittest.TestCase):
         self.assertIn("SDL_OpenAudioDeviceStream", native_source)
         self.assertIn("SDL_PutAudioStreamData", native_source)
         self.assertIn("SDL_ClearAudioStream", native_source)
+        self.assertIn('last_error_ = "SDL audio queue is full"', native_source)
+        self.assertNotIn("kQueueWaitLimit", native_source)
+        self.assertNotIn("sleep_for", native_source)
 
     def test_master_volume_scales_pcm_without_changing_system_volume(self) -> None:
         pcm = struct.pack("<hhhh", -32768, -1000, 1000, 32767)

@@ -8,7 +8,7 @@ audio, input, files, timing, threading, and memory.
 > **Work in progress:** this is reverse-engineering research, not a finished
 > source port or a ready-to-play release. The current Phase 7 IA-32 path is
 > deliberately fail-closed when ahead-of-time coverage is incomplete. Expect
-> missing features, guarded stops, correctness bugs, and performance below the
+> missing features, correctness bugs, and performance below the
 > original 60 Hz target.
 
 ## Development snapshots
@@ -25,13 +25,23 @@ from the MIT-licensed source and remain subject to their respective rights.
 
 ## Current status
 
-Updated: August 6, 2026.
+Updated: August 9, 2026.
 
 The current static IA-32 artifact boots from the XBE entry point, renders the
-frontend, accepts controller input, and plays native menu music. Manual testing
-now reaches the Load/Save screen. Creating a new save slot stops at the next
-unverified indirect call, guest address `0x00045141`; that is an intentional AOT
-coverage guard, not a claim of completed save support.
+frontend, accepts controller input, and has manually reached gameplay with
+visible 3D, menu/gameplay music, and corrected SFX attenuation. The retained
+offline boundary audit resolves all 170 remaining guarded boundaries, adds
+none, and pairs the eight complete 20-boundary milestones with eight generated
+IA-32 runtime optimizations. The decoded-store audit also has zero unsupported
+instructions.
+
+The current artifact is
+`ff8db42895b7970b554b9aa9fadaf62e82305e0946ca6f63b55b8ebd577936a4`.
+It fixes a normal-live control-thunk/service-body address collision that made
+the preceding zero-guard artifact open a black window and exit with
+`0xC0000005`. Manual testing confirmed that the replacement renders and
+continues beyond that first-vblank failure. A completed diagnostics-off
+gameplay/performance capture is still required; this is not a 60 FPS claim.
 
 The default `live_test.py` backend remains the diagnostic oracle. The
 work-in-progress static backend must be selected explicitly with
@@ -42,13 +52,13 @@ guest callbacks.
 | Area | Current state |
 | --- | --- |
 | XBE inspection and loader | Exact supported-build identity and deterministic mapping are implemented. |
-| Analysis and decoded block store | Reproducible for the currently observed target and coverage. |
-| Static IA-32 backend | Phase 7 in progress; boot and frontend work, new-save coverage is open at `0x00045141`. |
-| Host ABI and scheduling | Native primary, worker, vblank, filesystem, timing, memory, input, and reached service paths. |
-| Rendering | Vulkan frontend and prior Lesson One milestones render; current static-path gameplay revalidation is pending. |
-| Audio and input | Controller navigation and native menu music are manually confirmed; rumble and broader audio continuity remain open. |
-| Saves | Current static path reaches Load/Save but cannot yet create a new slot. Autosave and save-state support are incomplete. |
-| Performance | Historical measurements exist, but correctness and coverage take priority; no current 60 FPS claim. |
+| Analysis and decoded block store | Complete retained closure: 91,252 decoded records and zero unsupported audited instructions. |
+| Static IA-32 backend | Phase 7 in progress; retained normal-live artifact has zero guarded boundaries and no runtime fallback path. |
+| Host ABI and scheduling | Native primary, worker, vblank, filesystem, timing, memory, input, and 140 registered service paths. |
+| Rendering | Vulkan frontend and gameplay 3D are manually confirmed; the latest first-vblank black-window regression is fixed. |
+| Audio and input | Controller navigation, menu/gameplay music, and corrected gameplay SFX attenuation are manually confirmed; rumble and long-run continuity remain open. |
+| Saves | Load/Save boundary coverage is closed statically; creation, restart/load, overwrite, and autosave still need end-to-end acceptance. |
+| Performance | Eight boundary-budget optimizations are compiled into the backend; a current diagnostics-off 60 FPS measurement is still pending. |
 
 The active correctness evidence and limitations are summarized in
 [docs/VALIDATION.md](docs/VALIDATION.md). The ignored local Phase 7 handoff
