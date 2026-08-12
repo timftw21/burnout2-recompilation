@@ -44,7 +44,10 @@ def _put_library_version(
 
 def _section_digest(data: bytearray, raw_address: int, raw_size: int) -> bytes:
     payload = bytes(data[raw_address : raw_address + raw_size])
-    return hashlib.sha1(struct.pack("<I", raw_size) + payload).digest()
+    return hashlib.sha1(
+        struct.pack("<I", raw_size) + payload,
+        usedforsecurity=False,
+    ).digest()
 
 
 def _put_section(

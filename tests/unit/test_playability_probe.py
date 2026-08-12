@@ -11707,20 +11707,21 @@ class PlayabilityProbeTests(unittest.TestCase):
                 controller_state_path=root / "controller.json",
             )
 
-            self.assertTrue(bridge.publish_render(memory, force=True))
-            first = json.loads(render_path.read_text(encoding="utf-8"))
-            self.assertTrue(bridge.publish_render(memory, force=True))
-            unchanged = json.loads(render_path.read_text(encoding="utf-8"))
-            self.assertEqual(bridge.summary()["render_resource_scan_count"], 1)
-            self.assertEqual(
-                unchanged["resource_stream_generation"],
-                first["resource_stream_generation"],
-            )
-            self.assertTrue(unchanged["resource_snapshots_unchanged"])
+            with patch("tools.playability.playability_probe.time.time_ns", return_value=100):
+                self.assertTrue(bridge.publish_render(memory, force=True))
+                first = json.loads(render_path.read_text(encoding="utf-8"))
+                self.assertTrue(bridge.publish_render(memory, force=True))
+                unchanged = json.loads(render_path.read_text(encoding="utf-8"))
+                self.assertEqual(bridge.summary()["render_resource_scan_count"], 1)
+                self.assertEqual(
+                    unchanged["resource_stream_generation"],
+                    first["resource_stream_generation"],
+                )
+                self.assertTrue(unchanged["resource_snapshots_unchanged"])
 
-            memory.write(source_address, b"\x03\x04")
-            self.assertTrue(bridge.publish_render(memory, force=True))
-            changed = json.loads(render_path.read_text(encoding="utf-8"))
+                memory.write(source_address, b"\x03\x04")
+                self.assertTrue(bridge.publish_render(memory, force=True))
+                changed = json.loads(render_path.read_text(encoding="utf-8"))
 
             summary = bridge.summary()
             self.assertEqual(summary["render_resource_scan_count"], 2)
@@ -11730,6 +11731,7 @@ class PlayabilityProbeTests(unittest.TestCase):
                 changed["resource_stream_generation"],
                 first["resource_stream_generation"],
             )
+            self.assertEqual(changed["resource_stream_generation"], 101)
 
     def test_live_host_bridge_detects_cached_resource_page_changes(self) -> None:
         runtime = XboxRuntimeShims()

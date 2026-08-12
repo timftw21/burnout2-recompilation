@@ -744,10 +744,15 @@ def run_validation_graph(
         if timing_path is not None
         else cache_path.with_name("validation-timings.json")
     )
+    inherited_artifact_root = current_environment.get("B2R_VALIDATION_ARTIFACT_DIR")
     resolved_failure_root = (
         failure_root
         if failure_root is not None
-        else root / "reports" / "local" / "validation" / "failures"
+        else (
+            Path(inherited_artifact_root) / "nested-failures"
+            if inherited_artifact_root
+            else root / "reports" / "local" / "validation" / "failures"
+        )
     )
     pending_artifact_root = (
         resolved_failure_root.parent / "pending" / f"run-{os.getpid()}-{time.time_ns()}"

@@ -47,6 +47,7 @@ temp/
 /Audit.md
 
 # Tool caches
+.venv/
 .cache/
 .mypy_cache/
 .pytest_cache/

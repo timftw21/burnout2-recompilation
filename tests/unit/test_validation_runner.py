@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -243,6 +244,36 @@ class ValidationRunnerTests(unittest.TestCase):
             self.assertIn("input:input.txt", failure["input_hashes"])
             self.assertIn("time.sleep", failure["rerun_command"])
             self.assertTrue((summary.failure_capsule / "rerun.ps1").is_file())
+
+    def test_nested_validation_uses_inherited_artifact_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            inherited = Path(
+                os.environ.get(
+                    "B2R_VALIDATION_ARTIFACT_DIR",
+                    str(root / "outer-artifacts"),
+                )
+            )
+            node = ValidationNode(
+                "failure",
+                (sys.executable, "-c", "raise SystemExit(7)"),
+                "failure",
+            )
+
+            summary = run_validation_graph(
+                {"failure": node},
+                ("failure",),
+                cache_path=root / "cache.json",
+                root=root,
+                no_cache=True,
+                environment={"B2R_VALIDATION_ARTIFACT_DIR": str(inherited)},
+            )
+
+            assert summary.failure_capsule is not None
+            self.assertEqual(
+                summary.failure_capsule.parent,
+                inherited / "nested-failures",
+            )
 
     def test_timing_history_retains_p50_and_p95(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

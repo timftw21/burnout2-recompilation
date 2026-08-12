@@ -11,15 +11,22 @@ then fails closed on an unverified new-save indirect call.
 
 ## Exact native inputs
 
-`tools/native_toolchain.lock.json` pins CMake 4.4.0, Ninja 1.13.0, Clang
-22.1.8 targeting `x86_64-pc-windows-msvc`, Vulkan SDK 1.4.341.1 (header version
-341), and SDL3 3.4.0. It also pins SHA-256 identities for the compiler, shader
+`tools/native_toolchain.lock.json` pins CMake 4.4.2, Ninja 1.13.0, Clang
+22.1.8 targeting `x86_64-pc-windows-msvc`, Vulkan SDK 1.4.357.0 (header version
+357), and SDL3 3.4.14. It also pins SHA-256 identities for the compiler, shader
 compiler, Vulkan/SDL headers, import libraries, and SDL runtime.
 
 Validate the installed build tools alone:
 
 ```powershell
 python .\tools\native_toolchain.py --build-tools-only --pretty
+```
+
+Validate the build tools and compiler required by asset-free AOT/native tests
+without requiring the presenter SDK:
+
+```powershell
+python .\tools\native_toolchain.py --aot-tools-only --pretty
 ```
 
 Validate the complete presenter toolchain selected by `VULKAN_SDK`:

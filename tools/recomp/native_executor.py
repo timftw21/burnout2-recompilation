@@ -19,6 +19,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from tools.compiler_cache import cache_environment, resolve_compiler_cache, write_stats
+from tools.native_toolchain import resolve_clang_cl
 from tools.recomp.debug_metadata import (
     build_module_debug_metadata,
     guest_address_ranges,
@@ -11475,7 +11476,8 @@ class NativeResumableExecutor:
             f"clang-cl-thinlto-aot-targeted-v16-{aot_optimization_mode}-{debug_profile}"
         )
         build_dir.mkdir(parents=True, exist_ok=True)
-        compiler_path = compiler or shutil.which("clang-cl")
+        resolved_compiler = resolve_clang_cl(compiler)
+        compiler_path = str(resolved_compiler) if resolved_compiler is not None else None
         if compiler_path is None:
             raise NativeExecutorError("clang-cl is required to build the native guest loop")
         observer_addresses = {int(address) for address in observer_addresses}

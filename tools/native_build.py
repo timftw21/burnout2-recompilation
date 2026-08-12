@@ -125,7 +125,15 @@ def build_commands(
         raise ValueError("configure_only and build_only are mutually exclusive")
     configure = [str(tools.cmake), "--preset", preset]
     if build_presenter:
-        configure.append("-DB2R_BUILD_PRESENTER=ON")
+        configure.extend(
+            (
+                "-U",
+                "B2R_SDL3_*",
+                "-U",
+                "Vulkan_*",
+                "-DB2R_BUILD_PRESENTER=ON",
+            )
+        )
     if compiler_launcher is not None:
         configure.append(f"-DCMAKE_CXX_COMPILER_LAUNCHER={compiler_launcher}")
     build_directory = Path("build") / "cmake" / preset
@@ -176,11 +184,16 @@ def run_native_build(
         resolve_compiler_cache,
         write_stats,
     )
-    from tools.native_toolchain import toolchain_validation_errors, validate_native_toolchain
+    from tools.native_toolchain import (
+        resolve_clangxx,
+        toolchain_validation_errors,
+        validate_native_toolchain,
+    )
 
     if not skip_toolchain_validation:
         validation = validate_native_toolchain(
             include_build_tools=True,
+            include_compiler=True,
             include_presenter_tools=build_presenter,
         )
         if not validation["passed"]:
@@ -188,7 +201,10 @@ def run_native_build(
             raise NativeBuildError("native toolchain lock rejected: " + "; ".join(errors))
     tools = resolve_native_tools()
     environment = os.environ.copy()
-    pinned_path = os.pathsep.join(str(path) for path in tools.binary_directories)
+    compiler_directory = resolve_clangxx().parent
+    pinned_path = os.pathsep.join(
+        str(path) for path in (compiler_directory, *tools.binary_directories)
+    )
     environment["PATH"] = pinned_path + os.pathsep + environment.get("PATH", "")
     try:
         compiler_launcher = resolve_compiler_cache(compiler_cache)

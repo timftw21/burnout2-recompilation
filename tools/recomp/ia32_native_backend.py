@@ -35,7 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools.native_toolchain import load_toolchain_lock, sha256_file
+from tools.native_toolchain import load_toolchain_lock, resolve_clang_cl, sha256_file
 from tools.loader.xbe_loader import XbeLoaderError, load_xbe_file
 from tools.project_identity import ProjectIdentityError, verify_supported_xbe
 from tools.playability.replay_capsule import (
@@ -16508,12 +16508,8 @@ def _compiler_version(compiler: Path) -> str:
 
 
 def _resolve_compiler(compiler: Path | None) -> Path:
-    if compiler is not None:
-        resolved = compiler.resolve()
-    else:
-        discovered = shutil.which("clang-cl")
-        resolved = Path(discovered).resolve() if discovered else Path()
-    if not resolved.is_file():
+    resolved = resolve_clang_cl(compiler)
+    if resolved is None:
         raise Ia32BackendError("clang-cl is required to build the IA-32 prototype")
     locked_version = str(load_toolchain_lock()["compiler"]["version"])
     observed = _compiler_version(resolved)

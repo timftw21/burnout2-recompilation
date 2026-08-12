@@ -19,6 +19,7 @@ from typing import TypedDict, cast
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LOCK = REPO_ROOT / "tools" / "native_toolchain.lock.json"
 DEFAULT_CLANGXX = Path("C:/Program Files/LLVM/bin/clang++.exe")
+DEFAULT_CLANGCL = DEFAULT_CLANGXX.with_name("clang-cl.exe")
 
 
 class BuildToolLock(TypedDict):
@@ -90,7 +91,7 @@ def _macro_integer(path: Path, name: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _resolve_clangxx(explicit: Path | None) -> Path:
+def resolve_clangxx(explicit: Path | None = None) -> Path:
     if explicit is not None:
         return explicit.resolve()
     configured = os.environ.get("B2R_CLANGXX")
@@ -98,6 +99,31 @@ def _resolve_clangxx(explicit: Path | None) -> Path:
         return Path(configured).resolve()
     discovered = shutil.which("clang++")
     return Path(discovered).resolve() if discovered else DEFAULT_CLANGXX
+
+
+def resolve_clang_cl(explicit: str | Path | None = None) -> Path | None:
+    """Resolve clang-cl consistently with the locked clang++ installation."""
+
+    if explicit is not None:
+        candidate = Path(explicit)
+        if candidate.is_file():
+            return candidate.resolve()
+        discovered = shutil.which(str(explicit))
+        return Path(discovered).resolve() if discovered else None
+    configured = os.environ.get("B2R_CLANGCL")
+    if configured:
+        candidate = Path(configured)
+        return candidate.resolve() if candidate.is_file() else None
+    discovered = shutil.which("clang-cl")
+    if discovered:
+        return Path(discovered).resolve()
+    configured_clangxx = os.environ.get("B2R_CLANGXX")
+    fallback = (
+        Path(configured_clangxx).with_name("clang-cl.exe")
+        if configured_clangxx
+        else DEFAULT_CLANGCL
+    )
+    return fallback.resolve() if fallback.is_file() else None
 
 
 def _resolve_vulkan_sdk(explicit: Path | None, version: str) -> Path:
@@ -115,6 +141,7 @@ def validate_native_toolchain(
     clangxx: Path | None = None,
     vulkan_sdk: Path | None = None,
     include_build_tools: bool = True,
+    include_compiler: bool | None = None,
     include_presenter_tools: bool = True,
 ) -> dict[str, object]:
     lock = load_toolchain_lock(lock_path)
@@ -133,8 +160,11 @@ def validate_native_toolchain(
                 errors.append(f"{package} version {actual!r} != locked {expected!r}")
         observed["python_build_tools"] = build_tools
 
-    if include_presenter_tools:
-        compiler_path = _resolve_clangxx(clangxx)
+    if include_compiler is None:
+        include_compiler = include_presenter_tools
+
+    if include_compiler:
+        compiler_path = resolve_clangxx(clangxx)
         compiler_observed: dict[str, object] = {"path": str(compiler_path)}
         if not compiler_path.is_file():
             errors.append(f"locked compiler is missing: {compiler_path}")
@@ -166,6 +196,7 @@ def validate_native_toolchain(
                 errors.append("clang++ content hash does not match the lock")
         observed["compiler"] = compiler_observed
 
+    if include_presenter_tools:
         expected_sdk = lock["vulkan_sdk"]
         sdk_path = _resolve_vulkan_sdk(vulkan_sdk, expected_sdk["version"])
         sdk_observed: dict[str, object] = {"path": str(sdk_path)}
@@ -234,18 +265,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lock", type=Path, default=DEFAULT_LOCK)
     parser.add_argument("--clangxx", type=Path)
     parser.add_argument("--vulkan-sdk", type=Path)
-    parser.add_argument("--build-tools-only", action="store_true")
-    parser.add_argument("--presenter-tools-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--build-tools-only", action="store_true")
+    mode.add_argument(
+        "--aot-tools-only",
+        action="store_true",
+        help="validate Python build tools and the locked compiler, but not Vulkan/SDL",
+    )
+    mode.add_argument("--presenter-tools-only", action="store_true")
     parser.add_argument("--pretty", action="store_true")
     args = parser.parse_args(argv)
-    if args.build_tools_only and args.presenter_tools_only:
-        parser.error("tool-only modes are mutually exclusive")
     report = validate_native_toolchain(
         lock_path=args.lock,
         clangxx=args.clangxx,
         vulkan_sdk=args.vulkan_sdk,
         include_build_tools=not args.presenter_tools_only,
-        include_presenter_tools=not args.build_tools_only,
+        include_compiler=not args.build_tools_only,
+        include_presenter_tools=(
+            not args.build_tools_only and not args.aot_tools_only
+        ),
     )
     print(json.dumps(report, indent=2 if args.pretty else None, sort_keys=True))
     return 0 if report["passed"] else 1

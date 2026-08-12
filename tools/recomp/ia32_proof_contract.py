@@ -2216,7 +2216,8 @@ def build_asset_free_phase6_fixture(root: Path) -> Phase6ProofFixture:
             mutable_xbe[offset : offset + len(payload)] = payload
     text_payload = bytes(mutable_xbe[0x1000:0x1400])
     mutable_xbe[0x400 + 36 : 0x400 + 56] = hashlib.sha1(
-        struct.pack("<I", len(text_payload)) + text_payload
+        struct.pack("<I", len(text_payload)) + text_payload,
+        usedforsecurity=False,
     ).digest()
     xbe_path = root / "phase6-fixture.xbe"
     xbe_path.write_bytes(mutable_xbe)

@@ -49,6 +49,10 @@ class NativeBuildTests(unittest.TestCase):
                     str(self.tools.cmake),
                     "--preset",
                     "sanitizer",
+                    "-U",
+                    "B2R_SDL3_*",
+                    "-U",
+                    "Vulkan_*",
                     "-DB2R_BUILD_PRESENTER=ON",
                 ],
                 [

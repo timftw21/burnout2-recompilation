@@ -13077,7 +13077,10 @@ class LiveHostBridge:
             )
             if resource_signatures != self.last_render_resource_signatures:
                 resource_snapshot_changed = True
-                self.resource_stream_generation = time.time_ns()
+                self.resource_stream_generation = max(
+                    time.time_ns(),
+                    self.resource_stream_generation + 1,
+                )
                 if self.live_resource_transport is not None:
                     encoded_resources = self._encode_texture_resources_binary(
                         stream["resource_snapshots"]

@@ -5,16 +5,16 @@ description = "Offline analysis, recompilation, validation, and runtime tools fo
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "capstone==5.0.7",
+    "capstone==5.0.9",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "cmake==4.4.0",
+    "cmake==4.4.2",
     "mypy==2.3.0",
     "ninja==1.13.0",
-    "pre-commit==4.6.1",
-    "ruff==0.12.5",
+    "pre-commit==4.6.2",
+    "ruff==0.16.2",
 ]
 
 [tool.ruff]

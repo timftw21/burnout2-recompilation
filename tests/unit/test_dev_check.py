@@ -80,9 +80,15 @@ class DevCheckTests(unittest.TestCase):
 
     def test_all_selects_complete_base_gate(self) -> None:
         selection = select_checks((), all_checks=True)
+        nodes = build_validation_nodes(selection, jobs=2)
 
         self.assertTrue(set(BASE_NODE_NAMES).issubset(selection.nodes))
         self.assertTrue(selection.all_python_tests)
+        self.assertEqual(
+            nodes["aot_representative"].dependencies,
+            ("compileall", "native_toolchain"),
+        )
+        self.assertEqual(nodes["python_tests"].budget_seconds, 300.0)
 
     def test_global_python_configuration_uses_conservative_suite_fanout(self) -> None:
         selection = select_checks(("pyproject.toml",))

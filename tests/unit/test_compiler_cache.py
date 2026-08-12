@@ -20,6 +20,12 @@ from tools.compiler_cache import (
 
 
 class CompilerCacheTests(unittest.TestCase):
+    def test_install_rejects_non_https_archive_url(self) -> None:
+        lock = CompilerCacheLock("1", "test", "file:///tmp/sccache.zip", "0" * 64)
+        with tempfile.TemporaryDirectory() as temp_directory:
+            with self.assertRaisesRegex(CompilerCacheError, "must use HTTPS"):
+                install_pinned_cache(lock=lock, tool_root=Path(temp_directory))
+
     def test_install_verifies_archive_and_extracts_only_the_executable(self) -> None:
         archive = io.BytesIO()
         with zipfile.ZipFile(archive, "w") as bundle:

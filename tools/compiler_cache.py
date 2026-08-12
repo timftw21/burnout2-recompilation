@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -71,6 +72,13 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _validated_archive_url(value: str) -> str:
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise CompilerCacheError("sccache archive URL must use HTTPS")
+    return value
+
+
 def install_pinned_cache(
     *,
     lock: CompilerCacheLock | None = None,
@@ -90,7 +98,11 @@ def install_pinned_cache(
     install_directory.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="b2r-sccache-") as temp_directory:
         archive = Path(temp_directory) / "sccache.zip"
-        urllib.request.urlretrieve(selected.archive_url, archive)
+        # _validated_archive_url restricts this call to HTTPS with a hostname.
+        urllib.request.urlretrieve(  # nosec B310
+            _validated_archive_url(selected.archive_url),
+            archive,
+        )
         actual_digest = _sha256(archive)
         if actual_digest != selected.archive_sha256:
             raise CompilerCacheError(
