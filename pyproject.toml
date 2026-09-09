@@ -10,7 +10,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "cmake==4.4.2",
+    "cmake==4.4.3",
     "mypy==2.3.0",
     "ninja==1.13.0",
     "pre-commit==4.6.2",
