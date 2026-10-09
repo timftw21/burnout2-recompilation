@@ -3,7 +3,7 @@
 An unofficial Windows version of the original Xbox game, focused on fast gameplay
 and preserving its look and feel.
 
-<i>Still in development: menus and the first driving lesson work. The rest of the
+<i>Still in development: menus and driving lessons work. The rest of the
 game is still being tested.</i>
 
 ## Screenshots
