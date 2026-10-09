@@ -23,7 +23,7 @@ focused on speed and simplicity. I couldn't bear to keep the slop version public
 
 ### What works
 
-- Startup, menus and the first driving lesson, including driving, collisions and
+- Startup, menus and many levels, including driving, collisions and
   tested lesson transitions.
 - Background music, menu sounds and in-game sound effects.
 - Creating, saving and loading profiles through the game's Load/Save menu.
@@ -33,8 +33,6 @@ focused on speed and simplicity. I couldn't bear to keep the slop version public
 
 ### What still needs work
 
-- Remaining graphics glitches, including artifacts around car shadows and further
-  checks of reflections against the original game.
 - Testing all modes, tracks and saved-game progression.
 - Checking sound balance and consistently smooth performance across the whole game.
 - Custom control bindings and other settings.
