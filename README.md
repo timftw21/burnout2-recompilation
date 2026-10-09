@@ -3,8 +3,8 @@
 An unofficial Windows version of the original Xbox game, focused on fast gameplay
 and preserving its look and feel.
 
-Still in development: menus and the first driving lesson work. The rest of the
-game is still being tested.
+<i>Still in development: menus and the first driving lesson work. The rest of the
+game is still being tested.</i>
 
 ## Screenshots
 
@@ -17,8 +17,7 @@ game is still being tested.
 
 The original recompilation worked, but its poor performance and growing complexity
 led to a fresh start. Its implementation was replaced with a smaller version
-focused on speed and simplicity. The reverse-engineering knowledge was preserved,
-and the earlier code remains available in Git history.
+focused on speed and simplicity. I couldn't bear to keep the slop version public😅
 
 ## Current status
 
@@ -26,19 +25,19 @@ and the earlier code remains available in Git history.
 
 - Startup, menus and the first driving lesson, including driving, collisions and
   tested lesson transitions.
-- Background music, menu sounds and in-game sound effects.
+- Background music and menu sounds.
 - Gamepad and keyboard input.
 - Saved settings for display, audio and controls, with a selectable refresh rate
   that defaults to 60 Hz.
-- Boost blur.
 
 ### What still needs work
 
 - Remaining graphics glitches, including artifacts around car shadows and further
   checks of reflections against the original game.
 - Testing all modes, tracks and saved-game progression.
+- In-game sound effects.
 - Checking sound balance and consistently smooth performance across the whole game.
-- Custom control bindings.
+- Custom control bindings and other settings.
 
 ## Getting started
 
@@ -72,4 +71,4 @@ Connected gamepads work automatically. Keyboard controls are enabled by default:
 | Start / Pause | Enter |
 | Toggle settings | Esc (or F1) |
 
-This is an independent fan project, unaffiliated with the game's owners.
+<i>This is an independent fan project, unaffiliated with the game's owners.</i>
