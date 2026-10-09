@@ -99,7 +99,8 @@ std::vector<float> decode_audio(AudioFormat format,std::span<const std::byte> da
         decode_adpcm(format,data.data()+block*format.block_align,std::span(result).subspan(block*64*format.channels,64*format.channels));
     return result;
 }
-Audio::Audio(bool output) {
+Audio::Audio(bool output,float gain) {
+    if(!(gain>=0 && gain<=1)) throw std::runtime_error("Output volume must be between zero and one");
     if(!output) return;
     if(!SDL_InitSubSystem(SDL_INIT_AUDIO)) throw std::runtime_error(SDL_GetError());
     const SDL_AudioSpec specification{SDL_AUDIO_F32,2,48000};
@@ -120,12 +121,16 @@ Audio::Audio(bool output) {
             }
         },this);
     if(!stream_) {const std::string error=SDL_GetError();SDL_QuitSubSystem(SDL_INIT_AUDIO);throw std::runtime_error(error);}
-    if(!SDL_ResumeAudioStreamDevice(stream_)) {
+    if(!SDL_SetAudioStreamGain(stream_,gain) || !SDL_ResumeAudioStreamDevice(stream_)) {
         const std::string error=SDL_GetError();SDL_DestroyAudioStream(stream_);stream_=nullptr;
         SDL_QuitSubSystem(SDL_INIT_AUDIO);throw std::runtime_error(error);
     }
 }
 Audio::~Audio(){if(stream_){SDL_DestroyAudioStream(stream_);SDL_QuitSubSystem(SDL_INIT_AUDIO);}}
+void Audio::output_gain(float gain) {
+    if(!(gain>=0 && gain<=1)) throw std::runtime_error("Output volume must be between zero and one");
+    if(stream_ && !SDL_SetAudioStreamGain(stream_,gain)) throw std::runtime_error(SDL_GetError());
+}
 Audio::Voice& Audio::voice(std::uint32_t id) {
     if(failed_) throw std::runtime_error(failure_.data());
     if(!id || id>voices_.size() || !voices_[id-1].used) throw std::runtime_error("Invalid native audio voice");

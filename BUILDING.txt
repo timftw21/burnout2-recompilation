@@ -137,15 +137,18 @@ Vertex uploads can retain original interleaved streams, packed colors/normals,
 shorts, bytes, float2H and current attributes instead of expanding every vertex.
 Offscreen targets, including RGB565/Z16, can be copied and sampled on the GPU.
 Texture bindings reuse matching rendered surfaces instead of stale RAM images.
+GPU-produced cubemaps reuse six copied faces and refresh after producer writes.
+XRGB bindings supply opaque alpha before alpha kill, including rendered textures.
 Surface clips retain their framebuffer storage; growth preserves color, depth
 and stencil on the GPU.
 Prepare resources before submission. Readback is an explicit offline operation.
 The native tool retains its shader compiler for standalone component diagnostics.
 For shader-bank research, use b2-tool compile-shaders XBE OUTPUT.cpp --replace.
 
-The component suite passed 145 cases on RTX 5060 Ti and WARP with no D3D11
+The component suite passed 150 cases on RTX 5060 Ti and WARP with no D3D11
 warnings, including relocated vertex programs, unused instruction slots and
-mapped alpha output. Components do not establish scene parity or game FPS. Remaining graphics
+mapped alpha output, linear surface coordinates, XRGB/ARGB alpha kill and
+GPU cubemap face updates. Components do not establish scene parity or game FPS. Remaining graphics
 work includes fixed lighting, other dependent texture modes and scene verification.
 Fixed transforms support all seven skin modes, transformed/normalized normals,
 texture matrices, object/eye/normal/reflection/sphere texture generation and five
@@ -164,8 +167,19 @@ textures. Compare aligned original Xbox video screenshots; record source,
 timestamp and viewpoint. Asset rendering alone is not frame parity.
 
 SDL3 input supports Xbox gamepads and keyboard controls; 47 offline checks passed.
-The executable opens an SDL3 window with persistent Dear ImGui settings for files,
-V-sync, fullscreen and keyboard controls. F1 opens settings during gameplay.
+The executable opens an SDL3 window with persistent Dear ImGui settings in General,
+Audio, Graphics and Controls tabs. Esc toggles settings; F1 remains an alias.
+General selects the presentation limit, defaulting to 60 Hz independently of the
+monitor. Absolute SDL3 deadlines cap frames with or without V-sync; stalls and
+rate changes reset the schedule. The original Xbox video clock remains 60 Hz.
+Audio controls master volume and mute through SDL3's output gain; Graphics has
+V-sync and fullscreen, and Controls has keyboard input and a key reference.
+Settings are saved in data/local/settings.cfg. Hidden window diagnostics use
+defaults and check all four tabs, Esc and 60/120 Hz pacing without booting.
+F8, or Capture frame in Graphics, records the next complete GPU frame under
+build/captures. It exports target images and streaming draws.jsonl records with
+the original registers, shader tokens, constants and bounded vertex prefixes.
+Captures are opt-in, bounded to 1024 draws/32 MiB, and report truncation explicitly.
 Live execution reaches the original Press START, Load/Save and Single Player menus
 and the first driving lesson.
 Original sound-device creation now opens SDL3 audio. Boot uploads and replaces

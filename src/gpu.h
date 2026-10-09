@@ -17,6 +17,7 @@ public:
     bool busy();
     void wait();
     void snapshot();
+    void capture_frame(const std::filesystem::path& directory);
     GpuStats stats() const;
     std::function<void()> flip;
 private:

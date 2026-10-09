@@ -59,6 +59,8 @@ public:
     Xbox& operator=(const Xbox&)=delete;
     BootResult run(std::uint32_t visit_budget,std::uint32_t break_address=0,std::uint32_t break_hit=1);
     bool save_frame(const std::filesystem::path&);
+    void output_gain(float);
+    void capture_frame(const std::filesystem::path& directory);
 private:
     friend void native_platform(Cpu&,Memory&,std::uint32_t);
     struct State;

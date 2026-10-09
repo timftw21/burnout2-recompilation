@@ -115,6 +115,7 @@ struct Xbox::State {
     unsigned pending_io_count=0;
     std::unique_ptr<Input> owned_input;
     std::unique_ptr<Audio> audio;
+    float output_gain=1;
     std::unique_ptr<Spatial> audio_spatial;
     struct AudioBuffer {
         std::uint32_t raw,descriptor,voice,identifier,references=1;AudioFormat format;
@@ -783,7 +784,7 @@ struct Xbox::State {
         if(address==0x0022FC18) {
             if(argument(cpu,0) || argument(cpu,2)) throw NativeBoundary(address,"non-default audio device or aggregation is unsupported");
             if(!audio) {
-                audio=std::make_unique<Audio>();
+                audio=std::make_unique<Audio>(true,output_gain);
                 // RenderWare 211634 reads the real 48 kHz processing counter.
                 // Preserve its original wraparound/time conversion, with native
                 // output progress rather than a fabricated hardware timestamp.
@@ -2126,6 +2127,15 @@ struct Xbox::State {
 };
 Xbox::Xbox(Xbe& image,Memory& memory,std::span<std::byte> ram,const std::filesystem::path& disc,XboxHost host):state_(std::make_unique<State>(image,memory,ram,disc,std::move(host))) {}
 Xbox::~Xbox()=default;
+void Xbox::output_gain(float gain) {
+    if(!(gain>=0 && gain<=1)) throw std::runtime_error("Output volume must be between zero and one");
+    if(state_->audio) state_->audio->output_gain(gain);
+    state_->output_gain=gain;
+}
+void Xbox::capture_frame(const std::filesystem::path& directory) {
+    if(!state_->gpu) throw std::runtime_error("The game has not initialized graphics yet");
+    state_->gpu->capture_frame(directory);
+}
 BootResult Xbox::run(std::uint32_t budget,std::uint32_t break_address,std::uint32_t break_hit) {
     if(break_address && !break_hit) throw std::runtime_error("A diagnostic breakpoint requires a positive hit count");
     return state_->run(budget,break_address,break_hit);

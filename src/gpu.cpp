@@ -6,6 +6,7 @@
 #include <chrono>
 #include <deque>
 #include <map>
+#include <sstream>
 #include <tuple>
 
 namespace b2 {
@@ -41,13 +42,21 @@ struct Gpu::Impl {
     };
     std::vector<Draw> draws;
     unsigned draw_count=0;
-    struct Surface {std::uint32_t identifier,width,height;};
+    struct Surface {std::uint32_t identifier,width,height;std::uint64_t revision=0;};
+    Surface* active_surface=nullptr;
+    std::uint64_t surface_revision=0;
     std::map<std::array<std::uint32_t,4>,Surface> targets;
     std::map<std::array<std::uint32_t,5>,std::uint32_t> textures;
+    struct Cubemap {std::uint32_t identifier;std::array<std::uint64_t,6> revisions;};
+    std::map<std::array<std::uint32_t,5>,Cubemap> cubemaps;
     struct Fence {ComPtr<ID3D11Query> query;std::uint32_t address=0,value=0;};
     std::array<Fence,64> fences;
     unsigned fence_head=0,fence_count=0;
     GpuStats statistics;
+    std::filesystem::path capture_requested,capture_directory;
+    std::ostringstream capture_trace;
+    unsigned capture_draws=0;
+    bool capture_truncated=false;
     Impl(Renderer& r,Memory& m,Gpu& o,std::uint32_t base):renderer(r),memory(m),owner(o),semaphore_base(base) {
         for(auto& attribute:current.attributes) attribute={0,0,0,1};
         current.attributes[3]={1,1,1,1};draws.resize(256);indices.reserve(4096);inline_words.reserve(4096);
@@ -92,6 +101,7 @@ struct Gpu::Impl {
             renderer.grow_target(surface.identifier,w,h);surface.width=w;surface.height=h;
         }
         if(target!=found->second.identifier) {flush();target=found->second.identifier;renderer.set_target(target);}
+        active_surface=&found->second;
     }
     std::uint32_t texture(unsigned stage,ProgramView& view) {
         const auto method=0x1B00+stage*0x40,format=reg(method+4),image=reg(method+0x1C),pitch=reg(method+0x10)>>16;
@@ -103,14 +113,21 @@ struct Gpu::Impl {
         if(!width || !height || width>4096 || height>4096 || !mips || depth>2048)
             throw std::runtime_error("Invalid NV097 texture dimensions");
         const bool cube=(format&4)!=0;
+        const auto address=reg(method)&0x0FFFFFFF;
+        const std::array key{address,format,image,pitch,reg(method+0x20)};
+        if(linear) view.texture_scales[stage]={1.0f/width,1.0f/height,1.0f/depth,1};
         // Sampling a GPU-produced surface must see its current GPU contents,
         // rather than the original RAM allocation used for ordinary textures.
-        if(!cube && depth==1 && mips==1) for(const auto& [key,surface]:targets) {
-            const auto surface_format=key[2],surface_color=surface_format&15,surface_type=(surface_format>>8)&15;
-            const bool matching_color=surface_color==3?code==5:(code==6 || code==7 || code==0x12 || code==0x1E);
-            if(key[0]==(reg(method)&0x0FFFFFFF) && surface.width==width && surface.height==height && matching_color &&
-                ((surface_type==1)==linear) && (!linear || (key[3]&0xFFFF)==pitch)) return surface.identifier;
-        }
+        const auto surface_at=[&](std::uint32_t offset)->Surface* {
+            for(auto& [surface_key,surface]:targets) {
+                const auto surface_format=surface_key[2],surface_color=surface_format&15,surface_type=(surface_format>>8)&15;
+                const bool matching_color=surface_color==3?code==5:(code==6 || code==7 || code==0x12 || code==0x1E);
+                if(surface_key[0]==offset && surface.width==width && surface.height==height && matching_color &&
+                    ((surface_type==1)==linear) && (!linear || (surface_key[3]&0xFFFF)==pitch)) return &surface;
+            }
+            return nullptr;
+        };
+        if(!cube && depth==1 && mips==1) if(const auto surface=surface_at(address)) return surface->identifier;
         unsigned bpp=0,block=0;
         switch(code) {case 5:bpp=2;break;case 6:case 7:case 0x12:case 0x1E:bpp=4;break;
             case 0xC:block=8;break;case 0xE:case 0xF:block=16;break;
@@ -120,15 +137,39 @@ struct Gpu::Impl {
             const auto w=std::max(1U,width>>level),h=std::max(1U,height>>level),d=std::max(1U,depth>>level);
             size+=(block?std::uint64_t((w+3)/4)*((h+3)/4)*block:std::uint64_t(linear?pitch:w*bpp)*h)*d;
         }
-        if(cube) size*=6;
+        if(cube) {
+            const auto face_stride=(size+127)&~std::uint64_t(127);
+            if(depth==1 && mips==1) {
+                std::array<std::uint32_t,6> faces{};
+                std::array<std::uint64_t,6> revisions{};
+                unsigned matched=0;
+                for(unsigned face=0;face<faces.size();++face) {
+                    const auto offset=std::uint64_t(address)+face*face_stride;
+                    if(offset>UINT32_MAX) throw std::runtime_error("Cubemap address exceeds memory");
+                    if(const auto surface=surface_at(static_cast<std::uint32_t>(offset))) {
+                        faces[face]=surface->identifier;revisions[face]=surface->revision;++matched;
+                    }
+                }
+                if(matched && matched!=faces.size()) throw std::runtime_error("Partially GPU-produced cubemap is unsupported");
+                if(matched) {
+                    auto found=cubemaps.find(key);
+                    if(found==cubemaps.end() || found->second.revisions!=revisions) {
+                        // Execute pending producers before copying their faces;
+                        // subsequent car draws reuse this snapshot until a write.
+                        flush();
+                        const auto identifier=renderer.copy_cubemap(faces,found==cubemaps.end()?0:found->second.identifier);
+                        found=cubemaps.insert_or_assign(key,Cubemap{identifier,revisions}).first;
+                    }
+                    return found->second.identifier;
+                }
+            }
+            size=face_stride*6;
+        }
         if(!size || size>64*1024*1024) throw std::runtime_error("NV097 texture payload exceeds its bound");
-        const auto address=reg(method)&0x0FFFFFFF;
-        const std::array key{address,format,image,pitch,reg(method+0x20)};
         auto found=textures.find(key);
         if(found==textures.end()) found=textures.emplace(key,renderer.upload({width,height,static_cast<TextureFormat>(code),
             Bytes(static_cast<const std::byte*>(memory.access(address,static_cast<std::size_t>(size))),static_cast<std::size_t>(size)),
             mips,linear?pitch:0,cube,depth})).first;
-        if(linear) view.texture_scales[stage]={1.0f/width,1.0f/height,1.0f/depth,1};
         return found->second;
     }
     RenderState state(ProgramView& view) {
@@ -160,6 +201,8 @@ struct Gpu::Impl {
             s.texture_clip[i]=(reg(0x17F8)>>(i*4))&15;s.texture_address[i]=reg(method+8);
             const auto filter=reg(method+0x14);
             s.linear_filter[i]=((filter>>24)&15)==2;s.alpha_kill[i]=(reg(method+12)&4)!=0;
+            const auto code=(reg(method+4)>>8)&255;
+            s.texture_opaque[i]=code==7 || code==0x1E;
             if((reg(method+12)&0x40000000U) && s.texture_modes[i]) s.textures[i]=texture(i,view);
         }
         return s;
@@ -167,11 +210,13 @@ struct Gpu::Impl {
     void draw(std::uint32_t first,std::uint32_t count,std::span<const std::uint32_t> elements={},bool inlined=false) {
         if(!primitive || !count || count>32768 || first>0xFFFFFF-count) throw std::runtime_error("Invalid NV097 draw range");
         select_target();
-        auto& draw=draws[draw_count];draw.stream_count=0;draw.view={};draw.packed.clear();
+        ProgramView view{};
+        const auto render_state=state(view); // Resolving feedback can flush pending draws.
+        auto& draw=draws[draw_count];draw.stream_count=0;draw.view=view;draw.packed.clear();
         draw.current=current;draw.constants=constants;draw.count=count;
         draw.view.depth_scale=constants[58][2];
         if(draw.view.depth_scale<=0) throw std::runtime_error("NV097 viewport depth scale was not initialized");
-        draw.state=state(draw.view);
+        draw.state=render_state;
         const auto mode=reg(0x1E94)&3;
         std::uint32_t shader;
         if(mode==2) shader=renderer.prepare_program(program);
@@ -215,8 +260,47 @@ struct Gpu::Impl {
             draw.streams[stream]={Bytes(static_cast<const std::byte*>(memory.access(static_cast<std::uint32_t>(address),static_cast<std::size_t>(size))),static_cast<std::size_t>(size)),strides[stream]};
         }
         draw.layout=renderer.prepare_layout(shader,layout);renderer.prepare(draw.state);
+        if(!capture_directory.empty()) capture_draw(first,draw,shader);
         draw.indices.assign(elements.begin(),elements.end());
+        if(draw.state.color_mask) active_surface->revision=++surface_revision;
         if(++draw_count==draws.size()) flush();
+    }
+    void capture_draw(std::uint32_t first,const Draw& draw,std::uint32_t shader) {
+        if(capture_trace.tellp()>32*1024*1024 || capture_draws==1024) {capture_truncated=true;return;}
+        capture_trace<<std::format("{{\"type\":\"draw\",\"draw\":{},\"first\":{},\"count\":{},\"target\":{},\"shader\":{},\"program_start\":{},\"registers\":{},\"program\":{},\"constants\":{},\"current\":{},\"textures\":[",
+            capture_draws++,first,draw.count,target,shader,program.start,json(hex_bytes(std::as_bytes(std::span(registers[0])))),
+            json(hex_bytes(std::as_bytes(std::span(program.tokens)))),json(hex_bytes(std::as_bytes(std::span(constants)))),
+            json(hex_bytes(std::as_bytes(std::span(current.attributes)))));
+        for(unsigned i=0;i<4;++i) {
+            if(i) capture_trace<<',';const auto& scale=draw.view.texture_scales[i];
+            capture_trace<<std::format("{{\"resource\":{},\"scale\":[{},{},{},{}]}}",draw.state.textures[i],scale[0],scale[1],scale[2],scale[3]);
+        }
+        capture_trace<<"],\"streams\":[";
+        for(unsigned i=0;i<draw.stream_count;++i) {
+            if(i) capture_trace<<',';const auto& stream=draw.streams[i];
+            capture_trace<<std::format("{{\"stride\":{},\"size\":{},\"prefix\":{}}}",stream.stride,stream.bytes.size(),json(hex_bytes(stream.bytes.first(std::min<std::size_t>(128,stream.bytes.size())))));
+        }
+        capture_trace<<"]}\n";
+    }
+    void capture_flip() {
+        if(!capture_directory.empty()) {
+            save_png(renderer.read_target(0),capture_directory/"frame.png");
+            for(const auto& [key,surface]:targets) {
+                const auto name=std::format("target-{}-{:08X}.png",surface.identifier,key[0]);
+                save_png(renderer.read_target(surface.identifier),capture_directory/name);
+                capture_trace<<std::format("{{\"type\":\"surface\",\"resource\":{},\"color\":{},\"depth\":{},\"format\":{},\"pitch\":{},\"width\":{},\"height\":{},\"image\":{}}}\n",
+                    surface.identifier,json(hex32(key[0])),json(hex32(key[1])),json(hex32(key[2])),json(hex32(key[3])),surface.width,surface.height,json(name));
+            }
+            capture_trace<<std::format("{{\"type\":\"end\",\"draws\":{},\"truncated\":{}}}\n",capture_draws,capture_truncated);
+            write_text(capture_directory/"draws.jsonl",capture_trace.view(),false);
+            capture_directory.clear();capture_trace=std::ostringstream{};
+        }
+        if(!capture_requested.empty()) {
+            capture_directory=std::move(capture_requested);capture_requested.clear();
+            std::filesystem::create_directories(capture_directory);
+            capture_draws=0;capture_truncated=false;
+            capture_trace<<"{\"type\":\"header\",\"format\":\"b2-gpu-frame-v1\",\"game_inputs_automated\":false}\n";
+        }
     }
     void fence(std::uint32_t address,std::uint32_t value) {
         flush();if(fence_count==fences.size()) poll(true);
@@ -315,17 +399,23 @@ struct Gpu::Impl {
                 std::int32_t((h>>16)+1),std::int32_t((v>>16)+1)};
             const auto value=reg(0x1D8C),zeta=(reg(0x208)>>4)&15;
             renderer.clear_buffers(data,reg(0x1D90),zeta==1?float(value&0xFFFF)/65535:float(value>>8)/16777215,static_cast<std::uint8_t>(value),rectangle);
+            if(data&0xF0) active_surface->revision=++surface_revision;
             ++statistics.clears;
         } else if(method==0x1D70) {
             if(reg(0x1A4)!=8 || reg(0x1D6C)>92) throw std::runtime_error("Unbound NV097 semaphore DMA range");
             fence(semaphore_base+reg(0x1D6C),data);
         } else if(method==0x110) {flush();fence(0,0);poll(true);}
-        else if(method==0x12C) {flush();select_target();renderer.copy_to_main();target=0;++statistics.flips;if(owner.flip) owner.flip();}
+        else if(method==0x12C) {flush();select_target();renderer.copy_to_main();target=0;active_surface=nullptr;++statistics.flips;capture_flip();if(owner.flip) owner.flip();}
         if(indices.size()>32768 || inline_words.size()>2*1024*1024) throw std::runtime_error("NV097 inline draw exceeds its bound");
     }
 };
 Gpu::Gpu(Renderer& renderer,Memory& memory,std::uint32_t semaphore_base):impl_(std::make_unique<Impl>(renderer,memory,*this,semaphore_base)) {}
 Gpu::~Gpu()=default;
+void Gpu::capture_frame(const std::filesystem::path& directory) {
+    if(directory.empty() || !impl_->capture_requested.empty() || !impl_->capture_directory.empty())
+        throw std::runtime_error("A frame capture is already pending");
+    impl_->capture_requested=directory;
+}
 void Gpu::submit(std::uint32_t begin,std::uint32_t end) {
     auto& g=*impl_;
     if(end<begin || ((end-begin)&3) || end-begin>4*1024*1024) throw std::runtime_error("Invalid native GPU submission range");

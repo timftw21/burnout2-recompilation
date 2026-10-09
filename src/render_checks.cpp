@@ -237,7 +237,7 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
     });
     std::vector<std::byte> cube;
     constexpr std::uint32_t face_colors[]={0xFFFF0000,0xFF00FF00,0xFF0000FF,0xFFFFFF00,0xFFFF00FF,0xFF00FFFF};
-    for(const auto value:face_colors) {const auto face=solid(4,4,value);cube.insert(cube.end(),face.begin(),face.end());}
+    for(const auto value:face_colors) {const auto face=solid(4,4,value);cube.insert(cube.end(),face.begin(),face.end());cube.resize(cube.size()+64);}
     auto cube_state=textured(renderer.upload({4,4,TextureFormat::argb8,cube,1,0,true})); cube_state.texture_modes[0]=3;
     auto cube_vertices=white; for(auto& vertex:cube_vertices) vertex.uv[0]={1,0,0,1};
     run("cubemap-positive-x",cube_state,cube_vertices,red_pixel);
@@ -303,6 +303,12 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
         renderer.set_target(source_target);renderer.clear(0xFF00FF00);renderer.set_target();renderer.draw(copied_state,white);
     });
     run("render-target-content-update",textured(source_target),white,[](const Image& image) {expect(image,32,32,{0,255,0,255});});
+    auto opaque_feedback=colored();opaque_feedback.textures[0]=source_target;opaque_feedback.texture_modes[0]=1;
+    opaque_feedback.texture_opaque[0]=opaque_feedback.alpha_kill[0]=true;opaque_feedback.final_inputs={8,0x1800};
+    run("xrgb-feedback-alpha-kill-combiner",opaque_feedback,white,red_pixel,{}, {},[&] {
+        renderer.set_target(source_target);renderer.clear(0x00FF0000);
+        renderer.set_target();renderer.draw(opaque_feedback,white);
+    });
 
     const auto growth_check=[&](bool stencil,bool rgb565=false) {
         const std::string name=rgb565?"render-target-growth-rgb565-z16":stencil?"render-target-growth-stencil":"render-target-growth-depth-color";
@@ -537,21 +543,24 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
     launch_check("vertex-paired-register-ownership",paired,{0.5f,1,2,3});
 
     const auto gpu_check=[&](std::string_view name,bool indexed,bool shifted,bool programmable,bool inlined=false,bool skinned=false,bool generated_texture=false,bool surface_clip=false,
-                             bool target_sample=false,bool rgb565=false,bool unfinished=false) {
+                         bool target_sample=false,bool rgb565=false,bool unfinished=false,bool linear_sample=false,
+                         TextureFormat feedback_format=TextureFormat::argb8_linear) {
         if(total++) report+=',';
         std::string error;GpuStats statistics{};
         const auto image_path=directory/(std::string(name)+".png");
         try {
             Renderer native(64,64,warp,debug);
             std::vector<std::byte> ram(65536);Memory memory(0,ram);Gpu gpu(native,memory,60000);
+            const bool alpha_feedback=feedback_format==TextureFormat::argb8 || feedback_format==TextureFormat::xrgb8;
             std::vector<std::uint32_t> words;
             const auto packet=[&](std::uint32_t method,std::initializer_list<std::uint32_t> values,bool nonincreasing=false) {
                 words.push_back(method|(static_cast<std::uint32_t>(values.size())<<18)|(nonincreasing?0x40000000U:0));
                 words.insert(words.end(),values);
             };
             packet(0,{0xD});packet(0x1A4,{8});packet(0x1D6C,{0});
-            packet(0x200,{64U<<16,64U<<16,rgb565?0x06060213U:0x128U,rgb565?0x00800080U:0x01000100U,0x20000,0x30000});
-            packet(0x1D98,{63U<<16,63U<<16});packet(0x1D8C,{0xFFFFFF00,0xFF0000FF});packet(0x1D94,{0xF3});
+            packet(0x200,{64U<<16,64U<<16,rgb565?0x06060213U:alpha_feedback?0x06060228U:0x128U,
+                rgb565?0x00800080U:0x01000100U,0x20000,0x30000});
+            packet(0x1D98,{63U<<16,63U<<16});packet(0x1D8C,{0xFFFFFF00,alpha_feedback?0x000000FFU:0xFF0000FFU});packet(0x1D94,{0xF3});
             if(surface_clip) packet(0x200,{(32U<<16)|16U,(32U<<16)|16U});
             packet(0x29C,{0x0804});packet(0x33C,{0x207,0,1,0});packet(0x350,{0x8006,0x203,0x01010101,0,255,0x207,0,255,0x1E00,0x1E00,0x1E00});
             packet(0x39C,{0x405,0x901});packet(0x288,{0x00000004,0x00001400});
@@ -574,7 +583,7 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
             const auto payload=programmable?Bytes(std::as_bytes(std::span(screen_positions))):Bytes(std::as_bytes(std::span(positions).subspan(shifted?0:1)));
             std::memcpy(memory.access(4096,payload.size()),payload.data(),payload.size());
             packet(0x1720,{4096});packet(0x1760,{0x1042});
-            packet(0x1A30,{0x3F800000,0,0,0x3F800000});
+            packet(0x1A30,{0x3F800000,0,0,alpha_feedback?0U:0x3F800000U});
             if(programmable) {
                 packet(0x1E94,{2});packet(0x1E9C,{0});
                 words.push_back(0xB00|(8U<<18));
@@ -589,12 +598,30 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
             } else if(indexed) packet(0x1800,{0x00010000,0x00030002},true);
             else packet(0x1810,{0x03000000|first});
             packet(0x17FC,{0});
+            if(linear_sample) {
+                // A nonuniform GPU image sampled with pixel coordinates catches
+                // missing linear-texture normalization; a solid image cannot.
+                packet(0x1D98,{31U<<16,63U<<16});packet(0x1D90,{0xFF00FF00});packet(0x1D94,{0xF0});
+                packet(0x1D98,{63U<<16,63U<<16});
+                constexpr std::array<Float4,4> coordinates{{{0,0,0,1},{64,0,0,1},{64,64,0,1},{0,64,0,1}}};
+                std::memcpy(memory.access(8192,sizeof(coordinates)),coordinates.data(),sizeof(coordinates));
+                packet(0x1744,{8192});packet(0x1784,{0x1042});
+                gpu.capture_frame(directory/(std::string(name)+"-capture"));packet(0x12C,{0});
+            }
             if(target_sample) {
                 packet(0x200,{64U<<16,64U<<16,0x128,0x01000100,0x40000,0x50000});
                 packet(0x1D94,{0xF0});
-                packet(0x1B00,{0x20000,rgb565?0x06610520U:0x00011220U,0x030303,0x40000000});
+                const auto format=rgb565?0x06610520U:alpha_feedback?0x06610020U|(static_cast<unsigned>(feedback_format)<<8):0x00011220U;
+                packet(0x1B00,{0x20000,format,0x030303,alpha_feedback?0x40000004U:0x40000000U});
                 packet(0x1B10,{(rgb565?128U:256U)<<16,0x01010000});packet(0x1B1C,{(64U<<16)|64U});
                 packet(0x1E70,{1});packet(0x288,{0x00000008,0x00001800});
+                if(alpha_feedback) {
+                    // RGB-only target writes leave stored alpha zero. XRGB
+                    // sampling must supply one before the game's alpha kill.
+                    packet(0x1A30,{0x3F800000,0x3F800000,0x3F800000,0x3F800000});
+                    packet(0x1E60,{1});packet(0xAC0,{0x04080000});packet(0x260,{0x14180000});
+                    packet(0x1E40,{0xC00});packet(0xAA0,{0xC00});packet(0x288,{0xC,0x1C80});
+                }
                 packet(0x17FC,{8});packet(0x1810,{0x03000000});packet(0x17FC,{0});
             }
             packet(0x1D70,{123});
@@ -609,11 +636,20 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
             gpu.submit(0,static_cast<std::uint32_t>(bytes.size()));gpu.wait();gpu.snapshot();
             if(memory.load<std::uint32_t>(60000)!=123) throw std::runtime_error("GPU semaphore completed without publishing its value");
             statistics=gpu.stats();
-            if(statistics.draws!=(target_sample?2U:1U) || statistics.vertices!=(target_sample?8U:4U) || statistics.clears!=(target_sample?2U:1U)+(unfinished?1U:0U))
+            if(statistics.draws!=(target_sample?2U:1U) || statistics.vertices!=(target_sample?8U:4U) || statistics.clears!=(target_sample?2U:1U)+(unfinished?1U:0U)+(linear_sample?1U:0U))
                 throw std::runtime_error("GPU packet draw/clear counts differ");
-            if(statistics.flips!=2) throw std::runtime_error("Repeated GPU flips were not presented");
+            if(statistics.flips!=2+(linear_sample?1U:0U)) throw std::runtime_error("Repeated GPU flips were not presented");
             const auto image=native.readback();save_png(image,image_path);
             if(surface_clip) {expect(image,32,32,{255,0,0,255});expect(image,3,3,{0,0,255,255});expect(image,52,52,{0,0,255,255});}
+            else if(linear_sample) {
+                expect(image,8,32,{0,255,0,255});expect(image,55,32,{255,0,0,255});
+                const auto capture=directory/(std::string(name)+"-capture");File trace(capture/"draws.jsonl");
+                if(trace.size()>1024*1024) throw std::runtime_error("Small GPU capture exceeded its bound");
+                const auto trace_bytes=trace.read(0,static_cast<std::size_t>(trace.size()));
+                const std::string_view text(reinterpret_cast<const char*>(trace_bytes.data()),trace_bytes.size());
+                if(text.find("\"type\":\"draw\"")==text.npos || text.find("\"truncated\":false")==text.npos || !std::filesystem::exists(capture/"frame.png"))
+                    throw std::runtime_error("GPU frame capture omitted its draw or image");
+            } else if(feedback_format==TextureFormat::argb8) expect(image,32,32,{0,0,255,0});
             else red_pixel(image);
             if(!native.errors().empty()) throw std::runtime_error("GPU packet replay produced D3D11 validation messages");
             ++passed;
@@ -633,6 +669,74 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
     gpu_check("gpu-packets-rgb565-z16",false,false,false,false,false,false,false,false,true);
     gpu_check("gpu-packets-render-target-sampling",false,false,false,false,false,false,false,true);
     gpu_check("gpu-packets-rgb565-target-sampling",false,false,false,false,false,false,false,true,true);
+    gpu_check("gpu-packets-linear-target-coordinates",false,false,false,false,false,false,false,true,false,false,true);
+    gpu_check("gpu-packets-xrgb-feedback-alpha-kill",false,false,false,false,false,false,false,true,false,false,false,TextureFormat::xrgb8);
+    gpu_check("gpu-packets-argb-feedback-alpha-kill",false,false,false,false,false,false,false,true,false,false,false,TextureFormat::argb8);
+
+    if(total++) report+=',';
+    std::string cubemap_error;
+    const auto cubemap_image=directory/"gpu-packets-reflection-cubemap.png";
+    try {
+        Renderer native(64,64,warp,debug);
+        std::vector<std::byte> ram(65536);Memory memory(0,ram);Gpu gpu(native,memory,60000);
+        std::vector<std::uint32_t> words;
+        const auto packet=[&](std::uint32_t method,std::initializer_list<std::uint32_t> values) {
+            words.push_back(method|(static_cast<std::uint32_t>(values.size())<<18));words.insert(words.end(),values);
+        };
+        const auto submit=[&] {
+            const auto bytes=std::as_bytes(std::span(words));std::memcpy(memory.access(0,bytes.size()),bytes.data(),bytes.size());
+            gpu.submit(0,static_cast<std::uint32_t>(bytes.size()));gpu.wait();words.clear();
+        };
+        packet(0,{0xD});packet(0x1D98,{63U<<16,63U<<16});
+        for(unsigned face=0;face<6;++face) {
+            packet(0x200,{64U<<16,64U<<16,0x06060213,0x00800080,0x20000+face*8192,0});
+            packet(0x1D90,{face_colors[face]});packet(0x1D94,{0xF0});
+        }
+        packet(0x200,{64U<<16,64U<<16,0x128,0x01000100,0x40000,0x50000});
+        packet(0x1D90,{0xFF000000});packet(0x1D94,{0xF0});
+        packet(0x33C,{0x207,0,1,0});
+        packet(0x350,{0x8006,0x203,0x01010101,0,255,0x207,0,255,0x1E00,0x1E00,0x1E00});
+        packet(0x288,{8,0x1800});packet(0x1E70,{3});
+        for(unsigned stage=0;stage<4;++stage) packet(0x1B08+stage*0x40,{0x030303});
+        packet(0x1B00,{0x20000,0x06610524,0x030303,0x40000000});packet(0x1B14,{0x01010000});
+        packet(0xAF0,{0x3F800000,0x3F800000,0x3F800000,0});packet(0xA20,{0x42000000,0x42000000,0,0});
+        packet(0x680,{0x42000000,0,0,0,0,0xC2000000,0,0,0,0,0x3F800000,0,0,0,0,0x3F800000});
+        constexpr std::array<Float4,4> positions{{{-1,1,0.5f,1},{1,1,0.5f,1},{1,-1,0.5f,1},{-1,-1,0.5f,1}}};
+        std::memcpy(memory.access(4096,sizeof(positions)),positions.data(),sizeof(positions));
+        packet(0x1720,{4096});packet(0x1760,{0x1042});
+        // A queued scene draw must survive the flush required by the first
+        // cubemap copy, just as the game's road draws precede its car.
+        packet(0x288,{4,0x1400});packet(0x1E70,{0});
+        packet(0x17FC,{8});packet(0x1810,{0x03000000});packet(0x17FC,{0});
+        packet(0x288,{8,0x1800});packet(0x1E70,{3});
+        constexpr std::array<Float4,6> directions{{{1,0,0,1},{-1,0,0,1},{0,1,0,1},{0,-1,0,1},{0,0,1,1},{0,0,-1,1}}};
+        const auto sample_face=[&](unsigned face) {
+            packet(0x200,{(10U<<16)|face*10U,64U<<16});
+            const auto& face_direction=directions[face];
+            packet(0x1A90,{std::bit_cast<std::uint32_t>(face_direction[0]),std::bit_cast<std::uint32_t>(face_direction[1]),
+                std::bit_cast<std::uint32_t>(face_direction[2]),std::bit_cast<std::uint32_t>(face_direction[3])});
+            packet(0x17FC,{8});packet(0x1810,{0x03000000});packet(0x17FC,{0});
+        };
+        for(unsigned face=0;face<6;++face) sample_face(face);
+        packet(0x200,{64U<<16,64U<<16});packet(0x12C,{0});submit();
+        const auto initial=native.readback();
+        expect(initial,62,32,{255,255,255,255});
+        if(gpu.stats().draws!=7) throw std::runtime_error("Cubemap resolution dropped a queued draw");
+        for(unsigned face=0;face<6;++face) {
+            const auto value=face_colors[face];expect(initial,face*10+5,32,{(value>>16)&255,(value>>8)&255,value&255,255});
+        }
+        // Rewrite one existing face, then resample the same cached cubemap.
+        packet(0x200,{64U<<16,64U<<16,0x06060213,0x00800080,0x20000+5*8192,0});
+        packet(0x1D90,{0xFFFFFFFF});packet(0x1D94,{0xF0});
+        packet(0x200,{64U<<16,64U<<16,0x128,0x01000100,0x40000,0x50000});
+        sample_face(5);packet(0x200,{64U<<16,64U<<16});packet(0x12C,{0});submit();
+        const auto updated=native.readback();save_png(updated,cubemap_image);
+        expect(updated,55,32,{255,255,255,255});expect(updated,5,32,{255,0,0,255});
+        if(!native.errors().empty()) throw std::runtime_error("Cubemap feedback produced D3D11 validation messages");
+        ++passed;
+    } catch(const std::exception& failure) {cubemap_error=failure.what();}
+    report+=std::format("{{\"name\":\"gpu-packets-reflection-cubemap\",\"passed\":{},\"error\":{},\"image\":{}}}",
+        cubemap_error.empty(),json(cubemap_error),json(utf8(cubemap_image.wstring())));
 
     const auto messages = renderer.errors();
     report += std::format("],\"passed\":{},\"total\":{},\"shader_compilations\":{},\"debug_messages\":[",

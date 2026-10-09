@@ -98,7 +98,11 @@ void write_alpha(inout R r,uint destination,float v) {
    } \
    if(enabled) sampled=tx##N.Sample(sm##N,uv); \
   } \
-  r.t##N=sampled;if(enabled && mode!=4 && mode!=5 && stages[N].w && sampled.a==0) discard; \
+  if(enabled && mode!=4 && mode!=5) { \
+   if(stages[N].w&2) sampled.a=1; \
+   if((stages[N].w&1) && sampled.a==0) discard; \
+  } \
+  r.t##N=sampled; \
  } \
 }
 float4 main(P p):SV_Target {
@@ -155,7 +159,7 @@ std::string shader_source(ShaderKind kind) {
             return source+"float4 main(P p):SV_Target {return finish((controls.x&255)?saturate(p.c):max(p.c,0));}";
         const auto sample=kind==ShaderKind::modulate2d?"tx0.Sample(sm0,p.t0.xy/p.t0.w)":
             kind==ShaderKind::modulate_cube?"cube0.Sample(sm0,p.t0.xyz)":"vol0.Sample(sm0,p.t0.xyz/p.t0.w)";
-        return source+std::format("float4 main(P p):SV_Target {{float4 t={};if(stages[0].w && t.a==0) discard;return finish(saturate(max(p.c,0)*t));}}",sample);
+        return source+std::format("float4 main(P p):SV_Target {{float4 t={};if(stages[0].w&2) t.a=1;if((stages[0].w&1) && t.a==0) discard;return finish(saturate(max(p.c,0)*t));}}",sample);
     }
     if(kind>=ShaderKind::combiner0 && kind<=ShaderKind::combiner8)
         return std::format("#define COMBINER_COUNT {}\n",unsigned(kind)-unsigned(ShaderKind::combiner0))+std::string(combiner_source);

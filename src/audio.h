@@ -23,7 +23,7 @@ enum class AudioBus {none,submix,effects,effects_manual};
 std::vector<float> decode_audio(AudioFormat,std::span<const std::byte>);
 class Audio {
 public:
-    explicit Audio(bool output=true);
+    explicit Audio(bool output=true,float gain=1);
     ~Audio();
     Audio(const Audio&)=delete;
     Audio& operator=(const Audio&)=delete;
@@ -47,6 +47,7 @@ public:
     void route(std::uint32_t,std::uint32_t destination);
     void spatial(std::uint32_t,const SpatialResult&);
     void mix(std::span<float> stereo);
+    void output_gain(float);
     std::uint32_t sample_clock() const {return frames_processed_.load(std::memory_order_relaxed);}
     void effects(const EffectsImage&,std::uint32_t reverb_index=UINT32_MAX);
     void effect_data(std::uint32_t byte_offset,std::span<std::byte> destination);

@@ -57,7 +57,7 @@ struct RenderState {
     std::array<std::uint32_t, 4> textures{}, texture_modes{}; // NV097 texture shader modes.
     std::array<std::uint32_t, 4> texture_sources{}, texture_clip{};
     std::array<std::uint32_t, 4> texture_address{0x030303, 0x030303, 0x030303, 0x030303};
-    std::array<bool, 4> linear_filter{}, alpha_kill{};
+    std::array<bool, 4> linear_filter{}, alpha_kill{}, texture_opaque{};
     std::uint32_t combiner_control = 0;
     std::array<std::uint32_t, 8> color_inputs{}, alpha_inputs{}, color_outputs{}, alpha_outputs{};
     std::array<std::uint32_t, 8> factor0{}, factor1{};
@@ -99,6 +99,7 @@ public:
     void grow_target(std::uint32_t target,std::uint32_t width,std::uint32_t height);
     void set_target(std::uint32_t target=0);
     void copy_target(std::uint32_t destination); // GPU copy for later sampling.
+    std::uint32_t copy_cubemap(const std::array<std::uint32_t,6>& faces,std::uint32_t destination=0);
     void copy_to_main();
     void resize(std::uint32_t width, std::uint32_t height);
     void attach_window(void* native_window);
@@ -124,6 +125,7 @@ public:
                       std::span<const std::uint32_t> indices={});
     void end();
     Image readback(); // Explicit diagnostic operation; never implicit in draw/present.
+    Image read_target(std::uint32_t);
     Image read_display();
     RenderStats stats() const;
     std::string adapter() const;

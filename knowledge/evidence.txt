@@ -590,3 +590,42 @@ the declared 16-byte cleanup. Null buffers or missing voices return `E_FAIL`.
 Host payload/decode/output failures remain bounded diagnostics and do not enter
 the Xbox SDK hardware path or overwrite the guest-visible HRESULT.
 
+===== 2026-10-08 | manual lesson/boost GPU captures =====
+
+Manual F8 captures frame-30124387100 and frame-45701313900 contain 894 and
+730 draws, respectively, without truncation. Boost blur was confirmed repaired
+by the user after moving linear coordinate normalization before GPU-surface
+binding. No game inputs were automated for these captures.
+
+Stationary draw 857 samples the generated shadow at 0x00E30080 as XRGB8
+(format 0x08810729), with texture alpha kill enabled (control 0x4003FFC4).
+It already selects the correct swizzled target 93, rather than linear target 92.
+Target 93 contains the shadow mask; pixels (128,128) and (128,80) are
+RGBA (178,178,178,0). GPU feedback previously retained that zero stored alpha,
+unlike ordinary XRGB uploads, causing alpha kill to discard the shadow draw.
+XRGB sampling now supplies opaque alpha before alpha kill and combiners.
+
+Draws 490..495 generate six 128x128 RGB565 reflection faces at 0x01160000
+through 0x01188000, spaced 0x8000 bytes apart. Car draws 858..873 sample the
+same allocation as cubemap format 0x0771052D. The old feedback path excluded
+cubemaps and cached the unchanged RAM allocation. The native bridge now copies
+matching GPU faces into a reusable cube, updating it only after producer writes.
+Copies remain on the GPU; no readback or shader compilation is added to play.
+
+Cubemap face chains use 128-byte alignment, verified from the primary hardware
+definitions and texture sizing implementation:
+https://raw.githubusercontent.com/xemu-project/xemu/master/hw/xbox/nv2a/nv2a_regs.h
+https://raw.githubusercontent.com/xemu-project/xemu/master/hw/xbox/nv2a/pgraph/texture.c
+These sources establish resource layout, not gameplay or visual parity.
+
+The offline suite exercises all six GPU-generated RGB565 faces, updates one
+existing face, and retains scene draws queued before the first cube copy. XRGB
+alpha-kill checks cover both combiner paths; ARGB with zero alpha still discards.
+The 128-byte face alignment is also exercised by small ordinary cubemap uploads.
+The user confirmed blur in game. Shadow/reflection scene parity awaits manual
+verification of the repaired build.
+All 150 component cases passed on NVIDIA GeForce RTX 5060 Ti and Microsoft WARP
+with no D3D11 warnings. Reports: build/graphics-feedback-gpu-verified/report.json
+and build/graphics-feedback-warp/report.json. The release shader bank contains
+18 original vertex programs and 27 built-in shaders, compiled ahead of time.
+

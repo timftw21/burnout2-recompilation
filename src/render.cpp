@@ -575,6 +575,48 @@ void Renderer::copy_target(std::uint32_t destination) {
     r.context->CopyResource(found->second.color.Get(),r.target.Get());
     auto view=r.rtv.Get();r.context->OMSetRenderTargets(1,&view,r.dsv.Get());
 }
+std::uint32_t Renderer::copy_cubemap(const std::array<std::uint32_t,6>& faces,std::uint32_t destination) {
+    auto& r=*impl_;
+    if(r.recording) throw std::runtime_error("Copy cubemap faces outside frame submission");
+    std::array<ID3D11Texture2D*,6> sources{};
+    D3D11_TEXTURE2D_DESC description{};
+    for(unsigned face=0;face<faces.size();++face) {
+        const auto found=r.targets.find(faces[face]);
+        if(found==r.targets.end()) throw std::runtime_error("Cubemap face is not a render target");
+        sources[face]=found->second.color.Get();
+        D3D11_TEXTURE2D_DESC source{};sources[face]->GetDesc(&source);
+        if(!face) description=source;
+        if(source.Width!=source.Height || source.Width!=description.Width || source.Format!=description.Format)
+            throw std::runtime_error("Cubemap faces require matching square images and formats");
+    }
+    description.ArraySize=6;description.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+    description.MiscFlags=D3D11_RESOURCE_MISC_TEXTURECUBE;
+    ComPtr<ID3D11Texture2D> cube;
+    if(!destination) {
+        const auto required=std::size_t(description.Width)*description.Height*6*(description.Format==DXGI_FORMAT_B5G6R5_UNORM?2:4);
+        if(r.textures.size()>=4096 || required>256*1024*1024-r.texture_bytes)
+            throw std::runtime_error("Cubemap texture resource limit reached");
+        checked(r.device->CreateTexture2D(&description,nullptr,&cube),"GPU cubemap");
+        ComPtr<ID3D11ShaderResourceView> view;
+        checked(r.device->CreateShaderResourceView(cube.Get(),nullptr,&view),"GPU cubemap view");
+        destination=static_cast<std::uint32_t>(r.textures.size());
+        r.textures.push_back(std::move(view));r.texture_dimensions.push_back(3);r.texture_bytes+=required;
+    } else {
+        if(destination>=r.textures.size() || r.texture_dimensions[destination]!=3)
+            throw std::runtime_error("Cubemap destination was not created");
+        ComPtr<ID3D11Resource> resource;r.textures[destination]->GetResource(&resource);
+        checked(resource.As(&cube),"GPU cubemap resource");
+        D3D11_TEXTURE2D_DESC existing{};cube->GetDesc(&existing);
+        if(existing.Width!=description.Width || existing.Height!=description.Height || existing.Format!=description.Format ||
+            existing.MipLevels!=1 || existing.ArraySize!=6 || existing.Usage!=D3D11_USAGE_DEFAULT)
+            throw std::runtime_error("Cubemap destination differs from its faces");
+    }
+    r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
+    for(unsigned face=0;face<faces.size();++face)
+        r.context->CopySubresourceRegion(cube.Get(),face,0,0,0,sources[face],0,nullptr);
+    auto view=r.rtv.Get();r.context->OMSetRenderTargets(1,&view,r.dsv.Get());
+    return destination;
+}
 void Renderer::copy_to_main() {
     auto& r=*impl_;
     if(r.recording || !r.current_target) throw std::runtime_error("Copy an ended auxiliary target to the main image");
@@ -732,6 +774,8 @@ std::uint32_t Renderer::upload(const TextureData& texture) {
         }
         data[subresource] = {pixels, pitch, static_cast<UINT>(slice)};
         offset += size;
+        // NV097 aligns each complete cubemap face, including its mip chain.
+        if(texture.cubemap && mip+1==texture.mip_levels) offset=(offset+127)&~std::size_t(127);
     }
     if (offset != texture.bytes.size()) throw std::runtime_error("Texture payload has trailing bytes; specify its full mip count");
     D3D11_TEXTURE2D_DESC desc{};
@@ -1076,7 +1120,8 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
         if(sampled && r.texture_dimensions[state.textures[i]]!=(mode==3?3U:mode==2?2U:1U))
             throw std::runtime_error("Texture resource dimension does not match its shader mode");
         if(sampled) views[i+(mode==3?4:mode==2?8:0)] = r.textures[state.textures[i]].Get();
-        constants.stages[i]={mode,state.texture_sources[i],state.texture_clip[i],std::uint32_t(state.alpha_kill[i])};
+        constants.stages[i]={mode,state.texture_sources[i],state.texture_clip[i],
+            std::uint32_t(state.alpha_kill[i])|(std::uint32_t(state.texture_opaque[i])<<1)};
         samplers[i] = pipeline.samplers[i].Get();
     }
     std::array<UINT,17> stream_offsets{},stream_strides{};
@@ -1163,6 +1208,12 @@ void Renderer::end() {
         auto& timing=r.timings[r.timing_index];r.context->End(timing.finish.Get());r.context->End(timing.timer.Get());timing.pending=true;
     }
     r.recording = false; r.ended = true;
+}
+Image Renderer::read_target(std::uint32_t target) {
+    const auto previous=impl_->current_target;
+    set_target(target);
+    try {auto image=readback();set_target(previous);return image;}
+    catch(...) {set_target(previous);throw;}
 }
 Image Renderer::readback() {
     auto& r = *impl_;
