@@ -35,6 +35,7 @@ focused on speed and simplicity. I couldn't bear to keep the slop version public
 - Remaining graphics glitches, including artifacts around car shadows and further
   checks of reflections against the original game.
 - Testing all modes, tracks and saved-game progression.
+- Saving/loading.
 - In-game sound effects.
 - Checking sound balance and consistently smooth performance across the whole game.
 - Custom control bindings and other settings.
