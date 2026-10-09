@@ -1,0 +1,89 @@
+# Roots from the verified XBE and preserved knowledge/facts.json.
+entry
+@main_loop_address@
+@finite_address@
+@compare_address@
+@startup_pair_seeds@
+@startup_table_seeds@
+# Original RenderWare device descriptor returned by F4A50 and copied by F48AB.
+# Its system callback is at +4; the six render callbacks start at +10h.
+table 0x00344A7C 0x00344A80
+table 0x00344A88 0x00344AA0
+# 2175A0 dispatches complex render states 136..165 through 223208 + state*4.
+# Original 30 code pointers end at 2234A0; the following slot is null.
+table 0x00223428 0x002234A0
+# F2930 substitutes this original callback when a plugin hook is null.
+0x000ED200
+# Original F4540 installs device globals and callback/operation pairs.
+# F4740 fills defaults with D87E0.
+0x000EE810
+0x000EEB90
+0x000EED10
+0x000EEDA0
+0x000EF5B0
+0x000EF800
+0x000EF8F0
+0x000EF980
+0x000EF990
+0x000F4290
+0x000F4310
+0x000F44D0
+0x000F44E0
+0x000F7B20
+0x000F7E20
+0x000F8500
+0x000F8A60
+0x000F8CB0
+0x000F9680
+0x000F9720
+0x000F99D0
+0x000FA6D0
+0x000FA6F0
+0x000FA710
+0x000FAA40
+0x000FAA60
+0x000FAAA0
+0x000D87E0
+# Original D88A0 replaces the eleven-slot file table returned by F22E0.
+# Stores D88C1..D8906; the active open callback is called by EC4CE.
+0x000D86F0
+0x000D8770
+0x000D8780
+0x000D87B0
+0x000D87F0
+0x000D8810
+0x000D8870
+0x000D8890
+# Original 101FD0 wraps a RenderWare callback group, preserving its prior
+# methods in 5A6CB8; installs at 101FFD, 102004 and 10200B.
+0x00101F80
+0x00101630
+0x00101660
+# Original camera constructor E8670 installs synchronize/begin/end methods
+# at E86A8..E86B6, dispatched through camera fields +10h/+18h/+1Ch.
+0x000E82F0
+0x000E8370
+0x000E8340
+# Original asset-stream callback record, stores 11052D..110542.
+# Independently verified fields +0Ch/+10h/+14h/+18h from preserved knowledge.
+0x00110380
+0x00110440
+0x00110450
+0x00110490
+# Original XBoxAtomicAllInOne node initializer 105BE0, stores 105BE7..105BFB.
+0x00105830
+0x001058C0
+0x00105450
+0x001061A0
+# Verified terminal breakpoint, used by the offline exception diagnostic.
+0x000E5DC1
+# Thread entry from E2555; original CRT table bounds from E64E6/E653E.
+0x000E24E1
+0x000E682C
+# Original timer callback supplied to KeInitializeDpc by E6C26.
+0x000E6C14
+table 0x002CD660 0x002CD66C
+table 0x002E98F8 0x002E990C
+# Original startup callback table read by E0254 (one null, one function).
+table 0x002E9928 0x002E9930
+table @constructor_start@ @constructor_end@

@@ -1,9 +1,0 @@
-{
-  "schema_version": 1,
-  "tool": "sccache",
-  "version": "0.17.0",
-  "platform": "x86_64-pc-windows-msvc",
-  "archive_url": "https://github.com/mozilla/sccache/releases/download/v0.17.0/sccache-v0.17.0-x86_64-pc-windows-msvc.zip",
-  "archive_sha256": "e94cfc5b58cbe439302f586c1d1bd7980c2cd371d47bdf385ade657411e6f3ac",
-  "executable_sha256": "7a2b4220389c959bd78a12187f0d2339f4b3d794d3e9ff75cf1e5426f7c16a29"
-}

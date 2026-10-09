@@ -1,0 +1,4143 @@
+
+===== tools/playability/playability_probe.py:7934-7939 | TitleSceneRecordTableLayout =====
+
+@dataclass(frozen=True)
+class TitleSceneRecordTableLayout:
+    name: str
+    record_count: int
+    record_address: int
+    records: tuple[bytes, ...]
+
+
+===== tools/playability/playability_probe.py:7942-7947 | TitleSceneRecordSourceLayout =====
+
+@dataclass(frozen=True)
+class TitleSceneRecordSourceLayout:
+    title_path: str
+    image_base: int
+    header: bytes
+    tables: tuple[TitleSceneRecordTableLayout, ...]
+
+
+===== runtime/host/nv2a_command_processor.cpp:135-139 | push_buffer_word_starts_run =====
+
+bool push_buffer_word_starts_run(
+    const std::vector<PushBufferWord>& words,
+    size_t index) {
+    return index == 0u || words[index].run_id != words[index - 1u].run_id;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:142-149 | default_nv2a_vertex_attributes =====
+
+Nv2aVertexAttributes default_nv2a_vertex_attributes() {
+    Nv2aVertexAttributes attributes{};
+    for (auto& attribute : attributes) {
+        attribute = {0.0f, 0.0f, 0.0f, 1.0f};
+    }
+    attributes[3] = {1.0f, 1.0f, 1.0f, 1.0f};
+    return attributes;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:152-159 | host_texture_matches_draw =====
+
+bool host_texture_matches_draw(
+    const HostTexture& texture,
+    const NativeDraw& draw) {
+    if (!draw.texture_enabled) {
+        return texture.guest_address == 0u;
+    }
+    return host_texture_matches_stage(texture, draw, draw.texture_stage);
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:162-184 | host_texture_matches_stage =====
+
+bool host_texture_matches_stage(
+    const HostTexture& texture,
+    const NativeDraw& draw,
+    uint32_t stage) {
+    if (stage >= draw.texture_formats.size()
+        || nv2a_canonical_resource_address(texture.guest_address)
+            != nv2a_canonical_resource_address(
+                draw.texture_offsets[stage])) {
+        return false;
+    }
+    const uint32_t format_raw = draw.texture_formats[stage];
+    const auto [width, height] = nv2a_texture_extent(
+        format_raw,
+        draw.texture_image_rects[stage]);
+    return texture.width == width
+        && texture.height == height
+        && texture.cubemap == nv2a_texture_format_is_cubemap(format_raw)
+        && (nv2a_texture_format_matches(texture.format, format_raw)
+            || (texture.render_target_feedback
+                && b2r::nv2a::nv2a_render_target_feedback_format_matches(
+                    texture.format,
+                    format_raw)));
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:187-196 | nv2a_sampler_address_mode =====
+
+VkSamplerAddressMode nv2a_sampler_address_mode(uint32_t value) {
+    switch (value & 7u) {
+    case 1u: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    case 2u: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+    case 3u: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    case 4u: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    case 5u: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    }
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:199-208 | nv2a_sampler_address_name =====
+
+std::string nv2a_sampler_address_name(uint32_t value) {
+    switch (value & 7u) {
+    case 1u: return "repeat";
+    case 2u: return "mirrored_repeat";
+    case 3u: return "clamp_to_edge";
+    case 4u: return "clamp_to_border";
+    case 5u: return "clamp_ogl";
+    default: return "invalid_default_clamp";
+    }
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:211-228 | pipeline_state_for_draw =====
+
+NativePipelineState pipeline_state_for_draw(const NativeDraw& draw) {
+    NativePipelineState state{
+        draw.primitive,
+        draw.blend_enable,
+        draw.blend_source_factor,
+        draw.blend_destination_factor,
+        draw.blend_equation,
+        draw.color_mask,
+        draw.depth_test_enable,
+        draw.depth_function,
+        draw.depth_write_enable,
+        draw.cull_face_enable,
+        draw.cull_face,
+        draw.front_face,
+        draw.gpu_raw_attribute_fetch,
+    };
+    return state;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:242-255 | default_fixed_function_texture_combiner_recovery_required =====
+
+bool default_fixed_function_texture_combiner_recovery_required(
+    const NativeDraw& draw) {
+    if (!draw.texture_enabled || draw.texture_stage != 0u
+        || (draw.shader_stage_program & 0x1Fu) == 0u
+        || draw.combiner_control != 1u) {
+        return false;
+    }
+    return draw.combiner_color_inputs[0] == 0x04200000u
+        && draw.combiner_color_outputs[0] == 0x00000C00u
+        && draw.combiner_alpha_inputs[0] == 0x14200000u
+        && draw.combiner_alpha_outputs[0] == 0x00000C00u
+        && draw.final_combiner_inputs0 == 0x0000000Cu
+        && draw.final_combiner_inputs1 == 0x00001C80u;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:258-313 | fragment_state_for_draw =====
+
+NativeFragmentState fragment_state_for_draw(const NativeDraw& draw) {
+    NativeFragmentState state{};
+    state.alpha_test_enable = draw.alpha_test_enable;
+    state.alpha_function = draw.alpha_function;
+    state.alpha_reference = draw.alpha_reference & 0xFFu;
+    for (uint32_t stage = 0u; stage < state.texture_modes.size(); ++stage) {
+        const uint32_t programmed_texture_mode =
+            (draw.shader_stage_program >> (stage * 5u)) & 0x1Fu;
+        const bool enabled =
+            (draw.texture_controls[stage] & (1u << 30u)) != 0u;
+        state.texture_modes[stage] = enabled
+            ? programmed_texture_mode
+            : 0u;
+        if (state.texture_modes[stage] == 0u) {
+            continue;
+        }
+        state.texture_alpha_kill_mask |=
+            (draw.texture_controls[stage] & (1u << 2u)) != 0u
+            ? 1u << stage
+            : 0u;
+        const uint32_t texture_color_format =
+            (draw.texture_formats[stage] >> 8u) & 0xFFu;
+        state.texture_opaque_alpha_mask |=
+            texture_color_format == 0x07u
+                    || texture_color_format == 0x1Eu
+                ? 1u << stage
+                : 0u;
+        state.texture_cubemap_mask |=
+            nv2a_texture_format_is_cubemap(draw.texture_formats[stage])
+                ? 1u << stage
+                : 0u;
+    }
+    state.combiner_control = draw.combiner_control;
+    state.shader_stage_program = draw.shader_stage_program;
+    state.combiner_color_inputs = draw.combiner_color_inputs;
+    state.combiner_color_outputs = draw.combiner_color_outputs;
+    state.combiner_alpha_inputs = draw.combiner_alpha_inputs;
+    state.combiner_alpha_outputs = draw.combiner_alpha_outputs;
+    state.combiner_factors0 = draw.combiner_factors0;
+    state.combiner_factors1 = draw.combiner_factors1;
+    state.final_combiner_inputs0 = draw.final_combiner_inputs0;
+    state.final_combiner_inputs1 = draw.final_combiner_inputs1;
+    state.final_combiner_factor0 = draw.final_combiner_factors[0];
+    state.final_combiner_factor1 = draw.final_combiner_factors[1];
+    if (default_fixed_function_texture_combiner_recovery_required(draw)) {
+        // The title leaves the canonical diffuse-only NV2A defaults active
+        // for its fixed-function D3D texture draws. Recover the equivalent
+        // stage-zero MODULATE operation so the sampled texture and its alpha
+        // mask are combined with the vertex color/fade alpha.
+        state.combiner_color_inputs[0] = 0x08040000u;
+        state.combiner_alpha_inputs[0] = 0x18140000u;
+    }
+    state.fog_color = draw.fog_color;
+    state.fog_enable = draw.fog_enable;
+    return state;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:329-389 | gpu_vertex_program_compatible =====
+
+bool gpu_vertex_program_compatible(const NativeDraw& draw) {
+    if ((draw.transform_execution_mode & 3u) != 2u
+        || !draw.indexed_array
+        || draw.texture_stage >= draw.texture_formats.size()
+        || draw.transform_program_start >= draw.transform_program.size()) {
+        return false;
+    }
+    // The indexed materializer produces a complete, immutable 16-register
+    // input bank. Inline arrays currently reconstruct missing attributes in
+    // the CPU executor, so they remain on that exact path until the shader
+    // receives an equivalent validity/fallback contract.
+    // Preserve the CPU path for the title's recovered half-surface and
+    // overscan quad fixups. They inspect post-program output before modifying
+    // the final vertices and are intentionally outside the generic program.
+    const size_t effective_vertex_count = draw.vertex_count != 0u
+        ? draw.vertex_count
+        : draw.vertex_indices.size();
+    if (draw.primitive == 6u && effective_vertex_count == 4u
+        && draw.texture_address != 0u) {
+        return false;
+    }
+    const auto temporary_source_valid = [](uint32_t type, uint32_t index) {
+        return type != 1u || index == 12u || index < 12u;
+    };
+    for (uint32_t instruction = draw.transform_program_start;
+         instruction < draw.transform_program.size();
+         ++instruction) {
+        const auto& token = draw.transform_program[instruction];
+        const uint32_t mac_opcode = nv2a_vsh::field(token[1], 21, 4);
+        const uint32_t ilu_opcode = nv2a_vsh::field(token[1], 25, 3);
+        if (mac_opcode > 13u || ilu_opcode > 7u) {
+            return false;
+        }
+        const uint32_t a_type = nv2a_vsh::field(token[2], 26, 2);
+        const uint32_t a_register = nv2a_vsh::field(token[2], 28, 4);
+        const uint32_t b_type = nv2a_vsh::field(token[2], 11, 2);
+        const uint32_t b_register = nv2a_vsh::field(token[2], 13, 4);
+        const uint32_t c_type = nv2a_vsh::field(token[3], 28, 2);
+        const uint32_t c_register = nv2a_vsh::field(token[2], 0, 2) * 4u
+            + nv2a_vsh::field(token[3], 30, 2);
+        if (!temporary_source_valid(a_type, a_register)
+            || !temporary_source_valid(b_type, b_register)
+            || !temporary_source_valid(c_type, c_register)) {
+            return false;
+        }
+        const uint32_t output_mask = nv2a_vsh::field(token[3], 12, 4);
+        if (output_mask != 0u) {
+            // Context-constant writes are legal NV2A behavior, but the first
+            // GPU slice keeps constants immutable. Such programs retain the
+            // exact CPU implementation until a writable GPU context exists.
+            if (nv2a_vsh::field(token[3], 11, 1) == 0u
+                || nv2a_vsh::field(token[3], 3, 8) >= 13u) {
+                return false;
+            }
+        }
+        if (nv2a_vsh::field(token[3], 0, 1) != 0u) {
+            return true;
+        }
+    }
+    return false;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:392-444 | vertex_program_state_for_draw =====
+
+NativeVertexProgramState vertex_program_state_for_draw(
+    const NativeDraw& draw,
+    VkExtent2D target_extent,
+    bool enable_gpu_program) {
+    NativeVertexProgramState state{};
+    state.enabled = enable_gpu_program && gpu_vertex_program_compatible(draw)
+        ? 1u
+        : 0u;
+    state.transform_program_start = draw.transform_program_start;
+    state.target_width = target_extent.width;
+    state.target_height = target_extent.height;
+    state.specular_enable = draw.specular_enable;
+    state.fog_mode = draw.fog_mode;
+    state.fog_enable = draw.fog_enable;
+    state.fog_parameter0 = draw.fog_params[0];
+    state.fog_parameter1 = draw.fog_params[1];
+    state.texture_output = 9u + draw.texture_stage;
+    state.raw_attribute_fetch = draw.gpu_raw_attribute_fetch ? 1u : 0u;
+    state.raw_source_index_base = draw.gpu_raw_source_index_base;
+    for (uint32_t slot = 0u; slot < 16u; ++slot) {
+        const uint32_t row = slot / 4u;
+        const uint32_t lane = slot % 4u;
+        state.raw_attribute_formats[row][lane] = draw.vertex_formats[slot];
+        state.raw_attribute_base_offsets[row][lane] =
+            draw.gpu_raw_attribute_base_offsets[slot];
+        for (uint32_t component = 0u; component < 4u; ++component) {
+            std::memcpy(
+                &state.current_vertex_attributes[slot][component],
+                &draw.current_vertex_attributes[slot][component],
+                sizeof(uint32_t));
+        }
+    }
+    for (uint32_t stage = 0u; stage < draw.texture_formats.size(); ++stage) {
+        const uint32_t format = draw.texture_formats[stage];
+        const auto [width, height] = nv2a_texture_extent(
+            format,
+            draw.texture_image_rects[stage]);
+        state.texture_linears[stage] =
+            nv2a_texture_format_is_linear(format) ? 1u : 0u;
+        state.texture_widths[stage] = width;
+        state.texture_heights[stage] = height;
+        if (stage == draw.texture_stage) {
+            state.texture_linear = state.texture_linears[stage];
+            state.texture_width = width;
+            state.texture_height = height;
+        }
+    }
+    if (state.enabled != 0u) {
+        state.transform_program = draw.transform_program;
+        state.transform_constants = draw.transform_constants;
+    }
+    return state;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:447-459 | nv2a_depth_compare_op =====
+
+VkCompareOp nv2a_depth_compare_op(uint32_t function) {
+    switch (function) {
+    case 0x0200u: return VK_COMPARE_OP_NEVER;
+    case 0x0201u: return VK_COMPARE_OP_LESS;
+    case 0x0202u: return VK_COMPARE_OP_EQUAL;
+    case 0x0203u: return VK_COMPARE_OP_LESS_OR_EQUAL;
+    case 0x0204u: return VK_COMPARE_OP_GREATER;
+    case 0x0205u: return VK_COMPARE_OP_NOT_EQUAL;
+    case 0x0206u: return VK_COMPARE_OP_GREATER_OR_EQUAL;
+    case 0x0207u: return VK_COMPARE_OP_ALWAYS;
+    default: return VK_COMPARE_OP_LESS_OR_EQUAL;
+    }
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:462-472 | nv2a_cull_mode =====
+
+VkCullModeFlags nv2a_cull_mode(uint32_t enabled, uint32_t face) {
+    if (!enabled) {
+        return VK_CULL_MODE_NONE;
+    }
+    switch (face) {
+    case 0x0404u: return VK_CULL_MODE_FRONT_BIT;
+    case 0x0405u: return VK_CULL_MODE_BACK_BIT;
+    case 0x0408u: return VK_CULL_MODE_FRONT_AND_BACK;
+    default: return VK_CULL_MODE_BACK_BIT;
+    }
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:475-481 | nv2a_front_face =====
+
+VkFrontFace nv2a_front_face(uint32_t face) {
+    // Guest screen-space coordinates and the positive-height Vulkan viewport
+    // both use a top-left origin, so preserve the NV2A winding declaration.
+    return face == 0x0900u
+        ? VK_FRONT_FACE_CLOCKWISE
+        : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:484-501 | nv2a_blend_factor =====
+
+VkBlendFactor nv2a_blend_factor(
+    uint32_t factor,
+    VkBlendFactor fallback) {
+    switch (factor) {
+    case 0u: return VK_BLEND_FACTOR_ZERO;
+    case 1u: return VK_BLEND_FACTOR_ONE;
+    case 0x0300u: return VK_BLEND_FACTOR_SRC_COLOR;
+    case 0x0301u: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+    case 0x0302u: return VK_BLEND_FACTOR_SRC_ALPHA;
+    case 0x0303u: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    case 0x0304u: return VK_BLEND_FACTOR_DST_ALPHA;
+    case 0x0305u: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+    case 0x0306u: return VK_BLEND_FACTOR_DST_COLOR;
+    case 0x0307u: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+    case 0x0308u: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+    default: return fallback;
+    }
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:504-513 | nv2a_blend_op =====
+
+VkBlendOp nv2a_blend_op(uint32_t equation) {
+    switch (equation) {
+    case 0x8006u: return VK_BLEND_OP_ADD;
+    case 0x8007u: return VK_BLEND_OP_MIN;
+    case 0x8008u: return VK_BLEND_OP_MAX;
+    case 0x800Au: return VK_BLEND_OP_SUBTRACT;
+    case 0x800Bu: return VK_BLEND_OP_REVERSE_SUBTRACT;
+    default: return VK_BLEND_OP_ADD;
+    }
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:516-523 | nv2a_color_write_mask =====
+
+VkColorComponentFlags nv2a_color_write_mask(uint32_t mask) {
+    VkColorComponentFlags result = 0;
+    if (mask & 0x00000001u) result |= VK_COLOR_COMPONENT_B_BIT;
+    if (mask & 0x00000100u) result |= VK_COLOR_COMPONENT_G_BIT;
+    if (mask & 0x00010000u) result |= VK_COLOR_COMPONENT_R_BIT;
+    if (mask & 0x01000000u) result |= VK_COLOR_COMPONENT_A_BIT;
+    return result;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:526-564 | referenced_vertex_program_constants =====
+
+std::vector<uint32_t> referenced_vertex_program_constants(
+    const NativeDraw& draw) {
+    std::array<bool, 192> referenced{};
+    const auto mark_source = [&](uint32_t source_type, uint32_t constant_index) {
+        if (source_type == 3u && constant_index < referenced.size()) {
+            referenced[constant_index] = true;
+        }
+    };
+    for (uint32_t instruction = draw.transform_program_start;
+         instruction < draw.transform_program.size();
+         ++instruction) {
+        const auto& token = draw.transform_program[instruction];
+        const uint32_t mac_opcode = nv2a_vsh::field(token[1], 21, 4);
+        const uint32_t ilu_opcode = nv2a_vsh::field(token[1], 25, 3);
+        const uint32_t constant_index = nv2a_vsh::field(token[1], 13, 8);
+        const uint32_t a_type = nv2a_vsh::field(token[2], 26, 2);
+        const uint32_t b_type = nv2a_vsh::field(token[2], 11, 2);
+        const uint32_t c_type = nv2a_vsh::field(token[3], 28, 2);
+        if (mac_opcode != 0u) {
+            mark_source(a_type, constant_index);
+        }
+        if (mac_opcode == 2u || (mac_opcode >= 4u && mac_opcode <= 12u)) {
+            mark_source(b_type, constant_index);
+        }
+        if (mac_opcode == 3u || mac_opcode == 4u || ilu_opcode != 0u) {
+            mark_source(c_type, constant_index);
+        }
+        if ((token[3] & 1u) != 0u) {
+            break;
+        }
+    }
+    std::vector<uint32_t> result;
+    for (uint32_t index = 0; index < referenced.size(); ++index) {
+        if (referenced[index]) {
+            result.push_back(index);
+        }
+    }
+    return result;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:567-611 | nv2a_programmable_fog_factor =====
+
+float nv2a_programmable_fog_factor(
+    const NativeDraw& draw,
+    float fog_distance) {
+    if (draw.fog_enable == 0u
+        || (draw.fog_params[0] == 0u && draw.fog_params[1] == 0u)) {
+        return 1.0f;
+    }
+    float parameter0 = 0.0f;
+    float parameter1 = 0.0f;
+    std::memcpy(&parameter0, &draw.fog_params[0], sizeof(parameter0));
+    std::memcpy(&parameter1, &draw.fog_params[1], sizeof(parameter1));
+    if (!std::isfinite(fog_distance)
+        || !std::isfinite(parameter0)
+        || !std::isfinite(parameter1)) {
+        return 1.0f;
+    }
+    float factor = 1.0f;
+    switch (draw.fog_mode) {
+    case 0x2601u:
+    case 0x0804u:
+        factor = parameter0 + fog_distance * parameter1 - 1.0f;
+        break;
+    case 0x0800u:
+    case 0x0802u:
+        factor = parameter0
+            + std::exp2(fog_distance * parameter1 * 16.0f) - 1.5f;
+        break;
+    case 0x0801u:
+    case 0x0803u:
+        factor = parameter0
+            + std::exp2(
+                -fog_distance * fog_distance
+                * parameter1 * parameter1 * 32.0f)
+            - 1.5f;
+        break;
+    default:
+        return 1.0f;
+    }
+    if (draw.fog_mode == 0x0802u
+        || draw.fog_mode == 0x0803u
+        || draw.fog_mode == 0x0804u) {
+        factor = std::abs(factor);
+    }
+    return std::isfinite(factor) ? factor : 1.0f;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:614-800 | execute_presented_vertex_program =====
+
+uint32_t execute_presented_vertex_program(
+    std::vector<NativeVertex>& vertices,
+    const NativeDraw& draw,
+    PresentedVertexTransformDiagnostics* diagnostics) {
+    if ((draw.transform_execution_mode & 3u) != 2u
+        || draw.first_vertex + draw.vertex_count > vertices.size()) {
+        return 0;
+    }
+    PresentedVertexTransformDiagnostics local{};
+    local.eligible_vertex_count = draw.vertex_count;
+    uint32_t transformed = 0;
+    for (uint32_t index = 0; index < draw.vertex_count; ++index) {
+        NativeVertex& vertex = vertices[draw.first_vertex + index];
+        local.input_position_bounds.include(vertex.x, vertex.y);
+        local.input_z_bounds.include(vertex.z);
+        local.input_w_bounds.include(vertex.w);
+        std::array<std::array<float, 4>, 16> inputs = vertex.program_inputs;
+        if (!vertex.program_inputs_valid) {
+            for (auto& input : inputs) input[3] = 1.0f;
+            inputs[0] = {vertex.x, vertex.y, vertex.z, vertex.w};
+            inputs[3] = {vertex.r, vertex.g, vertex.b, vertex.a};
+            inputs[4] = {
+                vertex.secondary_r,
+                vertex.secondary_g,
+                vertex.secondary_b,
+                vertex.secondary_a,
+            };
+            const uint32_t texture_input = std::min<uint32_t>(
+                9u + draw.texture_stage, 15u);
+            inputs[texture_input] = {
+                vertex.u,
+                vertex.v,
+                vertex.texture_r,
+                vertex.texture_q,
+            };
+        }
+        const Nv2aVertexProgramResult result = execute_nv2a_vertex_program(
+            draw.transform_program,
+            draw.transform_constants,
+            draw.transform_program_start,
+            inputs);
+        if (!result.valid) {
+            ++local.invalid_program_vertex_count;
+            continue;
+        }
+        ++local.valid_program_vertex_count;
+        const auto& position = result.outputs[0];
+        local.position_output_mask_union |= result.output_masks[0];
+        const bool position_xyz_written =
+            (result.output_masks[0] & 14u) == 14u;
+        const bool position_w_written =
+            (result.output_masks[0] & 1u) != 0u;
+        const bool position_w_usable = position_w_written
+            && std::isfinite(position[3])
+            && std::abs(position[3]) > 0.000001f;
+        if ((result.output_masks[0] & 12u) == 12u
+            && std::isfinite(position[0]) && std::isfinite(position[1])) {
+            ++local.position_output_vertex_count;
+            local.clip_position_bounds.include(position[0], position[1]);
+            if ((result.output_masks[0] & 2u) != 0u) {
+                local.program_output_z_bounds.include(position[2]);
+            }
+            if (position_w_written) {
+                local.program_output_w_bounds.include(position[3]);
+                if (!std::isfinite(position[3])) {
+                    ++local.non_finite_position_w_vertex_count;
+                }
+            }
+            if (position_w_written && std::isfinite(position[3])) {
+                ++local.homogeneous_position_vertex_count;
+                if (std::abs(position[3]) <= 0.000001f) {
+                    ++local.near_zero_w_vertex_count;
+                }
+            }
+            // NV2A vertex programs leave oPos in screen space. The host's
+            // final upload pass converts these coordinates to Vulkan NDC.
+            ++local.screen_space_position_vertex_count;
+            vertex.x = position[0];
+            vertex.y = position[1];
+            local.output_pixel_bounds.include(vertex.x, vertex.y);
+            if ((result.output_masks[0] & 2u) != 0u) {
+                float viewport_depth_scale = 0.0f;
+                const uint32_t viewport_depth_scale_bits =
+                    draw.transform_constants[58][2];
+                std::memcpy(
+                    &viewport_depth_scale,
+                    &viewport_depth_scale_bits,
+                    sizeof(viewport_depth_scale));
+                vertex.z = std::isfinite(viewport_depth_scale)
+                    && std::abs(viewport_depth_scale) > 0.000001f
+                    ? position[2] / viewport_depth_scale
+                    : position[2];
+            }
+            if (position_w_usable) {
+                vertex.w = position[3];
+            } else if (position_xyz_written) {
+                // NV2A programs used by the title can emit screen-space
+                // oPos.xyz with an absent or unusable oPos.w. Complete the
+                // homogeneous component instead of rejecting the valid xyz
+                // output and forcing the fallback near depth.
+                vertex.w = 1.0f;
+                ++local.defaulted_position_w_vertex_count;
+                if (position_w_written) {
+                    ++local.invalid_position_w_vertex_count;
+                } else {
+                    ++local.implicit_position_w_vertex_count;
+                }
+            }
+            vertex.program_position_valid =
+                position_xyz_written
+                && std::isfinite(vertex.z)
+                && std::isfinite(vertex.w);
+        } else if ((result.output_masks[0] & 12u) != 0u) {
+            ++local.non_finite_position_vertex_count;
+        }
+        vertex.r = 0.0f;
+        vertex.g = 0.0f;
+        vertex.b = 0.0f;
+        vertex.a = 1.0f;
+        if (result.output_masks[3]) {
+            ++local.diffuse_output_vertex_count;
+            const auto& diffuse = result.outputs[3];
+            if (result.output_masks[3] & 8u) vertex.r = diffuse[0];
+            if (result.output_masks[3] & 4u) vertex.g = diffuse[1];
+            if (result.output_masks[3] & 2u) vertex.b = diffuse[2];
+            if (result.output_masks[3] & 1u) vertex.a = diffuse[3];
+        }
+        vertex.secondary_r = 0.0f;
+        vertex.secondary_g = 0.0f;
+        vertex.secondary_b = 0.0f;
+        vertex.secondary_a = 1.0f;
+        if (draw.specular_enable != 0u && result.output_masks[4]) {
+            const auto& secondary = result.outputs[4];
+            if (result.output_masks[4] & 8u) {
+                vertex.secondary_r = secondary[0];
+            }
+            if (result.output_masks[4] & 4u) {
+                vertex.secondary_g = secondary[1];
+            }
+            if (result.output_masks[4] & 2u) {
+                vertex.secondary_b = secondary[2];
+            }
+            if (result.output_masks[4] & 1u) {
+                vertex.secondary_a = secondary[3];
+            }
+        }
+        if (draw.fog_enable != 0u) {
+            const uint32_t fog_mask = result.output_masks[5];
+            const auto& fog_output = result.outputs[5];
+            const float fog_distance = (fog_mask & 8u) != 0u
+                ? fog_output[0]
+                : (fog_mask & 4u) != 0u
+                    ? fog_output[1]
+                    : (fog_mask & 2u) != 0u
+                        ? fog_output[2]
+                        : (fog_mask & 1u) != 0u
+                            ? fog_output[3]
+                            : 0.0f;
+            vertex.fog = nv2a_programmable_fog_factor(
+                draw, fog_distance);
+        }
+        for (uint32_t stage = 0u; stage < 4u; ++stage) {
+            const uint32_t texture_output = 9u + stage;
+            auto& coordinates = vertex.texture_coordinates[stage];
+            coordinates = vertex.program_inputs[texture_output];
+            if (result.output_masks[texture_output]) {
+                ++local.texture_output_vertex_count;
+                nv2a_vsh::write_mask(
+                    coordinates,
+                    result.outputs[texture_output],
+                    result.output_masks[texture_output]);
+            }
+        }
+        const auto& texture = vertex.texture_coordinates[
+            std::min<uint32_t>(draw.texture_stage, 3u)];
+        vertex.u = texture[0];
+        vertex.v = texture[1];
+        vertex.texture_r = texture[2];
+        vertex.texture_q = texture[3];
+        local.include_output_color(vertex.r, vertex.g, vertex.b, vertex.a);
+        ++transformed;
+    }
+    if (diagnostics != nullptr) {
+        diagnostics->merge(local);
+    }
+    return transformed;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:803-820 | fixed_function_composite_matrix_valid =====
+
+bool fixed_function_composite_matrix_valid(const NativeDraw& draw) {
+    if (draw.skin_mode != 0u) {
+        return false;
+    }
+    bool any_non_zero = false;
+    for (uint32_t row = 0; row < 4u; ++row) {
+        for (uint32_t lane = 0; lane < 4u; ++lane) {
+            float value = 0.0f;
+            const uint32_t bits = draw.transform_constants[row][lane];
+            std::memcpy(&value, &bits, sizeof(value));
+            if (!std::isfinite(value)) {
+                return false;
+            }
+            any_non_zero |= value != 0.0f;
+        }
+    }
+    return any_non_zero;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:823-920 | execute_presented_fixed_function_transform =====
+
+uint32_t execute_presented_fixed_function_transform(
+    std::vector<NativeVertex>& vertices,
+    const NativeDraw& draw,
+    PresentedVertexTransformDiagnostics* diagnostics) {
+    if ((draw.transform_execution_mode & 3u) != 0u
+        || draw.first_vertex + draw.vertex_count > vertices.size()) {
+        return 0u;
+    }
+    PresentedVertexTransformDiagnostics local{};
+    local.eligible_vertex_count = draw.vertex_count;
+    local.fixed_function_vertex_count = draw.vertex_count;
+    if (!fixed_function_composite_matrix_valid(draw)) {
+        local.invalid_fixed_function_vertex_count = draw.vertex_count;
+        local.raw_position_fallback_vertex_count = draw.vertex_count;
+        if (diagnostics != nullptr) {
+            diagnostics->merge(local);
+        }
+        return 0u;
+    }
+    auto constant = [&](uint32_t row, uint32_t lane) {
+        float value = 0.0f;
+        const uint32_t bits = draw.transform_constants[row][lane];
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    };
+    const float viewport_offset_x = constant(59u, 0u);
+    const float viewport_offset_y = constant(59u, 1u);
+    const float viewport_depth_scale = constant(58u, 2u);
+    constexpr float minimum_w = 0x1p-64f;
+    constexpr float maximum_w = 0x1p64f;
+    uint32_t transformed = 0u;
+    for (uint32_t index = 0; index < draw.vertex_count; ++index) {
+        NativeVertex& vertex = vertices[draw.first_vertex + index];
+        local.input_position_bounds.include(vertex.x, vertex.y);
+        local.input_z_bounds.include(vertex.z);
+        local.input_w_bounds.include(vertex.w);
+        const std::array<float, 4> position{
+            vertex.x,
+            vertex.y,
+            vertex.z,
+            vertex.w,
+        };
+        std::array<float, 4> clip{};
+        for (uint32_t output = 0u; output < 4u; ++output) {
+            for (uint32_t input = 0u; input < 4u; ++input) {
+                clip[output] += position[input] * constant(output, input);
+            }
+        }
+        if (!std::all_of(
+                clip.begin(), clip.end(),
+                [](float value) { return std::isfinite(value); })) {
+            ++local.invalid_fixed_function_vertex_count;
+            ++local.raw_position_fallback_vertex_count;
+            continue;
+        }
+        float homogeneous_w = clip[3];
+        if (homogeneous_w >= 0.0f) {
+            homogeneous_w = std::clamp(
+                homogeneous_w, minimum_w, maximum_w);
+        } else {
+            homogeneous_w = std::clamp(
+                homogeneous_w, -maximum_w, -minimum_w);
+        }
+        const float screen_x = std::trunc(
+            (clip[0] / homogeneous_w + viewport_offset_x) * 16.0f) / 16.0f;
+        const float screen_y = std::trunc(
+            (clip[1] / homogeneous_w + viewport_offset_y) * 16.0f) / 16.0f;
+        if (!std::isfinite(screen_x) || !std::isfinite(screen_y)) {
+            ++local.invalid_fixed_function_vertex_count;
+            ++local.raw_position_fallback_vertex_count;
+            continue;
+        }
+        local.clip_position_bounds.include(clip[0], clip[1]);
+        local.program_output_z_bounds.include(clip[2]);
+        local.program_output_w_bounds.include(homogeneous_w);
+        local.output_pixel_bounds.include(screen_x, screen_y);
+        ++local.position_output_vertex_count;
+        ++local.homogeneous_position_vertex_count;
+        ++local.screen_space_position_vertex_count;
+        ++local.fixed_function_transformed_vertex_count;
+        vertex.x = screen_x;
+        vertex.y = screen_y;
+        vertex.w = homogeneous_w;
+        const float normalized_depth =
+            std::isfinite(viewport_depth_scale)
+                && std::abs(viewport_depth_scale) > 0.000001f
+            ? clip[2] / viewport_depth_scale
+            : clip[2];
+        vertex.z = normalized_depth / homogeneous_w;
+        vertex.program_position_valid = std::isfinite(vertex.z);
+        local.include_output_color(vertex.r, vertex.g, vertex.b, vertex.a);
+        ++transformed;
+    }
+    if (diagnostics != nullptr) {
+        diagnostics->merge(local);
+    }
+    return transformed;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:923-957 | normalize_presented_linear_texture_coordinates =====
+
+uint32_t normalize_presented_linear_texture_coordinates(
+    std::vector<NativeVertex>& vertices,
+    const NativeDraw& draw) {
+    if (!draw.texture_enabled
+        || draw.texture_stage >= draw.texture_formats.size()
+        || draw.first_vertex + draw.vertex_count > vertices.size()) {
+        return 0u;
+    }
+    bool normalized = false;
+    for (uint32_t stage = 0u; stage < draw.texture_formats.size(); ++stage) {
+        const uint32_t format_raw = draw.texture_formats[stage];
+        if ((draw.texture_controls[stage] & (1u << 30u)) == 0u
+            || !nv2a_texture_format_is_linear(format_raw)) {
+            continue;
+        }
+        const auto [width, height] = nv2a_texture_extent(
+            format_raw,
+            draw.texture_image_rects[stage]);
+        if (width == 0u || height == 0u) {
+            continue;
+        }
+        for (uint32_t index = 0; index < draw.vertex_count; ++index) {
+            NativeVertex& vertex = vertices[draw.first_vertex + index];
+            auto& coordinates = vertex.texture_coordinates[stage];
+            coordinates[0] /= static_cast<float>(width);
+            coordinates[1] /= static_cast<float>(height);
+            if (stage == draw.texture_stage) {
+                vertex.u = coordinates[0];
+                vertex.v = coordinates[1];
+            }
+        }
+        normalized = true;
+    }
+    return normalized ? draw.vertex_count : 0u;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:960-987 | presented_vertex_span =====
+
+std::pair<size_t, size_t> presented_vertex_span(
+    const InterpretedD3DStream& stream) {
+    const size_t first_draw = std::min<size_t>(
+        stream.presented_draw_begin,
+        stream.draws.size());
+    const size_t end_draw = std::min<size_t>(
+        first_draw + stream.presented_draw_count,
+        stream.draws.size());
+    size_t first_vertex = stream.vertices.size();
+    size_t end_vertex = 0;
+    for (size_t draw_index = first_draw; draw_index < end_draw; ++draw_index) {
+        const NativeDraw& draw = stream.draws[draw_index];
+        if (draw.gpu_raw_attribute_fetch) {
+            continue;
+        }
+        const size_t draw_first = draw.first_vertex;
+        const size_t draw_end = draw_first + draw.vertex_count;
+        if (draw.vertex_count == 0u || draw_end > stream.vertices.size()) {
+            continue;
+        }
+        first_vertex = std::min(first_vertex, draw_first);
+        end_vertex = std::max(end_vertex, draw_end);
+    }
+    if (first_vertex >= end_vertex) {
+        return {0u, 0u};
+    }
+    return {first_vertex, end_vertex};
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:1084-1098 | parse_hex_byte =====
+
+uint8_t parse_hex_byte(const std::string& value, size_t offset) {
+    const auto nibble = [&](char ch) -> uint8_t {
+        if (ch >= '0' && ch <= '9') {
+            return static_cast<uint8_t>(ch - '0');
+        }
+        if (ch >= 'a' && ch <= 'f') {
+            return static_cast<uint8_t>(10 + ch - 'a');
+        }
+        if (ch >= 'A' && ch <= 'F') {
+            return static_cast<uint8_t>(10 + ch - 'A');
+        }
+        throw std::runtime_error("invalid render stream bytes_hex digit");
+    };
+    return static_cast<uint8_t>((nibble(value[offset]) << 4u) | nibble(value[offset + 1u]));
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:1867-1889 | dominant_surface_payload_from_words =====
+
+SurfacePayloadCandidate dominant_surface_payload_from_words(
+    const std::vector<PushBufferWord>& words) {
+    SurfacePayloadCandidate candidate{};
+    candidate.sample_count = static_cast<uint32_t>(words.size());
+    if (words.empty()) {
+        return candidate;
+    }
+
+    std::unordered_map<uint32_t, uint32_t> counts;
+    counts.reserve(words.size());
+    for (const PushBufferWord& word : words) {
+        ++counts[word.value];
+    }
+    for (const auto& [value, count] : counts) {
+        if (count > candidate.dominant_count
+            || (count == candidate.dominant_count && value < candidate.argb)) {
+            candidate.argb = value;
+            candidate.dominant_count = count;
+        }
+    }
+    candidate.valid = candidate.dominant_count >= 2u;
+    return candidate;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:1892-1896 | float_from_u32 =====
+
+float float_from_u32(uint32_t value) {
+    float result = 0.0f;
+    std::memcpy(&result, &value, sizeof(result));
+    return result;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:1899-1903 | u32_from_float =====
+
+uint32_t u32_from_float(float value) {
+    uint32_t result = 0u;
+    std::memcpy(&result, &value, sizeof(result));
+    return result;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:1906-1911 | float_from_i16_bits =====
+
+float float_from_i16_bits(uint32_t value) {
+    const uint16_t bits = static_cast<uint16_t>(value);
+    int16_t result = 0;
+    std::memcpy(&result, &bits, sizeof(result));
+    return static_cast<float>(result);
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:1914-1981 | native_draw_from_interpreted_state =====
+
+NativeDraw native_draw_from_interpreted_state(
+    const InterpretedD3DStream& interpreted) {
+    NativeDraw draw{};
+    draw.primitive = interpreted.active_primitive;
+    draw.texture_offsets = interpreted.texture_offsets;
+    draw.texture_addresses = interpreted.texture_addresses;
+    draw.texture_formats = interpreted.texture_formats;
+    draw.texture_image_rects = interpreted.texture_image_rects;
+    draw.texture_controls = interpreted.texture_controls;
+    draw.texture_filters = interpreted.texture_filters;
+    draw.vertex_offsets = interpreted.vertex_offsets;
+    draw.vertex_formats = interpreted.vertex_formats;
+    draw.current_vertex_attributes = interpreted.current_vertex_attributes;
+    draw.blend_enable = interpreted.blend_enable;
+    draw.blend_source_factor = interpreted.blend_source_factor;
+    draw.blend_destination_factor = interpreted.blend_destination_factor;
+    draw.blend_equation = interpreted.blend_equation;
+    draw.alpha_test_enable = interpreted.alpha_test_enable;
+    draw.alpha_function = interpreted.alpha_function;
+    draw.alpha_reference = interpreted.alpha_reference;
+    draw.surface_format = interpreted.surface_format;
+    draw.surface_pitch = interpreted.surface_pitch;
+    draw.surface_color_offset = interpreted.surface_color_offset;
+    draw.surface_clip_horizontal = interpreted.surface_clip_horizontal;
+    draw.surface_clip_vertical = interpreted.surface_clip_vertical;
+    draw.color_mask = interpreted.color_mask;
+    draw.depth_test_enable = interpreted.depth_test_enable;
+    draw.depth_function = interpreted.depth_function;
+    draw.depth_write_enable = interpreted.depth_write_enable;
+    draw.polygon_offset_fill_enable = interpreted.polygon_offset_fill_enable;
+    draw.polygon_offset_scale_factor = interpreted.polygon_offset_scale_factor;
+    draw.polygon_offset_bias = interpreted.polygon_offset_bias;
+    draw.skin_mode = interpreted.skin_mode;
+    draw.specular_enable = interpreted.specular_enable;
+    draw.cull_face_enable = interpreted.cull_face_enable;
+    draw.cull_face = interpreted.cull_face;
+    draw.front_face = interpreted.front_face;
+    draw.shader_stage_program = interpreted.shader_stage_program;
+    draw.combiner_control = interpreted.combiner_control;
+    draw.combiner_color_inputs = interpreted.combiner_color_inputs;
+    draw.combiner_color_outputs = interpreted.combiner_color_outputs;
+    draw.combiner_alpha_inputs = interpreted.combiner_alpha_inputs;
+    draw.combiner_alpha_outputs = interpreted.combiner_alpha_outputs;
+    draw.combiner_factors0 = interpreted.combiner_factors0;
+    draw.combiner_factors1 = interpreted.combiner_factors1;
+    draw.final_combiner_inputs0 = interpreted.final_combiner_inputs0;
+    draw.final_combiner_inputs1 = interpreted.final_combiner_inputs1;
+    draw.final_combiner_factors = interpreted.final_combiner_factors;
+    draw.fog_mode = interpreted.fog_mode;
+    draw.fog_generation_mode = interpreted.fog_generation_mode;
+    draw.fog_enable = interpreted.fog_enable;
+    draw.fog_color = interpreted.fog_color;
+    draw.fog_params = interpreted.fog_params;
+    draw.transform_execution_mode = interpreted.transform_execution_mode;
+    draw.transform_program_start = interpreted.transform_program_start;
+    draw.transform_program = interpreted.transform_program;
+    draw.transform_constants = interpreted.transform_constants;
+    for (uint32_t stage = 0; stage < interpreted.texture_controls.size(); ++stage) {
+        if ((interpreted.texture_controls[stage] & (1u << 30u)) == 0u) {
+            continue;
+        }
+        draw.texture_enabled = true;
+        draw.texture_stage = stage;
+        draw.texture_address = interpreted.texture_offsets[stage];
+        break;
+    }
+    return draw;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:1984-2132 | finish_inline_draw =====
+
+void finish_inline_draw(InterpretedD3DStream& interpreted) {
+    if (interpreted.active_primitive == 0 || interpreted.inline_words.empty()) {
+        interpreted.inline_words.clear();
+        return;
+    }
+    uint32_t stride_words = 0;
+    for (uint32_t format : interpreted.vertex_formats) {
+        const uint32_t type = format & 0xFu;
+        const uint32_t components = (format >> 4u) & 0xFu;
+        if (type == 2u) {
+            stride_words += components;
+        } else if ((type == 0u || type == 4u || type == 6u) && components != 0u) {
+            stride_words += 1u;
+        } else {
+            stride_words += (components + 1u) / 2u;
+        }
+    }
+    if (stride_words == 0) {
+        interpreted.inline_words.clear();
+        return;
+    }
+    NativeDraw draw = native_draw_from_interpreted_state(interpreted);
+    std::vector<NativeVertex> decoded_vertices;
+    decoded_vertices.reserve(interpreted.inline_words.size() / stride_words);
+    for (size_t base = 0; base + stride_words <= interpreted.inline_words.size(); base += stride_words) {
+        size_t cursor = base;
+        NativeVertex vertex{};
+        vertex.program_inputs = draw.current_vertex_attributes;
+        const auto& current_position = vertex.program_inputs[0];
+        vertex.x = current_position[0];
+        vertex.y = current_position[1];
+        vertex.z = current_position[2];
+        vertex.w = current_position[3];
+        const auto& current_diffuse = vertex.program_inputs[3];
+        vertex.r = current_diffuse[0];
+        vertex.g = current_diffuse[1];
+        vertex.b = current_diffuse[2];
+        vertex.a = current_diffuse[3];
+        const auto& current_secondary = vertex.program_inputs[4];
+        vertex.secondary_r = current_secondary[0];
+        vertex.secondary_g = current_secondary[1];
+        vertex.secondary_b = current_secondary[2];
+        vertex.secondary_a = current_secondary[3];
+        const auto& current_texture = vertex.program_inputs[
+            std::min<uint32_t>(9u + draw.texture_stage, 15u)];
+        vertex.u = current_texture[0];
+        vertex.v = current_texture[1];
+        vertex.texture_r = current_texture[2];
+        vertex.texture_q = current_texture[3];
+        for (uint32_t stage = 0u; stage < 4u; ++stage) {
+            vertex.texture_coordinates[stage] =
+                vertex.program_inputs[9u + stage];
+        }
+        for (uint32_t slot = 0; slot < interpreted.vertex_formats.size(); ++slot) {
+            const uint32_t format = interpreted.vertex_formats[slot];
+            const uint32_t type = format & 0xFu;
+            const uint32_t components = (format >> 4u) & 0xFu;
+            uint32_t word_count = 0;
+            if (type == 2u) {
+                word_count = components;
+            } else if ((type == 0u || type == 4u || type == 6u) && components != 0u) {
+                word_count = 1u;
+            } else {
+                word_count = (components + 1u) / 2u;
+            }
+            if (cursor + word_count > interpreted.inline_words.size()) {
+                break;
+            }
+            if (slot == 0 && type == 2u && components >= 2u) {
+                vertex.raw_x_bits = interpreted.inline_words[cursor];
+                vertex.raw_y_bits = interpreted.inline_words[cursor + 1u];
+                vertex.x = float_from_u32(interpreted.inline_words[cursor]);
+                vertex.y = float_from_u32(interpreted.inline_words[cursor + 1u]);
+                if (components >= 3u) {
+                    vertex.z = float_from_u32(interpreted.inline_words[cursor + 2u]);
+                }
+                if (components >= 4u) {
+                    vertex.w = float_from_u32(interpreted.inline_words[cursor + 3u]);
+                }
+            } else if (slot == 3 && word_count >= 1u) {
+                const uint32_t argb = interpreted.inline_words[cursor];
+                vertex.a = static_cast<float>((argb >> 24u) & 0xFFu) / 255.0f;
+                vertex.r = static_cast<float>((argb >> 16u) & 0xFFu) / 255.0f;
+                vertex.g = static_cast<float>((argb >> 8u) & 0xFFu) / 255.0f;
+                vertex.b = static_cast<float>(argb & 0xFFu) / 255.0f;
+            } else if (slot == 4 && word_count >= 1u) {
+                const uint32_t argb = interpreted.inline_words[cursor];
+                vertex.secondary_a = static_cast<float>(
+                    (argb >> 24u) & 0xFFu) / 255.0f;
+                vertex.secondary_r = static_cast<float>(
+                    (argb >> 16u) & 0xFFu) / 255.0f;
+                vertex.secondary_g = static_cast<float>(
+                    (argb >> 8u) & 0xFFu) / 255.0f;
+                vertex.secondary_b = static_cast<float>(
+                    argb & 0xFFu) / 255.0f;
+            } else if (slot == std::min<uint32_t>(9u + draw.texture_stage, 15u)
+                       && type == 2u && components >= 2u) {
+                vertex.u = float_from_u32(interpreted.inline_words[cursor]);
+                vertex.v = float_from_u32(interpreted.inline_words[cursor + 1u]);
+                if (components >= 3u) {
+                    vertex.texture_r = float_from_u32(
+                        interpreted.inline_words[cursor + 2u]);
+                }
+                if (components >= 4u) {
+                    vertex.texture_q = float_from_u32(
+                        interpreted.inline_words[cursor + 3u]);
+                }
+            }
+            cursor += word_count;
+        }
+        vertex.texture_coordinates[
+            std::min<uint32_t>(draw.texture_stage, 3u)] = {
+                vertex.u,
+                vertex.v,
+                vertex.texture_r,
+                vertex.texture_q,
+            };
+        decoded_vertices.push_back(vertex);
+    }
+    if (draw.primitive == 8u) {
+        constexpr std::array<size_t, 4> quad_strip_order{0u, 1u, 3u, 2u};
+        const size_t quad_count = decoded_vertices.size() / 4u;
+        for (size_t quad_index = 0; quad_index < quad_count; ++quad_index) {
+            NativeDraw converted = draw;
+            converted.first_vertex = static_cast<uint32_t>(
+                interpreted.vertices.size());
+            converted.vertex_count = 4u;
+            converted.primitive = 6u;
+            const size_t quad_begin = quad_index * 4u;
+            for (const size_t vertex_index : quad_strip_order) {
+                interpreted.vertices.push_back(
+                    decoded_vertices[quad_begin + vertex_index]);
+            }
+            interpreted.draws.push_back(std::move(converted));
+        }
+        interpreted.converted_quad_count += static_cast<uint32_t>(quad_count);
+        interpreted.discarded_quad_vertex_count += static_cast<uint32_t>(
+            decoded_vertices.size() - quad_count * 4u);
+    } else if (!decoded_vertices.empty()) {
+        draw.first_vertex = static_cast<uint32_t>(interpreted.vertices.size());
+        draw.vertex_count = static_cast<uint32_t>(decoded_vertices.size());
+        interpreted.vertices.insert(
+            interpreted.vertices.end(),
+            decoded_vertices.begin(),
+            decoded_vertices.end());
+        interpreted.draws.push_back(std::move(draw));
+    }
+    interpreted.inline_words.clear();
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:2135-2149 | finish_indexed_draw =====
+
+void finish_indexed_draw(InterpretedD3DStream& interpreted) {
+    if (interpreted.active_primitive == 0
+        || interpreted.active_vertex_indices.empty()) {
+        interpreted.active_vertex_indices.clear();
+        return;
+    }
+    NativeDraw draw = native_draw_from_interpreted_state(interpreted);
+    draw.indexed_array = true;
+    draw.vertex_indices = std::move(interpreted.active_vertex_indices);
+    interpreted.indexed_array_element_count += static_cast<uint32_t>(
+        draw.vertex_indices.size());
+    ++interpreted.indexed_array_draw_count;
+    interpreted.draws.push_back(std::move(draw));
+    interpreted.active_vertex_indices.clear();
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:2152-2210 | nv2a_method_is_batchable_state =====
+
+bool nv2a_method_is_batchable_state(uint32_t method) {
+    if ((method >= 0x0680u && method <= 0x06BCu)
+        || (method >= 0x0A20u && method <= 0x0A2Cu)
+        || (method >= 0x0AF0u && method <= 0x0AFCu)
+        || (method >= 0x0B00u && method <= 0x0BFCu)
+        || (method >= 0x1720u && method <= 0x179Cu)
+        || (method >= 0x1880u && method <= 0x1AFCu)
+        || (method >= 0x1B00u && method < 0x1C00u)
+        || (method >= 0x0260u && method <= 0x027Cu)
+        || (method >= 0x09C0u && method <= 0x09C8u)
+        || (method >= 0x0A60u && method <= 0x0ADCu)
+        || (method >= 0x1E20u && method <= 0x1E24u)
+        || (method >= 0x1E40u && method <= 0x1E5Cu)
+        || (method >= 0x1E80u && method <= 0x1E8Cu)) {
+        return (method & 3u) == 0u;
+    }
+    switch (method) {
+    case 0x0200u:
+    case 0x0204u:
+    case 0x0208u:
+    case 0x020Cu:
+    case 0x0210u:
+    case 0x0288u:
+    case 0x028Cu:
+    case 0x029Cu:
+    case 0x02A0u:
+    case 0x02A4u:
+    case 0x02A8u:
+    case 0x0300u:
+    case 0x0304u:
+    case 0x0308u:
+    case 0x030Cu:
+    case 0x0328u:
+    case 0x0338u:
+    case 0x033Cu:
+    case 0x0340u:
+    case 0x0344u:
+    case 0x0348u:
+    case 0x0350u:
+    case 0x0354u:
+    case 0x0358u:
+    case 0x035Cu:
+    case 0x0384u:
+    case 0x0388u:
+    case 0x039Cu:
+    case 0x03A0u:
+    case 0x03B8u:
+    case 0x1D90u:
+    case 0x1E60u:
+    case 0x1E70u:
+    case 0x1E94u:
+    case 0x1E9Cu:
+    case 0x1EA0u:
+    case 0x1EA4u:
+        return true;
+    default:
+        return false;
+    }
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:2336-2591 | interpret_nv2a_method =====
+
+void interpret_nv2a_method(
+    uint32_t method,
+    uint32_t data,
+    InterpretedD3DStream& interpreted) {
+    if (method == 0x012Cu) {
+        finish_inline_draw(interpreted);
+        finish_indexed_draw(interpreted);
+        interpreted.presented_draw_begin = interpreted.frame_draw_begin;
+        interpreted.presented_draw_count =
+            static_cast<uint32_t>(interpreted.draws.size()) - interpreted.frame_draw_begin;
+        interpreted.frame_draw_begin = static_cast<uint32_t>(interpreted.draws.size());
+        interpreted.presented_surface_clears =
+            std::move(interpreted.frame_surface_clears);
+        interpreted.frame_surface_clears.clear();
+        ++interpreted.flip_count;
+    } else if (method == 0x1810u) {
+        if (interpreted.active_primitive == 0u) {
+            ++interpreted.unsupported_draw_arrays_count;
+        } else {
+            const uint32_t first = data & 0x00FFFFFFu;
+            const uint32_t count = ((data >> 24u) & 0xFFu) + 1u;
+            for (uint32_t offset = 0; offset < count; ++offset) {
+                interpreted.active_vertex_indices.push_back(first + offset);
+            }
+        }
+    } else if (method == 0x17FCu) {
+        finish_inline_draw(interpreted);
+        finish_indexed_draw(interpreted);
+        interpreted.active_primitive = data;
+    } else if (method == 0x1800u && interpreted.active_primitive != 0u) {
+        interpreted.active_vertex_indices.push_back(data & 0xFFFFu);
+        interpreted.active_vertex_indices.push_back((data >> 16u) & 0xFFFFu);
+    } else if (method == 0x1808u && interpreted.active_primitive != 0u) {
+        interpreted.active_vertex_indices.push_back(data);
+    } else if (method == 0x1818u && interpreted.active_primitive != 0u) {
+        interpreted.inline_words.push_back(data);
+    } else if (method >= 0x1720u && method <= 0x175Cu && (method - 0x1720u) % 4u == 0u) {
+        interpreted.vertex_offsets[(method - 0x1720u) / 4u] = data;
+    } else if (method >= 0x1760u && method <= 0x179Cu && (method - 0x1760u) % 4u == 0u) {
+        interpreted.vertex_formats[(method - 0x1760u) / 4u] = data;
+    } else if (method >= 0x1880u && method <= 0x18FCu
+               && (method - 0x1880u) % 4u == 0u) {
+        const uint32_t slot = (method - 0x1880u) / 4u;
+        const uint32_t attribute = slot / 2u;
+        const uint32_t lane = slot % 2u;
+        interpreted.current_vertex_attributes[attribute][lane] =
+            float_from_u32(data);
+        interpreted.current_vertex_attributes[attribute][2] = 0.0f;
+        interpreted.current_vertex_attributes[attribute][3] = 1.0f;
+    } else if (method >= 0x1900u && method <= 0x193Cu
+               && (method - 0x1900u) % 4u == 0u) {
+        const uint32_t attribute = (method - 0x1900u) / 4u;
+        interpreted.current_vertex_attributes[attribute] = {
+            float_from_i16_bits(data),
+            float_from_i16_bits(data >> 16u),
+            0.0f,
+            1.0f,
+        };
+    } else if (method >= 0x1940u && method <= 0x197Cu
+               && (method - 0x1940u) % 4u == 0u) {
+        const uint32_t attribute = (method - 0x1940u) / 4u;
+        interpreted.current_vertex_attributes[attribute] = {
+            static_cast<float>(data & 0xFFu) / 255.0f,
+            static_cast<float>((data >> 8u) & 0xFFu) / 255.0f,
+            static_cast<float>((data >> 16u) & 0xFFu) / 255.0f,
+            static_cast<float>((data >> 24u) & 0xFFu) / 255.0f,
+        };
+    } else if (method >= 0x1980u && method <= 0x19FCu
+               && (method - 0x1980u) % 4u == 0u) {
+        const uint32_t slot = (method - 0x1980u) / 4u;
+        const uint32_t attribute = slot / 2u;
+        const uint32_t lane = (slot % 2u) * 2u;
+        interpreted.current_vertex_attributes[attribute][lane] =
+            float_from_i16_bits(data);
+        interpreted.current_vertex_attributes[attribute][lane + 1u] =
+            float_from_i16_bits(data >> 16u);
+    } else if (method >= 0x1A00u && method <= 0x1AFCu
+               && (method - 0x1A00u) % 4u == 0u) {
+        const uint32_t slot = (method - 0x1A00u) / 4u;
+        interpreted.current_vertex_attributes[slot / 4u][slot % 4u] =
+            float_from_u32(data);
+    } else if (method >= 0x0680u && method <= 0x06BCu && (method - 0x0680u) % 4u == 0u) {
+        // NV097_SET_COMPOSITE_MATRIX aliases fixed-function constants 0-3.
+        const uint32_t slot = (method - 0x0680u) / 4u;
+        interpreted.transform_constants[slot / 4u][slot % 4u] = data;
+    } else if (method >= 0x0A20u && method <= 0x0A2Cu && (method - 0x0A20u) % 4u == 0u) {
+        // NV097_SET_VIEWPORT_OFFSET aliases vertex constant 59.
+        interpreted.transform_constants[59u][(method - 0x0A20u) / 4u] = data;
+    } else if (method >= 0x0AF0u && method <= 0x0AFCu && (method - 0x0AF0u) % 4u == 0u) {
+        // NV097_SET_VIEWPORT_SCALE aliases vertex constant 58.
+        interpreted.transform_constants[58u][(method - 0x0AF0u) / 4u] = data;
+    } else if (method >= 0x0B00u && method <= 0x0B7Cu && (method - 0x0B00u) % 4u == 0u) {
+        const uint32_t slot = (method - 0x0B00u) / 4u;
+        if (interpreted.transform_program_load < interpreted.transform_program.size()) {
+            interpreted.transform_program[interpreted.transform_program_load][slot % 4u] = data;
+            if (slot % 4u == 3u) {
+                ++interpreted.transform_program_load;
+            }
+        }
+    } else if (method >= 0x0B80u && method <= 0x0BFCu && (method - 0x0B80u) % 4u == 0u) {
+        const uint32_t slot = (method - 0x0B80u) / 4u;
+        if (interpreted.transform_constant_load < interpreted.transform_constants.size()) {
+            interpreted.transform_constants[interpreted.transform_constant_load][slot % 4u] = data;
+            if (slot % 4u == 3u) {
+                ++interpreted.transform_constant_load;
+            }
+        }
+    } else if (method == 0x1E94u) {
+        interpreted.transform_execution_mode = data;
+    } else if (method >= 0x1E80u && method <= 0x1E8Cu && (method - 0x1E80u) % 4u == 0u) {
+        interpreted.transform_data[(method - 0x1E80u) / 4u] = data;
+    } else if (method == 0x1E90u) {
+        std::array<std::array<float, 4>, 16> inputs{};
+        for (uint32_t lane = 0; lane < 4u; ++lane) {
+            inputs[0][lane] = float_from_u32(interpreted.transform_data[lane]);
+        }
+        std::array<std::array<uint32_t, 4>, 192> updated_constants{};
+        const Nv2aVertexProgramResult launch = execute_nv2a_vertex_program(
+            interpreted.transform_program,
+            interpreted.transform_constants,
+            data,
+            inputs,
+            &updated_constants);
+        if (launch.valid) {
+            interpreted.transform_constants = std::move(updated_constants);
+            ++interpreted.launch_transform_program_count;
+        } else {
+            ++interpreted.failed_launch_transform_program_count;
+        }
+    } else if (method == 0x1E9Cu) {
+        interpreted.transform_program_load = data;
+    } else if (method == 0x1EA0u) {
+        interpreted.transform_program_start = data;
+    } else if (method == 0x1EA4u) {
+        interpreted.transform_constant_load = data;
+    } else if (method == 0x1D94u) {
+        ++interpreted.clear_surface_method_count;
+        interpreted.frame_surface_clears.push_back({
+            interpreted.surface_color_offset,
+            data,
+            interpreted.clear_color_argb,
+            static_cast<uint32_t>(interpreted.draws.size())
+                - interpreted.frame_draw_begin,
+        });
+    } else if (method == 0x0304u) {
+        interpreted.blend_enable = data;
+    } else if (method == 0x0300u) {
+        interpreted.alpha_test_enable = data;
+    } else if (method == 0x033Cu) {
+        interpreted.alpha_function = data;
+    } else if (method == 0x0340u) {
+        interpreted.alpha_reference = data;
+    } else if (method == 0x0344u) {
+        interpreted.blend_source_factor = data;
+    } else if (method == 0x0348u) {
+        interpreted.blend_destination_factor = data;
+    } else if (method == 0x0350u) {
+        interpreted.blend_equation = data;
+    } else if (method == 0x0200u) {
+        interpreted.surface_clip_horizontal = data;
+    } else if (method == 0x0204u) {
+        interpreted.surface_clip_vertical = data;
+    } else if (method == 0x0208u) {
+        interpreted.surface_format = data;
+    } else if (method == 0x020Cu) {
+        interpreted.surface_pitch = data;
+    } else if (method == 0x0210u) {
+        interpreted.surface_color_offset = data;
+    } else if (method >= 0x0260u && method <= 0x027Cu
+               && (method - 0x0260u) % 4u == 0u) {
+        interpreted.combiner_alpha_inputs[(method - 0x0260u) / 4u] = data;
+    } else if (method == 0x0288u) {
+        interpreted.final_combiner_inputs0 = data;
+    } else if (method == 0x028Cu) {
+        interpreted.final_combiner_inputs1 = data;
+    } else if (method == 0x029Cu) {
+        interpreted.fog_mode = data;
+    } else if (method == 0x02A0u) {
+        interpreted.fog_generation_mode = data;
+    } else if (method == 0x02A4u) {
+        interpreted.fog_enable = data;
+    } else if (method == 0x02A8u) {
+        interpreted.fog_color = data;
+    } else if (method == 0x0358u) {
+        interpreted.color_mask = data;
+    } else if (method == 0x030Cu) {
+        interpreted.depth_test_enable = data;
+    } else if (method == 0x0308u) {
+        interpreted.cull_face_enable = data;
+    } else if (method == 0x0354u) {
+        interpreted.depth_function = data;
+    } else if (method == 0x035Cu) {
+        interpreted.depth_write_enable = data;
+    } else if (method == 0x0338u) {
+        interpreted.polygon_offset_fill_enable = data;
+    } else if (method == 0x0384u) {
+        interpreted.polygon_offset_scale_factor = data;
+    } else if (method == 0x0388u) {
+        interpreted.polygon_offset_bias = data;
+    } else if (method == 0x0328u) {
+        interpreted.skin_mode = data;
+    } else if (method == 0x03B8u) {
+        interpreted.specular_enable = data;
+    } else if (method == 0x039Cu) {
+        interpreted.cull_face = data;
+    } else if (method == 0x03A0u) {
+        interpreted.front_face = data;
+    } else if (method >= 0x09C0u && method <= 0x09C8u
+               && (method - 0x09C0u) % 4u == 0u) {
+        interpreted.fog_params[(method - 0x09C0u) / 4u] = data;
+    } else if (method >= 0x0A60u && method <= 0x0A7Cu
+               && (method - 0x0A60u) % 4u == 0u) {
+        interpreted.combiner_factors0[(method - 0x0A60u) / 4u] = data;
+    } else if (method >= 0x0A80u && method <= 0x0A9Cu
+               && (method - 0x0A80u) % 4u == 0u) {
+        interpreted.combiner_factors1[(method - 0x0A80u) / 4u] = data;
+    } else if (method >= 0x0AA0u && method <= 0x0ABCu
+               && (method - 0x0AA0u) % 4u == 0u) {
+        interpreted.combiner_alpha_outputs[(method - 0x0AA0u) / 4u] = data;
+    } else if (method >= 0x0AC0u && method <= 0x0ADCu
+               && (method - 0x0AC0u) % 4u == 0u) {
+        interpreted.combiner_color_inputs[(method - 0x0AC0u) / 4u] = data;
+    } else if (method >= 0x1E20u && method <= 0x1E24u
+               && (method - 0x1E20u) % 4u == 0u) {
+        interpreted.final_combiner_factors[(method - 0x1E20u) / 4u] = data;
+    } else if (method >= 0x1E40u && method <= 0x1E5Cu
+               && (method - 0x1E40u) % 4u == 0u) {
+        interpreted.combiner_color_outputs[(method - 0x1E40u) / 4u] = data;
+    } else if (method == 0x1E70u) {
+        interpreted.shader_stage_program = data;
+    } else if (method == 0x1E60u) {
+        interpreted.combiner_control = data;
+    } else if (method >= 0x1B00u && method < 0x1C00u) {
+        const uint32_t stage = (method - 0x1B00u) / 0x40u;
+        const uint32_t register_offset = (method - 0x1B00u) % 0x40u;
+        if (stage < 4u) {
+            if (register_offset == 0x00u) {
+                interpreted.texture_offsets[stage] = data;
+            } else if (register_offset == 0x04u) {
+                interpreted.texture_formats[stage] = data;
+            } else if (register_offset == 0x08u) {
+                interpreted.texture_addresses[stage] = data;
+            } else if (register_offset == 0x0Cu) {
+                interpreted.texture_controls[stage] = data;
+            } else if (register_offset == 0x1Cu) {
+                interpreted.texture_image_rects[stage] = data;
+            } else if (register_offset == 0x14u) {
+                interpreted.texture_filters[stage] = data;
+            }
+        }
+    }
+    if (method == 0x1D90u) {
+        interpreted.clear_color_valid = true;
+        interpreted.clear_color_argb = data;
+    }
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:2743-2895 | interpret_push_buffer_method_packet =====
+
+void interpret_push_buffer_method_packet(
+    const std::vector<PushBufferWord>& words,
+    size_t& index,
+    InterpretedD3DStream& interpreted,
+    bool non_increasing) {
+    const uint32_t command = words[index].value;
+    const uint32_t method_count = (command >> 18u) & 0x7FFu;
+    const uint32_t first_method = ((command >> 2u) & 0x7FFu) * 4u;
+    const uint32_t subchannel = (command >> 13u) & 0x7u;
+    ++index;
+    if (method_count == 0) {
+        ++interpreted.zero_count_method_word_count;
+        // NV4/NV10 DMA-pusher method headers with a zero count are legal
+        // no-ops. Burnout 2 emits one before each populated ARRAY_ELEMENT16
+        // packet, so retain the telemetry without treating it as a lost draw.
+        if (interpreted.active_primitive != 0u
+            && (first_method == 0x1800u || first_method == 0x1808u)) {
+            ++interpreted.zero_count_indexed_array_noop_packet_count;
+        }
+        update_d3d_state_seed(interpreted, command);
+        return;
+    }
+    ++interpreted.method_packet_count;
+    update_d3d_state_seed(interpreted, command);
+    const bool bulk_indexed = non_increasing
+        && first_method == 0x1800u
+        && interpreted.active_primitive != 0u;
+    const bool bulk_inline = non_increasing
+        && first_method == 0x1818u
+        && interpreted.active_primitive != 0u;
+    const bool complete_packet = method_count <= words.size() - index;
+    bool bulk_state = complete_packet && !bulk_indexed && !bulk_inline;
+    if (bulk_state) {
+        for (uint32_t method_index = 0u;
+             method_index < method_count;
+             ++method_index) {
+            const uint32_t method = non_increasing
+                ? first_method
+                : first_method + method_index * 4u;
+            if (!nv2a_method_is_batchable_state(method)) {
+                bulk_state = false;
+                break;
+            }
+        }
+    }
+    if ((bulk_indexed || bulk_inline || bulk_state) && complete_packet) {
+        const auto packet_begin = words.begin()
+            + static_cast<std::ptrdiff_t>(index);
+        const auto packet_end = packet_begin
+            + static_cast<std::ptrdiff_t>(method_count);
+        const bool one_contiguous_run =
+            words[index - 1u].run_id == packet_begin->run_id
+            && packet_begin->run_id == (packet_end - 1)->run_id;
+        if (one_contiguous_run) {
+            if (bulk_indexed) {
+                const size_t output_begin =
+                    interpreted.active_vertex_indices.size();
+                interpreted.active_vertex_indices.resize(
+                    output_begin + static_cast<size_t>(method_count) * 2u);
+                if (interpreted.state_seed_updates_required) {
+                    for (uint32_t method_index = 0u;
+                         method_index < method_count;
+                         ++method_index) {
+                        update_d3d_state_seed(interpreted, first_method);
+                        update_d3d_state_seed(
+                            interpreted, words[index + method_index].value);
+                    }
+                }
+                for (uint32_t method_index = 0u;
+                     method_index < method_count;
+                     ++method_index) {
+                    const uint32_t data = words[index + method_index].value;
+                    interpreted.active_vertex_indices[
+                        output_begin + method_index * 2u] =
+                            data & 0xFFFFu;
+                    interpreted.active_vertex_indices[
+                        output_begin + method_index * 2u + 1u] =
+                            (data >> 16u) & 0xFFFFu;
+                }
+                interpreted.bulk_indexed_method_count += method_count;
+                interpreted.last_bulk_indexed_method_count += method_count;
+            } else if (bulk_inline) {
+                const size_t output_begin = interpreted.inline_words.size();
+                interpreted.inline_words.resize(output_begin + method_count);
+                if (interpreted.state_seed_updates_required) {
+                    for (uint32_t method_index = 0u;
+                         method_index < method_count;
+                         ++method_index) {
+                        update_d3d_state_seed(interpreted, first_method);
+                        update_d3d_state_seed(
+                            interpreted, words[index + method_index].value);
+                    }
+                }
+                for (uint32_t method_index = 0u;
+                     method_index < method_count;
+                     ++method_index) {
+                    const uint32_t data = words[index + method_index].value;
+                    interpreted.inline_words[output_begin + method_index] = data;
+                }
+                interpreted.bulk_inline_method_count += method_count;
+                interpreted.last_bulk_inline_method_count += method_count;
+            } else {
+                for (uint32_t method_index = 0u;
+                     method_index < method_count;
+                     ++method_index) {
+                    const uint32_t method = non_increasing
+                        ? first_method
+                        : first_method + method_index * 4u;
+                    const uint32_t data =
+                        words[index + method_index].value;
+                    update_d3d_state_seed(interpreted, method);
+                    update_d3d_state_seed(interpreted, data);
+                    if (nv2a_state_method_is_unchanged(
+                            method, data, interpreted)) {
+                        ++interpreted.state_method_noop_count;
+                        ++interpreted.last_state_method_noop_count;
+                    } else {
+                        interpret_nv2a_method(method, data, interpreted);
+                    }
+                }
+                interpreted.bulk_state_method_count += method_count;
+                interpreted.last_bulk_state_method_count += method_count;
+            }
+            interpreted.interpreted_method_count += method_count;
+            index += method_count;
+            return;
+        }
+    }
+    for (uint32_t method_index = 0; method_index < method_count; ++method_index) {
+        if (index >= words.size()) {
+            interpreted.pending_method_packet = true;
+            interpreted.pending_long_count_word = false;
+            interpreted.pending_method_non_increasing = non_increasing;
+            interpreted.pending_first_method = first_method;
+            interpreted.pending_method_count = method_count;
+            interpreted.pending_method_index = method_index;
+            interpreted.pending_next_address = words[index - 1u].address + 4u;
+            interpreted.pending_method_subchannel = subchannel;
+            return;
+        }
+        if (push_buffer_word_starts_run(words, index)) {
+            ++interpreted.truncated_packet_count;
+            return;
+        }
+        const uint32_t method = non_increasing ? first_method : first_method + method_index * 4u;
+        const uint32_t data = words[index].value;
+        update_d3d_state_seed(interpreted, method);
+        update_d3d_state_seed(interpreted, data);
+        interpret_nv2a_method(method, data, interpreted);
+        ++interpreted.interpreted_method_count;
+        ++index;
+    }
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:2898-2952 | interpret_long_non_increasing_packet =====
+
+void interpret_long_non_increasing_packet(
+    const std::vector<PushBufferWord>& words,
+    size_t& index,
+    InterpretedD3DStream& interpreted) {
+    const uint32_t command = words[index].value;
+    const uint32_t first_method = ((command >> 2u) & 0x7FFu) * 4u;
+    const uint32_t subchannel = (command >> 13u) & 0x7u;
+    update_d3d_state_seed(interpreted, command);
+    ++index;
+    if (index >= words.size()) {
+        interpreted.pending_method_packet = true;
+        interpreted.pending_long_count_word = true;
+        interpreted.pending_method_non_increasing = true;
+        interpreted.pending_first_method = first_method;
+        interpreted.pending_method_count = 0u;
+        interpreted.pending_method_index = 0u;
+        interpreted.pending_next_address = words[index - 1u].address + 4u;
+        interpreted.pending_method_subchannel = subchannel;
+        return;
+    }
+    if (push_buffer_word_starts_run(words, index)) {
+        ++interpreted.truncated_packet_count;
+        return;
+    }
+    const uint32_t method_count = words[index].value & 0x00FFFFFFu;
+    update_d3d_state_seed(interpreted, method_count);
+    ++index;
+    if (method_count == 0) {
+        ++interpreted.zero_count_method_word_count;
+        return;
+    }
+    ++interpreted.method_packet_count;
+    for (uint32_t method_index = 0; method_index < method_count; ++method_index) {
+        if (index >= words.size()) {
+            interpreted.pending_method_packet = true;
+            interpreted.pending_long_count_word = false;
+            interpreted.pending_method_non_increasing = true;
+            interpreted.pending_first_method = first_method;
+            interpreted.pending_method_count = method_count;
+            interpreted.pending_method_index = method_index;
+            interpreted.pending_next_address = words[index - 1u].address + 4u;
+            interpreted.pending_method_subchannel = subchannel;
+            return;
+        }
+        if (push_buffer_word_starts_run(words, index)) {
+            ++interpreted.truncated_packet_count;
+            return;
+        }
+        interpret_nv2a_method(first_method, words[index].value, interpreted);
+        update_d3d_state_seed(interpreted, first_method);
+        update_d3d_state_seed(interpreted, words[index].value);
+        ++interpreted.interpreted_method_count;
+        ++index;
+    }
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:2955-3006 | interpret_pending_push_buffer_method_packet =====
+
+void interpret_pending_push_buffer_method_packet(
+    const std::vector<PushBufferWord>& words,
+    size_t& index,
+    InterpretedD3DStream& interpreted) {
+    if (!interpreted.pending_method_packet || index >= words.size()) {
+        return;
+    }
+    if (words[index].address != interpreted.pending_next_address) {
+        ++interpreted.truncated_packet_count;
+        interpreted.pending_method_packet = false;
+        interpreted.pending_long_count_word = false;
+        return;
+    }
+    if (interpreted.pending_long_count_word) {
+        const uint32_t method_count = words[index].value & 0x00FFFFFFu;
+        update_d3d_state_seed(interpreted, method_count);
+        interpreted.pending_long_count_word = false;
+        interpreted.pending_method_count = method_count;
+        interpreted.pending_method_index = 0u;
+        interpreted.pending_next_address = words[index].address + 4u;
+        ++index;
+        if (method_count == 0u) {
+            ++interpreted.zero_count_method_word_count;
+            interpreted.pending_method_packet = false;
+            return;
+        }
+        ++interpreted.method_packet_count;
+    }
+    while (interpreted.pending_method_index < interpreted.pending_method_count) {
+        if (index >= words.size()) {
+            return;
+        }
+        if (words[index].address != interpreted.pending_next_address) {
+            ++interpreted.truncated_packet_count;
+            interpreted.pending_method_packet = false;
+            return;
+        }
+        const uint32_t method_index = interpreted.pending_method_index;
+        const uint32_t method = interpreted.pending_method_non_increasing
+            ? interpreted.pending_first_method
+            : interpreted.pending_first_method + method_index * 4u;
+        const uint32_t data = words[index].value;
+        update_d3d_state_seed(interpreted, method);
+        update_d3d_state_seed(interpreted, data);
+        interpret_nv2a_method(method, data, interpreted);
+        ++interpreted.interpreted_method_count;
+        ++interpreted.pending_method_index;
+        interpreted.pending_next_address = words[index].address + 4u;
+        ++index;
+    }
+    interpreted.pending_method_packet = false;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:3028-3047 | recovered_vertex_resource =====
+
+const RecoveredTextureResource* recovered_vertex_resource(
+    const RecoveredVertexResourceIndex& resource_index,
+    uint32_t address,
+    uint32_t size) {
+    const uint64_t requested_begin = address;
+    const uint64_t requested_end = requested_begin + size;
+    const auto candidates = resource_index.find(address >> 12u);
+    if (candidates == resource_index.end()) {
+        return nullptr;
+    }
+    for (const RecoveredTextureResource* resource : candidates->second) {
+        const uint64_t resource_begin = resource->address;
+        const uint64_t resource_end = resource_begin + resource->payload.size();
+        if (requested_begin < resource_begin || requested_end > resource_end) {
+            continue;
+        }
+        return resource;
+    }
+    return nullptr;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:3050-3060 | recovered_vertex_bytes =====
+
+const uint8_t* recovered_vertex_bytes(
+    const RecoveredVertexResourceIndex& resource_index,
+    uint32_t address,
+    uint32_t size) {
+    const RecoveredTextureResource* resource = recovered_vertex_resource(
+        resource_index, address, size);
+    return resource == nullptr
+        ? nullptr
+        : resource->payload.data()
+            + static_cast<size_t>(address - resource->address);
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:3063-3066 | sign_extend_vertex_component =====
+
+int32_t sign_extend_vertex_component(uint32_t value, uint32_t bits) {
+    const uint32_t shift = 32u - bits;
+    return static_cast<int32_t>(value << shift) >> shift;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:3069-3125 | decode_indexed_vertex_attribute_payload =====
+
+bool decode_indexed_vertex_attribute_payload(
+    const uint8_t* payload,
+    uint32_t format_raw,
+    std::array<float, 4>& output) {
+    const uint32_t type = format_raw & 0xFu;
+    const uint32_t components = (format_raw >> 4u) & 0xFu;
+    if (payload == nullptr || components == 0u) {
+        return false;
+    }
+    if (type == 2u) {
+        for (uint32_t component = 0; component < std::min(components, 4u); ++component) {
+            std::memcpy(&output[component], payload + component * 4u, sizeof(float));
+        }
+        return true;
+    }
+    if (type == 0u) {
+        output = {
+            static_cast<float>(payload[2]) / 255.0f,
+            static_cast<float>(payload[1]) / 255.0f,
+            static_cast<float>(payload[0]) / 255.0f,
+            static_cast<float>(payload[3]) / 255.0f,
+        };
+        return true;
+    }
+    if (type == 4u) {
+        for (uint32_t component = 0; component < std::min(components, 4u); ++component) {
+            output[component] = static_cast<float>(payload[component]) / 255.0f;
+        }
+        return true;
+    }
+    if (type == 1u || type == 5u) {
+        for (uint32_t component = 0; component < std::min(components, 4u); ++component) {
+            int16_t value = 0;
+            std::memcpy(&value, payload + component * 2u, sizeof(value));
+            output[component] = std::max(-1.0f, static_cast<float>(value) / 32767.0f);
+        }
+        return true;
+    }
+    if (type == 6u) {
+        uint32_t packed = 0;
+        std::memcpy(&packed, payload, sizeof(packed));
+        output[0] = std::max(
+            -1.0f,
+            static_cast<float>(sign_extend_vertex_component(packed & 0x7FFu, 11u))
+                / 1023.0f);
+        output[1] = std::max(
+            -1.0f,
+            static_cast<float>(sign_extend_vertex_component((packed >> 11u) & 0x7FFu, 11u))
+                / 1023.0f);
+        output[2] = std::max(
+            -1.0f,
+            static_cast<float>(sign_extend_vertex_component((packed >> 22u) & 0x3FFu, 10u))
+                / 511.0f);
+        return true;
+    }
+    return false;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:3128-3140 | decode_indexed_vertex_attribute =====
+
+bool decode_indexed_vertex_attribute(
+    const RecoveredVertexResourceIndex& resource_index,
+    uint32_t address,
+    uint32_t format_raw,
+    std::array<float, 4>& output) {
+    return decode_indexed_vertex_attribute_payload(
+        recovered_vertex_bytes(
+            resource_index,
+            address,
+            nv2a_vertex_element_size(format_raw)),
+        format_raw,
+        output);
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:3143-3221 | prepare_gpu_raw_attribute_fetch =====
+
+bool prepare_gpu_raw_attribute_fetch(
+    NativeDraw& draw,
+    const RecoveredVertexResourceIndex& resource_index,
+    const std::unordered_map<const RecoveredTextureResource*, uint32_t>&
+        packed_resource_offsets,
+    uint32_t raw_index_word_base,
+    std::vector<uint32_t>& raw_indices) {
+    if (!gpu_vertex_program_compatible(draw)
+        || draw.vertex_indices.empty()
+        || static_cast<uint64_t>(raw_index_word_base)
+                + raw_indices.size() + draw.vertex_indices.size()
+            > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    const auto [minimum_index, maximum_index] = std::minmax_element(
+        draw.vertex_indices.begin(), draw.vertex_indices.end());
+    std::array<uint32_t, 16> base_offsets{};
+    for (uint32_t slot = 0; slot < draw.vertex_formats.size(); ++slot) {
+        const uint32_t format_raw = draw.vertex_formats[slot];
+        const uint32_t type = format_raw & 0xFu;
+        const uint32_t element_size = nv2a_vertex_element_size(format_raw);
+        if (element_size == 0u) {
+            continue;
+        }
+        if ((type != 0u && type != 1u && type != 2u && type != 4u
+                && type != 5u && type != 6u)
+            || draw.vertex_offsets[slot] == 0u
+            || (format_raw >> 8u) == 0u) {
+            return false;
+        }
+        const uint64_t minimum_address = static_cast<uint64_t>(
+            draw.vertex_offsets[slot])
+            + static_cast<uint64_t>(*minimum_index) * (format_raw >> 8u);
+        const uint64_t maximum_address = static_cast<uint64_t>(
+            draw.vertex_offsets[slot])
+            + static_cast<uint64_t>(*maximum_index) * (format_raw >> 8u);
+        if (maximum_address > std::numeric_limits<uint32_t>::max()) {
+            return false;
+        }
+        // A vertex resource is one contiguous address interval. If both index
+        // extrema, including the final element width, resolve to the same
+        // resource, every linearly-strided index between them is resident too.
+        const RecoveredTextureResource* selected_resource =
+            recovered_vertex_resource(
+                resource_index,
+                static_cast<uint32_t>(minimum_address),
+                element_size);
+        const RecoveredTextureResource* maximum_resource =
+            recovered_vertex_resource(
+                resource_index,
+                static_cast<uint32_t>(maximum_address),
+                element_size);
+        if (selected_resource == nullptr
+            || maximum_resource != selected_resource) {
+            return false;
+        }
+        const auto packed = packed_resource_offsets.find(selected_resource);
+        if (packed == packed_resource_offsets.end()) {
+            return false;
+        }
+        // Unsigned wrap preserves packed + (array base - guest resource base)
+        // for captures whose resource begins at the first referenced vertex
+        // instead of the array's logical index-zero address.
+        base_offsets[slot] = packed->second
+            + draw.vertex_offsets[slot]
+            - selected_resource->address;
+    }
+    draw.gpu_raw_attribute_fetch = true;
+    draw.gpu_raw_source_index_base = raw_index_word_base
+        + static_cast<uint32_t>(raw_indices.size());
+    draw.gpu_raw_attribute_base_offsets = base_offsets;
+    draw.first_vertex = 0u;
+    draw.vertex_count = static_cast<uint32_t>(draw.vertex_indices.size());
+    raw_indices.insert(
+        raw_indices.end(),
+        draw.vertex_indices.begin(),
+        draw.vertex_indices.end());
+    return true;
+}
+
+
+===== runtime/host/nv2a_command_processor.cpp:3360-3486 | materialize_indexed_draws =====
+
+void materialize_indexed_draws(
+    InterpretedD3DStream& interpreted,
+    const std::vector<RecoveredTextureResource>& resources,
+    GpuRawVertexResourceCache& raw_resource_cache,
+    bool enable_gpu_raw_attribute_fetch,
+    bool resources_unchanged) {
+    const RecoveredVertexResourceIndex resource_index =
+        build_recovered_vertex_resource_index(resources);
+    std::unordered_map<const RecoveredTextureResource*, uint32_t>
+        packed_resource_offsets;
+    if (enable_gpu_raw_attribute_fetch
+        && !refresh_gpu_raw_vertex_resource_cache(
+            resources,
+            resources_unchanged,
+            raw_resource_cache,
+            packed_resource_offsets)) {
+        enable_gpu_raw_attribute_fetch = false;
+    }
+    interpreted.gpu_raw_vertex_indices.clear();
+    interpreted.gpu_raw_attribute_draw_count = 0u;
+    interpreted.gpu_raw_attribute_vertex_count = 0u;
+    for (NativeDraw& draw : interpreted.draws) {
+        if (!draw.indexed_array || draw.vertex_indices.empty()) {
+            continue;
+        }
+        const bool was_raw = draw.gpu_raw_attribute_fetch;
+        const bool was_materialized = was_raw || draw.vertex_count != 0u;
+        if (was_raw) {
+            draw.vertex_count = 0u;
+        }
+        draw.gpu_raw_attribute_fetch = false;
+        draw.gpu_raw_source_index_base = 0u;
+        draw.gpu_raw_attribute_base_offsets = {};
+        if (enable_gpu_raw_attribute_fetch
+            && prepare_gpu_raw_attribute_fetch(
+                draw,
+                resource_index,
+                packed_resource_offsets,
+                static_cast<uint32_t>(
+                    raw_resource_cache.gpu_raw_vertex_bytes.size()
+                        / sizeof(uint32_t)),
+                interpreted.gpu_raw_vertex_indices)) {
+            ++interpreted.gpu_raw_attribute_draw_count;
+            interpreted.gpu_raw_attribute_vertex_count += draw.vertex_count;
+            if (!was_materialized) {
+                ++interpreted.materialized_indexed_draw_count;
+                interpreted.materialized_indexed_vertex_count +=
+                    draw.vertex_count;
+            }
+            continue;
+        }
+        if (draw.vertex_count != 0u) {
+            continue;
+        }
+        std::vector<NativeVertex> decoded;
+        decoded.reserve(draw.vertex_indices.size());
+        bool complete = true;
+        for (const uint32_t vertex_index : draw.vertex_indices) {
+            NativeVertex vertex{};
+            vertex.program_inputs = draw.current_vertex_attributes;
+            for (uint32_t slot = 0; slot < draw.vertex_formats.size(); ++slot) {
+                const uint32_t format_raw = draw.vertex_formats[slot];
+                const uint32_t element_size = nv2a_vertex_element_size(format_raw);
+                const uint32_t stride = format_raw >> 8u;
+                if (element_size == 0u) {
+                    continue;
+                }
+                if (draw.vertex_offsets[slot] == 0u || stride == 0u) {
+                    complete = false;
+                    break;
+                }
+                const uint64_t attribute_address = static_cast<uint64_t>(
+                    draw.vertex_offsets[slot])
+                    + static_cast<uint64_t>(vertex_index) * stride;
+                if (attribute_address > std::numeric_limits<uint32_t>::max()
+                    || !decode_indexed_vertex_attribute(
+                        resource_index,
+                        static_cast<uint32_t>(attribute_address),
+                        format_raw,
+                        vertex.program_inputs[slot])) {
+                    complete = false;
+                    break;
+                }
+            }
+            if (!complete) {
+                break;
+            }
+            vertex.program_inputs_valid = true;
+            const auto& position = vertex.program_inputs[0];
+            vertex.x = position[0];
+            vertex.y = position[1];
+            vertex.z = position[2];
+            vertex.w = position[3];
+            const auto& diffuse = vertex.program_inputs[3];
+            vertex.r = diffuse[0];
+            vertex.g = diffuse[1];
+            vertex.b = diffuse[2];
+            vertex.a = diffuse[3];
+            const auto& secondary = vertex.program_inputs[4];
+            vertex.secondary_r = secondary[0];
+            vertex.secondary_g = secondary[1];
+            vertex.secondary_b = secondary[2];
+            vertex.secondary_a = secondary[3];
+            const auto& texture = vertex.program_inputs[
+                std::min<uint32_t>(9u + draw.texture_stage, 15u)];
+            vertex.u = texture[0];
+            vertex.v = texture[1];
+            vertex.texture_r = texture[2];
+            vertex.texture_q = texture[3];
+            for (uint32_t stage = 0u; stage < 4u; ++stage) {
+                vertex.texture_coordinates[stage] =
+                    vertex.program_inputs[9u + stage];
+            }
+            decoded.push_back(std::move(vertex));
+        }
+        if (!complete || decoded.empty()) {
+            ++interpreted.missing_indexed_resource_draw_count;
+            continue;
+        }
+        draw.first_vertex = static_cast<uint32_t>(interpreted.vertices.size());
+        draw.vertex_count = static_cast<uint32_t>(decoded.size());
+        interpreted.vertices.insert(
+            interpreted.vertices.end(), decoded.begin(), decoded.end());
+        ++interpreted.materialized_indexed_draw_count;
+        interpreted.materialized_indexed_vertex_count += draw.vertex_count;
+    }
+}
+
+
+===== runtime/host/presenter_diagnostics.cpp:5-339 | VulkanPresenter::prepare_presented_vertices =====
+
+std::vector<NativeVertex> VulkanPresenter::prepare_presented_vertices(
+    bool collect_diagnostics) {
+    uploaded_vertex_base_ = 0;
+    uploaded_vertex_count_ = 0;
+    presented_vertex_program_transformed_count_ = 0;
+    presented_fixed_function_transformed_count_ = 0;
+    presented_linear_texture_normalized_vertex_count_ = 0;
+    presented_vertex_transform_diagnostics_ = {};
+    presented_draw_transform_diagnostics_.clear();
+    presented_diagnostics_valid_ = false;
+    last_vertex_transform_us_ = 0;
+    const auto [presented_vertex_begin, presented_vertex_end] =
+        presented_vertex_span(interpreted_stream_);
+    const auto transform_begin = std::chrono::steady_clock::now();
+    std::vector<NativeVertex> vertices;
+    if (presented_vertex_begin < presented_vertex_end) {
+        vertices.assign(
+            interpreted_stream_.vertices.begin()
+                + static_cast<std::ptrdiff_t>(presented_vertex_begin),
+            interpreted_stream_.vertices.begin()
+                + static_cast<std::ptrdiff_t>(presented_vertex_end));
+        uploaded_vertex_base_ = static_cast<uint32_t>(
+            presented_vertex_begin);
+    }
+    uploaded_vertex_count_ = static_cast<uint32_t>(vertices.size());
+    const size_t first_draw = std::min<size_t>(
+        interpreted_stream_.presented_draw_begin,
+        interpreted_stream_.draws.size());
+    const size_t end_draw = std::min<size_t>(
+        first_draw + interpreted_stream_.presented_draw_count,
+        interpreted_stream_.draws.size());
+    const std::vector<RenderTargetFeedbackSpec>& feedback_specs =
+        presented_render_target_feedback_specs();
+    for (size_t draw_index = first_draw; draw_index < end_draw; ++draw_index) {
+        NativeDraw local_draw = interpreted_stream_.draws[draw_index];
+        const bool targets_presented =
+            draw_targets_presented_surface(local_draw);
+        const auto offscreen_spec = std::find_if(
+            feedback_specs.begin(),
+            feedback_specs.end(),
+            [&](const RenderTargetFeedbackSpec& spec) {
+                return spec.offscreen_produced
+                    && spec.producer_matches(
+                        local_draw.surface_color_offset);
+            });
+        if (!targets_presented
+            && offscreen_spec == feedback_specs.end()) {
+            continue;
+        }
+        if (!native_pipeline_primitive_supported(local_draw.primitive)) {
+            continue;
+        }
+        const bool use_gpu_vertex_program =
+            !options_.cpu_vertex_programs
+            && !options_.analyze_render_stream_only
+            && gpu_vertex_program_compatible(local_draw);
+        if (local_draw.gpu_raw_attribute_fetch) {
+            if (!use_gpu_vertex_program) {
+                continue;
+            }
+            if (targets_presented) {
+                presented_vertex_program_transformed_count_ +=
+                    local_draw.vertex_count;
+            } else {
+                ++offscreen_render_target_draw_count_;
+                offscreen_render_target_transformed_vertex_count_ +=
+                    local_draw.vertex_count;
+            }
+            continue;
+        }
+        if (local_draw.first_vertex < uploaded_vertex_base_) {
+            continue;
+        }
+        local_draw.first_vertex -= uploaded_vertex_base_;
+        if (local_draw.first_vertex + local_draw.vertex_count
+            > vertices.size()) {
+            continue;
+        }
+        PresentedDrawTransformDiagnostics draw_diagnostics{};
+        if (collect_diagnostics) {
+            draw_diagnostics.presented_index = static_cast<uint32_t>(
+                draw_index - first_draw);
+            draw_diagnostics.primitive = local_draw.primitive;
+            draw_diagnostics.vertex_count = local_draw.vertex_count;
+            draw_diagnostics.transform_execution_mode =
+                local_draw.transform_execution_mode;
+            draw_diagnostics.indexed_array = local_draw.indexed_array;
+        }
+        if (use_gpu_vertex_program) {
+            if (targets_presented) {
+                presented_vertex_program_transformed_count_ +=
+                    local_draw.vertex_count;
+            } else {
+                ++offscreen_render_target_draw_count_;
+                offscreen_render_target_transformed_vertex_count_ +=
+                    local_draw.vertex_count;
+            }
+            // Keep decoded program inputs and original attributes intact.
+            // The Vulkan vertex shader performs the program, fog, linear
+            // texture normalization, and final viewport conversion.
+            continue;
+        }
+        const uint32_t program_transformed =
+            execute_presented_vertex_program(
+                vertices,
+                local_draw,
+                collect_diagnostics ? &draw_diagnostics.transform : nullptr);
+        const uint32_t fixed_transformed =
+            execute_presented_fixed_function_transform(
+                vertices,
+                local_draw,
+                collect_diagnostics ? &draw_diagnostics.transform : nullptr);
+        const uint32_t linear_texture_normalized =
+            normalize_presented_linear_texture_coordinates(
+                vertices,
+                local_draw);
+        if (targets_presented) {
+            presented_vertex_program_transformed_count_ +=
+                program_transformed;
+            presented_fixed_function_transformed_count_ +=
+                fixed_transformed;
+            presented_linear_texture_normalized_vertex_count_ +=
+                linear_texture_normalized;
+            if (collect_diagnostics) {
+                presented_vertex_transform_diagnostics_.merge(
+                    draw_diagnostics.transform);
+            }
+            presented_half_quad_recovered_ |=
+                recover_presented_half_surface_quad(
+                    vertices,
+                    local_draw,
+                    swapchain_extent_.width,
+                    swapchain_extent_.height,
+                    presented_overscan_height_recovered_);
+        } else {
+            ++offscreen_render_target_draw_count_;
+            offscreen_render_target_transformed_vertex_count_ +=
+                program_transformed + fixed_transformed;
+            if (options_.analyze_render_stream_only) {
+                const PositionBounds& output_bounds =
+                    draw_diagnostics.transform.output_pixel_bounds;
+                const PresentedVertexTransformDiagnostics& transform =
+                    draw_diagnostics.transform;
+                log_.emit(
+                    "nv2a_offscreen_draw_diagnostics",
+                    {
+                        {"presented_index", std::to_string(
+                            draw_index - first_draw)},
+                        {"surface_color_offset", std::to_string(
+                            local_draw.surface_color_offset)},
+                        {"surface_width", std::to_string(
+                            offscreen_spec->width)},
+                        {"surface_height", std::to_string(
+                            offscreen_spec->height)},
+                        {"primitive", std::to_string(local_draw.primitive)},
+                        {"vertex_count", std::to_string(
+                            local_draw.vertex_count)},
+                        {"texture_address", std::to_string(
+                            local_draw.texture_address)},
+                        {"shader_stage_program", std::to_string(
+                            local_draw.shader_stage_program)},
+                        {"combiner_control", std::to_string(
+                            local_draw.combiner_control)},
+                        {"combiner_color_input0", std::to_string(
+                            local_draw.combiner_color_inputs[0])},
+                        {"combiner_color_output0", std::to_string(
+                            local_draw.combiner_color_outputs[0])},
+                        {"combiner_alpha_input0", std::to_string(
+                            local_draw.combiner_alpha_inputs[0])},
+                        {"combiner_alpha_output0", std::to_string(
+                            local_draw.combiner_alpha_outputs[0])},
+                        {"final_combiner_inputs0", std::to_string(
+                            local_draw.final_combiner_inputs0)},
+                        {"final_combiner_inputs1", std::to_string(
+                            local_draw.final_combiner_inputs1)},
+                        {"blend_enable", std::to_string(
+                            local_draw.blend_enable)},
+                        {"blend_source_factor", std::to_string(
+                            local_draw.blend_source_factor)},
+                        {"blend_destination_factor", std::to_string(
+                            local_draw.blend_destination_factor)},
+                        {"blend_equation", std::to_string(
+                            local_draw.blend_equation)},
+                        {"depth_test_enable", std::to_string(
+                            local_draw.depth_test_enable)},
+                        {"depth_function", std::to_string(
+                            local_draw.depth_function)},
+                        {"depth_write_enable", std::to_string(
+                            local_draw.depth_write_enable)},
+                        {"polygon_offset_fill_enable", std::to_string(
+                            local_draw.polygon_offset_fill_enable)},
+                        {"polygon_offset_scale_factor", json_float(
+                            float_from_u32(
+                                local_draw.polygon_offset_scale_factor))},
+                        {"polygon_offset_bias", json_float(float_from_u32(
+                            local_draw.polygon_offset_bias))},
+                        {"cull_face_enable", std::to_string(
+                            local_draw.cull_face_enable)},
+                        {"cull_face", std::to_string(local_draw.cull_face)},
+                        {"front_face", std::to_string(local_draw.front_face)},
+                        {"transform_execution_mode", std::to_string(
+                            local_draw.transform_execution_mode)},
+                        {"transform_program_start", std::to_string(
+                            local_draw.transform_program_start)},
+                        {"output_pixel_min_x", output_bounds.valid
+                            ? json_float(output_bounds.min_x) : "null"},
+                        {"output_pixel_max_x", output_bounds.valid
+                            ? json_float(output_bounds.max_x) : "null"},
+                        {"output_pixel_min_y", output_bounds.valid
+                            ? json_float(output_bounds.min_y) : "null"},
+                        {"output_pixel_max_y", output_bounds.valid
+                            ? json_float(output_bounds.max_y) : "null"},
+                        {"output_min_r", transform.output_color_bounds_valid
+                            ? json_float(transform.output_min_r) : "null"},
+                        {"output_max_r", transform.output_color_bounds_valid
+                            ? json_float(transform.output_max_r) : "null"},
+                        {"output_min_a", transform.output_color_bounds_valid
+                            ? json_float(transform.output_min_a) : "null"},
+                        {"output_max_a", transform.output_color_bounds_valid
+                            ? json_float(transform.output_max_a) : "null"},
+                    });
+            }
+        }
+        if (targets_presented && collect_diagnostics) {
+        for (uint32_t vertex_index = 0;
+             vertex_index < local_draw.vertex_count;
+             ++vertex_index) {
+            const NativeVertex& vertex =
+                vertices[local_draw.first_vertex + vertex_index];
+            draw_diagnostics.final_pixel_bounds.include(vertex.x, vertex.y);
+            draw_diagnostics.final_u_bounds.include(vertex.u);
+            draw_diagnostics.final_v_bounds.include(vertex.v);
+            draw_diagnostics.final_q_bounds.include(vertex.texture_q);
+            draw_diagnostics.final_fog_bounds.include(vertex.fog);
+            for (uint32_t stage = 0u; stage < 4u; ++stage) {
+                for (uint32_t component = 0u; component < 4u; ++component) {
+                    draw_diagnostics.final_texture_coordinate_bounds[stage]
+                        [component].include(
+                            vertex.texture_coordinates[stage][component]);
+                }
+            }
+            if ((local_draw.transform_execution_mode & 3u) == 0u) {
+                draw_diagnostics.fixed_function_vertices.push_back({
+                    vertex.x,
+                    vertex.y,
+                    vertex.z,
+                    vertex.w,
+                    vertex.u,
+                    vertex.v,
+                });
+            }
+        }
+        const uint32_t triangle_count = local_draw.primitive == 5u
+            ? local_draw.vertex_count / 3u
+            : local_draw.primitive == 6u && local_draw.vertex_count >= 3u
+                ? local_draw.vertex_count - 2u
+                : 0u;
+        for (uint32_t triangle = 0;
+             triangle < triangle_count;
+             ++triangle) {
+            uint32_t index0 = local_draw.primitive == 5u
+                ? triangle * 3u
+                : triangle;
+            uint32_t index1 = index0 + 1u;
+            const uint32_t index2 = index0 + 2u;
+            if (local_draw.primitive == 6u && (triangle & 1u) != 0u) {
+                std::swap(index0, index1);
+            }
+            const NativeVertex& vertex0 =
+                vertices[local_draw.first_vertex + index0];
+            const NativeVertex& vertex1 =
+                vertices[local_draw.first_vertex + index1];
+            const NativeVertex& vertex2 =
+                vertices[local_draw.first_vertex + index2];
+            const float signed_area =
+                (vertex1.x - vertex0.x) * (vertex2.y - vertex0.y)
+                - (vertex1.y - vertex0.y) * (vertex2.x - vertex0.x);
+            if (!std::isfinite(signed_area)
+                || std::abs(signed_area) <= 0.000001f) {
+                ++draw_diagnostics.degenerate_triangle_count;
+            } else if (signed_area > 0.0f) {
+                ++draw_diagnostics.positive_area_triangle_count;
+            } else {
+                ++draw_diagnostics.negative_area_triangle_count;
+            }
+        }
+        presented_draw_transform_diagnostics_.push_back(
+            std::move(draw_diagnostics));
+        }
+
+        const uint32_t target_width = targets_presented
+            ? swapchain_extent_.width
+            : offscreen_spec->width;
+        const uint32_t target_height = targets_presented
+            ? swapchain_extent_.height
+            : offscreen_spec->height;
+        for (uint32_t vertex_index = 0;
+             vertex_index < local_draw.vertex_count;
+             ++vertex_index) {
+            NativeVertex& vertex =
+                vertices[local_draw.first_vertex + vertex_index];
+            const float screen_x = vertex.x;
+            const float screen_y = vertex.y;
+            if (vertex.program_position_valid) {
+                vertex.x = nv2a_screen_coordinate_to_vulkan_ndc(
+                    screen_x, target_width);
+                vertex.y = nv2a_screen_coordinate_to_vulkan_ndc(
+                    screen_y, target_height);
+            } else {
+                vertex.x = screen_x * 2.0f
+                    / static_cast<float>(target_width) - 1.0f;
+                vertex.y = screen_y * 2.0f
+                    / static_cast<float>(target_height) - 1.0f;
+            }
+            // A positive-height Vulkan viewport maps NDC -1 to the top
+            // edge, matching the guest's top-left screen coordinates.
+            if (vertex.program_position_valid) {
+                vertex.x *= vertex.w;
+                vertex.y *= vertex.w;
+                vertex.z *= vertex.w;
+            } else {
+                vertex.z = 0.0f;
+                vertex.w = 1.0f;
+            }
+        }
+    }
+    last_vertex_transform_us_ = std::chrono::duration_cast<
+        std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - transform_begin).count();
+    if (collect_diagnostics) {
+        presented_diagnostics_valid_ = true;
+        presented_diagnostics_generation_ = render_work_generation_;
+    }
+    return vertices;
+}
+
+
+===== runtime/host/shaders/nv2a_inline.vert:70-72 | field_value =====
+
+uint field_value(uint value, uint start, uint length) {
+    return (value >> start) & ((1u << length) - 1u);
+}
+
+
+===== runtime/host/shaders/nv2a_inline.vert:74-76 | finite_value =====
+
+bool finite_value(float value) {
+    return !isnan(value) && !isinf(value);
+}
+
+
+===== runtime/host/shaders/nv2a_inline.vert:78-85 | swizzle_value =====
+
+vec4 swizzle_value(vec4 value, uint packed, bool negate) {
+    vec4 result;
+    for (uint lane = 0u; lane < 4u; ++lane) {
+        uint shift = 6u - lane * 2u;
+        result[lane] = value[(packed >> shift) & 3u];
+    }
+    return negate ? -result : result;
+}
+
+
+===== runtime/host/shaders/nv2a_inline.vert:87-194 | execute_operation =====
+
+vec4 execute_operation(uint opcode, vec4 a, vec4 b, vec4 c) {
+    precise vec4 result = vec4(0.0);
+    switch (opcode) {
+    case 1u:
+        result = a;
+        break;
+    case 2u:
+        result = a * b;
+        break;
+    case 3u:
+        result = a + b;
+        break;
+    case 4u:
+        result = a * b + c;
+        break;
+    case 5u: {
+        precise float value = a.x * b.x + a.y * b.y + a.z * b.z;
+        result = vec4(value);
+        break;
+    }
+    case 6u: {
+        precise float value = a.x * b.x + a.y * b.y + a.z * b.z + b.w;
+        result = vec4(value);
+        break;
+    }
+    case 7u: {
+        precise float value = a.x * b.x + a.y * b.y + a.z * b.z
+            + a.w * b.w;
+        result = vec4(value);
+        break;
+    }
+    case 8u:
+        result = vec4(1.0, a.y * b.y, a.z, b.w);
+        break;
+    case 9u:
+        result = vec4(
+            b.x < a.x ? b.x : a.x,
+            b.y < a.y ? b.y : a.y,
+            b.z < a.z ? b.z : a.z,
+            b.w < a.w ? b.w : a.w);
+        break;
+    case 10u:
+        result = vec4(
+            a.x < b.x ? b.x : a.x,
+            a.y < b.y ? b.y : a.y,
+            a.z < b.z ? b.z : a.z,
+            a.w < b.w ? b.w : a.w);
+        break;
+    case 11u:
+        result = vec4(
+            a.x < b.x ? 1.0 : 0.0,
+            a.y < b.y ? 1.0 : 0.0,
+            a.z < b.z ? 1.0 : 0.0,
+            a.w < b.w ? 1.0 : 0.0);
+        break;
+    case 12u:
+        result = vec4(
+            a.x >= b.x ? 1.0 : 0.0,
+            a.y >= b.y ? 1.0 : 0.0,
+            a.z >= b.z ? 1.0 : 0.0,
+            a.w >= b.w ? 1.0 : 0.0);
+        break;
+    case 13u:
+        result = vec4(floor(a.x + 0.001));
+        break;
+    case 14u:
+        result = vec4(1.0 / a.x);
+        break;
+    case 15u: {
+        precise float reciprocal = 1.0 / a.x;
+        precise float clamped_reciprocal = reciprocal < -1.884467e19
+            ? -1.884467e19
+            : 1.884467e19 < reciprocal
+                ? 1.884467e19
+                : reciprocal;
+        result = vec4(clamped_reciprocal);
+        break;
+    }
+    case 16u:
+        result = vec4(1.0 / sqrt(abs(a.x)));
+        break;
+    case 17u: {
+        float base = floor(a.x);
+        result = vec4(exp2(base), a.x - base, exp2(a.x), 1.0);
+        break;
+    }
+    case 18u: {
+        float value = abs(a.x);
+        float exponent = floor(log2(value));
+        result = vec4(
+            exponent, value / exp2(exponent), log2(value), 1.0);
+        break;
+    }
+    case 19u: {
+        precise float lit_x = a.x < 0.0 ? 0.0 : a.x;
+        precise float lit_y = a.y < 0.0 ? 0.0 : a.y;
+        result = vec4(
+            1.0,
+            lit_x,
+            a.x > 0.0 ? pow(lit_y, a.w) : 0.0,
+            1.0);
+        break;
+    }
+    default:
+        break;
+    }
+    return result;
+}
+
+
+===== runtime/host/shaders/nv2a_inline.vert:196-201 | write_mask =====
+
+void write_mask(inout vec4 destination, vec4 value, uint mask) {
+    if ((mask & 8u) != 0u) destination.x = value.x;
+    if ((mask & 4u) != 0u) destination.y = value.y;
+    if ((mask & 2u) != 0u) destination.z = value.z;
+    if ((mask & 1u) != 0u) destination.w = value.w;
+}
+
+
+===== runtime/host/shaders/nv2a_inline.vert:203-206 | raw_vertex_byte =====
+
+uint raw_vertex_byte(uint byte_offset) {
+    uint packed = raw_vertex_resource_words.words[byte_offset >> 2u];
+    return (packed >> ((byte_offset & 3u) * 8u)) & 0xFFu;
+}
+
+
+===== runtime/host/shaders/nv2a_inline.vert:208-211 | raw_vertex_u16 =====
+
+uint raw_vertex_u16(uint byte_offset) {
+    return raw_vertex_byte(byte_offset)
+        | (raw_vertex_byte(byte_offset + 1u) << 8u);
+}
+
+
+===== runtime/host/shaders/nv2a_inline.vert:213-221 | raw_vertex_u32 =====
+
+uint raw_vertex_u32(uint byte_offset) {
+    if ((byte_offset & 3u) == 0u) {
+        return raw_vertex_resource_words.words[byte_offset >> 2u];
+    }
+    return raw_vertex_byte(byte_offset)
+        | (raw_vertex_byte(byte_offset + 1u) << 8u)
+        | (raw_vertex_byte(byte_offset + 2u) << 16u)
+        | (raw_vertex_byte(byte_offset + 3u) << 24u);
+}
+
+
+===== runtime/host/shaders/nv2a_inline.vert:223-226 | sign_extend_raw_vertex_component =====
+
+int sign_extend_raw_vertex_component(uint value, uint bits) {
+    uint shift = 32u - bits;
+    return int(value << shift) >> int(shift);
+}
+
+
+===== runtime/host/shaders/nv2a_inline.vert:228-282 | decode_raw_vertex_attribute =====
+
+vec4 decode_raw_vertex_attribute(
+    uint byte_offset,
+    uint format_raw,
+    vec4 current_value) {
+    uint type = format_raw & 0xFu;
+    uint components = (format_raw >> 4u) & 0xFu;
+    vec4 value = current_value;
+    if (type == 2u) {
+        for (uint component = 0u; component < 4u; ++component) {
+            if (component < components) {
+                value[component] = uintBitsToFloat(raw_vertex_u32(
+                    byte_offset + component * 4u));
+            }
+        }
+    } else if (type == 0u) {
+        value = vec4(
+            float(raw_vertex_byte(byte_offset + 2u)) / 255.0,
+            float(raw_vertex_byte(byte_offset + 1u)) / 255.0,
+            float(raw_vertex_byte(byte_offset)) / 255.0,
+            float(raw_vertex_byte(byte_offset + 3u)) / 255.0);
+    } else if (type == 4u) {
+        for (uint component = 0u; component < 4u; ++component) {
+            if (component < components) {
+                value[component] = float(raw_vertex_byte(
+                    byte_offset + component)) / 255.0;
+            }
+        }
+    } else if (type == 1u || type == 5u) {
+        for (uint component = 0u; component < 4u; ++component) {
+            if (component < components) {
+                uint raw = raw_vertex_u16(byte_offset + component * 2u);
+                int signed_value = raw >= 0x8000u
+                    ? int(raw) - 0x10000
+                    : int(raw);
+                value[component] = max(
+                    -1.0, float(signed_value) / 32767.0);
+            }
+        }
+    } else if (type == 6u) {
+        uint packed = raw_vertex_u32(byte_offset);
+        value.x = max(
+            -1.0,
+            float(sign_extend_raw_vertex_component(
+                packed & 0x7FFu, 11u)) / 1023.0);
+        value.y = max(
+            -1.0,
+            float(sign_extend_raw_vertex_component(
+                (packed >> 11u) & 0x7FFu, 11u)) / 1023.0);
+        value.z = max(
+            -1.0,
+            float(sign_extend_raw_vertex_component(
+                (packed >> 22u) & 0x3FFu, 10u)) / 511.0);
+    }
+    return value;
+}
+
+
+===== runtime/host/shaders/nv2a_inline.vert:284-313 | fetch_source =====
+
+vec4 fetch_source(
+    uint type,
+    uint temporary_index,
+    uint input_index,
+    uint constant_index,
+    uint packed_swizzle,
+    bool negate,
+    bool relative,
+    float address,
+    vec4 inputs[16],
+    vec4 temporary[12],
+    vec4 outputs[13]) {
+    vec4 value = vec4(0.0);
+    if (type == 1u) {
+        value = temporary_index == 12u
+            ? outputs[0]
+            : temporary[temporary_index];
+    } else if (type == 2u) {
+        value = inputs[input_index];
+    } else if (type == 3u) {
+        int index = int(constant_index)
+            + (relative ? int(address) : 0);
+        if (index >= 0 && index < 192) {
+            value = uintBitsToFloat(
+                vertex_program_states.states[draw_push.state_index]
+                    .transform_constants[index]);
+        }
+    }
+    return swizzle_value(value, packed_swizzle, negate);
+}
+
+
+===== runtime/host/shaders/nv2a_inline.vert:315-318 | ilu_operation =====
+
+uint ilu_operation(uint opcode) {
+    const uint operations[8] = uint[8](0u, 1u, 14u, 15u, 16u, 17u, 18u, 19u);
+    return operations[opcode];
+}
+
+
+===== runtime/host/shaders/nv2a_inline.vert:320-434 | execute_vertex_program =====
+
+bool execute_vertex_program(
+    vec4 inputs[16],
+    out vec4 outputs[13],
+    out uint output_masks[13]) {
+    vec4 temporary[12];
+    for (uint index = 0u; index < 12u; ++index) {
+        temporary[index] = vec4(0.0);
+    }
+    for (uint index = 0u; index < 13u; ++index) {
+        outputs[index] = vec4(0.0);
+        output_masks[index] = 0u;
+    }
+    float address = 0.0;
+    uint start = vertex_program_states.states[draw_push.state_index]
+        .transform_program_start;
+    for (uint instruction = start; instruction < 136u; ++instruction) {
+        uvec4 token = vertex_program_states.states[draw_push.state_index]
+            .transform_program[instruction];
+        uint mac_opcode = field_value(token.y, 21u, 4u);
+        uint ilu_opcode = field_value(token.y, 25u, 3u);
+        if (mac_opcode > 13u || ilu_opcode > 7u) {
+            return false;
+        }
+        uint input_index = field_value(token.y, 9u, 4u);
+        uint constant_index = field_value(token.y, 13u, 8u);
+        bool relative = field_value(token.w, 1u, 1u) != 0u;
+        vec4 a = fetch_source(
+            field_value(token.z, 26u, 2u),
+            field_value(token.z, 28u, 4u),
+            input_index,
+            constant_index,
+            field_value(token.y, 0u, 8u),
+            field_value(token.y, 8u, 1u) != 0u,
+            relative,
+            address,
+            inputs,
+            temporary,
+            outputs);
+        vec4 b = fetch_source(
+            field_value(token.z, 11u, 2u),
+            field_value(token.z, 13u, 4u),
+            input_index,
+            constant_index,
+            field_value(token.z, 17u, 8u),
+            field_value(token.z, 25u, 1u) != 0u,
+            relative,
+            address,
+            inputs,
+            temporary,
+            outputs);
+        uint c_register = field_value(token.z, 0u, 2u) * 4u
+            + field_value(token.w, 30u, 2u);
+        vec4 c = fetch_source(
+            field_value(token.w, 28u, 2u),
+            c_register,
+            input_index,
+            constant_index,
+            field_value(token.z, 2u, 8u),
+            field_value(token.z, 10u, 1u) != 0u,
+            relative,
+            address,
+            inputs,
+            temporary,
+            outputs);
+
+        precise vec4 mac = mac_opcode == 3u
+            ? execute_operation(mac_opcode, a, c, vec4(0.0))
+            : execute_operation(mac_opcode, a, b, c);
+        precise vec4 ilu = execute_operation(
+            ilu_operation(ilu_opcode), c, vec4(0.0), vec4(0.0));
+
+        uint temporary_index = field_value(token.w, 20u, 4u);
+        uint mac_mask = field_value(token.w, 24u, 4u);
+        uint ilu_mask = field_value(token.w, 16u, 4u);
+        if (mac_opcode == 13u) {
+            address = mac.x;
+        } else if (mac_mask != 0u
+                   && !(ilu_opcode != 0u && temporary_index == 1u)) {
+            if (temporary_index == 12u) {
+                write_mask(outputs[0], mac, mac_mask);
+                output_masks[0] |= mac_mask;
+            } else if (temporary_index < 12u) {
+                write_mask(temporary[temporary_index], mac, mac_mask);
+            }
+        }
+        if (ilu_mask != 0u) {
+            uint ilu_temporary = mac_opcode != 0u ? 1u : temporary_index;
+            if (ilu_temporary == 12u) {
+                write_mask(outputs[0], ilu, ilu_mask);
+                output_masks[0] |= ilu_mask;
+            } else if (ilu_temporary < 12u) {
+                write_mask(temporary[ilu_temporary], ilu, ilu_mask);
+            }
+        }
+
+        uint output_mask = field_value(token.w, 12u, 4u);
+        if (output_mask != 0u) {
+            // Compatibility filtering keeps context-constant writes on CPU.
+            if (field_value(token.w, 11u, 1u) == 0u) {
+                return false;
+            }
+            uint output_index = field_value(token.w, 3u, 8u);
+            if (output_index >= 13u) {
+                return false;
+            }
+            vec4 value = field_value(token.w, 2u, 1u) != 0u ? ilu : mac;
+            write_mask(outputs[output_index], value, output_mask);
+            output_masks[output_index] |= output_mask;
+        }
+        if (field_value(token.w, 0u, 1u) != 0u) {
+            return true;
+        }
+    }
+    return false;
+}
+
+
+===== runtime/host/shaders/nv2a_inline.vert:436-465 | programmable_fog_factor =====
+
+float programmable_fog_factor(float fog_distance) {
+    uint state_index = draw_push.state_index;
+    float parameter0 = uintBitsToFloat(
+        vertex_program_states.states[state_index].fog_parameter0);
+    float parameter1 = uintBitsToFloat(
+        vertex_program_states.states[state_index].fog_parameter1);
+    if (parameter0 == 0.0 || parameter1 == 0.0
+        || !finite_value(parameter0) || !finite_value(parameter1)) {
+        return 1.0;
+    }
+    uint mode = vertex_program_states.states[state_index].fog_mode;
+    float factor;
+    if (mode == 0x2601u || mode == 0x0804u) {
+        factor = parameter0 + fog_distance * parameter1 - 1.0;
+    } else if (mode == 0x0800u || mode == 0x0802u) {
+        factor = parameter0
+            + exp2(fog_distance * parameter1 * 16.0) - 1.5;
+    } else if (mode == 0x0801u || mode == 0x0803u) {
+        factor = parameter0
+            + exp2(-fog_distance * fog_distance
+                * parameter1 * parameter1 * 32.0)
+            - 1.5;
+    } else {
+        return 1.0;
+    }
+    if (mode == 0x0802u || mode == 0x0803u || mode == 0x0804u) {
+        factor = abs(factor);
+    }
+    return finite_value(factor) ? factor : 1.0;
+}
+
+
+===== runtime/host/shaders/nv2a_inline.vert:467-638 | main =====
+
+void main() {
+    uint state_index = draw_push.state_index;
+    if (vertex_program_states.states[state_index].enabled == 0u) {
+        gl_Position = in_position;
+        frag_color = clamp(in_color, 0.0, 1.0);
+        frag_uv = vertex_program_states.states[state_index]
+                .texture_widths[0] != 0u
+            ? in_uv0
+            : in_uv;
+        frag_uv1 = in_uv1;
+        frag_uv2 = in_uv2;
+        frag_uv3 = in_uv3;
+        frag_secondary_color = clamp(in_secondary_color, 0.0, 1.0);
+        frag_fog = in_fog;
+        return;
+    }
+
+    bool raw_attribute_fetch = vertex_program_states.states[state_index]
+        .raw_attribute_fetch != 0u;
+    vec4 inputs[16];
+    if (raw_attribute_fetch) {
+        uint source_index = raw_vertex_resource_words.words[
+            vertex_program_states.states[state_index].raw_source_index_base
+                + uint(gl_VertexIndex)];
+        for (uint input_index = 0u; input_index < 16u; ++input_index) {
+            inputs[input_index] = uintBitsToFloat(
+                vertex_program_states.states[state_index]
+                    .current_vertex_attributes[input_index]);
+            uint row = input_index >> 2u;
+            uint lane = input_index & 3u;
+            uint format_raw = vertex_program_states.states[state_index]
+                .raw_attribute_formats[row][lane];
+            if (((format_raw >> 4u) & 0xFu) != 0u) {
+                uint byte_offset = vertex_program_states.states[state_index]
+                    .raw_attribute_base_offsets[row][lane]
+                    + source_index * (format_raw >> 8u);
+                inputs[input_index] = decode_raw_vertex_attribute(
+                    byte_offset, format_raw, inputs[input_index]);
+            }
+        }
+    } else {
+        uint vertex_base = uint(gl_VertexIndex)
+            * vertex_program_states.states[state_index].vertex_stride_words
+            + vertex_program_states.states[state_index]
+                .program_input_word_offset;
+        for (uint input_index = 0u; input_index < 16u; ++input_index) {
+            uint input_base = vertex_base + input_index * 4u;
+            inputs[input_index] = uintBitsToFloat(uvec4(
+                vertex_words.words[input_base],
+                vertex_words.words[input_base + 1u],
+                vertex_words.words[input_base + 2u],
+                vertex_words.words[input_base + 3u]));
+        }
+    }
+
+    vec4 outputs[13];
+    uint output_masks[13];
+    bool program_valid = execute_vertex_program(
+        inputs, outputs, output_masks);
+
+    vec4 position = raw_attribute_fetch ? inputs[0] : in_position;
+    vec4 color = raw_attribute_fetch ? inputs[3] : in_color;
+    vec4 secondary_color = raw_attribute_fetch
+        ? inputs[4]
+        : in_secondary_color;
+    vec4 textures[4];
+    textures[0] = raw_attribute_fetch ? inputs[9] : in_uv0;
+    textures[1] = raw_attribute_fetch ? inputs[10] : in_uv1;
+    textures[2] = raw_attribute_fetch ? inputs[11] : in_uv2;
+    textures[3] = raw_attribute_fetch ? inputs[12] : in_uv3;
+    float fog = raw_attribute_fetch ? 1.0 : in_fog;
+    bool program_position_valid = false;
+    if (program_valid) {
+        bool position_xyz_written = (output_masks[0] & 14u) == 14u;
+        bool position_w_written = (output_masks[0] & 1u) != 0u;
+        bool position_w_usable = position_w_written
+            && finite_value(outputs[0].w)
+            && abs(outputs[0].w) > 0.000001;
+        if ((output_masks[0] & 12u) == 12u
+            && finite_value(outputs[0].x)
+            && finite_value(outputs[0].y)) {
+            position.x = outputs[0].x;
+            position.y = outputs[0].y;
+            if ((output_masks[0] & 2u) != 0u) {
+                float depth_scale = uintBitsToFloat(
+                    vertex_program_states.states[state_index]
+                        .transform_constants[58].z);
+                position.z = finite_value(depth_scale)
+                        && abs(depth_scale) > 0.000001
+                    ? outputs[0].z / depth_scale
+                    : outputs[0].z;
+            }
+            if (position_w_usable) {
+                position.w = outputs[0].w;
+            } else if (position_xyz_written) {
+                // A missing, non-finite, or zero homogeneous component does
+                // not invalidate otherwise complete screen-space oPos.xyz.
+                // Default it instead of taking the z=0 fallback.
+                position.w = 1.0;
+            }
+            program_position_valid = position_xyz_written
+                && finite_value(position.z)
+                && finite_value(position.w);
+        }
+
+        color = vec4(0.0, 0.0, 0.0, 1.0);
+        if (output_masks[3] != 0u) {
+            write_mask(color, outputs[3], output_masks[3]);
+        }
+        secondary_color = vec4(0.0, 0.0, 0.0, 1.0);
+        if (vertex_program_states.states[state_index].specular_enable != 0u
+            && output_masks[4] != 0u) {
+            write_mask(secondary_color, outputs[4], output_masks[4]);
+        }
+        if (vertex_program_states.states[state_index].fog_enable != 0u) {
+            uint fog_mask = output_masks[5];
+            float fog_distance = (fog_mask & 8u) != 0u
+                ? outputs[5].x
+                : (fog_mask & 4u) != 0u
+                    ? outputs[5].y
+                    : (fog_mask & 2u) != 0u
+                        ? outputs[5].z
+                        : (fog_mask & 1u) != 0u
+                            ? outputs[5].w
+                            : 0.0;
+            fog = programmable_fog_factor(fog_distance);
+        }
+        for (uint stage = 0u; stage < 4u; ++stage) {
+            uint texture_output = 9u + stage;
+            if (output_masks[texture_output] != 0u) {
+                write_mask(textures[stage], outputs[texture_output],
+                    output_masks[texture_output]);
+            }
+        }
+    }
+
+    for (uint stage = 0u; stage < 4u; ++stage) {
+        if (vertex_program_states.states[state_index].texture_linears[stage] != 0u
+            && vertex_program_states.states[state_index].texture_widths[stage] != 0u
+            && vertex_program_states.states[state_index].texture_heights[stage] != 0u) {
+            textures[stage].x /= float(
+                vertex_program_states.states[state_index].texture_widths[stage]);
+            textures[stage].y /= float(
+                vertex_program_states.states[state_index].texture_heights[stage]);
+        }
+    }
+
+    if (program_position_valid) {
+        // NV2A viewport constants target its 0.53125 subpixel center. Move
+        // transformed screen coordinates onto Vulkan's 0.5 pixel centers.
+        position.xy -= vec2(0.03125);
+    }
+    position.x = position.x * 2.0
+        / float(vertex_program_states.states[state_index].target_width) - 1.0;
+    position.y = position.y * 2.0
+        / float(vertex_program_states.states[state_index].target_height) - 1.0;
+    if (program_position_valid) {
+        position.xyz *= position.w;
+    } else {
+        position.z = 0.0;
+        position.w = 1.0;
+    }
+
+    gl_Position = position;
+    frag_color = clamp(color, 0.0, 1.0);
+    frag_uv = textures[0];
+    frag_uv1 = textures[1];
+    frag_uv2 = textures[2];
+    frag_uv3 = textures[3];
+    frag_secondary_color = clamp(secondary_color, 0.0, 1.0);
+    frag_fog = fog;
+}
+
+
+===== runtime/host/shaders/nv2a_inline.vert:23-52 | VertexProgramState =====
+
+struct VertexProgramState {
+    uint enabled;
+    uint transform_program_start;
+    uint target_width;
+    uint target_height;
+    uint texture_linear;
+    uint texture_width;
+    uint texture_height;
+    uint specular_enable;
+    uint fog_mode;
+    uint fog_enable;
+    uint fog_parameter0;
+    uint fog_parameter1;
+    uint vertex_stride_words;
+    uint program_input_word_offset;
+    uint texture_output;
+    uint raw_attribute_fetch;
+    uvec4 transform_program[136];
+    uvec4 transform_constants[192];
+    uvec4 raw_attribute_formats[4];
+    uvec4 raw_attribute_base_offsets[4];
+    uvec4 current_vertex_attributes[16];
+    uint raw_source_index_base;
+    uint reserved1;
+    uint reserved2;
+    uint reserved3;
+    uvec4 texture_linears;
+    uvec4 texture_widths;
+    uvec4 texture_heights;
+};
+
+
+===== runtime/host/shaders/nv2a_inline.frag:54-60 | unpackArgb =====
+
+vec4 unpackArgb(uint packed) {
+    return vec4(
+        float((packed >> 16u) & 255u),
+        float((packed >> 8u) & 255u),
+        float(packed & 255u),
+        float((packed >> 24u) & 255u)) / 255.0;
+}
+
+
+===== runtime/host/shaders/nv2a_inline.frag:62-68 | unpackFogColor =====
+
+vec4 unpackFogColor(uint packed) {
+    return vec4(
+        float(packed & 255u),
+        float((packed >> 8u) & 255u),
+        float((packed >> 16u) & 255u),
+        float((packed >> 24u) & 255u)) / 255.0;
+}
+
+
+===== runtime/host/shaders/nv2a_inline.frag:70-75 | textureCoordinates =====
+
+vec4 textureCoordinates(uint stage) {
+    if (stage == 0u) return frag_uv;
+    if (stage == 1u) return frag_uv1;
+    if (stage == 2u) return frag_uv2;
+    return frag_uv3;
+}
+
+
+===== runtime/host/shaders/nv2a_inline.frag:77-82 | sampleTexture2D =====
+
+vec4 sampleTexture2D(uint stage, vec2 coordinates) {
+    if (stage == 0u) return texture(texture2d0, coordinates);
+    if (stage == 1u) return texture(texture2d1, coordinates);
+    if (stage == 2u) return texture(texture2d2, coordinates);
+    return texture(texture2d3, coordinates);
+}
+
+
+===== runtime/host/shaders/nv2a_inline.frag:84-89 | sampleTexture2DProjective =====
+
+vec4 sampleTexture2DProjective(uint stage, vec3 coordinates) {
+    if (stage == 0u) return textureProj(texture2d0, coordinates);
+    if (stage == 1u) return textureProj(texture2d1, coordinates);
+    if (stage == 2u) return textureProj(texture2d2, coordinates);
+    return textureProj(texture2d3, coordinates);
+}
+
+
+===== runtime/host/shaders/nv2a_inline.frag:91-96 | sampleTextureCube =====
+
+vec4 sampleTextureCube(uint stage, vec3 coordinates) {
+    if (stage == 0u) return texture(textureCube0, coordinates);
+    if (stage == 1u) return texture(textureCube1, coordinates);
+    if (stage == 2u) return texture(textureCube2, coordinates);
+    return texture(textureCube3, coordinates);
+}
+
+
+===== runtime/host/shaders/nv2a_inline.frag:98-115 | remapCubeTo2D =====
+
+vec2 remapCubeTo2D(vec3 coordinates) {
+    vec3 absolute = abs(coordinates);
+    vec2 uv;
+    if (absolute.x > absolute.y && absolute.x > absolute.z) {
+        uv = coordinates.x > 0.0
+            ? vec2(-coordinates.z, coordinates.y) / absolute.x
+            : vec2(coordinates.z, coordinates.y) / absolute.x;
+    } else if (absolute.y > absolute.z) {
+        uv = coordinates.y > 0.0
+            ? vec2(coordinates.x, -coordinates.z) / absolute.y
+            : vec2(coordinates.x, coordinates.z) / absolute.y;
+    } else {
+        uv = coordinates.z > 0.0
+            ? vec2(coordinates.x, coordinates.y) / absolute.z
+            : vec2(-coordinates.x, coordinates.y) / absolute.z;
+    }
+    return uv * 0.5 + 0.5;
+}
+
+
+===== runtime/host/shaders/nv2a_inline.frag:117-166 | readRegister =====
+
+vec4 readRegister(
+    uint register_index,
+    uint stage,
+    bool final_stage,
+    vec4 registers[16],
+    vec4 ef_product,
+    uint state_index) {
+    NativeFragmentState state = draw_states.states[state_index];
+    if (register_index == 0u) {
+        return vec4(0.0);
+    }
+    if (register_index == 1u || register_index == 2u) {
+        uint packed = 0u;
+        if (final_stage) {
+            packed = register_index == 1u
+                ? state.final_combiner_factor0
+                : state.final_combiner_factor1;
+        } else {
+            uint flags = state.combiner_control >> 8u;
+            bool unique = register_index == 1u
+                ? (flags & 0x10u) != 0u
+                : (flags & 0x100u) != 0u;
+            uint factor_stage = unique ? min(stage, 7u) : 0u;
+            packed = register_index == 1u
+                ? state.combiner_factors0[factor_stage]
+                : state.combiner_factors1[factor_stage];
+        }
+        return unpackArgb(packed);
+    }
+    if (register_index == 14u) {
+        uint flags = state.final_combiner_inputs1 & 255u;
+        vec3 v1 = (flags & 0x40u) != 0u
+            ? vec3(1.0) - registers[5].rgb
+            : registers[5].rgb;
+        vec3 r0 = (flags & 0x20u) != 0u
+            ? vec3(1.0) - registers[12].rgb
+            : registers[12].rgb;
+        vec3 sum = v1 + r0;
+        if ((flags & 0x80u) != 0u) {
+            sum = clamp(sum, 0.0, 1.0);
+        }
+        return vec4(sum, 0.0);
+    }
+    if (register_index == 15u) {
+        return ef_product;
+    }
+    return register_index < 16u
+        ? registers[register_index]
+        : vec4(0.0);
+}
+
+
+===== runtime/host/shaders/nv2a_inline.frag:168-177 | applyInputMapping =====
+
+vec3 applyInputMapping(vec3 value, uint mapping) {
+    if (mapping == 0x00u) return max(value, vec3(0.0));
+    if (mapping == 0x20u) return vec3(1.0) - clamp(value, 0.0, 1.0);
+    if (mapping == 0x40u) return 2.0 * max(value, vec3(0.0)) - 1.0;
+    if (mapping == 0x60u) return -2.0 * max(value, vec3(0.0)) + 1.0;
+    if (mapping == 0x80u) return max(value, vec3(0.0)) - 0.5;
+    if (mapping == 0xA0u) return -max(value, vec3(0.0)) + 0.5;
+    if (mapping == 0xC0u) return value;
+    return -value;
+}
+
+
+===== runtime/host/shaders/nv2a_inline.frag:179-188 | applyInputMapping =====
+
+float applyInputMapping(float value, uint mapping) {
+    if (mapping == 0x00u) return max(value, 0.0);
+    if (mapping == 0x20u) return 1.0 - clamp(value, 0.0, 1.0);
+    if (mapping == 0x40u) return 2.0 * max(value, 0.0) - 1.0;
+    if (mapping == 0x60u) return -2.0 * max(value, 0.0) + 1.0;
+    if (mapping == 0x80u) return max(value, 0.0) - 0.5;
+    if (mapping == 0xA0u) return -max(value, 0.0) + 0.5;
+    if (mapping == 0xC0u) return value;
+    return -value;
+}
+
+
+===== runtime/host/shaders/nv2a_inline.frag:190-208 | colorInput =====
+
+vec3 colorInput(
+    uint input_word,
+    uint stage,
+    bool final_stage,
+    vec4 registers[16],
+    vec4 ef_product,
+    uint state_index) {
+    vec4 source = readRegister(
+        input_word & 15u,
+        stage,
+        final_stage,
+        registers,
+        ef_product,
+        state_index);
+    vec3 value = (input_word & 0x10u) != 0u
+        ? source.aaa
+        : source.rgb;
+    return applyInputMapping(value, input_word & 0xE0u);
+}
+
+
+===== runtime/host/shaders/nv2a_inline.frag:210-228 | alphaInput =====
+
+float alphaInput(
+    uint input_word,
+    uint stage,
+    bool final_stage,
+    vec4 registers[16],
+    vec4 ef_product,
+    uint state_index) {
+    vec4 source = readRegister(
+        input_word & 15u,
+        stage,
+        final_stage,
+        registers,
+        ef_product,
+        state_index);
+    float value = (input_word & 0x10u) != 0u
+        ? source.a
+        : source.b;
+    return applyInputMapping(value, input_word & 0xE0u);
+}
+
+
+===== runtime/host/shaders/nv2a_inline.frag:230-237 | applyOutputMapping =====
+
+vec3 applyOutputMapping(vec3 value, uint mapping) {
+    if (mapping == 0x08u) return value - 0.5;
+    if (mapping == 0x10u) return value * 2.0;
+    if (mapping == 0x18u) return (value - 0.5) * 2.0;
+    if (mapping == 0x20u) return value * 4.0;
+    if (mapping == 0x30u) return value * 0.5;
+    return value;
+}
+
+
+===== runtime/host/shaders/nv2a_inline.frag:239-246 | applyOutputMapping =====
+
+float applyOutputMapping(float value, uint mapping) {
+    if (mapping == 0x08u) return value - 0.5;
+    if (mapping == 0x10u) return value * 2.0;
+    if (mapping == 0x18u) return (value - 0.5) * 2.0;
+    if (mapping == 0x20u) return value * 4.0;
+    if (mapping == 0x30u) return value * 0.5;
+    return value;
+}
+
+
+===== runtime/host/shaders/nv2a_inline.frag:248-252 | writeRgb =====
+
+void writeRgb(uint destination, vec3 value, inout vec4 registers[16]) {
+    if (destination != 0u && destination < 16u) {
+        registers[destination].rgb = clamp(value, -1.0, 1.0);
+    }
+}
+
+
+===== runtime/host/shaders/nv2a_inline.frag:254-258 | writeAlpha =====
+
+void writeAlpha(uint destination, float value, inout vec4 registers[16]) {
+    if (destination != 0u && destination < 16u) {
+        registers[destination].a = clamp(value, -1.0, 1.0);
+    }
+}
+
+
+===== runtime/host/shaders/nv2a_inline.frag:260-353 | runCombinerStage =====
+
+void runCombinerStage(
+    uint stage,
+    uint state_index,
+    inout vec4 registers[16]) {
+    NativeFragmentState state = draw_states.states[state_index];
+    uint color_inputs = state.combiner_color_inputs[stage];
+    uint alpha_inputs = state.combiner_alpha_inputs[stage];
+    uint color_output = state.combiner_color_outputs[stage];
+    uint alpha_output = state.combiner_alpha_outputs[stage];
+    uint color_flags = color_output >> 12u;
+    uint alpha_flags = alpha_output >> 12u;
+    vec4 no_ef_product = vec4(0.0);
+
+    vec3 color_a = colorInput(
+        (color_inputs >> 24u) & 255u,
+        stage, false, registers, no_ef_product, state_index);
+    vec3 color_b = colorInput(
+        (color_inputs >> 16u) & 255u,
+        stage, false, registers, no_ef_product, state_index);
+    vec3 color_c = colorInput(
+        (color_inputs >> 8u) & 255u,
+        stage, false, registers, no_ef_product, state_index);
+    vec3 color_d = colorInput(
+        color_inputs & 255u,
+        stage, false, registers, no_ef_product, state_index);
+    vec3 color_ab = (color_flags & 2u) != 0u
+        ? vec3(dot(color_a, color_b))
+        : color_a * color_b;
+    vec3 color_cd = (color_flags & 1u) != 0u
+        ? vec3(dot(color_c, color_d))
+        : color_c * color_d;
+
+    float alpha_a = alphaInput(
+        (alpha_inputs >> 24u) & 255u,
+        stage, false, registers, no_ef_product, state_index);
+    float alpha_b = alphaInput(
+        (alpha_inputs >> 16u) & 255u,
+        stage, false, registers, no_ef_product, state_index);
+    float alpha_c = alphaInput(
+        (alpha_inputs >> 8u) & 255u,
+        stage, false, registers, no_ef_product, state_index);
+    float alpha_d = alphaInput(
+        alpha_inputs & 255u,
+        stage, false, registers, no_ef_product, state_index);
+    float alpha_ab = alpha_a * alpha_b;
+    float alpha_cd = alpha_c * alpha_d;
+
+    bool mux_select_cd = ((state.combiner_control >> 8u) & 1u) != 0u
+        ? registers[12].a >= 0.5
+        : (uint(registers[12].a * 255.0) & 1u) != 0u;
+    vec3 color_muxsum = (color_flags & 4u) == 0u
+        ? color_ab + color_cd
+        : (mux_select_cd ? color_cd : color_ab);
+    float alpha_muxsum = (alpha_flags & 4u) == 0u
+        ? alpha_ab + alpha_cd
+        : (mux_select_cd ? alpha_cd : alpha_ab);
+    uint color_mapping = color_flags & 0x38u;
+    uint alpha_mapping = alpha_flags & 0x38u;
+
+    uint color_cd_destination = color_output & 15u;
+    uint color_ab_destination = (color_output >> 4u) & 15u;
+    uint color_muxsum_destination = (color_output >> 8u) & 15u;
+    writeRgb(
+        color_ab_destination,
+        applyOutputMapping(color_ab, color_mapping),
+        registers);
+    if (color_ab_destination != 0u && (color_flags & 0x80u) != 0u) {
+        writeAlpha(color_ab_destination, color_ab.b, registers);
+    }
+    writeRgb(
+        color_cd_destination,
+        applyOutputMapping(color_cd, color_mapping),
+        registers);
+    if (color_cd_destination != 0u && (color_flags & 0x40u) != 0u) {
+        writeAlpha(color_cd_destination, color_cd.b, registers);
+    }
+    writeRgb(
+        color_muxsum_destination,
+        applyOutputMapping(color_muxsum, color_mapping),
+        registers);
+
+    writeAlpha(
+        (alpha_output >> 4u) & 15u,
+        applyOutputMapping(alpha_ab, alpha_mapping),
+        registers);
+    writeAlpha(
+        alpha_output & 15u,
+        applyOutputMapping(alpha_cd, alpha_mapping),
+        registers);
+    writeAlpha(
+        (alpha_output >> 8u) & 15u,
+        applyOutputMapping(alpha_muxsum, alpha_mapping),
+        registers);
+}
+
+
+===== runtime/host/shaders/nv2a_inline.frag:355-385 | runFinalCombiner =====
+
+vec4 runFinalCombiner(
+    uint state_index,
+    vec4 registers[16]) {
+    NativeFragmentState state = draw_states.states[state_index];
+    uint inputs0 = state.final_combiner_inputs0;
+    uint inputs1 = state.final_combiner_inputs1;
+    vec4 no_ef_product = vec4(0.0);
+    vec3 e = colorInput(
+        (inputs1 >> 24u) & 255u,
+        8u, true, registers, no_ef_product, state_index);
+    vec3 f = colorInput(
+        (inputs1 >> 16u) & 255u,
+        8u, true, registers, no_ef_product, state_index);
+    vec4 ef_product = vec4(e * f, 0.0);
+    vec3 a = colorInput(
+        (inputs0 >> 24u) & 255u,
+        8u, true, registers, ef_product, state_index);
+    vec3 b = colorInput(
+        (inputs0 >> 16u) & 255u,
+        8u, true, registers, ef_product, state_index);
+    vec3 c = colorInput(
+        (inputs0 >> 8u) & 255u,
+        8u, true, registers, ef_product, state_index);
+    vec3 d = colorInput(
+        inputs0 & 255u,
+        8u, true, registers, ef_product, state_index);
+    float g = alphaInput(
+        (inputs1 >> 8u) & 255u,
+        8u, true, registers, ef_product, state_index);
+    return vec4(d + mix(c, b, a), g);
+}
+
+
+===== runtime/host/shaders/nv2a_inline.frag:387-459 | main =====
+
+void main() {
+    NativeFragmentState state = draw_states.states[draw.state_index];
+    vec4 registers[16];
+    for (uint index = 0u; index < 16u; ++index) {
+        registers[index] = vec4(0.0);
+    }
+    registers[3] = vec4(
+        unpackFogColor(state.fog_color).rgb,
+        clamp(frag_fog, 0.0, 1.0));
+    registers[4] = frag_color;
+    registers[5] = frag_secondary_color;
+
+    for (uint stage = 0u; stage < 4u; ++stage) {
+        uint texture_mode = state.texture_modes[stage];
+        if (texture_mode == 0u) {
+            continue;
+        }
+        vec4 coordinates = textureCoordinates(stage);
+        bool cubemap = (state.texture_cubemap_mask & (1u << stage)) != 0u;
+        vec4 sampled;
+        if (texture_mode == 3u) {
+            sampled = cubemap
+                ? sampleTextureCube(stage, coordinates.xyz)
+                : sampleTexture2D(stage, remapCubeTo2D(coordinates.xyz));
+        } else if (texture_mode == 1u) {
+            sampled = cubemap
+                ? sampleTextureCube(
+                    stage,
+                    normalize(vec3(
+                        1.0,
+                        coordinates.y / coordinates.w,
+                        -coordinates.x / coordinates.w)))
+                : sampleTexture2DProjective(stage, coordinates.xyw);
+        } else {
+            sampled = sampleTexture2D(stage, coordinates.xy);
+        }
+        if ((state.texture_opaque_alpha_mask & (1u << stage)) != 0u) {
+            sampled.a = 1.0;
+        }
+        registers[8u + stage] = sampled;
+        if ((state.texture_alpha_kill_mask & (1u << stage)) != 0u
+            && sampled.a == 0.0) {
+            discard;
+        }
+    }
+    uint stage0_mode = state.shader_stage_program & 0x1Fu;
+    registers[12].a = stage0_mode != 0u ? registers[8].a : 1.0;
+
+    uint stage_count = min(state.combiner_control & 255u, 8u);
+    for (uint stage = 0u; stage < stage_count; ++stage) {
+        runCombinerStage(stage, draw.state_index, registers);
+    }
+    out_color = (state.final_combiner_inputs0 != 0u
+            || state.final_combiner_inputs1 != 0u)
+        ? runFinalCombiner(draw.state_index, registers)
+        : registers[12];
+
+    if (state.alpha_test_enable == 0u) {
+        return;
+    }
+    uint alpha = uint(round(clamp(out_color.a, 0.0, 1.0) * 255.0));
+    uint function = state.alpha_function & 15u;
+    bool passed = function == 1u ? alpha < state.alpha_reference
+        : function == 2u ? alpha == state.alpha_reference
+        : function == 3u ? alpha <= state.alpha_reference
+        : function == 4u ? alpha > state.alpha_reference
+        : function == 5u ? alpha != state.alpha_reference
+        : function == 6u ? alpha >= state.alpha_reference
+        : function == 7u;
+    if (!passed) {
+        discard;
+    }
+}
+
+
+===== runtime/host/shaders/nv2a_inline.frag:12-35 | NativeFragmentState =====
+
+struct NativeFragmentState {
+    uint alpha_test_enable;
+    uint alpha_function;
+    uint alpha_reference;
+    uint texture_modes[4];
+    uint texture_alpha_kill_mask;
+    uint texture_opaque_alpha_mask;
+    uint texture_cubemap_mask;
+    uint reserved_texture;
+    uint combiner_control;
+    uint shader_stage_program;
+    uint combiner_color_inputs[8];
+    uint combiner_color_outputs[8];
+    uint combiner_alpha_inputs[8];
+    uint combiner_alpha_outputs[8];
+    uint combiner_factors0[8];
+    uint combiner_factors1[8];
+    uint final_combiner_inputs0;
+    uint final_combiner_inputs1;
+    uint final_combiner_factor0;
+    uint final_combiner_factor1;
+    uint fog_color;
+    uint fog_enable;
+};
+
+
+===== runtime/nv2a/raster_coordinates.h:1-19 | raster_coordinates.h =====
+
+#pragma once
+
+#include <cstdint>
+
+namespace b2r::nv2a {
+
+constexpr float kNv2aViewportSubpixelBias = 0.53125f;
+constexpr float kVulkanPixelCenter = 0.5f;
+constexpr float kNv2aToVulkanPixelCenterBias =
+    kNv2aViewportSubpixelBias - kVulkanPixelCenter;
+
+constexpr float nv2a_screen_coordinate_to_vulkan_ndc(
+    float coordinate,
+    uint32_t target_extent) {
+    return (coordinate - kNv2aToVulkanPixelCenterBias) * 2.0f
+        / static_cast<float>(target_extent) - 1.0f;
+}
+
+}  // namespace b2r::nv2a
+
+
+===== runtime/host/nv2a_vertex_program.h:1-252 | nv2a_vertex_program.h =====
+
+#pragma once
+
+// NV2A vertex-program token decoding follows the public-domain
+// xemu-project/nv2a_vsh_cpu field layout and execution semantics.
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+
+struct Nv2aVertexProgramResult {
+    std::array<std::array<float, 4>, 13> outputs{};
+    std::array<uint32_t, 13> output_masks{};
+    bool valid = false;
+};
+
+namespace nv2a_vsh {
+
+using Vec4 = std::array<float, 4>;
+
+inline uint32_t field(uint32_t value, uint32_t start, uint32_t length) {
+    return (value >> start) & ((1u << length) - 1u);
+}
+
+inline Vec4 swizzle(
+    const Vec4& value,
+    uint32_t packed,
+    bool negate) {
+    Vec4 result{};
+    for (uint32_t lane = 0; lane < 4; ++lane) {
+        const uint32_t shift = 6u - lane * 2u;
+        result[lane] = value[(packed >> shift) & 3u] * (negate ? -1.0f : 1.0f);
+    }
+    return result;
+}
+
+inline Vec4 execute_operation(
+    uint32_t opcode,
+    const Vec4& a,
+    const Vec4& b,
+    const Vec4& c) {
+    Vec4 result{};
+    switch (opcode) {
+    case 1: result = a; break;
+    case 2:
+        for (uint32_t i = 0; i < 4; ++i) result[i] = a[i] * b[i];
+        break;
+    case 3:
+        for (uint32_t i = 0; i < 4; ++i) result[i] = a[i] + b[i];
+        break;
+    case 4:
+        for (uint32_t i = 0; i < 4; ++i) result[i] = a[i] * b[i] + c[i];
+        break;
+    case 5: {
+        const float value = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        result.fill(value);
+        break;
+    }
+    case 6: {
+        const float value = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + b[3];
+        result.fill(value);
+        break;
+    }
+    case 7: {
+        const float value = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+        result.fill(value);
+        break;
+    }
+    case 8: result = {1.0f, a[1] * b[1], a[2], b[3]}; break;
+    case 9:
+        for (uint32_t i = 0; i < 4; ++i) result[i] = std::min(a[i], b[i]);
+        break;
+    case 10:
+        for (uint32_t i = 0; i < 4; ++i) result[i] = std::max(a[i], b[i]);
+        break;
+    case 11:
+        for (uint32_t i = 0; i < 4; ++i) result[i] = a[i] < b[i] ? 1.0f : 0.0f;
+        break;
+    case 12:
+        for (uint32_t i = 0; i < 4; ++i) result[i] = a[i] >= b[i] ? 1.0f : 0.0f;
+        break;
+    case 13: {
+        const float value = std::floor(a[0] + 0.001f);
+        result.fill(value);
+        break;
+    }
+    case 14: {
+        const float value = 1.0f / a[0];
+        result.fill(value);
+        break;
+    }
+    case 15: {
+        const float reciprocal = 1.0f / a[0];
+        const float value = std::clamp(reciprocal, -1.884467e19f, 1.884467e19f);
+        result.fill(value);
+        break;
+    }
+    case 16: {
+        const float value = 1.0f / std::sqrt(std::abs(a[0]));
+        result.fill(value);
+        break;
+    }
+    case 17: {
+        const float base = std::floor(a[0]);
+        result = {std::exp2(base), a[0] - base, std::exp2(a[0]), 1.0f};
+        break;
+    }
+    case 18: {
+        const float value = std::abs(a[0]);
+        const float exponent = std::floor(std::log2(value));
+        result = {exponent, value / std::exp2(exponent), std::log2(value), 1.0f};
+        break;
+    }
+    case 19:
+        result = {
+            1.0f,
+            std::max(a[0], 0.0f),
+            a[0] > 0.0f ? std::pow(std::max(a[1], 0.0f), a[3]) : 0.0f,
+            1.0f,
+        };
+        break;
+    default: break;
+    }
+    return result;
+}
+
+inline void write_mask(Vec4& destination, const Vec4& value, uint32_t mask) {
+    if (mask & 8u) destination[0] = value[0];
+    if (mask & 4u) destination[1] = value[1];
+    if (mask & 2u) destination[2] = value[2];
+    if (mask & 1u) destination[3] = value[3];
+}
+
+} // namespace nv2a_vsh
+
+inline Nv2aVertexProgramResult execute_nv2a_vertex_program(
+    const std::array<std::array<uint32_t, 4>, 136>& program,
+    const std::array<std::array<uint32_t, 4>, 192>& constant_bits,
+    uint32_t start,
+    const std::array<std::array<float, 4>, 16>& inputs,
+    std::array<std::array<uint32_t, 4>, 192>* context_output_bits = nullptr) {
+    using namespace nv2a_vsh;
+    Nv2aVertexProgramResult execution{};
+    std::array<Vec4, 12> temporary{};
+    std::array<Vec4, 192> constants{};
+    for (uint32_t row = 0; row < constants.size(); ++row) {
+        for (uint32_t lane = 0; lane < 4; ++lane) {
+            std::memcpy(&constants[row][lane], &constant_bits[row][lane], sizeof(float));
+        }
+    }
+    float address = 0.0f;
+
+    auto fetch = [&](uint32_t type, uint32_t temporary_index, uint32_t input_index,
+                     uint32_t constant_index, uint32_t packed_swizzle,
+                     bool negate, bool relative) -> Vec4 {
+        Vec4 value{};
+        if (type == 1u) {
+            value = temporary_index == 12u ? execution.outputs[0] : temporary[temporary_index];
+        } else if (type == 2u) {
+            value = inputs[input_index];
+        } else if (type == 3u) {
+            const int64_t index = static_cast<int64_t>(constant_index)
+                + (relative ? static_cast<int64_t>(address) : 0);
+            if (index < 0 || index >= static_cast<int64_t>(constants.size())) return {};
+            value = constants[static_cast<size_t>(index)];
+        }
+        return swizzle(value, packed_swizzle, negate);
+    };
+
+    for (uint32_t instruction = start; instruction < program.size(); ++instruction) {
+        const auto& token = program[instruction];
+        const uint32_t mac_opcode = field(token[1], 21, 4);
+        const uint32_t ilu_opcode = field(token[1], 25, 3);
+        if (mac_opcode > 13u || ilu_opcode > 7u) return execution;
+        const uint32_t input_index = field(token[1], 9, 4);
+        const uint32_t constant_index = field(token[1], 13, 8);
+        const bool relative = field(token[3], 1, 1) != 0;
+        const Vec4 a = fetch(
+            field(token[2], 26, 2), field(token[2], 28, 4), input_index,
+            constant_index, field(token[1], 0, 8), field(token[1], 8, 1), relative);
+        const Vec4 b = fetch(
+            field(token[2], 11, 2), field(token[2], 13, 4), input_index,
+            constant_index, field(token[2], 17, 8), field(token[2], 25, 1), relative);
+        const uint32_t c_register = field(token[2], 0, 2) * 4u + field(token[3], 30, 2);
+        const Vec4 c = fetch(
+            field(token[3], 28, 2), c_register, input_index, constant_index,
+            field(token[2], 2, 8), field(token[2], 10, 1), relative);
+
+        Vec4 mac{};
+        if (mac_opcode == 3u) mac = execute_operation(mac_opcode, a, c, {});
+        else mac = execute_operation(mac_opcode, a, b, c);
+        static constexpr std::array<uint32_t, 8> kIluOperations = {
+            0u, 1u, 14u, 15u, 16u, 17u, 18u, 19u,
+        };
+        const Vec4 ilu = execute_operation(kIluOperations[ilu_opcode], c, {}, {});
+
+        const uint32_t temporary_index = field(token[3], 20, 4);
+        const uint32_t mac_mask = field(token[3], 24, 4);
+        const uint32_t ilu_mask = field(token[3], 16, 4);
+        const auto write_temporary = [&](uint32_t index, const Vec4& value,
+                                         uint32_t mask) {
+            if (index == 12u) {
+                write_mask(execution.outputs[0], value, mask);
+                execution.output_masks[0] |= mask;
+            } else if (index < temporary.size()) {
+                write_mask(temporary[index], value, mask);
+            }
+        };
+        if (mac_opcode == 13u) {
+            address = mac[0];
+        } else if (mac_mask
+                   && !(ilu_opcode != 0u && temporary_index == 1u)) {
+            // R12 mirrors oPos. In a paired instruction the MAC write to R1
+            // is discarded because the ILU owns that temporary register.
+            write_temporary(temporary_index, mac, mac_mask);
+        }
+        if (ilu_mask) {
+            const uint32_t ilu_temporary = mac_opcode ? 1u : temporary_index;
+            write_temporary(ilu_temporary, ilu, ilu_mask);
+        }
+
+        const uint32_t output_mask = field(token[3], 12, 4);
+        if (output_mask) {
+            const Vec4& value = field(token[3], 2, 1) ? ilu : mac;
+            const uint32_t output_index = field(token[3], 3, 8);
+            if (field(token[3], 11, 1)) {
+                if (output_index >= execution.outputs.size()) return execution;
+                write_mask(execution.outputs[output_index], value, output_mask);
+                execution.output_masks[output_index] |= output_mask;
+            } else {
+                if (output_index >= constants.size()) return execution;
+                write_mask(constants[output_index], value, output_mask);
+            }
+        }
+        if (field(token[3], 0, 1)) {
+            if (context_output_bits != nullptr) {
+                for (uint32_t row = 0; row < constants.size(); ++row) {
+                    for (uint32_t lane = 0; lane < 4; ++lane) {
+                        std::memcpy(
+                            &(*context_output_bits)[row][lane],
+                            &constants[row][lane],
+                            sizeof(float));
+                    }
+                }
+            }
+            execution.valid = true;
+            return execution;
+        }
+    }
+    return execution;
+}
+
+
+===== runtime/host/native_pipeline_state.h:8-12 | native_pipeline_primitive_supported =====
+
+inline bool native_pipeline_primitive_supported(uint32_t primitive) {
+    return primitive == 2u
+        || primitive == 5u
+        || primitive == 6u;
+}
+
+
+===== runtime/host/native_pipeline_state.h:14-48 | NativePipelineState =====
+
+struct NativePipelineState {
+    uint32_t primitive = 6u;
+    uint32_t blend_enable = 0u;
+    uint32_t blend_source_factor = 1u;
+    uint32_t blend_destination_factor = 0u;
+    uint32_t blend_equation = 0x8006u;
+    uint32_t color_mask = 0x01010101u;
+    uint32_t depth_test_enable = 0u;
+    uint32_t depth_function = 0x0203u;
+    uint32_t depth_write_enable = 1u;
+    uint32_t cull_face_enable = 0u;
+    uint32_t cull_face = 0x0405u;
+    uint32_t front_face = 0x0900u;
+    bool raw_attribute_fetch = false;
+
+    bool operator==(const NativePipelineState& other) const {
+        return primitive == other.primitive
+            && blend_enable == other.blend_enable
+            && blend_source_factor == other.blend_source_factor
+            && blend_destination_factor == other.blend_destination_factor
+            && blend_equation == other.blend_equation
+            && color_mask == other.color_mask
+            && depth_test_enable == other.depth_test_enable
+            && depth_function == other.depth_function
+            && depth_write_enable == other.depth_write_enable
+            && cull_face_enable == other.cull_face_enable
+            && cull_face == other.cull_face
+            && front_face == other.front_face
+            && raw_attribute_fetch == other.raw_attribute_fetch;
+    }
+
+    bool operator!=(const NativePipelineState& other) const {
+        return !(*this == other);
+    }
+};
+
+
+===== runtime/host/vulkan_presenter_internal.h:202-226 | NativeVertex =====
+
+struct NativeVertex {
+    uint32_t raw_x_bits = 0;
+    uint32_t raw_y_bits = 0;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    float w = 1.0f;
+    float r = 1.0f;
+    float g = 1.0f;
+    float b = 1.0f;
+    float a = 1.0f;
+    float secondary_r = 0.0f;
+    float secondary_g = 0.0f;
+    float secondary_b = 0.0f;
+    float secondary_a = 1.0f;
+    float fog = 1.0f;
+    float u = 0.0f;
+    float v = 0.0f;
+    float texture_r = 0.0f;
+    float texture_q = 1.0f;
+    std::array<std::array<float, 4>, 4> texture_coordinates{};
+    bool program_position_valid = false;
+    bool program_inputs_valid = false;
+    std::array<std::array<float, 4>, 16> program_inputs{};
+};
+
+
+===== runtime/host/vulkan_presenter_internal.h:235-301 | NativeDraw =====
+
+struct NativeDraw {
+    uint32_t first_vertex = 0;
+    uint32_t vertex_count = 0;
+    uint32_t primitive = 0;
+    uint32_t texture_address = 0;
+    bool texture_enabled = false;
+    uint32_t texture_stage = 0;
+    std::array<uint32_t, 4> texture_offsets{};
+    std::array<uint32_t, 4> texture_addresses{};
+    std::array<uint32_t, 4> texture_formats{};
+    std::array<uint32_t, 4> texture_image_rects{};
+    std::array<uint32_t, 4> texture_controls{};
+    std::array<uint32_t, 4> texture_filters{};
+    std::array<uint32_t, 16> vertex_offsets{};
+    std::array<uint32_t, 16> vertex_formats{};
+    Nv2aVertexAttributes current_vertex_attributes =
+        default_nv2a_vertex_attributes();
+    std::vector<uint32_t> vertex_indices;
+    bool indexed_array = false;
+    bool gpu_raw_attribute_fetch = false;
+    uint32_t gpu_raw_source_index_base = 0;
+    std::array<uint32_t, 16> gpu_raw_attribute_base_offsets{};
+    uint32_t blend_enable = 0;
+    uint32_t blend_source_factor = 1;
+    uint32_t blend_destination_factor = 0;
+    uint32_t blend_equation = 0x8006;
+    uint32_t alpha_test_enable = 0;
+    uint32_t alpha_function = 0x0207;
+    uint32_t alpha_reference = 0;
+    uint32_t surface_format = 0;
+    uint32_t surface_pitch = 0;
+    uint32_t surface_color_offset = 0;
+    uint32_t surface_clip_horizontal = 0;
+    uint32_t surface_clip_vertical = 0;
+    uint32_t color_mask = 0x01010101;
+    uint32_t depth_test_enable = 0;
+    uint32_t depth_function = 0x0203;
+    uint32_t depth_write_enable = 1;
+    uint32_t polygon_offset_fill_enable = 0;
+    uint32_t polygon_offset_scale_factor = 0;
+    uint32_t polygon_offset_bias = 0;
+    uint32_t skin_mode = 0;
+    uint32_t specular_enable = 0;
+    uint32_t cull_face_enable = 0;
+    uint32_t cull_face = 0x0405;
+    uint32_t front_face = 0x0900;
+    uint32_t shader_stage_program = 0;
+    uint32_t combiner_control = 0;
+    std::array<uint32_t, 8> combiner_color_inputs{};
+    std::array<uint32_t, 8> combiner_color_outputs{};
+    std::array<uint32_t, 8> combiner_alpha_inputs{};
+    std::array<uint32_t, 8> combiner_alpha_outputs{};
+    std::array<uint32_t, 8> combiner_factors0{};
+    std::array<uint32_t, 8> combiner_factors1{};
+    uint32_t final_combiner_inputs0 = 0;
+    uint32_t final_combiner_inputs1 = 0;
+    std::array<uint32_t, 2> final_combiner_factors{};
+    uint32_t fog_mode = 0;
+    uint32_t fog_generation_mode = 0;
+    uint32_t fog_enable = 0;
+    uint32_t fog_color = 0;
+    std::array<uint32_t, 3> fog_params{};
+    uint32_t transform_execution_mode = 0;
+    uint32_t transform_program_start = 0;
+    std::array<std::array<uint32_t, 4>, 136> transform_program{};
+    std::array<std::array<uint32_t, 4>, 192> transform_constants{};
+};
+
+
+===== runtime/host/vulkan_presenter_internal.h:516-523 | RecoveredTextureResource =====
+
+struct RecoveredTextureResource {
+    uint32_t address = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::string format;
+    std::string content_hash;
+    std::vector<uint8_t> payload;
+};
+
+
+===== runtime/host/vulkan_presenter_internal.h:525-530 | NativeSurfaceClear =====
+
+struct NativeSurfaceClear {
+    uint32_t surface_color_offset = 0;
+    uint32_t flags = 0;
+    uint32_t color_argb = 0;
+    uint32_t draw_index = 0;
+};
+
+
+===== runtime/host/vulkan_presenter_internal.h:627-650 | NativeFragmentState =====
+
+struct NativeFragmentState {
+    uint32_t alpha_test_enable = 0;
+    uint32_t alpha_function = 0x0207;
+    uint32_t alpha_reference = 0;
+    std::array<uint32_t, 4> texture_modes{};
+    uint32_t texture_alpha_kill_mask = 0;
+    uint32_t texture_opaque_alpha_mask = 0;
+    uint32_t texture_cubemap_mask = 0;
+    uint32_t reserved_texture = 0;
+    uint32_t combiner_control = 0;
+    uint32_t shader_stage_program = 0;
+    std::array<uint32_t, 8> combiner_color_inputs{};
+    std::array<uint32_t, 8> combiner_color_outputs{};
+    std::array<uint32_t, 8> combiner_alpha_inputs{};
+    std::array<uint32_t, 8> combiner_alpha_outputs{};
+    std::array<uint32_t, 8> combiner_factors0{};
+    std::array<uint32_t, 8> combiner_factors1{};
+    uint32_t final_combiner_inputs0 = 0;
+    uint32_t final_combiner_inputs1 = 0;
+    uint32_t final_combiner_factor0 = 0;
+    uint32_t final_combiner_factor1 = 0;
+    uint32_t fog_color = 0;
+    uint32_t fog_enable = 0;
+};
+
+
+===== runtime/host/vulkan_presenter_internal.h:656-686 | NativeVertexProgramState =====
+
+struct NativeVertexProgramState {
+    uint32_t enabled = 0;
+    uint32_t transform_program_start = 0;
+    uint32_t target_width = 0;
+    uint32_t target_height = 0;
+    uint32_t texture_linear = 0;
+    uint32_t texture_width = 0;
+    uint32_t texture_height = 0;
+    uint32_t specular_enable = 0;
+    uint32_t fog_mode = 0;
+    uint32_t fog_enable = 0;
+    uint32_t fog_parameter0 = 0;
+    uint32_t fog_parameter1 = 0;
+    uint32_t vertex_stride_words = sizeof(NativeVertex) / sizeof(uint32_t);
+    uint32_t program_input_word_offset =
+        offsetof(NativeVertex, program_inputs) / sizeof(uint32_t);
+    uint32_t texture_output = 9;
+    uint32_t raw_attribute_fetch = 0;
+    std::array<std::array<uint32_t, 4>, 136> transform_program{};
+    std::array<std::array<uint32_t, 4>, 192> transform_constants{};
+    std::array<std::array<uint32_t, 4>, 4> raw_attribute_formats{};
+    std::array<std::array<uint32_t, 4>, 4> raw_attribute_base_offsets{};
+    std::array<std::array<uint32_t, 4>, 16> current_vertex_attributes{};
+    uint32_t raw_source_index_base = 0;
+    uint32_t reserved1 = 0;
+    uint32_t reserved2 = 0;
+    uint32_t reserved3 = 0;
+    std::array<uint32_t, 4> texture_linears{};
+    std::array<uint32_t, 4> texture_widths{};
+    std::array<uint32_t, 4> texture_heights{};
+};
+

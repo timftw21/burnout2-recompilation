@@ -1,0 +1,755 @@
+
+===== runtime/host/vulkan_resources.cpp:5-62 | VulkanPresenter::decompress_dxt1 =====
+
+std::vector<uint8_t> VulkanPresenter::decompress_dxt1(const RecoveredTextureResource& resource) const {
+    std::vector<uint8_t> rgba(static_cast<size_t>(resource.width) * resource.height * 4u, 255u);
+    const uint32_t blocks_x = (resource.width + 3u) / 4u;
+    const uint32_t blocks_y = (resource.height + 3u) / 4u;
+    auto expand565 = [](uint16_t value) {
+        return std::array<uint8_t, 3>{
+            static_cast<uint8_t>(((value >> 11u) & 31u) * 255u / 31u),
+            static_cast<uint8_t>(((value >> 5u) & 63u) * 255u / 63u),
+            static_cast<uint8_t>((value & 31u) * 255u / 31u),
+        };
+    };
+    for (uint32_t block_index = 0; block_index < blocks_x * blocks_y; ++block_index) {
+        const size_t offset = static_cast<size_t>(block_index) * 8u;
+        if (offset + 8u > resource.payload.size()) {
+            break;
+        }
+        // The guest upload has already converted these DXT1 surfaces to
+        // row-major block order. Applying an NV2A Morton unswizzle here
+        // scrambles the recovered title and publisher textures.
+        const uint32_t block_x = block_index % blocks_x;
+        const uint32_t block_y = block_index / blocks_x;
+        const uint16_t color0 = static_cast<uint16_t>(resource.payload[offset] | (resource.payload[offset + 1u] << 8u));
+        const uint16_t color1 = static_cast<uint16_t>(resource.payload[offset + 2u] | (resource.payload[offset + 3u] << 8u));
+        std::array<std::array<uint8_t, 4>, 4> colors{};
+        const auto rgb0 = expand565(color0);
+        const auto rgb1 = expand565(color1);
+        colors[0] = {rgb0[0], rgb0[1], rgb0[2], 255};
+        colors[1] = {rgb1[0], rgb1[1], rgb1[2], 255};
+        if (color0 > color1) {
+            for (uint32_t channel = 0; channel < 3u; ++channel) {
+                colors[2][channel] = static_cast<uint8_t>((2u * colors[0][channel] + colors[1][channel]) / 3u);
+                colors[3][channel] = static_cast<uint8_t>((colors[0][channel] + 2u * colors[1][channel]) / 3u);
+            }
+            colors[2][3] = colors[3][3] = 255;
+        } else {
+            for (uint32_t channel = 0; channel < 3u; ++channel) {
+                colors[2][channel] = static_cast<uint8_t>((colors[0][channel] + colors[1][channel]) / 2u);
+            }
+            colors[2][3] = 255;
+            colors[3] = {0, 0, 0, 0};
+        }
+        uint32_t indices = 0;
+        std::memcpy(&indices, resource.payload.data() + offset + 4u, sizeof(indices));
+        for (uint32_t y = 0; y < 4u; ++y) {
+            for (uint32_t x = 0; x < 4u; ++x) {
+                const uint32_t pixel_x = block_x * 4u + x;
+                const uint32_t pixel_y = block_y * 4u + y;
+                if (pixel_x >= resource.width || pixel_y >= resource.height) {
+                    continue;
+                }
+                const auto& color = colors[(indices >> (2u * (y * 4u + x))) & 3u];
+                const size_t destination = (static_cast<size_t>(pixel_y) * resource.width + pixel_x) * 4u;
+                std::copy(color.begin(), color.end(), rgba.begin() + destination);
+            }
+        }
+    }
+    return rgba;
+}
+
+
+===== runtime/host/vulkan_resources.cpp:64-145 | VulkanPresenter::decompress_dxt5 =====
+
+std::vector<uint8_t> VulkanPresenter::decompress_dxt5(const RecoveredTextureResource& resource) const {
+    std::vector<uint8_t> rgba(static_cast<size_t>(resource.width) * resource.height * 4u, 255u);
+    const uint32_t blocks_x = (resource.width + 3u) / 4u;
+    const uint32_t blocks_y = (resource.height + 3u) / 4u;
+    auto expand565 = [](uint16_t value) {
+        return std::array<uint8_t, 3>{
+            static_cast<uint8_t>(((value >> 11u) & 31u) * 255u / 31u),
+            static_cast<uint8_t>(((value >> 5u) & 63u) * 255u / 63u),
+            static_cast<uint8_t>((value & 31u) * 255u / 31u),
+        };
+    };
+    for (uint32_t block_index = 0; block_index < blocks_x * blocks_y; ++block_index) {
+        const size_t offset = static_cast<size_t>(block_index) * 16u;
+        if (offset + 16u > resource.payload.size()) {
+            break;
+        }
+        const uint32_t block_x = block_index % blocks_x;
+        const uint32_t block_y = block_index / blocks_x;
+
+        std::array<uint8_t, 8> alphas{};
+        alphas[0] = resource.payload[offset];
+        alphas[1] = resource.payload[offset + 1u];
+        if (alphas[0] > alphas[1]) {
+            for (uint32_t index = 1u; index <= 6u; ++index) {
+                alphas[index + 1u] = static_cast<uint8_t>(
+                    ((7u - index) * alphas[0] + index * alphas[1]) / 7u);
+            }
+        } else {
+            for (uint32_t index = 1u; index <= 4u; ++index) {
+                alphas[index + 1u] = static_cast<uint8_t>(
+                    ((5u - index) * alphas[0] + index * alphas[1]) / 5u);
+            }
+            alphas[6] = 0u;
+            alphas[7] = 255u;
+        }
+        uint64_t alpha_indices = 0u;
+        for (uint32_t byte_index = 0; byte_index < 6u; ++byte_index) {
+            alpha_indices |= static_cast<uint64_t>(resource.payload[offset + 2u + byte_index])
+                << (byte_index * 8u);
+        }
+
+        const size_t color_offset = offset + 8u;
+        const uint16_t color0 = static_cast<uint16_t>(
+            resource.payload[color_offset] | (resource.payload[color_offset + 1u] << 8u));
+        const uint16_t color1 = static_cast<uint16_t>(
+            resource.payload[color_offset + 2u] | (resource.payload[color_offset + 3u] << 8u));
+        const auto rgb0 = expand565(color0);
+        const auto rgb1 = expand565(color1);
+        std::array<std::array<uint8_t, 3>, 4> colors{};
+        colors[0] = rgb0;
+        colors[1] = rgb1;
+        for (uint32_t channel = 0; channel < 3u; ++channel) {
+            colors[2][channel] = static_cast<uint8_t>((2u * rgb0[channel] + rgb1[channel]) / 3u);
+            colors[3][channel] = static_cast<uint8_t>((rgb0[channel] + 2u * rgb1[channel]) / 3u);
+        }
+        uint32_t color_indices = 0u;
+        std::memcpy(
+            &color_indices,
+            resource.payload.data() + color_offset + 4u,
+            sizeof(color_indices));
+
+        for (uint32_t y = 0; y < 4u; ++y) {
+            for (uint32_t x = 0; x < 4u; ++x) {
+                const uint32_t pixel_index = y * 4u + x;
+                const uint32_t pixel_x = block_x * 4u + x;
+                const uint32_t pixel_y = block_y * 4u + y;
+                if (pixel_x >= resource.width || pixel_y >= resource.height) {
+                    continue;
+                }
+                const auto& color = colors[(color_indices >> (2u * pixel_index)) & 3u];
+                const uint8_t alpha = alphas[(alpha_indices >> (3u * pixel_index)) & 7u];
+                const size_t destination =
+                    (static_cast<size_t>(pixel_y) * resource.width + pixel_x) * 4u;
+                rgba[destination] = color[0];
+                rgba[destination + 1u] = color[1];
+                rgba[destination + 2u] = color[2];
+                rgba[destination + 3u] = alpha;
+            }
+        }
+    }
+    return rgba;
+}
+
+
+===== runtime/host/vulkan_resources.cpp:147-180 | VulkanPresenter::decompress_dxt_mip_chain =====
+
+std::vector<std::vector<uint8_t>> VulkanPresenter::decompress_dxt_mip_chain(
+    const RecoveredTextureResource& resource) const {
+    const uint32_t block_bytes = resource.format == "DXT1" ? 8u : 16u;
+    std::vector<std::vector<uint8_t>> mips;
+    size_t payload_offset = 0u;
+    uint32_t width = resource.width;
+    uint32_t height = resource.height;
+    while (width != 0u && height != 0u) {
+        const size_t payload_size = static_cast<size_t>((width + 3u) / 4u)
+            * ((height + 3u) / 4u) * block_bytes;
+        if (payload_offset + payload_size > resource.payload.size()) {
+            break;
+        }
+        RecoveredTextureResource level = resource;
+        level.width = width;
+        level.height = height;
+        level.payload.assign(
+            resource.payload.begin()
+                + static_cast<std::ptrdiff_t>(payload_offset),
+            resource.payload.begin()
+                + static_cast<std::ptrdiff_t>(
+                    payload_offset + payload_size));
+        mips.push_back(resource.format == "DXT1"
+            ? decompress_dxt1(level)
+            : decompress_dxt5(level));
+        payload_offset += payload_size;
+        if (width == 1u && height == 1u) {
+            break;
+        }
+        width = std::max(width / 2u, 1u);
+        height = std::max(height / 2u, 1u);
+    }
+    return mips;
+}
+
+
+===== runtime/host/vulkan_resources.cpp:232-256 | VulkanPresenter::convert_bgra8_texture =====
+
+std::vector<uint8_t> VulkanPresenter::convert_bgra8_texture(
+    const RecoveredTextureResource& resource,
+    bool opaque_alpha,
+    bool swizzled) const {
+    const size_t pixel_count = static_cast<size_t>(resource.width)
+        * resource.height;
+    const std::vector<uint8_t> linear = swizzled
+        ? nv2a_unswizzle_texture_2d(
+            resource.payload, resource.width, resource.height, 4u)
+        : std::vector<uint8_t>{};
+    const std::vector<uint8_t>& source = swizzled
+        ? linear
+        : resource.payload;
+    std::vector<uint8_t> rgba(pixel_count * 4u, 0u);
+    for (size_t pixel = 0; pixel < pixel_count; ++pixel) {
+        const size_t offset = pixel * 4u;
+        rgba[offset] = source[offset + 2u];
+        rgba[offset + 1u] = source[offset + 1u];
+        rgba[offset + 2u] = source[offset];
+        rgba[offset + 3u] = opaque_alpha
+            ? 255u
+            : source[offset + 3u];
+    }
+    return rgba;
+}
+
+
+===== runtime/host/vulkan_resources.cpp:258-280 | VulkanPresenter::convert_r5g6b5_texture =====
+
+std::vector<uint8_t> VulkanPresenter::convert_r5g6b5_texture(
+    const RecoveredTextureResource& resource) const {
+    const size_t pixel_count = static_cast<size_t>(resource.width)
+        * resource.height;
+    const std::vector<uint8_t> linear = nv2a_unswizzle_texture_2d(
+        resource.payload, resource.width, resource.height, 2u);
+    std::vector<uint8_t> rgba(pixel_count * 4u, 255u);
+    for (size_t pixel = 0; pixel < pixel_count; ++pixel) {
+        uint16_t packed = 0u;
+        std::memcpy(
+            &packed,
+            linear.data() + pixel * 2u,
+            sizeof(packed));
+        const size_t offset = pixel * 4u;
+        rgba[offset] = static_cast<uint8_t>(
+            ((packed >> 11u) & 31u) * 255u / 31u);
+        rgba[offset + 1u] = static_cast<uint8_t>(
+            ((packed >> 5u) & 63u) * 255u / 63u);
+        rgba[offset + 2u] = static_cast<uint8_t>(
+            (packed & 31u) * 255u / 31u);
+    }
+    return rgba;
+}
+
+
+===== runtime/host/vulkan_resources.cpp:1455-1475 | VulkanPresenter::draw_surface_extent =====
+
+std::pair<uint32_t, uint32_t> VulkanPresenter::draw_surface_extent(
+    const NativeDraw& draw) const {
+    const uint32_t clip_x = draw.surface_clip_horizontal & 0xFFFFu;
+    const uint32_t clip_y = draw.surface_clip_vertical & 0xFFFFu;
+    const uint32_t clip_width =
+        (draw.surface_clip_horizontal >> 16u) & 0xFFFFu;
+    const uint32_t clip_height =
+        (draw.surface_clip_vertical >> 16u) & 0xFFFFu;
+    const uint32_t color_pitch = draw.surface_pitch & 0xFFFFu;
+    uint32_t width = color_pitch / 4u;
+    if (width == 0u) {
+        width = clip_x == 0u ? clip_width : swapchain_extent_.width;
+    }
+    uint32_t height = clip_y == 0u
+        ? clip_height
+        : swapchain_extent_.height;
+    if (height == 0u) {
+        height = swapchain_extent_.height;
+    }
+    return {width, height};
+}
+
+
+===== runtime/host/vulkan_resources.cpp:1477-1483 | VulkanPresenter::surface_extent_matches_presented =====
+
+bool VulkanPresenter::surface_extent_matches_presented(
+    uint32_t width,
+    uint32_t height) const {
+    return width == swapchain_extent_.width
+        && (height == swapchain_extent_.height
+            || (swapchain_extent_.height == 480u && height == 448u));
+}
+
+
+===== runtime/host/vulkan_resources.cpp:1511-1560 | VulkanPresenter::draw_surface_clip_is_subsurface_viewport =====
+
+bool VulkanPresenter::draw_surface_clip_is_subsurface_viewport(
+    const NativeDraw& draw) const {
+    const uint32_t clip_x = draw.surface_clip_horizontal & 0xFFFFu;
+    const uint32_t clip_width = draw.surface_clip_horizontal >> 16u;
+    const uint32_t clip_y = draw.surface_clip_vertical & 0xFFFFu;
+    const uint32_t clip_height = draw.surface_clip_vertical >> 16u;
+    // An atlas target occupies a strict sub-rectangle on both axes. The
+    // car-select preview deliberately uses the full presented width with a
+    // vertically clipped viewport, so treating every viewport smaller on
+    // either axis as offscreen drops the preview body draws.
+    if (clip_width == 0u || clip_height == 0u
+        || clip_width >= swapchain_extent_.width
+        || clip_height >= swapchain_extent_.height
+        || (draw.transform_execution_mode & 3u) != 2u) {
+        return false;
+    }
+
+    const float viewport_scale_x =
+        float_from_u32(draw.transform_constants[58][0]);
+    const float viewport_scale_y =
+        float_from_u32(draw.transform_constants[58][1]);
+    const float viewport_offset_x =
+        float_from_u32(draw.transform_constants[59][0]);
+    const float viewport_offset_y =
+        float_from_u32(draw.transform_constants[59][1]);
+    if (!std::isfinite(viewport_scale_x)
+        || !std::isfinite(viewport_scale_y)
+        || !std::isfinite(viewport_offset_x)
+        || !std::isfinite(viewport_offset_y)) {
+        return false;
+    }
+
+    constexpr float kViewportTolerance = 0.01f;
+    const float half_width = static_cast<float>(clip_width) * 0.5f;
+    const float half_height = static_cast<float>(clip_height) * 0.5f;
+    return std::abs(viewport_scale_x - half_width)
+            <= kViewportTolerance
+        && std::abs(viewport_scale_y + half_height)
+            <= kViewportTolerance
+        && std::abs(
+            viewport_offset_x
+                - (static_cast<float>(clip_x) + half_width
+                    + b2r::nv2a::kNv2aViewportSubpixelBias))
+            <= kViewportTolerance
+        && std::abs(
+            viewport_offset_y
+                - (static_cast<float>(clip_y) + half_height
+                    + b2r::nv2a::kNv2aViewportSubpixelBias))
+            <= kViewportTolerance;
+}
+
+
+===== runtime/host/vulkan_resources.cpp:1562-1591 | VulkanPresenter::draw_targets_presented_surface =====
+
+bool VulkanPresenter::draw_targets_presented_surface(const NativeDraw& draw) const {
+    // The title builds camera textures in atlas-shaped regions of the
+    // presented allocation. SET_SURFACE_CLIP alone cannot distinguish
+    // those passes from UI scissors, but their programmable viewport is
+    // centered and scaled to the clip rectangle exactly.
+    if (draw_surface_clip_is_subsurface_viewport(draw)) {
+        return false;
+    }
+    if (presented_surface_color_offset_ != 0u) {
+        return draw.surface_color_offset == presented_surface_color_offset_;
+    }
+    if (draw.surface_clip_horizontal == 0u
+        || draw.surface_clip_vertical == 0u) {
+        return true;
+    }
+    const uint32_t clip_x = draw.surface_clip_horizontal & 0xFFFFu;
+    const uint32_t clip_width = draw.surface_clip_horizontal >> 16u;
+    const uint32_t clip_y = draw.surface_clip_vertical & 0xFFFFu;
+    const uint32_t clip_height = draw.surface_clip_vertical >> 16u;
+    // SET_SURFACE_CLIP is also the title's per-widget scissor. Once the
+    // viewport-matched subpasses above are excluded, retain non-zero-origin
+    // clips as draws on the current surface. Only an origin-zero
+    // sub-surface remains a useful fallback discriminator when an address
+    // was not captured.
+    if (clip_x != 0u || clip_y != 0u) {
+        return true;
+    }
+    return clip_width >= swapchain_extent_.width
+        && clip_height >= swapchain_extent_.height;
+}
+
+
+===== runtime/host/vulkan_resources.cpp:1593-1615 | VulkanPresenter::draw_scissor =====
+
+VkRect2D VulkanPresenter::draw_scissor(
+    const NativeDraw& draw,
+    VkExtent2D target_extent) const {
+    const uint32_t clip_x = draw.surface_clip_horizontal & 0xFFFFu;
+    const uint32_t clip_width = draw.surface_clip_horizontal >> 16u;
+    const uint32_t clip_y = draw.surface_clip_vertical & 0xFFFFu;
+    const uint32_t clip_height = draw.surface_clip_vertical >> 16u;
+    if (clip_width == 0u || clip_height == 0u) {
+        return {{0, 0}, target_extent};
+    }
+    const uint32_t bounded_x = std::min(clip_x, target_extent.width);
+    const uint32_t bounded_y = std::min(clip_y, target_extent.height);
+    return {
+        {
+            static_cast<int32_t>(bounded_x),
+            static_cast<int32_t>(bounded_y),
+        },
+        {
+            std::min(clip_width, target_extent.width - bounded_x),
+            std::min(clip_height, target_extent.height - bounded_y),
+        },
+    };
+}
+
+
+===== runtime/host/vulkan_resources.cpp:1617-1621 | VulkanPresenter::draw_has_supported_host_transform =====
+
+bool VulkanPresenter::draw_has_supported_host_transform(const NativeDraw& draw) {
+    const uint32_t mode = draw.transform_execution_mode & 3u;
+    return mode == 2u
+        || (mode == 0u && fixed_function_composite_matrix_valid(draw));
+}
+
+
+===== runtime/host/shaders/nv2a_texture_convert.comp:28-31 | raw_u8 =====
+
+uint raw_u8(uint byte_offset) {
+    uint packed = raw_words[byte_offset >> 2u];
+    return (packed >> ((byte_offset & 3u) * 8u)) & 0xFFu;
+}
+
+
+===== runtime/host/shaders/nv2a_texture_convert.comp:33-35 | raw_u16 =====
+
+uint raw_u16(uint byte_offset) {
+    return raw_u8(byte_offset) | (raw_u8(byte_offset + 1u) << 8u);
+}
+
+
+===== runtime/host/shaders/nv2a_texture_convert.comp:37-42 | raw_u32 =====
+
+uint raw_u32(uint byte_offset) {
+    return raw_u8(byte_offset)
+        | (raw_u8(byte_offset + 1u) << 8u)
+        | (raw_u8(byte_offset + 2u) << 16u)
+        | (raw_u8(byte_offset + 3u) << 24u);
+}
+
+
+===== runtime/host/shaders/nv2a_texture_convert.comp:44-49 | expand_565 =====
+
+uvec3 expand_565(uint packed) {
+    return uvec3(
+        ((packed >> 11u) & 31u) * 255u / 31u,
+        ((packed >> 5u) & 63u) * 255u / 63u,
+        (packed & 31u) * 255u / 31u);
+}
+
+
+===== runtime/host/shaders/nv2a_texture_convert.comp:51-56 | pack_rgba =====
+
+uint pack_rgba(uvec4 color) {
+    return color.r
+        | (color.g << 8u)
+        | (color.b << 16u)
+        | (color.a << 24u);
+}
+
+
+===== runtime/host/shaders/nv2a_texture_convert.comp:58-64 | unpack_rgba =====
+
+uvec4 unpack_rgba(uint packed) {
+    return uvec4(
+        packed & 0xFFu,
+        (packed >> 8u) & 0xFFu,
+        (packed >> 16u) & 0xFFu,
+        (packed >> 24u) & 0xFFu);
+}
+
+
+===== runtime/host/shaders/nv2a_texture_convert.comp:66-91 | decode_dxt1 =====
+
+uvec4 decode_dxt1(uvec2 pixel) {
+    uint blocks_x = (state.width + 3u) / 4u;
+    uint block_index = (pixel.y / 4u) * blocks_x + pixel.x / 4u;
+    uint block_offset = state.input_byte_offset + block_index * 8u;
+    uint color0_raw = raw_u16(block_offset);
+    uint color1_raw = raw_u16(block_offset + 2u);
+    uvec3 color0 = expand_565(color0_raw);
+    uvec3 color1 = expand_565(color1_raw);
+    uint indices = raw_u32(block_offset + 4u);
+    uint local_index = (pixel.y & 3u) * 4u + (pixel.x & 3u);
+    uint selected = (indices >> (local_index * 2u)) & 3u;
+    if (selected == 0u) {
+        return uvec4(color0, 255u);
+    }
+    if (selected == 1u) {
+        return uvec4(color1, 255u);
+    }
+    if (color0_raw > color1_raw) {
+        return selected == 2u
+            ? uvec4((2u * color0 + color1) / 3u, 255u)
+            : uvec4((color0 + 2u * color1) / 3u, 255u);
+    }
+    return selected == 2u
+        ? uvec4((color0 + color1) / 2u, 255u)
+        : uvec4(0u);
+}
+
+
+===== runtime/host/shaders/nv2a_texture_convert.comp:93-117 | decode_dxt5_alpha =====
+
+uint decode_dxt5_alpha(uint block_offset, uint pixel_index) {
+    uint alpha0 = raw_u8(block_offset);
+    uint alpha1 = raw_u8(block_offset + 1u);
+    uint bit_offset = pixel_index * 3u;
+    uint byte_offset = bit_offset / 8u;
+    uint shift = bit_offset & 7u;
+    uint bits = raw_u8(block_offset + 2u + byte_offset)
+        | (raw_u8(block_offset + 3u + byte_offset) << 8u);
+    uint selected = (bits >> shift) & 7u;
+    if (selected == 0u) {
+        return alpha0;
+    }
+    if (selected == 1u) {
+        return alpha1;
+    }
+    if (alpha0 > alpha1) {
+        return ((8u - selected) * alpha0
+            + (selected - 1u) * alpha1) / 7u;
+    }
+    if (selected < 6u) {
+        return ((6u - selected) * alpha0
+            + (selected - 1u) * alpha1) / 5u;
+    }
+    return selected == 6u ? 0u : 255u;
+}
+
+
+===== runtime/host/shaders/nv2a_texture_convert.comp:119-137 | decode_dxt5 =====
+
+uvec4 decode_dxt5(uvec2 pixel) {
+    uint blocks_x = (state.width + 3u) / 4u;
+    uint block_index = (pixel.y / 4u) * blocks_x + pixel.x / 4u;
+    uint block_offset = state.input_byte_offset + block_index * 16u;
+    uint color_offset = block_offset + 8u;
+    uvec3 color0 = expand_565(raw_u16(color_offset));
+    uvec3 color1 = expand_565(raw_u16(color_offset + 2u));
+    uint color_indices = raw_u32(color_offset + 4u);
+    uint pixel_index = (pixel.y & 3u) * 4u + (pixel.x & 3u);
+    uint selected = (color_indices >> (pixel_index * 2u)) & 3u;
+    uvec3 color = selected == 0u
+        ? color0
+        : selected == 1u
+            ? color1
+            : selected == 2u
+                ? (2u * color0 + color1) / 3u
+                : (color0 + 2u * color1) / 3u;
+    return uvec4(color, decode_dxt5_alpha(block_offset, pixel_index));
+}
+
+
+===== runtime/host/shaders/nv2a_texture_convert.comp:139-156 | downsample =====
+
+uvec4 downsample(uvec2 pixel) {
+    uvec4 sum = uvec4(0u);
+    uint count = 0u;
+    for (uint dy = 0u; dy < 2u; ++dy) {
+        for (uint dx = 0u; dx < 2u; ++dx) {
+            uvec2 source = pixel * 2u + uvec2(dx, dy);
+            if (source.x >= state.source_width
+                || source.y >= state.source_height) {
+                continue;
+            }
+            uint packed = rgba_words[state.source_word_offset
+                + source.y * state.source_width + source.x];
+            sum += unpack_rgba(packed);
+            ++count;
+        }
+    }
+    return sum / max(count, 1u);
+}
+
+
+===== runtime/host/shaders/nv2a_texture_convert.comp:158-170 | main =====
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= state.width || pixel.y >= state.height) {
+        return;
+    }
+    uvec4 color = state.mode == MODE_DXT1
+        ? decode_dxt1(pixel)
+        : state.mode == MODE_DXT5
+            ? decode_dxt5(pixel)
+            : downsample(pixel);
+    rgba_words[state.output_word_offset
+        + pixel.y * state.width + pixel.x] = pack_rgba(color);
+}
+
+
+===== runtime/nv2a/texture_layout.h:1-172 | texture_layout.h =====
+
+#pragma once
+
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace b2r::nv2a {
+
+inline uint32_t nv2a_canonical_resource_address(uint32_t address) {
+    return (address & 0xF0000000u) == 0x20000000u
+        ? address & ~0x20000000u
+        : address;
+}
+
+inline bool nv2a_texture_format_matches(
+    std::string_view format,
+    uint32_t format_raw
+) {
+    switch ((format_raw >> 8u) & 0xFFu) {
+    case 0x05u: return format == "R5G6B5";
+    case 0x06u: return format == "A8R8G8B8";
+    case 0x07u: return format == "X8R8G8B8";
+    case 0x0Cu: return format == "DXT1";
+    case 0x0Eu: return format == "DXT3";
+    case 0x0Fu: return format == "DXT5";
+    case 0x12u: return format == "A8R8G8B8_LINEAR";
+    case 0x1Eu: return format == "X8R8G8B8_LINEAR";
+    default:
+        constexpr char hexadecimal[] = "0123456789ABCDEF";
+        const uint32_t color_format = (format_raw >> 8u) & 0xFFu;
+        std::array<char, 10> name{
+            'f', 'o', 'r', 'm', 'a', 't', '_', '0', '0', '\0'};
+        name[7] = hexadecimal[(color_format >> 4u) & 0xFu];
+        name[8] = hexadecimal[color_format & 0xFu];
+        return format == name.data();
+    }
+}
+
+inline bool nv2a_render_target_feedback_formats_compatible(
+    std::string_view left,
+    std::string_view right
+) {
+    if (left == right) {
+        return true;
+    }
+    const bool left_argb32 = left == "A8R8G8B8" || left == "X8R8G8B8";
+    const bool right_argb32 = right == "A8R8G8B8" || right == "X8R8G8B8";
+    const bool left_linear_argb32 = left == "A8R8G8B8_LINEAR"
+        || left == "X8R8G8B8_LINEAR";
+    const bool right_linear_argb32 = right == "A8R8G8B8_LINEAR"
+        || right == "X8R8G8B8_LINEAR";
+    return (left_argb32 && right_argb32)
+        || (left_linear_argb32 && right_linear_argb32);
+}
+
+inline bool nv2a_render_target_feedback_format_matches(
+    std::string_view format,
+    uint32_t format_raw
+) {
+    if (nv2a_texture_format_matches(format, format_raw)) {
+        return true;
+    }
+    switch ((format_raw >> 8u) & 0xFFu) {
+    case 0x06u:
+    case 0x07u:
+        return nv2a_render_target_feedback_formats_compatible(
+            format, "A8R8G8B8");
+    case 0x12u:
+    case 0x1Eu:
+        return nv2a_render_target_feedback_formats_compatible(
+            format, "A8R8G8B8_LINEAR");
+    default:
+        return false;
+    }
+}
+
+inline bool nv2a_texture_format_is_linear(uint32_t format_raw) {
+    const uint32_t color_format = (format_raw >> 8u) & 0xFFu;
+    return color_format == 0x12u || color_format == 0x1Eu;
+}
+
+inline bool nv2a_texture_format_is_cubemap(uint32_t format_raw) {
+    return (format_raw & (1u << 2u)) != 0u;
+}
+
+inline uint32_t nv2a_texture_uncompressed_bytes_per_pixel(
+    uint32_t format_raw
+) {
+    switch ((format_raw >> 8u) & 0xFFu) {
+    case 0x05u: return 2u;
+    case 0x06u:
+    case 0x07u:
+    case 0x12u:
+    case 0x1Eu:
+        return 4u;
+    default:
+        return 0u;
+    }
+}
+
+inline std::pair<uint32_t, uint32_t> nv2a_texture_extent(
+    uint32_t format_raw,
+    uint32_t image_rect_raw
+) {
+    if (nv2a_texture_format_is_linear(format_raw) && image_rect_raw != 0u) {
+        return {
+            (image_rect_raw >> 16u) & 0xFFFFu,
+            image_rect_raw & 0xFFFFu,
+        };
+    }
+    return {
+        1u << ((format_raw >> 20u) & 0xFu),
+        1u << ((format_raw >> 24u) & 0xFu),
+    };
+}
+
+inline std::vector<uint8_t> nv2a_unswizzle_texture_2d(
+    const std::vector<uint8_t>& payload,
+    uint32_t width,
+    uint32_t height,
+    uint32_t bytes_per_pixel
+) {
+    std::vector<uint8_t> linear(payload.size(), 0u);
+    if (bytes_per_pixel == 0u) {
+        return linear;
+    }
+    uint32_t mask_x = 0u;
+    uint32_t mask_y = 0u;
+    uint32_t dimension_bit = 1u;
+    uint32_t mask_bit = 1u;
+    bool done = false;
+    while (!done) {
+        done = true;
+        if (dimension_bit < width) {
+            mask_x |= mask_bit;
+            mask_bit <<= 1u;
+            done = false;
+        }
+        if (dimension_bit < height) {
+            mask_y |= mask_bit;
+            mask_bit <<= 1u;
+            done = false;
+        }
+        dimension_bit <<= 1u;
+    }
+    uint32_t offset_y = 0u;
+    for (uint32_t y = 0u; y < height; ++y) {
+        uint32_t offset_x = 0u;
+        for (uint32_t x = 0u; x < width; ++x) {
+            const size_t source = static_cast<size_t>(offset_x + offset_y)
+                * bytes_per_pixel;
+            const size_t destination = (static_cast<size_t>(y) * width + x)
+                * bytes_per_pixel;
+            if (source + bytes_per_pixel <= payload.size()
+                && destination + bytes_per_pixel <= linear.size()) {
+                std::copy_n(
+                    payload.begin() + static_cast<std::ptrdiff_t>(source),
+                    bytes_per_pixel,
+                    linear.begin() + static_cast<std::ptrdiff_t>(destination));
+            }
+            offset_x = (offset_x - mask_x) & mask_x;
+        }
+        offset_y = (offset_y - mask_y) & mask_y;
+    }
+    return linear;
+}
+
+}  // namespace b2r::nv2a
+

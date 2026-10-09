@@ -1,0 +1,771 @@
+
+===== tools/playability/host_audio.py:51-56 | PcmClip =====
+
+@dataclass(frozen=True)
+class PcmClip:
+    sample_rate: int
+    channels: int
+    bits_per_sample: int
+    payload: bytes
+
+
+===== tools/playability/host_audio.py:124-167 | parse_rws_pcm =====
+
+def parse_rws_pcm(payload: bytes) -> list[PcmClip]:
+    """Extract PCM16 clips from the 0x809 RenderWare audio container."""
+
+    def u32(offset: int) -> int:
+        if offset < 0 or offset + 4 > len(payload):
+            raise ValueError("truncated RWS integer")
+        return struct.unpack_from("<I", payload, offset)[0]
+
+    if len(payload) < 0x1C or u32(0) != RWS_FILE_ID:
+        raise ValueError("not a RenderWare 0x809 audio stream")
+    file_header = 0x0C
+    if u32(file_header) != RWS_FILE_HEADER_ID:
+        raise ValueError("missing RWS file header")
+    file_data = file_header + 0x0C + u32(file_header + 4)
+    if u32(file_data) != RWS_FILE_DATA_ID:
+        raise ValueError("missing RWS file data chunk")
+
+    stream_count = u32(file_data + 0x0C)
+    stream_offset = file_data + 0x10
+    clips: list[PcmClip] = []
+    for _ in range(stream_count):
+        if u32(stream_offset) != RWS_STREAM_ID:
+            raise ValueError("missing RWS stream chunk")
+        stream_chunk_size = u32(stream_offset + 4)
+        stream_header = stream_offset + 0x0C
+        if u32(stream_header) != RWS_STREAM_HEADER_ID:
+            raise ValueError("missing RWS stream header")
+        stream_header_size = u32(stream_header + 4)
+        sample_rate = u32(stream_header + 0x10)
+        pcm_size = u32(stream_header + 0x18)
+        channels = payload[stream_header + 0x1D]
+        codec_uuid = u32(stream_header + 0x2C)
+        if codec_uuid != RWS_PCM16_CODEC_UUID:
+            raise ValueError(f"unsupported RWS codec 0x{codec_uuid:08X}")
+        data_chunk = stream_header + stream_header_size + 0x0C
+        if u32(data_chunk) != RWS_STREAM_DATA_ID or u32(data_chunk + 4) != pcm_size:
+            raise ValueError("invalid RWS stream data chunk")
+        pcm_start = data_chunk + 0x0C
+        pcm_end = pcm_start + pcm_size
+        if pcm_end > len(payload):
+            raise ValueError("truncated RWS PCM payload")
+        clips.append(PcmClip(sample_rate, channels, 16, payload[pcm_start:pcm_end]))
+        stream_offset += stream_chunk_size + 0x0C
+    return clips
+
+
+===== tools/playability/host_audio.py:170-230 | parse_rws_xbox_adpcm =====
+
+def parse_rws_xbox_adpcm(
+    payload: bytes,
+    *,
+    channels: int = 2,
+    substream_index: int = 0,
+) -> PcmClip:
+    """Decode a RenderWare 0x80D streamed Xbox IMA-ADPCM track to PCM16."""
+
+    if channels <= 0:
+        raise ValueError("channel count must be positive")
+    if len(payload) < 0x24:
+        raise ValueError("truncated streamed RWS track")
+    file_id, file_size = struct.unpack_from("<II", payload, 0)
+    if file_id != RWS_STREAMED_FILE_ID or file_size + 12 > len(payload):
+        raise ValueError("not a RenderWare 0x80D streamed audio track")
+    header_offset = 12
+    header_id, header_size = struct.unpack_from("<II", payload, header_offset)
+    if header_id != RWS_STREAMED_HEADER_ID:
+        raise ValueError("missing streamed RWS header")
+    data_offset = header_offset + 12 + header_size
+    if data_offset + 12 > len(payload):
+        raise ValueError("missing streamed RWS data")
+    data_id, data_size = struct.unpack_from("<II", payload, data_offset)
+    if data_id != RWS_STREAMED_DATA_ID or data_offset + 12 + data_size > len(payload):
+        raise ValueError("invalid streamed RWS data chunk")
+
+    sample_rate = _find_streamed_sample_rate(payload[header_offset:data_offset])
+    encoded = _extract_streamed_substream(
+        payload,
+        data_offset=data_offset,
+        data_size=data_size,
+        substream_index=substream_index,
+    )
+    block_align = 36 * channels
+    if len(encoded) % block_align:
+        raise ValueError("streamed Xbox ADPCM payload is not block-aligned")
+
+    block_count = len(encoded) // block_align
+    output = bytearray(block_count * 64 * channels * 2)
+    output_offset = 0
+    packed_block = struct.Struct(f"<{64 * channels}h")
+    for block_offset in range(0, len(encoded), block_align):
+        channel_samples = []
+        for channel in range(channels):
+            channel_block = bytearray(
+                encoded[block_offset + channel * 4:block_offset + channel * 4 + 4]
+            )
+            for group in range(8):
+                group_offset = block_offset + channels * 4 + group * channels * 4
+                channel_block.extend(
+                    encoded[group_offset + channel * 4:group_offset + channel * 4 + 4]
+                )
+            channel_samples.append(_decode_xbox_adpcm_block(bytes(channel_block)))
+        interleaved = [
+            channel_samples[channel][sample_index]
+            for sample_index in range(64)
+            for channel in range(channels)
+        ]
+        packed_block.pack_into(output, output_offset, *interleaved)
+        output_offset += packed_block.size
+    return PcmClip(sample_rate, channels, 16, bytes(output))
+
+
+===== tools/playability/host_audio.py:233-290 | _extract_streamed_substream =====
+
+def _extract_streamed_substream(
+    payload: bytes,
+    *,
+    data_offset: int,
+    data_size: int,
+    substream_index: int,
+) -> bytes:
+    """Extract one substream using the packet layout declared by the RWS header."""
+
+    def u32(offset: int) -> int:
+        if offset < 0 or offset + 4 > data_offset:
+            raise ValueError("truncated streamed RWS packet layout")
+        return struct.unpack_from("<I", payload, offset)[0]
+
+    if data_offset < 0x9C:
+        raise ValueError("streamed RWS packet layout is missing")
+    substream_count = u32(0x40)
+    packet_size = u32(0x4C)
+    if not 1 <= substream_count <= 8 or packet_size == 0:
+        raise ValueError("invalid streamed RWS packet layout")
+    if not 0 <= substream_index < substream_count:
+        raise ValueError("streamed RWS substream index is out of range")
+
+    descriptors: list[tuple[int, int, int]] = []
+    for offset in range(0x80, data_offset - 0x1C + 1, 4):
+        flags, span, _, format_flags, _, audio_size, packet_offset = (
+            struct.unpack_from("<7I", payload, offset)
+        )
+        if (
+            flags == 7
+            and format_flags == 0x00040004
+            and 0 < span <= packet_size
+            and 0 < audio_size <= span
+            and packet_offset < packet_size
+            and packet_offset + span <= packet_size
+        ):
+            descriptors.append((packet_offset, span, audio_size))
+    descriptors.sort()
+    if len(descriptors) != substream_count:
+        raise ValueError("streamed RWS substream descriptors are invalid")
+
+    packet_offset, _, audio_size = descriptors[substream_index]
+    declared_size = u32(0x98 + substream_index * 4)
+    data = payload[data_offset + 12:data_offset + 12 + data_size]
+    output = bytearray()
+    for packet_start in range(0, len(data), packet_size):
+        audio_start = packet_start + packet_offset
+        if audio_start >= len(data):
+            break
+        audio_end = min(len(data), audio_start + audio_size)
+        output.extend(data[audio_start:audio_end])
+        if len(output) >= declared_size:
+            del output[declared_size:]
+            break
+
+    if not output:
+        raise ValueError("streamed RWS substream contains no complete ADPCM blocks")
+    return bytes(output)
+
+
+===== tools/playability/host_audio.py:293-297 | _find_streamed_sample_rate =====
+
+def _find_streamed_sample_rate(header: bytes) -> int:
+    for sample_rate in (48000, 44100, 32000, 22050):
+        if struct.pack("<I", sample_rate) in header:
+            return sample_rate
+    raise ValueError("streamed RWS sample rate was not found")
+
+
+===== tools/playability/host_audio.py:300-325 | _decode_xbox_adpcm_block =====
+
+def _decode_xbox_adpcm_block(block: bytes) -> list[int]:
+    if len(block) != 36:
+        raise ValueError("Xbox ADPCM channel block must be 36 bytes")
+    predictor, step_index = struct.unpack_from("<hB", block, 0)
+    if step_index >= len(_IMA_STEP_TABLE):
+        raise ValueError("invalid Xbox ADPCM step index")
+    samples = [predictor]
+    for packed in block[4:]:
+        for nibble in (packed & 0x0F, packed >> 4):
+            if len(samples) == 64:
+                return samples
+            step = _IMA_STEP_TABLE[step_index]
+            difference = step >> 3
+            if nibble & 1:
+                difference += step >> 2
+            if nibble & 2:
+                difference += step >> 1
+            if nibble & 4:
+                difference += step
+            predictor += -difference if nibble & 8 else difference
+            predictor = max(-32768, min(32767, predictor))
+            step_index = max(0, min(88, step_index + _IMA_INDEX_TABLE[nibble]))
+            samples.append(predictor)
+    if len(samples) != 64:
+        raise ValueError("truncated Xbox ADPCM block")
+    return samples
+
+
+===== tools/recomp/native_executor.py:8347-8387 | b2r_audio_decode_adpcm_channel =====
+
+static bool b2r_audio_decode_adpcm_channel(
+    const uint8_t block[36], int16_t output[64]
+) {
+    static constexpr int index_table[16] = {
+        -1, -1, -1, -1, 2, 4, 6, 8,
+        -1, -1, -1, -1, 2, 4, 6, 8};
+    static constexpr int step_table[89] = {
+        7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31,
+        34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130,
+        143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449,
+        494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411,
+        1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026,
+        4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442,
+        11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623,
+        27086, 29794, 32767};
+    int16_t initial = 0;
+    std::memcpy(&initial, block, sizeof(initial));
+    int predictor = initial;
+    int step_index = block[2];
+    if (step_index >= 89) { return false; }
+    output[0] = initial;
+    uint32_t sample = 1u;
+    for (uint32_t byte_index = 4u; byte_index < 36u && sample < 64u;
+         ++byte_index) {
+        const uint8_t packed = block[byte_index];
+        for (uint32_t half = 0u; half < 2u && sample < 64u; ++half) {
+            const uint8_t nibble = half == 0u ? packed & 0x0fu : packed >> 4u;
+            const int step = step_table[step_index];
+            int difference = step >> 3;
+            if ((nibble & 1u) != 0u) { difference += step >> 2; }
+            if ((nibble & 2u) != 0u) { difference += step >> 1; }
+            if ((nibble & 4u) != 0u) { difference += step; }
+            predictor += (nibble & 8u) != 0u ? -difference : difference;
+            predictor = std::max(-32768, std::min(32767, predictor));
+            step_index = std::max(
+                0, std::min(88, step_index + index_table[nibble]));
+            output[sample++] = static_cast<int16_t>(predictor);
+        }
+    }
+    return sample == 64u;
+}
+
+
+===== tools/recomp/native_executor.py:8389-8434 | b2r_audio_decode_xbox_adpcm =====
+
+static bool b2r_audio_decode_xbox_adpcm(
+    const uint8_t* encoded,
+    size_t encoded_size,
+    uint32_t sample_rate,
+    uint32_t channel_count,
+    std::vector<int16_t>& output
+) {
+    if (encoded == nullptr || (channel_count != 1u && channel_count != 2u) ||
+        sample_rate == 0u) {
+        return false;
+    }
+    const size_t block_align = 36u * channel_count;
+    if (encoded_size == 0u || encoded_size % block_align != 0u) {
+        return false;
+    }
+    std::vector<int16_t> decoded;
+    decoded.reserve(encoded_size / block_align * 64u * channel_count);
+    for (size_t block_offset = 0u; block_offset < encoded_size;
+         block_offset += block_align) {
+        int16_t channels[2][64]{};
+        for (uint32_t channel = 0u; channel < channel_count; ++channel) {
+            uint8_t block[36]{};
+            std::memcpy(
+                block, encoded + block_offset + channel * 4u, 4u);
+            for (uint32_t group = 0u; group < 8u; ++group) {
+                const size_t group_offset = block_offset + channel_count * 4u +
+                    group * channel_count * 4u;
+                std::memcpy(
+                    block + 4u + group * 4u,
+                    encoded + group_offset + channel * 4u, 4u);
+            }
+            if (!b2r_audio_decode_adpcm_channel(block, channels[channel])) {
+                return false;
+            }
+        }
+        for (uint32_t sample = 0u; sample < 64u; ++sample) {
+            for (uint32_t channel = 0u; channel < channel_count; ++channel) {
+                decoded.push_back(channels[channel][sample]);
+            }
+        }
+    }
+    output = b2r_audio_normalize_pcm16(
+        reinterpret_cast<const uint8_t*>(decoded.data()),
+        decoded.size() * sizeof(int16_t), sample_rate, channel_count);
+    return !output.empty();
+}
+
+
+===== tools/recomp/native_executor.py:9118-9166 | b2r_audio_select_buffer_region =====
+
+static bool b2r_audio_select_buffer_region(
+    B2RNativeHostServiceState* state,
+    const B2RNativeNormalRuntimeState::AudioBufferMirror* mirror,
+    uint32_t buffer,
+    uint32_t flags,
+    uint32_t& data,
+    uint32_t& size,
+    uint32_t& loop_start_bytes,
+    uint32_t& loop_size_bytes
+) {
+    constexpr uint32_t kPlayStartOffset = 0xc0u;
+    constexpr uint32_t kPlayLengthOffset = 0xc4u;
+    constexpr uint32_t kLoopStartOffset = 0xc8u;
+    constexpr uint32_t kLoopLengthOffset = 0xccu;
+    if (state == nullptr || mirror == nullptr || buffer == 0u) { return false; }
+    const uint32_t descriptor = b2r_native_service_read_u32(state, buffer);
+    if (descriptor == 0u) { return false; }
+    const uint32_t play_start = b2r_native_service_read_u32(
+        state, descriptor + kPlayStartOffset);
+    const uint32_t play_length = b2r_native_service_read_u32(
+        state, descriptor + kPlayLengthOffset);
+    const bool loop = (flags & 1u) != 0u;
+    const uint32_t requested_loop_start = loop
+        ? b2r_native_service_read_u32(state, descriptor + kLoopStartOffset)
+        : 0u;
+    const uint32_t requested_loop_length = loop
+        ? b2r_native_service_read_u32(state, descriptor + kLoopLengthOffset)
+        : play_length;
+    const uint32_t effective_loop_start = loop ? requested_loop_start : 0u;
+    const uint32_t effective_loop_length = loop && requested_loop_length != 0u
+        ? requested_loop_length
+        : (effective_loop_start <= play_length
+            ? play_length - effective_loop_start : 0u);
+    const uint64_t play_end = static_cast<uint64_t>(play_start) + play_length;
+    const uint64_t loop_end =
+        static_cast<uint64_t>(effective_loop_start) + effective_loop_length;
+    const uint64_t region_address =
+        static_cast<uint64_t>(mirror->data) + play_start;
+    if (play_length == 0u || play_end > mirror->size ||
+        effective_loop_length == 0u || loop_end > play_length ||
+        region_address > 0xffffffffull) {
+        return false;
+    }
+    data = static_cast<uint32_t>(region_address);
+    size = play_length;
+    loop_start_bytes = effective_loop_start;
+    loop_size_bytes = effective_loop_length;
+    return true;
+}
+
+
+===== tools/recomp/ia32_native_backend.py:12805-12815 | live_audio_format =====
+
+static LiveAudioFormat live_audio_format(U32 address) {
+    LiveAudioFormat format = {0};
+    if (!address) return format;
+    format.tag = *(U16*)address;
+    format.channels = *(U16*)(address + 2u);
+    format.sample_rate = *(U32*)(address + 4u);
+    format.block_align = *(U16*)(address + 0xCu);
+    format.bits_per_sample = *(U16*)(address + 0xEu);
+    format.samples_per_block = *(U16*)(address + 0x12u);
+    return format;
+}
+
+
+===== tools/recomp/ia32_native_backend.py:13016-13050 | live_audio_decode_adpcm_channel =====
+
+static BOOL live_audio_decode_adpcm_channel(const U8* block, short* output) {
+    static const int index_table[16] = {
+        -1,-1,-1,-1,2,4,6,8,-1,-1,-1,-1,2,4,6,8};
+    static const int step_table[89] = {
+        7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,
+        55,60,66,73,80,88,97,107,118,130,143,157,173,190,209,230,253,
+        279,307,337,371,408,449,494,544,598,658,724,796,876,963,1060,
+        1166,1282,1411,1552,1707,1878,2066,2272,2499,2749,3024,3327,
+        3660,4026,4428,4871,5358,5894,6484,7132,7845,8630,9493,10442,
+        11487,12635,13899,15289,16818,18500,20350,22385,24623,27086,
+        29794,32767};
+    int predictor = *(const short*)block;
+    int step_index = block[2];
+    U32 byte_index, half, sample = 1u;
+    if (step_index >= 89) return 0;
+    output[0] = (short)predictor;
+    for (byte_index = 4u; byte_index < 36u && sample < 64u; ++byte_index) {
+        U8 packed = block[byte_index];
+        for (half = 0u; half < 2u && sample < 64u; ++half) {
+            U8 nibble = half ? packed >> 4u : packed & 15u;
+            int step = step_table[step_index];
+            int difference = step >> 3;
+            if (nibble & 1u) difference += step >> 2;
+            if (nibble & 2u) difference += step >> 1;
+            if (nibble & 4u) difference += step;
+            predictor += (nibble & 8u) ? -difference : difference;
+            predictor = live_audio_clamp(predictor);
+            step_index += index_table[nibble];
+            if (step_index < 0) step_index = 0;
+            if (step_index > 88) step_index = 88;
+            output[sample++] = (short)predictor;
+        }
+    }
+    return sample == 64u;
+}
+
+
+===== tools/recomp/ia32_native_backend.py:13051-13144 | live_audio_decode =====
+
+static BOOL live_audio_decode(
+    U32 data, U32 size, LiveAudioFormat format,
+    short** output, U32* output_samples
+) {
+    U64 source_frames, frames, bytes;
+    short* decoded;
+    U32 frame;
+    if (!data || !size || !output || !output_samples ||
+        (format.channels != 1u && format.channels != 2u) ||
+        format.sample_rate < 4000u || format.sample_rate > 192000u)
+        return 0;
+    source_frames = 0u;
+    if (format.tag == 1u && format.bits_per_sample == 16u &&
+        !(size % (format.channels * 2u))) {
+        source_frames = size / (format.channels * 2u);
+    } else if (format.tag == 0x69u && !(size % (format.channels * 36u))) {
+        source_frames = (U64)(size / (format.channels * 36u)) * 64u;
+    } else return 0;
+    frames = live_audio_div_u64_u32(
+        source_frames * 48000u + format.sample_rate / 2u,
+        format.sample_rate);
+    bytes = frames * 4u;
+    if (!frames || frames > 32u * 1024u * 1024u || bytes > 0x7FFFFFFFu)
+        return 0;
+    decoded = (short*)VirtualAlloc(0, (U32)bytes, 0x3000u, 0x04u);
+    if (!decoded) return 0;
+    if (format.tag == 1u) {
+        const short* input = (const short*)data;
+        for (frame = 0u; frame < (U32)frames; ++frame) {
+            U64 position = (U64)frame * format.sample_rate;
+            U32 source = (U32)live_audio_div_u64_u32(position, 48000u);
+            U32 next = source + 1u < source_frames ? source + 1u : source;
+            U64 fraction = live_audio_div_u64_u32(
+                (position - (U64)source * 48000u) * (1ull << 32u),
+                48000u);
+            long left0 = input[source * format.channels];
+            long left1 = input[next * format.channels];
+            long right0 = format.channels == 2u
+                ? input[source * 2u + 1u] : left0;
+            long right1 = format.channels == 2u
+                ? input[next * 2u + 1u] : left1;
+            decoded[frame * 2u] = (short)(
+                left0 + ((long long)(left1 - left0) * fraction >> 32u));
+            decoded[frame * 2u + 1u] = (short)(
+                right0 + ((long long)(right1 - right0) * fraction >> 32u));
+        }
+    } else {
+        U32 block_align = format.channels * 36u;
+        U32 block_offset, decoded_frame = 0u;
+        short channels[2][64];
+        U8 block[36];
+        for (block_offset = 0u; block_offset < size;
+             block_offset += block_align) {
+            U32 channel, group, sample;
+            for (channel = 0u; channel < format.channels; ++channel) {
+                copy_bytes(block, (const void*)(data + block_offset + channel * 4u), 4u);
+                for (group = 0u; group < 8u; ++group)
+                    copy_bytes(
+                        block + 4u + group * 4u,
+                        (const void*)(data + block_offset + format.channels * 4u +
+                            group * format.channels * 4u + channel * 4u), 4u);
+                if (!live_audio_decode_adpcm_channel(block, channels[channel])) {
+                    VirtualFree(decoded, 0u, 0x8000u);
+                    return 0;
+                }
+            }
+            for (sample = 0u; sample < 64u; ++sample) {
+                if (format.sample_rate == 48000u) {
+                    decoded[decoded_frame * 2u] = channels[0][sample];
+                    decoded[decoded_frame * 2u + 1u] = format.channels == 2u
+                        ? channels[1][sample] : channels[0][sample];
+                } else {
+                    U32 normalized = (U32)live_audio_div_u64_u32(
+                        (U64)decoded_frame * 48000u + format.sample_rate / 2u,
+                        format.sample_rate);
+                    U32 normalized_end = (U32)live_audio_div_u64_u32(
+                        (U64)(decoded_frame + 1u) * 48000u +
+                            format.sample_rate / 2u,
+                        format.sample_rate);
+                    while (normalized < normalized_end && normalized < frames) {
+                        decoded[normalized * 2u] = channels[0][sample];
+                        decoded[normalized * 2u + 1u] = format.channels == 2u
+                            ? channels[1][sample] : channels[0][sample];
+                        ++normalized;
+                    }
+                }
+                ++decoded_frame;
+            }
+        }
+    }
+    *output = decoded;
+    *output_samples = (U32)frames * 2u;
+    return 1;
+}
+
+
+===== tools/recomp/ia32_native_backend.py:13413-13555 | live_audio_rws_track =====
+
+static BOOL live_audio_rws_track(
+    const char* relative, U32 music_kind, U32 track_index
+) {
+    const U32 music_key = 0x31F10600u;
+    U8* payload = 0;
+    U8* encoded = 0;
+    short* samples[2] = {0, 0};
+    LiveAudioPlayback* playbacks[2] = {0, 0};
+    LiveAudioFormat format = {0};
+    U32 size = 0u, header_size, data_offset, data_size;
+    U32 substream_count, packet_size;
+    U32 declared_sizes[2] = {0u, 0u};
+    U32 descriptor_offsets[2] = {0u, 0u};
+    U32 descriptor_audio[2] = {0u, 0u};
+    U32 sample_counts[2] = {0u, 0u};
+    U32 descriptor_count = 0u;
+    U32 sample_rate = 0u, offset, stream, index;
+    if (!live_audio_read_asset(relative, &payload, &size)) goto failure;
+    if (size < 0x9Cu || *(U32*)payload != 0x80Du ||
+        (U64)*(U32*)(payload + 4u) + 12ull > size ||
+        *(U32*)(payload + 12u) != 0x80Eu) goto failure;
+    header_size = *(U32*)(payload + 16u);
+    if ((U64)header_size + 24ull > size) goto failure;
+    data_offset = header_size + 24u;
+    if ((U64)data_offset + 12ull > size ||
+        *(U32*)(payload + data_offset) != 0x80Fu) goto failure;
+    data_size = *(U32*)(payload + data_offset + 4u);
+    if ((U64)data_offset + 12ull + data_size > size) goto failure;
+    substream_count = *(U32*)(payload + 0x40u);
+    packet_size = *(U32*)(payload + 0x4Cu);
+    if (!substream_count || substream_count > 2u || !packet_size ||
+        0x98u + substream_count * 4u > data_offset) goto failure;
+    for (stream = 0u; stream < substream_count; ++stream) {
+        declared_sizes[stream] = *(U32*)(payload + 0x98u + stream * 4u);
+        if (!declared_sizes[stream] || declared_sizes[stream] > data_size)
+            goto failure;
+    }
+    for (offset = 12u; offset + 4u <= data_offset; ++offset) {
+        U32 candidate = *(U32*)(payload + offset);
+        if (candidate == 48000u || candidate == 44100u ||
+            candidate == 32000u || candidate == 22050u) {
+            sample_rate = candidate;
+            break;
+        }
+    }
+    if (!sample_rate) goto failure;
+    for (offset = 0x80u; offset + 0x1Cu <= data_offset; offset += 4u) {
+        U32 flags = *(U32*)(payload + offset);
+        U32 span = *(U32*)(payload + offset + 4u);
+        U32 format_flags = *(U32*)(payload + offset + 0xCu);
+        U32 audio_size = *(U32*)(payload + offset + 0x14u);
+        U32 packet_offset = *(U32*)(payload + offset + 0x18u);
+        if (flags == 7u && format_flags == 0x00040004u && span &&
+            span <= packet_size && audio_size && audio_size <= span &&
+            packet_offset < packet_size &&
+            (U64)packet_offset + span <= packet_size) {
+            if (descriptor_count >= substream_count) goto failure;
+            descriptor_offsets[descriptor_count] = packet_offset;
+            descriptor_audio[descriptor_count] = audio_size;
+            ++descriptor_count;
+        }
+    }
+    if (descriptor_count != substream_count) goto failure;
+    format.tag = 0x69u;
+    format.channels = 2u;
+    format.sample_rate = sample_rate;
+    format.block_align = 72u;
+    format.bits_per_sample = 4u;
+    format.samples_per_block = 64u;
+    for (stream = 0u; stream < substream_count; ++stream) {
+        U32 encoded_size = 0u;
+        encoded = (U8*)VirtualAlloc(
+            0, declared_sizes[stream], 0x3000u, 0x04u);
+        if (!encoded) goto failure;
+        for (offset = 0u;
+             offset < data_size && encoded_size < declared_sizes[stream];
+             offset += packet_size) {
+            U32 source = offset + descriptor_offsets[stream];
+            U32 copied;
+            if (source >= data_size) break;
+            copied = descriptor_audio[stream];
+            if (copied > data_size - source) copied = data_size - source;
+            if (copied > declared_sizes[stream] - encoded_size)
+                copied = declared_sizes[stream] - encoded_size;
+            copy_bytes(
+                encoded + encoded_size,
+                payload + data_offset + 12u + source,
+                copied);
+            encoded_size += copied;
+        }
+        if (encoded_size != declared_sizes[stream] || encoded_size % 72u ||
+            !live_audio_decode(
+                (U32)encoded, encoded_size, format,
+                &samples[stream], &sample_counts[stream])) goto failure;
+        VirtualFree(encoded, 0u, 0x8000u);
+        encoded = 0;
+    }
+    if (!live_start_audio_lane()) goto failure;
+    live_audio_stop_music();
+    live_audio_lock();
+    for (stream = 0u; stream < substream_count; ++stream) {
+        playbacks[stream] = live_audio_reserve_playback();
+        if (!playbacks[stream]) {
+            for (index = 0u; index < stream; ++index) {
+                live_audio_forget_playback(playbacks[index]);
+                playbacks[index]->active = 0u;
+            }
+            live_audio_unlock();
+            goto failure;
+        }
+    }
+    for (stream = 0u; stream < substream_count; ++stream) {
+        LiveAudioPlayback* playback = playbacks[stream];
+        playback->key = music_key + stream;
+        g_live_audio_playback_cache[(playback->key >> 4u) & 63u] = playback;
+        playback->active = 1u;
+        playback->loop = 1u;
+        playback->sample_count = sample_counts[stream];
+        playback->samples = samples[stream];
+        playback->cursor_frame_q32 = 0u;
+        playback->step_q32 = 1ull << 32u;
+        playback->loop_start_frame = 0u;
+        playback->loop_end_frame = sample_counts[stream] / 2u;
+        playback->left_gain_q16 = 32768;
+        playback->right_gain_q16 = 32768;
+        samples[stream] = 0;
+    }
+    live_audio_unlock();
+    VirtualFree(payload, 0u, 0x8000u);
+    ++g_live_audio_music_load_count;
+    g_live_audio_music_active = 1u;
+    g_live_audio_music_kind = music_kind;
+    g_live_audio_music_track_index = track_index;
+    g_live_audio_music_stream_count = substream_count;
+    return 1;
+failure:
+    for (index = 0u; index < 2u; ++index)
+        if (samples[index]) VirtualFree(samples[index], 0u, 0x8000u);
+    if (encoded) VirtualFree(encoded, 0u, 0x8000u);
+    if (payload) VirtualFree(payload, 0u, 0x8000u);
+    ++g_live_audio_music_failure_count;
+    return 0;
+}
+
+
+===== tools/recomp/ia32_native_backend.py:13680-13775 | live_audio_effect_image =====
+
+static U32 live_audio_effect_image(
+    U32 this_pointer, U32 image, U32 image_size, U32 workspace_output
+) {
+    const U32 workspace_address = 0x31FF0000u;
+    const U32 invalid_call = 0x88780032u;
+    U32 hardware_owner, hardware_root, hardware_image, descriptor;
+    U32 table_source, table_size, count, index;
+    U32 image_table_a, image_table_b;
+    U32 relocation0, relocation8, relocation10, relocation18;
+    U64 table_offset;
+    if (!live_readable_range(this_pointer, 0x24u) ||
+        (image_size != 0x54FCu && image_size != 0x5800u) ||
+        !live_readable_range(image, image_size) ||
+        (workspace_output != 0u &&
+         !live_readable_range(workspace_output, 4u)))
+        goto invalid;
+    image_table_a = *(U32*)(image + 0x804u);
+    image_table_b = *(U32*)(image + 0x80Cu);
+    if (*(U32*)(image + 0x800u) != 0u || image_table_a != 0x9EFu ||
+        *(U32*)(image + 0x808u) != 0x2FD4u || image_table_b != 0x916u ||
+        *(U32*)(image + 0x810u) != 3u)
+        goto invalid;
+    hardware_owner = *(U32*)(this_pointer + 8u);
+    descriptor = *(U32*)(this_pointer + 0xCu);
+    if (!live_readable_range(hardware_owner, 0x18u) ||
+        !live_readable_range(descriptor, 8u) ||
+        image_size > *(U32*)(this_pointer + 4u))
+        goto invalid;
+    hardware_root = *(U32*)(hardware_owner + 0x10u);
+    if (!live_readable_range(hardware_root, 4u)) goto invalid;
+    hardware_image = *(U32*)hardware_root;
+    if (!live_readable_range(hardware_image, *(U32*)(this_pointer + 4u)))
+        goto invalid;
+    for (index = 0u; index < 6u; ++index)
+        *(U32*)(hardware_image + 0x800u + index * 4u) = 0u;
+    *(U32*)(hardware_image + 0x800u) = *(U32*)(image + 0x800u);
+    *(U32*)(hardware_image + 0x804u) = image_table_a;
+    *(U32*)(hardware_image + 0x808u) = *(U32*)(image + 0x808u);
+    *(U32*)(hardware_image + 0x80Cu) = image_table_b;
+    *(U32*)(hardware_image + 0x814u) = *(U32*)(image + 0x814u);
+    copy_bytes(
+        (void*)(hardware_image + 0x818u), (void*)(image + 0x818u),
+        image_size - 0x818u);
+    table_offset = 0x818ull + ((U64)image_table_a + image_table_b) * 4ull;
+    if (table_offset != 0x542Cull || table_offset + 8ull > image_size)
+        goto invalid;
+    table_source = hardware_image + (U32)table_offset;
+    count = *(U32*)table_source;
+    if (count != 5u) goto invalid;
+    table_size = 8u + count * 0x20u;
+    if (table_offset + table_size > image_size) goto invalid;
+    if (!g_live_audio_effect_workspace) {
+        void* workspace = VirtualAlloc(
+            (void*)workspace_address, 0x10000u, 0x3000u, 0x04u);
+        if (workspace != (void*)workspace_address) {
+            ++g_live_audio_effect_image_failure_count;
+            return 0x8007000Eu;
+        }
+        g_live_audio_effect_workspace = workspace_address;
+    }
+    copy_bytes((void*)workspace_address, (void*)table_source, table_size);
+    relocation0 = *(U32*)(descriptor + 4u) - 0x017C6818u;
+    relocation8 = (0xFFA0BE7Au - image_table_a) * 4u;
+    relocation10 = 0xFE836000u;
+    relocation18 = *(U32*)(hardware_owner + 0x14u) - 0x0000C000u;
+    for (index = 0u; index < count; ++index) {
+        U32 entry = workspace_address + 8u + index * 0x20u;
+        U32 source0 = *(U32*)entry;
+        U32 size0 = *(U32*)(entry + 4u);
+        U32 source8 = *(U32*)(entry + 8u);
+        U32 size8 = *(U32*)(entry + 0xCu);
+        U32 target0 = source0 + relocation0;
+        U32 target8 = source8 + relocation8;
+        if ((U64)source0 + size0 > image_size ||
+            (U64)source8 + size8 > image_size ||
+            target0 < 0xFE830000u || target0 + size0 < target0 ||
+            target0 + size0 > 0xFE840000u ||
+            target8 < 0xFE830000u || target8 + size8 < target8 ||
+            target8 + size8 > 0xFE840000u)
+            goto invalid;
+        copy_bytes((void*)target0, (void*)(hardware_image + source0), size0);
+        copy_bytes((void*)target8, (void*)(hardware_image + source8), size8);
+        *(U32*)entry = target0;
+        *(U32*)(entry + 8u) = target8;
+        *(U32*)(entry + 0x10u) += relocation10;
+        *(U32*)(entry + 0x18u) += relocation18;
+    }
+    *(U32*)(hardware_image + 0x810u) = 0u;
+    *(U32*)(this_pointer + 0x20u) = workspace_address;
+    if (workspace_output) *(U32*)workspace_output = workspace_address;
+    ++g_live_audio_effect_image_count;
+    return 0u;
+invalid:
+    ++g_live_audio_effect_image_failure_count;
+    return invalid_call;
+}
+

@@ -1,0 +1,881 @@
+
+===== tools/xbe/xbe_info.py:15-16 | XbeFormatError =====
+
+class XbeFormatError(ValueError):
+    """Raised when an input file is not a parseable XBE."""
+
+
+===== tools/xbe/xbe_info.py:462-466 | _require_range =====
+
+def _require_range(data: bytes, offset: int, size: int, label: str) -> None:
+    if offset < 0 or size < 0 or offset + size > len(data):
+        raise XbeFormatError(
+            f"{label} range 0x{offset:X}..0x{offset + size:X} is outside file"
+        )
+
+
+===== tools/xbe/xbe_info.py:469-471 | _u16 =====
+
+def _u16(data: bytes, offset: int) -> int:
+    _require_range(data, offset, 2, "u16")
+    return struct.unpack_from("<H", data, offset)[0]
+
+
+===== tools/xbe/xbe_info.py:474-476 | _u32 =====
+
+def _u32(data: bytes, offset: int) -> int:
+    _require_range(data, offset, 4, "u32")
+    return struct.unpack_from("<I", data, offset)[0]
+
+
+===== tools/xbe/xbe_info.py:479-485 | _timestamp_to_iso8601 =====
+
+def _timestamp_to_iso8601(value: int) -> str | None:
+    if value == 0:
+        return None
+    try:
+        return dt.datetime.fromtimestamp(value, tz=dt.UTC).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+===== tools/xbe/xbe_info.py:488-489 | _decode_fixed_ascii =====
+
+def _decode_fixed_ascii(raw: bytes) -> str:
+    return raw.split(b"\x00", 1)[0].decode("ascii", errors="replace")
+
+
+===== tools/xbe/xbe_info.py:492-494 | _decode_fixed_utf16le =====
+
+def _decode_fixed_utf16le(raw: bytes) -> str:
+    text = raw.decode("utf-16-le", errors="replace")
+    return text.split("\x00", 1)[0]
+
+
+===== tools/xbe/xbe_info.py:497-502 | _read_c_string =====
+
+def _read_c_string(data: bytes, offset: int) -> str:
+    _require_range(data, offset, 1, "string")
+    end = data.find(b"\x00", offset)
+    if end == -1:
+        end = len(data)
+    return data[offset:end].decode("ascii", errors="replace")
+
+
+===== tools/xbe/xbe_info.py:505-515 | _read_wide_string =====
+
+def _read_wide_string(data: bytes, offset: int) -> str:
+    _require_range(data, offset, 2, "wide string")
+    cursor = offset
+    raw = bytearray()
+    while cursor + 1 < len(data):
+        unit = data[cursor : cursor + 2]
+        if unit == b"\x00\x00":
+            break
+        raw.extend(unit)
+        cursor += 2
+    return raw.decode("utf-16-le", errors="replace")
+
+
+===== tools/xbe/xbe_info.py:518-519 | _flags =====
+
+def _flags(value: int, names: dict[int, str]) -> list[str]:
+    return [name for bit, name in names.items() if value & bit]
+
+
+===== tools/xbe/xbe_info.py:522-526 | _unknown_flag_bits =====
+
+def _unknown_flag_bits(value: int, names: dict[int, str]) -> int:
+    known = 0
+    for bit in names:
+        known |= bit
+    return value & ~known
+
+
+===== tools/xbe/xbe_info.py:529-530 | _hex32 =====
+
+def _hex32(value: int) -> str:
+    return f"0x{value:08X}"
+
+
+===== tools/xbe/xbe_info.py:533-540 | _range =====
+
+def _range(start: int, size: int) -> dict[str, Any]:
+    return {
+        "start": start,
+        "end": start + size,
+        "size": size,
+        "start_hex": _hex32(start),
+        "end_hex": _hex32(start + size),
+    }
+
+
+===== tools/xbe/xbe_info.py:543-557 | _title_id_details =====
+
+def _title_id_details(title_id: int) -> dict[str, Any]:
+    hex_value = f"{title_id:08X}"
+    publisher_code: str | None = None
+    try:
+        publisher_bytes = bytes.fromhex(hex_value[:4])
+        if all(32 <= byte <= 126 for byte in publisher_bytes):
+            publisher_code = publisher_bytes.decode("ascii")
+    except ValueError:
+        publisher_code = None
+
+    return {
+        "hex": hex_value,
+        "publisher_code": publisher_code,
+        "publisher_title_number": int(hex_value[4:], 16),
+    }
+
+
+===== tools/xbe/xbe_info.py:560-618 | _parse_header =====
+
+def _parse_header(data: bytes) -> dict[str, Any]:
+    timestamp = _u32(data, 0x0114)
+    pe_timestamp = _u32(data, 0x0148)
+    init_flags = _u32(data, 0x0124)
+    header = {
+        "base_address": _u32(data, 0x0104),
+        "headers_size": _u32(data, 0x0108),
+        "image_size": _u32(data, 0x010C),
+        "image_header_size": _u32(data, 0x0110),
+        "timestamp": timestamp,
+        "timestamp_utc": _timestamp_to_iso8601(timestamp),
+        "certificate_address": _u32(data, 0x0118),
+        "section_count": _u32(data, 0x011C),
+        "section_headers_address": _u32(data, 0x0120),
+        "init_flags": init_flags,
+        "init_flag_names": _flags(init_flags, INIT_FLAGS),
+        "init_unknown_flag_bits": _unknown_flag_bits(init_flags, INIT_FLAGS),
+        "encoded_entry_point": _u32(data, 0x0128),
+        "tls_address": _u32(data, 0x012C),
+        "stack_size": _u32(data, 0x0130),
+        "pe_heap_reserve": _u32(data, 0x0134),
+        "pe_heap_commit": _u32(data, 0x0138),
+        "pe_base_address": _u32(data, 0x013C),
+        "pe_image_size": _u32(data, 0x0140),
+        "pe_checksum": _u32(data, 0x0144),
+        "pe_timestamp": pe_timestamp,
+        "pe_timestamp_utc": _timestamp_to_iso8601(pe_timestamp),
+        "debug_pathname_address": _u32(data, 0x014C),
+        "debug_filename_address": _u32(data, 0x0150),
+        "debug_unicode_filename_address": _u32(data, 0x0154),
+        "encoded_kernel_thunk_address": _u32(data, 0x0158),
+        "non_kernel_import_directory_address": _u32(data, 0x015C),
+        "library_versions_count": _u32(data, 0x0160),
+        "library_versions_address": _u32(data, 0x0164),
+        "kernel_library_version_address": _u32(data, 0x0168),
+        "xapi_library_version_address": _u32(data, 0x016C),
+        "logo_bitmap_address": _u32(data, 0x0170),
+        "logo_bitmap_size": _u32(data, 0x0174),
+    }
+
+    if header["image_header_size"] >= HEADER_EXTENDED_TYPE1_SIZE:
+        header["library_features_address"] = _u32(data, 0x0178)
+        header["library_features_count"] = _u32(data, 0x017C)
+    else:
+        header["library_features_address"] = 0
+        header["library_features_count"] = 0
+
+    if header["image_header_size"] >= HEADER_EXTENDED_TYPE2_SIZE:
+        header["debug_info_address"] = _u32(data, 0x0180)
+    else:
+        header["debug_info_address"] = 0
+
+    header["entry_point"] = _decode_keyed_address(
+        header["encoded_entry_point"], ENTRY_KEYS, header
+    )
+    header["kernel_thunk_address"] = _decode_keyed_address(
+        header["encoded_kernel_thunk_address"], KERNEL_THUNK_KEYS, header
+    )
+    return header
+
+
+===== tools/xbe/xbe_info.py:621-639 | _validate_header =====
+
+def _validate_header(data: bytes, header: dict[str, Any]) -> None:
+    if header["image_header_size"] < HEADER_MIN_SIZE:
+        raise XbeFormatError(
+            f"unexpected image header size: 0x{header['image_header_size']:X}"
+        )
+    if header["headers_size"] < header["image_header_size"]:
+        raise XbeFormatError(
+            "headers_size is smaller than image_header_size: "
+            f"0x{header['headers_size']:X} < 0x{header['image_header_size']:X}"
+        )
+    if header["headers_size"] > len(data):
+        raise XbeFormatError(
+            f"headers_size 0x{header['headers_size']:X} is larger than file"
+        )
+    if header["image_size"] < header["headers_size"]:
+        raise XbeFormatError(
+            "image_size is smaller than headers_size: "
+            f"0x{header['image_size']:X} < 0x{header['headers_size']:X}"
+        )
+
+
+===== tools/xbe/xbe_info.py:642-668 | _decode_keyed_address =====
+
+def _decode_keyed_address(
+    encoded: int, keys: dict[str, int], header: dict[str, Any]
+) -> dict[str, Any]:
+    base_address = header["base_address"]
+    image_end = base_address + header["image_size"]
+    candidates = []
+    chosen = None
+
+    for name, key in keys.items():
+        decoded = encoded ^ key
+        valid = base_address <= decoded < image_end
+        candidate = {
+            "key": name,
+            "value": decoded,
+            "address": _hex32(decoded),
+            "valid_for_image": valid,
+        }
+        candidates.append(candidate)
+        if valid and chosen is None:
+            chosen = candidate
+
+    return {
+        "encoded": _hex32(encoded),
+        "encoded_value": encoded,
+        "selected": chosen,
+        "candidates": candidates,
+    }
+
+
+===== tools/xbe/xbe_info.py:671-681 | _header_address_to_file_offset =====
+
+def _header_address_to_file_offset(
+    address: int, header: dict[str, Any], size: int = 1
+) -> int:
+    base_address = header["base_address"]
+    headers_size = header["headers_size"]
+    if base_address <= address and address + size <= base_address + headers_size:
+        return address - base_address
+    raise XbeFormatError(
+        f"virtual range 0x{address:08X}..0x{address + size:08X} "
+        "is not inside the XBE header"
+    )
+
+
+===== tools/xbe/xbe_info.py:684-739 | _map_virtual_address =====
+
+def _map_virtual_address(
+    address: int,
+    header: dict[str, Any],
+    sections: list[dict[str, Any]],
+    size: int = 1,
+    *,
+    require_file_backed: bool = True,
+) -> dict[str, Any]:
+    if address == 0:
+        raise XbeFormatError("null virtual address cannot be mapped")
+    if size < 0:
+        raise XbeFormatError("negative mapping size is invalid")
+
+    base_address = header["base_address"]
+    headers_size = header["headers_size"]
+    if base_address <= address and address + size <= base_address + headers_size:
+        return {
+            "region": "$headers",
+            "region_index": None,
+            "virtual_address": address,
+            "virtual_offset": address - base_address,
+            "file_offset": address - base_address,
+            "file_backed": True,
+            "zero_fill": False,
+        }
+
+    for section in sections:
+        virtual_address = section["virtual_address"]
+        virtual_size = section["virtual_size"]
+        relative = address - virtual_address
+        if relative < 0 or relative + size > virtual_size:
+            continue
+
+        raw_size = section["raw_size"]
+        file_backed = relative + size <= raw_size
+        if file_backed:
+            file_offset = section["raw_address"] + relative
+        elif require_file_backed:
+            raise XbeFormatError(
+                f"virtual range 0x{address:08X}..0x{address + size:08X} "
+                f"falls in zero-fill memory for section {section['name']!r}"
+            )
+        else:
+            file_offset = None
+
+        return {
+            "region": section["name"],
+            "region_index": section["index"],
+            "virtual_address": address,
+            "virtual_offset": relative,
+            "file_offset": file_offset,
+            "file_backed": file_backed,
+            "zero_fill": not file_backed,
+        }
+
+    raise XbeFormatError(f"virtual address 0x{address:08X} could not be mapped")
+
+
+===== tools/xbe/xbe_info.py:742-800 | _parse_section_headers =====
+
+def _parse_section_headers(data: bytes, header: dict[str, Any]) -> list[dict[str, Any]]:
+    section_headers_offset = _header_address_to_file_offset(
+        header["section_headers_address"],
+        header,
+        header["section_count"] * SECTION_HEADER_SIZE,
+    )
+
+    sections = []
+    for index in range(header["section_count"]):
+        offset = section_headers_offset + index * SECTION_HEADER_SIZE
+        _require_range(data, offset, SECTION_HEADER_SIZE, "section header")
+        (
+            flags,
+            virtual_address,
+            virtual_size,
+            raw_address,
+            raw_size,
+            section_name_address,
+            section_name_ref_count,
+            head_shared_page_ref_count_address,
+            tail_shared_page_ref_count_address,
+        ) = struct.unpack_from("<IIIIIIIII", data, offset)
+        digest = data[offset + 0x24 : offset + SECTION_HEADER_SIZE].hex().upper()
+
+        sections.append(
+            {
+                "index": index,
+                "name": None,
+                "flags": flags,
+                "flag_names": _flags(flags, SECTION_FLAGS),
+                "unknown_flag_bits": _unknown_flag_bits(flags, SECTION_FLAGS),
+                "virtual_address": virtual_address,
+                "virtual_size": virtual_size,
+                "virtual_end": virtual_address + virtual_size,
+                "raw_address": raw_address,
+                "raw_size": raw_size,
+                "raw_end": raw_address + raw_size,
+                "zero_fill_size": max(virtual_size - raw_size, 0),
+                "raw_overflow_size": max(raw_size - virtual_size, 0),
+                "section_name_address": section_name_address,
+                "section_name_ref_count": section_name_ref_count,
+                "head_shared_page_ref_count_address": head_shared_page_ref_count_address,
+                "tail_shared_page_ref_count_address": tail_shared_page_ref_count_address,
+                "digest_sha1": digest,
+            }
+        )
+
+    for section in sections:
+        try:
+            name_mapping = _map_virtual_address(
+                section["section_name_address"], header, sections
+            )
+            section["name"] = _read_c_string(data, name_mapping["file_offset"])
+        except XbeFormatError:
+            section["name"] = f"section_{section['index']}"
+
+        section["digest_verification"] = _verify_section_digest(data, section)
+
+    return sections
+
+
+===== tools/xbe/xbe_info.py:803-832 | _verify_section_digest =====
+
+def _verify_section_digest(data: bytes, section: dict[str, Any]) -> dict[str, Any]:
+    raw_address = section["raw_address"]
+    raw_size = section["raw_size"]
+    expected = section["digest_sha1"]
+
+    if raw_size == 0:
+        section_data = b""
+    else:
+        try:
+            _require_range(data, raw_address, raw_size, f"section {section['index']} raw")
+            section_data = data[raw_address : raw_address + raw_size]
+        except XbeFormatError as exc:
+            return {
+                "algorithm": "sha1(length_le32 + raw_section)",
+                "expected_sha1": expected,
+                "actual_sha1": None,
+                "matches": False,
+                "error": str(exc),
+            }
+
+    actual = hashlib.sha1(
+        struct.pack("<I", raw_size) + section_data, usedforsecurity=False
+    ).hexdigest().upper()
+    return {
+        "algorithm": "sha1(length_le32 + raw_section)",
+        "expected_sha1": expected,
+        "actual_sha1": actual,
+        "matches": actual == expected,
+        "error": None,
+    }
+
+
+===== tools/xbe/xbe_info.py:835-895 | _parse_certificate =====
+
+def _parse_certificate(
+    data: bytes, header: dict[str, Any], sections: list[dict[str, Any]]
+) -> dict[str, Any]:
+    certificate_mapping = _map_virtual_address(
+        header["certificate_address"], header, sections, CERTIFICATE_MIN_SIZE
+    )
+    certificate_offset = certificate_mapping["file_offset"]
+    certificate_size = _u32(data, certificate_offset)
+    _require_range(data, certificate_offset, certificate_size, "certificate")
+
+    title_id = _u32(data, certificate_offset + 0x08)
+    title_raw = data[
+        certificate_offset
+        + CERTIFICATE_TITLE_NAME_OFFSET : certificate_offset
+        + CERTIFICATE_TITLE_NAME_OFFSET
+        + CERTIFICATE_TITLE_NAME_SIZE
+    ]
+    alternate_title_ids = [
+        _u32(data, certificate_offset + 0x5C + index * 4) for index in range(16)
+    ]
+    allowed_media = _u32(data, certificate_offset + 0x9C)
+    game_region = _u32(data, certificate_offset + 0xA0)
+
+    certificate = {
+        "offset": certificate_offset,
+        "virtual_address": header["certificate_address"],
+        "size": certificate_size,
+        "timestamp": _u32(data, certificate_offset + 0x04),
+        "timestamp_utc": _timestamp_to_iso8601(_u32(data, certificate_offset + 0x04)),
+        "title_id": _title_id_details(title_id),
+        "title_name": _decode_fixed_utf16le(title_raw),
+        "alternate_title_ids": [
+            _title_id_details(value) for value in alternate_title_ids if value != 0
+        ],
+        "allowed_media": allowed_media,
+        "allowed_media_names": _flags(allowed_media, MEDIA_FLAGS),
+        "allowed_media_unknown_bits": _unknown_flag_bits(allowed_media, MEDIA_FLAGS),
+        "game_region": game_region,
+        "game_region_names": _flags(game_region, REGION_FLAGS),
+        "game_region_unknown_bits": _unknown_flag_bits(game_region, REGION_FLAGS),
+        "ratings": _u32(data, certificate_offset + 0xA4),
+        "disc_number": _u32(data, certificate_offset + 0xA8),
+        "version": _u32(data, certificate_offset + 0xAC),
+        "has_lan_key": any(data[certificate_offset + 0xB0 : certificate_offset + 0xC0]),
+        "has_signature_key": any(
+            data[certificate_offset + 0xC0 : certificate_offset + 0xD0]
+        ),
+        "extended": None,
+    }
+
+    if certificate_size >= CERTIFICATE_EXTENDED_SIZE:
+        certificate["extended"] = {
+            "original_certificate_size": _u32(data, certificate_offset + 0x1D0),
+            "online_service_id": _u32(data, certificate_offset + 0x1D4),
+            "security_flags": _u32(data, certificate_offset + 0x1D8),
+            "has_code_encryption_key": any(
+                data[certificate_offset + 0x1DC : certificate_offset + 0x1EC]
+            ),
+        }
+
+    return certificate
+
+
+===== tools/xbe/xbe_info.py:898-910 | _parse_library_version =====
+
+def _parse_library_version(data: bytes, offset: int, label: str) -> dict[str, Any]:
+    _require_range(data, offset, LIBRARY_VERSION_SIZE, label)
+    flags = _u16(data, offset + 0x0E)
+    return {
+        "name": _decode_fixed_ascii(data[offset : offset + 0x08]),
+        "version_major": _u16(data, offset + 0x08),
+        "version_minor": _u16(data, offset + 0x0A),
+        "version_build": _u16(data, offset + 0x0C),
+        "flags": flags,
+        "qfe_version": flags & 0x1FFF,
+        "approved": (flags >> 13) & 0x03,
+        "debug_build": bool(flags & 0x8000),
+    }
+
+
+===== tools/xbe/xbe_info.py:913-950 | _parse_library_versions =====
+
+def _parse_library_versions(
+    data: bytes, header: dict[str, Any], sections: list[dict[str, Any]]
+) -> dict[str, Any]:
+    versions = []
+    if header["library_versions_count"] and header["library_versions_address"]:
+        mapping = _map_virtual_address(
+            header["library_versions_address"],
+            header,
+            sections,
+            header["library_versions_count"] * LIBRARY_VERSION_SIZE,
+        )
+        for index in range(header["library_versions_count"]):
+            versions.append(
+                _parse_library_version(
+                    data,
+                    mapping["file_offset"] + index * LIBRARY_VERSION_SIZE,
+                    f"library version {index}",
+                )
+                | {"index": index}
+            )
+
+    named_versions = {}
+    for key, address in (
+        ("kernel", header["kernel_library_version_address"]),
+        ("xapi", header["xapi_library_version_address"]),
+    ):
+        if not address:
+            named_versions[key] = None
+            continue
+        try:
+            mapping = _map_virtual_address(address, header, sections, LIBRARY_VERSION_SIZE)
+            named_versions[key] = _parse_library_version(
+                data, mapping["file_offset"], f"{key} library version"
+            ) | {"virtual_address": address}
+        except XbeFormatError as exc:
+            named_versions[key] = {"error": str(exc), "virtual_address": address}
+
+    return {"versions": versions, **named_versions}
+
+
+===== tools/xbe/xbe_info.py:953-976 | _parse_library_features =====
+
+def _parse_library_features(
+    data: bytes, header: dict[str, Any], sections: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    count = header["library_features_count"]
+    address = header["library_features_address"]
+    if not count or not address:
+        return []
+
+    mapping = _map_virtual_address(address, header, sections, count * LIBRARY_VERSION_SIZE)
+    features = []
+    for index in range(count):
+        offset = mapping["file_offset"] + index * LIBRARY_VERSION_SIZE
+        _require_range(data, offset, LIBRARY_VERSION_SIZE, f"library feature {index}")
+        features.append(
+            {
+                "index": index,
+                "name": _decode_fixed_ascii(data[offset : offset + 0x08]),
+                "version_major": _u16(data, offset + 0x08),
+                "version_minor": _u16(data, offset + 0x0A),
+                "version_build": _u16(data, offset + 0x0C),
+                "flags": _u16(data, offset + 0x0E),
+            }
+        )
+    return features
+
+
+===== tools/xbe/xbe_info.py:979-1012 | _parse_tls =====
+
+def _parse_tls(
+    data: bytes, header: dict[str, Any], sections: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    address = header["tls_address"]
+    if not address:
+        return None
+
+    mapping = _map_virtual_address(address, header, sections, TLS_HEADER_SIZE)
+    offset = mapping["file_offset"]
+    callback_table_address = _u32(data, offset + 0x0C)
+    tls = {
+        "virtual_address": address,
+        "file_offset": offset,
+        "raw_data_start_address": _u32(data, offset + 0x00),
+        "raw_data_end_address": _u32(data, offset + 0x04),
+        "tls_index_address": _u32(data, offset + 0x08),
+        "callback_table_address": callback_table_address,
+        "zero_fill_size": _u32(data, offset + 0x10),
+        "characteristics": _u32(data, offset + 0x14),
+        "callback_addresses": [],
+        "callback_parse_error": None,
+    }
+
+    if callback_table_address:
+        try:
+            tls["callback_addresses"] = [
+                entry["value"]
+                for entry in _read_terminated_u32_table(
+                    data, header, sections, callback_table_address
+                )
+            ]
+        except XbeFormatError as exc:
+            tls["callback_parse_error"] = str(exc)
+    return tls
+
+
+===== tools/xbe/xbe_info.py:1015-1043 | _read_terminated_u32_table =====
+
+def _read_terminated_u32_table(
+    data: bytes,
+    header: dict[str, Any],
+    sections: list[dict[str, Any]],
+    address: int,
+    *,
+    max_entries: int = TERMINATED_TABLE_MAX_ENTRIES,
+) -> list[dict[str, Any]]:
+    entries = []
+    cursor = address
+    for index in range(max_entries):
+        mapping = _map_virtual_address(cursor, header, sections, 4)
+        value = _u32(data, mapping["file_offset"])
+        if value == 0:
+            return entries
+        entries.append(
+            {
+                "index": index,
+                "address": cursor,
+                "address_hex": _hex32(cursor),
+                "file_offset": mapping["file_offset"],
+                "value": value,
+                "value_hex": _hex32(value),
+            }
+        )
+        cursor += 4
+    raise XbeFormatError(
+        f"unterminated u32 table at 0x{address:08X}; exceeded {max_entries} entries"
+    )
+
+
+===== tools/xbe/xbe_info.py:1046-1080 | _parse_kernel_imports =====
+
+def _parse_kernel_imports(
+    data: bytes, header: dict[str, Any], sections: list[dict[str, Any]]
+) -> dict[str, Any]:
+    selected = header["kernel_thunk_address"]["selected"]
+    if not selected:
+        return {
+            "table_address": None,
+            "count": 0,
+            "imports": [],
+            "error": "encoded kernel thunk address did not decode inside the image",
+        }
+
+    table_address = selected["value"]
+    table = _read_terminated_u32_table(data, header, sections, table_address)
+    imports = []
+    for entry in table:
+        ordinal = entry["value"] & 0x1FF
+        imports.append(
+            {
+                "index": entry["index"],
+                "thunk_address": entry["address"],
+                "thunk_address_hex": entry["address_hex"],
+                "raw_value": entry["value"],
+                "raw_value_hex": entry["value_hex"],
+                "ordinal": ordinal,
+                "name": KERNEL_EXPORT_NAMES.get(ordinal),
+            }
+        )
+    return {
+        "table_address": table_address,
+        "table_address_hex": _hex32(table_address),
+        "count": len(imports),
+        "imports": imports,
+        "error": None,
+    }
+
+
+===== tools/xbe/xbe_info.py:1083-1133 | _parse_non_kernel_imports =====
+
+def _parse_non_kernel_imports(
+    data: bytes, header: dict[str, Any], sections: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    address = header["non_kernel_import_directory_address"]
+    if not address:
+        return []
+
+    imports = []
+    cursor = address
+    for index in range(TERMINATED_TABLE_MAX_ENTRIES):
+        mapping = _map_virtual_address(cursor, header, sections, IMPORT_DESCRIPTOR_SIZE)
+        offset = mapping["file_offset"]
+        thunk_array_address = _u32(data, offset + 0x00)
+        image_name_address = _u32(data, offset + 0x04)
+        if thunk_array_address == 0 or image_name_address == 0:
+            return imports
+
+        name_mapping = _map_virtual_address(image_name_address, header, sections, 2)
+        image_name = _read_wide_string(data, name_mapping["file_offset"])
+        thunk_table = _read_terminated_u32_table(
+            data, header, sections, thunk_array_address
+        )
+        thunks = [
+            {
+                "index": entry["index"],
+                "thunk_address": entry["address"],
+                "thunk_address_hex": entry["address_hex"],
+                "raw_value": entry["value"],
+                "raw_value_hex": entry["value_hex"],
+                "ordinal": entry["value"] & 0x7FFFFFFF,
+            }
+            for entry in thunk_table
+        ]
+        imports.append(
+            {
+                "index": index,
+                "descriptor_address": cursor,
+                "descriptor_address_hex": _hex32(cursor),
+                "image_name": image_name,
+                "image_name_address": image_name_address,
+                "thunk_array_address": thunk_array_address,
+                "thunk_count": len(thunks),
+                "thunks": thunks,
+            }
+        )
+        cursor += IMPORT_DESCRIPTOR_SIZE
+
+    raise XbeFormatError(
+        f"unterminated import descriptor table at 0x{address:08X}; "
+        f"exceeded {TERMINATED_TABLE_MAX_ENTRIES} descriptors"
+    )
+
+
+===== tools/xbe/xbe_info.py:1136-1155 | _read_optional_strings =====
+
+def _read_optional_strings(
+    data: bytes, header: dict[str, Any], sections: list[dict[str, Any]]
+) -> dict[str, Any]:
+    strings: dict[str, Any] = {}
+    fields = (
+        ("debug_pathname", "debug_pathname_address", _read_c_string, 1),
+        ("debug_filename", "debug_filename_address", _read_c_string, 1),
+        ("debug_unicode_filename", "debug_unicode_filename_address", _read_wide_string, 2),
+    )
+    for output_key, address_key, reader, size in fields:
+        address = header[address_key]
+        if not address:
+            strings[output_key] = None
+            continue
+        try:
+            mapping = _map_virtual_address(address, header, sections, size)
+            strings[output_key] = reader(data, mapping["file_offset"])
+        except XbeFormatError as exc:
+            strings[output_key] = {"error": str(exc), "virtual_address": address}
+    return strings
+
+
+===== tools/xbe/xbe_info.py:1158-1228 | _build_memory_map =====
+
+def _build_memory_map(
+    header: dict[str, Any], sections: list[dict[str, Any]]
+) -> dict[str, Any]:
+    regions = [
+        {
+            "kind": "headers",
+            "name": "$headers",
+            "index": None,
+            "flags": 0,
+            "flag_names": [],
+            "virtual_address": header["base_address"],
+            "virtual_size": header["headers_size"],
+            "virtual_end": header["base_address"] + header["headers_size"],
+            "raw_address": 0,
+            "raw_size": header["headers_size"],
+            "raw_end": header["headers_size"],
+            "file_backed_size": header["headers_size"],
+            "zero_fill_size": 0,
+            "raw_overflow_size": 0,
+            "virtual_range": _range(header["base_address"], header["headers_size"]),
+            "raw_range": _range(0, header["headers_size"]),
+        }
+    ]
+
+    for section in sections:
+        regions.append(
+            {
+                "kind": "section",
+                "name": section["name"],
+                "index": section["index"],
+                "flags": section["flags"],
+                "flag_names": section["flag_names"],
+                "virtual_address": section["virtual_address"],
+                "virtual_size": section["virtual_size"],
+                "virtual_end": section["virtual_end"],
+                "raw_address": section["raw_address"],
+                "raw_size": section["raw_size"],
+                "raw_end": section["raw_end"],
+                "file_backed_size": min(section["raw_size"], section["virtual_size"]),
+                "zero_fill_size": section["zero_fill_size"],
+                "raw_overflow_size": section["raw_overflow_size"],
+                "virtual_range": _range(
+                    section["virtual_address"], section["virtual_size"]
+                ),
+                "raw_range": _range(section["raw_address"], section["raw_size"]),
+            }
+        )
+
+    regions.sort(key=lambda item: (item["virtual_address"], item["index"] or -1))
+    gaps = []
+    image_start = header["base_address"]
+    image_end = image_start + header["image_size"]
+    cursor = image_start
+    for region in regions:
+        if region["virtual_address"] > cursor:
+            gaps.append(_range(cursor, region["virtual_address"] - cursor))
+        cursor = max(cursor, region["virtual_end"])
+    if cursor < image_end:
+        gaps.append(_range(cursor, image_end - cursor))
+
+    return {
+        "base_address": header["base_address"],
+        "image_size": header["image_size"],
+        "image_end": image_end,
+        "base_address_hex": _hex32(header["base_address"]),
+        "image_end_hex": _hex32(image_end),
+        "regions": regions,
+        "gaps": gaps,
+        "zero_fill_total": sum(region["zero_fill_size"] for region in regions),
+        "raw_overflow_total": sum(region["raw_overflow_size"] for region in regions),
+    }
+
+
+===== tools/xbe/xbe_info.py:1231-1266 | parse_xbe_bytes =====
+
+def parse_xbe_bytes(data: bytes) -> dict[str, Any]:
+    """Parse XBE metadata without exposing executable bytes."""
+
+    if len(data) < HEADER_MIN_SIZE:
+        raise XbeFormatError(
+            f"file is too small for an XBE header: {len(data)} bytes"
+        )
+    if data[:4] != MAGIC:
+        raise XbeFormatError("missing XBEH magic")
+
+    header = _parse_header(data)
+    _validate_header(data, header)
+    sections = _parse_section_headers(data, header)
+
+    certificate = _parse_certificate(data, header, sections)
+    libraries = _parse_library_versions(data, header, sections)
+    library_features = _parse_library_features(data, header, sections)
+    tls = _parse_tls(data, header, sections)
+    kernel_imports = _parse_kernel_imports(data, header, sections)
+    non_kernel_imports = _parse_non_kernel_imports(data, header, sections)
+    debug_strings = _read_optional_strings(data, header, sections)
+    memory_map = _build_memory_map(header, sections)
+
+    return {
+        "format": "xbe",
+        "header": header,
+        "certificate": certificate,
+        "debug_strings": debug_strings,
+        "memory_map": memory_map,
+        "sections": sections,
+        "tls": tls,
+        "libraries": libraries,
+        "library_features": library_features,
+        "kernel_imports": kernel_imports,
+        "non_kernel_imports": non_kernel_imports,
+    }
+
+
+===== tools/xbe/xbe_info.py:1269-1270 | parse_xbe_file =====
+
+def parse_xbe_file(path: Path) -> dict[str, Any]:
+    return parse_xbe_bytes(path.read_bytes())
+

@@ -1,0 +1,199 @@
+Build and native diagnostics
+
+Windows x64, Visual Studio 2026 C++ tools, Windows SDK, CMake and Git are required.
+Use C++23. Zydis is pinned and linked only into b2-tool, never the game executable.
+Run PowerShell commands from the repository root. Private media and generated
+outputs remain ignored. No Python is required.
+
+cmake --preset windows
+cmake --build --preset release
+& .\build\windows\Release\b2-tool.exe extract 'Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso' default.xbe data/local/default.xbe
+& .\build\windows\Release\b2-tool.exe extract 'Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso' data/b2distfx.bin data/local/b2distfx.bin
+cmake --preset windows -DB2_XBE="$PWD/data/local/default.xbe"
+cmake --build --preset release
+
+Skip extraction for existing files: extraction refuses overwrites. Enabling
+B2_XBE also requires the effects image; B2_EFFECTS can override its local path.
+The target is verified against knowledge/supported_target.json.
+Debug uses: cmake --build --preset debug
+
+Static CPU generation
+
+B2_XBE enables ahead-of-time generation from entry, main, verified startup roots
+and original constructor tables. Discovery follows direct calls, bounded switches
+and installed static callbacks with a 16 KiB decoder cache. Limits: 65536 functions,
+4096 instructions per function, 2097152 instructions total, 256 MiB source, 512
+stable compilation shards. Unchanged shards keep their timestamps. There is no
+runtime decoder, JIT or interpreter fallback.
+
+Coverage reports:
+build/windows/generated/Release/native_cpu.cpp.json
+build/windows/generated/Debug/native_cpu.cpp.json
+
+The report distinguishes compiled and proven closed functions, unresolved calls,
+instruction failures, required services and native platform bindings. Partial
+builds emit translatable functions with explicit boundaries for missing targets;
+they do not establish complete coverage or boot. Native platform bindings preserve
+visible behavior and calling conventions, and are reported separately.
+The current batch translates over 35500 discovered functions without unsupported
+instructions. Mutable indirect calls still need verified targets; this is not a
+claim that every gameplay path or hardware service is covered.
+
+Use b2-tool --help for bounded data reads, decoding, analysis and batch generation.
+Seeds accept one address or entry per line, and table START END for verified
+file-backed function-pointer tables. # starts a comment. A custom batch:
+& .\build\windows\Release\b2-tool.exe batch data/local/default.xbe build/windows/generated/cpu-seeds.txt 65536 4096 build/native.cpp --allow-partial --report build/native.json
+
+Incomplete batches exit 3. Without --allow-partial they publish only the report.
+--replace permits replacing generated outputs. Wrong executables exit 2.
+
+CPU, loader and original startup
+
+& .\build\windows\Release\b2.exe --check-cpu data/local/default.xbe
+& .\build\windows\Release\b2.exe --check-audio
+& .\build\windows\Release\b2.exe --check-spatial data/local/default.xbe
+& .\build\windows\Release\b2.exe --check-effects data/local/b2distfx.bin
+& .\build\windows\Release\b2.exe --bench-cpu
+& .\build\windows\Release\b2-tool.exe check-image data/local/default.xbe
+& .\build\windows\Release\b2.exe --check-boot data/local/default.xbe 1000000 --disc 'Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso'
+
+CPU checks use native instruction references, original helpers, memory overlap
+and alignment, floating state, TLS and fixed dispatch. Direct native calls retain
+guest floating state; host services suspend it. Helper benchmarks are not FPS.
+Audio checks exercise the shared PCM/Xbox ADPCM decoder and mixer without a game
+or sound device. Native SDL3 playback supports buffers, loops, gain, frequency and
+output routing. All five original DSP programs compile ahead of time into native
+C++ functions (1754 instructions), with real delay-buffer transfers and shared
+SDL3 processing. Sixty-five offline effects checks and thirty-seven audio checks pass,
+including all 32 mix bins, headroom and replacement of the native effects image.
+Play and write positions follow the original codec-block lead and loop wrapping;
+play-region changes reset the loop region and normalize zero lengths.
+Public effect-data updates, reads and commits use the native DSP state. Deferred
+updates wait for commit; they do not enter private MCPX hardware paths or overwrite
+the game's sample memory. Seven additional effect cases cover those operations.
+3D geometry, distance curves, cones and Doppler use the original compiled SDK
+calculators, including environmental direct/room attenuation and low-pass
+coefficients. Native room sends feed the original reverb program. Native stereo
+placement consumes their angles and preserves unity gain for a centered source.
+FXIN voices return processed samples through
+their own volume, 3D placement and room sends; both DSP mix-buffer windows share
+one backing buffer. HRTF filtering, environmental listener changes,
+stream packets and scene audio parity remain
+incomplete. Source and listener
+settings support immediate application and explicit deferred commits.
+Use --inspect-effects XBE IMAGE OUTPUT_DIRECTORY to decode bounded Xbox effects
+images through the original SDK's compiled routines without booting. It exports
+each DSP program and its descriptor for research and checks the native image
+decoder against the original SDK. --check-effects executes the compiled programs
+without booting or opening a sound device.
+
+The loader handles preload flags, zeroed storage, section references and lazy
+loads. Boot diagnostics execute original entry and thread routines through the
+static table. Reports include the stopping address, registers, stack, recent
+execution, thread states and service calls. Native fibers retain compiled call
+stacks; function/loop checkpoints allow time slices even during busy waits.
+Reports also include reserved/committed memory blocks
+and the last failed allocation request
+(size, alignment, requested address, lowest and highest address).
+Headless boot accepts at most 200000000 diagnostic checkpoints and retains a
+30-second wall-clock limit. Larger checkpoint budgets let original busy waits
+receive real timed callbacks and asynchronous disc completion.
+The executable reaches original main and completes original graphics setup against a real D3D11
+device. Original command buffers reach native draws, framebuffer flips and GPU
+fences. Live execution reaches the original Single Player menu after its no-save
+acknowledgements, loads the first driving lesson and renders its car, road,
+traffic and HUD. Scripted acceleration advances the original car. A complete
+race remains unverified. Add --frame OUTPUT.png
+to save the actual submitted image; diagnostic file operations are also reported.
+Use --memory ADDRESS:BYTES to include a bounded RAM slice in the report. Each slice
+contains at most 4096 bytes; at most four slices are accepted. Addresses and sizes
+can use decimal or 0x-prefixed hexadecimal notation.
+Use --break ADDRESS[:HIT] to stop at an original native function or loop checkpoint.
+HIT defaults to 1. Breakpoints and memory snapshots remain diagnostic-only.
+
+Mounting an ISO verifies its default.xbe matches the compiled target. Disc files
+are read-only. Native saves and cache use data/user/UDATA, TDATA and CACHE.
+The cache binding creates Z: and a private title directory. Requested cache
+formatting affects only that title's cache. Storage rejects traversal and reparse
+points; saves remain persistent.
+
+Offline D3D11 rendering
+
+& .\build\windows\Release\b2-tool.exe check-render build/checks/render --debug
+& .\build\windows\Release\b2-tool.exe check-render build/checks/render-warp --warp --debug
+
+Use fresh output directories. Runs save PNGs and structured adapter, failure and
+GPU timing reports. The renderer supports all ten NV097 primitives, indexed draws,
+depth, stencil, culling, scissor, polygon offset, blending, alpha tests, four texture
+stages, register combiners and fog. The build translates the original vertex
+programs and compiles the renderer, fixed-transform and GUI shaders into the
+executable. The game has no shader compiler dependency. Shader constants and
+render state change normally during play; no HLSL is compiled during drawing.
+Launch programs execute on the GPU in offline checks. The game rejects any
+vertex program missing from its compiled bank. Texture uploads support mip chains, cubemaps,
+3D volumes, Morton layouts, RGB565, ARGB/XRGB and native DXT1/3/5. Projected
+2D/3D sampling, pass-through, clipping and dependent AR/GB sampling are supported.
+Vertex uploads can retain original interleaved streams, packed colors/normals,
+shorts, bytes, float2H and current attributes instead of expanding every vertex.
+Offscreen targets, including RGB565/Z16, can be copied and sampled on the GPU.
+Texture bindings reuse matching rendered surfaces instead of stale RAM images.
+Surface clips retain their framebuffer storage; growth preserves color, depth
+and stencil on the GPU.
+Prepare resources before submission. Readback is an explicit offline operation.
+The native tool retains its shader compiler for standalone component diagnostics.
+For shader-bank research, use b2-tool compile-shaders XBE OUTPUT.cpp --replace.
+
+The component suite passed 145 cases on RTX 5060 Ti and WARP with no D3D11
+warnings, including relocated vertex programs, unused instruction slots and
+mapped alpha output. Components do not establish scene parity or game FPS. Remaining graphics
+work includes fixed lighting, other dependent texture modes and scene verification.
+Fixed transforms support all seven skin modes, transformed/normalized normals,
+texture matrices, object/eye/normal/reflection/sphere texture generation and five
+fog sources. Matrix aliases share the original vertex-program constant bank.
+Original GPU packet submission is supported. GPU fences and timing queries avoid
+allocating queries or
+waiting for timing samples during normal rendering.
+
+& .\build\windows\Release\b2-tool.exe render-texture INPUT.bin 0x0F 256 128 OUTPUT.png
+& .\build\windows\Release\b2-tool.exe inspect-textures data/local/global.dic
+& .\build\windows\Release\b2-tool.exe render-dictionary data/local/global.dic build/checks/global-textures
+& .\build\windows\Release\b2-tool.exe compare-images ACTUAL.png REFERENCE.png DIFFERENCE.png 3
+
+The native RenderWare reader rendered all 120 global.dic and 80 frontend.dic
+textures. Compare aligned original Xbox video screenshots; record source,
+timestamp and viewpoint. Asset rendering alone is not frame parity.
+
+SDL3 input supports Xbox gamepads and keyboard controls; 47 offline checks passed.
+The executable opens an SDL3 window with persistent Dear ImGui settings for files,
+V-sync, fullscreen and keyboard controls. F1 opens settings during gameplay.
+Live execution reaches the original Press START, Load/Save and Single Player menus
+and the first driving lesson.
+Original sound-device creation now opens SDL3 audio. Boot uploads and replaces
+the custom DSP image and starts native processing. Sound-resource method tables
+are discovered from their verified original registrar. A 90-second diagnostic
+completed driving, collisions and the lesson transition without an unsupported
+stop. Race modes and scene audio parity remain unverified.
+
+& .\build\windows\Release\b2.exe
+& .\build\windows\Release\b2.exe --check-window build/checks/settings.png
+& .\build\windows\Release\b2.exe --check-window build/checks/settings-warp.png --warp
+& .\build\windows\Release\b2.exe --run-game data/local/default.xbe --disc 'Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso' --seconds 20 --frame build/checks/live.png
+
+--run-game also accepts --controls SCRIPT for explicit autonomous diagnostics.
+Each text line contains milliseconds, an SDL button/axis name and its value:
+0 start 1
+300 start 0
+Button values are 0/1; axes use -32768..32767. Events must be ordered, with at most
+128 events and a 16 KiB file. Timing begins with the first original game flip.
+The script owns a separate virtual gamepad and never changes physical controls.
+Frame captures retain the last presented image, including when execution stops
+mid-frame or in a smaller offscreen pass. Captures and traces remain opt-in.
+--memory ADDRESS:BYTES captures up to four selected RAM ranges after a live run,
+with at most 4096 bytes per range. --trace-io includes the last 64 file operations
+with filenames, offsets, transfer sizes and destination addresses in the JSON
+report. Release builds keep optimized native symbols in b2.pdb for data breakpoints.
+Hidden window checks exercise the actual
+SDL3/D3D11/ImGui presentation path without booting the game.
+
+DESIGN.txt defines the native service approach. Preserved knowledge is research:
+verify ABI and addresses against original bytes and primary interfaces.

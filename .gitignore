@@ -1,65 +1,64 @@
-# Local proprietary game media and extracted content
-Burnout 2/
-data/local/*
-!data/local/.gitkeep
+# Private game files, settings and saves
+/Burnout 2/
+/data/local/
+/data/user/
 
-# Disc images and dumps
 *.iso
 *.xiso
-*.xiso.iso
 *.xbe
 *.bin
-*.img
-*.cue
-*.ccd
-*.sub
-*.mdf
-*.mds
 
-# Reverse-engineering and analysis databases
+# Build output and downloaded dependencies
+/build/
+/build-*/
+/out/
+/generated/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CMakeUserPresets.json
+
+# Compiled programs, libraries and compiler caches
+*.exe
+*.dll
+*.obj
+*.o
+*.lib
+*.a
+*.pch
+*.ilk
+*.exp
+*.pdb
+*.ipch
+
+# Local analysis databases, captures and crash dumps
 *.i64
+*.idb
 *.id0
 *.id1
 *.id2
 *.nam
 *.til
 *.ghidra
+*.gpr
+*.rep/
 *.bndb
-*.map
-*.sym
-*.pdb
+*.sqlite*
+*.db
 *.etl
 *.rdc
-*.nsys-rep
+*.dmp
+*.mdmp
+*.log
 
-# Generated outputs
-build/
-dist/
-out/
-generated/
-reports/local/
-logs/
-tmp/
-temp/
-
-# Local agent and audit notes
-/AGENTS.md
-/Audit.md
-
-# Tool caches
-.venv/
+# Local editor and operating-system files
 .cache/
-.mypy_cache/
-.pytest_cache/
-.ruff_cache/
-__pycache__/
-*.py[cod]
-
-# Editor and OS clutter
-.DS_Store
+.vs/
+*.suo
+*.user
+*.tmp
 Thumbs.db
-desktop.ini
-.idea/
-.vscode/
-*.swp
-*.swo
+Desktop.ini
+.DS_Store

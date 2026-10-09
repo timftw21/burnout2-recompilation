@@ -1,0 +1,750 @@
+
+===== runtime/xbox/shims.py:34-54 | XboxStatus =====
+
+class XboxStatus:
+    """NTSTATUS-style status values used by shim return models."""
+
+    SUCCESS = 0x00000000
+    WAIT_0 = 0x00000000
+    WAIT_TIMEOUT = 0x00000102
+    PENDING = 0x00000103
+    NOT_IMPLEMENTED = 0xC0000002
+    INVALID_HANDLE = 0xC0000008
+    INVALID_PARAMETER = 0xC000000D
+    NO_SUCH_FILE = 0xC000000F
+    NO_MORE_FILES = 0x80000006
+    ACCESS_DENIED = 0xC0000022
+    BUFFER_TOO_SMALL = 0xC0000023
+    OBJECT_NAME_COLLISION = 0xC0000035
+    OBJECT_NAME_NOT_FOUND = 0xC0000034
+    OBJECT_PATH_NOT_FOUND = 0xC000003A
+    END_OF_FILE = 0xC0000011
+    INVALID_INFO_CLASS = 0xC0000003
+    INFO_LENGTH_MISMATCH = 0xC0000004
+    TIMEOUT = 0x00000102
+
+
+===== runtime/xbox/shims.py:2778-2796 | _parse_xbox_rsa_public_key =====
+
+def _parse_xbox_rsa_public_key(public_key: bytes) -> dict[str, Any]:
+    if len(public_key) < 284 or public_key[:4] != b"RSA1":
+        raise XboxRuntimeError("not an Xbox RSA1 public key blob")
+    blob_length = int.from_bytes(public_key[4:8], "little")
+    bit_length = int.from_bytes(public_key[8:12], "little")
+    modulus_size = int.from_bytes(public_key[12:16], "little")
+    exponent = int.from_bytes(public_key[16:20], "little")
+    modulus = int.from_bytes(public_key[20:276], "little")
+    if exponent <= 0 or modulus <= 0:
+        raise XboxRuntimeError("invalid Xbox RSA public key")
+    return {
+        "format": "xbox-rsa1",
+        "blob_length": blob_length,
+        "bit_length": bit_length,
+        "modulus_size": modulus_size,
+        "exponent": exponent,
+        "modulus": modulus,
+        "size": 256,
+    }
+
+
+===== runtime/xbox/shims.py:2799-2835 | _parse_rsa_public_key =====
+
+def _parse_rsa_public_key(public_key: Any, signature_size: int) -> dict[str, Any]:
+    if isinstance(public_key, dict):
+        modulus = int(public_key["modulus"])
+        exponent = int(public_key.get("exponent", 65537))
+        size = int(public_key.get("size", max(signature_size, (modulus.bit_length() + 7) // 8)))
+        return {
+            "format": "generic",
+            "modulus": modulus,
+            "exponent": exponent,
+            "size": size,
+            "modulus_size": size - 1,
+        }
+    if isinstance(public_key, tuple) and len(public_key) >= 2:
+        modulus, exponent = int(public_key[0]), int(public_key[1])
+        size = max(signature_size, (modulus.bit_length() + 7) // 8)
+        return {
+            "format": "generic",
+            "modulus": modulus,
+            "exponent": exponent,
+            "size": size,
+            "modulus_size": size - 1,
+        }
+    if isinstance(public_key, bytes):
+        if public_key.startswith(b"RSA1"):
+            return _parse_xbox_rsa_public_key(public_key)
+        if len(public_key) >= 8:
+            exponent = int.from_bytes(public_key[:4], "big")
+            modulus = int.from_bytes(public_key[4:], "big")
+            size = max(signature_size, len(public_key) - 4)
+            return {
+                "format": "raw-exponent-modulus",
+                "modulus": modulus,
+                "exponent": exponent,
+                "size": size,
+                "modulus_size": size - 1,
+            }
+    raise XboxRuntimeError("unsupported RSA public key format")
+
+
+===== runtime/xbox/shims.py:2838-2859 | _verify_xbox_pkcs1_sha1 =====
+
+def _verify_xbox_pkcs1_sha1(decrypted_little: bytes, digest: bytes, modulus_size: int) -> bool:
+    if len(digest) != 20 or len(decrypted_little) <= modulus_size:
+        return False
+    if decrypted_little[:20] != digest[::-1]:
+        return False
+    zero_position = 20
+    for prefix in _XBOX_SHA1_DIGEST_INFO_PREFIXES:
+        if decrypted_little[20 : 20 + len(prefix)] == prefix:
+            zero_position = 20 + len(prefix)
+            break
+    else:
+        return False
+    if decrypted_little[zero_position] != 0:
+        return False
+    if decrypted_little[modulus_size] != 0:
+        return False
+    if decrypted_little[modulus_size - 1] != 1:
+        return False
+    return all(
+        value == 0xFF
+        for value in decrypted_little[zero_position + 1 : modulus_size - 1]
+    )
+
+
+===== runtime/xbox/shims.py:2862-2873 | _verify_pkcs1_v15_sha1 =====
+
+def _verify_pkcs1_v15_sha1(decrypted_big: bytes, digest: bytes) -> bool:
+    expected_tail = _SHA1_DIGEST_INFO_PREFIX + digest
+    if len(digest) != 20 or len(decrypted_big) < len(expected_tail) + 11:
+        return False
+    if not decrypted_big.startswith(b"\x00\x01"):
+        return False
+    separator = decrypted_big.find(b"\x00", 2)
+    if separator < 10:
+        return False
+    if any(value != 0xFF for value in decrypted_big[2:separator]):
+        return False
+    return decrypted_big[separator + 1 :] == expected_tail
+
+
+===== runtime/xbox/shims.py:3526-3529 | nt_query_information_file =====
+
+    def nt_query_information_file(self, guest_path_or_handle: str | int) -> dict[str, Any]:
+        if isinstance(guest_path_or_handle, int):
+            return self.filesystem.query_file_handle_information(guest_path_or_handle)
+        return self.filesystem.query_file_information(guest_path_or_handle)
+
+
+===== runtime/xbox/shims.py:3531-3536 | nt_query_volume_information_file =====
+
+    def nt_query_volume_information_file(
+        self, guest_path_or_handle: str | int = "D:\\"
+    ) -> dict[str, Any]:
+        if isinstance(guest_path_or_handle, int):
+            return self.filesystem.query_volume_handle_information(guest_path_or_handle)
+        return self.filesystem.query_volume_information(guest_path_or_handle)
+
+
+===== runtime/xbox/shims.py:4077-4078 | rtl_enter_critical_section =====
+
+    def rtl_enter_critical_section(self, address: int) -> int:
+        return self.sync.enter_critical_section(address)
+
+
+===== runtime/xbox/shims.py:4080-4081 | rtl_leave_critical_section =====
+
+    def rtl_leave_critical_section(self, address: int) -> int:
+        return self.sync.leave_critical_section(address)
+
+
+===== runtime/xbox/shims.py:4083-4085 | rtl_initialize_critical_section =====
+
+    def rtl_initialize_critical_section(self, address: int) -> int:
+        self.trace.add("runtime", "initialize_critical_section", address=address)
+        return XboxStatus.SUCCESS
+
+
+===== runtime/xbox/shims.py:4087-4095 | rtl_init_ansi_string =====
+
+    def rtl_init_ansi_string(
+        self, destination_address: int = 0, source_address: int = 0
+    ) -> dict[str, Any]:
+        result = {
+            "destination_address": destination_address,
+            "source_address": source_address,
+        }
+        self.trace.add("runtime", "init_ansi_string", result=result)
+        return result
+
+
+===== runtime/xbox/shims.py:4146-4162 | rtl_time_fields_to_time =====
+
+    def rtl_time_fields_to_time(
+        self,
+        year: int,
+        month: int,
+        day: int,
+        hour: int = 0,
+        minute: int = 0,
+        second: int = 0,
+        milliseconds: int = 0,
+    ) -> int:
+        value = dt.datetime(
+            year, month, day, hour, minute, second, milliseconds * 1000, tzinfo=dt.UTC
+        )
+        unix_100ns = int(value.timestamp() * 10_000_000)
+        filetime = unix_100ns + 116444736000000000
+        self.trace.add("runtime", "time_fields_to_time", filetime=filetime)
+        return filetime
+
+
+===== runtime/xbox/shims.py:4164-4177 | rtl_time_to_time_fields =====
+
+    def rtl_time_to_time_fields(self, filetime: int) -> dict[str, int]:
+        timestamp = (filetime - 116444736000000000) / 10_000_000
+        value = dt.datetime.fromtimestamp(timestamp, tz=dt.UTC)
+        fields = {
+            "year": value.year,
+            "month": value.month,
+            "day": value.day,
+            "hour": value.hour,
+            "minute": value.minute,
+            "second": value.second,
+            "milliseconds": value.microsecond // 1000,
+        }
+        self.trace.add("runtime", "time_to_time_fields", filetime=filetime, fields=fields)
+        return fields
+
+
+===== tools/recomp/native_executor.py:2088-2104 | b2r_load_xc_sha_context =====
+
+static void b2r_load_xc_sha_context(
+    B2RNativeHostServiceState* state,
+    uint32_t address,
+    B2RSha1Context* context
+) {
+    const uint32_t payload = address + B2R_XC_SHA_CONTEXT_OFFSET;
+    for (uint32_t index = 0u; index < 5u; ++index) {
+        context->state[index] = b2r_native_service_read_u32(
+            state, payload + index * 4u);
+    }
+    context->count[0] = b2r_native_service_read_u32(state, payload + 20u);
+    context->count[1] = b2r_native_service_read_u32(state, payload + 24u);
+    for (uint32_t index = 0u; index < 64u; ++index) {
+        context->buffer[index] = b2r_native_service_read_u8(
+            state, payload + 28u + index);
+    }
+}
+
+
+===== tools/recomp/native_executor.py:2106-2122 | b2r_store_xc_sha_context =====
+
+static void b2r_store_xc_sha_context(
+    B2RNativeHostServiceState* state,
+    uint32_t address,
+    const B2RSha1Context* context
+) {
+    const uint32_t payload = address + B2R_XC_SHA_CONTEXT_OFFSET;
+    for (uint32_t index = 0u; index < 5u; ++index) {
+        b2r_native_service_write_u32(
+            state, payload + index * 4u, context->state[index]);
+    }
+    b2r_native_service_write_u32(state, payload + 20u, context->count[0]);
+    b2r_native_service_write_u32(state, payload + 24u, context->count[1]);
+    for (uint32_t index = 0u; index < 64u; ++index) {
+        b2r_native_service_write_u8(
+            state, payload + 28u + index, context->buffer[index]);
+    }
+}
+
+
+===== tools/recomp/native_executor.py:2300-2353 | b2r_native_decode_object_path =====
+
+static bool b2r_native_decode_object_path(
+    B2RNativeHostServiceState* state,
+    uint32_t object_attributes,
+    char* path,
+    uint32_t capacity,
+    uint32_t* path_length
+) {
+    if (state == nullptr || object_attributes == 0u || path == nullptr ||
+        capacity < 2u || path_length == nullptr) {
+        return false;
+    }
+    uint32_t candidates[6] = {object_attributes, 0u, 0u, 0u, 0u, 0u};
+    for (uint32_t index = 0u; index < 5u; ++index) {
+        candidates[index + 1u] = b2r_native_service_read_u32(
+            state, object_attributes + index * 4u);
+    }
+    for (uint32_t candidate_index = 0u; candidate_index < 6u;
+         ++candidate_index) {
+        const uint32_t descriptor = candidates[candidate_index];
+        if (descriptor == 0u) { continue; }
+        const uint32_t length =
+            static_cast<uint32_t>(b2r_native_service_read_u8(state, descriptor)) |
+            (static_cast<uint32_t>(
+                b2r_native_service_read_u8(state, descriptor + 1u)) << 8u);
+        const uint32_t maximum_length =
+            static_cast<uint32_t>(
+                b2r_native_service_read_u8(state, descriptor + 2u)) |
+            (static_cast<uint32_t>(
+                b2r_native_service_read_u8(state, descriptor + 3u)) << 8u);
+        const uint32_t buffer = b2r_native_service_read_u32(
+            state, descriptor + 4u);
+        if (length == 0u || length > maximum_length || length >= capacity ||
+            buffer == 0u) {
+            continue;
+        }
+        bool path_like = false;
+        bool valid = true;
+        for (uint32_t index = 0u; index < length; ++index) {
+            const uint8_t value = b2r_native_service_read_u8(
+                state, buffer + index);
+            if (value < 0x20u || value > 0x7eu) {
+                valid = false;
+                break;
+            }
+            path[index] = static_cast<char>(value);
+            path_like = path_like || value == '\\' || value == '/' || value == ':';
+        }
+        if (!valid || !path_like) { continue; }
+        path[length] = '\0';
+        *path_length = length;
+        return true;
+    }
+    return false;
+}
+
+
+===== tools/recomp/native_executor.py:2664-2726 | b2r_native_write_file_information =====
+
+static uint32_t b2r_native_write_file_information(
+    B2RNativeHostServiceState* state,
+    const B2RNativeFileEntry* file,
+    uint32_t destination,
+    uint32_t requested_length,
+    uint32_t information_class
+) {
+    if (state == nullptr || file == nullptr || destination == 0u ||
+        requested_length == 0u) {
+        return 0u;
+    }
+    const bool is_directory = (file->flags & 1u) != 0u;
+    const uint64_t allocation_size = file->size != 0u
+        ? (file->size + 0x7ffu) & ~0x7ffull : 0u;
+    uint32_t payload_size = 24u;
+    if (information_class == 4u) { payload_size = 40u; }
+    else if (information_class == 34u) { payload_size = 56u; }
+    else if (information_class == 14u || information_class == 19u ||
+             information_class == 20u) { payload_size = 8u; }
+    else if (information_class == 18u) { payload_size = 76u; }
+    const uint32_t write_size = requested_length < payload_size
+        ? requested_length : payload_size;
+    for (uint32_t index = 0u; index < write_size; ++index) {
+        b2r_native_service_write_u8(state, destination + index, 0u);
+    }
+    auto write_if_present = [&](uint32_t offset, uint32_t value) {
+        if (offset + 4u <= write_size) {
+            b2r_native_service_write_u32(state, destination + offset, value);
+        }
+    };
+    auto write_u64_if_present = [&](uint32_t offset, uint64_t value) {
+        if (offset + 8u <= write_size) {
+            b2r_native_service_write_u64(state, destination + offset, value);
+        }
+    };
+    if (information_class == 4u) {
+        write_if_present(32u, is_directory ? 0x10u : 0x80u);
+    } else if (information_class == 34u) {
+        write_u64_if_present(32u, allocation_size);
+        write_u64_if_present(40u, file->size);
+        write_if_present(48u, is_directory ? 0x10u : 0x80u);
+    } else if (information_class == 14u) {
+        write_u64_if_present(0u, file->position);
+    } else if (information_class == 19u) {
+        write_u64_if_present(0u, allocation_size);
+    } else if (information_class == 20u) {
+        write_u64_if_present(0u, file->size);
+    } else {
+        const uint32_t standard_offset = information_class == 18u ? 40u : 0u;
+        write_u64_if_present(standard_offset, allocation_size);
+        write_u64_if_present(standard_offset + 8u, file->size);
+        write_if_present(standard_offset + 16u, 1u);
+        if (standard_offset + 22u <= write_size) {
+            b2r_native_service_write_u8(
+                state, destination + standard_offset + 21u,
+                is_directory ? 1u : 0u);
+        }
+        if (information_class == 18u) {
+            write_if_present(72u, 0u);
+        }
+    }
+    return write_size;
+}
+
+
+===== tools/recomp/native_executor.py:8627-8639 | b2r_audio_guest_format =====
+
+static B2RNativeNormalRuntimeState::AudioFormat b2r_audio_guest_format(
+    B2RNativeHostServiceState* state, uint32_t address
+) {
+    B2RNativeNormalRuntimeState::AudioFormat format{};
+    if (state == nullptr || address == 0u) { return format; }
+    format.tag = b2r_native_service_read_u16(state, address);
+    format.channels = b2r_native_service_read_u16(state, address + 2u);
+    format.sample_rate = b2r_native_service_read_u32(state, address + 4u);
+    format.block_align = b2r_native_service_read_u16(state, address + 0xcu);
+    format.bits_per_sample = b2r_native_service_read_u16(state, address + 0xeu);
+    format.samples_per_block = b2r_native_service_read_u16(state, address + 0x12u);
+    return format;
+}
+
+
+===== tools/recomp/native_executor.py:8959-9015 | b2r_native_audio_buffer_get_status =====
+
+static uint32_t b2r_native_audio_buffer_get_status(
+    B2RNativeHostServiceState* state,
+    uint32_t buffer,
+    uint32_t status_output
+) {
+    constexpr uint32_t kSuccess = 0u;
+    constexpr uint32_t kFailure = 0x80004005u;
+    constexpr uint32_t kStatusPlaying = 0x00000001u;
+    constexpr uint32_t kStatusLooping = 0x00000004u;
+    constexpr uint32_t kVoicePointerOffset = 0x4u;
+    constexpr uint32_t kVoiceFlagsOffset = 0x12u;
+    constexpr uint16_t kVoicePlaying = 0x0002u;
+    if (state == nullptr || !state->normal_runtime_enabled || buffer == 0u ||
+        status_output == 0u) {
+        return kFailure;
+    }
+    ++state->native_audio_buffer_get_status_count;
+    B2RNativeNormalRuntimeState* runtime = b2r_get_normal_runtime_state(state);
+    b2r_audio_resolve_pending_buffer(state, runtime, buffer);
+    B2RNativeNormalRuntimeState::AudioBufferMirror* mirror =
+        b2r_audio_buffer_mirror(runtime, buffer, false);
+    if (runtime == nullptr || mirror == nullptr) { return kFailure; }
+    bool playing = false;
+    bool looping = false;
+    {
+        std::lock_guard<std::mutex> lock(runtime->audio_mutex);
+        for (const auto& playback : runtime->audio_buffer_playbacks) {
+            if (playback.key != buffer) { continue; }
+            playing = true;
+            looping = playback.loop;
+            break;
+        }
+        mirror->playing = playing;
+    }
+    const uint32_t voice = b2r_native_service_read_u32(
+        state, buffer + kVoicePointerOffset);
+    if (voice != 0u) {
+        const uint32_t voice_flags_address = voice + kVoiceFlagsOffset;
+        const uint16_t voice_flags = b2r_native_service_read_u16(
+            state, voice_flags_address);
+        if (!playing && (voice_flags & kVoicePlaying) != 0u) {
+            ++state->native_audio_stale_playing_repair_count;
+        }
+        const uint16_t synchronized_flags = playing
+            ? static_cast<uint16_t>(voice_flags | kVoicePlaying)
+            : static_cast<uint16_t>(voice_flags & ~kVoicePlaying);
+        if (synchronized_flags != voice_flags) {
+            b2r_native_service_write_u16(
+                state, voice_flags_address, synchronized_flags);
+        }
+    }
+    const uint32_t status =
+        (playing ? kStatusPlaying : 0u) |
+        (playing && looping ? kStatusLooping : 0u);
+    b2r_native_service_write_u32(state, status_output, status);
+    return kSuccess;
+}
+
+
+===== tools/recomp/native_executor.py:9168-9378 | b2r_native_audio_buffer_play =====
+
+static uint32_t b2r_native_audio_buffer_play(
+    B2RNativeHostServiceState* state,
+    uint32_t buffer,
+    uint32_t flags
+) {
+    constexpr uint32_t kSuccess = 0u;
+    constexpr uint32_t kFailure = 0x80004005u;
+    constexpr uint32_t kVoicePointerOffset = 0x4u;
+    constexpr uint32_t kVoiceFlagsOffset = 0x12u;
+    constexpr uint16_t kVoiceAllocated = 0x0001u;
+    constexpr uint16_t kVoicePlaying = 0x0002u;
+    constexpr uint16_t kVoicePending = 0x8000u;
+    if (state == nullptr || !state->normal_runtime_enabled) { return kFailure; }
+    state->native_audio_buffer_play_stage = 1u;
+    state->native_audio_last_buffer = buffer;
+    state->native_audio_last_data = 0u;
+    state->native_audio_last_size = 0u;
+    state->native_audio_last_sample_rate = 0u;
+    state->native_audio_last_format_tag = 0u;
+    state->native_audio_last_channels = 0u;
+    state->native_audio_last_bits_per_sample = 0u;
+    state->native_audio_last_block_align = 0u;
+    state->native_audio_last_samples_per_block = 0u;
+    auto publish_debug = [&]() {
+        if (state->live_control_mapping == nullptr ||
+            state->live_control_size < 256u) {
+            return;
+        }
+        std::memcpy(
+            state->live_control_mapping + 236u,
+            &state->native_audio_buffer_play_stage,
+            sizeof(uint32_t));
+        std::memcpy(
+            state->live_control_mapping + 240u,
+            &state->native_audio_last_buffer,
+            sizeof(uint32_t));
+        std::memcpy(
+            state->live_control_mapping + 244u,
+            &state->native_audio_last_data,
+            sizeof(uint32_t));
+        std::memcpy(
+            state->live_control_mapping + 248u,
+            &state->native_audio_last_size,
+            sizeof(uint32_t));
+        std::memcpy(
+            state->live_control_mapping + 252u,
+            &state->native_audio_last_sample_rate,
+            sizeof(uint32_t));
+        MemoryBarrier();
+    };
+    publish_debug();
+    ++state->native_audio_buffer_play_count;
+    B2RNativeNormalRuntimeState* runtime = b2r_get_normal_runtime_state(state);
+    if (runtime == nullptr || buffer == 0u) { return kFailure; }
+    const uint32_t voice = b2r_native_service_read_u32(
+        state, buffer + kVoicePointerOffset);
+    if (voice == 0u) { return kFailure; }
+    const uint32_t voice_flags_address = voice + kVoiceFlagsOffset;
+    const uint16_t voice_flags = b2r_native_service_read_u16(
+        state, voice_flags_address);
+    b2r_native_service_write_u16(
+        state,
+        voice_flags_address,
+        static_cast<uint16_t>(
+            (voice_flags | kVoiceAllocated | kVoicePlaying) & ~kVoicePending));
+    b2r_audio_resolve_pending_buffer(state, runtime, buffer);
+    B2RNativeNormalRuntimeState::AudioBufferMirror* mirror =
+        b2r_audio_buffer_mirror(runtime, buffer, false);
+    uint32_t selected_data = 0u;
+    uint32_t selected_size = 0u;
+    uint32_t loop_start_bytes = 0u;
+    uint32_t loop_size_bytes = 0u;
+    const bool selected = b2r_audio_select_buffer_region(
+        state, mirror, buffer, flags, selected_data, selected_size,
+        loop_start_bytes, loop_size_bytes);
+    state->native_audio_buffer_play_stage = 2u;
+    if (selected) {
+        state->native_audio_last_data = selected_data;
+        state->native_audio_last_size = selected_size;
+        state->native_audio_last_sample_rate = mirror->format.sample_rate;
+        state->native_audio_last_format_tag = mirror->format.tag;
+        state->native_audio_last_channels = mirror->format.channels;
+        state->native_audio_last_bits_per_sample = mirror->format.bits_per_sample;
+        state->native_audio_last_block_align = mirror->format.block_align;
+        state->native_audio_last_samples_per_block =
+            mirror->format.samples_per_block;
+        if ((flags & 1u) != 0u &&
+            selected_size > state->native_audio_largest_loop_play_length) {
+            state->native_audio_largest_loop_buffer = buffer;
+            state->native_audio_largest_loop_data = selected_data;
+            state->native_audio_largest_loop_play_length = selected_size;
+            state->native_audio_largest_loop_start = loop_start_bytes;
+            state->native_audio_largest_loop_length = loop_size_bytes;
+            state->native_audio_largest_loop_sample_rate =
+                mirror->format.sample_rate;
+            state->native_audio_largest_loop_frequency = mirror->frequency;
+            state->native_audio_largest_loop_format_tag = mirror->format.tag;
+        }
+    }
+    publish_debug();
+    const bool loop = (flags & 1u) != 0u;
+    size_t loop_start_frame = 0u;
+    size_t loop_end_frame = 0u;
+    size_t current_position_frame = 0u;
+    if (selected &&
+        (!b2r_audio_normalized_frame_count(
+            mirror->format, loop_start_bytes, loop_start_frame) ||
+         !b2r_audio_normalized_frame_count(
+            mirror->format,
+            loop ? loop_start_bytes + loop_size_bytes : selected_size,
+            loop_end_frame) ||
+         !b2r_audio_normalized_frame_count(
+            mirror->format, mirror->current_position,
+            current_position_frame) ||
+         loop_start_frame >= loop_end_frame)) {
+        ++state->native_audio_decode_failure_count;
+        return kSuccess;
+    }
+    bool has_playback = false;
+    if (mirror != nullptr) {
+        std::lock_guard<std::mutex> lock(runtime->audio_mutex);
+        for (auto& playback : runtime->audio_buffer_playbacks) {
+            if (playback.key != buffer) { continue; }
+            has_playback = true;
+            playback.step_q32 = b2r_audio_frequency_step_q32(
+                mirror->frequency, mirror->format.sample_rate);
+            playback.loop_start_frame = loop_start_frame;
+            playback.loop_end_frame = loop_end_frame;
+            playback.gain_q16 = b2r_audio_volume_gain_q16(mirror->volume);
+            playback.loop = loop;
+            break;
+        }
+        if (mirror->playing && !has_playback) {
+            ++state->native_audio_stale_playing_repair_count;
+        }
+        mirror->playing = has_playback;
+    }
+    if (has_playback) {
+        ++state->native_audio_buffer_repeated_play_count;
+        state->native_audio_buffer_play_stage = 6u;
+        publish_debug();
+        return kSuccess;
+    }
+    std::vector<int16_t> samples;
+    state->native_audio_buffer_play_stage = 3u;
+    publish_debug();
+    if (!selected || !b2r_audio_decode_guest_payload(
+            state, selected_data, selected_size, mirror->format, samples)) {
+        state->native_audio_buffer_play_stage = 20u;
+        publish_debug();
+        ++state->native_audio_decode_failure_count;
+        return kSuccess;
+    }
+    state->native_audio_buffer_play_stage = 4u;
+    publish_debug();
+    ++state->native_audio_decoded_buffer_count;
+    if (!b2r_audio_ensure_output(state, runtime)) {
+        state->native_audio_buffer_play_stage = 21u;
+        publish_debug();
+        return kSuccess;
+    }
+    state->native_audio_buffer_play_stage = 5u;
+    publish_debug();
+    std::lock_guard<std::mutex> lock(runtime->audio_mutex);
+    runtime->audio_buffer_playbacks.erase(
+        std::remove_if(
+            runtime->audio_buffer_playbacks.begin(),
+            runtime->audio_buffer_playbacks.end(),
+            [&](const B2RNativeNormalRuntimeState::AudioPlayback& playback) {
+                return playback.key == buffer;
+            }),
+        runtime->audio_buffer_playbacks.end());
+    if (runtime->audio_buffer_playbacks.size() >= 64u) {
+        const uint32_t dropped_key =
+            runtime->audio_buffer_playbacks.front().key;
+        runtime->audio_buffer_playbacks.pop_front();
+        for (auto& candidate : runtime->audio_buffer_mirrors) {
+            if (candidate.key == dropped_key) {
+                candidate.playing = false;
+                break;
+            }
+        }
+        ++state->native_audio_dropped_buffer_count;
+    }
+    if (loop_end_frame > samples.size() / 2u) {
+        ++state->native_audio_decode_failure_count;
+        return kSuccess;
+    }
+    runtime->audio_buffer_playbacks.push_back({
+        buffer,
+        std::move(samples),
+        static_cast<uint64_t>(current_position_frame) << 32u,
+        b2r_audio_frequency_step_q32(
+            mirror->frequency, mirror->format.sample_rate),
+        loop_start_frame,
+        loop_end_frame,
+        b2r_audio_volume_gain_q16(mirror->volume),
+        loop,
+        selected_data,
+        selected_size,
+        mirror->format,
+        b2r_audio_region_generation(state, selected_data, selected_size),
+    });
+    mirror->playing = true;
+    state->native_audio_active_buffer_count = static_cast<uint32_t>(
+        runtime->audio_buffer_playbacks.size());
+    runtime->audio_condition.notify_one();
+    state->native_audio_buffer_play_stage = 6u;
+    publish_debug();
+    return kSuccess;
+}
+
+
+===== tools/recomp/native_executor.py:9380-9415 | b2r_native_audio_buffer_stop =====
+
+static void b2r_native_audio_buffer_stop(
+    B2RNativeHostServiceState* state,
+    uint32_t buffer
+) {
+    if (state == nullptr || !state->normal_runtime_enabled) { return; }
+    ++state->native_audio_buffer_stop_count;
+    B2RNativeNormalRuntimeState* runtime = b2r_get_normal_runtime_state(state);
+    if (runtime == nullptr) { return; }
+    B2RNativeNormalRuntimeState::AudioBufferMirror* mirror =
+        b2r_audio_buffer_mirror(runtime, buffer, false);
+    std::lock_guard<std::mutex> lock(runtime->audio_mutex);
+    if (mirror != nullptr) {
+        mirror->playing = false;
+        for (const auto& playback : runtime->audio_buffer_playbacks) {
+            if (playback.key != buffer) { continue; }
+            uint32_t position = mirror->current_position;
+            if (b2r_audio_normalized_frame_byte_position(
+                    playback.format,
+                    static_cast<size_t>(playback.cursor_frame_q32 >> 32u),
+                    position)) {
+                mirror->current_position = position;
+            }
+            break;
+        }
+    }
+    runtime->audio_buffer_playbacks.erase(
+        std::remove_if(
+            runtime->audio_buffer_playbacks.begin(),
+            runtime->audio_buffer_playbacks.end(),
+            [&](const B2RNativeNormalRuntimeState::AudioPlayback& playback) {
+                return playback.key == buffer;
+            }),
+        runtime->audio_buffer_playbacks.end());
+    state->native_audio_active_buffer_count = static_cast<uint32_t>(
+        runtime->audio_buffer_playbacks.size());
+}
+
+
+===== tools/recomp/native_executor.py:9417-9442 | b2r_native_audio_buffer_stop_ex =====
+
+static uint32_t b2r_native_audio_buffer_stop_ex(
+    B2RNativeHostServiceState* state,
+    uint32_t buffer
+) {
+    constexpr uint32_t kSuccess = 0u;
+    constexpr uint32_t kFailure = 0x80004005u;
+    constexpr uint32_t kVoicePointerOffset = 0x4u;
+    constexpr uint32_t kVoiceFlagsOffset = 0x12u;
+    constexpr uint16_t kVoicePlaying = 0x0002u;
+    constexpr uint16_t kVoicePending = 0x8000u;
+    if (state == nullptr || !state->normal_runtime_enabled || buffer == 0u) {
+        return kFailure;
+    }
+    b2r_native_audio_buffer_stop(state, buffer);
+    const uint32_t voice = b2r_native_service_read_u32(
+        state, buffer + kVoicePointerOffset);
+    if (voice == 0u) { return kFailure; }
+    const uint32_t voice_flags_address = voice + kVoiceFlagsOffset;
+    const uint16_t voice_flags = b2r_native_service_read_u16(
+        state, voice_flags_address);
+    b2r_native_service_write_u16(
+        state,
+        voice_flags_address,
+        static_cast<uint16_t>(voice_flags & ~(kVoicePlaying | kVoicePending)));
+    return kSuccess;
+}
+

@@ -1,0 +1,181 @@
+Static callback discovery beyond direct calls
+
+Frontend global 31FC88 points to preinitialized object 31FC98, whose first field
+is method table 2B4CC0. 2A5C0 copies the object into its entries; 2A741 invokes
+the first method, 309A0. Discovery follows at most three file-backed data pointers
+from literals or loaded globals, validates a code-pointer method group, and
+compiles its contiguous methods. Mutable dispatch remains unresolved in reports.
+
+F6D70 is the RenderWare stream registrar. Argument 1 is a plugin registry and
+argument 2 is an identifier. It stores arguments 3/4/5 at plugin fields
+0Ch/10h/14h. F6DB0 loads the read callback at F6E98 and invokes it at F6EAD.
+FEC90 forwards identifier/read/write/size plus registry 344BD8 to F6D70.
+102240 registers 101DB0/101D90/101DE0 for plugin 50Eh through that wrapper.
+Discovery recognizes the complete forwarding sequence and follows its callback
+arguments across all matching object-type wrappers, rather than seeding the
+single callback encountered during boot.
+
+The material-effects atomic constructor 1018B0 saves the original atomic object
+method (+10h) in its plugin record (+4) and installs wrapper 101870 at +10h.
+101870 reads that saved method and calls it before updating material effects.
+Discovery validates the complete constructor before following the method write.
+
+EF9C0 attaches frame-linked objects; their +10h callback must also be compiled.
+FDC60 initializes an atomic with FDB80 at +10h and FD250 at +48h. The latter is
+loaded into EAX before being stored. Discovery follows literal/register method
+writes for objects passed to the verified frame setter, including the atomic's
+second method. FDB80 updates flags and, when required, calls FD450.
+
+UI draw callback family
+
+1EF10 initializes a position/colour value object with BFBF0 at +48h (1EF2E).
+1E720 installs BFE70 into the same field (1E749). Inlined constructors repeat
+these writes, and 32770 also replaces that field with BFD30 (3292E).
+The original queued draw consumer C1210 uses a linked record: position starts
+at +8h, colour at +18h and callback at +50h. C1306 calls that callback with the
+calculated position/colour and record data; C1309 follows the next link.
+Static discovery validates constructor and consumer bytes and includes literal
+code pointers installed at +48h in functions calling or inlining those verified
+UI constructors. An offset alone does not identify an object type. Mutable
+dispatch remains unresolved rather than being forced to one target.
+C14A0 obtains a pooled queue record through D9DA0 and returns its +8h value
+object; it also sets that object's +40h/+44h ownership fields. Its callers can
+install the same +48h draw method. For example, 31F30 writes 31E60 at 32159.
+Discovery verifies the complete factory before including its callers.
+Text constructors use the same layout without calling a generic initializer:
+229D0 installs C0080 (229F9), 2EF40 installs C0390 (2EF64), 303B0 installs
+C04A0 (304B0), and C0E70 installs C0890 (C0F7D). C1020 and C1070 call C0E70,
+then replace its method with C08F0 and C0A60 at C1057 and C10A7 respectively.
+Their original initializers, stores and shared consumer establish the whole
+text callback family; discovery includes callers and inlined installations.
+
+Loaded globals must pass through an initialized object before their method table
+is considered. The CRT character table referenced at 1205DC through 347ED0 holds
+packed 16-bit classification flags such as 00100010, not function pointers.
+
+File-worker completion interfaces
+
+1107C0 submits an open job with callback argument 3; 110870 submits a read job
+with callback argument 4; 1108C0 submits a seek job with callback argument 3.
+These are one-based argument numbers. Each stores the method at job +20h and
+context at +24h. 1109B0 calls it at 110A64 (and 110AF8 for failed opens) with
+{handle, byte count, error, context}. All three producers call enqueue 110690.
+117260 takes a completion method as argument 6, writes it at context +4 and
+submits wrapper 117240 through 1107C0. The wrapper rewrites handle/context
+arguments and tail-calls that stored method at 117258. Discovery follows these
+verified producer interfaces for the whole job family.
+
+Media stream descriptors
+
+11D730 copies descriptor +3Ch/+40h to stream +D8h/+DCh. 11CA40 invokes that
+completion at 11D2E2. The descriptor at 116740 is a local 68-byte record with
+116680 at +3Ch. Discovery follows the second argument's stack address and that
+field's initializer across the verified cdecl helpers 11B430 and 11B730.
+116680 also initializes a {116270, stream context} notification tuple before
+binding its queue through 11B730. Queue producers' paired method/context writes
+are additional compilation roots; their original dispatch remains intact.
+111710 installs the manager observer {110C60, self} at +28h/+2Ch (1117AA).
+11B430 binds its pointer from descriptor +0Ch to state +2Ch; 11B4B0 invokes
+{method, context} at 11B4F1. Discovery also validates this constructor's tuple.
+
+Pool allocator forwarding wrappers
+
+106E90 and 108C60 prepend their pool object to five arguments and call 109EC0.
+Their fourth incoming argument becomes the allocator's fifth argument: method.
+1151A0 passes 1150F0 through 106E90 at 11541A. Discovery recognizes the complete
+five-argument forwarding sequence, call target and cdecl cleanup across this
+wrapper family rather than adding that one callback as a manual seed.
+
+110C90 iterates the manager's linked sources and invokes argument 2 at 110CE2
+with {source, context}. 110D10 walks a source chain and invokes the same argument
+at 110D25. 11106E/111081 pass 111040 through these interfaces. Both verified
+iterator ABIs are included in callback-argument discovery.
+
+11B620 initializes a three-word {object, method, context} source-action record
+with D87E0 at +4h. 11B650 invokes that field at 11B65B. Specialized initializers
+such as 116510 replace it: 116526 installs 1162C0 and 116533 stores its context.
+Discovery follows +4h method installations for this verified initializer family.
+
+109DE0 forwards resource-release callback argument 2 and context argument 3
+through the descriptor's +34h release method and then through 10D0C0. The latter
+invokes that callback at 10D10D with {resource, context}. 115D30 passes 115140
+through this interface at 115D8B. Both verified producers are discovery roots
+for release completions, complementing the existing allocation interface.
+
+111E00 prepares a source-close descriptor with context at +28h (111E0A) and
+1115F0 at +24h (111E0D). The source constructor copies the pair into source
++27Ch/+280h; 1155C0 invokes it at 115A26 on close. Verified tuple discovery
+accepts both adjacent write orders, since context can precede the method.
+
+CRT floating conversion initializer 11E251 loads EAX with 12186B, then stores it
+in global slots 347EB4 (11E256) and 347EC8 (11E283). The formatter calls 347EB4
+at 121EAA. Global callback-store discovery follows bounded, uninterrupted MOV
+register chains as well as immediate writes. The batch still requires an actual
+call through the destination slot before scheduling its stored code pointer.
+
+Long argument preparation in geometry queries
+
+90420 invokes incoming argument 3 at 9059E (CALL [ESP+1A4h]); its verified
+consumer ABI was already registered. B2530 pushes B22A0 at B2792, then performs
+vector calculations and writes unrelated local fields before pushing its other
+two arguments and calling 90420 at B283B. The old 32-instruction local scan
+stopped before that legitimate callback push. Verified consumer argument scans
+now allow 128 instructions, retaining their stack-rewrite and control-flow
+barriers. B22A0 is discovered from the original argument setup, without a manual
+seed, runtime decoder or substitute collision result.
+
+Indexed stream completion arrays
+
+116E70 initializes its stream through 11B430 and allocates separate request,
+notification and context arrays. At 116F34 it loads the notification array from
+owner +74h; 116F37 writes 116D80 to array + index*8. It reloads that same array
+at 116F41, adjusts the context array pointer by the same byte offset, and stores
+the context at notification +4h (116F46). Each request receives a pointer to its
+notification pair at +10h (116F52). 1155C0 invokes that pair at 11584B with
+{request, context}. 116D80 updates the outstanding-request mask and invokes the
+parent completion only when its remaining requests have finished.
+
+Discovery recognizes the complete indexed method/context setup in verified
+stream constructors. The array reload, shared offset, separate context origin
+and +4h context store must all agree; arbitrary code-looking integers are not
+callbacks. This extends installation discovery without manually seeding the
+missing method or claiming that mutable indirect dispatch is closed.
+
+Selected UI methods and mixed stack arguments
+
+1D180 reads incoming argument 8 from ESP+20h and installs it at UI object +48h
+(1D184/1D190), then returns with 20h stack cleanup. 26740 selects 24440 or 25150
+into EDI in switch cases at 26813/2682D/26847/26861. The branches merge at 26870;
+the verified C14A0 queue factory preserves EDI. 268AB pushes that register, then
+the caller reserves two float argument slots at 268B1 before calling 1D180 at
+268D2. C1210 invokes the installed method at C1306.
+
+Callback discovery follows verified stack slots through both pushes and explicit
+argument reservations. Register origins follow the recovered control-flow graph,
+including all switch branches; only the verified queue factory can be crossed
+when tracing its preserved registers. Unknown writes and other calls remain
+barriers. The walk is bounded to 4096 states within one recovered function; it
+does not decode other functions or retain the executable instruction set.
+
+Collision dispatch matrix
+
+6A6A0 computes row*4+column from its object-kind arguments and loads the method
+from 336E48 at 6A6AD. Two conditional paths reorder the objects before CALL EAX
+at 6A6E6. The original 64-byte matrix contains seven unique methods: 6AAA0,
+6A210, 6A550, 6A5C0, 6A420, 6A440 and 6A630. Null entries are deliberate; the
+next field at 336E88 begins the non-code string '.rtd'. A driving collision
+reached 6A210 before this matrix was discovered.
+
+Discovery now follows actual register origins for indirect calls too. A called
+32-bit indexed load from a file-backed code-pointer group identifies the dispatch
+array; null entries are permitted, while a nonzero non-code entry terminates the
+group. The same branch-aware walk finds the whole collision matrix and other
+matching original dispatch groups, without a seed for the encountered method.
+
+Complete CRT conversion interface
+
+11E251 initializes the six adjacent callback cells 347EB4..347EC8. Its complete
+56-byte installer matches the preserved PHASE7_RUNTIME_CALLBACK_INSTALLER_BYTES
+and the original executable. Discovery retains the whole verified interface,
+including 121561 and 12157B, whose cells have no currently observed call. The
+individual absolute stores still remain available for cross-function call proofs.

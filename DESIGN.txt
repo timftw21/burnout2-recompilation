@@ -1,0 +1,104 @@
+Burnout 2 recompilation design
+
+Build a small Windows x64 recompilation whose first priority is performance.
+Preserve correct gameplay and achieve visual parity with the original Xbox game.
+Use knowledge/ as research input, with discoveries tied to the verified executable.
+
+1. Performance
+
+Initial target: sustained 60 FPS at native resolution, within a 16.67 ms frame
+budget. Name reference hardware and representative menu, racing and crash scenes
+before acceptance. Measure CPU/GPU time, median and 99th-percentile frame times,
+loading time and peak memory; average FPS alone is insufficient.
+
+Compile game code ahead of time into native functions. Use direct calls and
+verified target tables for indirect calls. Reuse buffers, cache shaders and
+textures, upload changed data, and preserve draw order. Keep allocation, blocking
+I/O, shader compilation and detailed logging outside critical gameplay paths.
+Add threads only for measured bottlenecks. Optimisations must preserve game timing.
+
+Implement verified Xbox platform APIs directly with native file, graphics, input
+and audio services. Keep their calling conventions and visible effects. Report
+these bindings separately from translated game code; do not build physical-device
+emulators or substitute success for missing functionality.
+
+2. Language and recompilation
+
+Use C++23 for the game, recompiler, extraction and diagnostic tools, with C where
+useful and HLSL for shaders. Build with CMake and a native toolchain. Generation,
+building, playing and debugging must require no Python.
+
+Verify the executable against knowledge/supported_target.json, then rebuild
+instruction and function maps through bounded native analysis. Preserve required
+32-bit addresses, memory layouts, calling conventions and CPU behaviour. Report
+unresolved instructions or call targets with addresses and bytes; resolve their
+actual behaviour before accepting the affected path.
+
+3. Accuracy
+
+Match geometry, textures, lighting, effects, menus, HUD and gameplay timing.
+Translate the Xbox GPU behaviour needed to produce those results. Allow harmless
+differences in rasterisation and precision; investigate differences that change
+appearance or gameplay. Visual parity is the acceptance standard.
+
+Graphical references are screenshots from video captures of the original Xbox
+game. Record source, timestamp and known scene/view settings. Match viewpoints and
+account for capture scaling, compression and colour differences. This workflow
+requires no direct access to the original game or xemu gameplay reference.
+
+Validate CPU, service and gameplay behaviour using executable evidence and
+independently verified rules. The preserved excerpts guide investigation.
+
+4. Autonomous debugging without booting the game
+
+Provide a native command-line suite that inspects executable addresses and assets,
+checks CPU and service behaviour, inspects textures and shaders, replays individual
+draws or frames, compares images, diagnoses audio and measures performance.
+
+Run isolated game-code cases and offscreen D3D11 rendering through the same core
+used by gameplay. Replay inputs contain the required state, commands, resources
+and expected component outputs; video screenshots supply separate visual references.
+The suite must work from assets and small reference cases before the first game
+boot; optional captures from the recomp expand coverage later.
+
+Batch runs produce images, state differences, timing and memory reports, plus
+structured results and failure exit codes. Map failures back to game addresses,
+draws and resources. Image comparisons allow expected rendering and video-capture
+differences while exposing missing or incorrect effects. Tracing and captures are opt-in
+and disabled during normal play. The suite is a focused tool, not a large test framework.
+
+5. Simplicity
+
+Keep two native executables: the game with settings, and one tool for recompilation
+and offline diagnostics. Share CPU, service, audio and rendering code between them.
+Gameplay stays in one process. Keep dependencies few, caches bounded and components
+direct; add infrastructure only for a demonstrated requirement.
+
+6. SDL3 and Direct3D 11
+
+SDL3 manages windows, events, controllers and audio devices/streams. Translate Xbox
+GPU commands into native D3D11 rendering and HLSL shaders on the SDL3 window.
+
+SDL_GPU targets D3D12, Vulkan and Metal [1]. D3D11 therefore uses SDL3's platform
+facilities with a native graphics device and presentation path.
+
+7. User-friendly settings
+
+Use Dear ImGui with its SDL3 platform and D3D11 rendering backends [2, 3]. Provide
+game-file selection and validation, display/fullscreen/resolution/VSync settings,
+audio controls and controller remapping. Support keyboard and controller navigation,
+clear error messages, persistent settings and restore-defaults. Keep developer
+diagnostics in a separate advanced view.
+
+Implementation order
+
+Build native extraction/recompilation and offline validation first. Establish
+measured CPU execution, then D3D11 rendering with offline visual comparisons.
+Integrate SDL3 input/audio and the GUI, then verify complete gameplay, visual
+parity and performance across representative scenes.
+
+Backend references
+
+[1] SDL GPU documentation: https://wiki.libsdl.org/SDL3/CategoryGPU
+[2] Dear ImGui SDL3 backend: https://github.com/ocornut/imgui/blob/master/backends/imgui_impl_sdl3.h
+[3] Dear ImGui D3D11 backend: https://github.com/ocornut/imgui/blob/master/backends/imgui_impl_dx11.h

@@ -1,0 +1,3055 @@
+
+===== tools/recomp/ia32_native_backend.py:5276-5284 | _validate_phase7_audio_dsp_mmio_instruction =====
+
+def _validate_phase7_audio_dsp_mmio_instruction(
+    instruction: X86Instruction,
+) -> None:
+    expected = PHASE7_AUDIO_DSP_MMIO_FAMILY.get(instruction.address)
+    if expected is None or instruction.bytes_hex.upper() != expected:
+        raise Ia32BackendError(
+            f"0x{instruction.address:08X} {instruction.text()} does not match the "
+            "finite normal-live audio DSP MMIO family"
+        )
+
+
+===== tools/recomp/ia32_native_backend.py:5287-5297 | _validate_phase7_audio_dsp_mmio_family =====
+
+def _validate_phase7_audio_dsp_mmio_family(
+    instructions: Mapping[int, X86Instruction],
+) -> None:
+    missing = sorted(set(PHASE7_AUDIO_DSP_MMIO_FAMILY) - set(instructions))
+    if missing:
+        raise Ia32BackendError(
+            "normal-live audio DSP MMIO family is incomplete: "
+            + ", ".join(f"0x{address:08X}" for address in missing)
+        )
+    for address in sorted(PHASE7_AUDIO_DSP_MMIO_FAMILY):
+        _validate_phase7_audio_dsp_mmio_instruction(instructions[address])
+
+
+===== tools/recomp/ia32_native_backend.py:5300-5344 | _validate_phase7_vblank_callback_family =====
+
+def _validate_phase7_vblank_callback_family(
+    instructions: Mapping[int, X86Instruction],
+) -> None:
+    """Validate the one finite D3D vblank installer/setter/callback family."""
+
+    missing = sorted(set(PHASE7_VBLANK_CALLBACK_INSTRUCTION_BYTES) - set(instructions))
+    if missing:
+        raise Ia32BackendError(
+            "normal-live vblank callback family is incomplete: "
+            + ", ".join(f"0x{address:08X}" for address in missing)
+        )
+    for address, expected in PHASE7_VBLANK_CALLBACK_INSTRUCTION_BYTES.items():
+        if instructions[address].bytes_hex.upper() != expected:
+            raise Ia32BackendError(f"normal-live vblank callback family drifted at 0x{address:08X}")
+
+    register_callers = {
+        address
+        for address, instruction in instructions.items()
+        if instruction.mnemonic.casefold() == "call"
+        and instruction.target == NORMAL_LIVE_VBLANK_REGISTER_ADDRESS
+    }
+    if register_callers != {0x000B8D5A}:
+        raise Ia32BackendError(
+            "normal-live vblank register-caller family drifted: expected 0x000B8D5A"
+        )
+    callback_installers = {
+        address
+        for address, instruction in instructions.items()
+        if any(
+            operand.kind == "imm" and operand.immediate == NORMAL_LIVE_VBLANK_CALLBACK_ADDRESS
+            for operand in instruction.operands
+        )
+    }
+    if callback_installers != {0x000B8D3D}:
+        raise Ia32BackendError(
+            "normal-live vblank callback-installer family drifted: expected 0x000B8D3D"
+        )
+    direct_callback_callers = {
+        address
+        for address, instruction in instructions.items()
+        if instruction.mnemonic.casefold() == "call"
+        and instruction.target == NORMAL_LIVE_VBLANK_CALLBACK_ADDRESS
+    }
+    if direct_callback_callers:
+        raise Ia32BackendError("normal-live vblank callback gained an unexpected direct caller")
+
+
+===== tools/recomp/ia32_native_backend.py:5347-5408 | _validate_phase7_audio_buffer_mmio_family =====
+
+def _validate_phase7_audio_buffer_mmio_family(
+    instructions: Mapping[int, X86Instruction],
+) -> None:
+    missing = sorted(set(PHASE7_AUDIO_BUFFER_MMIO_FAMILY) - set(instructions))
+    if missing:
+        raise Ia32BackendError(
+            "normal-live audio buffer MMIO family is incomplete: "
+            + ", ".join(f"0x{address:08X}" for address in missing)
+        )
+    for address, expected in PHASE7_AUDIO_BUFFER_MMIO_FAMILY.items():
+        instruction = instructions[address]
+        if instruction.bytes_hex.upper() != expected:
+            raise Ia32BackendError(
+                f"0x{address:08X} {instruction.text()} does not match the "
+                "finite normal-live audio buffer MMIO family"
+            )
+
+    direct_callers = {
+        instruction.address
+        for instruction in instructions.values()
+        if instruction.mnemonic.casefold() == "call"
+        and instruction.target == PHASE7_AUDIO_BUFFER_COPY_TARGET
+    }
+    if direct_callers != PHASE7_AUDIO_BUFFER_COPY_CALL_SITES:
+        raise Ia32BackendError(
+            "normal-live audio buffer copy-caller family drifted: expected "
+            + ", ".join(
+                f"0x{address:08X}" for address in sorted(PHASE7_AUDIO_BUFFER_COPY_CALL_SITES)
+            )
+            + "; observed "
+            + (", ".join(f"0x{address:08X}" for address in sorted(direct_callers)) or "none")
+        )
+
+    reference_sites = {
+        instruction.address
+        for instruction in instructions.values()
+        if any(
+            value is not None
+            and PHASE7_AUDIO_BUFFER_MMIO_START <= _u32(int(value)) < PHASE7_AUDIO_BUFFER_MMIO_END
+            for operand in instruction.operands
+            for value in (
+                operand.absolute,
+                operand.immediate,
+                (
+                    operand.displacement
+                    if operand.kind == "mem"
+                    and operand.absolute is None
+                    and (operand.base is not None or operand.index is not None)
+                    else None
+                ),
+            )
+        )
+    }
+    if reference_sites != PHASE7_AUDIO_BUFFER_MMIO_REFERENCE_SITES:
+        raise Ia32BackendError(
+            "normal-live FE83xxxx audio buffer reference family drifted: expected "
+            + ", ".join(
+                f"0x{address:08X}" for address in sorted(PHASE7_AUDIO_BUFFER_MMIO_REFERENCE_SITES)
+            )
+            + "; observed "
+            + (", ".join(f"0x{address:08X}" for address in sorted(reference_sites)) or "none")
+        )
+
+
+===== tools/recomp/ia32_native_backend.py:5411-5426 | _validate_phase7_audio_sg_mmio_family =====
+
+def _validate_phase7_audio_sg_mmio_family(
+    instructions: Mapping[int, X86Instruction],
+) -> None:
+    missing = sorted(set(PHASE7_AUDIO_SG_MMIO_FAMILY) - set(instructions))
+    if missing:
+        raise Ia32BackendError(
+            "normal-live audio SG MMIO family is incomplete: "
+            + ", ".join(f"0x{address:08X}" for address in missing)
+        )
+    for address, expected in PHASE7_AUDIO_SG_MMIO_FAMILY.items():
+        instruction = instructions[address]
+        if instruction.bytes_hex.upper() != expected:
+            raise Ia32BackendError(
+                f"0x{address:08X} {instruction.text()} does not match the "
+                "finite normal-live audio SG MMIO family"
+            )
+
+
+===== tools/recomp/ia32_native_backend.py:5429-5485 | _validate_phase7_mcpx_indexed_mmio_family =====
+
+def _validate_phase7_mcpx_indexed_mmio_family(
+    instructions: Mapping[int, X86Instruction],
+) -> None:
+    missing = sorted(set(PHASE7_MCPX_INDEXED_MMIO_FAMILY) - set(instructions))
+    if missing:
+        raise Ia32BackendError(
+            "normal-live MCPX indexed MMIO family is incomplete: "
+            + ", ".join(f"0x{address:08X}" for address in missing)
+        )
+    for address, expected in PHASE7_MCPX_INDEXED_MMIO_FAMILY.items():
+        instruction = instructions[address]
+        if instruction.bytes_hex.upper() != expected:
+            raise Ia32BackendError(
+                f"0x{address:08X} {instruction.text()} does not match the "
+                "finite normal-live MCPX indexed MMIO family"
+            )
+
+    direct_callers = {
+        instruction.address
+        for instruction in instructions.values()
+        if instruction.mnemonic.casefold() == "call"
+        and instruction.target == PHASE7_MCPX_SLOT_WRITE_TARGET
+    }
+    if direct_callers != PHASE7_MCPX_SLOT_WRITE_CALL_SITES:
+        unexpected = sorted(direct_callers - PHASE7_MCPX_SLOT_WRITE_CALL_SITES)
+        missing_callers = sorted(PHASE7_MCPX_SLOT_WRITE_CALL_SITES - direct_callers)
+        details = []
+        if unexpected:
+            details.append("unexpected " + ", ".join(f"0x{address:08X}" for address in unexpected))
+        if missing_callers:
+            details.append(
+                "missing " + ", ".join(f"0x{address:08X}" for address in missing_callers)
+            )
+        raise Ia32BackendError(
+            "normal-live MCPX slot-writer caller family drifted: " + "; ".join(details)
+        )
+
+    indexed_sites = {
+        instruction.address
+        for instruction in instructions.values()
+        for operand in instruction.operands
+        if operand.kind == "mem"
+        and operand.absolute is None
+        and (operand.base is not None or operand.index is not None)
+        and (_u32(operand.displacement) & ~(PAGE_SIZE - 1)) == PHASE7_MCPX_MMIO_PAGE
+    }
+    if indexed_sites != PHASE7_MCPX_INDEXED_MMIO_ACCESS_SITES:
+        unexpected = sorted(indexed_sites - PHASE7_MCPX_INDEXED_MMIO_ACCESS_SITES)
+        missing_sites = sorted(PHASE7_MCPX_INDEXED_MMIO_ACCESS_SITES - indexed_sites)
+        details = []
+        if unexpected:
+            details.append("unexpected " + ", ".join(f"0x{address:08X}" for address in unexpected))
+        if missing_sites:
+            details.append("missing " + ", ".join(f"0x{address:08X}" for address in missing_sites))
+        raise Ia32BackendError(
+            "normal-live indexed FE820xxx access family drifted: " + "; ".join(details)
+        )
+
+
+===== tools/recomp/ia32_native_backend.py:18136-18164 | _phase7_aligned_copy_tail_targets =====
+
+def _phase7_aligned_copy_tail_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the masked nonzero aligned-copy tail selector as one family."""
+
+    site = PHASE7_ALIGNED_COPY_TAIL_SITE
+    if site not in indirect_sites or not set(PHASE7_ALIGNED_COPY_TAIL_TARGETS) <= allowed_targets:
+        return {}
+    instruction = instructions.get(site)
+    if (
+        instruction is None
+        or instruction.bytes_hex.upper() != "FF249DD4B62800"
+        or memory.read(
+            PHASE7_ALIGNED_COPY_TAIL_PROOF_START,
+            len(bytes.fromhex(PHASE7_ALIGNED_COPY_TAIL_PROOF_BYTES)),
+        ).hex().upper()
+        != PHASE7_ALIGNED_COPY_TAIL_PROOF_BYTES
+        or memory.read_u32(PHASE7_ALIGNED_COPY_TAIL_TABLE) != 0
+        or tuple(
+            memory.read_u32(PHASE7_ALIGNED_COPY_TAIL_TABLE + index * 4)
+            for index in range(1, 16)
+        )
+        != PHASE7_ALIGNED_COPY_TAIL_TARGETS
+    ):
+        return {}
+    return {site: tuple(sorted(PHASE7_ALIGNED_COPY_TAIL_TARGETS))}
+
+
+===== tools/recomp/ia32_native_backend.py:18167-18250 | _phase7_memmove_jump_table_targets =====
+
+def _phase7_memmove_jump_table_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate every indexed branch in the optimized memmove routine."""
+
+    sites = set(PHASE7_MEMMOVE_JUMP_BINDINGS)
+    table_targets = {
+        target
+        for entries in PHASE7_MEMMOVE_JUMP_TABLES.values()
+        for _index, target in entries
+    }
+    if not sites <= indirect_sites or not table_targets <= allowed_targets:
+        return {}
+    if (
+        set(PHASE7_MEMMOVE_JUMP_SITE_BYTES) != sites
+        or set(PHASE7_MEMMOVE_JUMP_REFERENCES) != set(PHASE7_MEMMOVE_JUMP_TABLES)
+    ):
+        return {}
+
+    physical_entries: dict[int, int] = {}
+    for table_base, entries in PHASE7_MEMMOVE_JUMP_TABLES.items():
+        if not entries or len({index for index, _target in entries}) != len(entries):
+            return {}
+        for index, target in entries:
+            address = _u32(table_base + index * 4)
+            prior = physical_entries.setdefault(address, target)
+            if prior != target or memory.read_u32(address) != target:
+                return {}
+    for address, encoded in PHASE7_MEMMOVE_JUMP_CONTROL_BYTES.items():
+        expected = bytes.fromhex(encoded)
+        if memory.read(address, len(expected)) != expected:
+            return {}
+    for address, encoded in PHASE7_MEMMOVE_JUMP_SITE_BYTES.items():
+        instruction = instructions.get(address)
+        if instruction is None or instruction.bytes_hex.upper() != encoded:
+            return {}
+
+    observed_references = {
+        table_base: {
+            address
+            for address, instruction in instructions.items()
+            if any(
+                operand.kind == "mem"
+                and operand.base is None
+                and operand.index is not None
+                and operand.scale == 4
+                and operand.absolute is None
+                and operand.segment is None
+                and _u32(operand.displacement) == table_base
+                for operand in instruction.operands
+            )
+        }
+        for table_base in PHASE7_MEMMOVE_JUMP_TABLES
+    }
+    if observed_references != PHASE7_MEMMOVE_JUMP_REFERENCES:
+        return {}
+
+    recovered: dict[int, tuple[int, ...]] = {}
+    for site, (table_base, index_register) in PHASE7_MEMMOVE_JUMP_BINDINGS.items():
+        instruction = instructions.get(site)
+        memory_operands = (
+            []
+            if instruction is None
+            else [operand for operand in instruction.operands if operand.kind == "mem"]
+        )
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() not in {"jmp", "jmp_indirect"}
+            or len(memory_operands) != 1
+            or memory_operands[0].base is not None
+            or memory_operands[0].index != index_register
+            or memory_operands[0].scale != 4
+            or memory_operands[0].absolute is not None
+            or memory_operands[0].segment is not None
+            or _u32(memory_operands[0].displacement) != table_base
+        ):
+            return {}
+        recovered[site] = tuple(
+            sorted({target for _index, target in PHASE7_MEMMOVE_JUMP_TABLES[table_base]})
+        )
+    return recovered
+
+
+===== tools/recomp/ia32_native_backend.py:18253-18415 | _phase7_function_pair_helper_targets =====
+
+def _phase7_function_pair_helper_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate and bind the captured function-pair helper family as one unit."""
+
+    helper_sites = set(PHASE7_FUNCTION_PAIR_HELPER_TARGETS)
+    if not helper_sites <= indirect_sites:
+        return {}
+    required_decoded_targets = {
+        target for pair in PHASE7_FUNCTION_PAIR_TABLE for target in pair
+    } | {target for targets in PHASE7_FUNCTION_PAIR_HELPER_TARGETS.values() for target in targets}
+    if not required_decoded_targets <= allowed_targets:
+        return {}
+    for index, pair in enumerate(PHASE7_FUNCTION_PAIR_TABLE):
+        for column, expected in enumerate(pair):
+            address = PHASE7_FUNCTION_PAIR_TABLE_BASE + index * 8 + column * 4
+            if memory.read_u32(address) != expected:
+                return {}
+
+    def register_call(address: int, register: str) -> bool:
+        instruction = instructions.get(address)
+        return bool(
+            instruction is not None
+            and instruction.mnemonic.casefold() == "call"
+            and len(instruction.operands) == 1
+            and instruction.operands[0].kind == "reg"
+            and instruction.operands[0].reg == register
+        )
+
+    def table_call(address: int, base: str) -> bool:
+        instruction = instructions.get(address)
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() not in {"call", "jmp"}
+            or len(instruction.operands) != 1
+        ):
+            return False
+        operand = instruction.operands[0]
+        return (
+            operand.kind == "mem"
+            and operand.base == base
+            and operand.index is None
+            and operand.scale == 1
+            and operand.displacement == 4
+            and operand.absolute is None
+            and operand.segment is None
+            and operand.size == 32
+        )
+
+    def register_immediate(address: int, register: str, value: int) -> bool:
+        instruction = instructions.get(address)
+        return bool(
+            instruction is not None
+            and instruction.mnemonic.casefold() == "mov"
+            and len(instruction.operands) == 2
+            and instruction.operands[0].kind == "reg"
+            and instruction.operands[0].reg == register
+            and instruction.operands[1].kind == "imm"
+            and instruction.operands[1].immediate == value
+        )
+
+    def register_move(address: int, destination: str, source: str) -> bool:
+        instruction = instructions.get(address)
+        return bool(
+            instruction is not None
+            and instruction.mnemonic.casefold() == "mov"
+            and len(instruction.operands) == 2
+            and instruction.operands[0].kind == "reg"
+            and instruction.operands[0].reg == destination
+            and instruction.operands[1].kind == "reg"
+            and instruction.operands[1].reg == source
+        )
+
+    def stack_load(address: int, destination: str, displacement: int) -> bool:
+        instruction = instructions.get(address)
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "mov"
+            or len(instruction.operands) != 2
+            or instruction.operands[0].kind != "reg"
+            or instruction.operands[0].reg != destination
+        ):
+            return False
+        operand = instruction.operands[1]
+        return (
+            operand.kind == "mem"
+            and operand.base == "esp"
+            and operand.index is None
+            and operand.scale == 1
+            and operand.displacement == displacement
+            and operand.absolute is None
+            and operand.segment is None
+        )
+
+    def push_immediate(address: int, value: int) -> bool:
+        instruction = instructions.get(address)
+        return bool(
+            instruction is not None
+            and instruction.mnemonic.casefold() == "push"
+            and len(instruction.operands) == 1
+            and instruction.operands[0].kind == "imm"
+            and instruction.operands[0].immediate == value
+        )
+
+    def direct_call(address: int, target: int) -> bool:
+        instruction = instructions.get(address)
+        return bool(
+            instruction is not None
+            and instruction.mnemonic.casefold() == "call"
+            and instruction.target == target
+        )
+
+    def table_row_lea(address: int, destination: str, index: str) -> bool:
+        instruction = instructions.get(address)
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "lea"
+            or len(instruction.operands) != 2
+            or instruction.operands[0].kind != "reg"
+            or instruction.operands[0].reg != destination
+        ):
+            return False
+        operand = instruction.operands[1]
+        return (
+            operand.kind == "mem"
+            and operand.base == "eax"
+            and operand.index == index
+            and operand.scale == 8
+            and operand.displacement == -8
+            and operand.absolute is None
+            and operand.segment is None
+        )
+
+    if not all(
+        (
+            register_call(0x0010A22D, "ebx"),
+            table_call(0x0010A253, "edi"),
+            register_call(0x0010A263, "eax"),
+            table_call(0x0010A290, "esi"),
+            register_call(0x0010A29C, "ebx"),
+            stack_load(0x0010A211, "ebp", 0xC),
+            stack_load(0x0010A21D, "edi", 0x10),
+            stack_load(0x0010A24B, "eax", 0x10),
+            stack_load(0x0010A256, "eax", 0x18),
+            table_row_lea(0x0010A24F, "edi", "esi"),
+            register_move(0x0010A281, "edi", "ecx"),
+            table_row_lea(0x0010A288, "esi", "edi"),
+            push_immediate(0x0010A4A0, 0x0010A2F0),
+            push_immediate(0x0010A4A5, len(PHASE7_FUNCTION_PAIR_TABLE)),
+            push_immediate(0x0010A4A7, PHASE7_FUNCTION_PAIR_TABLE_BASE),
+            register_immediate(0x0010A4AC, "ebx", 0x0010A2B0),
+            direct_call(0x0010A4BC, 0x0010A210),
+            register_immediate(0x0010A50A, "ebx", 0x0010A2F0),
+            register_immediate(0x0010A50F, "ecx", len(PHASE7_FUNCTION_PAIR_TABLE)),
+            register_immediate(0x0010A514, "eax", PHASE7_FUNCTION_PAIR_TABLE_BASE),
+            direct_call(0x0010A519, 0x0010A280),
+        )
+    ):
+        return {}
+    return dict(PHASE7_FUNCTION_PAIR_HELPER_TARGETS)
+
+
+===== tools/recomp/ia32_native_backend.py:18418-18474 | _phase7_collision_dispatch_targets =====
+
+def _phase7_collision_dispatch_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the finite collision primitive dispatch table as one family."""
+
+    site = PHASE7_COLLISION_DISPATCH_SITE
+    if site not in indirect_sites:
+        return {}
+    targets = tuple(
+        sorted(
+            {
+                target
+                for row in PHASE7_COLLISION_DISPATCH_TABLE
+                for target in row
+                if target
+            }
+        )
+    )
+    if (
+        not set(targets) <= allowed_targets
+        or PHASE7_COLLISION_DISPATCH_OBSERVED_BOUNDARY != (site, 0x0006A550)
+        or PHASE7_COLLISION_DISPATCH_OBSERVED_BOUNDARY[1] not in targets
+    ):
+        return {}
+    for row, entries in enumerate(PHASE7_COLLISION_DISPATCH_TABLE):
+        for column, expected in enumerate(entries):
+            address = PHASE7_COLLISION_DISPATCH_TABLE_BASE + (row * 4 + column) * 4
+            if memory.read_u32(address) != expected:
+                return {}
+    helper_payload = memory.read(
+        PHASE7_COLLISION_DISPATCH_HELPER_START,
+        PHASE7_COLLISION_DISPATCH_HELPER_END
+        - PHASE7_COLLISION_DISPATCH_HELPER_START,
+    )
+    if hashlib.sha256(helper_payload).hexdigest() != PHASE7_COLLISION_DISPATCH_HELPER_SHA256:
+        return {}
+    instruction = instructions.get(site)
+    if (
+        instruction is None
+        or instruction.mnemonic.casefold() != "call"
+        or len(instruction.operands) != 1
+        or instruction.operands[0].kind != "reg"
+        or instruction.operands[0].reg != "eax"
+    ):
+        return {}
+    direct_callers = {
+        address
+        for address, candidate in instructions.items()
+        if candidate.mnemonic.casefold() == "call"
+        and candidate.target == PHASE7_COLLISION_DISPATCH_HELPER_START
+    }
+    if direct_callers != set(PHASE7_COLLISION_DISPATCH_CALLERS):
+        return {}
+    return {site: targets}
+
+
+===== tools/recomp/ia32_native_backend.py:18477-18525 | _phase7_base_manager_object_targets =====
+
+def _phase7_base_manager_object_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the complete finite base-manager entry vtable family."""
+
+    sites = set(PHASE7_BASE_MANAGER_OBJECT_BINDINGS)
+    targets = {target for _slot, target in PHASE7_BASE_MANAGER_OBJECT_BINDINGS.values()}
+    vtable_targets = set(PHASE7_BASE_MANAGER_OBJECT_VTABLE_ENTRIES)
+    if (
+        not sites <= indirect_sites
+        or not targets <= allowed_targets
+        or not vtable_targets <= allowed_targets
+    ):
+        return {}
+    for address, expected in PHASE7_BASE_MANAGER_OBJECT_INSTRUCTION_BYTES.items():
+        instruction = instructions.get(address)
+        if instruction is None or instruction.bytes_hex.upper() != expected:
+            return {}
+    for index, entry in enumerate(PHASE7_BASE_MANAGER_OBJECT_VTABLE_ENTRIES):
+        if memory.read_u32(PHASE7_BASE_MANAGER_OBJECT_VTABLE + index * 4) != entry:
+            return {}
+    for slot, target in PHASE7_BASE_MANAGER_OBJECT_BINDINGS.values():
+        if memory.read_u32(PHASE7_BASE_MANAGER_OBJECT_VTABLE + slot) != target:
+            return {}
+
+    installers = {
+        address
+        for address, instruction in instructions.items()
+        if instruction.mnemonic.casefold() == "mov"
+        and any(
+            operand.kind == "imm" and operand.immediate == PHASE7_BASE_MANAGER_OBJECT_VTABLE
+            for operand in instruction.operands
+        )
+    }
+    if installers != {0x00139390}:
+        return {}
+    direct_callers = {
+        address
+        for address, instruction in instructions.items()
+        if instruction.mnemonic.casefold() == "call" and instruction.target in vtable_targets
+    }
+    if direct_callers:
+        return {}
+    return {
+        site: (target,) for site, (_slot, target) in PHASE7_BASE_MANAGER_OBJECT_BINDINGS.items()
+    }
+
+
+===== tools/recomp/ia32_native_backend.py:18528-18786 | _phase7_game_state_object_targets =====
+
+def _phase7_game_state_object_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the complete static game-state registry and its dispatches."""
+
+    objects = {
+        index: (cell, object_address, vtable, entries)
+        for index, cell, object_address, vtable, entries in PHASE7_GAME_STATE_OBJECTS
+    }
+    if set(objects) != set(range(0x10)):
+        return {}
+    if {
+        cell for cell, _object, _vtable, _entries in objects.values()
+    } != set(range(0x002FE318, 0x002FE358, 4)):
+        return {}
+
+    concrete_entries: list[tuple[int, ...]] = []
+    for index, (cell, object_address, vtable, entries) in objects.items():
+        if memory.read_u32(cell) != object_address:
+            return {}
+        if object_address == 0:
+            if index != 0x09 or vtable != 0 or entries:
+                return {}
+            continue
+        if vtable == 0 or len(entries) != 16 or memory.read_u32(object_address) != vtable:
+            return {}
+        for slot, target in enumerate(entries):
+            if memory.read_u32(vtable + slot * 4) != target:
+                return {}
+        concrete_entries.append(entries)
+
+    all_targets = {target for entries in concrete_entries for target in entries}
+    if not all_targets <= allowed_targets:
+        return {}
+
+    transition_code = memory.read(
+        PHASE7_GAME_STATE_TRANSITION_CODE_START,
+        PHASE7_GAME_STATE_TRANSITION_CODE_END
+        - PHASE7_GAME_STATE_TRANSITION_CODE_START,
+    )
+    if (
+        hashlib.sha256(transition_code).hexdigest()
+        != PHASE7_GAME_STATE_TRANSITION_CODE_SHA256
+    ):
+        return {}
+
+    active_references = tuple(
+        sorted(
+            address
+            for address, instruction in instructions.items()
+            if any(
+                operand.absolute == PHASE7_GAME_STATE_ACTIVE_OBJECT_CELL
+                for operand in instruction.operands
+            )
+        )
+    )
+    if (
+        len(active_references) != PHASE7_GAME_STATE_REFERENCE_COUNT
+        or hashlib.sha256(
+            b"".join(struct.pack("<I", address) for address in active_references)
+        ).hexdigest()
+        != PHASE7_GAME_STATE_REFERENCE_SHA256
+    ):
+        return {}
+
+    ordered_addresses = sorted(instructions)
+    positions = {address: index for index, address in enumerate(ordered_addresses)}
+
+    def writes_register(instruction: X86Instruction, register: str) -> bool:
+        return bool(
+            instruction.operands
+            and instruction.operands[0].kind == "reg"
+            and instruction.operands[0].reg == register
+        )
+
+    derived_slots: dict[int, int] = {}
+    for site in sorted(indirect_sites):
+        instruction = instructions.get(site)
+        if instruction is None or instruction.mnemonic.casefold() not in {"call", "jmp"}:
+            continue
+        memory_operands = [operand for operand in instruction.operands if operand.kind == "mem"]
+        if len(memory_operands) != 1:
+            continue
+        call_operand = memory_operands[0]
+        if (
+            call_operand.base is None
+            or call_operand.index is not None
+            or call_operand.displacement not in range(0, 0x40, 4)
+        ):
+            continue
+
+        position = positions.get(site)
+        if position is None:
+            continue
+        vtable_load: X86Instruction | None = None
+        vtable_position = -1
+        for previous_position in range(position - 1, max(-1, position - 20), -1):
+            previous = instructions[ordered_addresses[previous_position]]
+            if site - previous.address > 0x70 or previous.mnemonic.casefold() in {"ret", "jmp"}:
+                break
+            if writes_register(previous, call_operand.base):
+                vtable_load = previous
+                vtable_position = previous_position
+                break
+        if vtable_load is None or vtable_load.mnemonic.casefold() != "mov":
+            continue
+        if len(vtable_load.operands) != 2:
+            continue
+        vtable_source = vtable_load.operands[1]
+        if (
+            vtable_source.kind != "mem"
+            or vtable_source.base is None
+            or vtable_source.index is not None
+            or vtable_source.displacement != 0
+        ):
+            continue
+
+        object_load: X86Instruction | None = None
+        for previous_position in range(
+            vtable_position - 1,
+            max(-1, vtable_position - 20),
+            -1,
+        ):
+            previous = instructions[ordered_addresses[previous_position]]
+            if (
+                vtable_load.address - previous.address > 0x70
+                or previous.mnemonic.casefold() in {"ret", "jmp"}
+            ):
+                break
+            if writes_register(previous, vtable_source.base):
+                object_load = previous
+                break
+        if object_load is None or object_load.mnemonic.casefold() != "mov":
+            continue
+        if len(object_load.operands) != 2:
+            continue
+        object_source = object_load.operands[1]
+        if (
+            object_source.kind != "mem"
+            or object_source.absolute != PHASE7_GAME_STATE_ACTIVE_OBJECT_CELL
+        ):
+            continue
+        derived_slots[site] = call_operand.displacement
+
+    derived_sites = tuple(sorted(derived_slots))
+    if (
+        len(derived_sites) != PHASE7_GAME_STATE_DERIVED_SITE_COUNT
+        or hashlib.sha256(
+            b"".join(struct.pack("<I", site) for site in derived_sites)
+        ).hexdigest()
+        != PHASE7_GAME_STATE_DERIVED_SITE_SHA256
+    ):
+        return {}
+
+    recovered = {
+        site: tuple(sorted({entries[slot // 4] for entries in concrete_entries}))
+        for site, slot in derived_slots.items()
+    }
+    for site, (slot, exact_index) in PHASE7_GAME_STATE_SPECIAL_BINDINGS.items():
+        instruction = instructions.get(site)
+        memory_operands = (
+            []
+            if instruction is None
+            else [operand for operand in instruction.operands if operand.kind == "mem"]
+        )
+        if (
+            instruction is None
+            or instruction.bytes_hex.upper() != PHASE7_GAME_STATE_SPECIAL_SITE_BYTES[site]
+            or instruction.mnemonic.casefold() not in {"call", "jmp"}
+            or len(memory_operands) != 1
+            or memory_operands[0].displacement != slot
+        ):
+            return {}
+        if exact_index is None:
+            recovered[site] = tuple(
+                sorted({entries[slot // 4] for entries in concrete_entries})
+            )
+        else:
+            exact_entries = objects[exact_index][3]
+            recovered[site] = (exact_entries[slot // 4],)
+
+    helper_code = memory.read(
+        PHASE7_GAME_STATE_HELPER_START,
+        PHASE7_GAME_STATE_HELPER_END - PHASE7_GAME_STATE_HELPER_START,
+    )
+    if hashlib.sha256(helper_code).hexdigest() != PHASE7_GAME_STATE_HELPER_SHA256:
+        return {}
+    helper_callers = {
+        address
+        for address, instruction in instructions.items()
+        if instruction.mnemonic.casefold() == "call"
+        and instruction.target == PHASE7_GAME_STATE_HELPER_START
+    }
+    if helper_callers != set(PHASE7_GAME_STATE_HELPER_CALLERS):
+        return {}
+    helper_methods = {
+        method for method, _sha256 in PHASE7_GAME_STATE_HELPER_CALLERS.values()
+    }
+    if not helper_methods <= all_targets:
+        return {}
+    for call_site, (method, caller_sha256) in PHASE7_GAME_STATE_HELPER_CALLERS.items():
+        instruction = instructions.get(call_site)
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "call"
+            or instruction.target != PHASE7_GAME_STATE_HELPER_START
+            or method >= call_site
+            or hashlib.sha256(memory.read(method, call_site + 5 - method)).hexdigest()
+            != caller_sha256
+        ):
+            return {}
+    helper_state_indexes = tuple(
+        index
+        for index, (_cell, object_address, _vtable, entries) in objects.items()
+        if object_address and helper_methods.intersection(entries)
+    )
+    if helper_state_indexes != PHASE7_GAME_STATE_HELPER_STATE_INDEXES:
+        return {}
+    helper_entries = [objects[index][3] for index in helper_state_indexes]
+    for site, (slot, site_bytes) in PHASE7_GAME_STATE_HELPER_BINDINGS.items():
+        instruction = instructions.get(site)
+        memory_operands = (
+            []
+            if instruction is None
+            else [operand for operand in instruction.operands if operand.kind == "mem"]
+        )
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "call"
+            or instruction.bytes_hex.upper() != site_bytes
+            or len(memory_operands) != 1
+            or memory_operands[0].displacement != slot
+        ):
+            return {}
+        recovered[site] = tuple(
+            sorted({entries[slot // 4] for entries in helper_entries})
+        )
+
+    sites = tuple(sorted(recovered))
+    boundary_site, boundary_index, boundary_slot, boundary_target = (
+        PHASE7_GAME_STATE_OBSERVED_BOUNDARY
+    )
+    if (
+        len(sites) != PHASE7_GAME_STATE_SITE_COUNT
+        or hashlib.sha256(
+            b"".join(struct.pack("<I", site) for site in sites)
+        ).hexdigest()
+        != PHASE7_GAME_STATE_SITE_SHA256
+        or not set(sites) <= indirect_sites
+        or not {target for targets in recovered.values() for target in targets}
+        <= allowed_targets
+        or objects[boundary_index][3][boundary_slot // 4] != boundary_target
+        or boundary_target not in recovered.get(boundary_site, ())
+    ):
+        return {}
+    return recovered
+
+
+===== tools/recomp/ia32_native_backend.py:18789-18888 | _phase7_level_load_strategy_targets =====
+
+def _phase7_level_load_strategy_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the complete finite level-load strategy-object family."""
+
+    sites = set(PHASE7_LEVEL_LOAD_STRATEGY_BINDINGS)
+    vtables = {
+        vtable: entries for _object_address, vtable, entries in PHASE7_LEVEL_LOAD_STRATEGY_OBJECTS
+    }
+    vtable_targets = {target for entries in vtables.values() for target in entries}
+    if not sites <= indirect_sites or not vtable_targets <= allowed_targets:
+        return {}
+    if set(PHASE7_LEVEL_LOAD_STRATEGY_SITE_BYTES) != sites:
+        return {}
+
+    for object_address, vtable, entries in PHASE7_LEVEL_LOAD_STRATEGY_OBJECTS:
+        if memory.read_u32(object_address) != vtable or vtables.get(vtable) != entries:
+            return {}
+        for index, target in enumerate(entries):
+            if memory.read_u32(vtable + index * 4) != target:
+                return {}
+
+    caller_starts = {
+        caller_start
+        for caller_start, _vtable, _slot in PHASE7_LEVEL_LOAD_STRATEGY_BINDINGS.values()
+    }
+    if caller_starts != set(PHASE7_LEVEL_LOAD_STRATEGY_CALLER_BYTES):
+        return {}
+    for caller_start, encoded in PHASE7_LEVEL_LOAD_STRATEGY_CALLER_BYTES.items():
+        expected = bytes.fromhex(encoded)
+        if memory.read(caller_start, len(expected)) != expected:
+            return {}
+    for installer_start, encoded in PHASE7_LEVEL_LOAD_STRATEGY_INSTALLER_BYTES.items():
+        expected = bytes.fromhex(encoded)
+        if memory.read(installer_start, len(expected)) != expected:
+            return {}
+    for address, encoded in PHASE7_LEVEL_LOAD_STRATEGY_REFERENCE_BYTES.items():
+        instruction = instructions.get(address)
+        if instruction is None or instruction.bytes_hex.upper() != encoded:
+            return {}
+
+    object_addresses = set(PHASE7_LEVEL_LOAD_STRATEGY_REFERENCES)
+    observed_references = {
+        object_address: {
+            address
+            for address, instruction in instructions.items()
+            if any(
+                (
+                    operand.kind == "imm"
+                    and operand.immediate == object_address
+                )
+                or (
+                    operand.kind == "mem"
+                    and operand.absolute == object_address
+                )
+                for operand in instruction.operands
+            )
+        }
+        for object_address in object_addresses
+    }
+    if observed_references != PHASE7_LEVEL_LOAD_STRATEGY_REFERENCES:
+        return {}
+
+    recovered: dict[int, tuple[int, ...]] = {}
+    for site, (caller_start, vtable, slot) in PHASE7_LEVEL_LOAD_STRATEGY_BINDINGS.items():
+        instruction = instructions.get(site)
+        encoded = PHASE7_LEVEL_LOAD_STRATEGY_SITE_BYTES[site]
+        caller_end = caller_start + len(
+            bytes.fromhex(PHASE7_LEVEL_LOAD_STRATEGY_CALLER_BYTES[caller_start])
+        )
+        memory_operands = (
+            []
+            if instruction is None
+            else [operand for operand in instruction.operands if operand.kind == "mem"]
+        )
+        if (
+            instruction is None
+            or instruction.bytes_hex.upper() != encoded
+            or instruction.mnemonic.casefold() not in {"call", "jmp"}
+            or len(memory_operands) != 1
+            or memory_operands[0].displacement != slot
+            or not caller_start <= site < caller_end
+        ):
+            return {}
+        if vtable:
+            selected_entries = vtables.get(vtable)
+            if selected_entries is None:
+                return {}
+            site_targets: tuple[int, ...] = (selected_entries[slot // 4],)
+        else:
+            site_targets = tuple(
+                sorted({table_entries[slot // 4] for table_entries in vtables.values()})
+            )
+        if not set(site_targets) <= allowed_targets:
+            return {}
+        recovered[site] = site_targets
+    return recovered
+
+
+===== tools/recomp/ia32_native_backend.py:18891-19065 | _phase7_level_parameter_bank_targets =====
+
+def _phase7_level_parameter_bank_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the complete fixed 32-object level-parameter dispatch bank."""
+
+    code = memory.read(
+        PHASE7_LEVEL_PARAMETER_BANK_CODE_START,
+        PHASE7_LEVEL_PARAMETER_BANK_CODE_END
+        - PHASE7_LEVEL_PARAMETER_BANK_CODE_START,
+    )
+    if hashlib.sha256(code).hexdigest() != PHASE7_LEVEL_PARAMETER_BANK_CODE_SHA256:
+        return {}
+
+    objects = {
+        field: (object_address, vtable, entries)
+        for field, object_address, vtable, entries in (
+            PHASE7_LEVEL_PARAMETER_BANK_OBJECTS
+        )
+    }
+    if set(objects) != set(range(0x10, 0x90, 4)):
+        return {}
+    for _field, (object_address, vtable, entries) in objects.items():
+        if memory.read_u32(object_address) != vtable or len(entries) != 3:
+            return {}
+        for index, target in enumerate(entries):
+            if memory.read_u32(vtable + index * 4) != target:
+                return {}
+
+    generic_sites = set(PHASE7_LEVEL_PARAMETER_BANK_GENERIC_BINDINGS)
+    all_targets = {
+        target
+        for _object_address, _vtable, entries in objects.values()
+        for target in entries
+    }
+    if not generic_sites <= indirect_sites or not all_targets <= allowed_targets:
+        return {}
+    generic_bytes = {
+        0x0001AB3F: "FF12",
+        0x0001ABEB: "FF5208",
+        0x0001AC27: "FF5004",
+    }
+    recovered: dict[int, tuple[int, ...]] = {}
+    for site, slot in PHASE7_LEVEL_PARAMETER_BANK_GENERIC_BINDINGS.items():
+        instruction = instructions.get(site)
+        memory_operands = (
+            []
+            if instruction is None
+            else [operand for operand in instruction.operands if operand.kind == "mem"]
+        )
+        if (
+            instruction is None
+            or instruction.bytes_hex.upper() != generic_bytes[site]
+            or instruction.mnemonic.casefold() != "call"
+            or len(memory_operands) != 1
+            or memory_operands[0].displacement != slot
+        ):
+            return {}
+        recovered[site] = tuple(
+            sorted({entries[slot // 4] for _object, _vtable, entries in objects.values()})
+        )
+
+    region = sorted(
+        (
+            instruction
+            for address, instruction in instructions.items()
+            if PHASE7_LEVEL_PARAMETER_BANK_SETTER_START
+            <= address
+            < PHASE7_LEVEL_PARAMETER_BANK_CODE_END
+        ),
+        key=lambda instruction: instruction.address,
+    )
+    direct_targets: dict[int, tuple[int, ...]] = {}
+    for position, instruction in enumerate(region):
+        memory_operands = [
+            operand for operand in instruction.operands if operand.kind == "mem"
+        ]
+        if (
+            instruction.mnemonic.casefold() != "call"
+            or len(memory_operands) != 1
+            or memory_operands[0].base is None
+            or memory_operands[0].displacement != 4
+        ):
+            continue
+
+        vtable_register = memory_operands[0].base
+        vtable_load: X86Instruction | None = None
+        vtable_position = -1
+        for previous_position in range(position - 1, max(-1, position - 30), -1):
+            previous = region[previous_position]
+            if (
+                instruction.address - previous.address > 0x90
+                or previous.mnemonic.casefold() in {"ret", "jmp"}
+            ):
+                break
+            if (
+                previous.operands
+                and previous.operands[0].kind == "reg"
+                and previous.operands[0].reg == vtable_register
+            ):
+                vtable_load = previous
+                vtable_position = previous_position
+                break
+        if vtable_load is None or vtable_load.mnemonic.casefold() != "mov":
+            continue
+        if len(vtable_load.operands) != 2:
+            continue
+        vtable_source = vtable_load.operands[1]
+        if (
+            vtable_source.kind != "mem"
+            or vtable_source.base is None
+            or vtable_source.index is not None
+            or vtable_source.displacement != 0
+        ):
+            continue
+
+        object_register = vtable_source.base
+        object_load: X86Instruction | None = None
+        for previous_position in range(
+            vtable_position - 1,
+            max(-1, vtable_position - 20),
+            -1,
+        ):
+            previous = region[previous_position]
+            if (
+                vtable_load.address - previous.address > 0x60
+                or previous.mnemonic.casefold() in {"ret", "jmp"}
+            ):
+                break
+            if (
+                previous.operands
+                and previous.operands[0].kind == "reg"
+                and previous.operands[0].reg == object_register
+            ):
+                object_load = previous
+                break
+        if object_load is None or object_load.mnemonic.casefold() != "mov":
+            continue
+        if len(object_load.operands) != 2:
+            continue
+        object_source = object_load.operands[1]
+        if (
+            object_source.kind != "mem"
+            or object_source.base != "esi"
+            or object_source.index is not None
+            or object_source.displacement not in objects
+        ):
+            continue
+        entries = objects[object_source.displacement][2]
+        direct_targets[instruction.address] = (entries[1],)
+
+    direct_sites = tuple(sorted(direct_targets))
+    direct_site_sha256 = hashlib.sha256(
+        b"".join(struct.pack("<I", site) for site in direct_sites)
+    ).hexdigest()
+    boundary_site, boundary_field, boundary_target = (
+        PHASE7_LEVEL_PARAMETER_BANK_OBSERVED_BOUNDARY
+    )
+    if (
+        len(direct_sites) != PHASE7_LEVEL_PARAMETER_BANK_SETTER_SITE_COUNT
+        or direct_site_sha256
+        != PHASE7_LEVEL_PARAMETER_BANK_SETTER_SITE_SHA256
+        or objects[boundary_field][2][1] != boundary_target
+        or direct_targets.get(boundary_site) != (boundary_target,)
+        or not set(direct_sites) <= indirect_sites
+        or not {
+            target for targets in direct_targets.values() for target in targets
+        }
+        <= allowed_targets
+    ):
+        return {}
+    recovered.update(direct_targets)
+    return recovered
+
+
+===== tools/recomp/ia32_native_backend.py:19068-19217 | _phase7_level_load_manager_targets =====
+
+def _phase7_level_load_manager_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate both fixed level-load manager arrays and self-dispatches."""
+
+    sites = set(PHASE7_LEVEL_LOAD_MANAGER_BINDINGS)
+    vtables = {vtable: entries for vtable, entries in PHASE7_LEVEL_LOAD_MANAGER_VTABLES}
+    vtable_targets = {target for entries in vtables.values() for target in entries}
+    if not sites <= indirect_sites or not vtable_targets <= allowed_targets:
+        return {}
+    if set(PHASE7_LEVEL_LOAD_MANAGER_SITE_BYTES) != sites:
+        return {}
+    if not set(PHASE7_LEVEL_LOAD_MANAGER_COMMON_VTABLES) <= set(vtables):
+        return {}
+
+    for vtable, entries in PHASE7_LEVEL_LOAD_MANAGER_VTABLES:
+        for index, target in enumerate(entries):
+            if memory.read_u32(vtable + index * 4) != target:
+                return {}
+    for object_address, vtable in PHASE7_LEVEL_LOAD_MANAGER_OBJECT_BINDINGS:
+        if memory.read_u32(object_address) != vtable:
+            return {}
+
+    caller_starts = {
+        caller_start
+        for caller_start, _vtable, _slot in PHASE7_LEVEL_LOAD_MANAGER_BINDINGS.values()
+    }
+    if caller_starts != set(PHASE7_LEVEL_LOAD_MANAGER_CALLER_BYTES):
+        return {}
+    for caller_start, encoded in PHASE7_LEVEL_LOAD_MANAGER_CALLER_BYTES.items():
+        expected = bytes.fromhex(encoded)
+        if memory.read(caller_start, len(expected)) != expected:
+            return {}
+    for address, encoded in PHASE7_LEVEL_LOAD_MANAGER_SWEEP_PROOF_BYTES.items():
+        expected = bytes.fromhex(encoded)
+        if memory.read(address, len(expected)) != expected:
+            return {}
+    sweep_helpers = {
+        helper
+        for helper, _prefix_start, _encoded in (
+            PHASE7_LEVEL_LOAD_MANAGER_SWEEP_DIRECT_CALLERS.values()
+        )
+    }
+    observed_sweep_callers = {
+        helper: {
+            address
+            for address, instruction in instructions.items()
+            if instruction.mnemonic.casefold() == "call"
+            and instruction.target == helper
+        }
+        for helper in sweep_helpers
+    }
+    expected_sweep_callers = {
+        helper: {
+            call_site
+            for call_site, (candidate, _prefix_start, _encoded) in (
+                PHASE7_LEVEL_LOAD_MANAGER_SWEEP_DIRECT_CALLERS.items()
+            )
+            if candidate == helper
+        }
+        for helper in sweep_helpers
+    }
+    if observed_sweep_callers != expected_sweep_callers:
+        return {}
+    for call_site, (helper, prefix_start, encoded) in (
+        PHASE7_LEVEL_LOAD_MANAGER_SWEEP_DIRECT_CALLERS.items()
+    ):
+        expected = bytes.fromhex(encoded)
+        instruction = instructions.get(call_site)
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "call"
+            or instruction.target != helper
+            or prefix_start + len(expected) != call_site + 5
+            or memory.read(prefix_start, len(expected)) != expected
+        ):
+            return {}
+    for installer_start, encoded in PHASE7_LEVEL_LOAD_MANAGER_INSTALLER_BYTES.items():
+        expected = bytes.fromhex(encoded)
+        if memory.read(installer_start, len(expected)) != expected:
+            return {}
+    for address, encoded in PHASE7_LEVEL_LOAD_MANAGER_REFERENCE_BYTES.items():
+        instruction = instructions.get(address)
+        if instruction is None or instruction.bytes_hex.upper() != encoded:
+            return {}
+
+    vtable_addresses = set(PHASE7_LEVEL_LOAD_MANAGER_REFERENCES)
+    observed_references = {
+        vtable: {
+            address
+            for address, instruction in instructions.items()
+            if any(
+                (operand.kind == "imm" and operand.immediate == vtable)
+                or (operand.kind == "mem" and operand.absolute == vtable)
+                for operand in instruction.operands
+            )
+        }
+        for vtable in vtable_addresses
+    }
+    if observed_references != PHASE7_LEVEL_LOAD_MANAGER_REFERENCES:
+        return {}
+
+    recovered: dict[int, tuple[int, ...]] = {}
+    for site, (caller_start, vtable, slot) in PHASE7_LEVEL_LOAD_MANAGER_BINDINGS.items():
+        instruction = instructions.get(site)
+        encoded = PHASE7_LEVEL_LOAD_MANAGER_SITE_BYTES[site]
+        caller_end = caller_start + len(
+            bytes.fromhex(PHASE7_LEVEL_LOAD_MANAGER_CALLER_BYTES[caller_start])
+        )
+        memory_operands = (
+            []
+            if instruction is None
+            else [operand for operand in instruction.operands if operand.kind == "mem"]
+        )
+        if (
+            instruction is None
+            or instruction.bytes_hex.upper() != encoded
+            or instruction.mnemonic.casefold() not in {"call", "jmp"}
+            or len(memory_operands) != 1
+            or memory_operands[0].displacement != slot
+            or not caller_start <= site < caller_end
+        ):
+            return {}
+        if vtable:
+            selected_entries = vtables.get(vtable)
+            if selected_entries is None or slot // 4 >= len(selected_entries):
+                return {}
+            site_targets: tuple[int, ...] = (selected_entries[slot // 4],)
+        else:
+            common_entries = [vtables[item] for item in PHASE7_LEVEL_LOAD_MANAGER_COMMON_VTABLES]
+            if any(slot // 4 >= len(table_entries) for table_entries in common_entries):
+                return {}
+            site_targets = tuple(
+                sorted({table_entries[slot // 4] for table_entries in common_entries})
+            )
+        if not set(site_targets) <= allowed_targets:
+            return {}
+        recovered[site] = site_targets
+    boundary_site, boundary_vtable, boundary_slot, boundary_target = (
+        PHASE7_LEVEL_LOAD_MANAGER_SWEEP_OBSERVED_BOUNDARY
+    )
+    if (
+        vtables[boundary_vtable][boundary_slot // 4] != boundary_target
+        or recovered.get(boundary_site) != (boundary_target,)
+    ):
+        return {}
+    return recovered
+
+
+===== tools/recomp/ia32_native_backend.py:19220-19327 | _phase7_level_update_primary_targets =====
+
+def _phase7_level_update_primary_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate all primary slot-0x18 calls in the level-update switch."""
+
+    target = dict(PHASE7_LEVEL_LOAD_MANAGER_VTABLES)[
+        PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE
+    ][0x18 // 4]
+    sites = set(PHASE7_LEVEL_UPDATE_PRIMARY_BINDINGS)
+    if (
+        not sites <= indirect_sites
+        or target not in allowed_targets
+        or not sites.isdisjoint(PHASE7_LEVEL_UPDATE_SECONDARY_GUARDED_SITES)
+        or memory.read_u32(PHASE7_LEVEL_UPDATE_PRIMARY_CELL)
+        not in PHASE7_LEVEL_UPDATE_PRIMARY_OBJECTS
+    ):
+        return {}
+
+    vtable_entries = dict(PHASE7_LEVEL_LOAD_MANAGER_VTABLES)[
+        PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE
+    ]
+    for object_address in PHASE7_LEVEL_UPDATE_PRIMARY_OBJECTS:
+        if memory.read_u32(object_address) != PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE:
+            return {}
+    for index, entry in enumerate(vtable_entries):
+        if memory.read_u32(PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE + index * 4) != entry:
+            return {}
+
+    if memory.read(
+        PHASE7_LEVEL_UPDATE_SELECTOR_ADDRESS,
+        len(bytes.fromhex(PHASE7_LEVEL_UPDATE_SELECTOR_BYTES)),
+    ) != bytes.fromhex(PHASE7_LEVEL_UPDATE_SELECTOR_BYTES):
+        return {}
+    if tuple(
+        memory.read_u32(PHASE7_LEVEL_UPDATE_JUMP_TABLE_ADDRESS + index * 4)
+        for index in range(len(PHASE7_LEVEL_UPDATE_JUMP_TABLE))
+    ) != PHASE7_LEVEL_UPDATE_JUMP_TABLE:
+        return {}
+
+    for address, encoded in PHASE7_LEVEL_UPDATE_SWITCH_INSTRUCTION_BYTES.items():
+        instruction = instructions.get(address)
+        if instruction is None or instruction.bytes_hex.upper() != encoded:
+            return {}
+    for address, (_case_entry, helper) in PHASE7_LEVEL_UPDATE_HELPER_CALLS.items():
+        instruction = instructions[address]
+        if instruction.mnemonic.casefold() != "call" or instruction.target != helper:
+            return {}
+
+    expected_helper_references = {
+        helper: {address}
+        for address, (_case_entry, helper) in PHASE7_LEVEL_UPDATE_HELPER_CALLS.items()
+    }
+    observed_helper_references = {
+        helper: {
+            address
+            for address, instruction in instructions.items()
+            if instruction.target == helper
+        }
+        for helper in expected_helper_references
+    }
+    if observed_helper_references != expected_helper_references:
+        return {}
+
+    helper_sites: dict[int, set[int]] = {}
+    for site, (helper, caller_start) in PHASE7_LEVEL_UPDATE_PRIMARY_BINDINGS.items():
+        instruction = instructions.get(site)
+        caller_payload = bytes.fromhex(
+            PHASE7_LEVEL_UPDATE_PRIMARY_CALLER_BYTES[caller_start]
+        )
+        memory_operands = (
+            []
+            if instruction is None
+            else [operand for operand in instruction.operands if operand.kind == "mem"]
+        )
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "call"
+            or instruction.bytes_hex.upper() not in {"FF5018", "FF5218"}
+            or len(memory_operands) != 1
+            or memory_operands[0].displacement != 0x18
+            or site + instruction.size != caller_start + len(caller_payload)
+            or memory.read(caller_start, len(caller_payload)) != caller_payload
+        ):
+            return {}
+        helper_sites.setdefault(helper, set()).add(site)
+    if helper_sites != {
+        helper: {site}
+        for site, (helper, _caller_start) in PHASE7_LEVEL_UPDATE_PRIMARY_BINDINGS.items()
+    }:
+        return {}
+    if {
+        helper for _case_entry, helper in PHASE7_LEVEL_UPDATE_HELPER_CALLS.values()
+    } != set(helper_sites):
+        return {}
+    if not all(
+        PHASE7_LEVEL_UPDATE_PRIMARY_BINDINGS[site][0] == helper
+        for _switch_call, (_case_entry, helper) in PHASE7_LEVEL_UPDATE_HELPER_CALLS.items()
+        for site in helper_sites[helper]
+    ):
+        return {}
+    if not {
+        boundary for boundary in PHASE7_LEVEL_UPDATE_OBSERVED_BOUNDARIES
+    } <= {(site, target) for site in sites}:
+        return {}
+    return {site: (target,) for site in sites}
+
+
+===== tools/recomp/ia32_native_backend.py:19330-19412 | _phase7_level_sample_primary_targets =====
+
+def _phase7_level_sample_primary_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the three primary position queries in the fixed sample loop."""
+
+    sites = set(PHASE7_LEVEL_SAMPLE_PRIMARY_BINDINGS)
+    target = dict(PHASE7_LEVEL_LOAD_MANAGER_VTABLES)[
+        PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE
+    ][0x18 // 4]
+    if not sites <= indirect_sites or target not in allowed_targets:
+        return {}
+
+    vtable_entries = dict(PHASE7_LEVEL_LOAD_MANAGER_VTABLES)[
+        PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE
+    ]
+    for index, object_address in enumerate(PHASE7_LEVEL_UPDATE_PRIMARY_OBJECTS):
+        bound_object = memory.read_u32(
+            PHASE7_LEVEL_UPDATE_PRIMARY_CELL + index * 4
+        )
+        if (
+            (index == 0 and bound_object != object_address)
+            or (index != 0 and bound_object not in {0, object_address})
+            or memory.read_u32(object_address)
+            != PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE
+        ):
+            return {}
+    for index, entry in enumerate(vtable_entries):
+        if memory.read_u32(PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE + index * 4) != entry:
+            return {}
+
+    for address, encoded in PHASE7_LEVEL_SAMPLE_PROOF_BYTES.items():
+        payload = bytes.fromhex(encoded)
+        if memory.read(address, len(payload)) != payload:
+            return {}
+
+    for site, base in PHASE7_LEVEL_SAMPLE_PRIMARY_BINDINGS.items():
+        instruction = instructions.get(site)
+        memory_operands = (
+            []
+            if instruction is None
+            else [operand for operand in instruction.operands if operand.kind == "mem"]
+        )
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "call"
+            or instruction.bytes_hex.upper()
+            != ("FF5018" if base == "eax" else "FF5218")
+            or len(memory_operands) != 1
+            or memory_operands[0].base != base
+            or memory_operands[0].displacement != 0x18
+        ):
+            return {}
+
+    observed_direct_calls = {
+        address: instruction.target
+        for address, instruction in instructions.items()
+        if instruction.target == 0x0009D160
+    }
+    if observed_direct_calls != PHASE7_LEVEL_SAMPLE_DIRECT_CALLS:
+        return {}
+    for address, target_address in PHASE7_LEVEL_SAMPLE_DIRECT_CALLS.items():
+        instruction = instructions.get(address)
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "call"
+            or instruction.target != target_address
+        ):
+            return {}
+
+    boundary_site, boundary_object, boundary_vtable, boundary_target = (
+        PHASE7_LEVEL_SAMPLE_OBSERVED_BOUNDARY
+    )
+    if (
+        boundary_site not in sites
+        or boundary_object not in PHASE7_LEVEL_UPDATE_PRIMARY_OBJECTS
+        or boundary_vtable != PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE
+        or boundary_target != target
+    ):
+        return {}
+    return {site: (target,) for site in sites}
+
+
+===== tools/recomp/ia32_native_backend.py:19415-19610 | _phase7_level_query_targets =====
+
+def _phase7_level_query_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the fixed primary query and its predictable record sibling."""
+
+    sites = set(PHASE7_LEVEL_QUERY_BINDINGS)
+    targets = {
+        target for _vtable, _slot, target in PHASE7_LEVEL_QUERY_BINDINGS.values()
+    }
+    if not sites <= indirect_sites or not targets <= allowed_targets:
+        return {}
+
+    for address, encoded in PHASE7_LEVEL_QUERY_PROOF_BYTES.items():
+        expected = bytes.fromhex(encoded)
+        if memory.read(address, len(expected)) != expected:
+            return {}
+
+    expected_callers = {
+        target: {
+            call_site
+            for call_site, candidate in PHASE7_LEVEL_QUERY_DIRECT_CALLS.items()
+            if candidate == target
+        }
+        for target in set(PHASE7_LEVEL_QUERY_DIRECT_CALLS.values())
+    }
+    observed_callers = {
+        target: {
+            address
+            for address, instruction in instructions.items()
+            if instruction.mnemonic.casefold() == "call"
+            and instruction.target == target
+        }
+        for target in expected_callers
+    }
+    if observed_callers != expected_callers:
+        return {}
+    for call_site, target in PHASE7_LEVEL_QUERY_DIRECT_CALLS.items():
+        instruction = instructions.get(call_site)
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "call"
+            or instruction.target != target
+        ):
+            return {}
+
+    if memory.read_u32(PHASE7_LEVEL_QUERY_OWNER) != PHASE7_LEVEL_UPDATE_PRIMARY_CELL:
+        return {}
+    for index, object_address in enumerate(PHASE7_LEVEL_UPDATE_PRIMARY_OBJECTS):
+        cell_value = memory.read_u32(PHASE7_LEVEL_UPDATE_PRIMARY_CELL + index * 4)
+        if cell_value not in {0, object_address}:
+            return {}
+        if memory.read_u32(object_address) != PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE:
+            return {}
+    primary_vtable = dict(PHASE7_LEVEL_LOAD_MANAGER_VTABLES)[
+        PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE
+    ]
+    for index, target in enumerate(primary_vtable):
+        if memory.read_u32(PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE + index * 4) != target:
+            return {}
+
+    record_count = memory.read_u32(PHASE7_LEVEL_QUERY_RECORD_COUNT_CELL)
+    if (
+        memory.read_u32(PHASE7_LEVEL_QUERY_RECORD_BASE_CELL)
+        != PHASE7_LEVEL_QUERY_RECORD_BASE
+        or not 0 < record_count <= PHASE7_LEVEL_QUERY_RECORD_CAPACITY
+    ):
+        return {}
+    for index, target in enumerate(PHASE7_LEVEL_QUERY_RECORD_VTABLE_ENTRIES):
+        if memory.read_u32(PHASE7_LEVEL_QUERY_RECORD_VTABLE + index * 4) != target:
+            return {}
+    for index in range(PHASE7_LEVEL_QUERY_RECORD_CAPACITY):
+        record = (
+            PHASE7_LEVEL_QUERY_RECORD_BASE
+            + index * PHASE7_LEVEL_QUERY_RECORD_STRIDE
+        )
+        if memory.read_u32(record) != PHASE7_LEVEL_QUERY_RECORD_VTABLE:
+            return {}
+    if memory.read_u32(PHASE7_LEVEL_QUERY_POOL_BASE_CELL) != PHASE7_LEVEL_QUERY_POOL_BASE:
+        return {}
+    for index, target in enumerate(PHASE7_LEVEL_QUERY_POOL_VTABLE_ENTRIES):
+        if memory.read_u32(PHASE7_LEVEL_QUERY_POOL_VTABLE + index * 4) != target:
+            return {}
+    for index in range(PHASE7_LEVEL_QUERY_POOL_CAPACITY):
+        record = PHASE7_LEVEL_QUERY_POOL_BASE + index * PHASE7_LEVEL_QUERY_POOL_STRIDE
+        if memory.read_u32(record) != PHASE7_LEVEL_QUERY_POOL_VTABLE:
+            return {}
+
+    observed_base_references = {
+        address
+        for address, instruction in instructions.items()
+        if any(
+            (operand.kind == "imm" and operand.immediate == PHASE7_LEVEL_QUERY_RECORD_BASE)
+            or (
+                operand.kind == "mem"
+                and operand.absolute == PHASE7_LEVEL_QUERY_RECORD_BASE
+            )
+            for operand in instruction.operands
+        )
+    }
+    observed_vtable_references = {
+        address
+        for address, instruction in instructions.items()
+        if any(
+            (operand.kind == "imm" and operand.immediate == PHASE7_LEVEL_QUERY_RECORD_VTABLE)
+            or (
+                operand.kind == "mem"
+                and operand.absolute == PHASE7_LEVEL_QUERY_RECORD_VTABLE
+            )
+            for operand in instruction.operands
+        )
+    }
+    observed_pool_base_references = {
+        address
+        for address, instruction in instructions.items()
+        if any(
+            (operand.kind == "imm" and operand.immediate == PHASE7_LEVEL_QUERY_POOL_BASE)
+            or (
+                operand.kind == "mem"
+                and operand.absolute == PHASE7_LEVEL_QUERY_POOL_BASE
+            )
+            for operand in instruction.operands
+        )
+    }
+    observed_pool_vtable_references = {
+        address
+        for address, instruction in instructions.items()
+        if any(
+            (operand.kind == "imm" and operand.immediate == PHASE7_LEVEL_QUERY_POOL_VTABLE)
+            or (
+                operand.kind == "mem"
+                and operand.absolute == PHASE7_LEVEL_QUERY_POOL_VTABLE
+            )
+            for operand in instruction.operands
+        )
+    }
+    if (
+        observed_base_references != PHASE7_LEVEL_QUERY_RECORD_BASE_REFERENCES
+        or observed_vtable_references != PHASE7_LEVEL_QUERY_RECORD_VTABLE_REFERENCES
+        or observed_pool_base_references != PHASE7_LEVEL_QUERY_POOL_BASE_REFERENCES
+        or observed_pool_vtable_references
+        != PHASE7_LEVEL_QUERY_POOL_VTABLE_REFERENCES
+    ):
+        return {}
+
+    recovered: dict[int, tuple[int, ...]] = {}
+    expected_site_bytes = {
+        0x000798B5: "FF5218",
+        0x0007994D: "FF5204",
+        0x0009F562: "FF5004",
+        0x0009F650: "FF5004",
+        0x0009F6AC: "FF5004",
+    }
+    for site, (vtable, slot, target) in PHASE7_LEVEL_QUERY_BINDINGS.items():
+        instruction = instructions.get(site)
+        memory_operands = (
+            []
+            if instruction is None
+            else [operand for operand in instruction.operands if operand.kind == "mem"]
+        )
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "call"
+            or instruction.bytes_hex.upper() != expected_site_bytes[site]
+            or len(memory_operands) != 1
+            or memory_operands[0].base != PHASE7_LEVEL_QUERY_SITE_BASES[site]
+            or memory_operands[0].displacement != slot
+        ):
+            return {}
+        table = (
+            primary_vtable
+            if vtable == PHASE7_LEVEL_UPDATE_PRIMARY_VTABLE
+            else PHASE7_LEVEL_QUERY_RECORD_VTABLE_ENTRIES
+            if vtable == PHASE7_LEVEL_QUERY_RECORD_VTABLE
+            else PHASE7_LEVEL_QUERY_POOL_VTABLE_ENTRIES
+        )
+        if table[slot // 4] != target:
+            return {}
+        recovered[site] = (target,)
+
+    observed_site, _object, observed_vtable, observed_target = (
+        PHASE7_LEVEL_QUERY_OBSERVED_BOUNDARY
+    )
+    predicted_site, _record, predicted_vtable, predicted_target = (
+        PHASE7_LEVEL_QUERY_PREDICTED_BOUNDARY
+    )
+    if (
+        PHASE7_LEVEL_QUERY_BINDINGS[observed_site]
+        != (observed_vtable, 0x18, observed_target)
+        or PHASE7_LEVEL_QUERY_BINDINGS[predicted_site]
+        != (predicted_vtable, 0x04, predicted_target)
+    ):
+        return {}
+    return recovered
+
+
+===== tools/recomp/ia32_native_backend.py:19613-19697 | _phase7_runtime_callback_vector_targets =====
+
+def _phase7_runtime_callback_vector_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the complete late level-load runtime callback vector."""
+
+    sites = set(PHASE7_RUNTIME_CALLBACK_BINDINGS)
+    vector = dict(PHASE7_RUNTIME_CALLBACK_VECTOR)
+    callback_targets = set(vector.values())
+    if not sites <= indirect_sites or not callback_targets <= allowed_targets:
+        return {}
+    if (
+        set(PHASE7_RUNTIME_CALLBACK_SITE_BYTES) != sites
+        or set(PHASE7_RUNTIME_CALLBACK_REFERENCES) != set(vector)
+    ):
+        return {}
+
+    for cell, target in PHASE7_RUNTIME_CALLBACK_VECTOR:
+        if memory.read_u32(cell) != target:
+            return {}
+
+    caller_starts = {
+        caller_start
+        for caller_start, _cell, _target in PHASE7_RUNTIME_CALLBACK_BINDINGS.values()
+    }
+    if caller_starts != set(PHASE7_RUNTIME_CALLBACK_CALLER_BYTES):
+        return {}
+    for caller_start, encoded in PHASE7_RUNTIME_CALLBACK_CALLER_BYTES.items():
+        expected = bytes.fromhex(encoded)
+        if memory.read(caller_start, len(expected)) != expected:
+            return {}
+    for installer_start, encoded in PHASE7_RUNTIME_CALLBACK_INSTALLER_BYTES.items():
+        expected = bytes.fromhex(encoded)
+        if memory.read(installer_start, len(expected)) != expected:
+            return {}
+    for address, encoded in PHASE7_RUNTIME_CALLBACK_REFERENCE_BYTES.items():
+        instruction = instructions.get(address)
+        if instruction is None or instruction.bytes_hex.upper() != encoded:
+            return {}
+
+    observed_references = {
+        cell: {
+            address
+            for address, instruction in instructions.items()
+            if any(
+                operand.kind == "mem" and operand.absolute == cell
+                for operand in instruction.operands
+            )
+        }
+        for cell in vector
+    }
+    if observed_references != PHASE7_RUNTIME_CALLBACK_REFERENCES:
+        return {}
+    if any(
+        instruction.mnemonic.casefold() in {"call", "jmp"}
+        and instruction.target in callback_targets
+        for instruction in instructions.values()
+    ):
+        return {}
+
+    recovered: dict[int, tuple[int, ...]] = {}
+    for site, (caller_start, cell, target) in PHASE7_RUNTIME_CALLBACK_BINDINGS.items():
+        instruction = instructions.get(site)
+        caller_end = caller_start + len(
+            bytes.fromhex(PHASE7_RUNTIME_CALLBACK_CALLER_BYTES[caller_start])
+        )
+        memory_operands = (
+            []
+            if instruction is None
+            else [operand for operand in instruction.operands if operand.kind == "mem"]
+        )
+        if (
+            instruction is None
+            or instruction.bytes_hex.upper() != PHASE7_RUNTIME_CALLBACK_SITE_BYTES[site]
+            or instruction.mnemonic.casefold() != "call"
+            or len(memory_operands) != 1
+            or memory_operands[0].absolute != cell
+            or vector.get(cell) != target
+            or not caller_start <= site < caller_end
+        ):
+            return {}
+        recovered[site] = (target,)
+    return recovered
+
+
+===== tools/recomp/ia32_native_backend.py:19700-19741 | _phase7_title_input_object_targets =====
+
+def _phase7_title_input_object_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the complete finite title-input object vtable family."""
+
+    sites = set(PHASE7_TITLE_INPUT_OBJECT_BINDINGS)
+    vtable_targets = set(PHASE7_TITLE_INPUT_OBJECT_VTABLE_ENTRIES)
+    if not sites <= indirect_sites or not vtable_targets <= allowed_targets:
+        return {}
+    if (
+        memory.read_u32(PHASE7_TITLE_INPUT_OBJECT_POINTER_CELL) != PHASE7_TITLE_INPUT_OBJECT
+        or memory.read_u32(PHASE7_TITLE_INPUT_OBJECT) != PHASE7_TITLE_INPUT_OBJECT_VTABLE
+    ):
+        return {}
+    for index, entry in enumerate(PHASE7_TITLE_INPUT_OBJECT_VTABLE_ENTRIES):
+        if memory.read_u32(PHASE7_TITLE_INPUT_OBJECT_VTABLE + index * 4) != entry:
+            return {}
+    for address, expected in PHASE7_TITLE_INPUT_OBJECT_INSTRUCTION_BYTES.items():
+        instruction = instructions.get(address)
+        if instruction is None or instruction.bytes_hex.upper() != expected:
+            return {}
+    pointer_cell_references = {
+        address
+        for address, instruction in instructions.items()
+        if any(
+            operand.kind == "mem" and operand.absolute == PHASE7_TITLE_INPUT_OBJECT_POINTER_CELL
+            for operand in instruction.operands
+        )
+    }
+    if pointer_cell_references != {0x0002A636}:
+        return {}
+    direct_callers = {
+        address
+        for address, instruction in instructions.items()
+        if instruction.mnemonic.casefold() == "call" and instruction.target in vtable_targets
+    }
+    if direct_callers:
+        return {}
+    return {site: (target,) for site, (_slot, target) in PHASE7_TITLE_INPUT_OBJECT_BINDINGS.items()}
+
+
+===== tools/recomp/ia32_native_backend.py:19744-19779 | _phase7_post_start_object_targets =====
+
+def _phase7_post_start_object_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the bounded post-Start global-object slot-C family."""
+
+    sites = set(PHASE7_POST_START_OBJECT_BINDINGS)
+    vtable_targets = set(PHASE7_POST_START_OBJECT_VTABLE_ENTRIES)
+    if not sites <= indirect_sites or not vtable_targets <= allowed_targets:
+        return {}
+    if (
+        memory.read_u32(PHASE7_POST_START_OBJECT_POINTER_CELL)
+        != PHASE7_POST_START_OBJECT_INITIAL_POINTER
+        or memory.read_u32(PHASE7_POST_START_OBJECT) != PHASE7_POST_START_OBJECT_VTABLE
+    ):
+        return {}
+    for index, entry in enumerate(PHASE7_POST_START_OBJECT_VTABLE_ENTRIES):
+        if memory.read_u32(PHASE7_POST_START_OBJECT_VTABLE + index * 4) != entry:
+            return {}
+    for address, expected in PHASE7_POST_START_OBJECT_INSTRUCTION_BYTES.items():
+        instruction = instructions.get(address)
+        if instruction is None or instruction.bytes_hex.upper() != expected:
+            return {}
+    for slot, target in PHASE7_POST_START_OBJECT_BINDINGS.values():
+        if memory.read_u32(PHASE7_POST_START_OBJECT_VTABLE + slot) != target:
+            return {}
+    direct_callers = {
+        address
+        for address, instruction in instructions.items()
+        if instruction.mnemonic.casefold() == "call" and instruction.target in vtable_targets
+    }
+    if direct_callers:
+        return {}
+    return {site: (target,) for site, (_slot, target) in PHASE7_POST_START_OBJECT_BINDINGS.items()}
+
+
+===== tools/recomp/ia32_native_backend.py:19782-19816 | _phase7_save_slot_object_targets =====
+
+def _phase7_save_slot_object_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the bounded save-slot global-object slot-C family."""
+
+    sites = set(PHASE7_SAVE_SLOT_OBJECT_BINDINGS)
+    vtable_targets = set(PHASE7_SAVE_SLOT_OBJECT_VTABLE_ENTRIES)
+    owner_vtable_targets = set(PHASE7_SAVE_SLOT_OWNER_VTABLE_ENTRIES)
+    if not sites <= indirect_sites or not vtable_targets <= allowed_targets:
+        return {}
+    if not owner_vtable_targets <= allowed_targets:
+        return {}
+    if (
+        memory.read_u32(PHASE7_SAVE_SLOT_OBJECT_POINTER_CELL)
+        != PHASE7_SAVE_SLOT_OBJECT_INITIAL_POINTER
+        or memory.read_u32(PHASE7_SAVE_SLOT_OBJECT) != PHASE7_SAVE_SLOT_OBJECT_VTABLE
+    ):
+        return {}
+    for index, entry in enumerate(PHASE7_SAVE_SLOT_OBJECT_VTABLE_ENTRIES):
+        if memory.read_u32(PHASE7_SAVE_SLOT_OBJECT_VTABLE + index * 4) != entry:
+            return {}
+    for index, entry in enumerate(PHASE7_SAVE_SLOT_OWNER_VTABLE_ENTRIES):
+        if memory.read_u32(PHASE7_SAVE_SLOT_OWNER_VTABLE + index * 4) != entry:
+            return {}
+    for address, expected in PHASE7_SAVE_SLOT_OBJECT_INSTRUCTION_BYTES.items():
+        instruction = instructions.get(address)
+        if instruction is None or instruction.bytes_hex.upper() != expected:
+            return {}
+    for slot, target in PHASE7_SAVE_SLOT_OBJECT_BINDINGS.values():
+        if memory.read_u32(PHASE7_SAVE_SLOT_OBJECT_VTABLE + slot) != target:
+            return {}
+    return {site: (target,) for site, (_slot, target) in PHASE7_SAVE_SLOT_OBJECT_BINDINGS.items()}
+
+
+===== tools/recomp/ia32_native_backend.py:19819-19861 | _phase7_resource_selection_object_targets =====
+
+def _phase7_resource_selection_object_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate all exact slot-C callers of the resource-selection object."""
+
+    sites = set(PHASE7_RESOURCE_SELECTION_OBJECT_BINDINGS)
+    vtable_targets = set(PHASE7_RESOURCE_SELECTION_OBJECT_VTABLE_ENTRIES)
+    if not sites <= indirect_sites or not vtable_targets <= allowed_targets:
+        return {}
+    if (
+        memory.read_u32(PHASE7_RESOURCE_SELECTION_OBJECT_POINTER_CELL)
+        != PHASE7_RESOURCE_SELECTION_OBJECT_INITIAL_POINTER
+        or memory.read_u32(PHASE7_RESOURCE_SELECTION_OBJECT)
+        != PHASE7_RESOURCE_SELECTION_OBJECT_VTABLE
+    ):
+        return {}
+    for index, entry in enumerate(PHASE7_RESOURCE_SELECTION_OBJECT_VTABLE_ENTRIES):
+        if memory.read_u32(PHASE7_RESOURCE_SELECTION_OBJECT_VTABLE + index * 4) != entry:
+            return {}
+    caller_starts = {
+        caller_start
+        for caller_start, _slot, _target in PHASE7_RESOURCE_SELECTION_OBJECT_BINDINGS.values()
+    }
+    if caller_starts != set(PHASE7_RESOURCE_SELECTION_OBJECT_CALLER_BYTES):
+        return {}
+    for site, (caller_start, slot, target) in PHASE7_RESOURCE_SELECTION_OBJECT_BINDINGS.items():
+        expected = bytes.fromhex(PHASE7_RESOURCE_SELECTION_OBJECT_CALLER_BYTES[caller_start])
+        instruction = instructions.get(site)
+        if (
+            site != caller_start + len(expected) - 3
+            or memory.read(caller_start, len(expected)) != expected
+            or instruction is None
+            or instruction.bytes_hex.upper() != expected[-3:].hex().upper()
+            or memory.read_u32(PHASE7_RESOURCE_SELECTION_OBJECT_VTABLE + slot) != target
+        ):
+            return {}
+    return {
+        site: (target,)
+        for site, (_caller_start, _slot, target) in PHASE7_RESOURCE_SELECTION_OBJECT_BINDINGS.items()
+    }
+
+
+===== tools/recomp/ia32_native_backend.py:19864-19903 | _phase7_level_select_object_targets =====
+
+def _phase7_level_select_object_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the complete finite level-select global-object family."""
+
+    sites = set(PHASE7_LEVEL_SELECT_OBJECT_BINDINGS)
+    vtable_targets = set(PHASE7_LEVEL_SELECT_OBJECT_VTABLE_ENTRIES)
+    if not sites <= indirect_sites or not vtable_targets <= allowed_targets:
+        return {}
+    if (
+        memory.read_u32(PHASE7_LEVEL_SELECT_OBJECT_POINTER_CELL)
+        != PHASE7_LEVEL_SELECT_OBJECT
+        or memory.read_u32(PHASE7_LEVEL_SELECT_OBJECT)
+        != PHASE7_LEVEL_SELECT_OBJECT_VTABLE
+    ):
+        return {}
+    for index, entry in enumerate(PHASE7_LEVEL_SELECT_OBJECT_VTABLE_ENTRIES):
+        if memory.read_u32(PHASE7_LEVEL_SELECT_OBJECT_VTABLE + index * 4) != entry:
+            return {}
+    for caller_start, encoded in PHASE7_LEVEL_SELECT_OBJECT_CALLER_BYTES.items():
+        expected = bytes.fromhex(encoded)
+        if memory.read(caller_start, len(expected)) != expected:
+            return {}
+    for site, (caller_start, slot, target) in PHASE7_LEVEL_SELECT_OBJECT_BINDINGS.items():
+        expected = bytes.fromhex(PHASE7_LEVEL_SELECT_OBJECT_CALLER_BYTES[caller_start])
+        instruction = instructions.get(site)
+        if (
+            site != caller_start + len(expected) - 3
+            or instruction is None
+            or instruction.bytes_hex.upper() != expected[-3:].hex().upper()
+            or memory.read_u32(PHASE7_LEVEL_SELECT_OBJECT_VTABLE + slot) != target
+        ):
+            return {}
+    return {
+        site: (target,)
+        for site, (_caller_start, _slot, target) in PHASE7_LEVEL_SELECT_OBJECT_BINDINGS.items()
+    }
+
+
+===== tools/recomp/ia32_native_backend.py:19906-19955 | _phase7_new_save_object_targets =====
+
+def _phase7_new_save_object_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the complete finite new-save global-object call batch."""
+
+    sites = set(PHASE7_NEW_SAVE_OBJECT_BINDINGS)
+    vtables = (
+        (
+            PHASE7_POST_START_OBJECT_POINTER_CELL,
+            PHASE7_POST_START_OBJECT_INITIAL_POINTER,
+            PHASE7_POST_START_OBJECT,
+            PHASE7_POST_START_OBJECT_VTABLE,
+            PHASE7_POST_START_OBJECT_VTABLE_ENTRIES,
+        ),
+        (
+            PHASE7_NEW_SAVE_COMPANION_OBJECT_POINTER_CELL,
+            PHASE7_NEW_SAVE_COMPANION_OBJECT_INITIAL_POINTER,
+            PHASE7_NEW_SAVE_COMPANION_OBJECT,
+            PHASE7_NEW_SAVE_COMPANION_OBJECT_VTABLE,
+            PHASE7_NEW_SAVE_COMPANION_OBJECT_VTABLE_ENTRIES,
+        ),
+    )
+    vtable_targets = {
+        target for _cell, _initial, _object, _vtable, entries in vtables for target in entries
+    }
+    if not sites <= indirect_sites or not vtable_targets <= allowed_targets:
+        return {}
+    for pointer_cell, initial_pointer, object_address, vtable, entries in vtables:
+        if (
+            memory.read_u32(pointer_cell) != initial_pointer
+            or memory.read_u32(object_address) != vtable
+        ):
+            return {}
+        for index, entry in enumerate(entries):
+            if memory.read_u32(vtable + index * 4) != entry:
+                return {}
+    for address, expected in PHASE7_NEW_SAVE_OBJECT_INSTRUCTION_BYTES.items():
+        instruction = instructions.get(address)
+        if instruction is None or instruction.bytes_hex.upper() != expected:
+            return {}
+    for vtable, slot, target in PHASE7_NEW_SAVE_OBJECT_BINDINGS.values():
+        if memory.read_u32(vtable + slot) != target:
+            return {}
+    return {
+        site: (target,)
+        for site, (_vtable, _slot, target) in PHASE7_NEW_SAVE_OBJECT_BINDINGS.items()
+    }
+
+
+===== tools/recomp/ia32_native_backend.py:19958-19979 | _phase7_directsound_refcount_targets =====
+
+def _phase7_directsound_refcount_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate both finite DirectSound reference-count vtable calls as one unit."""
+
+    sites = set(PHASE7_DIRECTSOUND_REFCOUNT_BINDINGS)
+    targets = {target for _slot, target in PHASE7_DIRECTSOUND_REFCOUNT_BINDINGS.values()}
+    if not sites <= indirect_sites or not targets <= allowed_targets:
+        return {}
+    for address, expected in PHASE7_DIRECTSOUND_REFCOUNT_INSTRUCTION_BYTES.items():
+        instruction = instructions.get(address)
+        if instruction is None or instruction.bytes_hex.upper() != expected:
+            return {}
+    for slot, target in PHASE7_DIRECTSOUND_REFCOUNT_BINDINGS.values():
+        if memory.read_u32(PHASE7_DIRECTSOUND_REFCOUNT_VTABLE + slot) != target:
+            return {}
+    return {
+        site: (target,) for site, (_slot, target) in PHASE7_DIRECTSOUND_REFCOUNT_BINDINGS.items()
+    }
+
+
+===== tools/recomp/ia32_native_backend.py:19982-20036 | _phase7_directsound_voice_targets =====
+
+def _phase7_directsound_voice_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Validate the complete finite DirectSound hardware-voice object family."""
+
+    sites = set(PHASE7_DIRECTSOUND_VOICE_BINDINGS)
+    targets = {target for _slot, target in PHASE7_DIRECTSOUND_VOICE_BINDINGS.values()}
+    vtable_targets = set(PHASE7_DIRECTSOUND_VOICE_VTABLE_ENTRIES)
+    if (
+        not sites <= indirect_sites
+        or not targets <= allowed_targets
+        or not vtable_targets <= allowed_targets
+    ):
+        return {}
+    for address, expected_bytes in PHASE7_DIRECTSOUND_VOICE_INSTRUCTION_BYTES.items():
+        instruction = instructions.get(address)
+        if instruction is None or instruction.bytes_hex.upper() != expected_bytes:
+            return {}
+    for index, entry in enumerate(PHASE7_DIRECTSOUND_VOICE_VTABLE_ENTRIES):
+        if memory.read_u32(PHASE7_DIRECTSOUND_VOICE_VTABLE + index * 4) != entry:
+            return {}
+    for slot, target in PHASE7_DIRECTSOUND_VOICE_BINDINGS.values():
+        if memory.read_u32(PHASE7_DIRECTSOUND_VOICE_VTABLE + slot) != target:
+            return {}
+
+    installers = {
+        address
+        for address, instruction in instructions.items()
+        if instruction.mnemonic.casefold() == "mov"
+        and any(
+            operand.kind == "imm" and operand.immediate == PHASE7_DIRECTSOUND_VOICE_VTABLE
+            for operand in instruction.operands
+        )
+    }
+    if installers != {0x00234F4A, 0x00235510}:
+        return {}
+    expected_callers = {
+        0x00234F36: {0x0022F2A4},
+        0x002353D5: {0x0022F2BE},
+        0x00232D56: {0x002318C2, 0x002353DA},
+        0x002349BD: {0x00234BE6, 0x002351BE},
+        0x0023550C: {0x002355CC},
+    }
+    for callee, expected_callee_callers in expected_callers.items():
+        callers = {
+            address
+            for address, instruction in instructions.items()
+            if instruction.mnemonic.casefold() == "call" and instruction.target == callee
+        }
+        if callers != expected_callee_callers:
+            return {}
+    return {site: (target,) for site, (_slot, target) in PHASE7_DIRECTSOUND_VOICE_BINDINGS.items()}
+
+
+===== tools/recomp/ia32_native_backend.py:20039-20111 | _phase7_d150_callback_targets =====
+
+def _phase7_d150_callback_targets(
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Bind both 0x10D150 callback sites from all decoded direct callers."""
+
+    callback_sites = set(PHASE7_D150_CALLBACK_TARGETS)
+    callback_targets = {
+        target for targets in PHASE7_D150_CALLBACK_TARGETS.values() for target in targets
+    }
+    if not callback_sites <= indirect_sites or not callback_targets <= allowed_targets:
+        return {}
+    direct_callers = {
+        address
+        for address, instruction in instructions.items()
+        if instruction.mnemonic.casefold() == "call" and instruction.target == 0x0010D150
+    }
+    if direct_callers != {0x0010D1BE, *PHASE7_D150_CALLBACK_CALLERS}:
+        return {}
+
+    entry_load = instructions.get(0x0010D16A)
+    if (
+        entry_load is None
+        or entry_load.mnemonic.casefold() != "mov"
+        or len(entry_load.operands) != 2
+        or entry_load.operands[0].kind != "reg"
+        or entry_load.operands[0].reg != "ebp"
+    ):
+        return {}
+    entry_operand = entry_load.operands[1]
+    if (
+        entry_operand.kind != "mem"
+        or entry_operand.base != "esp"
+        or entry_operand.index is not None
+        or entry_operand.scale != 1
+        or entry_operand.displacement != 0x18
+        or entry_operand.absolute is not None
+        or entry_operand.segment is not None
+    ):
+        return {}
+    for site in callback_sites:
+        instruction = instructions.get(site)
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "call"
+            or len(instruction.operands) != 1
+            or instruction.operands[0].kind != "reg"
+            or instruction.operands[0].reg != "ebp"
+        ):
+            return {}
+    for call_site, (install_site, target) in PHASE7_D150_CALLBACK_CALLERS.items():
+        install = instructions.get(install_site)
+        call = instructions.get(call_site)
+        if (
+            install is None
+            or install.mnemonic.casefold() != "push"
+            or len(install.operands) != 1
+            or install.operands[0].kind != "imm"
+            or install.operands[0].immediate != target
+            or call is None
+            or call.mnemonic.casefold() != "call"
+            or call.target != 0x0010D150
+        ):
+            return {}
+    recursive_call = instructions.get(0x0010D1BE)
+    if (
+        recursive_call is None
+        or recursive_call.mnemonic.casefold() != "call"
+        or recursive_call.target != 0x0010D150
+    ):
+        return {}
+    return dict(PHASE7_D150_CALLBACK_TARGETS)
+
+
+===== tools/recomp/ia32_native_backend.py:20114-20172 | _phase7_bb0_callback_targets =====
+
+def _phase7_bb0_callback_targets(
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Bind the sole 0x112BB0 callback from its only decoded direct caller."""
+
+    if (
+        PHASE7_BB0_CALLBACK_SITE not in indirect_sites
+        or PHASE7_BB0_CALLBACK_TARGET not in allowed_targets
+    ):
+        return {}
+    direct_callers = {
+        address
+        for address, instruction in instructions.items()
+        if instruction.mnemonic.casefold() == "call" and instruction.target == 0x00112BB0
+    }
+    if direct_callers != {PHASE7_BB0_CALLBACK_CALLER}:
+        return {}
+    entry_load = instructions.get(0x00112BC0)
+    if (
+        entry_load is None
+        or entry_load.mnemonic.casefold() != "mov"
+        or len(entry_load.operands) != 2
+        or entry_load.operands[0].kind != "reg"
+        or entry_load.operands[0].reg != "edi"
+    ):
+        return {}
+    entry_operand = entry_load.operands[1]
+    if (
+        entry_operand.kind != "mem"
+        or entry_operand.base != "esp"
+        or entry_operand.index is not None
+        or entry_operand.scale != 1
+        or entry_operand.displacement != 0x18
+        or entry_operand.absolute is not None
+        or entry_operand.segment is not None
+    ):
+        return {}
+    indirect = instructions.get(PHASE7_BB0_CALLBACK_SITE)
+    install = instructions.get(PHASE7_BB0_CALLBACK_INSTALL)
+    caller = instructions.get(PHASE7_BB0_CALLBACK_CALLER)
+    if (
+        indirect is None
+        or indirect.mnemonic.casefold() != "call"
+        or len(indirect.operands) != 1
+        or indirect.operands[0].kind != "reg"
+        or indirect.operands[0].reg != "edi"
+        or install is None
+        or install.mnemonic.casefold() != "push"
+        or len(install.operands) != 1
+        or install.operands[0].kind != "imm"
+        or install.operands[0].immediate != PHASE7_BB0_CALLBACK_TARGET
+        or caller is None
+        or caller.mnemonic.casefold() != "call"
+        or caller.target != 0x00112BB0
+    ):
+        return {}
+    return {PHASE7_BB0_CALLBACK_SITE: (PHASE7_BB0_CALLBACK_TARGET,)}
+
+
+===== tools/recomp/ia32_native_backend.py:20175-20317 | _phase7_asset_stream_callback_targets =====
+
+def _phase7_asset_stream_callback_targets(
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Bind the asset-stream call only with its complete installed record."""
+
+    record_targets = {
+        target for _slot, target, _installer in PHASE7_ASSET_STREAM_CALLBACK_RECORD_SLOTS
+    }
+    callback_sites = set(PHASE7_ASSET_STREAM_CALLBACK_BINDINGS)
+    if not callback_sites <= indirect_sites or not record_targets <= allowed_targets:
+        return {}
+
+    def register_memory_load(address: int, destination: str, base: str, displacement: int) -> bool:
+        instruction = instructions.get(address)
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "mov"
+            or len(instruction.operands) != 2
+            or instruction.operands[0].kind != "reg"
+            or instruction.operands[0].reg != destination
+        ):
+            return False
+        operand = instruction.operands[1]
+        return (
+            operand.kind == "mem"
+            and operand.base == base
+            and operand.index is None
+            and operand.scale == 1
+            and operand.displacement == displacement
+            and operand.absolute is None
+            and operand.segment is None
+        )
+
+    def register_memory_store(address: int, base: str, displacement: int, source: str) -> bool:
+        instruction = instructions.get(address)
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "mov"
+            or len(instruction.operands) != 2
+            or instruction.operands[1].kind != "reg"
+            or instruction.operands[1].reg != source
+        ):
+            return False
+        operand = instruction.operands[0]
+        return (
+            operand.kind == "mem"
+            and operand.base == base
+            and operand.index is None
+            and operand.scale == 1
+            and operand.displacement == displacement
+            and operand.absolute is None
+            and operand.segment is None
+        )
+
+    cleanup_call = instructions.get(0x00112E50)
+    construction_call = instructions.get(0x001130C6)
+    copy_call = instructions.get(0x001131BD)
+    if (
+        cleanup_call is None
+        or cleanup_call.mnemonic.casefold() != "call"
+        or len(cleanup_call.operands) != 1
+        or cleanup_call.operands[0].kind != "reg"
+        or cleanup_call.operands[0].reg != "eax"
+        or not register_memory_load(0x00112E45, "eax", "esi", 0x0C)
+        or not register_memory_load(0x00112E48, "eax", "eax", 0x10)
+        or construction_call is None
+        or construction_call.mnemonic.casefold() != "call"
+        or len(construction_call.operands) != 1
+        or construction_call.operands[0].kind != "reg"
+        or construction_call.operands[0].reg != "eax"
+        or not register_memory_load(0x001130AB, "eax", "ebp", 0x0C)
+        or not register_memory_load(0x001130B9, "eax", "eax", 0x0C)
+        or copy_call is None
+        or copy_call.mnemonic.casefold() != "call"
+        or len(copy_call.operands) != 1
+        or copy_call.operands[0].kind != "mem"
+        or copy_call.operands[0].base != "esp"
+        or copy_call.operands[0].index is not None
+        or copy_call.operands[0].scale != 1
+        or copy_call.operands[0].displacement != 0x24
+        or copy_call.operands[0].absolute is not None
+        or copy_call.operands[0].segment is not None
+        or not register_memory_load(0x00113109, "eax", "ebp", 0x0C)
+        or not register_memory_load(0x0011310C, "eax", "eax", 0x14)
+        or not register_memory_store(0x0011311B, "esp", 0x14, "eax")
+    ):
+        return {}
+
+    for slot, target, installer_address in PHASE7_ASSET_STREAM_CALLBACK_RECORD_SLOTS:
+        installer = instructions.get(installer_address)
+        if (
+            installer is None
+            or installer.mnemonic.casefold() != "mov"
+            or len(installer.operands) != 2
+        ):
+            return {}
+        destination, source = installer.operands
+        if (
+            destination.kind != "mem"
+            or destination.base != "esi"
+            or destination.index is not None
+            or destination.scale != 1
+            or destination.displacement != slot
+            or destination.absolute is not None
+            or destination.segment is not None
+            or source.kind != "imm"
+            or source.immediate != target
+        ):
+            return {}
+
+    installed_target_references = {
+        address
+        for address, instruction in instructions.items()
+        if any(
+            operand.kind == "imm" and operand.immediate in record_targets
+            for operand in instruction.operands
+        )
+    }
+    expected_installers = {
+        installer for _slot, _target, installer in PHASE7_ASSET_STREAM_CALLBACK_RECORD_SLOTS
+    }
+    if installed_target_references != expected_installers:
+        return {}
+
+    for entry, expected_references in PHASE7_ASSET_STREAM_ENTRY_REFERENCES.items():
+        references = {
+            address for address, instruction in instructions.items() if instruction.target == entry
+        }
+        if references != expected_references:
+            return {}
+
+    direct_target_callers = {
+        address
+        for address, instruction in instructions.items()
+        if instruction.mnemonic.casefold() == "call" and instruction.target in record_targets
+    }
+    if direct_target_callers:
+        return {}
+    return {
+        site: (target,) for site, (_slot, target) in PHASE7_ASSET_STREAM_CALLBACK_BINDINGS.items()
+    }
+
+
+===== tools/recomp/ia32_native_backend.py:20320-20419 | _phase7_resource_converter_callback_targets =====
+
+def _phase7_resource_converter_callback_targets(
+    memory: SparseMemory,
+    instructions: Mapping[int, X86Instruction],
+    indirect_sites: AbstractSet[int],
+    allowed_targets: AbstractSet[int],
+) -> dict[int, tuple[int, ...]]:
+    """Bind the complete fixed resource-converter callback-vector family."""
+
+    callback_sites = set(PHASE7_RESOURCE_CONVERTER_CALLBACK_BINDINGS)
+    callback_targets = {
+        target for _slot, target in PHASE7_RESOURCE_CONVERTER_CALLBACK_VECTOR
+    }
+    if not callback_sites <= indirect_sites or not callback_targets <= allowed_targets:
+        return {}
+    for index, value in enumerate(PHASE7_RESOURCE_CONVERTER_DESCRIPTOR_VALUES):
+        if memory.read_u32(PHASE7_RESOURCE_CONVERTER_DESCRIPTOR + index * 4) != value:
+            return {}
+    installer = bytes.fromhex(PHASE7_RESOURCE_CONVERTER_INSTALLER_BYTES)
+    if memory.read(0x00105BE0, len(installer)) != installer:
+        return {}
+    for address, encoded in PHASE7_RESOURCE_CONVERTER_INSTRUCTION_BYTES.items():
+        instruction = instructions.get(address)
+        if instruction is None or instruction.bytes_hex.upper() != encoded:
+            return {}
+
+    for site in callback_sites:
+        instruction = instructions[site]
+        if (
+            instruction.mnemonic.casefold() != "call"
+            or len(instruction.operands) != 1
+            or instruction.operands[0].kind != "reg"
+            or instruction.operands[0].reg != "eax"
+        ):
+            return {}
+    for address, (slot, target) in PHASE7_RESOURCE_CONVERTER_INSTALLER_BINDINGS.items():
+        instruction = instructions.get(address)
+        if (
+            instruction is None
+            or instruction.mnemonic.casefold() != "mov"
+            or len(instruction.operands) != 2
+        ):
+            return {}
+        destination, source = instruction.operands
+        if (
+            destination.kind != "mem"
+            or destination.base != "eax"
+            or destination.index is not None
+            or destination.scale != 1
+            or destination.displacement != slot
+            or destination.absolute is not None
+            or destination.segment is not None
+            or source.kind != "imm"
+            or source.immediate != target
+        ):
+            return {}
+
+    descriptor_references = {
+        address
+        for address, instruction in instructions.items()
+        if any(
+            operand.kind == "imm"
+            and operand.immediate == PHASE7_RESOURCE_CONVERTER_DESCRIPTOR
+            for operand in instruction.operands
+        )
+    }
+    callback_target_references = {
+        address
+        for address, instruction in instructions.items()
+        if any(
+            operand.kind == "imm" and operand.immediate in callback_targets
+            for operand in instruction.operands
+        )
+    }
+    converter_callers = {
+        address
+        for address, instruction in instructions.items()
+        if instruction.mnemonic.casefold() == "call"
+        and instruction.target == 0x00105C90
+    }
+    plugin_direct_callers = {
+        address
+        for address, instruction in instructions.items()
+        if instruction.mnemonic.casefold() == "call"
+        and instruction.target in {0x00105920, 0x00105BE0}
+    }
+    boundary_site, boundary_target = PHASE7_RESOURCE_CONVERTER_OBSERVED_BOUNDARY
+    if (
+        descriptor_references != {0x00105C10}
+        or callback_target_references
+        != {0x0010501B, *PHASE7_RESOURCE_CONVERTER_INSTALLER_BINDINGS}
+        or converter_callers != {0x00105A3C}
+        or plugin_direct_callers
+        or PHASE7_RESOURCE_CONVERTER_CALLBACK_BINDINGS[boundary_site][1]
+        != boundary_target
+    ):
+        return {}
+    return {
+        site: (target,)
+        for site, (_slot, target) in PHASE7_RESOURCE_CONVERTER_CALLBACK_BINDINGS.items()
+    }
+
+
+===== tools/playability/playability_probe.py:2756-2786 | _has_static_code_boundary =====
+
+def _has_static_code_boundary(
+    target: int,
+    *,
+    read_bytes: Callable[[int, int], bytes],
+    terminator_end_addresses: set[int],
+) -> bool:
+    """Return whether a static pointer lands at a credible code boundary."""
+
+    try:
+        prefix = read_bytes(target - 16, 16)
+    except (KeyError, ValueError, XbeMemoryAccessError):
+        return False
+    if len(prefix) != 16:
+        return False
+    trailing_padding = 0
+    for value in reversed(prefix):
+        if value not in {0x90, 0xCC}:
+            break
+        trailing_padding += 1
+    before_padding = prefix[:-trailing_padding] if trailing_padding else prefix
+    follows_return = bool(before_padding) and before_padding[-1] in {0xC3, 0xCB}
+    follows_sized_return = (
+        len(before_padding) >= 3 and before_padding[-3] in {0xC2, 0xCA}
+    )
+    follows_alignment_sled = target % 16 == 0 and trailing_padding >= 2
+    return (
+        follows_return
+        or follows_sized_return
+        or follows_alignment_sled
+        or target in terminator_end_addresses
+    )
+
+
+===== tools/playability/playability_probe.py:2789-2862 | _stored_code_pointer_targets =====
+
+def _stored_code_pointer_targets(
+    known_functions: Iterable[LiftedFunction],
+    *,
+    read_bytes: Callable[[int, int], bytes],
+    is_code: Callable[[int], bool],
+    initializer_source_window: int = 0x100,
+    minimum_initializer_targets: int = 3,
+) -> tuple[int, ...]:
+    """Find validated code pointers stored by already decoded guest code."""
+
+    functions = tuple(known_functions)
+    known_instruction_bytes = {
+        address
+        for function in functions
+        for instruction in function.instructions
+        for address in range(instruction.address, instruction.next_address)
+    }
+    terminator_end_addresses = {
+        instruction.next_address
+        for function in functions
+        for instruction in function.instructions
+        if instruction.mnemonic in {"jmp", "ret"}
+    }
+    candidate_sources: dict[int, set[tuple[int, int | None]]] = {}
+    for function in functions:
+        for instruction in function.instructions:
+            if (
+                not is_code(instruction.address)
+                or instruction.mnemonic != "mov"
+                or len(instruction.operands) != 2
+            ):
+                continue
+            destination, source = instruction.operands
+            if (
+                destination.kind != "mem"
+                or source.kind != "imm"
+                or source.immediate is None
+            ):
+                continue
+            target = source.immediate & 0xFFFFFFFF
+            if not is_code(target) or target in known_instruction_bytes:
+                continue
+            candidate_sources.setdefault(target, set()).add(
+                (instruction.address, destination.absolute)
+            )
+
+    boundary_targets = {
+        target
+        for target in candidate_sources
+        if _has_static_code_boundary(
+            target,
+            read_bytes=read_bytes,
+            terminator_end_addresses=terminator_end_addresses,
+        )
+    }
+    candidate_sites = sorted(
+        (source, target)
+        for target, sites in candidate_sources.items()
+        for source, destination in sites
+        if destination is not None
+    )
+    initializer_targets: set[int] = set()
+    for source, target in candidate_sites:
+        neighboring_targets = {
+            neighbor_target
+            for neighbor_source, neighbor_target in candidate_sites
+            if abs(neighbor_source - source) <= initializer_source_window
+        }
+        if (
+            len(neighboring_targets) >= minimum_initializer_targets
+            and neighboring_targets & boundary_targets
+        ):
+            initializer_targets.add(target)
+    return tuple(sorted(boundary_targets | initializer_targets))
+
+
+===== tools/playability/playability_probe.py:2865-2950 | _stack_argument_code_pointer_targets =====
+
+def _stack_argument_code_pointer_targets(
+    known_functions: Iterable[LiftedFunction],
+    *,
+    read_bytes: Callable[[int, int], bytes],
+    is_code: Callable[[int], bool],
+    callback_argument_indices: Mapping[int, int],
+) -> tuple[int, ...]:
+    """Recover immediate callbacks passed to proven stack-callback consumers."""
+
+    functions = tuple(known_functions)
+    known_instruction_bytes = {
+        address
+        for function in functions
+        for instruction in function.instructions
+        for address in range(instruction.address, instruction.next_address)
+    }
+    targets: set[int] = set()
+    for function in functions:
+        instructions = function.instructions
+        for index, instruction in enumerate(instructions):
+            if instruction.mnemonic != "call" or instruction.target is None:
+                continue
+            argument_index = callback_argument_indices.get(instruction.target)
+            if argument_index is None or not is_code(instruction.address):
+                continue
+            push = None
+            remaining_pushes = argument_index
+            for candidate in reversed(instructions[max(0, index - 64) : index]):
+                if candidate.mnemonic == "push":
+                    if remaining_pushes == 0:
+                        push = candidate
+                        break
+                    remaining_pushes -= 1
+                    continue
+                writes_stack_pointer = (
+                    candidate.mnemonic
+                    not in {"cmp", "test"}
+                    and bool(candidate.operands)
+                    and candidate.operands[0].kind == "reg"
+                    and candidate.operands[0].reg == "esp"
+                )
+                exchanges_stack_pointer = (
+                    candidate.mnemonic == "xchg"
+                    and any(
+                        operand.kind == "reg" and operand.reg == "esp"
+                        for operand in candidate.operands
+                    )
+                )
+                if (
+                    candidate.mnemonic
+                    in {
+                        "call",
+                        "enter",
+                        "int",
+                        "iret",
+                        "jcc",
+                        "jmp",
+                        "leave",
+                        "ret",
+                    }
+                    or candidate.mnemonic.startswith("pop")
+                    or candidate.mnemonic.startswith("push")
+                    or writes_stack_pointer
+                    or exchanges_stack_pointer
+                ):
+                    break
+            if push is None:
+                continue
+            if len(push.operands) != 1:
+                continue
+            operand = push.operands[0]
+            if operand.kind != "imm" or operand.immediate is None:
+                continue
+            target = operand.immediate & 0xFFFFFFFF
+            if (
+                target in known_instruction_bytes
+                or not is_code(target)
+                or not _has_static_code_boundary(
+                    target,
+                    read_bytes=read_bytes,
+                    terminator_end_addresses=set(),
+                )
+            ):
+                continue
+            targets.add(target)
+    return tuple(sorted(targets))
+
+
+===== tools/playability/playability_probe.py:2953-3058 | _register_stack_argument_code_pointer_targets =====
+
+def _register_stack_argument_code_pointer_targets(
+    known_functions: Iterable[LiftedFunction],
+    *,
+    read_bytes: Callable[[int, int], bytes],
+    is_code: Callable[[int], bool],
+    callback_argument_indices: Mapping[int, int],
+    definition_window: int = 0x200,
+) -> tuple[int, ...]:
+    """Recover register-held callbacks for declared stack-callback ABIs."""
+
+    functions = tuple(known_functions)
+    instructions = sorted(
+        {
+            instruction.address: instruction
+            for function in functions
+            for instruction in function.instructions
+        }.values(),
+        key=lambda instruction: instruction.address,
+    )
+    known_instruction_bytes = {
+        address
+        for instruction in instructions
+        for address in range(instruction.address, instruction.next_address)
+    }
+    targets: set[int] = set()
+    for index, instruction in enumerate(instructions):
+        if instruction.mnemonic != "call" or instruction.target is None:
+            continue
+        argument_index = callback_argument_indices.get(instruction.target)
+        if argument_index is None or not is_code(instruction.address):
+            continue
+        push = None
+        remaining_slots = argument_index
+        for candidate in reversed(instructions[max(0, index - 64) : index]):
+            if candidate.mnemonic == "push":
+                if remaining_slots == 0:
+                    push = candidate
+                    break
+                remaining_slots -= 1
+                continue
+            if (
+                candidate.mnemonic == "sub"
+                and len(candidate.operands) == 2
+                and candidate.operands[0].kind == "reg"
+                and candidate.operands[0].reg == "esp"
+                and candidate.operands[1].kind == "imm"
+                and candidate.operands[1].immediate is not None
+                and candidate.operands[1].immediate > 0
+                and candidate.operands[1].immediate % 4 == 0
+            ):
+                reserved_slots = candidate.operands[1].immediate // 4
+                if reserved_slots > remaining_slots:
+                    break
+                remaining_slots -= reserved_slots
+                continue
+            writes_stack_pointer = (
+                candidate.mnemonic not in {"cmp", "test"}
+                and bool(candidate.operands)
+                and candidate.operands[0].kind == "reg"
+                and candidate.operands[0].reg == "esp"
+            )
+            exchanges_stack_pointer = (
+                candidate.mnemonic == "xchg"
+                and any(
+                    operand.kind == "reg" and operand.reg == "esp"
+                    for operand in candidate.operands
+                )
+            )
+            if (
+                candidate.mnemonic
+                in {"call", "enter", "int", "iret", "jcc", "jmp", "leave", "ret"}
+                or candidate.mnemonic.startswith("pop")
+                or writes_stack_pointer
+                or exchanges_stack_pointer
+            ):
+                break
+        if push is None or len(push.operands) != 1:
+            continue
+        pushed = push.operands[0]
+        if pushed.kind != "reg" or pushed.reg is None:
+            continue
+        for candidate in instructions:
+            if not push.address - definition_window <= candidate.address < push.address:
+                continue
+            if (
+                candidate.mnemonic != "mov"
+                or len(candidate.operands) != 2
+                or candidate.operands[0].kind != "reg"
+                or candidate.operands[0].reg != pushed.reg
+                or candidate.operands[1].kind != "imm"
+                or candidate.operands[1].immediate is None
+            ):
+                continue
+            target = candidate.operands[1].immediate & 0xFFFFFFFF
+            if (
+                target in known_instruction_bytes
+                or not is_code(target)
+                or not _has_static_code_boundary(
+                    target,
+                    read_bytes=read_bytes,
+                    terminator_end_addresses=set(),
+                )
+            ):
+                continue
+            targets.add(target)
+    return tuple(sorted(targets))
+
+
+===== tools/playability/playability_probe.py:3061-3184 | _static_code_pointer_table_targets =====
+
+def _static_code_pointer_table_targets(
+    known_functions: Iterable[LiftedFunction],
+    *,
+    read_bytes: Callable[[int, int], bytes],
+    read_u32: Callable[[int], int],
+    is_code: Callable[[int], bool],
+    table_ranges: Iterable[tuple[int, int]],
+    minimum_table_entries: int = 3,
+    minimum_boundary_targets: int = 2,
+) -> tuple[int, ...]:
+    """Find function entries in credible static callback and vtable runs."""
+
+    functions = tuple(known_functions)
+    table_ranges = tuple(sorted(table_ranges))
+    known_instruction_bytes = {
+        address
+        for function in functions
+        for instruction in function.instructions
+        for address in range(instruction.address, instruction.next_address)
+    }
+    targets: set[int] = set()
+
+    def retain_run(run: list[int]) -> None:
+        if len(run) < minimum_table_entries:
+            return
+        unique_targets = set(run)
+        boundary_targets = {
+            target
+            for target in unique_targets
+            if _has_static_code_boundary(
+                target,
+                read_bytes=read_bytes,
+                # Table confidence must remain independent of previously
+                # decoded targets. Raw return/alignment bytes cannot cascade
+                # packed numeric data into a false code-table family.
+                terminator_end_addresses=set(),
+            )
+        }
+        if (
+            len(boundary_targets) < minimum_boundary_targets
+            or len(boundary_targets) * 2 < len(unique_targets)
+        ):
+            return
+        # Once the run itself is proven to be a code-pointer table, retain the
+        # whole family. Some valid COM-style thunks begin immediately after
+        # non-return control flow and therefore lack an independent boundary.
+        targets.update(unique_targets - known_instruction_bytes)
+
+    prepared_ranges: list[tuple[int, int, bytes | None]] = []
+    for start_address, end_address in table_ranges:
+        aligned_start = (start_address + 3) & ~3
+        readable_size = max(0, end_address - aligned_start) & ~3
+        table_data = None
+        if readable_size:
+            try:
+                candidate = read_bytes(aligned_start, readable_size)
+                if len(candidate) == readable_size:
+                    table_data = candidate
+            except (KeyError, ValueError, XbeMemoryAccessError):
+                pass
+        prepared_ranges.append((aligned_start, end_address, table_data))
+
+    for aligned_start, end_address, table_data in prepared_ranges:
+        run: list[int] = []
+        if table_data is not None:
+            targets_in_range = (
+                int(words[0]) & 0xFFFFFFFF
+                for words in struct.iter_unpack("<I", table_data)
+            )
+        else:
+            def fallback_targets() -> Iterable[int]:
+                for entry_address in range(aligned_start, end_address - 3, 4):
+                    try:
+                        yield int(read_u32(entry_address)) & 0xFFFFFFFF
+                    except (KeyError, ValueError, XbeMemoryAccessError):
+                        yield 0
+
+            targets_in_range = fallback_targets()
+        for target in targets_in_range:
+            if is_code(target):
+                run.append(target)
+                continue
+            retain_run(run)
+            run = []
+        retain_run(run)
+
+    # Xbox library registration tables also store callbacks at the end of a
+    # repeated six-DWORD descriptor record instead of as a contiguous vtable.
+    # Require the two static descriptor pointers, exact zero/one sentinels, a
+    # run of records, and the same independent code-boundary proof used above.
+    table_range_starts = tuple(start for start, _end in table_ranges)
+
+    def is_static_pointer(address: int) -> bool:
+        index = bisect.bisect_right(table_range_starts, address) - 1
+        return index >= 0 and address < table_ranges[index][1]
+
+    for aligned_start, _end_address, table_data in prepared_ranges:
+        run = []
+        if table_data is None:
+            continue
+        offset = 0
+        while offset + 24 <= len(table_data):
+            try:
+                words = struct.unpack_from("<6I", table_data, offset)
+            except struct.error:
+                words = (0, 0, 0, 0, 0, 0)
+            if (
+                is_static_pointer(words[0])
+                and not is_code(words[0])
+                and words[1] == 0
+                and words[2] == 0
+                and is_static_pointer(words[3])
+                and not is_code(words[3])
+                and words[4] == 1
+                and is_code(words[5])
+            ):
+                run.append(words[5])
+                offset += 24
+                continue
+            retain_run(run)
+            run = []
+            offset += 4
+        retain_run(run)
+    return tuple(sorted(targets))
+
+
+===== tools/playability/playability_probe.py:18912-18961 | _absolute_indirect_jump_table_targets =====
+
+def _absolute_indirect_jump_table_targets(
+    function: LiftedFunction,
+    *,
+    read_u32: Callable[[int], int],
+    is_executable: Callable[[int], bool],
+    max_entries_per_direction: int = 256,
+    consecutive_miss_limit: int = 8,
+) -> tuple[int, ...]:
+    """Resolve bounded address-taken targets from absolute IA-32 jump tables."""
+
+    targets: list[int] = []
+    seen_targets: set[int] = set()
+    table_bases: set[int] = set()
+    for instruction in function.instructions:
+        if instruction.mnemonic != "jmp" or len(instruction.operands) != 1:
+            continue
+        operand = instruction.operands[0]
+        if (
+            operand.kind != "mem"
+            or operand.base is not None
+            or operand.index is None
+            or operand.scale != 4
+            or operand.absolute is not None
+        ):
+            continue
+        table_base = operand.displacement & 0xFFFFFFFF
+        if table_base in table_bases:
+            continue
+        table_bases.add(table_base)
+        for direction in (1, -1):
+            misses = 0
+            first_index = 0 if direction > 0 else -1
+            for offset in range(max_entries_per_direction):
+                index = first_index + offset * direction
+                entry_address = (table_base + index * 4) & 0xFFFFFFFF
+                try:
+                    target = int(read_u32(entry_address)) & 0xFFFFFFFF
+                except (KeyError, ValueError, XbeMemoryAccessError):
+                    target = 0
+                if not is_executable(target):
+                    misses += 1
+                    if misses >= consecutive_miss_limit:
+                        break
+                    continue
+                misses = 0
+                if target in seen_targets:
+                    continue
+                seen_targets.add(target)
+                targets.append(target)
+    return tuple(targets)
+

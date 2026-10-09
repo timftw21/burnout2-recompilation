@@ -11,11 +11,10 @@ independent interoperability and reverse-engineering project is not affiliated
 with or endorsed by those owners.
 
 The repository does not provide the game or an Xbox SDK. Users must supply
-their own lawfully obtained inputs. Runtime dependencies such as Capstone,
-Clang/LLVM, Vulkan, SDL3, CMake, and Ninja remain governed by their own
-licenses and are not relicensed by this repository.
+their own lawfully obtained inputs. Local game media and extracted content
+remain outside source control. Preserved research references are in
+[knowledge/](knowledge/); their original source revision and extraction hashes
+are recorded in the research manifest.
 
-See [docs/ASSET_POLICY.md](docs/ASSET_POLICY.md) for the contribution boundary.
-The maintainer-approved milestone screenshots under `docs/images/` are captured
-game output used only for project documentation; they are not covered by the
-MIT license.
+The native development tools use Zydis and Zycore. Their licenses are reproduced
+in [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).

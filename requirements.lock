@@ -1,2 +1,0 @@
-# Runtime dependency lock. Update intentionally and validate the full unit suite.
-capstone==5.0.9

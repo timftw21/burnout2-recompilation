@@ -1,0 +1,58 @@
+Surface storage and clipping
+
+The title-to-attract path reaches a surface clip with H=02800000h (x=0,w=640)
+and V=01430056h (y=86,h=323), format 128h, pitch 0A000A00h and color offset
+A58000h. The origin changes the writable rectangle of the same framebuffer;
+it does not identify a new allocation or move the framebuffer origin.
+
+The native cache identifies surface storage by color/depth offsets, format and
+pitch. A smaller clip reuses its storage. Draws snapshot the clip as a scissor.
+Swizzled surface dimensions come from the format's width/height exponents.
+Linear storage grows only if a new clip requires larger extents. Growth retains
+color, depth and stencil through GPU copies; retired resources are released.
+There is no CPU readback or allocation when only the clip changes.
+
+The existing offline suite checks a full surface followed by an inset draw,
+including preservation outside the clip, and checks retained color/depth/stencil
+and initialized added capacity after growing a target. D3D11 debug validation
+checks the native copy operations on both the hardware adapter and WARP.
+
+Primary interfaces used to verify the implementation:
+https://raw.githubusercontent.com/xemu-project/xemu/master/hw/xbox/nv2a/pgraph/gl/draw.c
+https://raw.githubusercontent.com/xemu-project/xemu/master/hw/xbox/nv2a/pgraph/gl/surface.c
+https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-copysubresourceregion
+
+16-bit targets and texture aliases
+
+Loading reaches format 07070213h, pitch 0A000100h, color offset 1160000h,
+depth offset zero. Its color code 3 is RGB565, depth code 1 is Z16, layout 2
+is swizzled, and both dimension exponents are 7 (128 by 128). The native backend
+creates B5G6R5_UNORM color and D16_UNORM depth rather than treating the surface
+as an ordinary 32-bit image. Readback expands the actual 16-bit colors. Target
+growth preserves both formats and copies Z16 through R16_TYPELESS storage.
+Stencil operations have no effect on the stencil-free depth format.
+
+Texture binding checks matching surface offset, format, dimensions, layout and
+linear pitch before uploading ordinary RAM textures. A matching surface uses
+its current GPU view; CPU RAM does not contain its freshly rendered contents.
+Surface growth refreshes that shared view. RGB565 presentation converts color
+with one GPU draw using a shader prepared at target creation, without CPU reads.
+
+140 offline cases pass on the RTX 5060 Ti and WARP with no D3D11 debug messages,
+including RGB565/Z16 rendering, retained color/depth after growth, color
+conversion and subsequent sampling of both 16-bit and 32-bit GPU surfaces.
+This does not establish complete game graphics coverage or screenshot parity.
+
+Surface/register corroboration (facts only):
+https://raw.githubusercontent.com/xemu-project/xemu/master/hw/xbox/nv2a/nv2a_regs.h
+https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_format_support
+
+The original SDK can issue repeated flips without new geometry. Each native flip
+selects the current GPU color surface before presentation; the previous flip's
+temporary main-target binding is not the next presentation source.
+
+Diagnostic snapshots retain main, the last presented image, after any flip.
+They do not promote an unfinished frame or offscreen pass during shutdown. A new
+offline case presents a red frame, starts an unpresented 32x32 RGB565 pass, and
+verifies that capture still returns the complete original 64x64 frame. The full
+141-case suite passes on the RTX 5060 Ti and WARP without validation messages.

@@ -1,0 +1,31 @@
+Native asynchronous file completion
+
+Original D95D0 opens streamed resources with flags 60000001: overlapped,
+unbuffered, read-only. E09BA translates these to NtCreateFile options.
+D98C0 returns pending reads to D9B60; that method calls original GetOverlappedResult
+E048E. Immediate success takes a different path at D9958..D9969, which requires
+the requested byte count and otherwise marks the resource failed.
+
+special.rws contains 17744h bytes; its aligned request is 17800h. The previous
+service returned immediate success with the correct short count, producing the
+original disc-error screen. Do not pad the file or invent a larger byte count.
+
+The native service issues Windows overlapped I/O for asynchronous handles.
+Thirty-two stable request slots retain host events, file ownership and offsets.
+The scheduler checks completion without blocking, publishes actual status/bytes,
+then signals the guest event and file object. Destruction cancels and waits for
+owned requests before releasing their storage. Diagnostics record options,
+requested bytes, offset, pending and completed status.
+
+The original sample.xsb/effects callers use ordinary heap buffers with options
+48h and sector-sized transfers. Guest buffer alignment must not inherit the
+host's physical-DMA constraint; the private mounted-image handle is buffered.
+
+Boot verification records options 48h, pending 103h, then success with 96068
+bytes for the 96256-byte special.rws request. The loader accepts completion,
+advances into frontend assets and reaches the next missing stream callback.
+
+Primary interfaces:
+https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-readfile
+https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-getoverlappedresult
+https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-cancelioex

@@ -1,0 +1,24 @@
+NV097 fixed transform contracts
+
+Fixed and programmable transforms share a 192-vector context. Composite rows
+occupy 0..3, projection 4..7. Four model-view/inverse pairs occupy 8..39, eight
+vectors per pair. Eye position is 56, fog plane 57, viewport scale/offset 58/59.
+Each texture stage uses eight vectors from 64: texgen planes first, matrix second.
+Method aliases now update that same context rather than unrelated register data.
+
+Skin modes 0..6 select no blending, 2/3/4 matrices with a generated final weight,
+or 2/3/4 explicit weights. Normals use inverse model-view rows, with optional
+normalization. The unskinned composite already includes model-view. The skinned
+composite transforms the blended eye position. Texture generation precedes its
+texture matrix. Fog comes from specular alpha, radial distance, signed/absolute
+plane distance or the fog vertex attribute; the final combiner consumes it.
+
+The shared offscreen suite passes 133 checks on RTX 5060 Ti and WARP with no D3D11
+validation messages. New cases cover all skin modes, normal transforms, texgen,
+texture matrices, fog sources and raw GPU packet aliases. Fixed lighting and other
+dependent texture modes remain incomplete; component checks do not prove parity.
+
+Primary register/layout reference:
+https://raw.githubusercontent.com/xemu-project/xemu/master/hw/xbox/nv2a/nv2a_regs.h
+Primary method reference:
+https://raw.githubusercontent.com/xemu-project/xemu/master/hw/xbox/nv2a/pgraph/pgraph.c

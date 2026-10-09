@@ -1,0 +1,51 @@
+Shaders compiled during the native build
+
+The manual driving report from 2026-10-08 recorded 156 shader compilations.
+The renderer compiled HLSL while preparing draws; hardware state changes also
+duplicated identical pixel shaders. Fixed-transform changes produced more
+vertex shaders. ImGui compiled its own two shaders when opening the interface.
+
+The native build tool now produces native_shaders.cpp. The executable links
+stripped D3D11 bytecode; only b2-tool links the HLSL compiler. The ImGui backend
+uses its pinned, unchanged shader source compiled by the same build step.
+The renderer creates these shaders before game execution. Unknown original
+vertex code stops with a missing-bank error rather than compiling during play.
+
+Original SDK CreateVertexShader at 00214D90 reads a WORD version and WORD
+instruction count, then copies count*16 bytes through 00214A80 without rewriting
+the program. The supported XBE contains these verified 2078h title headers:
+0033CE38, 0033E160, 0033E238, 0033E300, 0033E3A8, 0033E618, 0033E8C0,
+0033EA68, 0033EC70, 0033EED8, 0033F040, 0033F278, 0033F3F0, 0033F498,
+0033F540, 0033F798, 0033FA78.
+SDK passthrough selection at 002153F0 uses 00223108 (12 instructions),
+002231C8 (11) and 00223278 (12). These twenty records contain eighteen unique
+programs. Program matching ignores inactive instruction slots and load offset;
+only the instructions through the first final marker determine its code.
+
+Register combiners use nine compiled pixel shaders for zero through eight
+stages. Constants carry the original inputs, outputs and texture controls.
+Four additional shaders reduce complete pass-through/multiplication instruction
+patterns to direct arithmetic, retaining alpha tests and texture alpha kill.
+These exact reductions avoid register selection work for simple draws; other
+programs retain the general arithmetic shader. All seven fixed skin modes are
+compiled, with texgen, matrices and fog controls supplied as constants.
+
+Performance research: 64 fullscreen draws per sample, 20 retained samples after
+8 warmups, GPU timestamps, RTX 5060 Ti. At 640x480 the simple color and textured
+shaders each took about 0.0022 ms per draw, matching equivalent specialized HLSL.
+At 1280x960 both took about 0.0086 ms. The general versions cost about 0.0105
+and 0.0248 ms at 640x480, so simple patterns select the reduced shaders.
+These synthetic measurements do not establish race FPS or screenshot parity.
+The final executable's shader bank also matches these timings, with zero shader
+compilations reported. All 145 offline graphics cases pass on RTX 5060 Ti and
+WARP without debug messages. Both hidden SDL3/ImGui window checks pass. The
+executable's import table contains D3D11 and no D3DCOMPILER or D3DCompile import.
+
+The general shader retains raw pass-through texture coordinates; combiner input
+mapping controls their range. Texture alpha kill applies only to a fetch, so it
+does not discard a clip-plane or coordinate pass-through stage. Disabled texture
+registers have alpha one. Blue-to-alpha output uses the mapped combiner result,
+including its scale/bias. Existing clipping/pass-through checks now enable alpha
+kill, and a mapped blue-to-alpha case verifies the output alpha.
+Hardware-behavior corroboration only (no emulator gameplay or linked code):
+https://github.com/xemu-project/xemu/blob/master/hw/xbox/nv2a/pgraph/glsl/psh.c

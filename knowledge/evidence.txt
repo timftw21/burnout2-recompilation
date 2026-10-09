@@ -1,0 +1,592 @@
+
+===== tests/unit/test_playability_probe.py:617-726 | test_stack_callback_recovery_uses_proven_consumer_argument =====
+
+    def test_stack_callback_recovery_uses_proven_consumer_argument(self) -> None:
+        constructor_callback = 0x2409
+        constructor_call_address = 0x1209
+        constructor_caller = lift_x86_function(
+            b"".join(
+                (
+                    b"\x68" + struct.pack("<I", constructor_callback),
+                    b"\x57\x6A\x20\x50",
+                    _call_relative_bytes(constructor_call_address, 0x134D0),
+                    b"\xC3",
+                )
+            ),
+            base_address=0x1200,
+            symbol="vector_constructor_caller",
+        )
+        iterator_callback = 0x260D
+        iterator_call_address = 0x1308
+        iterator_caller = lift_x86_function(
+            b"".join(
+                (
+                    b"\x6A\x00",
+                    b"\x68" + struct.pack("<I", iterator_callback),
+                    b"\x50",
+                    _call_relative_bytes(iterator_call_address, 0xFD810),
+                    b"\xC3",
+                )
+            ),
+            base_address=0x1300,
+            symbol="linked_list_iterator_caller",
+        )
+        spatial_callback = 0x280D
+        spatial_call_address = 0x1413
+        spatial_caller = lift_x86_function(
+            b"".join(
+                (
+                    b"\x6A\x00",
+                    b"\x68" + struct.pack("<I", spatial_callback),
+                    b"\x8D\x54\x24\x08\x8B\xCE\x52",
+                    b"\x8B\xC0\x57\x8B\xCE",
+                    _call_relative_bytes(spatial_call_address, 0x8F3D0),
+                    b"\xC3",
+                )
+            ),
+            base_address=0x1400,
+            symbol="spatial_query_caller",
+        )
+        collision_callback = 0x2A0D
+        collision_call_address = 0x1613
+        collision_caller = lift_x86_function(
+            b"".join(
+                (
+                    b"\x6A\x00",
+                    b"\x68" + struct.pack("<I", collision_callback),
+                    b"\x8D\x54\x24\x08\x8B\xCE\x52",
+                    b"\x8B\xC0\x57\x8B\xCE",
+                    _call_relative_bytes(collision_call_address, 0x90420),
+                    b"\xC3",
+                )
+            ),
+            base_address=0x1600,
+            symbol="spatial_collision_caller",
+        )
+        frontend_callback = 0x2C0D
+        frontend_setup = bytearray()
+        frontend_setup.extend(b"\x6A\x01\x52")
+        frontend_setup.extend(b"\x68" + struct.pack("<I", frontend_callback))
+        frontend_setup.extend(b"\x55\x55")
+        frontend_call_address = 0x1700 + len(frontend_setup)
+        frontend_setup.extend(
+            _call_relative_bytes(
+                frontend_call_address,
+                TITLE_FRONTEND_COMPARE_SEARCH_ADDRESS,
+            )
+        )
+        frontend_setup.extend(b"\xC3")
+        frontend_caller = lift_x86_function(
+            bytes(frontend_setup),
+            base_address=0x1700,
+            symbol="frontend_compare_search_caller",
+        )
+
+        targets = _stack_argument_code_pointer_targets(
+            [
+                constructor_caller,
+                iterator_caller,
+                spatial_caller,
+                collision_caller,
+                frontend_caller,
+            ],
+            read_bytes=lambda address, _size: {
+                constructor_callback - 16: b"\x01" * 15 + b"\xC3",
+                iterator_callback - 16: b"\x01" * 15 + b"\xC3",
+                spatial_callback - 16: b"\x01" * 15 + b"\xC3",
+                collision_callback - 16: b"\x01" * 15 + b"\xC3",
+                frontend_callback - 16: b"\x01" * 15 + b"\xC3",
+            }[address],
+            is_code=lambda address: 0x1000 <= address < 0x14000,
+            callback_argument_indices=TITLE_STACK_CALLBACK_ARGUMENT_INDICES,
+        )
+
+        self.assertEqual(
+            targets,
+            (
+                constructor_callback,
+                iterator_callback,
+                spatial_callback,
+                collision_callback,
+                frontend_callback,
+            ),
+        )
+
+
+===== tests/unit/test_playability_probe.py:728-753 | test_stack_callback_recovery_stops_at_stack_mutation =====
+
+    def test_stack_callback_recovery_stops_at_stack_mutation(self) -> None:
+        callback = 0x2A0D
+        call_address = 0x150D
+        function = lift_x86_function(
+            b"".join(
+                (
+                    b"\x68" + struct.pack("<I", callback),
+                    b"\x53\x50\x83\xC4\x04\x51\x8B\xCE",
+                    _call_relative_bytes(call_address, 0x8F3D0),
+                    b"\xC3",
+                )
+            ),
+            base_address=0x1500,
+            symbol="stack_mutating_caller",
+        )
+
+        targets = _stack_argument_code_pointer_targets(
+            [function],
+            read_bytes=lambda address, _size: {
+                callback - 16: b"\x01" * 15 + b"\xC3"
+            }[address],
+            is_code=lambda address: 0x1000 <= address < 0x14000,
+            callback_argument_indices={0x8F3D0: 2},
+        )
+
+        self.assertEqual(targets, ())
+
+
+===== tests/unit/test_ia32_coverage_growth.py:2417-2473 | test_title_input_object_vtable_fails_closed_on_family_drift =====
+
+    def test_title_input_object_vtable_fails_closed_on_family_drift(self) -> None:
+        instructions = _title_input_object_instructions()
+        targets = set(PHASE7_TITLE_INPUT_OBJECT_VTABLE_ENTRIES)
+        wrong_call = dict(instructions)
+        wrong_call[0x0002AB5A] = lift_x86_function(
+            bytes.fromhex("FF5008"),
+            base_address=0x0002AB5A,
+            symbol="wrong_title_input_object_slot",
+        ).instructions[0]
+        added_reference = dict(instructions)
+        added_reference[0x00140000] = lift_x86_function(
+            bytes.fromhex("A158C93100"),
+            base_address=0x00140000,
+            symbol="added_title_input_object_pointer_reference",
+        ).instructions[0]
+
+        for memory, candidate, sites, candidate_targets in (
+            (
+                _title_input_object_memory(corrupt_slot=3),
+                instructions,
+                set(PHASE7_TITLE_INPUT_OBJECT_BINDINGS),
+                targets,
+            ),
+            (
+                _title_input_object_memory(),
+                wrong_call,
+                set(PHASE7_TITLE_INPUT_OBJECT_BINDINGS),
+                targets,
+            ),
+            (
+                _title_input_object_memory(),
+                added_reference,
+                set(PHASE7_TITLE_INPUT_OBJECT_BINDINGS),
+                targets,
+            ),
+            (_title_input_object_memory(), instructions, set(), targets),
+            (
+                _title_input_object_memory(),
+                instructions,
+                set(PHASE7_TITLE_INPUT_OBJECT_BINDINGS),
+                targets - {0x0002B040},
+            ),
+        ):
+            with self.subTest(
+                instruction_count=len(candidate),
+                site_count=len(sites),
+                target_count=len(candidate_targets),
+            ):
+                self.assertEqual(
+                    _phase7_title_input_object_targets(
+                        memory,
+                        candidate,
+                        sites,
+                        candidate_targets,
+                    ),
+                    {},
+                )
+
+
+===== tests/unit/test_ia32_coverage_growth.py:2565-2580 | test_new_save_object_vtables_recover_complete_call_batch =====
+
+    def test_new_save_object_vtables_recover_complete_call_batch(self) -> None:
+        recovered = _phase7_new_save_object_targets(
+            _new_save_object_memory(),
+            _new_save_object_instructions(),
+            set(PHASE7_NEW_SAVE_OBJECT_BINDINGS),
+            set(PHASE7_POST_START_OBJECT_VTABLE_ENTRIES)
+            | set(PHASE7_NEW_SAVE_COMPANION_OBJECT_VTABLE_ENTRIES),
+        )
+
+        self.assertEqual(
+            recovered,
+            {
+                site: (target,)
+                for site, (_vtable, _slot, target) in PHASE7_NEW_SAVE_OBJECT_BINDINGS.items()
+            },
+        )
+
+
+===== tests/unit/test_native_executor.py:618-647 | test_x87_stack_preserves_double_precision_between_instructions =====
+
+    def test_x87_stack_preserves_double_precision_between_instructions(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex(
+                "D90500200000"  # fld dword [0x2000]
+                "D80504200000"  # fadd dword [0x2004]
+                "D82500200000"  # fsub dword [0x2000]
+                "D91D08200000"  # fstp dword [0x2008]
+                "C3"
+            ),
+            base_address=0x6080,
+            symbol="native_x87_double_precision_stack",
+        )
+        state = CpuState.with_registers(esp=0x8000)
+        state.fpu_control_word = 0x023F
+        memory = SparseMemory(
+            {
+                0x2000: struct.pack("<f", 16_777_216.0),
+                0x2004: struct.pack("<f", 1.0),
+                0x8000: 0,
+            }
+        )
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            executor = NativeResumableExecutor(function, build_dir=Path(temp_dir))
+            returned_to = executor.run(state, memory, max_steps=8)
+
+        self.assertEqual(returned_to, 0)
+        self.assertEqual(struct.unpack("<f", memory.read(0x2008, 4))[0], 1.0)
+        self.assertEqual(state.fpu_stack, [])
+        self.assertEqual(state.fpu_control_word, 0x023F)
+
+
+===== tests/unit/test_native_executor.py:900-934 | test_fcompp_compares_and_pops_both_x87_operands_natively =====
+
+    def test_fcompp_compares_and_pops_both_x87_operands_natively(self) -> None:
+        function = lift_x86_function(
+            bytes.fromhex(
+                "D90500200000"  # fld dword [0x2000]
+                "D90504200000"  # fld dword [0x2004]
+                "DED9"  # fcompp
+                "DFE0"  # fnstsw ax
+                "C3"
+            ),
+            base_address=0x0E00,
+            symbol="native_fcompp",
+        )
+        state = CpuState.with_registers(
+            esp=0x8000,
+            fpu_status_word=0x4000,
+        )
+        memory = SparseMemory(
+            {
+                0x2000: struct.pack("<f", 3.0),
+                0x2004: struct.pack("<f", 2.0),
+                0x8000: 0,
+            }
+        )
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            executor = NativeResumableExecutor(
+                function,
+                build_dir=Path(temp_dir),
+            )
+            returned_to = executor.run(state, memory, max_steps=10)
+
+        self.assertEqual(returned_to, 0)
+        self.assertEqual(state.fpu_stack, [])
+        self.assertEqual(state.fpu_status_word, 0x0100)
+        self.assertEqual(state.get_register("eax") & 0xFFFF, 0x0100)
+
+
+===== tests/unit/test_host_audio.py:75-79 | test_parse_renderware_809_pcm_clip =====
+
+    def test_parse_renderware_809_pcm_clip(self) -> None:
+        pcm = struct.pack("<hhhh", -32768, -1, 0, 32767)
+        clips = parse_rws_pcm(_rws_pcm_fixture(pcm, sample_rate=22050))
+
+        self.assertEqual(clips, [PcmClip(22050, 1, 16, pcm)])
+
+
+===== tests/unit/test_host_audio.py:104-137 | test_parse_renderware_80d_streamed_xbox_adpcm =====
+
+    def test_parse_renderware_80d_streamed_xbox_adpcm(self) -> None:
+        header_payload = bytearray(0xE8)
+        struct.pack_into("<I", header_payload, 0x40 - 0x18, 1)
+        struct.pack_into("<I", header_payload, 0x4C - 0x18, 0xA0)
+        struct.pack_into("<I", header_payload, 0x90 - 0x18, 0x140)
+        struct.pack_into("<I", header_payload, 0x98 - 0x18, 72 * 2)
+        struct.pack_into(
+            "<7I",
+            header_payload,
+            0xC8 - 0x18,
+            7,
+            0xA0,
+            0,
+            0x00040004,
+            0,
+            72,
+            0,
+        )
+        struct.pack_into("<I", header_payload, 0xE4 - 0x18, 48000)
+        header = struct.pack("<III", 0x80E, len(header_payload), 0x1003FFFF)
+        header += header_payload
+        channel_header = struct.pack("<hBB", 0, 0, 0)
+        encoded = channel_header * 2 + bytes(64)
+        packets = (encoded + bytes(0xA0 - len(encoded))) * 2
+        data = struct.pack("<III", 0x80F, len(packets), 0x1003FFFF) + packets
+        body = header + data
+        payload = struct.pack("<III", 0x80D, len(body), 0x1003FFFF) + body
+
+        clip = parse_rws_xbox_adpcm(payload)
+
+        self.assertEqual(clip.sample_rate, 48000)
+        self.assertEqual(clip.channels, 2)
+        self.assertEqual(clip.bits_per_sample, 16)
+        self.assertEqual(clip.payload, bytes(64 * 2 * 2 * 2))
+
+
+===== tests/unit/test_render_d3d8_stream.py:53-78 | test_decodes_nv2a_texture_image_rect_at_hardware_method =====
+
+    def test_decodes_nv2a_texture_image_rect_at_hardware_method(self) -> None:
+        image_rect = (640 << 16) | 480
+        decoded = decode_render_stream(
+            {
+                "format": "b2-recomp-render-command-stream",
+                "writes": [
+                    {
+                        "kind": "d3d_push_buffer",
+                        "address": 0x80000080,
+                        "value": (1 << 18) | 0x1B1C,
+                    },
+                    {
+                        "kind": "d3d_push_buffer",
+                        "address": 0x80000084,
+                        "value": image_rect,
+                    },
+                ],
+            }
+        )
+
+        packet = next(
+            command for command in decoded["commands"]
+            if command.get("method") == "nv2a_increasing_methods"
+        )
+        self.assertEqual(packet["methods"][0]["name"], "texture_image_rect_0")
+        self.assertEqual(packet["methods"][0]["data"], image_rect)
+
+
+===== docs/VALIDATION.md:351-358 | historical guest observation =====
+
+The title confirm path originally failed on the worker's unregistered
+`NtQueryDirectoryFile` import at `0xE0000510`. The service is now native and has
+a deterministic directory-enumeration regression test; manual play advanced to
+Load/Save after the repair. Repeated volume probes then exposed an append-only
+native file-table high-water mark: after 128 closed handles, `NtOpenFile("U:\\")`
+failed and guest `idiv` at `0x000D9496` divided by the resulting zero allocation
+unit. Native file registration now reuses inactive slots, with a 140-cycle
+open/close regression test.
+
+
+===== docs/VALIDATION.md:384-393 | historical guest observation =====
+
+Manual run `c2607c60-4d55-4560-a305-8cc228b5a01c` then progressed past the old
+hang and exposed an AOT coverage failure at `0x00111040` after 146,052,791 guest
+instructions. The target is a valid address-taken level-loading callback called
+indirectly from `0x00110CE2`, not a host service or invalid PSS pointer. Its
+decoded block is now present in the supported image's SQLite store. Transport
+code 9 handling also persists future executable failure targets after the
+native run has stopped and labels the result
+`native_normal_runtime_coverage_gap`; normal execution still performs no
+interpretation, compilation, promotion, or Python callback. Manual first-level
+entry remains the acceptance check.
+
+
+===== docs/VALIDATION.md:395-403 | historical guest observation =====
+
+Run `17e6fef4-d8b6-462c-8765-762681fd9b2c` advanced again and reached a second
+address-taken callback, `0x00116DD0`, after 207,854,878 guest instructions. Its
+post-run coverage result was `decoded_for_next_aot`, demonstrating that the new
+code-9 persistence path worked. The report also retained two successful Track
+PSS publications totaling 9,568,256 bytes and zero validation failures. Static
+analysis places this callback in the exact table beginning at `0x00347100`.
+Deterministic pre-run recovery now includes all 11 callbacks in that family,
+and every member is present in the supported-image SQLite store. Manual
+first-level entry remains open.
+
+
+===== docs/VALIDATION.md:411-418 | historical guest observation =====
+
+Manual run `fc0243ad-2d48-4288-8b02-b3192a859d8d` reached the first level's
+How to Play card and then remained in a DirectSound cleanup poll until the user
+closed the window. Render publication remained healthy for 1,539 guest flips,
+the exact F12 snapshot passed the frozen render-debug suite, and input still
+reached the guest. The final worker state identified the loop at `0x00107080`:
+status continued to report playing after its stop command. The recovered
+GetStatus method has two such internal states: active `0x0003` and
+pending/allocated `0x8001`.
+
+
+===== docs/VALIDATION.md:420-429 | historical guest observation =====
+
+Run `84b2268a-9f6a-40af-98d5-3243c59cf15c` rebuilt the affected AOT module and
+retained the same poll, while diagnostics showed the active-state-only fast
+path was present but invoked zero times. This proves the observed voice was in
+the second `0x8001` state rather than using a stale artifact. The native guard
+now mirrors both exact GetStatus predicates, clears only pending bit `0x8000`
+and playing bit `0x0002`, and resumes at `0x00107086` so the guest performs its
+own status query and finalizer. Focused coverage exercises both states and the
+already-stopped no-op case. The combined native-executor/playability suite
+passes all 321 tests; manual progress beyond the card remains the acceptance
+check.
+
+
+===== docs/VALIDATION.md:431-438 | historical guest observation =====
+
+The next first-run failure after How to Play decoded callback `0x00024440` and
+then succeeded only after the following preparation generated its module. The
+frontend-card constructor stores stack argument 7 as its later callback, while
+its callers load that argument through `edi` across a branch family. Declared
+register-stack ABI recovery now seeds all three proven callbacks
+(`0x00024440`, `0x00025150`, and `0x00025A10`) during the pre-run AOT closure.
+An extracted-image check confirms all three have static code boundaries, and
+the asset-free branch-family regression recovers the complete set.
+
+
+===== docs/VALIDATION.md:477-486 | historical guest observation =====
+
+The follow-up create-save run `c346bcb0-c85d-464c-a0af-69d67f457821`
+advanced past the native crypto services and stopped with transport code 9 at
+`0xE0000710`. The return address `0x000DFB9A` follows calls to
+`KeQuerySystemTime` and kernel ordinal 305, `RtlTimeToTimeFields`; the normal
+native table had left that timestamp conversion as a cold Python callback.
+`RtlTimeToTimeFields` and its ordinal-304 inverse, `RtlTimeFieldsToTime`, now
+run in the native dispatcher with their exact two-argument guest ABI. A native
+regression converts a known 64-bit system time into the eight signed 16-bit Xbox
+time fields, verifies milliseconds and weekday, round-trips it exactly, and
+uses zero Python handlers.
+
+
+===== docs/VALIDATION.md:488-499 | historical guest observation =====
+
+Create-save run `47b70b13-be96-4c20-9c49-c93873500797` advanced through the
+time conversion and opened `U:\` plus `SaveImage.xbx`, then stopped with
+transport code 9 at `0xE0000670`. Import resolution maps that target to kernel
+ordinal 260, `RtlAnsiStringToUnicodeString`; the exact title call at
+`0x000E23CB` passes destination and source counted-string descriptors with
+allocation disabled and returns at `0x000E23D1`. The adjacent inverse helper
+calls ordinal 308, `RtlUnicodeStringToAnsiString`, at `0x000E2493`. Both
+conversions now operate on guest `Length`/`MaximumLength`/`Buffer` descriptors
+in the normal native runtime, use the USA target's fixed Windows-1252 mapping,
+honor preallocated or service-allocated destinations, return NTSTATUS buffer
+errors, and clean the exact three-argument ABI. The CP-1252 round-trip
+regression uses zero Python handlers.
+
+
+===== docs/VALIDATION.md:501-513 | historical guest observation =====
+
+Create-save run `a5a703db-ed32-410e-9a70-a5d16cd8dd6f` completed without a
+runtime failure and wrote a valid 54-byte `SaveMeta.xbx`, but never created the
+`Profile 1` payload. Static analysis of the title's XAPI wrappers found that
+retail Xbox `NtCreateFile` pushes nine arguments and returns with `ret 0x24`;
+the runtime ABI override incorrectly modeled the 11-argument Windows form and
+cleaned 44 bytes. The extra eight-byte cleanup made the metadata writer restore
+`EBX` from UTF-16 metadata (`0x006D0061`) instead of the caller's creation
+disposition, so the following profile open rejected its disposition before it
+could reach the filesystem. The override and diagnostic bridge now use the
+nine-argument Xbox contract. `STATUS_OBJECT_NAME_COLLISION` also maps to
+`ERROR_ALREADY_EXISTS` (183), as required by `XCreateSaveGame` to recover the
+valid metadata directory left by the failed attempt. All 622 Python unit tests
+pass; manual create, restart, and load remains the acceptance check.
+
+
+===== docs/VALIDATION.md:557-564 | historical guest observation =====
+
+Those repairs were necessary but did not close autosave. Retained July run
+`0759728e-edf7-4356-bf7e-d755d9770b0a` still displayed `Autosave failed` after
+the user triggered an autosave. The retained native persistence trace records
+the lower I/O operation finishing with title error 9 after `save_file_open`
+(`0x000D8D70`), then the save manager publishing error 13 at offset `0x048`
+and the UI entering failure state 4. No autosave payload write followed. This
+proves the corrected path-not-found conversion reaches the title, but a
+higher-level save-manager transition still rejects the new-slot path.
+
+
+===== docs/VALIDATION.md:575-582 | historical guest observation =====
+
+Manual run `1d52ff0e-c940-45bf-9010-2ba506bda291` reached the Driver's Ed
+How to Play card with the HUD over black and then advanced without further
+controller changes. The run remained static- and native-clean: live
+compilation and native promotion were disabled, frontier interpreter counts
+were zero, and normal execution made zero Python callbacks. An exact F12
+capture showed that the guest explicitly cleared presented surface
+`0x00330000` to black at draw index zero and then submitted only six HUD draws;
+there was no missing presenter copy or retained-backbuffer operation to repair.
+
+
+===== docs/VALIDATION.md:593-604 | historical guest observation =====
+
+Manual run `9642a6e1-3ac0-46d4-a3dd-59aef3cf16b2` disproved VBlank drift as the
+How to Play root cause. All 1,079 guest-visible ticks had matching callback
+schedules, runs, and completions with zero unscheduled ticks or failures, but
+the title still rendered only the six HUD draws over its own black clear for
+27 flips before resuming world rendering. There were no controller changes
+during that interval. Static analysis identifies the Driver's Ed demonstration
+input as the track's `DReplayNXBOX.dat` or `DReplayPXBOX.dat` stream loaded by
+guest function `0x00088D30`. Native diagnostics now retain each title-asset
+path, header, read result, and close result, plus the guest replay controller's
+count, index, loaded, mode, buffer, and selection state on every published
+flip. A manual rerun without an F12 capture is the next acceptance step; input
+remains manual.
+
+
+===== docs/VALIDATION.md:662-671 | historical guest observation =====
+
+The `Loading - please wait` frame stall was traced to a missing host delivery
+path for the callback registered through Xbox D3D at `0x00215880`. The title's
+callback at `0x000B86C0` copies `D3DVBLANKDATA.VBlank` into `0x005518FC`; without
+that write, the asynchronous asset wait loop pumps `0x000D5460` only once and
+never reaches its read/finalize passes. The normal scheduler now invokes the
+registered callback through a separate native AOT context with the exact
+three-DWORD VBlank payload and wall-clock-paced 60 Hz cadence. It preserves the
+primary context, has explicit completion/failure counters, and classifies an
+uncompiled callback as transport code 9. No Python runtime callback, live
+compilation, interpreter, or native promotion is involved.
+
+
+===== docs/VALIDATION.md:673-676 | historical guest observation =====
+
+The newly reachable `0x0010F9F0` target was then proven to be argument 2 of the
+title compare/search callback consumer at `0x0010D150`. That ABI is now in the
+declared stack-callback map, so deterministic AOT closure recovers it before a
+normal run rather than discovering it at runtime.
+
+
+===== docs/VALIDATION.md:688-698 | historical guest observation =====
+
+Manual normal run `aadc8980-d227-4793-a39b-2d7df3515a86` still displayed a
+stalled frame after 120 acknowledged publications. Its read-only live snapshot
+recorded 6,264,249 primary steps, 103,821 worker steps, scheduler phase 5, and
+EIP `0x0022D896` (`IDirectSoundBuffer::Play`). Audio stage 20 had already
+rejected buffer `0x22664A48` at data `0x2266422C`: the payload was 64 bytes and
+had sample rate zero. Therefore neither the decoder nor SDL device open was
+blocking. The stall begins after the observer forwards into the original Xbox
+DirectSound SDK body, while executing an AOT module. The next repair must make
+`Play` a complete guest-visible host ABI boundary (including object/voice state,
+HRESULT, and stack cleanup) or identify and implement the exact SDK hardware
+wait it requires; simply suppressing the call would not be acceptable evidence.
+
+
+===== docs/VALIDATION.md:700-711 | historical guest observation =====
+
+Static recovery of the supported XBE closes the source-level ambiguity. Public
+wrapper `0x0022D896` normalizes the interface pointer by `-0x1C`, calls
+`0x0022C90E`, and returns with `ret 0x10`. The internal method loads its voice
+from object offset `0x20`, which is public-buffer offset `+4`, then calls the
+voice `Play` core at `0x00235136`. That core establishes allocated/playing
+state through the 16-bit voice word at offset `0x12` before programming MCPX.
+The native service now terminates at this proven boundary: it resolves that
+voice, preserves unrelated state bits and adjacent bytes, sets allocated and
+playing, clears the host-owned hardware-pending bit, returns `S_OK`, and applies
+the declared 16-byte cleanup. Null buffers or missing voices return `E_FAIL`.
+Host payload/decode/output failures remain bounded diagnostics and do not enter
+the Xbox SDK hardware path or overwrite the guest-visible HRESULT.
+

@@ -1,0 +1,324 @@
+Burnout 2 Xbox audio DSP research (verified target, 2026-10-08)
+
+Source: the supported default.xbe, SHA256
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+Disc data/b2distfx.bin: 21756 bytes, SHA256
+4DA840E1EFADADE3FD7DDFE5DC0500157DEDC133F18748B738F8D00EE3746BE8.
+Private media and generated programs remain ignored.
+
+Boot's earlier invalid sound pointer came from rejecting Xbox MEM_NOZERO
+(0x800000) in NtAllocateVirtualMemory. The original heap requests 0x801000
+for its 0x783000-byte audio allocation. Supporting the flag advances boot to
+actual audio initialization, rather than substituting pointers or callbacks.
+Flag corroboration: XboxDev/nxdk lib/xboxkrnl/xboxkrnl.h, MEM_NOZERO.
+
+Public DirectSoundCreate: 0x22FC18, three stack arguments, ret 0x0C.
+Public DirectSoundDownloadEffectsImage: 0x22D6E6, five stack arguments, ret 0x14.
+The preserved service record at 0x230ABD is an internal thiscall function,
+not the public upload boundary. Do not bind it as a public three-argument API.
+Title loader 0x10AA10 uploads the image and passes locations 2 and 4.
+SDL sound-device creation and native effect upload now succeed.
+
+Image metadata:
+  0x804: 2543 program words; 0x80C: 2326 data words.
+  Payload begins at 0x818. Descriptor table starts at
+  0x818 + 4 * (2543 + 2326) = 0x542C.
+  Table contains five effects, eight header bytes, five 32-byte descriptors,
+  followed by five encrypted eight-byte program seeds.
+  Descriptor +4 is each effect's program size in bytes.
+
+Effect  File offset  Program bytes  DSP state base (entry's r5 immediate)
+0       0x0818       144            X:0x0080
+1       0x08A8       532            X:0x00AE
+2       0x0ABC       4184           X:0x00C5
+3       0x1B14       4844           X:0x02EF
+4       0x2E00       464            X:0x0519
+
+SDK image loader 0x230850 decodes the seed array, then each program separately.
+Seed routine 0x23637D takes one output pointer, ret 4; it seeds 0x236304 with
+low word 0x49DE12BA and high word 0x7FA49BCA, then steps 80 times.
+Decoder 0x2363AA takes seed pointer, input, byte count, output, mode; ret 0x14.
+The image loader uses mode zero and in-place output.
+Cipher step 0x236304 takes four stack arguments, ret 0x10; state is stored at
+0x24AD90/0x24AD94. These routines are already compiled ahead of time.
+
+b2 --inspect-effects XBE IMAGE OUTPUT_DIRECTORY executes these original SDK
+routines without booting, with a 64 KiB image cap. It recovered all five programs.
+The first program performs 32-frame gain mixing into one or more output buffers;
+flag bit 1 chooses addition to existing output. The other programs include
+distortion, filters and delay processing; all five execute as compiled C++.
+No DSP interpreter, emulator or JIT is linked into the recompilation.
+
+Bounded research disassembly used dsp56300-disasm 1.0.0 (MIT):
+https://github.com/mborgerson/dsp56300
+Windows x64 release archive SHA256 (checked against its release asset digest):
+6EC091D3E4B6E6E6276B474C852736449D7F538A1F8826A89E3CB6E787BC5AC6.
+Only the disassembler and its licenses were extracted; no emulator was used.
+ISA reference: https://www.nxp.com/docs/en/reference-manual/DSP56300FM.pdf
+
+Observed instruction families in effects 1..4: move, add, bsr, dor, rts, bra,
+brset, bset, movep, macr, cmp, movec, asl, brclr, beq, sub, nop, clr, mac,
+and, blt, bclr, lua, bge, asr, mpy, mpyi, neg. Decryption and disassembly alone
+do not establish execution or parity.
+
+Native effects implementation
+
+b2-tool compile-effects emits fixed native functions and direct calls for all
+1754 instructions: effects 0..4 contain 27, 103, 707, 827 and 90 instructions.
+Unknown encodings fail generation; the game has no runtime DSP decoder, JIT
+or interpreter. Uploaded programs must match the compiled fingerprints.
+The native image decoder independently matches every byte of the original
+compiled SDK output. Effects execute in 32-frame blocks using 24-bit samples,
+56-bit accumulators and convergent rounding. SR bit 20 enables saturation mode;
+it does not select integer multiplication.
+
+Native DMA follows bounded seven-word descriptors and performs actual circular
+delay-buffer copies before reporting completion. Ports X:FFFFD4/FFFFD6 select
+the next node and control DMA; X:FFFFC5 exposes the completion interrupt.
+Source register/encoding corroboration:
+https://github.com/mborgerson/dsp56300 (v1.0.0)
+https://github.com/xemu-project/xemu/tree/master/hw/xbox/mcpx/apu
+These sources were consulted for hardware facts; no emulator is linked.
+
+The native upload exposes synchronized X state at FE830000, read-only compiled
+program bytes at FE83A000 and persistent native scratch at FE900000. The guest
+receives the original descriptor fields with these native address relocations.
+SDL processing and CPU effect-parameter reads/writes share the same state.
+Unsupported DMA formats, modulo addressing and changes to live program layout produce
+explicit boundaries instead of pretending to succeed.
+
+--check-effects passes 65 arithmetic, gain, filter, routing, parameter and five-program graph checks.
+Its 2048-frame graph transfers 138240 delay words. A Ryzen 5 5600X processed that
+component in 3.6703 ms; this is not a game FPS or audio-parity measurement.
+HRTF filtering, stream packets and reference listening remain incomplete.
+
+All 32 input bins feed the compiled graph through the shared X:C00..FFF and
+X:1400..17FF windows. Public buffer descriptor +14h selects the input of an
+FX source; the first six bins feed native speaker folding.
+Per-bin headroom uses binary shifts, and per-source headroom uses hundredths of
+a decibel. Original 21161D/211634 timestamp conversion reads the real native
+48 kHz sample clock at FE80200C. Same-layout uploads prepare a new native state,
+swap it under the SDL stream lock and retire the previous state outside that lock.
+
+Resource method discovery
+
+The sound descriptor constructor calls 10D4F0 with two literal table/count pairs.
+Its loops at 10D560 and 10D5B0 use 24-byte source records; +14h is a callable
+method and null methods become ED200. GUID/type metadata occupy earlier fields.
+The table at 345610 contains seven records, including 10A9D0 at 3456B4.
+The game later copies these methods into eight-byte {code, method-id} records
+and dispatches them at 10C530. Static discovery must follow this registration
+contract; these are not contiguous vtables or arbitrary code-looking data.
+
+Native audio work
+
+22D9CA is the no-argument, void DirectSoundDoWork entry (RET, no stack cleanup).
+The verified prefix is 56 E8 C5 E6 FF FF 0F B6 F0 A1 C0 AC 24 00. It tests the
+device at 24ACC0 and calls 22C4D0, which passes the device's MCPX object at +0Ch
+to 231128. That routine drains the hardware object's notification list at +4B0h
+and invokes each record's virtual callback. Native device creation owns no MCPX
+object, so translating this private hardware path cannot process native voices.
+The public binding instead publishes actual SDL mixer buffer state and errors.
+No-device calls remain valid. Stream packet callbacks still require a native
+stream implementation; this binding does not claim to implement them.
+
+Buffer format changes
+
+The original resource path calls SetBufferData (22EF4B) before SetFormat
+(22EF2F, caller 1077F8), while asynchronous resource work fills the bound memory.
+A boot snapshot shows 783000h bytes of backing capacity with stereo 48 kHz Xbox
+ADPCM (72-byte blocks); the capacity includes 24 bytes beyond the last full block.
+The native API binds the original guest memory rather than copying and decoding
+an unfinished buffer. PCM reads that memory directly; ADPCM uses one 64-frame
+block cache per voice (512 bytes maximum), shared with the strict offline decoder.
+Playback allocates nothing and performs no file I/O or whole-buffer decode.
+Format, binding, start, seek and loop wrap invalidate the block cache. Only complete
+codec blocks are playable; capacity padding is not fabricated as sample data.
+Offline data() owns its byte copy for callers without guest memory. The checks
+exercise format changes with data attached, repeated format application, writes
+after binding and a padded ADPCM allocation. Buffer storage must remain alive
+until unbound, as required by the original SetBufferData ownership contract.
+
+Effect-input bus format
+
+An original FXIN buffer descriptor has flags 80010h, size zero and no format
+pointer. The SDK default at 237B78 is PCM, mono, 48 kHz, 192000 bytes/second,
+four-byte blocks and 24 bits of mixer precision. This describes a mix-bin input
+bus, not an encoded sample buffer. Native buses accept that format and process
+their existing floating mix-bin signals; encoded bytes cannot be attached to
+them. PCM file decoding remains strict. Shared routing/gain checks now use this
+original bus format, and a check rejects attaching sample memory to a bus.
+
+Extended buffer stop
+
+22D8D2 is the public four-word extended stop wrapper, ending in RET 10h. It
+converts its public buffer to the private object and calls 22C9AE. The game's
+107050 passes {buffer, time low=0, time high=0, flags=0} at 107072 and then
+polls GetStatus until playback has stopped. The native binding performs that
+actual immediate stop on the SDL voice and publishes its stopped state. Scheduled
+or envelope modes remain explicit unsupported boundaries; no MCPX registers
+are fabricated for the private hardware implementation.
+
+Original 3D source calculations
+
+22E8C4 is the four-word SetRolloffCurve wrapper; its original prefix is
+FF7424108B442408FF7424108BC8 and it ends in RET 10h. 22E005 stores the point
+pointer/count at 3D state +50h/+54h; setting apply bit 0 defers recalculation.
+The resource caller at 106F78 passes {buffer,2CAE20,1,1}; that single float is
+1.0 (original bytes 0000803F). 2302A4 interpolates distance curves from unity at
+the minimum distance through their supplied points across the maximum distance.
+A single unity point is constant; other one-point curves still interpolate.
+
+SetAllParameters at 22E78C takes {buffer,76-byte DS3DBUFFER,apply}, RET 0Ch.
+Its original leaf 22DD25 copies parameter +4h..+48h into source +8h..+4Ch.
+This includes position, velocity, cone, min/max distance, mode and source factors.
+Calculate3D (22EC59) takes {listener,source}; GetVoiceData (22CEDB) takes
+{listener,source,listener-I3DL2,source-I3DL2,output}. Output +4h/+8h are distance
+and cone attenuation in hundredths of a decibel, and +24h is Doppler pitch.
+Source +68h is computed distance; +74h/+78h hold angular placement.
+
+The native shared Spatial component executes those already compiled routines in
+bounded 8 KiB mathematical scratch storage. Original 23074D initializes its full
+mathematical dispatch table. FS:+58 is zero for this standalone calculation, so
+the original 22BEDA/22BEFF guards perform no kernel mutex work. These routines
+operate on parameter records and original constants, without MCPX objects.
+They are ordinary AOT calls, not a runtime decoder or CPU interpreter.
+
+SDL voices consume cached gain, stereo placement and pitch adjustments. Calls
+commit only changed deferred settings; unchanged commits do no recalculation.
+Native stereo placement is an approximation; console HRTF filtering and
+audio scene parity are not claimed. Offline --check-spatial exercises the original
+calculators without game boot or a sound device and measures repeated calculations.
+
+Environmental source settings
+
+Public SetI3DL2Source is 22E8E8, prefix 8B442404FF74240C8BC8FF74240C,
+arguments {buffer,36-byte DSI3DL2BUFFER,apply}, RET 0Ch. Original leaf 22E048
+copies nine words to source +80h..+A0h and marks source +7Ch dirty; apply 1
+defers calculation. Immediate settings and explicit deferred commits update
+the native source rather than entering uninitialized MCPX objects.
+
+The original constructor copies 18 source words from 237C74 and nine
+environmental words from 237C48 (22F116/22F12C). Listener constructor 22EF70
+copies twelve environmental words from 237BD8. They encode the generic preset,
+including Room=-1000, RoomHF=-100, RoomRolloff=0 and HFReference=5000.
+The original generic preset differs from the silent API default.
+
+GetVoiceData 22CEDB calls original 235B1C with the actual distance, listener
+room rolloff, HF reference and source parameters. Its output +1Ch/+20h are
+direct/room attenuation; +30h/+34h are direct/room filter coefficients. Original
+235982 computes the 16-bit one-pole coefficients; SDL caches them and retains
+fixed filter histories without allocations in the mixing callback. Original
+232FED/233139..23315F establishes which mix bins receive each adjustment:
+6..9 use direct attenuation and front/back gains; bin 10 uses room attenuation;
+both also receive distance/cone attenuation. The native max-distance mute flag
+feeds source +58h bit 2 of the original calculation.
+
+The actual upload locations are {reverb=2,crosstalk=4}. Effect 2's original
+state C5h+5 holds 1540h, the input at 1400h+10*32; its program reads that
+pointer at P:17Bh/17Fh. Native upload checks this input and room sends reach
+the original compiled reverb graph. SDL's stereo placement still approximates
+HRTF and listener preset changes remain incomplete. FXIN return processing is
+described below. 12 spatial, 37 audio and 65 DSP offline cases pass without booting.
+
+API layout/range and mix-bin corroboration (facts only):
+https://gist.github.com/inactive123/2985275 (original Xbox dsound.h).
+
+Buffer cursors and regions
+
+Verified in the supported executable: public GetCurrentPosition 22D932 calls
+22CADD, then CMcpxBuffer::GetCurrentPosition 234D32. A playing voice obtains
+its hardware sample offset through 233C67; 231883 converts samples to bytes.
+ADPCM conversion is (samples >> 6) * block_align, PCM is samples * block_align.
+The write cursor leads by max(bytes(32 samples), block_align), rather than
+being identical to the play cursor. Inside an active loop it is
+loop_start + (play + lead) % loop_length; otherwise it wraps at allocation
+capacity. Stopped voices return the cached play position for both outputs.
+
+SetPlayRegion 22E908 -> 22E169 normalizes size zero to capacity - start.
+22E112 stores play start/length at descriptor C0/C4 and resets loop C8/CC
+to 0/length. SetLoopRegion 22D8F6 -> 22CA58 normalizes against play length
+and changes C8/CC only. Invalid nonzero lengths return 88780032.
+2351E6 resets the cached play position and updates hardware start through
+234908: descriptor B8 supplies the source address, and C0 is added to that
+address before setting the DMA page/offset. The sample cursor is relative
+to the play region, rather than adding the region's source-memory offset.
+
+Native buffer bookkeeping now retains source address/capacity at B8/BC,
+normalizes region lengths, resets the loop on play-region changes, and
+returns separate cursors. Five added cases exercise PCM lead/capacity wrap,
+nonzero loop start, stopped cursors and one-block ADPCM lead. All 37 audio
+cases pass without booting or opening a sound device.
+
+Effect parameter overwrite (manual data watch, 2026-10-08)
+
+Local manual-audio-watch-20261008-182654.log/.json reproduces the same failure
+with manual input only: voice 17, stereo ADPCM block 91044, guest header
+017D0650 = CBD838000D2D6200. The disc's corresponding right-channel header is
+F8AD4300. A hardware write watch on 017D0654 catches a four-byte copy from
+guest 00627E58 of value 00622D0D, with the neighboring encoded music unchanged.
+The native stack is 236204 -> 230B56 -> 22C31A -> 22D734 -> title 10A720.
+
+Verified original bytes establish public SetEffectData at 22D734, six stack
+words and RET 18h. 10A720 passes deferred flag 1. The private SDK path computes
+a hardware shadow offset at 230B8D (LEA with displacement 017D0618) before
+236204 copies the parameter. Running that path without its MCPX objects writes
+the parameter into ordinary guest RAM, overlapping the streaming music bank.
+The invalid ADPCM index is the consequence, rather than a codec/data defect.
+
+GetEffectData is 22D70D (five words, RET 14h), through 22C37C -> 230BFF.
+CommitEffectData is 22D75E (one word, RET 4), through 22C3DB -> 2309EC.
+2309C5 validates effect indices; 230B56 defers when flags bit 0 is set;
+230BFF reads active state, and 2309EC submits queued parameter changes.
+
+Bind all three public operations to native DSP state using the uploaded effect's
+declared state address/size. Queue deferred bytes until commit, retain immediate
+writes, and preserve unrelated live DSP history. No writes to music memory, no
+ADPCM clamping, and no per-update allocation. The seven added offline effect
+cases exercise the captured gain, commit visibility, immediate overwrite,
+unaligned data, adjacent state, range bounds and image replacement.
+The rebuilt release passes all 58 effect cases, 37 audio cases and 52 original
+game CPU cases. Repeated manual replay validation remains to be completed.
+
+Missing driving sound: shared mix buffers and FXIN returns
+
+The manual routing capture manual-audio-routing-20261008-184823.log ended
+normally with no audio failure and no automated inputs. It records an FXIN
+voice on mix bin 14, routed engine sources, and effect 1's input/output both
+set to DC0h. Original title 0D2845..0D2898 writes DC0h to effect 1 offsets
+14h/18h through public SetEffectData. SDK 22F1A4 takes the FXIN input bin
+from descriptor +14h. SDK 234FF7 binds that voice to a 32-sample region at
+24AE48 + (input_bin - 11) * bytes(32 samples).
+
+X:C00..FFF and X:1400..17FF name one 32-by-32 mix buffer. Previously the
+native mixer duplicated six speaker bins, but other bins and effect writes
+were separated. Distortion at DC0h could not read input bin 14 at 15C0h;
+reverb writes and subsequent filter reads also failed to share their samples.
+Dsp loads, stores and delay transfers now resolve the shared backing buffer.
+Hardware address corroboration, without running an emulator:
+https://github.com/xemu-project/xemu/blob/master/hw/xbox/mcpx/apu/dsp/interp/dsp_cpu.c
+
+FXIN voices now consume the preceding processed block before the mixer replaces
+its inputs. Source sends enter their selected bin; the return voice applies its
+own gain, headroom, 3D placement and environmental filters once. FXIN activation
+follows routed playing sources; FXIN2 retains explicit Play/Stop control.
+The existing offline suite adds seven cases for shared effect addressing,
+speaker audibility, captured engine routing, return volume/mute and FXIN2.
+A native replay of the captured route produced peak zero before the fix and
+0.625082 afterward. This proves signal delivery, not reference sound parity.
+
+Centered 3D return volume
+
+The native equal-power stereo pan multiplied both centered channels by
+sqrt(0.5), imposing an extra 3.01 dB loss on in-game FXIN returns. SDK volume
+construction at 00232FED applies the distance/cone result to paired bins 6/7
+and 8/9 equally (bin selection at 00233139..0023315F). GetVoiceData at 0022CEDB
+exposes distance/cone, front/back and environmental attenuation separately.
+The SDK amplitude multiplier at 0022BF4D uses 2000.0 from 002C944C; the native
+hundredths-of-dB conversion is already correct. Original 2D headroom remains
+600 hundredths of a dB; it is not the cause of this extra loss.
+
+Stereo pan now preserves unity on its stronger channel and both channels at
+the center, while retaining the original distance/cone/front/back and effect
+gains. The existing spatial check verifies a centered source has gains 1/1.
+This corrects an unintended attenuation; full HRTF filtering remains incomplete.

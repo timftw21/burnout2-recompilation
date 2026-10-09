@@ -1,0 +1,22 @@
+Native Ethernet status
+
+The menu calls original E726A. Its first call to ordinal 253 (PhyInitialize)
+at E728E supplies two zero words. It then calls ordinal 252 (PhyGetLinkState)
+with one zero word at E7295. E72A7 masks the active bit and returns zero for a
+disconnected cable. This query does not require starting the Xbox network stack.
+
+The native provider uses Windows GetIfTable2 and frees its table with FreeMibTable.
+Only connected, operational, physical Ethernet interfaces count. Wi-Fi, loopback
+and virtual interfaces do not become an invented Xbox cable. Active and speed
+flags represent actual native status; speeds above 100 Mbps use the Xbox's highest
+available speed flag. Duplex is unavailable in this table and remains unspecified.
+Initialization and forced refresh query the native interfaces without resetting
+hardware. Enumeration errors are returned or reported, never changed to success.
+This implements link queries, not Xbox Live or multiplayer transport.
+
+Original API signatures and flag corroboration:
+https://github.com/Cxbx-Reloaded/Cxbx-Reloaded/blob/master/src/core/kernel/exports/EmuKrnlPhy.cpp
+Windows interface API and field definitions:
+https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-getiftable2
+https://learn.microsoft.com/en-us/windows/win32/api/netioapi/ns-netioapi-mib_if_row2
+These references supply API facts; no emulator code is copied or linked.

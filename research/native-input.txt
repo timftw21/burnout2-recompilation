@@ -1,0 +1,23 @@
+Autonomous controller input
+
+The live diagnostic script owns a process-local SDL virtual gamepad. Its Input
+instance selects only that joystick ID and disables keyboard input. Physical
+controllers and global keyboard state are untouched. Script timing starts with
+the first original GPU flip; reports include applied events and controller packets.
+
+SDL 3.4.18 drops non-centering joystick events while its windows lack keyboard
+focus unless SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS is enabled. The bundled
+SDL_joystick.c implements this in SDL_PrivateJoystickShouldIgnoreEvent. Scripts
+previously applied events that SDL discarded while the user worked in Codex.
+The native app now sets the background hint only for an explicitly supplied
+control script, before SDL initialization. No foreground or computer-use action
+is needed, and ordinary manual controller behavior is unchanged.
+
+The 35-second native-background-menu-live report proves all 12 script events
+reached the controller and the original no-save acknowledgement appeared.
+After callback-discovery fixes, native-ui-road-live applied 21 events, accelerated
+the original car to 38 mph and rendered the lesson's road, traffic, car and HUD.
+The run stopped at its requested duration without an unsupported boundary.
+
+Primary interface:
+https://wiki.libsdl.org/SDL3/SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS

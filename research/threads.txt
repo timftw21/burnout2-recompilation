@@ -1,0 +1,35 @@
+Native thread scheduling and callback discovery
+
+CC5A0 waits for a resource and loops at CC5C0 without a kernel wait. Cooperative
+scheduling only at services starved the two original workers. Native function
+entries and loop headers now check a 1024-site counter; expiration checks a 1 ms
+time slice. Switching preserves the compiled C++ stack and floating state through
+Windows fibers. Interrupts disabled or IRQL above 1 prevent preemption. Diagnostics
+report each thread's original routine, continuation, stack and state.
+
+E67A7 registers a record containing LIST_ENTRY at +0 and a callback at +8.
+E6690 walks the list; E66B4 calls that callback. Original 124492 installs 127F58
+at 5A871C before passing record 5A8714 to E67A7. Discovery follows literal
+registration arguments and verified callback writes, including BSS records.
+
+E68C4 is the six-argument CreateThread wrapper. It forwards argument 3 as the
+start routine to PsCreateSystemThreadEx and supplies original system entry E682C.
+112930 stores argument 2 at +4 of a thread record; 112960 invokes that field.
+112980 supplies 112960 as CreateThread's start routine. Discovery follows both
+contracts instead of treating arbitrary immediates as function pointers.
+
+215880 stores the vertical-blank callback at device-context 2256C0+1988.
+Original B86C0 copies the first DWORD of D3DVBLANKDATA to 5518FC. CC5C0
+uses changes in that counter to pump D5460. Preserved evidence identifies this
+same resource stall. Native 60 Hz delivery invokes the compiled callback at
+IRQL 2 and preserves the interrupted thread's CPU and floating state. Delivery
+continues when every thread is waiting. Boot now leaves the busy wait.
+
+The registered RenderWare plugin constructor EA8B0 receives its engine offset
+as argument 2 and installs EA5F0/EA6B0 at engine base 5ADCA8 plus that offset.
+It saves the offset at 5A64E4; EA890 dispatches the first installed method.
+Static discovery validates both constructor and dispatcher bytes and follows
+the stored methods. These fixes compile 35607 discovered functions. Complete
+boot and race rendering have not been established.
+
+Fiber API: https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createfiberex
