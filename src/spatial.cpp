@@ -1,5 +1,6 @@
 #include "spatial.h"
 #include "xbe.h"
+#include "xbox.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -105,17 +106,16 @@ SpatialResult Spatial::calculate(const SpatialListener& value,const SpatialParam
     }
     if(parameters[15]!=2) {
         const auto pan=std::clamp(std::sin(result.angles[0]*std::numbers::pi_v<float>/180),-1.0f,1.0f);
-        // The SDK gives paired 3D bins the same volume (232FED/233139).
-        // Stereo placement must retain that level at the listener's centre.
-        const auto maximum=1+std::abs(pan);
-        result.pan={std::sqrt((1-pan)/maximum),std::sqrt((1+pan)/maximum)};
+        // Keep total stereo power constant as a source moves. The previous
+        // stronger-channel normalization added up to 3 dB at the centre.
+        result.pan={std::sqrt((1-pan)*0.5f),std::sqrt((1+pan)*0.5f)};
     }
     if(!std::isfinite(result.gain) || !std::isfinite(result.pitch) || result.pitch<=0 ||
         !std::isfinite(result.distance) || !std::isfinite(result.pan[0]) || !std::isfinite(result.pan[1]))
         throw std::runtime_error("Original 3D audio calculation produced invalid output");
     return result;
 }
-std::string check_spatial(const std::filesystem::path& executable) {
+std::string check_spatial(const std::filesystem::path& executable,const std::filesystem::path& output_directory) {
     Xbe image(executable);if(!image.supported()) throw std::runtime_error("3D audio checks require the verified executable");
     std::vector<std::byte> bytes(image.image_size);image.load(bytes);Memory memory(image.base,bytes);Spatial spatial(memory);
     SpatialParameters parameters{};parameters[0]=76;parameters[7]=parameters[8]=360;
@@ -123,7 +123,7 @@ std::string check_spatial(const std::filesystem::path& executable) {
     set(11,1);set(13,5);set(14,100);set(16,1);set(17,1);set(18,1);
     SpatialListener listener_value;unsigned checks=0;
     const auto require=[&](bool condition){++checks;if(!condition) throw std::runtime_error("Original 3D audio check failed at case "+std::to_string(checks));};
-    auto result=spatial.calculate(listener_value,parameters,{});require(result.gain==1 && result.pitch==1 && result.distance==0 && result.pan==std::array<float,2>{1,1});
+    auto result=spatial.calculate(listener_value,parameters,{});require(result.gain==1 && result.pitch==1 && result.distance==0 && result.pan==std::array<float,2>{std::sqrt(0.5f),std::sqrt(0.5f)});
     set(3,10);result=spatial.calculate(listener_value,parameters,{});require(result.distance==10 && result.gain<1 && result.gain>0);
     const std::array<float,1> unity{1};result=spatial.calculate(listener_value,parameters,std::as_bytes(std::span(unity)));require(result.gain==1);
     const std::array<float,1> descending{0.5f};result=spatial.calculate(listener_value,parameters,std::as_bytes(std::span(descending)));
@@ -149,6 +149,7 @@ std::string check_spatial(const std::filesystem::path& executable) {
     const auto started=std::chrono::steady_clock::now();
     for(unsigned i=0;i<1000;++i) result=spatial.calculate(listener_value,parameters,std::as_bytes(std::span(unity)));
     const auto elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
-    return std::format("{{\"format\":\"b2-spatial-check-v1\",\"passed\":true,\"game_booted\":false,\"cases\":{},\"calculations\":1000,\"processing_ms\":{},\"right_angles\":[{},{}],\"left_angles\":[{},{}],\"runtime_decoder\":false}}",checks,elapsed,right.angles[0],right.angles[1],left.angles[0],left.angles[1]);
+    const auto bindings=output_directory.empty()?"null":check_audio_listener(executable,output_directory);
+    return std::format("{{\"format\":\"b2-spatial-check-v1\",\"passed\":true,\"game_booted\":false,\"cases\":{},\"calculations\":1000,\"processing_ms\":{},\"right_angles\":[{},{}],\"left_angles\":[{},{}],\"runtime_decoder\":false,\"bindings\":{}}}",checks,elapsed,right.angles[0],right.angles[1],left.angles[0],left.angles[1],bindings);
 }
 }

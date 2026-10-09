@@ -60,4 +60,7 @@ inline __m128 xmm(const FloatingState& state, unsigned index) {
 inline void set_xmm(FloatingState& state, unsigned index, __m128 value) {
     std::memcpy(state.xmm[index].data(),&value,16);
 }
+// Preserve the Xbox estimate independently of the host CPU's RSQRT lookup.
+__m128 rsqrt_ss(__m128 value);
+__m128 rsqrt_ps(__m128 value);
 }

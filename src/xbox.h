@@ -13,6 +13,7 @@ struct XboxHost {
     std::function<bool()> poll;
     std::function<void()> flip;
     bool trace_io=false;
+    std::filesystem::path storage_root;
 };
 struct BootIo {
     std::uint32_t ordinal=0,status=0,information=0,callsite=0;
@@ -63,7 +64,13 @@ public:
     void capture_frame(const std::filesystem::path& directory);
 private:
     friend void native_platform(Cpu&,Memory&,std::uint32_t);
+    friend std::string check_storage(const std::filesystem::path&,const std::filesystem::path&);
+    friend std::string check_replays(const std::filesystem::path&,const std::filesystem::path&,const std::filesystem::path&);
+    friend std::string check_audio_listener(const std::filesystem::path&,const std::filesystem::path&);
     struct State;
     std::unique_ptr<State> state_;
 };
+std::string check_storage(const std::filesystem::path& xbe,const std::filesystem::path& output);
+std::string check_replays(const std::filesystem::path& xbe,const std::filesystem::path& disc,const std::filesystem::path& output);
+std::string check_audio_listener(const std::filesystem::path& xbe,const std::filesystem::path& output);
 }

@@ -629,3 +629,247 @@ with no D3D11 warnings. Reports: build/graphics-feedback-gpu-verified/report.jso
 and build/graphics-feedback-warp/report.json. The release shader bank contains
 18 original vertex programs and 27 built-in shaders, compiled ahead of time.
 
+===== 2026-10-09 | purple shadows and distant texture detail =====
+
+The user confirmed reflections and the return of shadows, with purple artifacts.
+Manual capture frame-123362583600 contains 649 draws without truncation, under
+build/windows/Release/build/captures. Draws 609..614 produce the 256x256 shadow;
+draw 615 samples it as XRGB8 with alpha kill. Surface records 92 and 93 have
+the same color allocation 0x00E30080, zero depth offset, packed 1024-byte pitch
+and dimensions. Their only format difference is linear 0x08080124 versus
+Morton 0x08080224. The linear image is black; the swizzled image has colored
+speckles around the car mask. Draw 609's retained clear registers specify black,
+all color channels and the full 256x256 rectangle. The old capture did not log
+clear events, so those registers alone do not establish their preceding order.
+
+The bridge allocated independent native images for these memory aliases. A full
+uniform clear can safely migrate the same packed color storage between layouts:
+all pixels have identical bytes, irrespective of their permutation. Reuse now
+requires matching offset, dimensions, pixel format, packed pitch and no active
+depth allocation. Draws invalidate the uniform-clear condition. A subsequent
+full clear can migrate again; nonuniform layout reinterpretation is explicitly
+unsupported instead of sampling an unrelated stale image. Partial clears are
+never treated as full allocation clears. F8 captures now also record clear
+events and their format, flags, color and rectangle.
+
+Captured world textures use independent minification/magnification filters,
+negative signed LOD bias and 2x anisotropy. For example draw 5 has texture filter
+0x02063DBB and control 0x4003FFD0: trilinear minification, linear magnification,
+bias -581/256 (-2.26953125 levels), and 2x anisotropy. The old sampler used only
+the magnification bit for every filter, with zero bias and no anisotropy. Native
+samplers now translate those fields and the level clamps. Their cache is shared
+independently of blend/depth/raster pipelines; LOD changes no longer duplicate
+entire pipelines or four sampler objects.
+
+Primary hardware definitions, signed bias conversion and layout-clear migration:
+https://raw.githubusercontent.com/XboxDev/nxdk/master/lib/pbkit/nv_regs.h
+https://raw.githubusercontent.com/xemu-project/xemu/master/hw/xbox/nv2a/nv2a_regs.h
+https://raw.githubusercontent.com/xemu-project/xemu/master/hw/xbox/nv2a/pgraph/texture.h
+https://raw.githubusercontent.com/xemu-project/xemu/master/hw/xbox/nv2a/pgraph/gl/surface.c
+These references establish register/storage behavior, not gameplay parity.
+
+Focused offline cases check negative, positive and fractional detail bias,
+disabled mipmapping, minimum/maximum levels, grazing-angle anisotropic detail,
+and repeated linear-clear/swizzled-render shadow cycles with nonuniform masks.
+They use the shared native renderer and GPU packet bridge without booting.
+All 158 cases pass on NVIDIA GeForce RTX 5060 Ti and Microsoft WARP with no
+D3D11 validation messages. Final reports: build/shadow-detail-gpu-release/report.json
+and build/shadow-detail-warp-release/report.json. The rebuilt release retains
+18 original vertex programs and 27 built-in shaders compiled ahead of time,
+with runtime_compiler=false. In-game appearance awaits the user's manual check.
+
+===== 2026-10-09 | automatic failure logging for manual Crash mode reproduction =====
+
+The user reported a stop while loading Crash mode, with no known log or visible
+error. No recent b2.exe application-crash event or saved game report was found.
+Normal GUI play previously discarded BootResult diagnostic details after putting
+the boundary text in the settings status. A missing function is not yet proven.
+
+GUI and command-line runs now share the game-result serializer. Each process
+opens a separate log under the executable's logs/ directory, records its verified
+target hash, and retains game starts, exits and caught errors. The game-end report
+includes registers/flags, stack, checkpoint history, threads and failed file I/O.
+Successful gameplay file tracing remains opt-in. An unhandled native-exception
+filter writes bounded exception/module-offset and same-thread guest context to
+the already-open file without heap allocation or symbol loading. Normal shutdown
+adds session_end. No per-frame file writes or automatic frame captures are added.
+
+The rebuilt release passed the existing hidden settings check. A bounded offline
+native fault probe verified code 0xC0000005, CPU state, history and exception
+parameters survive process termination in valid JSON lines. The actual game
+executable's caught-error path also retained its error and session-end records.
+Neither validation booted the game. The user will reproduce Crash mode later;
+its cause and fix remain pending that evidence.
+Exception-filter reference:
+https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-setunhandledexceptionfilter
+
+===== 2026-10-09 | original profile saving and loading =====
+
+Log b2-20261009-152255-8080.log stopped at original code 0x000E1842 while reading
+16 bytes from 0xFFF01450. This was ordinal 325 (XboxSignatureKey), incorrectly
+left as a function stub rather than mapped key data. Original bytes at 0x000E19EF
+read its import at 0x00293D24 before passing it to the HMAC helper. SHA imports
+335/336/337, HMAC 340 and save-metadata conversions 260/308 were also unbound.
+Existing native file and directory services already supported persistent saves.
+
+Original signature begin/update/end routines at 0x000E1990, 0x000E1A0D and
+0x000E1A27 use a copyable 116-byte SHA context. The inner and outer HMAC helpers
+at 0x000E1842 and 0x000E18A9 cap keys at 64 bytes. The nonroaming signature
+helper at 0x000E191B uses XboxHDKey. The native provider now supplies those
+crypto services, counted Windows-1252/UTF-16 conversions and mapped data exports
+323/325/353/354. Game code and original profile signing remain compiled ahead
+of time; no original game instructions or signature checks were bypassed.
+
+A new native console identity is generated once into data/user/storage.key
+beside b2.exe. Per-title keys are derived from that identity and the verified
+XBE certificate. This is native storage identity, not a retail BIOS or EEPROM
+dump. Saves and their identity persist independently of the working directory;
+back up the whole data/user folder. Startup logs record its path without keys.
+
+Primary ABI and per-title key derivation references:
+https://github.com/XboxDev/nxdk/blob/master/lib/xboxkrnl/xboxkrnl.h
+https://github.com/Cxbx-Reloaded/Cxbx-Reloaded/blob/master/src/core/kernel/exports/EmuKrnlXc.cpp
+https://github.com/Cxbx-Reloaded/Cxbx-Reloaded/blob/master/src/core/kernel/init/CxbxKrnl.cpp
+Original import, certificate and SDK bytes were checked in bounded address ranges.
+
+The rebuilt release passed 91 isolated --check-storage cases without booting.
+The check executes original heap, title-mount, save-directory, profile initializer
+and signature routines, verifies crypto independently with Windows CNG, creates
+and reopens a signed profile across fresh runtimes, then overwrites it through
+the asynchronous unbuffered file path and reopens again. It also checks SHA
+padding and copied contexts, Xbox HMAC truncation and unaligned-write rejection.
+Fixtures stay in build/save-load-offline-v3, separate from user saves.
+
+The user confirmed the complete in-game create/save/close/reopen/load sequence.
+Their Profile 1 file is 31,744 bytes under UDATA/41430019/57BD267AFF58. Logs
+b2-20261009-155651-14416.log and b2-20261009-155734-16940.log both record the
+executable-relative storage root, normal window closure and session_end, with
+zero runtime shader compilations. Crash mode investigation remains deferred.
+
+===== 2026-10-09 | Crash-mode drawing callback omitted from static build =====
+
+Log b2-20261009-160455-16260.log proves an unsupported stop at 0x00034C20:
+"function is absent from the fixed native table". The top return is 0x000C1309;
+original C1210 invokes queued record +50h at C1306, then follows its next link.
+The failure is a missing compiled game callback, not a missing platform binding.
+
+Bounded native analysis of producer 35570 found 1667 instructions without budget
+exhaustion. At 36670, BA204C0300 loads EDX with 34C20; at 366AD, 895048 installs
+EDX at UI value object +48h. This producer calls the verified 1E720 initializer.
+Existing discovery recognized literal method stores but skipped register stores.
+The same instructions appear in recovered shared-tail entries 35B68, 35C74,
+35EA7 and 36597. Analysis of 34C20 itself finds 100 supported instructions and
+direct calls to C23F0. Before/after reports for 35570 differ by callback 34C20.
+
+UI register stores now use the existing bounded control-flow origin walk, with
+verified constructor/queue-consumer bytes, branch predecessors and register
+copies. Unknown writes and unverified calls remain barriers. The build compiles
+the discovered targets ahead of time; mutable calls stay explicitly unresolved.
+No hand-added callback seed, replacement game routine or runtime decoder is used.
+
+The rebuilt release includes 34C20 in its fixed native table and compiles 36,047
+discovered functions. The existing offline CPU image check now invokes C1210
+with the actual 34C20 callback for empty, full and partial bars. It checks the
+10/10/16 generated vertices, selected positions and colours, callback execution
+and the original return stack. Initial fixture expectations were corrected from
+the original stack/rectangle instructions; game execution was not altered.
+Final --check-cpu passed, including those three cases, without booting or opening
+a window. Report: build/crash-ui-passed.json. The user subsequently confirmed
+that the Crash-mode loading failure is fixed; complete mode coverage is unverified.
+
+During rebuilds, identical shader source retained its old timestamp, causing the
+build to repeat the successful 51-second shader-generation step. Its rule now
+stamps completion while retaining unchanged source timestamps. Subsequent builds
+of changed CPU checks skipped that step. Shaders remain compiled ahead of time;
+the verified bank retains 18 original vertex programs and 27 built-in shaders.
+
+===== 2026-10-09 | driving-lesson demonstrations and preserved CPU math =====
+
+Captures frame-30496957700 and frame-26078336300 show an explicit black clear
+followed by six HUD draws on the How to Play card. The second capture adds
+game-state.json at the request time, with replay count/index/loaded/playback all
+zero, lesson 0, NTSC and forward FWYL track 7. This snapshot alone does not prove
+a file-loading failure: the GPU image is captured at the next complete frame.
+
+An isolated --check-replays fixture initializes the original SDK heap, CRT locks,
+five-stream pool and file manager, then executes replay loader 88D30 for every
+recorded menu and lesson demonstration. All 18 NTSC/PAL files loaded correctly,
+with matching frame counts, loaded flags and complete six-byte input records.
+The disc contains the replay inputs; the demonstrations are rendered gameplay.
+Fixture reports stay ignored under build/, with no game boot or graphics/audio
+device. Normal gameplay tracing remains opt-in.
+
+The user recalled an original fix involving excessively accurate math. Preserved
+commit 1e6c8b0 and knowledge/processor.txt contain that reciprocal-square-root
+fix and expected results: 1.0 -> 3F7FF000, 2.0 -> 3F34F800, 4.0 -> 3EFFF000.
+The fresh AOT emitter instead used the host RSQRT intrinsic at 21 original scalar
+instruction sites. Estimates depend on the CPU vendor; substituting an exact
+reciprocal square root also changes the console result. Replay routine 88890
+checks low bytes of player position, making accumulated math differences relevant.
+
+The emitter now uses the preserved approximation for scalar/packed RSQRT. Its
+2048 midpoint buckets occupy 4 KiB and are constructed entirely at compile time
+using integer arithmetic, including the original intermediate float32 rounding.
+Gameplay performs only lookup/bit operations; MXCSR rounding and host estimates
+cannot change it. Zero, denormal, infinity and NaN behavior is retained. Other
+floating instructions and original x87 precision remain unchanged.
+
+Original vector helper EA760 contains F30F52C0 at EA7BD. The offline CPU check
+executes it for a unit axis and a diagonal and checks the console normalization
+results. Separate cases compare the table with the preserved midpoint formula,
+exercise special values/control settings and preserve scalar upper lanes.
+The final release rebuild passed --check-cpu (6240 floating and 469 memory cases,
+including original normalization), all 18 --check-replays files, 91 --check-storage
+cases and 12 --check-spatial cases with 1000 original calculations. Reports:
+build/lesson-rsqrt-final-cpu.json, build/lesson-rsqrt-replays.json,
+build/lesson-rsqrt-storage.json and build/lesson-rsqrt-spatial.json. These checks
+did not boot the game. Exact owned build/diagnostic worker audits found no survivors.
+The user confirmed that the How to Play demonstration plays after restoring the
+preserved approximation. This closes the reported black-screen/skipped-demo issue;
+complete playback coverage across all lessons and regional variants is unverified.
+
+2026-10-09 shared in-game SFX attenuation and audio diagnostics
+
+The user's three manual F8 captures (frame-35066655000, frame-37098290200,
+frame-40748694500) replay offline with no decoder/DSP failure. The third capture
+has engine FXIN peak 0.76699984 before spatial processing and 0.03146265 after;
+other active 3D sources decode normally but send zero. The native listener's
+position equals the player's source velocity rather than its world position.
+
+Verified supported-XBE wrappers and their original setters identify position at
+22F9C4->22F6E4, velocity 22FA1D->22F757, distance 22F932->22F53A, rolloff
+22F9F9->22F5F8, Doppler 22F956->22F599 and orientation 22F97A->22F657.
+Original title updater 10AD00 passes six distinct fields to those wrappers.
+The provider had mislabeled velocity as position and Doppler as distance, while
+the real position/distance/rolloff updates still entered unused private objects.
+Correct the complete listener binding path and its immediate/deferred fields.
+This removes incorrect distance attenuation/max-distance muting without changing
+sound volumes. Research and byte/caller evidence: research/audio-dsp.txt.
+
+F8 now saves bounded audio.bin and audio-game-state.json alongside the frame,
+including sample banks, playback controls, routing and DSP/filter histories.
+It also arms a 10-second, 512-event playback trace, normally disabled.
+--inspect-audio replays two seconds with frozen controls without game boot or
+an audio device, exporting WAV and per-voice/bin level reports. Original shared
+sample banks are copied once; source/scratch bounds are 64/16 MiB.
+
+Offline verification passes 31 original-SDK binding/commit cases, 12 spatial,
+42 audio/capture, 65 DSP and existing CPU checks (6240 floating cases).
+Reports: build/audio-listener-check-20261009b.json,
+build/audio-listener-mix-check-20261009.json,
+build/audio-listener-effects-check-20261009.json and
+build/audio-listener-cpu-check-20261009.json. Captured/uninterrupted audio samples
+match, including DSP history and a partially consumed block. The user confirmed
+that missing sounds returned. Captures frame-37968894700/frame-40069468200 show
+the listener at the correct world position, separate velocity, distance=1,
+rolloff=0 and Doppler=0.625. Engine spatial gain is 1, routed peak 0.6292095;
+nearby traffic also reaches the output. The user reported excessive engine volume.
+Remove the earlier up-to-3.01 dB stronger-channel stereo boost and restore
+equal-power stereo placement, keeping original source/effect gains. The spatial
+check verifies centered gains sqrt(0.5). The user confirmed the engine balance is
+better after the rollback. Final capture frame-38516072200 retains correct
+listener position/velocity and factors, engine spatial gain 1 and stereo gains
+0.70710236/0.7071112. Its offline replay passes without failures; report:
+build/checks/audio-final-frame-38516072200/report.json. Routed peak includes the
+unpanned room send and does not by itself measure the stereo gain reduction.
+

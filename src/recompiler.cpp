@@ -390,7 +390,7 @@ public:
             const bool scalar=name.ends_with("ss");
             name.insert(name.size()-2,"_");
             const bool unary=name.starts_with("sqrt_") || name.starts_with("rsqrt_") || name.starts_with("rcp_");
-            std::string value="_mm_"+name+'(';
+            std::string value=(name.starts_with("rsqrt_") ? "b2::" : "_mm_")+name+'(';
             if (!unary) value+=vector(operands[0])+',';
             value+=vector(operands[1],scalar)+')';
             if (unary && scalar) value="_mm_move_ss("+vector(operands[0])+','+value+')';

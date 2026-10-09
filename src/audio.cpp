@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <format>
 #include <stdexcept>
+#include <tuple>
 
 namespace b2 {
 namespace {
@@ -81,7 +82,218 @@ struct Audio::Effects {
         for(const auto& effect:image.effects) program.insert(program.end(),effect.code.begin(),effect.code.end());
         program.resize(image.program_words*4);
     }
+    auto fields() {
+        return std::tie(state.x,state.registers,state.accumulators,state.dma_next,state.dma_control,state.interrupts,
+            state.transferred_words,state.work_remaining,state.active_effect,state.negative,state.zero,state.overflow,
+            pending,dirty,dirty_first,dirty_end,count,available,cursor,reverb,output);
+    }
 };
+namespace {
+struct Level {
+    double energy=0;float peak=0;std::uint64_t samples=0,nonzero=0;
+    void add(float value) {
+        if(!std::isfinite(value)) throw std::runtime_error("Non-finite audio sample");
+        energy+=double(value)*value;peak=std::max(peak,std::abs(value));++samples;nonzero+=value!=0;
+    }
+    std::string report() const {
+        return std::format("{{\"peak\":{},\"rms\":{},\"samples\":{},\"nonzero\":{}}}",peak,samples?std::sqrt(energy/samples):0,samples,nonzero);
+    }
+};
+template<class Tuple> constexpr std::size_t field_size(const Tuple& fields) {
+    return std::apply([](const auto&... value){return (sizeof(value)+...);},fields);
+}
+void write_wav(const std::filesystem::path& path,std::span<const float> samples) {
+    std::ofstream file(path,std::ios::binary);if(!file) throw std::runtime_error("Cannot create audio diagnostic WAV");
+    const auto word=[&](auto value){file.write(reinterpret_cast<const char*>(&value),sizeof(value));};
+    file.write("RIFF",4);word(std::uint32_t(36+samples.size()*2));file.write("WAVEfmt ",8);word(std::uint32_t(16));
+    word(std::uint16_t(1));word(std::uint16_t(2));word(std::uint32_t(48000));word(std::uint32_t(192000));
+    word(std::uint16_t(4));word(std::uint16_t(16));file.write("data",4);word(std::uint32_t(samples.size()*2));
+    for(float value:samples) {
+        if(!std::isfinite(value)) throw std::runtime_error("Cannot export non-finite audio sample");
+        word(static_cast<std::int16_t>(std::clamp(value*32768.f,-32768.f,32767.f)));
+    }
+    if(!file) throw std::runtime_error("Audio diagnostic WAV write failed");
+}
+}
+struct Audio::Probe {
+    std::array<Level,256> decoded,sent;
+    std::array<Level,32> bins,dsp;
+};
+struct Audio::Capture {
+    std::array<VoiceState,256> voices{};
+    std::array<std::uint32_t,256> offsets{};
+    std::array<std::uint32_t,32> headroom{};
+    std::vector<std::byte> data;
+    std::unique_ptr<Effects> effects;
+    std::uint32_t clock=0;
+};
+std::unique_ptr<Audio::Capture> Audio::snapshot() {
+    auto capture=std::make_unique<Capture>();
+    std::array<std::span<const std::byte>,256> sources;
+    std::vector<std::pair<std::uintptr_t,std::uintptr_t>> ranges;ranges.reserve(256);
+    {
+        StreamLock lock(stream_);
+        for(unsigned i=0;i<voices_.size();++i) {
+            capture->voices[i]=static_cast<const VoiceState&>(voices_[i]);sources[i]=voices_[i].source;
+            if(!sources[i].empty()) {
+                const auto first=reinterpret_cast<std::uintptr_t>(sources[i].data());
+                ranges.emplace_back(first,first+sources[i].size());
+            }
+        }
+        capture->headroom=bin_headroom_;capture->clock=sample_clock();
+        if(effects_) capture->effects=std::make_unique<Effects>(*effects_);
+    }
+    // Guest code is suspended by the caller. SDL reads these sources but never
+    // changes their storage. Merge shared/overlapping banks before copying them.
+    std::ranges::sort(ranges);std::vector<std::pair<std::uintptr_t,std::uintptr_t>> merged;
+    for(const auto& range:ranges) {
+        if(!merged.empty() && range.first<merged.back().second) merged.back().second=std::max(merged.back().second,range.second);
+        else merged.push_back(range);
+    }
+    std::size_t total=0;for(const auto& range:merged) total+=range.second-range.first;
+    if(total>64*1024*1024) throw std::runtime_error("Audio capture source banks exceed 64 MiB");
+    capture->data.resize(total);capture->offsets.fill(UINT32_MAX);std::size_t offset=0;
+    for(const auto& range:merged) {
+        const auto size=range.second-range.first;
+        std::memcpy(capture->data.data()+offset,reinterpret_cast<const void*>(range.first),size);
+        for(unsigned i=0;i<sources.size();++i) {
+            const auto first=reinterpret_cast<std::uintptr_t>(sources[i].data());
+            if(!sources[i].empty() && first>=range.first && first+sources[i].size()<=range.second)
+                capture->offsets[i]=static_cast<std::uint32_t>(offset+first-range.first);
+        }
+        offset+=size;
+    }
+    return capture;
+}
+void Audio::restore(const Capture& capture) {
+    for(unsigned i=0;i<voices_.size();++i) {
+        auto& value=voices_[i];value=Voice{};static_cast<VoiceState&>(value)=capture.voices[i];
+        if(!value.used) continue;
+        validate(value.format,value.bus!=AudioBus::none);
+        const auto invalid=[](float number){return !std::isfinite(number);};
+        if(static_cast<unsigned>(value.bus)>static_cast<unsigned>(AudioBus::effects_manual) ||
+            (value.bus==AudioBus::none?value.input_bin!=UINT32_MAX:value.input_bin>=32) ||
+            value.bin_count>8 || value.route>256 ||
+            !std::isfinite(value.cursor) || value.cursor<0 || !std::isfinite(value.step) || value.step<=0 ||
+            !std::isfinite(value.spatial_pitch) || value.spatial_pitch<=0 ||
+            invalid(value.gain) || invalid(value.headroom) || invalid(value.spatial_gain) ||
+            std::ranges::any_of(value.block,invalid) || std::ranges::any_of(value.bin_gains,invalid) ||
+            std::ranges::any_of(value.spatial_pan,invalid) || std::ranges::any_of(value.front_back,invalid) ||
+            std::ranges::any_of(value.environment_gain,invalid) ||
+            std::ranges::any_of(value.environment_pole,[](float pole){return !std::isfinite(pole) || pole<0 || pole>=1;}) ||
+            std::ranges::any_of(value.environment_history,[&](const auto& path){return std::ranges::any_of(path,invalid);}))
+            throw std::runtime_error("Invalid captured audio voice controls");
+        for(unsigned bin=0;bin<value.bin_count;++bin) if(value.bins[bin]>=32) throw std::runtime_error("Invalid captured audio mix bin");
+        if(value.bus==AudioBus::none) {
+            const auto offset=capture.offsets[i];
+            if(value.byte_count && (offset>capture.data.size() || value.byte_count>capture.data.size()-offset))
+                throw std::runtime_error("Captured audio source exceeds its bank");
+            if(value.byte_count) value.source=std::span(capture.data).subspan(offset,value.byte_count);
+            const auto capacity=value.byte_count/value.format.block_align*(value.format.tag==0x69?64:1);
+            if(value.play_start>capacity || value.play_frames>capacity-value.play_start || value.loop_start>value.play_frames ||
+                value.loop_frames>value.play_frames-value.loop_start || (value.playing && !value.play_frames))
+                throw std::runtime_error("Captured audio play/loop region exceeds its bank");
+        }
+    }
+    for(unsigned i=0;i<voices_.size();++i) if(voices_[i].used) {
+        unsigned count=0;
+        for(auto cursor=voices_[i].route;cursor;) {
+            if(cursor>256 || ++count>256 || !voices_[cursor-1].used) throw std::runtime_error("Invalid captured audio routing graph");
+            cursor=voices_[cursor-1].route;
+        }
+    }
+    bin_headroom_=capture.headroom;for(auto value:bin_headroom_) if(value>7) throw std::runtime_error("Invalid captured audio bin headroom");
+    frames_processed_.store(capture.clock,std::memory_order_relaxed);
+    effects_=capture.effects?std::make_unique<Effects>(*capture.effects):nullptr;
+}
+void Audio::capture(const std::filesystem::path& directory) {
+    const auto saved=snapshot();std::filesystem::create_directories(directory);
+    const auto path=directory/"audio.bin";
+    if(std::filesystem::exists(path)) throw std::runtime_error("Audio capture already exists");
+    std::ofstream file(path,std::ios::binary);if(!file) throw std::runtime_error("Cannot create audio capture");
+    const auto write=[&](const auto& value){file.write(reinterpret_cast<const char*>(&value),sizeof(value));};
+    file.write("B2AUD001",8);
+    const std::array<std::uint32_t,6> header={sizeof(VoiceState),static_cast<std::uint32_t>(saved->data.size()),saved->clock,
+        saved->effects?static_cast<std::uint32_t>(field_size(saved->effects->fields())):0,
+        saved->effects?static_cast<std::uint32_t>(saved->effects->state.scratch.size()):0,256};
+    write(header);write(saved->voices);write(saved->offsets);write(saved->headroom);
+    if(saved->effects) {
+        std::apply([&](const auto&... value){(write(value),...);},saved->effects->fields());
+        const auto& scratch=saved->effects->state.scratch;
+        file.write(reinterpret_cast<const char*>(scratch.data()),scratch.size());
+    }
+    file.write(reinterpret_cast<const char*>(saved->data.data()),saved->data.size());
+    if(!file) throw std::runtime_error("Audio capture write failed");
+}
+std::string Audio::inspect_capture(const std::filesystem::path& source,const std::filesystem::path& image_path,
+                                 const std::filesystem::path& output) {
+    if(std::filesystem::exists(output)) throw std::runtime_error("Audio inspection requires a fresh output directory");
+    File file(source);const auto header=file.read(0,32);
+    if(std::memcmp(header.data(),"B2AUD001",8) || u32(header,8)!=sizeof(VoiceState) || u32(header,28)!=256 ||
+        u32(header,12)>64*1024*1024 || u32(header,24)>16*1024*1024)
+        throw std::runtime_error("Unsupported audio capture format or bounds");
+    auto saved=std::make_unique<Capture>();saved->clock=u32(header,16);std::uint64_t position=32;
+    const auto read=[&](auto& value){file.read(position,std::as_writable_bytes(std::span(&value,1)));position+=sizeof(value);};
+    read(saved->voices);read(saved->offsets);read(saved->headroom);
+    if(u32(header,20)) {
+        File effects_file(image_path);if(effects_file.size()>65536) throw std::runtime_error("Captured audio effect image exceeds 64 KiB");
+        const auto image=decode_effects(effects_file.read(0,static_cast<std::size_t>(effects_file.size())));
+        if(!compiled_effects_match(image)) throw std::runtime_error("Captured audio needs its statically compiled effect image");
+        saved->effects=std::make_unique<Effects>(image,UINT32_MAX);
+        if(u32(header,20)!=field_size(saved->effects->fields()) || u32(header,24)!=saved->effects->state.scratch.size())
+            throw std::runtime_error("Captured audio effect layout differs from this build");
+        std::apply([&](auto&... value){(read(value),...);},saved->effects->fields());
+        auto& effect=*saved->effects;
+        if(effect.count!=image.effects.size() || effect.available>32 || effect.cursor>32 || effect.available+effect.cursor>32 ||
+            effect.dirty_first>0x6000 || effect.dirty_end>0x6000 ||
+            std::ranges::any_of(effect.output,[](float sample){return !std::isfinite(sample);}))
+            throw std::runtime_error("Invalid captured audio effect block");
+        file.read(position,effect.state.scratch);position+=effect.state.scratch.size();
+    } else if(u32(header,24)) throw std::runtime_error("Audio capture has scratch without effects");
+    saved->data.resize(u32(header,12));file.read(position,saved->data);position+=saved->data.size();
+    if(position!=file.size()) throw std::runtime_error("Audio capture length differs from its declared layout");
+    Audio replay(false);replay.restore(*saved);Probe probe;replay.probe_=&probe;
+    std::array<Level,256> payload;
+    std::vector<std::string> failures;
+    for(unsigned id=0;id<replay.voices_.size();++id) {
+        auto& voice=replay.voices_[id];if(!voice.used || voice.bus!=AudioBus::none || !voice.play_frames) continue;
+        const auto original=static_cast<const VoiceState&>(voice);voice.cached_block=UINT32_MAX;
+        try {
+            for(unsigned frame=0;frame<std::min(voice.play_frames,voice.format.rate);++frame) {
+                const auto decoded=replay.sample(voice,voice.play_start+frame);
+                for(unsigned channel=0;channel<voice.format.channels;++channel) payload[id].add(decoded[channel]);
+            }
+        } catch(const std::exception& error) {failures.push_back(std::format("voice {} payload: {}",id+1,error.what()));}
+        static_cast<VoiceState&>(voice)=original;
+    }
+    std::filesystem::create_directories(output);std::vector<float> mixed(48000*2*2);
+    try {replay.mix(mixed);} catch(const std::exception& error) {failures.push_back(error.what());}
+    write_wav(output/"scene.wav",mixed);Level final;for(float value:mixed) final.add(value);
+    std::string voices,bins,errors;
+    for(unsigned i=0;i<saved->voices.size();++i) {
+        const auto& voice=saved->voices[i];if(!voice.used) continue;
+        if(!voices.empty()) voices+=',';
+        std::string assignments;
+        for(unsigned n=0;n<voice.bin_count;++n) {
+            if(n) assignments+=',';const auto bin=voice.bins[n];
+            assignments+=std::format("{{\"bin\":{},\"gain\":{},\"headroom_shift\":{}}}",bin,voice.bin_gains[bin],saved->headroom[bin]);
+        }
+        voices+=std::format("{{\"id\":{},\"playing\":{},\"loop\":{},\"bus\":{},\"input_bin\":{},\"route\":{},\"source_address\":{},\"bytes\":{},\"codec\":{},\"channels\":{},\"rate\":{},\"cursor\":{},\"play_start\":{},\"play_frames\":{},\"loop_start\":{},\"loop_frames\":{},\"gain\":{},\"headroom\":{},\"spatial_gain\":{},\"pan\":[{},{}],\"environment_gain\":[{},{}],\"front_back\":[{},{}],\"bins\":[{}],\"payload\":{},\"decoded\":{},\"sent\":{}}}",
+            i+1,voice.playing,voice.loop,static_cast<unsigned>(voice.bus),voice.input_bin,voice.route,json(hex32(voice.source_address)),voice.byte_count,
+            voice.format.tag,voice.format.channels,voice.format.rate,voice.cursor,voice.play_start,voice.play_frames,voice.loop_start,voice.loop_frames,
+            voice.gain,voice.headroom,voice.spatial_gain,voice.spatial_pan[0],voice.spatial_pan[1],voice.environment_gain[0],voice.environment_gain[1],
+            voice.front_back[0],voice.front_back[1],assignments,payload[i].report(),probe.decoded[i].report(),probe.sent[i].report());
+    }
+    for(unsigned i=0;i<32;++i) {
+        if(i) bins+=',';bins+=std::format("{{\"bin\":{},\"input\":{},\"processed\":{}}}",i,probe.bins[i].report(),probe.dsp[i].report());
+    }
+    for(const auto& error:failures){if(!errors.empty()) errors+=',';errors+=json(error);}
+    const auto report=std::format("{{\"format\":\"b2-audio-inspection-v1\",\"passed\":{},\"game_booted\":false,\"audio_device_opened\":false,\"frozen_controls\":true,\"master_gain_applied\":false,\"sent_meter_channels\":32,\"frames\":96000,\"source_bytes\":{},\"clock\":{},\"output\":{},\"voices\":[{}],\"bins\":[{}],\"failures\":[{}]}}",
+        failures.empty(),saved->data.size(),saved->clock,final.report(),voices,bins,errors);
+    write_text(output/"report.json",report,false);
+    return std::format("{{\"format\":\"b2-audio-inspection-v1\",\"passed\":{},\"game_booted\":false,\"audio_device_opened\":false,\"voices\":{},\"frames\":96000,\"report\":{},\"failures\":[{}]}}",
+        failures.empty(),std::ranges::count_if(saved->voices,[](const auto& voice){return voice.used;}),json(utf8((output/"report.json").wstring())),errors);
+}
 std::vector<float> decode_audio(AudioFormat format,std::span<const std::byte> data) {
     validate(format);
     if(data.size()%format.block_align) throw std::runtime_error("Audio payload ends inside a sample block");
@@ -308,6 +520,15 @@ void Audio::spatial(std::uint32_t id,const SpatialResult& adjustment) {
     value.front_back=adjustment.front_back;value.environment_gain=adjustment.environment_gain;value.environment_pole=adjustment.environment_pole;
 }
 void Audio::mix_voice(Voice& value,std::span<const std::array<float,2>> samples,std::span<float> output,unsigned frame_count) {
+    if(!probe_) {send_voice(value,samples,output,frame_count);return;}
+    const auto id=static_cast<unsigned>(&value-voices_.data());
+    std::array<float,32*32> before;std::copy(output.begin(),output.end(),before.begin());
+    for(const auto& sample:samples) for(unsigned channel=0;channel<value.format.channels;++channel) probe_->decoded[id].add(sample[channel]);
+    send_voice(value,samples,output,frame_count);
+    for(unsigned bin=0;bin<32;++bin) for(unsigned frame=0;frame<samples.size();++frame)
+        probe_->sent[id].add((output[bin*frame_count+frame]-before[bin*frame_count+frame])/(1U<<bin_headroom_[bin]));
+}
+void Audio::send_voice(Voice& value,std::span<const std::array<float,2>> samples,std::span<float> output,unsigned frame_count) {
     float gain=value.gain*value.headroom*value.spatial_gain;auto pan=value.spatial_pan;const Voice* sink=&value;
     bool effect_bus=false;
     for(auto cursor=value.route;cursor;cursor=voices_[cursor-1].route) {
@@ -400,6 +621,7 @@ void Audio::mix_bins(std::span<float> output,unsigned frame_count) {
     for(unsigned bin=0;bin<32;++bin) {
         const auto gain=1.0f/(1U<<bin_headroom_[bin]);
         for(auto& sample:output.subspan(bin*frame_count,frame_count)) sample=std::clamp(sample*gain,-1.0f,1.0f);
+        if(probe_) for(float sample:output.subspan(bin*frame_count,frame_count)) probe_->bins[bin].add(sample);
     }
 }
 void Audio::mix_sources(std::span<float> output) {
@@ -512,6 +734,8 @@ void Audio::mix_unlocked(std::span<float> output) {
                 state.store(0x1400+bin*32+i,static_cast<std::uint32_t>(sample));
             }
             for(unsigned i=0;i<effects.count;++i) run_effect(state,i);
+            if(probe_) for(unsigned bin=0;bin<32;++bin) for(unsigned i=0;i<32;++i)
+                probe_->dsp[bin].add(Dsp::signed24(state.load(0xC00+bin*32+i))/8388608.0f);
             frames_processed_.fetch_add(32,std::memory_order_relaxed);
             for(unsigned i=0;i<32;++i) {
                 const auto sample=[&](unsigned bin){return Dsp::signed24(state.load(0xC00+bin*32+i))/8388608.0f;};
@@ -529,7 +753,7 @@ void Audio::mix(std::span<float> output) {
     if(output.size()%2) throw std::runtime_error("Audio mixer requires stereo frames");
     StreamLock lock(stream_);mix_unlocked(output);
 }
-std::string check_audio() {
+std::string check_audio(const std::filesystem::path& effects_path,const std::filesystem::path& output) {
     unsigned checks=0;
     const auto require=[&](bool condition){++checks;if(!condition) throw std::runtime_error("Offline audio check failed");};
     const AudioFormat pcm{1,1,2,16,0,48000},stereo{1,2,4,16,0,48000},adpcm{0x69,1,36,4,64,48000};
@@ -605,6 +829,37 @@ std::string check_audio() {
     const std::array<MixBin,1> center_only{{{2,0}}};distance.mixbins(emitter,center_only);distance.mix(mixed);
     require(std::abs(mixed[0]-0.25f*0.5f*0.5f*0.70710678f)<0.000001f && mixed[0]==mixed[1]);
     distance.position(emitter,0);distance.mix(mixed);require(std::abs(mixed[0]-0.04419417f)<0.000001f);
+    const auto snapshot=distance.snapshot();auto replay=std::make_unique<Audio>(false);replay->restore(*snapshot);
+    std::array<float,64> reference{},captured{};distance.mix(reference);replay->mix(captured);
+    require(reference==captured && distance.sample_clock()==replay->sample_clock());
+    auto shared=std::make_unique<Audio>(false);std::array<std::int16_t,4> bank={8192,16384,-8192,-16384};
+    const auto first=shared->create(pcm),second=shared->create(pcm);
+    shared->bind(first,std::as_bytes(std::span(bank)));shared->bind(second,std::as_bytes(std::span(bank)).subspan(2,4));
+    const auto merged=shared->snapshot();require(merged->data.size()==8 && merged->offsets[second-1]==merged->offsets[first-1]+2);
+    auto restored=std::make_unique<Audio>(false);restored->restore(*merged);restored->play(first,true);restored->play(second,true);
+    Audio::Probe probe;restored->probe_=&probe;restored->mix(captured);
+    require(probe.decoded[first-1].peak==0.5f && probe.decoded[second-1].peak==0.5f && probe.sent[first-1].peak==0.5f);
+    if(!output.empty()) {
+        if(std::filesystem::exists(output)) throw std::runtime_error("Audio checks require a fresh output directory");
+        File file(effects_path);if(file.size()>65536) throw std::runtime_error("Effects image exceeds 64 KiB");
+        const auto image=decode_effects(file.read(0,static_cast<std::size_t>(file.size())));
+        auto fixture=std::make_unique<Audio>(false);auto& scene=*fixture;scene.effects(image,2);
+        // Known original distortion parameters also used by the effects checks.
+        const std::array<std::uint32_t,11> parameters{0xDC0,0xDC0,0x1BC5B,0x3FFFFF,0x19A027,0x7FFFFF,0x1A7250,0,0x1FFFFF,0,0x7126E8};
+        scene.effect_data((0xAE+5)*4,std::as_bytes(std::span(parameters)),false);
+        const auto source=scene.create(pcm),bus=scene.create(bus_format,AudioBus::effects,14);
+        scene.data(source,bytes);scene.mixbins(source,std::array<MixBin,1>{{{14,0}}});
+        scene.mixbins(bus,std::array<MixBin,5>{{{6,0},{8,0},{7,0},{9,0},{10,0}}});
+        scene.route(source,bus);scene.play(source,true);
+        std::array<float,82> warmup{};scene.mix(warmup);scene.capture(output/"capture");
+        // Check serialized DSP/filter/partial-block state against uninterrupted playback.
+        scene.mix(reference);const auto report=Audio::inspect_capture(output/"capture/audio.bin",effects_path,output/"replay");
+        require(report.find("\"passed\":true")!=std::string::npos);
+        File wav(output/"replay/scene.wav");const auto replayed=wav.read(44,reference.size()*2);
+        bool equal=true;for(unsigned i=0;i<reference.size();++i)
+            equal&=std::bit_cast<std::int16_t>(u16(replayed,i*2))==static_cast<std::int16_t>(std::clamp(reference[i]*32768.f,-32768.f,32767.f));
+        require(equal);
+    }
     return "{\"format\":\"b2-audio-check-v1\",\"passed\":true,\"game_booted\":false,\"audio_device_opened\":false,\"cases\":"+std::to_string(checks)+"}";
 }
 }

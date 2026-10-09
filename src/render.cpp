@@ -143,7 +143,7 @@ D3D11_STENCIL_OP stencil_operation(std::uint32_t value) {
     default:throw std::runtime_error("Unsupported stencil operation");
     }
 }
-using PipelineKey = std::array<std::uint32_t, 32>;
+using PipelineKey = std::array<std::uint32_t, 22>;
 PipelineKey pipeline_key(const RenderState& state) {
     PipelineKey key{};
     std::size_t i = 0;
@@ -151,11 +151,18 @@ PipelineKey pipeline_key(const RenderState& state) {
          std::uint32_t(state.cull), std::uint32_t(state.front_ccw),
          state.depth_function, state.blend_source, state.blend_destination, state.blend_equation,
          state.cull_face, state.color_mask}) key[i++] = value;
-    for (unsigned n = 0; n < 4; ++n) for (auto value : {state.texture_address[n], std::uint32_t(state.linear_filter[n])}) key[i++] = value;
     for(auto value : {std::uint32_t(state.stencil_test),state.stencil_function,state.stencil_read_mask,state.stencil_write_mask,
         state.stencil_fail,state.stencil_depth_fail,state.stencil_pass,std::uint32_t(state.polygon_offset),
         std::bit_cast<std::uint32_t>(state.polygon_offset_scale),std::bit_cast<std::uint32_t>(state.polygon_offset_bias),std::uint32_t(state.scissor_test)}) key[i++]=value;
     return key;
+}
+using SamplerKey=std::array<std::uint32_t,3>;
+SamplerKey sampler_key(const RenderState& state,unsigned stage) {
+    if(!state.textures[stage]) return {0x030303,0x01030000,0x0003FFC0};
+    auto filter=state.texture_filter[stage]&0x0F3F1FFF;
+    auto control=state.texture_control[stage]&0x3FFFFFF0;
+    if(((filter>>16)&63)<=2) {filter&=~0x1FFFU;control&=0x30;} // Level-zero filtering ignores LOD.
+    return {state.texture_address[stage],filter,control};
 }
 struct alignas(16) Constants {
     std::array<Float4, 8> factor0, factor1;
@@ -332,9 +339,9 @@ struct Renderer::Impl {
         ComPtr<ID3D11BlendState> blend;
         ComPtr<ID3D11DepthStencilState> depth;
         ComPtr<ID3D11RasterizerState> raster;
-        std::array<ComPtr<ID3D11SamplerState>, 4> samplers;
     };
     std::map<PipelineKey, Pipeline> pipelines;
+    std::map<SamplerKey,ComPtr<ID3D11SamplerState>> sampler_states;
     struct Program {
         VertexProgram key;
         bool launch;
@@ -806,6 +813,34 @@ void Renderer::prepare(const RenderState& state) {
     auto& r = *impl_;
     if (r.recording) throw std::runtime_error("Prepare pipelines before frame submission");
     validate_fragment(state);
+    // Sampling varies per texture, independently of blend/depth/raster state.
+    // Sharing these objects avoids rebuilding whole pipelines for LOD changes.
+    for(unsigned i=0;i<4;++i) {
+        const auto key=sampler_key(state,i);
+        if(r.sampler_states.contains(key)) continue;
+        if(r.sampler_states.size()>=4096) throw std::runtime_error("Sampler cache limit reached");
+        const auto filter=key[1],control=key[2];
+        const auto min=(filter>>16)&63,mag=(filter>>24)&15;
+        if(min<1 || min>6 || mag<1 || mag>2) throw std::runtime_error("Unsupported NV097 texture filter");
+        const bool min_linear=(min&1)==0,mip_linear=min>=5,mip_enabled=min>=3;
+        D3D11_SAMPLER_DESC sampler{};
+        sampler.Filter=D3D11_FILTER((min_linear?0x10:0)|(mag==2?4:0)|(mip_linear?1:0));
+        sampler.AddressU=address_mode(key[0]&15);
+        sampler.AddressV=address_mode((key[0]>>8)&15);
+        sampler.AddressW=address_mode((key[0]>>16)&15);
+        sampler.MaxAnisotropy=1U<<((control>>4)&3);
+        if(sampler.MaxAnisotropy>1 && min_linear && mag==2) sampler.Filter=D3D11_FILTER_ANISOTROPIC;
+        sampler.ComparisonFunc=D3D11_COMPARISON_NEVER;
+        if(mip_enabled) {
+            // NV097 stores a signed 13-bit bias with eight fractional bits.
+            auto bias=int(filter&0x1FFF);if(bias&0x1000) bias-=0x2000;
+            sampler.MipLODBias=float(bias)/256;
+            sampler.MinLOD=float((control>>18)&0xFFF);sampler.MaxLOD=float((control>>6)&0xFFF);
+        }
+        ComPtr<ID3D11SamplerState> native;
+        checked(r.device->CreateSamplerState(&sampler,&native),"Sampler state");
+        r.sampler_states.emplace(key,std::move(native));
+    }
     const auto key = pipeline_key(state);
     if (r.pipelines.contains(key)) return;
     if (r.pipelines.size() >= 1024) throw std::runtime_error("Pipeline cache limit reached");
@@ -847,16 +882,6 @@ void Renderer::prepare(const RenderState& state) {
         raster.SlopeScaledDepthBias=state.polygon_offset_scale; raster.DepthBias=static_cast<INT>(state.polygon_offset_bias);
     }
     checked(r.device->CreateRasterizerState(&raster, &pipeline.raster), "Rasterizer state");
-    for (unsigned i = 0; i < 4; ++i) {
-        D3D11_SAMPLER_DESC sampler{};
-        sampler.Filter = state.linear_filter[i] ? D3D11_FILTER_MIN_MAG_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_POINT;
-        sampler.AddressU = address_mode(state.texture_address[i] & 15);
-        sampler.AddressV = address_mode((state.texture_address[i] >> 8) & 15);
-        sampler.AddressW = address_mode((state.texture_address[i] >> 16) & 15);
-        sampler.MaxAnisotropy = 1; sampler.ComparisonFunc = D3D11_COMPARISON_NEVER;
-        sampler.MaxLOD = D3D11_FLOAT32_MAX;
-        checked(r.device->CreateSamplerState(&sampler, &pipeline.samplers[i]), "Sampler state");
-    }
     r.pipelines.emplace(key, std::move(pipeline));
 }
 std::uint32_t Renderer::prepare_program(const VertexProgram& program,bool launch) {
@@ -1122,7 +1147,9 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
         if(sampled) views[i+(mode==3?4:mode==2?8:0)] = r.textures[state.textures[i]].Get();
         constants.stages[i]={mode,state.texture_sources[i],state.texture_clip[i],
             std::uint32_t(state.alpha_kill[i])|(std::uint32_t(state.texture_opaque[i])<<1)};
-        samplers[i] = pipeline.samplers[i].Get();
+        const auto sampler=r.sampler_states.find(sampler_key(state,i));
+        if(sampler==r.sampler_states.end()) throw std::runtime_error("Sampler was not prepared before submission");
+        samplers[i]=sampler->second.Get();
     }
     std::array<UINT,17> stream_offsets{},stream_strides{};
     if(streams) {

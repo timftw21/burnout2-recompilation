@@ -34,5 +34,5 @@ private:
     std::array<std::byte,8192> scratch_{};
     std::array<std::uint32_t,12> environment_listener_{};
 };
-std::string check_spatial(const std::filesystem::path&);
+std::string check_spatial(const std::filesystem::path&,const std::filesystem::path& output={});
 }

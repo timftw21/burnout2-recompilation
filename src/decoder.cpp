@@ -537,12 +537,13 @@ Function recover(Xbe& image, std::uint32_t address, std::uint32_t instruction_bu
                 output.mem.disp.value==0x48 && input.type==ZYDIS_OPERAND_TYPE_IMMEDIATE &&
                 std::ranges::find(ui_methods,static_cast<std::uint32_t>(input.imm.value.u))!=ui_methods.end();
         });
+    std::vector<std::pair<std::uint32_t,int>> ui_callback_registers;
     if(ui_producer) for(const auto& [pc,instruction]:function.instructions) {
         const auto& output=instruction.operands[0];const auto& input=instruction.operands[1];
         if(instruction.decoded.mnemonic!=ZYDIS_MNEMONIC_MOV || output.type!=ZYDIS_OPERAND_TYPE_MEMORY || output.size!=32 ||
            output.mem.segment!=ZYDIS_REGISTER_DS || output.mem.base==ZYDIS_REGISTER_NONE || output.mem.base==ZYDIS_REGISTER_ESP ||
            output.mem.base==ZYDIS_REGISTER_EBP || output.mem.index!=ZYDIS_REGISTER_NONE || output.mem.disp.value!=0x48 ||
-           input.type!=ZYDIS_OPERAND_TYPE_IMMEDIATE || !is_code(static_cast<std::uint32_t>(input.imm.value.u))) continue;
+           !(input.type==ZYDIS_OPERAND_TYPE_IMMEDIATE || (input.type==ZYDIS_OPERAND_TYPE_REGISTER && input.size==32))) continue;
         if(!matches_bytes(0x0001EF10,"D944240C8B542418D84C24148B442414") ||
            !matches_bytes(0x0001EF2E,"C74148F0FB0B00") ||
            !matches_bytes(0x0001E749,"C7464870FE0B00") ||
@@ -559,7 +560,8 @@ Function recover(Xbe& image, std::uint32_t address, std::uint32_t instruction_bu
            !matches_bytes(0x000C14A0,"8B513C568B742408C1E60403F28D460450E8EA8801008B4C241083C00883C4048970448948405EC20800") ||
            !matches_bytes(0x000C1306,"FF5650"))
             throw std::runtime_error("UI draw callback layout differs from its verified ABI");
-        add_callback(static_cast<std::uint32_t>(input.imm.value.u));
+        if(input.type==ZYDIS_OPERAND_TYPE_IMMEDIATE) add_callback(static_cast<std::uint32_t>(input.imm.value.u));
+        else ui_callback_registers.emplace_back(pc,general(input.reg.value));
     }
     // Original resource descriptor constructors initialize ESI through 10CF90
     // before installing methods at +28h..+3Ch. 10B08E..10B0A3 installs one
@@ -878,6 +880,9 @@ Function recover(Xbe& image, std::uint32_t address, std::uint32_t instruction_bu
             }
         }
     };
+    // UI producers also install methods through registers (36670 -> 366AD).
+    // Follow their real origins with the same bounded control-flow walk.
+    for(const auto& [pc,reg]:ui_callback_registers) register_callbacks(pc,reg);
     // A called indexed load proves that a file-backed pointer array is a
     // dispatch table. Trace its register through the actual branch predecessors.
     for(const auto& [pc,instruction]:function.instructions) {

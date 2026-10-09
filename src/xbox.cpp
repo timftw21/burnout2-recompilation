@@ -7,7 +7,10 @@
 #include "spatial.h"
 #include "effects.h"
 #include "render.h"
+#include "diagnostics.h"
+#include "crypto.h"
 #include <Windows.h>
+#include <bcrypt.h>
 #include <iphlpapi.h>
 #include <algorithm>
 #include <chrono>
@@ -15,6 +18,7 @@
 #include <deque>
 #include <map>
 #include <optional>
+#include <sstream>
 
 namespace b2 {
 namespace {
@@ -132,6 +136,13 @@ struct Xbox::State {
     SpatialListener audio_listener,audio_deferred_listener;
     std::uint32_t audio_pending_listener=0;
     bool audio_full_hrtf=false;
+    struct AudioEvent {
+        std::uint32_t clock=0,address=0,caller=0,count=0,identifier=0,source=0,start=0,bytes=0;
+        std::array<std::uint32_t,6> arguments{};
+    };
+    std::array<AudioEvent,512> audio_events{};
+    std::uint32_t audio_event_count=0,audio_trace_until=0;
+    bool audio_trace=false;
     bool ethernet_initialized=false;
     std::uint32_t ethernet_state=0;
     Input* input=nullptr;
@@ -189,7 +200,13 @@ struct Xbox::State {
                 FILE_FLAG_OVERLAPPED|FILE_FLAG_RANDOM_ACCESS,nullptr);
             if(disc_io->native==INVALID_HANDLE_VALUE) throw std::runtime_error("Cannot open mounted disc for native asynchronous reads");
         }
-        user_root=std::filesystem::absolute("data/user").lexically_normal();
+        if(this->host.storage_root.empty()) {
+            std::array<wchar_t,32768> executable{};
+            const auto length=GetModuleFileNameW(nullptr,executable.data(),static_cast<DWORD>(executable.size()));
+            if(!length || length==executable.size()) throw std::runtime_error("Cannot locate native save storage");
+            user_root=std::filesystem::path(std::wstring_view(executable.data(),length)).parent_path()/"data/user";
+        } else user_root=std::filesystem::absolute(this->host.storage_root).lexically_normal();
+        user_root=std::filesystem::absolute(user_root).lexically_normal();
         if(std::filesystem::weakly_canonical(user_root)!=user_root)
             throw std::runtime_error("Native storage path crosses a reparse point");
         std::filesystem::create_directories(user_root/"TDATA");
@@ -218,6 +235,7 @@ struct Xbox::State {
         bind<67>(); bind<69>(); bind<190>(); bind<196>(); bind<198>(); bind<202>(); bind<203>();
         bind<207>(); bind<210>(); bind<211>(); bind<215>(); bind<218>(); bind<219>(); bind<226>(); bind<236>();
         bind<327>();bind<328>();
+        bind<335>();bind<336>();bind<337>();bind<340>();bind<260>();bind<308>();
         bind<2>();
         for(const auto& section:image.sections) {
             memory.store<std::uint32_t>(section.header_address+24,section.preloaded()?1:0);
@@ -248,6 +266,7 @@ struct Xbox::State {
         const auto version=export_data(324,8);
         memory.store<std::uint16_t>(version,1); memory.store<std::uint16_t>(version+4,5838);
         export_data(322,8); // Retail ABI flags; the host has no devkit peripherals.
+        initialize_save_keys();
         tick_address=export_data(156,4);
         export_data(164,4); // Cold native launch: no dashboard launch-data page.
         memory.store<std::uint32_t>(export_data(356,4),6); // Standard AV mode: native-resolution SD profile.
@@ -279,6 +298,35 @@ struct Xbox::State {
         kernel_cursor+=size;
         for(const auto& import : image.imports) if(import.ordinal==ordinal) memory.store<std::uint32_t>(import.address,address);
         return address;
+    }
+    void initialize_save_keys() {
+        // The native profile owns its console identity; no original EEPROM is required.
+        const auto path=user_root/"storage.key";
+        if(GetFileAttributesW(path.c_str())!=INVALID_FILE_ATTRIBUTES &&
+           (GetFileAttributesW(path.c_str())&FILE_ATTRIBUTE_REPARSE_POINT))
+            throw std::runtime_error("Native save identity is a reparse point");
+        std::array<std::byte,32> keys{};
+        if(!std::filesystem::exists(path)) {
+            if(BCryptGenRandom(nullptr,reinterpret_cast<PUCHAR>(keys.data()),static_cast<ULONG>(keys.size()),BCRYPT_USE_SYSTEM_PREFERRED_RNG)<0)
+                throw std::runtime_error("Cannot create native save identity");
+            write_text(path,std::string_view(reinterpret_cast<const char*>(keys.data()),keys.size()),false);
+        }
+        File file(path);
+        if(file.size()!=keys.size()) throw std::runtime_error("Native save identity has an invalid size; preserve storage.key with your saves");
+        file.read(0,keys);
+        if(std::ranges::all_of(Bytes(keys).first(16),[](std::byte value){return value==std::byte{};}))
+            throw std::runtime_error("Native save identity has an invalid empty disk key");
+        std::memcpy(memory.access(export_data(323,16),16),keys.data(),16);
+        const auto certificate=image.data(u32(image.data(image.base+0x118,4),0),0x1D0);
+        if(u32(certificate,0)<certificate.size()) throw std::runtime_error("Executable certificate has no save signing keys");
+        const auto derive=[&](std::uint32_t destination,unsigned offset) {
+            const auto key=xbox_hmac(Bytes(keys).subspan(16),Bytes(certificate).subspan(offset,16));
+            std::memcpy(memory.access(destination,16),key.data(),16);
+        };
+        derive(export_data(325,16),0xC0);derive(export_data(353,16),0xB0);
+        const auto alternate=export_data(354,256);
+        for(unsigned i=0;i<16;++i) derive(alternate+i*16,0xD0+i*16);
+        diagnostic_record("{\"type\":\"storage_ready\",\"root\":"+json(utf8(user_root.wstring()))+"}");
     }
     std::uint32_t allocate(std::uint32_t size,std::uint32_t alignment,bool committed,std::uint32_t protect,
                            std::uint32_t requested=0,std::uint32_t lowest=0,std::uint32_t highest=UINT32_MAX,bool clear=true) {
@@ -381,6 +429,7 @@ struct Xbox::State {
     }
     void yield(ThreadState state=ThreadState::ready,std::uint32_t object=0,
                std::chrono::steady_clock::time_point due=std::chrono::steady_clock::time_point::max()) {
+        if(!scheduler) throw NativeBoundary(current?current->cpu.eip:0,"offline native call requires an initialized scheduler to wait");
         if(memory.load<std::uint8_t>(current->tib+0x24)>1) throw NativeBoundary(current->cpu.eip,"a DPC attempted a blocking wait");
         current->state=state; current->wait_object=object; current->due=due;
         if(object) current->wait_kind=WaitKind::critical;
@@ -752,11 +801,17 @@ struct Xbox::State {
         const auto result=audio_spatial->calculate(audio_listener,buffer.spatial,curve,&buffer.environment,(buffer.flags&0x20000)!=0);
         audio->spatial(buffer.identifier,result);
     }
+    static void copy_listener(SpatialListener& destination,const SpatialListener& source,unsigned fields) {
+        if(fields&1) destination.position=source.position;
+        if(fields&2) destination.velocity=source.velocity;
+        if(fields&4) {destination.front=source.front;destination.up=source.up;}
+        if(fields&8) destination.distance=source.distance;
+        if(fields&16) destination.rolloff=source.rolloff;
+        if(fields&32) destination.doppler=source.doppler;
+    }
     void commit_spatial() {
         const bool listener_changed=audio_pending_listener!=0;
-        if(audio_pending_listener&1) audio_listener.distance=audio_deferred_listener.distance;
-        if(audio_pending_listener&2) audio_listener.position=audio_deferred_listener.position;
-        if(audio_pending_listener&4) {audio_listener.front=audio_deferred_listener.front;audio_listener.up=audio_deferred_listener.up;}
+        copy_listener(audio_listener,audio_deferred_listener,audio_pending_listener);
         audio_pending_listener=0;
         for(auto& [object,buffer]:audio_buffers) {
             const bool changed=listener_changed || buffer.pending_spatial || buffer.pending_curve || buffer.pending_environment;
@@ -767,6 +822,31 @@ struct Xbox::State {
         }
     }
     void audio_api(Cpu& cpu,std::uint32_t address) {
+        if(audio_trace && audio) {
+            const auto sample_clock=audio->sample_clock();
+            if(std::bit_cast<std::int32_t>(sample_clock-audio_trace_until)>=0) audio_trace=false;
+            else {
+                unsigned count=0;
+                switch(address) {
+                case 0x0022D896:case 0x0022D8D2:case 0x0022F8EA:count=4;break;
+                case 0x0022EF4B:case 0x0022E908:case 0x0022D8F6:count=3;break;
+                case 0x0022EF2F:case 0x0022E754:case 0x0022E770:case 0x0022D952:count=2;break;
+                case 0x0022D8BA:case 0x0022C11B:count=1;break;
+                }
+                if(count) {
+                    auto& event=audio_events[audio_event_count++%audio_events.size()];event={};
+                    event.clock=sample_clock;event.address=address;event.caller=memory.load<std::uint32_t>(cpu.registers[esp]);event.count=count;
+                    for(unsigned i=0;i<count;++i) event.arguments[i]=argument(cpu,i);
+                    const auto found=audio_buffers.find(event.arguments[0]);
+                    if(found!=audio_buffers.end()) {
+                        const auto& buffer=found->second;event.identifier=buffer.identifier;
+                        event.source=memory.load<std::uint32_t>(buffer.descriptor+0xB8);
+                        event.start=memory.load<std::uint32_t>(buffer.descriptor+0xC0);
+                        event.bytes=memory.load<std::uint32_t>(buffer.descriptor+0xC4);
+                    }
+                }
+            }
+        }
         if(address==0x0022D9CA) {
             // Native mixing completes buffers on SDL's audio thread. Publish
             // that state here; the original MCPX notification lists are not
@@ -876,26 +956,29 @@ struct Xbox::State {
             if(output) memory.store<std::uint32_t>(output,descriptor);
             finish(cpu,20,success);return;
         }
-        if(address==0x0022F956 || address==0x0022FA1D || address==0x0022F97A || address==0x0022F3F5) {
+        if(address==0x0022F932 || address==0x0022F9F9 || address==0x0022F956 || address==0x0022F9C4 ||
+            address==0x0022FA1D || address==0x0022F97A || address==0x0022F3F5) {
             if(object!=audio_device) throw NativeBoundary(address,"invalid native sound device");
             const auto real=[&](unsigned index){const auto value=std::bit_cast<float>(argument(cpu,index));
                 if(!std::isfinite(value)) throw NativeBoundary(address,"non-finite audio listener parameter");return value;};
             if(address==0x0022F3F5) {commit_spatial();finish(cpu,4,success);return;}
-            const unsigned count=address==0x0022F956?1:address==0x0022FA1D?3:6;
+            const unsigned field=address==0x0022F9C4?1:address==0x0022FA1D?2:address==0x0022F97A?4:
+                address==0x0022F932?8:address==0x0022F9F9?16:32;
+            const unsigned count=field<4?3:field==4?6:1;
             const auto deferred=argument(cpu,count+1);
             if(deferred>1) throw NativeBoundary(address,"invalid audio listener apply mode");
             auto& listener=deferred?audio_deferred_listener:audio_listener;
-            if(count==1) {const auto distance=real(1);if(distance<=0) throw NativeBoundary(address,"audio distance factor must be positive");listener.distance=distance;}
-            else if(count==3) for(unsigned i=0;i<3;++i) listener.position[i]=real(i+1);
+            if(count==1) {
+                const auto factor=real(1);if(factor<0 || (field==8 && factor==0)) throw NativeBoundary(address,"invalid audio listener factor");
+                if(field==8) listener.distance=factor;else if(field==16) listener.rolloff=factor;else listener.doppler=factor;
+            }
+            else if(count==3) for(unsigned i=0;i<3;++i) (field==1?listener.position:listener.velocity)[i]=real(i+1);
             else for(unsigned i=0;i<3;++i) {listener.front[i]=real(i+1);listener.up[i]=real(i+4);}
-            const auto field=count==1?1U:count==3?2U:4U;
             if(deferred) audio_pending_listener|=field;
             else {
-                if(field==1) audio_deferred_listener.distance=audio_listener.distance;
-                else if(field==2) audio_deferred_listener.position=audio_listener.position;
-                else {audio_deferred_listener.front=audio_listener.front;audio_deferred_listener.up=audio_listener.up;}
+                copy_listener(audio_deferred_listener,audio_listener,field);
                 audio_pending_listener&=~field;
-                for(auto& [object,buffer]:audio_buffers) update_spatial(buffer);
+                for(auto& [buffer_object,buffer]:audio_buffers) update_spatial(buffer);
             }
             finish(cpu,(count+2)*4,success);return;
         }
@@ -1228,12 +1311,42 @@ struct Xbox::State {
         information=!existed?2:disposition==0?0:disposition==4 || disposition==5?3:1;
         return success;
     }
+    std::uint32_t convert_string(Cpu& cpu,bool to_unicode) {
+        const auto destination=argument(cpu,0),source=argument(cpu,1);
+        const auto length=memory.load<std::uint16_t>(source),maximum=memory.load<std::uint16_t>(source+2);
+        const auto input_address=memory.load<std::uint32_t>(source+4);
+        if(length>maximum || (to_unicode?false:(length&1)!=0)) return invalid_parameter;
+        const auto bytes=length?memory.access(input_address,length):nullptr;
+        int characters=0;
+        if(length) characters=to_unicode?MultiByteToWideChar(1252,0,static_cast<const char*>(bytes),length,nullptr,0):
+            WideCharToMultiByte(1252,0,static_cast<const wchar_t*>(bytes),length/2,nullptr,0,nullptr,nullptr);
+        if(length && !characters) return invalid_parameter;
+        const auto unit=to_unicode?2U:1U,required=(static_cast<unsigned>(characters)+1)*unit;
+        if(required>UINT16_MAX) return 0xC0000106;
+        auto output=memory.load<std::uint32_t>(destination+4);
+        if(argument(cpu,2)) {
+            output=allocate(required,page,true,PAGE_READWRITE);
+            if(!output) return no_memory;
+            output|=0x80000000U;
+            memory.store<std::uint16_t>(destination+2,static_cast<std::uint16_t>(required));
+            memory.store<std::uint32_t>(destination+4,output);
+        } else if(memory.load<std::uint16_t>(destination+2)<required) return 0x80000005;
+        auto target=memory.access(output,required);
+        if(characters) {
+            const auto written=to_unicode?MultiByteToWideChar(1252,0,static_cast<const char*>(bytes),length,static_cast<wchar_t*>(target),characters):
+                WideCharToMultiByte(1252,0,static_cast<const wchar_t*>(bytes),length/2,static_cast<char*>(target),characters,nullptr,nullptr);
+            if(written!=characters) return invalid_parameter;
+        }
+        std::memset(static_cast<std::byte*>(target)+required-unit,0,unit);
+        memory.store<std::uint16_t>(destination,static_cast<std::uint16_t>(required-unit));
+        return success;
+    }
     void io_status(std::uint32_t address,std::uint32_t status,std::uint32_t information=0) {
         memory.store<std::uint32_t>(address,status); memory.store<std::uint32_t>(address+4,information);
     }
     void trace_io(Cpu& cpu,unsigned ordinal,std::uint32_t status,std::uint32_t information,const std::string& path,
                   std::uint32_t options=0,std::uint32_t requested=0,std::uint64_t offset=0,std::uint32_t buffer=0) {
-        if(live && !host.trace_io) return;
+        if(live && !host.trace_io && (status==success || status==0x103)) return;
         if(io_trace.size()==64) io_trace.pop_front();
         io_trace.push_back({ordinal,status,information,memory.load<std::uint32_t>(cpu.registers[esp]),path,options,requested,offset,buffer});
     }
@@ -1306,7 +1419,7 @@ struct Xbox::State {
             io_status(request.status,result,transferred);
             memory.store<std::uint32_t>(request.file_object+0x38+4,1);
             if(request.event) memory.store<std::uint32_t>(request.event+4,1);
-            if(!live || host.trace_io) {
+            if(!live || host.trace_io || result!=success) {
                 if(io_trace.size()==64) io_trace.pop_front();
                 io_trace.push_back({request.ordinal,result,transferred,request.callsite,request.file->path,
                     request.file->options,request.requested,request.offset,request.buffer});
@@ -1457,6 +1570,29 @@ struct Xbox::State {
                 }
             }
             finish(cpu,4,success);
+        } else if constexpr(Ordinal==335 || Ordinal==336 || Ordinal==337) {
+            const auto address=argument(cpu,0);Sha1 sha;
+            auto storage=memory.access(address,sizeof(sha));std::memcpy(&sha,storage,sizeof(sha));
+            if constexpr(Ordinal==335) sha.reset();
+            else if constexpr(Ordinal==336) {
+                const auto length=argument(cpu,2);
+                if(length) sha.update(Bytes(static_cast<const std::byte*>(memory.access(argument(cpu,1),length)),length));
+            } else {
+                auto output=memory.access(argument(cpu,1),20);const auto digest=sha.finish();
+                std::memcpy(storage,&sha,sizeof(sha));std::memcpy(output,digest.data(),digest.size());
+                finish(cpu,8);return;
+            }
+            std::memcpy(storage,&sha,sizeof(sha));finish(cpu,Ordinal==335?4:12);
+        } else if constexpr(Ordinal==340) {
+            const auto span=[&](unsigned pointer,unsigned size,std::uint32_t limit=UINT32_MAX) {
+                const auto length=std::min(argument(cpu,size),limit);
+                return length?Bytes(static_cast<const std::byte*>(memory.access(argument(cpu,pointer),length)),length):Bytes{};
+            };
+            auto output=memory.access(argument(cpu,6),20);
+            const auto digest=xbox_hmac(span(0,1,64),span(2,3),span(4,5));
+            std::memcpy(output,digest.data(),digest.size());finish(cpu,28);
+        } else if constexpr(Ordinal==260 || Ordinal==308) {
+            finish(cpu,12,convert_string(cpu,Ordinal==260));
         } else if constexpr(Ordinal==190 || Ordinal==202) {
             std::uint32_t information=0;
             const auto result=open_file(cpu,Ordinal==190?8:5,Ordinal==190?6:4,Ordinal==190?argument(cpu,7):1U,information);
@@ -2039,6 +2175,7 @@ struct Xbox::State {
         else if constexpr(Ordinal==49) throw NativeBoundary(cpu.eip,std::format("guest requested firmware action {}",argument(cpu,0)));
     }
     BootResult run(std::uint32_t budget,std::uint32_t break_address,std::uint32_t break_hit) {
+        struct DiagnosticScope {~DiagnosticScope(){diagnostic_guest(nullptr);}} diagnostic_scope;
         if(scheduler) throw std::runtime_error("A native Xbox instance can boot only once");
         if(IsThreadAFiber()) scheduler=GetCurrentFiber();
         else { scheduler=ConvertThreadToFiberEx(nullptr,FIBER_FLAG_FLOAT_SWITCH); converted=scheduler!=nullptr; }
@@ -2087,7 +2224,7 @@ struct Xbox::State {
             }
             current=selected; clock_data();
             quantum_due=std::chrono::steady_clock::now()+std::chrono::milliseconds(1);
-            SwitchToFiber(selected->fiber);
+            diagnostic_guest(&selected->cpu);SwitchToFiber(selected->fiber);
         }
         BootResult result;
         result.entry_returned=entry_returned; result.main_reached=diagnostic.reached_watch;
@@ -2118,6 +2255,7 @@ struct Xbox::State {
             for(unsigned i=0;i<result.stack_word_count;++i) result.stack_words[i]=memory.load<std::uint32_t>(stack+i*4);
         }
         result.cpu.kernel=nullptr; result.cpu.diagnostic=nullptr; result.cpu.clock=nullptr; result.cpu.preempt=nullptr;
+        diagnostic_guest(nullptr);
         // Resume sleeping native stacks with cancellation so their C++ and floating
         // scopes unwind before DeleteFiber releases host stacks.
         stopping=true;
@@ -2135,14 +2273,291 @@ void Xbox::output_gain(float gain) {
 void Xbox::capture_frame(const std::filesystem::path& directory) {
     if(!state_->gpu) throw std::runtime_error("The game has not initialized graphics yet");
     state_->gpu->capture_frame(directory);
+    const auto& memory=state_->memory;
+    std::ostringstream snapshot;
+    snapshot<<std::format("{{\"format\":\"b2-game-state-v1\",\"phase\":\"capture_request\",\"source_sha256\":{},\"replay\":{{\"frames\":{},\"index\":{},\"loaded\":{},\"playback\":{},\"finished\":{},\"fade_state\":{},\"deadline_bits\":{},\"buffer\":{}}},\"memory\":[",
+        json(state_->image.sha256),memory.load<std::uint32_t>(0x002FFD68),memory.load<std::uint32_t>(0x002FFD6C),
+        memory.load<std::uint32_t>(0x002FFD70),memory.load<std::uint32_t>(0x002FFD74),memory.load<std::uint32_t>(0x002FFD78),
+        memory.load<std::uint32_t>(0x002FFD7C),memory.load<std::uint32_t>(0x002FFD80),json(hex32(memory.load<std::uint32_t>(0x00522358))));
+    // Bounded original title state; collecting it requires an explicit capture.
+    constexpr std::pair<std::uint32_t,unsigned> slices[]={{0x002FFD68,0xA0},{0x002FE370,16},{0x00300080,0x60},
+        {0x0034AB40,0x40},{0x003525E0,0x144},{0x0048A150,16},{0x004CD800,32},{0x00522358,12},{0x00489F70,5*0x50}};
+    for(unsigned i=0;i<std::size(slices);++i) {
+        if(i) snapshot<<',';const auto [address,size]=slices[i];
+        snapshot<<std::format("{{\"address\":{},\"bytes\":{}}}",json(hex32(address)),json(hex_bytes({static_cast<const std::byte*>(memory.access(address,size)),size})));
+    }
+    snapshot<<"],\"io\":[";
+    for(unsigned i=0;i<state_->io_trace.size();++i) {
+        if(i) snapshot<<',';const auto& io=state_->io_trace[i];
+        snapshot<<std::format("{{\"ordinal\":{},\"status\":{},\"information\":{},\"callsite\":{},\"path\":{},\"options\":{},\"requested\":{},\"offset\":{},\"buffer\":{}}}",
+            io.ordinal,json(hex32(io.status)),io.information,json(hex32(io.callsite)),json(io.path),io.options,io.requested,io.offset,json(hex32(io.buffer)));
+    }
+    snapshot<<"]}";
+    std::filesystem::create_directories(directory);write_text(directory/"game-state.json",snapshot.view(),false);
+    if(state_->audio) {
+        state_->audio->capture(directory);
+        const auto& listener=state_->audio_listener;
+        std::ostringstream report;
+        report<<std::format("{{\"format\":\"b2-audio-game-state-v1\",\"source_sha256\":{},\"master_gain\":{},\"error\":{},\"full_hrtf_requested\":{},\"listener\":{{\"position\":[{},{},{}],\"velocity\":[{},{},{}],\"front\":[{},{},{}],\"up\":[{},{},{}],\"distance_factor\":{},\"rolloff_factor\":{},\"doppler_factor\":{}}},\"buffers\":[",
+            json(state_->image.sha256),state_->output_gain,json(state_->audio->failure()),state_->audio_full_hrtf,
+            listener.position[0],listener.position[1],listener.position[2],listener.velocity[0],listener.velocity[1],listener.velocity[2],
+            listener.front[0],listener.front[1],listener.front[2],listener.up[0],listener.up[1],listener.up[2],listener.distance,listener.rolloff,listener.doppler);
+        unsigned index=0;
+        for(const auto& [object,buffer]:state_->audio_buffers) {
+            if(index++) report<<',';
+            const auto curve=buffer.curve_count?std::span(static_cast<const std::byte*>(memory.access(buffer.curve,buffer.curve_count*4)),buffer.curve_count*4):std::span<const std::byte>{};
+            report<<std::format("{{\"id\":{},\"object\":{},\"flags\":{},\"spatial_parameters\":{},\"environment_parameters\":{},\"curve_address\":{},\"curve_count\":{},\"curve_bytes\":{},\"pending_spatial\":{},\"pending_environment\":{}}}",
+                buffer.identifier,json(hex32(object)),json(hex32(buffer.flags)),json(hex_bytes(std::as_bytes(std::span(buffer.spatial)))),
+                json(hex_bytes(std::as_bytes(std::span(buffer.environment)))),json(hex32(buffer.curve)),buffer.curve_count,json(hex_bytes(curve)),buffer.pending_spatial,buffer.pending_environment);
+        }
+        const auto count=std::min<std::uint32_t>(state_->audio_event_count,static_cast<std::uint32_t>(state_->audio_events.size()));
+        report<<std::format("],\"events_truncated\":{},\"events\":[",state_->audio_event_count>count);
+        for(unsigned i=0;i<count;++i) {
+            const auto& event=state_->audio_events[(state_->audio_event_count-count+i)%state_->audio_events.size()];
+            if(i) report<<',';
+            report<<std::format("{{\"clock\":{},\"api\":{},\"caller\":{},\"id\":{},\"source\":{},\"start\":{},\"bytes\":{},\"arguments\":[",
+                event.clock,json(hex32(event.address)),json(hex32(event.caller)),event.identifier,json(hex32(event.source)),event.start,event.bytes);
+            for(unsigned a=0;a<event.count;++a) {if(a) report<<',';report<<json(hex32(event.arguments[a]));}
+            report<<"]}";
+        }
+        report<<"]}";write_text(directory/"audio-game-state.json",report.view(),false);
+        state_->audio_event_count=0;state_->audio_trace_until=state_->audio->sample_clock()+480000;state_->audio_trace=true;
+    }
 }
 BootResult Xbox::run(std::uint32_t budget,std::uint32_t break_address,std::uint32_t break_hit) {
     if(break_address && !break_hit) throw std::runtime_error("A diagnostic breakpoint requires a positive hit count");
     return state_->run(budget,break_address,break_hit);
 }
+std::string check_audio_listener(const std::filesystem::path& executable,const std::filesystem::path& output) {
+    Xbe image(executable);
+    if(!image.supported() || std::filesystem::exists(output)) throw std::runtime_error("Audio binding checks require the verified XBE and a fresh output directory");
+    std::vector<std::byte> ram(64*1024*1024);image.load(std::span(ram).subspan(image.base,image.image_size));Memory memory(0,ram);
+    XboxHost provider;provider.storage_root=output;Xbox xbox(image,memory,ram,{},std::move(provider));auto& state=*xbox.state_;
+    state.audio=std::make_unique<Audio>(false);state.audio_device=0xA008;
+    // Reference setters run their original software-only, deferred SDK path.
+    // The separate native provider uses no audio device or game boot.
+    constexpr std::uint32_t object=0xA000,settings=0xB000,stack=0xCFC0;
+    memory.store<std::uint32_t>(object+8,settings);memory.store<std::uint32_t>(0x0024A634,0);
+    Cpu cpu;cpu.kernel=&state.services;cpu.fs_base=0xD000;
+    // 22C095 skips its device mutex at DPC level. Deferred setters only copy
+    // settings in this supported path; no hardware or scheduler is involved.
+    memory.store<std::uint8_t>(cpu.fs_base+0x24,1);
+    unsigned checks=0;
+    const auto require=[&](bool passed,std::string_view name) {
+        if(!passed) throw std::runtime_error("Audio binding check failed: "+std::string(name));++checks;
+    };
+    const auto invoke=[&](std::uint32_t entry,std::span<const std::uint32_t> arguments) {
+        cpu.registers[esp]=stack;memory.store<std::uint32_t>(stack,return_sentinel);
+        for(unsigned i=0;i<arguments.size();++i) memory.store<std::uint32_t>(stack+4+i*4,arguments[i]);
+        invoke_native(cpu,memory,entry);
+        require(cpu.eip==return_sentinel && cpu.registers[esp]==stack+4+arguments.size()*4 && cpu.registers[eax]==0,"original/native setter ABI");
+    };
+    const auto values=[](const SpatialListener& listener) {
+        return std::array<float,15>{listener.position[0],listener.position[1],listener.position[2],listener.velocity[0],listener.velocity[1],listener.velocity[2],
+            listener.front[0],listener.front[1],listener.front[2],listener.up[0],listener.up[1],listener.up[2],listener.distance,listener.rolloff,listener.doppler};
+    };
+    const auto initial=values(state.audio_listener);
+    for(unsigned i=0;i<initial.size();++i) memory.store<std::uint32_t>(settings+0x3C+i*4,std::bit_cast<std::uint32_t>(initial[i]));
+    struct Setter {std::uint32_t api,reference,count;std::array<float,6> data;};
+    const std::array setters{
+        Setter{0x0022F9C4,0x0022F6E4,3,{-355.89722f,67.815994f,-1264.2976f}},
+        Setter{0x0022FA1D,0x0022F757,3,{29.20445f,0.16950999f,-41.51002f}},
+        Setter{0x0022F97A,0x0022F657,6,{0.6f,0,-0.8f,0,1,0}},
+        Setter{0x0022F932,0x0022F53A,1,{0.625f}},
+        Setter{0x0022F9F9,0x0022F5F8,1,{0.75f}},
+        Setter{0x0022F956,0x0022F599,1,{0.5f}}
+    };
+    for(const auto& setter:setters) {
+        std::array<std::uint32_t,8> arguments{};arguments[0]=object;
+        for(unsigned i=0;i<setter.count;++i) arguments[i+1]=std::bit_cast<std::uint32_t>(setter.data[i]);
+        arguments[setter.count+1]=1;invoke(setter.reference,std::span(arguments).first(setter.count+2));
+        arguments[0]=state.audio_device;invoke(setter.api,std::span(arguments).first(setter.count+2));
+        const auto deferred=values(state.audio_deferred_listener);bool equal=true;
+        for(unsigned i=0;i<deferred.size();++i) equal&=memory.load<std::uint32_t>(settings+0x3C+i*4)==std::bit_cast<std::uint32_t>(deferred[i]);
+        require(equal,"all listener fields match original SDK setters");
+        require(values(state.audio_listener)==initial,"deferred changes wait for commit");
+    }
+    invoke(0x0022F3F5,std::array<std::uint32_t,1>{state.audio_device});
+    require(values(state.audio_listener)==values(state.audio_deferred_listener) && !state.audio_pending_listener,"complete deferred listener commit");
+    const auto position=state.audio_listener.position;
+    invoke(0x0022F9C4,std::array<std::uint32_t,5>{state.audio_device,0,0,0,1});
+    invoke(0x0022FA1D,std::array<std::uint32_t,5>{state.audio_device,0,0,0,0});
+    require(state.audio_listener.position==position && state.audio_listener.velocity==std::array<float,3>{} && state.audio_pending_listener==1,"immediate velocity preserves deferred position");
+    invoke(0x0022F3F5,std::array<std::uint32_t,1>{state.audio_device});
+    require(state.audio_listener.position==std::array<float,3>{} && !state.audio_pending_listener,"mixed immediate/deferred commit");
+    const auto report=std::format("{{\"format\":\"b2-audio-binding-check-v1\",\"passed\":true,\"game_booted\":false,\"audio_device_opened\":false,\"cases\":{},\"original_setters\":6}}",checks);
+    write_text(output/"audio-bindings.json",report,false);return report;
+}
 bool Xbox::save_frame(const std::filesystem::path& path) {
     if(!state_->gpu || (!state_->gpu->stats().clears && !state_->gpu->stats().draws)) return false;
     state_->gpu->snapshot();save_png(state_->graphics->readback(),path);return true;
+}
+std::string check_storage(const std::filesystem::path& executable,const std::filesystem::path& output) {
+    Xbe image(executable);
+    if(!image.supported() || std::filesystem::exists(output)) throw std::runtime_error("Storage checks require the verified XBE and a fresh output directory");
+    std::filesystem::create_directories(output);
+    unsigned checks=0;
+    const auto require=[&](bool passed,std::string_view name) {
+        if(!passed) throw std::runtime_error("Storage check failed: "+std::string(name));
+        ++checks;
+    };
+    const auto reference=[&](Bytes key,Bytes bytes) {
+        BCRYPT_ALG_HANDLE algorithm=nullptr;BCRYPT_HASH_HANDLE hash=nullptr;
+        struct Scope {BCRYPT_ALG_HANDLE& algorithm;BCRYPT_HASH_HANDLE& hash;
+            ~Scope(){if(hash) BCryptDestroyHash(hash);if(algorithm) BCryptCloseAlgorithmProvider(algorithm,0);}} scope{algorithm,hash};
+        const auto check=[](NTSTATUS status){if(status<0) throw std::runtime_error("Storage reference hash failed");};
+        check(BCryptOpenAlgorithmProvider(&algorithm,BCRYPT_SHA1_ALGORITHM,nullptr,key.empty()?0:BCRYPT_ALG_HANDLE_HMAC_FLAG));
+        check(BCryptCreateHash(algorithm,&hash,nullptr,0,reinterpret_cast<PUCHAR>(const_cast<std::byte*>(key.data())),static_cast<ULONG>(key.size()),0));
+        if(!bytes.empty()) check(BCryptHashData(hash,reinterpret_cast<PUCHAR>(const_cast<std::byte*>(bytes.data())),static_cast<ULONG>(bytes.size()),0));
+        ShaDigest digest{};check(BCryptFinishHash(hash,reinterpret_cast<PUCHAR>(digest.data()),static_cast<ULONG>(digest.size()),0));return digest;
+    };
+    std::array<std::byte,128> input{};
+    for(unsigned i=0;i<input.size();++i) input[i]=static_cast<std::byte>(i*73+19);
+    for(unsigned size:{0U,3U,55U,56U,63U,64U,65U,128U}) {
+        Sha1 sha;sha.reset();sha.update(Bytes(input).first(size/2));auto clone=sha;
+        sha.update(Bytes(input).subspan(size/2,size-size/2));clone.update(Bytes(input).subspan(size/2,size-size/2));
+        const auto expected=reference({},Bytes(input).first(size));
+        require(sha.finish()==expected && clone.finish()==expected,"SHA partial blocks and copied context");
+    }
+    require(xbox_hmac(input,Bytes(input).first(7),Bytes(input).subspan(7,13))==reference(Bytes(input).first(64),Bytes(input).first(20)),"Xbox HMAC two inputs and long-key truncation");
+    std::string saved_directory;
+    std::array<std::byte,32> saved_keys{};
+    for(unsigned reload=0;reload<3;++reload) {
+        std::vector<std::byte> ram(64*1024*1024);image.load(std::span(ram).subspan(image.base,image.image_size));Memory memory(0,ram);
+        XboxHost provider;provider.storage_root=output;
+        Xbox xbox(image,memory,ram,{},std::move(provider));auto& state=*xbox.state_;
+        auto& thread=state.create(0,0,0,image.stack_commit,0,false);state.current=&thread;
+        auto& cpu=thread.cpu;cpu.preempt=nullptr;state.diagnostic.remaining=2000000;
+        const auto stack=cpu.registers[esp]-4096;
+        const auto invoke=[&](std::uint32_t address,std::initializer_list<std::uint32_t> arguments) {
+            cpu.registers[esp]=stack;memory.store<std::uint32_t>(stack,return_sentinel);
+            unsigned index=0;for(auto value:arguments) memory.store<std::uint32_t>(stack+4+index++*4,value);
+            invoke_native(cpu,memory,address);
+            require(cpu.eip==return_sentinel && cpu.registers[esp]==stack+4+arguments.size()*4,"original SDK calling convention");
+            return cpu.registers[eax];
+        };
+        constexpr std::uint32_t area=0xA000,profile=0x1000,profile_size=0x7C04,signed_size=0x7AB8,aligned_size=0x7E00;
+        const auto text=[&](std::uint32_t address,std::string_view value) {
+            std::memcpy(memory.access(address,value.size()),value.data(),value.size());memory.store<std::uint8_t>(address+static_cast<std::uint32_t>(value.size()),0);
+        };
+        File identity(std::filesystem::absolute(output)/"storage.key");std::array<std::byte,32> keys{};identity.read(0,keys);
+        if(!reload) saved_keys=keys;else require(saved_keys==keys,"save identity survives a fresh runtime");
+        // Reproduce the SDK's verified process-heap setup at E6075..E60A3 only.
+        std::memset(memory.access(area,0x30),0,0x30);memory.store<std::uint32_t>(area,0x30);
+        const auto heap=invoke(0x000E435A,{2,0,image.heap_reserve,image.heap_commit,0,area});require(heap!=0,"original process heap");
+        memory.store<std::uint32_t>(0x005A8974,heap);
+        require(invoke(0x000E5D08,{image.title_id,0})==success,"original title storage mount");
+        text(area,"U:\\");const std::wstring name=L"Offline storage check";
+        std::memcpy(memory.access(area+0x40,(name.size()+1)*2),name.c_str(),(name.size()+1)*2);
+        require(invoke(0x000E1445,{area,area+0x40,reload?3U:4U,0,area+0x100,260})==0,"original save-directory creation/reopening");
+        std::string path;
+        for(unsigned i=0;i<260 && memory.load<std::uint8_t>(area+0x100+i);++i) path+=static_cast<char>(memory.load<std::uint8_t>(area+0x100+i));
+        require(!path.empty() && (!reload || path==saved_directory),"save metadata identifies the same directory");
+        saved_directory=path;
+        path+="Profile 1";text(area+0x300,path);
+        const auto handle=invoke(0x000E09BA,{area+0x300,reload?GENERIC_READ:GENERIC_READ|GENERIC_WRITE,3,0,reload?3U:2U,0x80,0});
+        require(handle!=UINT32_MAX,"original save file open");
+        if(!reload) {
+            cpu.registers[ecx]=profile;cpu.registers[esp]=stack;memory.store<std::uint32_t>(stack,return_sentinel);
+            invoke_native(cpu,memory,0x000D6290);
+            require(cpu.eip==return_sentinel && cpu.registers[esp]==stack+4,"original signed player-profile initialization");
+        }
+        memory.store<std::uint64_t>(area+0x700,0);
+        require(invoke(0xFFF00000U+(reload?219U:236U)*16,{handle,0,0,0,area+0x710,profile,profile_size,area+0x700})==success &&
+            memory.load<std::uint32_t>(area+0x714)==profile_size,"complete original profile write/read");
+        if(!reload) require(invoke(0xFFF00000U+198*16,{handle,area+0x710})==success,"save flush");
+        require(invoke(0xFFF00000U+187*16,{handle})==success,"save file close");
+        const auto key=memory.load<std::uint32_t>(0x00293D24),disk=memory.load<std::uint32_t>(0x00293D20);
+        const auto span=[&](std::uint32_t address,unsigned size){return Bytes(static_cast<const std::byte*>(memory.access(address,size)),size);};
+        const auto inner=reference(span(key,16),span(profile,signed_size)),expected=reference(span(disk,16),inner);
+        require(std::equal(expected.begin(),expected.end(),span(profile+signed_size,20).begin()),"persisted profile signature matches independent HMAC");
+        const auto signature=invoke(0x000E1A84,{1});require(signature!=UINT32_MAX,"original save signature begin");
+        require(invoke(0x000E1A0D,{signature,profile,signed_size})==0,"original load signature update");
+        require(invoke(0x000E1A27,{signature,area+0x740})==0 && std::equal(expected.begin(),expected.end(),span(area+0x740,20).begin()),"original save signature validates after reopening");
+        if(reload==1) {
+            // Use the same overlapped/unbuffered request flags as D8E86's title save writer.
+            const auto overwrite=invoke(0x000E09BA,{area+0x300,GENERIC_WRITE,3,0,3,0x60000000,0});
+            require(overwrite!=UINT32_MAX,"existing profile overwrite open");
+            memory.store<std::uint32_t>(profile+0x7AB4,7);
+            const auto changed=invoke(0x000E1A84,{1});require(changed!=UINT32_MAX,"overwrite signature begin");
+            require(invoke(0x000E1A0D,{changed,profile,signed_size})==0 && invoke(0x000E1A27,{changed,profile+signed_size})==0,"original overwrite signature");
+            require(invoke(0xFFF00000U+236*16,{overwrite,0,0,0,area+0x710,profile,profile_size,area+0x700})==invalid_parameter,"unbuffered writes reject a non-sector length");
+            require(invoke(0xFFF00000U+236*16,{overwrite,0,0,0,area+0x710,profile,aligned_size,area+0x700})==0x103,"original asynchronous save write is pending");
+            const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+            while(state.pending_io_count && std::chrono::steady_clock::now()<deadline) {state.dispatch_io();if(state.pending_io_count) Sleep(1);}
+            require(!state.pending_io_count && memory.load<std::uint32_t>(area+0x710)==success && memory.load<std::uint32_t>(area+0x714)==aligned_size,"asynchronous save completes with the real byte count");
+            require(invoke(0xFFF00000U+198*16,{overwrite,area+0x710})==success && invoke(0xFFF00000U+187*16,{overwrite})==success,"overwritten profile flush and close");
+        }
+        if(reload==2) {
+            require(memory.load<std::uint32_t>(profile+0x7AB4)==7,"overwritten profile persists in another fresh runtime");
+            memory.store<std::uint8_t>(profile,memory.load<std::uint8_t>(profile)^1U);
+            const auto changed=reference(span(key,16),span(profile,signed_size));
+            require(reference(span(disk,16),changed)!=expected,"changed save data fails integrity verification");
+        }
+    }
+    return std::format("{{\"format\":\"b2-storage-check-v1\",\"passed\":true,\"game_booted\":false,\"cases\":{},\"profile_bytes\":31748,\"reopened\":true,\"overwritten\":true,\"async_write\":true,\"runtime_decoder\":false,\"storage\":{}}}",checks,json(utf8(std::filesystem::absolute(output).wstring())));
+}
+std::string check_replays(const std::filesystem::path& executable,const std::filesystem::path& disc_path,const std::filesystem::path& output) {
+    Xbe image(executable);Disc disc(disc_path);
+    if(!image.supported() || std::filesystem::exists(output)) throw std::runtime_error("Replay checks require the verified XBE and a fresh output directory");
+    std::vector<std::byte> ram(64*1024*1024);image.load(std::span(ram).subspan(image.base,image.image_size));Memory memory(0,ram);
+    XboxHost provider;provider.storage_root=output;
+    Xbox xbox(image,memory,ram,disc_path,std::move(provider));auto& state=*xbox.state_;
+    auto& thread=state.create(0,0,0,image.stack_commit,0,false);state.current=&thread;
+    auto& cpu=thread.cpu;cpu.preempt=nullptr;state.diagnostic.remaining=2000000;
+    diagnostic_guest(&cpu);
+    const auto stack=cpu.registers[esp]-4096;
+    const auto invoke=[&](std::uint32_t address,std::initializer_list<std::uint32_t> arguments) {
+        diagnostic_record("{\"type\":\"replay_check_call\",\"address\":"+json(hex32(address))+'}');
+        cpu.registers[esp]=stack;memory.store<std::uint32_t>(stack,return_sentinel);
+        unsigned index=0;for(auto value:arguments) memory.store<std::uint32_t>(stack+4+index++*4,value);
+        invoke_native(cpu,memory,address);
+        if(cpu.eip!=return_sentinel || cpu.registers[esp]!=stack+4+arguments.size()*4)
+            throw std::runtime_error("Replay check calling convention differs at "+hex32(address));
+        return cpu.registers[eax];
+    };
+    // Original SDK heap setup, file-pool constructor and startup arguments.
+    memory.store<std::uint32_t>(0xA000,0x30);
+    const auto heap=invoke(0x000E435A,{2,0,image.heap_reserve,image.heap_commit,0,0xA000});
+    if(!heap) throw std::runtime_error("Replay check could not initialize the original SDK heap");
+    memory.store<std::uint32_t>(0x005A8974,heap);
+    invoke(0x00123801,{});
+    invoke(0x00139380,{});
+    cpu.registers[ecx]=0x00303C70;invoke(0x000D9570,{5,0x00489F70,0x003D6864,0x00295B14});
+    memory.store<std::uint32_t>(0x0034AB48,0x00303C70);
+    constexpr std::uint32_t controller=0x002FFD68,buffer=0x01000000;
+    memory.store<std::uint32_t>(0x003D686C,buffer);
+    std::ostringstream report;unsigned cases=0;
+    const auto check=[&](std::string_view path,unsigned track,unsigned mode,unsigned lesson,unsigned pal) {
+        const auto entry=disc.find(path);
+        if(entry.size<32 || entry.size>0x66000) throw std::runtime_error("Replay check file is outside the original replay-buffer bounds");
+        std::vector<std::byte> expected(entry.size);disc.read(entry,0,expected);
+        const auto frames=u32(expected,4);
+        if(u32(expected,0)!=32 || entry.size!=32+std::uint64_t(frames)*6)
+            throw std::runtime_error("Replay header/length differs for "+std::string(path));
+        cpu.registers[ecx]=controller;invoke(0x00088850,{0});
+        memory.store<std::uint32_t>(0x0034AB58,mode);memory.store<std::uint32_t>(0x0048A150,track);
+        memory.store<std::uint32_t>(0x00352600,lesson);memory.store<std::uint32_t>(0x00352720,pal);
+        memory.store<std::uint32_t>(0x004CD80C,1);
+        std::fill_n(ram.begin()+buffer,entry.size-32,std::byte{0xA5});
+        cpu.registers[ecx]=controller;const auto loaded=invoke(0x00088D30,{});
+        if(loaded!=frames || memory.load<std::uint32_t>(controller+8)!=1 ||
+           !std::equal(expected.begin()+32,expected.end(),ram.begin()+buffer)) {
+            const auto& io=state.io_trace;
+            throw std::runtime_error(std::format("Original replay load differs for {}: {} of {} frames, loaded {}, last I/O {}",
+                path,loaded,frames,memory.load<std::uint32_t>(controller+8),io.empty()?"none":hex32(io.back().status)));
+        }
+        if(cases++) report<<',';
+        report<<std::format("{{\"path\":{},\"frames\":{},\"bytes\":{},\"identical\":true}}",json(path),frames,entry.size);
+    };
+    for(unsigned pal=0;pal<2;++pal) {
+        const auto region=pal?'P':'N';
+        for(const auto& item:std::array<std::pair<std::string_view,unsigned>,3>{{{"ctyl",1},{"fwyl",7},{"cstl",9}}})
+            check(std::format("tracks/forward/{}/DReplay{}XBOX.dat",item.first,region),item.second,1,0,pal);
+        for(unsigned lesson=0;lesson<6;++lesson)
+            check(std::format("tracks/{}/fwyl/L{}Intro{}XBOX.dat",lesson==3?"reverse":"forward",lesson,region),lesson==3?22:7,15,lesson,pal);
+    }
+    return std::format("{{\"format\":\"b2-replay-check-v1\",\"passed\":true,\"game_booted\":false,\"cases\":{},\"files\":[{}]}}",cases,report.view());
 }
 void native_platform(Cpu& cpu,Memory& memory,std::uint32_t address) {
     if(!cpu.kernel || !cpu.kernel->context || cpu.kernel->entries[255]!=Xbox::State::dispatch_kernel<255>)

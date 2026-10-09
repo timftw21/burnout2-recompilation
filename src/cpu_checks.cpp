@@ -4,6 +4,7 @@
 #include "xbe.h"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 
 extern "C" {
 #define B2_REFERENCES(bits) \
@@ -300,6 +301,47 @@ unsigned check_floating_contexts() {
     require(before==after,"Guest floating execution changed the host x87 environment");
     return checked;
 }
+unsigned check_reciprocal_sqrt() {
+    struct Case {std::uint32_t input,expected;};
+    // Expected values retained by the original recomp's CPU fix (1e6c8b0).
+    constexpr Case cases[]={{0x3F000000,0x3FB4F800},{0x3F800000,0x3F7FF000},
+        {0x40000000,0x3F34F800},{0x40800000,0x3EFFF000},{0,0x7F800000},
+        {0x80000000,0xFF800000},{1,0x7F800000},{0x80000001,0xFF800000},
+        {0xBF800000,0xFFC00000},{0x7F800000,0},{0xFF800000,0xFFC00000},
+        {0x7F812345,0x7FC12345},{0xFFC12345,0xFFC12345}};
+    const auto host_mxcsr=_mm_getcsr();
+    struct Restore {unsigned mxcsr;~Restore(){_mm_setcsr(mxcsr);}} restore{host_mxcsr};
+    unsigned checked=0;
+    for(unsigned control:{0x1F80U,0x3F80U,0x5F80U,0x7F80U,0x9FC0U}) {
+        _mm_setcsr(control);
+        for(const auto& sample:cases) {
+            const std::array<std::uint32_t,4> input={sample.input,0x7F812345,0xFFFFFFFF,0x13579BDF};
+            __m128 value;std::memcpy(&value,input.data(),16);
+            const auto scalar=rsqrt_ss(value),packed=rsqrt_ps(value);
+            std::array<std::uint32_t,4> result,all;
+            std::memcpy(result.data(),&scalar,16);std::memcpy(all.data(),&packed,16);
+            require(result==std::array<std::uint32_t,4>{sample.expected,input[1],input[2],input[3]} &&
+                all[0]==sample.expected && all[1]==0x7FC12345 && all[2]==0xFFFFFFFF && _mm_getcsr()==control,
+                "Xbox reciprocal-square-root estimate, scalar lanes or control state changed");
+            ++checked;
+        }
+    }
+    _mm_setcsr(0x1F80);
+    // Independently compare the compact table with the preserved midpoint formula.
+    for(unsigned exponent:{1U,2U,127U,128U,253U,254U}) for(unsigned bucket=0;bucket<1024;++bucket) {
+        const auto bits=(exponent<<23)|(bucket<<13);
+        const auto midpoint=std::bit_cast<float>(bits|0x1000U);
+        const auto estimate=static_cast<float>(1.0/std::sqrt(static_cast<double>(midpoint)));
+        const auto expected=(std::bit_cast<std::uint32_t>(estimate)+0x400U)&0xFFFFF800U;
+        for(unsigned offset:{0U,0x1FFFU}) {
+            const auto value=_mm_castsi128_ps(_mm_cvtsi32_si128(static_cast<int>(bits|offset)));
+            require(static_cast<std::uint32_t>(_mm_cvtsi128_si32(_mm_castps_si128(rsqrt_ss(value))))==expected,
+                "Xbox reciprocal-square-root lookup differs from the preserved midpoint formula");
+        }
+        ++checked;
+    }
+    return checked;
+}
 unsigned check_vertex_colors() {
     const auto& pack=function(0x000C2020);
     constexpr std::uint32_t base=0x1000,object=0x2000,colors=0x5000,stack=0x7000;
@@ -578,7 +620,7 @@ CpuChecks check_cpu_batch() {
 #undef B2_HOST
     result.memory_cases = check_strings<std::uint8_t>() + check_strings<std::uint16_t>() + check_strings<std::uint32_t>();
     result.game_cases = check_compare() + check_call_chain();
-    result.floating_cases=check_floating_contexts()+check_vertex_colors()+check_mmx_copy();
+    result.floating_cases=check_floating_contexts()+check_reciprocal_sqrt()+check_vertex_colors()+check_mmx_copy();
     result.control_cases=check_control_boundaries()+check_compact_jump_table()+check_segment_setup()+check_flags_stack();
     return result;
 }
@@ -608,6 +650,59 @@ unsigned check_cpu_image(const std::filesystem::path& path) {
                 "Original memory-copy table changed overlap, alignment, bounds or its calling convention");
             ++cases;
         }
+    // Original vector normalization must retain the console estimate: even a
+    // unit vector is slightly shorter than one. A host estimate changes replays.
+    require(memory.load<std::uint32_t>(0x000EA7BD)==0xC0520FF3,"Original RSQRTSS bytes changed");
+    for(const auto& sample:std::array{std::array{1.f,0.f,0.f},std::array{1.f,1.f,0.f}}) {
+        for(unsigned i=0;i<3;++i) memory.store<std::uint32_t>(0x2400+i*4,std::bit_cast<std::uint32_t>(sample[i]));
+        memory.store<std::uint32_t>(stack,0xABCDEF00);
+        memory.store<std::uint32_t>(stack+4,0x2500);memory.store<std::uint32_t>(stack+8,0x2400);
+        Cpu cpu;cpu.registers[esp]=stack;function(0x000EA760).run(cpu,memory);
+        const auto normalized=sample[1] ? 0x3F34F800U : 0x3F7FF000U;
+        require(cpu.eip==0xABCDEF00 && cpu.registers[esp]==stack+4 && cpu.floating.xmm[0][0]==normalized &&
+            memory.load<std::uint32_t>(0x2500)==normalized &&
+            memory.load<std::uint32_t>(0x2504)==(sample[1] ? normalized : 0U) && memory.load<std::uint32_t>(0x2508)==0,
+            "Original vector normalization lost the Xbox reciprocal-square-root approximation");
+        ++cases;
+    }
+    // Replay the original queued Crash-mode draw callback without booting.
+    // It draws a background and optional filled/unfilled bar segments.
+    constexpr std::uint32_t record=0x2000,transform=0x2200,queue=0x2300,owner=0x2400,vertices=0x0057A448;
+    struct DrawCase {float border_x,border_y,fill,last_x,last_y;unsigned vertex_count;};
+    constexpr DrawCase draws[]={{0,0,0,110,60,10},{0.1f,0,1,100,60,10},{0.1f,0.125f,0.5f,100,55,16}};
+    const auto store_float=[&](std::uint32_t address,float value) {memory.store<std::uint32_t>(address,std::bit_cast<std::uint32_t>(value));};
+    const auto load_float=[&](std::uint32_t address) {return std::bit_cast<float>(memory.load<std::uint32_t>(address));};
+    for(const auto& sample:draws) {
+        std::fill_n(bytes.begin()+record,0x500,std::byte{});
+        constexpr float position[]={10,20,100,40,8,16,24,128},identity[]={0,0,1,1,1,1,1,1};
+        for(unsigned i=0;i<8;++i) {
+            store_float(record+8+i*4,position[i]);store_float(transform+i*4,identity[i]);
+        }
+        for(unsigned i=0;i<4;++i) store_float(record+0x28+i*4,1);
+        store_float(record+0x38,sample.border_x);store_float(record+0x3C,sample.border_y);
+        store_float(record+0x40,sample.fill);memory.store<std::uint32_t>(record+0x48,transform);
+        memory.store<std::uint32_t>(record+0x50,0x00034C20);
+        memory.store<std::uint32_t>(queue+4,owner);memory.store<std::uint32_t>(owner+8,record);
+        memory.store<std::uint32_t>(vertices+0x1C00,0);store_float(vertices+0x1C04,0.75f);
+        memory.store<std::uint32_t>(vertices+0x1C10,0);
+        store_float(0x002C4F70,640);store_float(0x002C4F6C,480);
+        memory.store<std::uint32_t>(stack,0xABCDEF00);
+        ExecutionDiagnostic diagnostic;diagnostic.remaining=10000;diagnostic.watch_address=0x00034C20;
+        Cpu cpu;cpu.registers[esp]=stack;cpu.registers[ecx]=queue;cpu.diagnostic=&diagnostic;
+        function(0x000C1210).run(cpu,memory);
+        const auto last=vertices+(sample.vertex_count-1)*28;
+        require(diagnostic.reached_watch && cpu.eip==0xABCDEF00 && cpu.registers[esp]==stack+4 &&
+            memory.load<std::uint32_t>(vertices+0x1C00)==sample.vertex_count &&
+            load_float(vertices)==10 && load_float(vertices+4)==20 &&
+            memory.load<std::uint32_t>(vertices+16)==0x80000000 &&
+            load_float(last)==sample.last_x && load_float(last+4)==sample.last_y &&
+            memory.load<std::uint32_t>(last+16)==0x80081018,
+            std::format("Original Crash-mode UI queue differs for border ({}, {}), fill {}: callback {}, return {}, stack {}, vertices {}, first ({}, {}, {:08X}), last ({}, {}, {:08X})",
+                sample.border_x,sample.border_y,sample.fill,diagnostic.reached_watch,hex32(cpu.eip),hex32(cpu.registers[esp]),
+                memory.load<std::uint32_t>(vertices+0x1C00),load_float(vertices),load_float(vertices+4),memory.load<std::uint32_t>(vertices+16),
+                load_float(last),load_float(last+4),memory.load<std::uint32_t>(last+16)));
+        ++cases;
+    }
     return cases;
 }
 

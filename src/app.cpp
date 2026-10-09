@@ -2,6 +2,7 @@
 #include "input.h"
 #include "file.h"
 #include "xbox.h"
+#include "diagnostics.h"
 #include <SDL3/SDL.h>
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
@@ -157,7 +158,7 @@ struct App {
     void capture_frame() {
         if(!game) return;
         const auto directory=std::filesystem::path("build/captures")/std::format("frame-{}",SDL_GetTicksNS());
-        try {game->capture_frame(directory);status="Rendering capture: "+directory.string();}
+        try {game->capture_frame(directory);status="Frame and audio capture: "+directory.string();}
         catch(const std::exception& error) {status=error.what();}
     }
     void refresh_options() {
@@ -281,6 +282,8 @@ struct App {
     BootResult play(const std::filesystem::path& executable,const std::filesystem::path& disc,const std::filesystem::path& frame,
                     std::span<const MemorySlice> slices={},bool trace_io=false) {
         Xbe image(executable);if(!image.supported()) throw std::runtime_error("The executable does not match the supported Burnout 2 release.");
+        diagnostic_record(std::format("{{\"type\":\"game_start\",\"xbe\":{},\"disc\":{},\"sha256\":{}}}",
+            json(utf8(executable.wstring())),json(utf8(disc.wstring())),json(image.sha256)));
         std::vector<std::byte> ram(64*1024*1024);image.load(std::span(ram).subspan(image.base,image.image_size));Memory memory(0,ram);
         XboxHost host{renderer.get(),input.get(),[&]{return poll();},[&]{
             if(controls && !controls->started) controls->started=SDL_GetTicksNS();display(false);
@@ -289,8 +292,9 @@ struct App {
         Xbox xbox(image,memory,ram,disc,std::move(host));
         xbox.output_gain(settings.muted?0:settings.volume/100.0f);
         struct Session {App& app;~Session(){app.game=nullptr;app.playing=false;app.show_settings=true;}} session{*this};
-        game=&xbox;playing=true;show_settings=false;frames=first_frame=last_frame=0;pacer={};
+        game=&xbox;playing=true;show_settings=false;frames=first_frame=last_frame=0;pacer={};memory_snapshot="[]";
         const auto result=xbox.run(0);
+        try {diagnostic_record(run_report(result));} catch(...) {diagnostic_record("{\"type\":\"log_error\",\"message\":\"Could not serialize game result\"}");}
         std::ostringstream captured;captured<<'[';
         for(unsigned i=0;i<slices.size();++i) {
             if(i) captured<<',';const auto& slice=slices[i];
@@ -301,18 +305,13 @@ struct App {
         if(!frame.empty()) xbox.save_frame(frame);
         renderer->set_target(0);return result;
     }
-};
-}
-int run_app(const std::filesystem::path& xbe,const std::filesystem::path& disc,unsigned seconds,const std::filesystem::path& frame,
-            const std::filesystem::path& controls,std::span<const MemorySlice> slices,bool trace_io) {
-    App app(false,false,controls);
-    if(seconds) app.stop_at=SDL_GetTicksNS()+std::uint64_t(seconds)*1000000000;
-    if(!xbe.empty()) {
-        const auto result=app.play(xbe,disc,frame,slices,trace_io);
+    std::string run_report(const BootResult& result) const {
         std::ostringstream report;
-        report<<std::format("{{\"format\":\"b2-live-run-v2\",\"main_reached\":{},\"draws\":{},\"flips\":{},\"presented_frames\":{},\"boundary\":{},\"eip\":{},\"visits\":{},\"audio_error\":{},\"controller_connected\":{},\"controller_packet\":{},\"control_events_applied\":{},\"history\":[",
-            result.main_reached,result.graphics.draws,result.graphics.flips,app.frames,json(result.boundary),json(hex32(result.cpu.eip)),
-            result.diagnostic.visits,json(result.audio_error),app.input->connected(),app.input->state(0).packet,app.controls?app.controls->next:0);
+        report<<std::format("{{\"type\":\"game_end\",\"format\":\"b2-live-run-v2\",\"entry_returned\":{},\"main_reached\":{},\"active_thread\":{},\"draws\":{},\"flips\":{},\"presented_frames\":{},\"boundary\":{},\"eip\":{},\"flags\":{},\"visits\":{},\"audio_error\":{},\"controller_connected\":{},\"controller_packet\":{},\"control_events_applied\":{},\"registers\":[",
+            result.entry_returned,result.main_reached,result.active_thread,result.graphics.draws,result.graphics.flips,frames,json(result.boundary),json(hex32(result.cpu.eip)),json(hex32(result.cpu.flags)),
+            result.diagnostic.visits,json(result.audio_error),input->connected(),input->state(0).packet,controls?controls->next:0);
+        for(unsigned i=0;i<result.cpu.registers.size();++i) {if(i) report<<',';report<<json(hex32(result.cpu.registers[i]));}
+        report<<"],\"history\":[";
         const auto count=std::min<std::uint64_t>(result.diagnostic.visits,result.diagnostic.history.size());
         for(std::uint64_t i=0;i<count;++i) {if(i) report<<',';report<<json(hex32(result.diagnostic.history[(result.diagnostic.visits-count+i)%result.diagnostic.history.size()]));}
         report<<"],\"stack_words\":[";
@@ -322,17 +321,27 @@ int run_app(const std::filesystem::path& xbe,const std::filesystem::path& disc,u
             if(i) report<<',';const auto& thread=result.threads[i];
             report<<std::format("{{\"id\":{},\"eip\":{},\"state\":{},\"wait_object\":{}}}",thread.id,json(hex32(thread.eip)),json(thread.state),json(hex32(thread.wait_object)));
         }
-        const auto stats=app.renderer->stats();
+        const auto stats=renderer->stats();
         report<<"],\"io\":[";
         for(unsigned i=0;i<result.io.size();++i) {
             if(i) report<<',';const auto& io=result.io[i];
-            report<<std::format("{{\"ordinal\":{},\"status\":{},\"information\":{},\"path\":{},\"buffer\":{},\"requested\":{},\"offset\":{}}}",
-                io.ordinal,json(hex32(io.status)),io.information,json(io.path),json(hex32(io.buffer)),io.requested,io.offset);
+            report<<std::format("{{\"ordinal\":{},\"status\":{},\"information\":{},\"callsite\":{},\"path\":{},\"buffer\":{},\"requested\":{},\"offset\":{}}}",
+                io.ordinal,json(hex32(io.status)),io.information,json(hex32(io.callsite)),json(io.path),json(hex32(io.buffer)),io.requested,io.offset);
         }
-        const auto fps=app.last_frame>app.first_frame?(app.frames-1)*1000000000.0/(app.last_frame-app.first_frame):0;
+        const auto fps=last_frame>first_frame?(frames-1)*1000000000.0/(last_frame-first_frame):0;
         report<<std::format("],\"adapter\":{},\"shader_compilations\":{},\"uploaded_vertex_bytes\":{},\"vblank_callbacks\":{},\"refresh_rate\":{},\"presented_fps\":{:.3f},\"memory\":{}}}",
-            json(result.graphics_adapter),stats.shader_compilations,stats.vertex_bytes,result.vblank_callbacks,app.settings.refresh_rate,fps,app.memory_snapshot);
-        std::cout<<report.str()<<'\n';
+            json(result.graphics_adapter),stats.shader_compilations,stats.vertex_bytes,result.vblank_callbacks,settings.refresh_rate,fps,memory_snapshot);
+        return report.str();
+    }
+};
+}
+int run_app(const std::filesystem::path& xbe,const std::filesystem::path& disc,unsigned seconds,const std::filesystem::path& frame,
+            const std::filesystem::path& controls,std::span<const MemorySlice> slices,bool trace_io) {
+    App app(false,false,controls);
+    if(seconds) app.stop_at=SDL_GetTicksNS()+std::uint64_t(seconds)*1000000000;
+    if(!xbe.empty()) {
+        const auto result=app.play(xbe,disc,frame,slices,trace_io);
+        std::cout<<app.run_report(result)<<'\n';
         return result.boundary.empty() || result.boundary.find("Native window closed")!=std::string::npos?0:3;
     }
     while(app.poll()) {
@@ -340,7 +349,11 @@ int run_app(const std::filesystem::path& xbe,const std::filesystem::path& disc,u
         if(app.launch) {
             app.launch=false;app.status="Starting game...";app.display(true);
             try {const auto result=app.play(app.settings.xbe.data(),app.settings.disc.data(),{});app.status=result.boundary.empty()?"Game exited.":result.boundary;}
-            catch(const std::exception& error) {app.playing=false;app.show_settings=true;app.status=error.what();}
+            catch(const std::exception& error) {
+                diagnostic_record("{\"type\":\"game_error\",\"message\":"+json(error.what())+'}');
+                app.playing=false;app.show_settings=true;app.status=error.what();
+            }
+            if(!diagnostic_log().empty()) app.status+="\nLog: "+utf8(diagnostic_log().wstring());
         }
     }
     return 0;

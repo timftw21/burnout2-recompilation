@@ -307,18 +307,69 @@ speaker audibility, captured engine routing, return volume/mute and FXIN2.
 A native replay of the captured route produced peak zero before the fix and
 0.625082 afterward. This proves signal delivery, not reference sound parity.
 
-Centered 3D return volume
+Earlier stereo gain increase (removed 2026-10-09)
 
-The native equal-power stereo pan multiplied both centered channels by
-sqrt(0.5), imposing an extra 3.01 dB loss on in-game FXIN returns. SDK volume
-construction at 00232FED applies the distance/cone result to paired bins 6/7
-and 8/9 equally (bin selection at 00233139..0023315F). GetVoiceData at 0022CEDB
-exposes distance/cone, front/back and environmental attenuation separately.
-The SDK amplitude multiplier at 0022BF4D uses 2000.0 from 002C944C; the native
-hundredths-of-dB conversion is already correct. Original 2D headroom remains
-600 hundredths of a dB; it is not the cause of this extra loss.
+The earlier quiet-engine investigation replaced equal-power panning with unity
+gain on the stronger channel. This added up to 3.01 dB for centered 3D sources.
+SDK 232FED applies equal distance/cone volume to paired bins 6/7 and 8/9
+(selection at 233139..23315F), but those bin volumes do not establish the power
+normalization of the native stereo approximation. GetVoiceData at 22CEDB exposes
+distance/cone, front/back and environmental attenuation separately. SDK amplitude
+conversion 22BF4D uses 2000.0 from 2C944C; hundredths-of-dB conversion and the
+original 600-hundredths 2D headroom are unchanged.
 
-Stereo pan now preserves unity on its stronger channel and both channels at
-the center, while retaining the original distance/cone/front/back and effect
-gains. The existing spatial check verifies a centered source has gains 1/1.
-This corrects an unintended attenuation; full HRTF filtering remains incomplete.
+After the actual listener-binding correction below, the user confirmed missing
+sounds returned but the engine was too loud. Remove the earlier stereo boost:
+use sqrt((1-pan)/2) and sqrt((1+pan)/2), preserving total power across directions.
+The existing spatial check verifies centered channel gains sqrt(0.5). Original
+source volumes, headroom, distance/cone and effect gains are retained. This is
+still stereo placement rather than complete console HRTF filtering.
+
+Shared SFX attenuation: listener API identity (2026-10-09)
+
+Manual captures frame-35066655000, frame-37098290200 and frame-40748694500
+save 9,150,692-byte audio snapshots. Offline replay succeeds with no audio errors.
+In the third capture, engine FXIN voice 1 decodes peak 0.76699984 but sends only
+0.03146265: spatial gain is 0.050003454. Traffic voices 27/29 decode peaks above
+0.86 and send zero because their spatial gain is zero. Their source positions
+are approximately {-357,68,-1268}, while the listener position is
+{29.20445,0.16950999,-41.51002}, exactly the player's source velocity.
+
+Original bytes establish that the public listener wrappers are:
+  22F9C4 -> 22F6E4: position, three coordinates, RET 14h.
+  22FA1D -> 22F757: velocity, three coordinates, RET 14h.
+  22F97A -> 22F657: orientation, six coordinates, RET 20h.
+  22F932 -> 22F53A: distance factor, RET 0Ch.
+  22F9F9 -> 22F5F8: rolloff factor, RET 0Ch.
+  22F956 -> 22F599: Doppler factor, RET 0Ch.
+Each includes the public object and immediate/deferred argument.
+The private setters write settings +3C/+48/+54/+60/+6C/+70/+74 respectively;
+the two orientation vectors occupy +54 and +60. Title 10AD00 calls these six
+wrappers at 10ADBD/10ADE3/10AD98/10AD48/10AD61/10AD2F with distinct fields.
+Position and velocity wrappers share their first nine bytes; identical prefixes
+alone do not establish which API they implement.
+
+The native provider mislabeled velocity as position and Doppler as distance.
+Real position, distance and rolloff setters were still entering private SDK
+objects that the native provider does not use. This displaced the listener and
+applied distance attenuation/max-distance mute to otherwise valid SFX.
+Correct all six public bindings and retain each listener field independently,
+including deferred commits. This changes the shared 3D path without volume
+boosts or sound-specific exceptions. Offline binding verification compares the
+native state with the original deferred setters, then exercises mixed commits.
+The user confirmed that the missing sounds returned after the listener correction.
+Post-fix captures frame-37968894700 and frame-40069468200 show correct world-space
+listener position, separate velocity, distance=1, rolloff=0 and Doppler=0.625.
+Engine spatial gain is now 1 and routed peak 0.6292095; active traffic sounds
+also reach the output. The user's excessive-engine-volume report prompted removal
+of the earlier stereo gain increase described above. The user confirmed the engine
+balance is better after its removal. Final capture frame-38516072200 retains the
+correct listener fields and engine spatial gain 1; its stereo gains are
+0.70710236/0.7071112, matching equal-power placement without the earlier boost.
+Offline replay passes. Its routed peak includes the unpanned room send, so that
+aggregate meter alone cannot measure the stereo gain reduction.
+The release passes 31 binding comparisons/commit cases, 12 spatial cases with
+1000 original calculations, 42 audio cases including serialized capture replay,
+65 original effect checks and the existing CPU checks. Original deferred setters
+are invoked with their supported DPC guard (FS:+24 = 1) to skip the device mutex;
+they copy the actual settings fields without hardware, a scheduler or game boot.

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(burnout2 VERSION 0.1.0 LANGUAGES C CXX)
+project(burnout2 VERSION 1.0.0 LANGUAGES C CXX)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "The initial target is Windows x64.")
@@ -45,7 +45,7 @@ FetchContent_Declare(zydis
     GIT_PROGRESS FALSE)
 FetchContent_MakeAvailable(zydis)
 
-add_library(b2-core STATIC src/file.cpp src/disc.cpp src/xbe.cpp src/assets.cpp src/effects.cpp)
+add_library(b2-core STATIC src/file.cpp src/disc.cpp src/xbe.cpp src/assets.cpp src/effects.cpp src/diagnostics.cpp src/crypto.cpp)
 target_include_directories(b2-core PUBLIC src PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(b2-core PRIVATE bcrypt)
 target_compile_definitions(b2-core PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
@@ -178,12 +178,17 @@ if(B2_XBE)
         VERBATIM)
     add_custom_target(b2-native-generated DEPENDS "${native_stamp}")
     set(native_shaders "${CMAKE_CURRENT_BINARY_DIR}/generated/$<CONFIG>/native_shaders.cpp")
-    add_custom_command(OUTPUT "${native_shaders}"
+    # The generator preserves unchanged source timestamps; stamp completed work.
+    set(native_shader_stamp "${native_shaders}.stamp")
+    add_custom_command(OUTPUT "${native_shader_stamp}"
+        BYPRODUCTS "${native_shaders}"
         COMMAND b2-tool compile-shaders "${B2_XBE}" "${native_shaders}" --replace
+        COMMAND "${CMAKE_COMMAND}" -E touch "${native_shader_stamp}"
         DEPENDS b2-tool "${B2_XBE}" "${CMAKE_CURRENT_BINARY_DIR}/generated/gui_shaders.h"
         VERBATIM)
+    add_custom_target(b2-shaders-generated DEPENDS "${native_shader_stamp}")
     add_executable(b2 src/main.cpp src/cpu_checks.cpp src/cpu_reference.asm "${native_cpu}" "${native_cpu}.asm" ${native_shards} "${native_shaders}")
-    add_dependencies(b2 b2-native-generated)
+    add_dependencies(b2 b2-native-generated b2-shaders-generated)
     target_link_libraries(b2 PRIVATE b2-core b2-graphics b2-cpu b2-app)
     target_compile_definitions(b2 PRIVATE B2_FINITE_ADDRESS=${finite_address} B2_COMPARE_ADDRESS=${compare_address})
 else()

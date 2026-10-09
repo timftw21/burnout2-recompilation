@@ -57,7 +57,9 @@ struct RenderState {
     std::array<std::uint32_t, 4> textures{}, texture_modes{}; // NV097 texture shader modes.
     std::array<std::uint32_t, 4> texture_sources{}, texture_clip{};
     std::array<std::uint32_t, 4> texture_address{0x030303, 0x030303, 0x030303, 0x030303};
-    std::array<bool, 4> linear_filter{}, alpha_kill{}, texture_opaque{};
+    std::array<std::uint32_t,4> texture_filter{0x01030000,0x01030000,0x01030000,0x01030000};
+    std::array<std::uint32_t,4> texture_control{0x0003FFC0,0x0003FFC0,0x0003FFC0,0x0003FFC0};
+    std::array<bool, 4> alpha_kill{}, texture_opaque{};
     std::uint32_t combiner_control = 0;
     std::array<std::uint32_t, 8> color_inputs{}, alpha_inputs{}, color_outputs{}, alpha_outputs{};
     std::array<std::uint32_t, 8> factor0{}, factor1{};

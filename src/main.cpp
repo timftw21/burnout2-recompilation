@@ -9,6 +9,7 @@
 #include "dsp.h"
 #include "app.h"
 #include "input.h"
+#include "diagnostics.h"
 #include <algorithm>
 #include <charconv>
 #include <chrono>
@@ -277,6 +278,7 @@ bool check_boot(const std::filesystem::path& path,std::uint32_t budget,const std
 }
 
 int main(int argc, char** argv) {
+    b2::initialize_diagnostics();
     try {
         if(argc==1) return b2::run_app();
         if (argc == 2 && std::string_view(argv[1]) == "--help") {
@@ -284,15 +286,26 @@ int main(int argc, char** argv) {
                          "  b2 --check-cpu [XBE]\n  b2 --check-input\n  b2 --bench-cpu [ITERATIONS]\n"
                          "  b2 --check-boot XBE [VISIT_BUDGET] [--disc ISO] [--frame PNG] [--memory ADDRESS:BYTES] [--break ADDRESS[:HIT]]\n"
                          "  b2 --run-game XBE [--disc ISO] [--seconds N] [--frame PNG] [--controls SCRIPT] [--memory ADDRESS:BYTES] [--trace-io]\n"
-                         "  b2 --check-window PNG [--warp]\n  b2 --check-audio\n"
-                         "  b2 --check-effects IMAGE\n  b2 --check-spatial XBE\n"
-                         "  b2 --inspect-effects XBE IMAGE OUTPUT_DIRECTORY\n";
+                         "  b2 --check-window PNG [--warp]\n  b2 --check-audio [EFFECTS_IMAGE OUTPUT_DIRECTORY]\n"
+                         "  b2 --check-effects IMAGE\n  b2 --check-spatial XBE [OUTPUT_DIRECTORY]\n"
+                         "  b2 --inspect-effects XBE IMAGE OUTPUT_DIRECTORY\n"
+                         "  b2 --check-storage XBE OUTPUT_DIRECTORY\n"
+                         "  b2 --check-replays XBE ISO OUTPUT_DIRECTORY\n"
+                         "  b2 --inspect-audio CAPTURE.bin EFFECTS_IMAGE OUTPUT_DIRECTORY\n";
             return 0;
         }
         const auto command = std::string_view(argv[1]);
+        if(command=="--check-storage" && argc==4) {std::cout<<b2::check_storage(argv[2],argv[3])<<'\n';return 0;}
+        if(command=="--check-replays" && argc==5) {std::cout<<b2::check_replays(argv[2],argv[3],argv[4])<<'\n';return 0;}
+        if(command=="--inspect-audio" && argc==5) {
+            const auto report=b2::Audio::inspect_capture(argv[2],argv[3],argv[4]);std::cout<<report<<'\n';
+            return report.find("\"passed\":true")!=std::string::npos?0:1;
+        }
         if(command=="--inspect-effects" && argc==5) {std::cout<<inspect_effects(argv[2],argv[3],argv[4])<<'\n';return 0;}
         if(command=="--check-audio" && argc==2) {std::cout<<b2::check_audio()<<'\n';return 0;}
+        if(command=="--check-audio" && argc==4) {std::cout<<b2::check_audio(argv[2],argv[3])<<'\n';return 0;}
         if(command=="--check-spatial" && argc==3) {std::cout<<b2::check_spatial(argv[2])<<'\n';return 0;}
+        if(command=="--check-spatial" && argc==4) {std::cout<<b2::check_spatial(argv[2],argv[3])<<'\n';return 0;}
         if(command=="--check-effects" && argc==3) {const auto report=b2::check_effects(argv[2]);std::cout<<report<<'\n';
             return report.find("\"passed\":false")==std::string::npos?0:3;}
         if(command=="--check-window" && (argc==3 || (argc==4 && std::string_view(argv[3])=="--warp"))) {
@@ -385,6 +398,7 @@ int main(int argc, char** argv) {
                   << ",\"includes_input_setup\":true},\"compiled_functions\":" << b2::compiled_batch.size() << "}\n";
         return 0;
     } catch (const std::exception& error) {
+        b2::diagnostic_record("{\"type\":\"error\",\"message\":"+b2::json(error.what())+'}');
         std::cout << "{\"error\":" << b2::json(error.what()) << "}\n";
         return 1;
     }

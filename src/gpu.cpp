@@ -42,7 +42,7 @@ struct Gpu::Impl {
     };
     std::vector<Draw> draws;
     unsigned draw_count=0;
-    struct Surface {std::uint32_t identifier,width,height;std::uint64_t revision=0;};
+    struct Surface {std::uint32_t identifier,width,height;std::uint64_t revision=0;bool color_cleared=false;};
     Surface* active_surface=nullptr;
     std::uint64_t surface_revision=0;
     std::map<std::array<std::uint32_t,4>,Surface> targets;
@@ -76,7 +76,7 @@ struct Gpu::Impl {
         } catch(...) {renderer.end();draw_count=0;throw;}
         renderer.end();draw_count=0;
     }
-    void select_target() {
+    bool select_target(std::uint32_t clear_flags=0) {
         const auto horizontal=reg(0x200),vertical=reg(0x204);
         const auto clip_width=horizontal>>16,clip_height=vertical>>16;
         if(!clip_width || !clip_height)
@@ -90,18 +90,40 @@ struct Gpu::Impl {
         if(type!=1 && type!=2) throw std::runtime_error("Unsupported NV097 surface layout");
         const auto width=type==2?1U<<((format>>16)&15):(horizontal&0xFFFF)+clip_width;
         const auto height=type==2?1U<<((format>>24)&15):(vertical&0xFFFF)+clip_height;
+        const auto clear_h=reg(0x1D98),clear_v=reg(0x1D9C);
+        const bool complete_clear=(clear_flags&0xF0)==0xF0 && !(clear_h&0xFFFF) && !(clear_v&0xFFFF) &&
+            (clear_h>>16)+1>=width && (clear_v>>16)+1>=height;
         const std::array key{reg(0x210),reg(0x214),format,reg(0x20C)};
         auto found=targets.find(key);
+        if(found==targets.end() && !key[1]) {
+            // A uniform full-allocation clear has the same bytes in pitched and
+            // Morton order. Migrate that storage instead of creating a second,
+            // uncleared image for the game's clear-then-render layout switch.
+            const auto packed_pitch=width*(color==3?2U:4U);
+            for(auto alias=targets.begin();alias!=targets.end();++alias) {
+                const auto& [alias_key,surface]=*alias;
+                const auto alias_type=(alias_key[2]>>8)&15;
+                if(alias_key[0]!=key[0] || alias_key[1] || alias_type==type ||
+                    (alias_key[2]&255)!=(format&255) || surface.width!=width || surface.height!=height ||
+                    (type==1 && (key[3]&0xFFFF)!=packed_pitch) ||
+                    (alias_type==1 && (alias_key[3]&0xFFFF)!=packed_pitch)) continue;
+                if(!complete_clear && !surface.color_cleared)
+                    throw std::runtime_error("Nonuniform surface layout alias requires pixel remapping");
+                flush();auto node=targets.extract(alias);node.key()=key;
+                found=targets.insert(std::move(node)).position;break;
+            }
+        }
         if(found==targets.end()) {
             flush();found=targets.emplace(key,Surface{renderer.create_target(width,height,color==3?SurfaceColor::rgb565:SurfaceColor::rgba8,
                 zeta==1?SurfaceDepth::z16:SurfaceDepth::z24s8),width,height}).first;
         } else if(width>found->second.width || height>found->second.height) {
             flush();auto& surface=found->second;
             const auto w=std::max(width,surface.width),h=std::max(height,surface.height);
-            renderer.grow_target(surface.identifier,w,h);surface.width=w;surface.height=h;
+            renderer.grow_target(surface.identifier,w,h);surface.width=w;surface.height=h;surface.color_cleared=false;
         }
         if(target!=found->second.identifier) {flush();target=found->second.identifier;renderer.set_target(target);}
         active_surface=&found->second;
+        return complete_clear && (clear_h>>16)+1>=active_surface->width && (clear_v>>16)+1>=active_surface->height;
     }
     std::uint32_t texture(unsigned stage,ProgramView& view) {
         const auto method=0x1B00+stage*0x40,format=reg(method+4),image=reg(method+0x1C),pitch=reg(method+0x10)>>16;
@@ -199,8 +221,8 @@ struct Gpu::Impl {
             s.texture_modes[i]=(reg(0x1E70)>>(i*5))&31;
             s.texture_sources[i]=i<2?0:(reg(0x1E78)>>(8+i*4))&15;
             s.texture_clip[i]=(reg(0x17F8)>>(i*4))&15;s.texture_address[i]=reg(method+8);
-            const auto filter=reg(method+0x14);
-            s.linear_filter[i]=((filter>>24)&15)==2;s.alpha_kill[i]=(reg(method+12)&4)!=0;
+            s.texture_filter[i]=reg(method+0x14);s.texture_control[i]=reg(method+12);
+            s.alpha_kill[i]=(s.texture_control[i]&4)!=0;
             const auto code=(reg(method+4)>>8)&255;
             s.texture_opaque[i]=code==7 || code==0x1E;
             if((reg(method+12)&0x40000000U) && s.texture_modes[i]) s.textures[i]=texture(i,view);
@@ -262,7 +284,7 @@ struct Gpu::Impl {
         draw.layout=renderer.prepare_layout(shader,layout);renderer.prepare(draw.state);
         if(!capture_directory.empty()) capture_draw(first,draw,shader);
         draw.indices.assign(elements.begin(),elements.end());
-        if(draw.state.color_mask) active_surface->revision=++surface_revision;
+        if(draw.state.color_mask) {active_surface->revision=++surface_revision;active_surface->color_cleared=false;}
         if(++draw_count==draws.size()) flush();
     }
     void capture_draw(std::uint32_t first,const Draw& draw,std::uint32_t shader) {
@@ -393,13 +415,18 @@ struct Gpu::Impl {
             for(unsigned lane=0;lane<4;++lane) input.attributes[0][lane]=real(reg(0x1E80+lane*4));
             renderer.launch_program(renderer.prepare_program(launch,true),constants,input);
         } else if(method==0x1D94) {
-            flush();select_target();
+            flush();const auto complete_clear=select_target(data);
             const auto h=reg(0x1D98),v=reg(0x1D9C);
             const std::array<std::int32_t,4> rectangle{std::int32_t(h&0xFFFF),std::int32_t(v&0xFFFF),
                 std::int32_t((h>>16)+1),std::int32_t((v>>16)+1)};
             const auto value=reg(0x1D8C),zeta=(reg(0x208)>>4)&15;
             renderer.clear_buffers(data,reg(0x1D90),zeta==1?float(value&0xFFFF)/65535:float(value>>8)/16777215,static_cast<std::uint8_t>(value),rectangle);
-            if(data&0xF0) active_surface->revision=++surface_revision;
+            if(data&0xF0) {active_surface->revision=++surface_revision;active_surface->color_cleared=complete_clear;}
+            if(!capture_directory.empty()) {
+                if(capture_trace.tellp()>32*1024*1024) capture_truncated=true;
+                else capture_trace<<std::format("{{\"type\":\"clear\",\"target\":{},\"flags\":{},\"color\":{},\"format\":{},\"rectangle\":[{},{},{},{}]}}\n",
+                    target,data,json(hex32(reg(0x1D90))),json(hex32(reg(0x208))),rectangle[0],rectangle[1],rectangle[2],rectangle[3]);
+            }
             ++statistics.clears;
         } else if(method==0x1D70) {
             if(reg(0x1A4)!=8 || reg(0x1D6C)>92) throw std::runtime_error("Unbound NV097 semaphore DMA range");

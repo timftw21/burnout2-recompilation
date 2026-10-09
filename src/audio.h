@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <span>
 #include <string>
@@ -60,11 +61,14 @@ public:
     std::uint32_t effect_program(std::uint32_t byte_offset,unsigned size);
     std::string failure();
     bool output_ready() const {return stream_!=nullptr;}
+    // Explicit diagnostics, called between guest slices. Replay opens no device.
+    void capture(const std::filesystem::path& directory);
+    static std::string inspect_capture(const std::filesystem::path& capture,const std::filesystem::path& effects,
+                                      const std::filesystem::path& output);
 private:
-    struct Voice {
+    friend std::string check_audio(const std::filesystem::path&,const std::filesystem::path&);
+    struct VoiceState {
         AudioFormat format;
-        std::vector<std::byte> encoded;
-        std::span<const std::byte> source;
         std::array<float,128> block{};
         std::uint32_t cached_block=UINT32_MAX,source_address=0;
         double cursor=0,step=1;
@@ -80,6 +84,10 @@ private:
         AudioBus bus=AudioBus::none;
         bool used=false,playing=false,loop=false;
     };
+    struct Voice : VoiceState {
+        std::vector<std::byte> encoded;
+        std::span<const std::byte> source;
+    };
     Voice& voice(std::uint32_t);
     static std::uint32_t frames(AudioFormat,std::uint32_t bytes);
     std::array<float,2> sample(Voice&,std::uint32_t frame);
@@ -87,6 +95,12 @@ private:
     void mix_sources(std::span<float>);
     void mix_bins(std::span<float>,unsigned frames);
     void mix_voice(Voice&,std::span<const std::array<float,2>>,std::span<float>,unsigned frames);
+    void send_voice(Voice&,std::span<const std::array<float,2>>,std::span<float>,unsigned frames);
+    struct Capture;
+    std::unique_ptr<Capture> snapshot();
+    void restore(const Capture&);
+    struct Probe;
+    Probe* probe_=nullptr;
     struct Effects;
     std::unique_ptr<Effects> effects_;
     SDL_AudioStream* stream_=nullptr;
@@ -96,5 +110,5 @@ private:
     bool failed_=false;
     std::array<char,256> failure_{};
 };
-std::string check_audio();
+std::string check_audio(const std::filesystem::path& effects={},const std::filesystem::path& output={});
 }

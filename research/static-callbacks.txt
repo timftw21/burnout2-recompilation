@@ -38,6 +38,13 @@ Static discovery validates constructor and consumer bytes and includes literal
 code pointers installed at +48h in functions calling or inlining those verified
 UI constructors. An offset alone does not identify an object type. Mutable
 dispatch remains unresolved rather than being forced to one target.
+The Crash-mode UI producer 35570 also installs a callback through a register:
+36670 loads EDX with 34C20 (BA204C0300), and 366AD writes EDX to object +48h
+(895048). C1306 invokes it through queued record +50h. Literal-store discovery
+missed this installation. Register stores in the same verified UI family now
+use the existing bounded control-flow origin walk, including register copies
+and branch predecessors. Unknown writes and unverified calls remain barriers;
+no callback address is manually seeded and mutable dispatch remains unresolved.
 C14A0 obtains a pooled queue record through D9DA0 and returns its +8h value
 object; it also sets that object's +40h/+44h ownership fields. Its callers can
 install the same +48h draw method. For example, 31F30 writes 31E60 at 32159.
