@@ -8,9 +8,10 @@ game is still being tested.
 
 ## Screenshots
 
-![Single Player menu](screenshots/single-player.jpg)
-
-![First driving lesson](screenshots/driving-lesson.jpg)
+<p>
+  <img src="screenshots/single-player.jpg" alt="Single Player menu" width="49%">
+  <img src="screenshots/driving-lesson.jpg" alt="First driving lesson" width="49%">
+</p>
 
 ## What happened to the original release?
 
