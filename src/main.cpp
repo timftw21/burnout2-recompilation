@@ -391,11 +391,15 @@ int main(int argc, char** argv) {
         run(count);
         const auto ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count();
         const auto chain = b2::benchmark_call_chain(count);
+        const auto matrix=b2::benchmark_matrix(count);
         std::cout << prefix << ",\"format\":\"b2-cpu-bench-v2\",\"calls\":" << count
                   << ",\"ns_per_call\":" << ns / count << ",\"elapsed_ms\":" << ns / 1000000
                   << ",\"checksum\":" << checksum << ",\"includes_input_setup\":true,\"call_chain\":{\"guest_address\":\"0x00012BC0\",\"calls\":"
                   << count << ",\"ns_per_call\":" << chain.ns_per_call << ",\"checksum\":" << chain.checksum
-                  << ",\"includes_input_setup\":true},\"compiled_functions\":" << b2::compiled_batch.size() << "}\n";
+                  << ",\"includes_input_setup\":true},\"matrix\":{\"guest_address\":\"0x00227BD9\",\"calls\":" << count
+                  << ",\"fused_ns_per_call\":" << matrix.fused.ns_per_call << ",\"unfused_ns_per_call\":" << matrix.unfused.ns_per_call
+                  << ",\"fused_checksum\":" << matrix.fused.checksum << ",\"unfused_checksum\":" << matrix.unfused.checksum
+                  << ",\"includes_input_setup\":true,\"game_booted\":false},\"compiled_functions\":" << b2::compiled_batch.size() << "}\n";
         return 0;
     } catch (const std::exception& error) {
         b2::diagnostic_record("{\"type\":\"error\",\"message\":"+b2::json(error.what())+'}');

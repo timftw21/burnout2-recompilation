@@ -6,6 +6,7 @@
 #include "assets.h"
 #include "dsp_compiler.h"
 #include "shaders.h"
+#include "performance.h"
 #include <charconv>
 #include <chrono>
 #include <format>
@@ -36,6 +37,8 @@ constexpr auto usage =
     "  b2-tool compile-shaders XBE OUTPUT.cpp [--replace]\n"
     "  b2-tool data XBE ADDRESS BYTE_COUNT\n"
     "  b2-tool check-render OUTPUT_DIRECTORY [--warp] [--debug]\n"
+    "  b2-tool check-performance OUTPUT_DIRECTORY\n"
+    "  b2-tool inspect-performance CAPTURE.bin OUTPUT_DIRECTORY\n"
     "  b2-tool render-texture FILE NV097_FORMAT WIDTH HEIGHT OUTPUT.png [--warp]\n"
     "  b2-tool inspect-textures DICTIONARY\n"
     "  b2-tool render-dictionary DICTIONARY OUTPUT_DIRECTORY [--warp]\n"
@@ -61,7 +64,11 @@ int wmain(int argc, wchar_t** argv) {
         const auto started = std::chrono::steady_clock::now();
         int result = 0;
         std::string output;
-        if (command == L"compile-shaders" && (argc==4 || (argc==5 && std::wstring_view(argv[4])==L"--replace"))) {
+        if(command==L"check-performance" && argc==3) {
+            output=b2::check_performance(argv[2]);
+        } else if(command==L"inspect-performance" && argc==4) {
+            output=b2::inspect_performance(argv[2],argv[3]);
+        } else if (command == L"compile-shaders" && (argc==4 || (argc==5 && std::wstring_view(argv[4])==L"--replace"))) {
             output=b2::compile_shaders(argv[2],argv[3],argc==5);
         } else if (command == L"compile-effects" && (argc==4 || (argc==5 && std::wstring_view(argv[4])==L"--replace"))) {
             output=b2::compile_effects(argv[2],argv[3],argc==5);

@@ -33,3 +33,7 @@ Python/Capstone scans or parallel memory-intensive commands. After heavy/timed-o
 commands, check owned workers and stop only exact surviving processes they created.
 
 Explain concisely. Subagents and computer use require explicit user authorization.
+
+Publish only Installation.zip as the release asset, using cmake/package.ps1.
+Include build sources, required inputs, setup instructions and license notices;
+keep research, screenshots, private media and generated output out of the archive.

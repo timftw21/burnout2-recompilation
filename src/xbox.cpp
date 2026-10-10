@@ -391,6 +391,7 @@ struct Xbox::State {
         cpu.kernel=&services; cpu.clock=&clock; cpu.diagnostic=live && graphics_initialized?nullptr:&diagnostic;
         cpu.preempt=[](Cpu& cpu) {
             auto& host=*static_cast<State*>(cpu.kernel->context);
+            if(host.host.performance) host.host.performance->guest_sample(cpu.eip,host.current?host.current->id:0);
             if(!(cpu.flags&0x200) || host.memory.load<std::uint8_t>(cpu.fs_base+0x24)>1 ||
                std::chrono::steady_clock::now()<host.quantum_due) return;
             HostFloatingScope floating(cpu.floating);
@@ -433,7 +434,7 @@ struct Xbox::State {
         if(memory.load<std::uint8_t>(current->tib+0x24)>1) throw NativeBoundary(current->cpu.eip,"a DPC attempted a blocking wait");
         current->state=state; current->wait_object=object; current->due=due;
         if(object) current->wait_kind=WaitKind::critical;
-        SwitchToFiber(scheduler);
+        {PerfScope idle(host.performance,PerfPhase::scheduler);SwitchToFiber(scheduler);}
         if(stopping) throw ThreadExit{0xC0000120};
         current->state=ThreadState::running;
         current->wait_kind=WaitKind::none;
@@ -865,6 +866,7 @@ struct Xbox::State {
             if(argument(cpu,0) || argument(cpu,2)) throw NativeBoundary(address,"non-default audio device or aggregation is unsupported");
             if(!audio) {
                 audio=std::make_unique<Audio>(true,output_gain);
+                if(host.performance && host.performance->active()) audio->performance(true);
                 // RenderWare 211634 reads the real 48 kHz processing counter.
                 // Preserve its original wraparound/time conversion, with native
                 // output progress rather than a fabricated hardware timestamp.
@@ -1162,6 +1164,7 @@ struct Xbox::State {
         gpu_cursor=memory.load<std::uint32_t>(context+0x24);
         gpu=std::make_unique<Gpu>(*graphics,memory,notification);
         gpu->flip=host.flip;
+        if(host.performance && host.performance->active()) gpu->performance(host.performance);
         memory.store<std::uint32_t>(context+0x534,0x40);
         graphics_helper(cpu,0x00219BC0,0x0021A811);
         const std::array presentation{parameters};
@@ -1204,7 +1207,20 @@ struct Xbox::State {
             try {
                 if(!gpu) throw std::runtime_error("Original graphics API precedes native GPU creation");
                 if(address==0x00216870) {finish(cpu,0,gpu->busy()?1:0);return;}
-                if(address==0x0021B080) {submit_graphics();gpu->wait();finish(cpu,8);return;}
+                if(address==0x0021B080) {
+                    const auto value=argument(cpu,0);
+                    gpu->busy();
+                    auto issued=memory.load<std::uint32_t>(context+0x2C);
+                    const auto completed=memory.load<std::uint32_t>(memory.load<std::uint32_t>(context+0x30));
+                    if(issued-value<issued-completed) {
+                        // The SDK inserts the current fence before waiting if
+                        // the caller supplied the next, not yet emitted value.
+                        if(value==issued) graphics_helper(cpu,0x0021AFD0,0x0021B0AF,std::array{0U});
+                        submit_graphics();issued=memory.load<std::uint32_t>(context+0x2C);
+                        gpu->wait_fence(value,issued);
+                    }
+                    finish(cpu,8);return;
+                }
                 if(address==0x0021AE80) {
                     if(cpu.registers[ecx]!=context) throw std::runtime_error("Unsupported original push-buffer submission context");
                     submit_graphics();finish(cpu,0);return;
@@ -1546,6 +1562,7 @@ struct Xbox::State {
         throw NativeBoundary(cpu.eip,std::format("unsupported virtual disc IOCTL 0x{:08X}",code));
     }
     template<unsigned Ordinal> void service(Cpu& cpu) {
+        PerfScope timing(host.performance,PerfPhase::kernel,Ordinal);
         ++service_calls[Ordinal]; clock_data();
         if constexpr(Ordinal==327 || Ordinal==328) {
             const auto pointer=argument(cpu,0);
@@ -2220,11 +2237,11 @@ struct Xbox::State {
             if(!selected) {
                 if(!pending) break;
                 if(earliest==std::chrono::steady_clock::time_point::max()) { boundary="All native guest threads are waiting without a signal source"; break; }
-                Sleep(1); continue;
+                {PerfScope idle(host.performance,PerfPhase::scheduler);Sleep(1);}continue;
             }
             current=selected; clock_data();
             quantum_due=std::chrono::steady_clock::now()+std::chrono::milliseconds(1);
-            diagnostic_guest(&selected->cpu);SwitchToFiber(selected->fiber);
+            diagnostic_guest(&selected->cpu);{PerfScope guest(host.performance,PerfPhase::guest);SwitchToFiber(selected->fiber);}
         }
         BootResult result;
         result.entry_returned=entry_returned; result.main_reached=diagnostic.reached_watch;
@@ -2269,6 +2286,22 @@ void Xbox::output_gain(float gain) {
     if(!(gain>=0 && gain<=1)) throw std::runtime_error("Output volume must be between zero and one");
     if(state_->audio) state_->audio->output_gain(gain);
     state_->output_gain=gain;
+}
+void Xbox::performance_recording(bool enabled) {
+    if(state_->gpu) state_->gpu->performance(enabled?state_->host.performance:nullptr);
+    if(state_->audio) state_->audio->performance(enabled);
+}
+PerfCounters Xbox::performance_counters() const {
+    PerfCounters counters=state_->graphics?state_->graphics->stats().counters:PerfCounters{};
+    const auto set=[&](PerfMetric key,std::uint64_t value){counters[unsigned(key)]=value;};
+    if(state_->gpu) {
+        const auto gpu=state_->gpu->stats();set(PerfMetric::submissions,gpu.submissions);set(PerfMetric::packets,gpu.packets);
+        set(PerfMetric::methods,gpu.methods);set(PerfMetric::fences,gpu.fences);
+    }
+    if(state_->audio) {
+        const auto audio=state_->audio->performance();set(PerfMetric::audio_batches,audio.batches);set(PerfMetric::audio_mix_ns,audio.mix_ns);set(PerfMetric::audio_overruns,audio.overruns);
+    }
+    return counters;
 }
 void Xbox::capture_frame(const std::filesystem::path& directory) {
     if(!state_->gpu) throw std::runtime_error("The game has not initialized graphics yet");
@@ -2565,6 +2598,7 @@ void native_platform(Cpu& cpu,Memory& memory,std::uint32_t address) {
     auto& host=*static_cast<Xbox::State*>(cpu.kernel->context);
     if(&host.memory!=&memory) throw NativeBoundary(address,"native platform API received another guest memory");
     HostFloatingScope floating(cpu.floating);
+    PerfScope timing(host.host.performance,PerfPhase::platform,address);
     host.platform(cpu,address);
 }
 }

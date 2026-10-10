@@ -6,6 +6,7 @@ namespace b2 {
 class Memory;
 struct GpuStats {
     std::uint64_t submissions=0,packets=0,methods=0,draws=0,vertices=0,clears=0,flips=0,fences=0;
+    std::uint64_t fence_queries=0,fence_queue_waits=0;
 };
 // The original SDK produces NV2A packets. This bridge shares the native renderer
 // with offline diagnostics; it does not decode or execute CPU instructions.
@@ -16,8 +17,10 @@ public:
     void submit(std::uint32_t begin,std::uint32_t end);
     bool busy();
     void wait();
+    void wait_fence(std::uint32_t value,std::uint32_t issued);
     void snapshot();
     void capture_frame(const std::filesystem::path& directory);
+    void performance(Performance*);
     GpuStats stats() const;
     std::function<void()> flip;
 private:

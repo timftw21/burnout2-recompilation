@@ -20,6 +20,7 @@ struct AudioFormat {
 };
 struct MixBin {std::uint32_t bin;std::int32_t volume;};
 struct AudioPosition {std::uint32_t play,write;};
+struct AudioPerformance {std::uint64_t batches=0,mix_ns=0,overruns=0;};
 enum class AudioBus {none,submix,effects,effects_manual};
 std::vector<float> decode_audio(AudioFormat,std::span<const std::byte>);
 class Audio {
@@ -63,6 +64,8 @@ public:
     bool output_ready() const {return stream_!=nullptr;}
     // Explicit diagnostics, called between guest slices. Replay opens no device.
     void capture(const std::filesystem::path& directory);
+    void performance(bool);
+    AudioPerformance performance() const;
     static std::string inspect_capture(const std::filesystem::path& capture,const std::filesystem::path& effects,
                                       const std::filesystem::path& output);
 private:
@@ -107,6 +110,8 @@ private:
     std::array<Voice,256> voices_{};
     std::array<std::uint32_t,32> bin_headroom_{};
     std::atomic<std::uint32_t> frames_processed_{0};
+    std::atomic<bool> performance_enabled_{false};
+    std::atomic<std::uint64_t> mix_batches_{0},mix_ns_{0},mix_overruns_{0};
     bool failed_=false;
     std::array<char,256> failure_{};
 };

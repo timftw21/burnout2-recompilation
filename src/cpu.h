@@ -128,6 +128,16 @@ public:
         regions_[region_count_++]={base,bytes};
     }
     void* access(std::uint32_t address, std::size_t size) const { return pointer(address,size); }
+    void* try_access(std::uint32_t address,std::size_t size) const noexcept {
+        if(address>=base_ && address-base_<=bytes_.size() && size<=bytes_.size()-(address-base_))
+            return bytes_.data()+(address-base_);
+        for(unsigned i=0;i<region_count_;++i) {
+            const auto& region=regions_[i];
+            if(address>=region.base && address-region.base<=region.bytes.size() && size<=region.bytes.size()-(address-region.base))
+                return region.bytes.data()+(address-region.base);
+        }
+        return nullptr;
+    }
     void prefetch(std::uint32_t address) const {
         if(address>=base_ && static_cast<std::uint64_t>(address)-base_<bytes_.size())
             _mm_prefetch(reinterpret_cast<const char*>(bytes_.data()+address-base_),_MM_HINT_NTA);

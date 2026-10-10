@@ -1,0 +1,49 @@
+Optional presentation interpolation
+
+The GUI presents completed original frames at an independent display rate.
+Source flips and the existing Xbox video callback stay at 60 Hz. Interpolation
+is enabled when selecting a rate above 60 Hz; a manual opt-out persists until
+another rate is selected. It adds approximately one source frame of display
+delay: after the latest source frame arrives, display times traverse the
+previous/latest pair.
+Stalls over 100 ms, new sessions and enabling the feature reset its history.
+
+Motion estimation follows iterative gradient-based image registration:
+Lucas and Kanade, 1981, "An Iterative Image Registration Technique with an
+Application to Stereo Vision".
+https://publications.ri.cmu.edu/storage/publications/pub_files/pub3/lucas_bruce_d_1981_1/lucas_bruce_d_1981_1.pdf
+
+Our implementation uses dense local 5x5 windows and four luminance levels
+(160x120, 80x60, 40x30, 20x15), with six refinement iterations per level.
+Forward/backward motion, residual error and texture gradients reject unreliable
+warps. Refinement keeps the best measured displacement and backs off steps that
+worsen the match; confidence describes that same displacement. A bounded
+scene-change reduction rejects unrelated image pairs. Missing
+or inconsistent correspondences use the current image. Intermediate frames warp
+both images into alignment; simply blending unaligned frames is not interpolation.
+Endpoint images are sampled directly. ImGui is composed after the game image.
+
+Only native D3D11 image operations are added: game functions remain static,
+ahead-of-time recompilations. All new shaders enter the existing build-time shader
+bank. The disabled path makes no history copies and dispatches no motion passes.
+It also stays inactive at presentation limits of 60 Hz or less.
+History uses two full-resolution RGBA8 images plus fixed-size flow/luminance data.
+Resolution scaling changes history size, not the motion grid or game timing.
+
+Offline evidence is emitted by b2 --check-window: synthetic known translation,
+exact endpoints, stationary HUD, occlusion, scene change and reset, plus GPU
+component time and independently measured source/presentation rates. Actual game
+quality/performance still requires manual checks in menu/race/crash scenes.
+The method cannot reconstruct unseen geometry or ensure artifact-free fast motion.
+
+2026-10-09 offline check on NVIDIA GeForce RTX 5060 Ti:
+- Source cadence 60.000 Hz with unmodified presentation 120.009/144.022 Hz.
+- The app's generated-frame path presents at 144.038 Hz with source still 60.000 Hz.
+- Known (16,8)-pixel translation: generated midpoint matches the interior
+  (8,4)-pixel reference to 8-bit rounding; stationary HUD and endpoints unchanged.
+- Current pixels preserved for a newly appearing object and a black/white cut.
+- GPU snapshot, luminance/motion and 640x480 warp: 0.195 ms for the measured pair.
+- D3D11 debug messages absent and HLSL compilation count zero.
+The Microsoft software renderer also passes the image checks, with 139.944 ms
+component time; its high-rate timing cases use unmodified frames. These are
+synthetic component checks, not game FPS measurements.

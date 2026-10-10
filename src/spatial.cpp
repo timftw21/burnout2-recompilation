@@ -62,19 +62,28 @@ SpatialResult Spatial::calculate(const SpatialListener& value,const SpatialParam
         const auto gain=real(u32(curve,offset));
         if(!std::isfinite(gain) || gain<0 || gain>1) throw std::runtime_error("Invalid 3D audio distance curve gain");
     }
-    std::fill(scratch_.begin()+0x100,scratch_.begin()+0x338,std::byte{});
+    static_assert(sizeof(SpatialListener)==15*sizeof(float));
+    const bool listener_changed=!listener_valid_ || std::memcmp(&value,&previous_listener_,sizeof(value));
+    // The SDK keeps derived listener orientation between sources. Its low
+    // seven dirty bits describe the listener; source bits occupy the high word.
+    // Clearing the listener and setting all source bits forced it to rebuild
+    // the same orientation for every voice on every immediate setter.
+    std::fill(scratch_.begin()+0x200,scratch_.begin()+0x338,std::byte{});
     const auto store=[&](std::uint32_t address,float number) {
         if(!std::isfinite(number)) throw std::runtime_error("Non-finite 3D audio listener parameter");
         memory_.store<std::uint32_t>(address,std::bit_cast<std::uint32_t>(number));
     };
-    memory_.store<std::uint32_t>(listener,UINT32_MAX);memory_.store<std::uint32_t>(listener+4,UINT32_MAX);
-    for(unsigned i=0;i<3;++i) {
-        store(listener+8+i*4,value.position[i]);store(listener+0x14+i*4,value.velocity[i]);
-        store(listener+0x20+i*4,value.front[i]);store(listener+0x2C+i*4,value.up[i]);
+    memory_.store<std::uint32_t>(listener,listener_changed?0x7FU:0U);
+    if(listener_changed) {
+        memory_.store<std::uint32_t>(listener+4,0);
+        for(unsigned i=0;i<3;++i) {
+            store(listener+8+i*4,value.position[i]);store(listener+0x14+i*4,value.velocity[i]);
+            store(listener+0x20+i*4,value.front[i]);store(listener+0x2C+i*4,value.up[i]);
+        }
+        if(value.distance<=0 || value.rolloff<0 || value.doppler<0) throw std::runtime_error("Invalid 3D audio listener factor");
+        store(listener+0x38,value.distance);store(listener+0x3C,value.rolloff);store(listener+0x40,value.doppler);
     }
-    if(value.distance<=0 || value.rolloff<0 || value.doppler<0) throw std::runtime_error("Invalid 3D audio listener factor");
-    store(listener+0x38,value.distance);store(listener+0x3C,value.rolloff);store(listener+0x40,value.doppler);
-    memory_.store<std::uint32_t>(source,UINT32_MAX);memory_.store<std::uint32_t>(source+4,UINT32_MAX);
+    memory_.store<std::uint32_t>(source,0xFFFF0000U);
     std::memcpy(memory_.access(source+8,72),parameters.data()+1,72);
     if(!curve.empty()) std::memcpy(memory_.access(points,curve.size()),curve.data(),curve.size());
     memory_.store<std::uint32_t>(source+0x50,curve.empty()?0:points);
@@ -113,6 +122,7 @@ SpatialResult Spatial::calculate(const SpatialListener& value,const SpatialParam
     if(!std::isfinite(result.gain) || !std::isfinite(result.pitch) || result.pitch<=0 ||
         !std::isfinite(result.distance) || !std::isfinite(result.pan[0]) || !std::isfinite(result.pan[1]))
         throw std::runtime_error("Original 3D audio calculation produced invalid output");
+    previous_listener_=value;listener_valid_=true;
     return result;
 }
 std::string check_spatial(const std::filesystem::path& executable,const std::filesystem::path& output_directory) {
@@ -126,7 +136,7 @@ std::string check_spatial(const std::filesystem::path& executable,const std::fil
     auto result=spatial.calculate(listener_value,parameters,{});require(result.gain==1 && result.pitch==1 && result.distance==0 && result.pan==std::array<float,2>{std::sqrt(0.5f),std::sqrt(0.5f)});
     set(3,10);result=spatial.calculate(listener_value,parameters,{});require(result.distance==10 && result.gain<1 && result.gain>0);
     const std::array<float,1> unity{1};result=spatial.calculate(listener_value,parameters,std::as_bytes(std::span(unity)));require(result.gain==1);
-    const std::array<float,1> descending{0.5f};result=spatial.calculate(listener_value,parameters,std::as_bytes(std::span(descending)));
+    std::array<float,1> descending{0.5f};result=spatial.calculate(listener_value,parameters,std::as_bytes(std::span(descending)));
     require(result.gain<1 && result.gain>0.5f);
     set(3,100);result=spatial.calculate(listener_value,parameters,std::as_bytes(std::span(descending)));require(std::abs(result.gain-0.5f)<0.001f);
     parameters[15]=2;result=spatial.calculate(listener_value,parameters,std::as_bytes(std::span(descending)));require(result.gain==1 && result.pitch==1 && result.pan[0]==1 && result.pan[1]==1);
@@ -146,6 +156,30 @@ std::string check_spatial(const std::filesystem::path& executable,const std::fil
     parameters[15]=0;set(1,100);result=spatial.calculate(listener_value,parameters,std::as_bytes(std::span(unity)),&environment,true);
     require(result.gain==0);
     set(1,-10);
+    // A fresh SDK context independently checks reuse across listener changes,
+    // source modes, environmental parameters and mutable curve contents.
+    const auto compare_fresh=[&](const SpatialListener& value,bool with_environment,bool mute) {
+        Memory fresh_memory(image.base,bytes);Spatial fresh(fresh_memory);
+        const auto curve=std::as_bytes(std::span(descending));
+        const auto expected=fresh.calculate(value,parameters,curve,with_environment?&environment:nullptr,mute);
+        const auto actual=spatial.calculate(value,parameters,curve,with_environment?&environment:nullptr,mute);
+        require(actual.gain==expected.gain && actual.pan==expected.pan && actual.front_back==expected.front_back &&
+            actual.environment_gain==expected.environment_gain && actual.environment_pole==expected.environment_pole &&
+            actual.pitch==expected.pitch && actual.distance==expected.distance && actual.angles==expected.angles && actual.adjustments==expected.adjustments);
+    };
+    for(unsigned change=0;change<7;++change) {
+        if(change==1) listener_value.position={2,-3,4};
+        if(change==2) listener_value.velocity={6,1,-2};
+        if(change==3) {listener_value.front={0.6f,0,-0.8f};listener_value.up={0,1,0};}
+        if(change==4) listener_value.distance=0.5f;
+        if(change==5) listener_value.rolloff=0.75f;
+        if(change==6) listener_value.doppler=0.5f;
+        for(unsigned mode=0;mode<3;++mode) {
+            parameters[15]=mode;descending[0]=mode==1?0.25f:0.5f;
+            compare_fresh(listener_value,false,false);compare_fresh(listener_value,true,true);
+        }
+    }
+    parameters[15]=0;listener_value={};descending[0]=0.5f;
     const auto started=std::chrono::steady_clock::now();
     for(unsigned i=0;i<1000;++i) result=spatial.calculate(listener_value,parameters,std::as_bytes(std::span(unity)));
     const auto elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();

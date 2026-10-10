@@ -3,8 +3,27 @@
 #include <algorithm>
 #include <stdexcept>
 #include <format>
+#include <climits>
 
 namespace b2 {
+KeyboardBindings default_keyboard_bindings() {
+    return {SDL_SCANCODE_UP,SDL_SCANCODE_DOWN,SDL_SCANCODE_LEFT,SDL_SCANCODE_RIGHT,
+        SDL_SCANCODE_RETURN,SDL_SCANCODE_BACKSPACE,SDL_SCANCODE_LCTRL,SDL_SCANCODE_RCTRL,
+        SDL_SCANCODE_SPACE,SDL_SCANCODE_LSHIFT,SDL_SCANCODE_E,SDL_SCANCODE_Q,
+        SDL_SCANCODE_R,SDL_SCANCODE_F,SDL_SCANCODE_S,SDL_SCANCODE_W,
+        SDL_SCANCODE_A,SDL_SCANCODE_D,0,0,0,0,0,0};
+}
+bool valid_keyboard_binding(int key) {
+    return key>=0 && key<SDL_SCANCODE_COUNT && key!=SDL_SCANCODE_ESCAPE && key!=SDL_SCANCODE_F1 && key!=SDL_SCANCODE_F8 && key!=SDL_SCANCODE_F9;
+}
+void apply_keyboard(GamepadState& state,const KeyboardBindings& bindings,std::span<const bool> keys) {
+    const auto held=[&](unsigned action) {const auto key=bindings[action];return key>0 && std::size_t(key)<keys.size() && keys[key];};
+    for(unsigned i=0;i<8;++i) {if(held(i)) state.buttons|=1U<<i;if(held(i+8)) state.analog[i]=255;}
+    for(unsigned axis=0;axis<4;++axis) {
+        const auto negative=held(16+axis*2),positive=held(17+axis*2);
+        if(negative || positive) state.axes[axis]=static_cast<std::int16_t>((positive?32767:0)-(negative?32767:0));
+    }
+}
 Input::Input(bool keyboard,bool pump_events,std::uint32_t device_id):keyboard_(keyboard),pump_events_(pump_events),device_id_(device_id) {
     if(!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) throw std::runtime_error(SDL_GetError());
     try {refresh();update();} catch(...) {
@@ -39,7 +58,7 @@ void Input::update() {
     if(updated_ && now-updated_<8000000) return;
     updated_=now;
     if(pump_events_) {SDL_Event value;while(SDL_PollEvent(&value)) event(value);}
-    const auto* keys=SDL_GetKeyboardState(nullptr);
+    int key_count=0;const auto* keys=SDL_GetKeyboardState(&key_count);
     for(unsigned port=0;port<4;++port) {
         GamepadState next;next.packet=states_[port].packet;
         if(auto* device=devices_[port];device && SDL_GamepadConnected(device)) {
@@ -59,13 +78,7 @@ void Input::update() {
             }
         }
         if(port==0 && keyboard_ && !capture_keyboard_) {
-            constexpr SDL_Scancode digital[]={SDL_SCANCODE_UP,SDL_SCANCODE_DOWN,SDL_SCANCODE_LEFT,SDL_SCANCODE_RIGHT,
-                SDL_SCANCODE_RETURN,SDL_SCANCODE_BACKSPACE,SDL_SCANCODE_LCTRL,SDL_SCANCODE_RCTRL};
-            constexpr SDL_Scancode analog[]={SDL_SCANCODE_SPACE,SDL_SCANCODE_LSHIFT,SDL_SCANCODE_E,SDL_SCANCODE_Q,
-                SDL_SCANCODE_R,SDL_SCANCODE_F,SDL_SCANCODE_S,SDL_SCANCODE_W};
-            for(unsigned i=0;i<8;++i) {if(keys[digital[i]]) next.buttons|=1U<<i;if(keys[analog[i]]) next.analog[i]=255;}
-            if(keys[SDL_SCANCODE_A] || keys[SDL_SCANCODE_D]) next.axes[0]=static_cast<std::int16_t>(
-                (keys[SDL_SCANCODE_D]?32767:0)-(keys[SDL_SCANCODE_A]?32767:0));
+            apply_keyboard(next,bindings_,{keys,static_cast<std::size_t>(key_count)});
         }
         if(next!=states_[port]) ++next.packet;
         states_[port]=next;
@@ -116,6 +129,17 @@ std::string check_input() {
     Input input(false,true,device.id);
     unsigned cases=0;
     const auto expect=[&](bool valid,std::string_view name) {if(!valid) throw std::runtime_error("SDL3 input mismatch: "+std::string(name));++cases;};
+    std::array<bool,SDL_SCANCODE_COUNT> keys{};
+    auto bindings=default_keyboard_bindings();GamepadState keyboard;
+    keys[SDL_SCANCODE_W]=true;apply_keyboard(keyboard,bindings,keys);expect(keyboard.analog[7]==255,"default accelerate binding");
+    bindings[15]=SDL_SCANCODE_Z;keyboard={};apply_keyboard(keyboard,bindings,keys);expect(keyboard.analog[7]==0,"old binding released");
+    keys[SDL_SCANCODE_Z]=true;apply_keyboard(keyboard,bindings,keys);expect(keyboard.analog[7]==255,"custom accelerate binding");
+    bindings[15]=0;keyboard={};apply_keyboard(keyboard,bindings,keys);expect(keyboard.analog[7]==0,"unbound action");
+    bindings[20]=SDL_SCANCODE_J;bindings[21]=SDL_SCANCODE_L;keys[SDL_SCANCODE_J]=true;keyboard={};keyboard.analog[0]=123;
+    apply_keyboard(keyboard,bindings,keys);expect(keyboard.axes[2]==-32767 && keyboard.analog[0]==123,"custom stick and gamepad mixing");
+    keys[SDL_SCANCODE_L]=true;apply_keyboard(keyboard,bindings,keys);expect(keyboard.axes[2]==0,"opposite directions cancel");
+    bindings[0]=INT_MAX;apply_keyboard(keyboard,bindings,keys);expect(keyboard.buttons==0,"out of range binding is inert");
+    expect(!valid_keyboard_binding(SDL_SCANCODE_ESCAPE) && !valid_keyboard_binding(SDL_SCANCODE_F8) && !valid_keyboard_binding(SDL_SCANCODE_F9) && valid_keyboard_binding(0),"reserved shortcuts");
     const auto sample=[&]() -> const GamepadState& {SDL_Delay(9);input.update();return input.state(0);};
     expect(input.connected()==1,"virtual device connection");
     constexpr SDL_GamepadButton digital[]={SDL_GAMEPAD_BUTTON_DPAD_UP,SDL_GAMEPAD_BUTTON_DPAD_DOWN,

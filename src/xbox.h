@@ -14,6 +14,7 @@ struct XboxHost {
     std::function<void()> flip;
     bool trace_io=false;
     std::filesystem::path storage_root;
+    Performance* performance=nullptr;
 };
 struct BootIo {
     std::uint32_t ordinal=0,status=0,information=0,callsite=0;
@@ -62,6 +63,8 @@ public:
     bool save_frame(const std::filesystem::path&);
     void output_gain(float);
     void capture_frame(const std::filesystem::path& directory);
+    void performance_recording(bool);
+    PerfCounters performance_counters() const;
 private:
     friend void native_platform(Cpu&,Memory&,std::uint32_t);
     friend std::string check_storage(const std::filesystem::path&,const std::filesystem::path&);

@@ -41,6 +41,60 @@ compilations reported. All 145 offline graphics cases pass on RTX 5060 Ti and
 WARP without debug messages. Both hidden SDL3/ImGui window checks pass. The
 executable's import table contains D3D11 and no D3DCOMPILER or D3DCompile import.
 
+Scaled UI pixel origin, 2026-10-09
+
+Capture frame-51886055200 has logical 640x480 surfaces and a 1280x960 image.
+UI draw 546 uses the SDK passthrough program: its twelve instructions exactly
+match the verified XBE bytes at 00223108. Constants 0/1 are
+{1,1,16777215,1}/{0.53125,0.53125,0,0}. The shader multiplies the input position
+by constant 0, then adds constant 1; screen coordinates retain the pixel origin.
+
+The renderer scaled that origin along with geometry. A bounded native replay
+of this program, with a rectangle from (16,16) to (48,48), reproduced these
+incorrect horizontal bounds: 1x=16..47, 2x=33..96, 3x=49..144, 4x=66..193.
+Expected bounds are 16*s..48*s-1, so the error is one or two physical pixels.
+The same problem affects the vertical origin.
+
+For ordinary UI vertices, keep the host origin at half a physical pixel: add
+0.5*(1-1/s) to the logical-coordinate bias before converting to clip space.
+The existing NV2A subpixel correction and native 1x rendering are preserved.
+Both expanded vertices and packed game streams use this common conversion.
+The offline suite now checks both paths at every supported scale with this SDK
+program, checking pixels on both sides of each rectangle edge. All 174 render
+cases pass on RTX 5060 Ti and WARP with no D3D11 debug messages. Both hidden
+window checks pass automatic selection, persisted opt-out and FPS overlay checks;
+the final executable compiles no shaders during these checks.
+Host pixel-coordinate reference:
+https://learn.microsoft.com/en-us/windows/win32/direct3d10/d3d10-graphics-programming-guide-resources-coordinates
+
+Scaled framebuffer transitions, 2026-10-09
+
+Capture frame-377419886700 contains two draws at 2x resolution. Both use the
+SDK passthrough at 00223108 with the same constants as the UI capture. The
+first copies surface 4 to surface 1 using point sampling; the second subtracts
+8 from RGB. Their rectangle is (-0.5,-0.5)..(639.5,479.5), with pixel-space
+texture coordinates (0,0)..(640,480). These vertices already describe pixel
+edges. Applying the UI center correction again moves each copy and leaves a
+framebuffer edge uncovered. Repeating this during the fade stretches the image.
+
+A bounded native reproduction used a varying gray image and the captured
+packed layout/state. Before the correction, a single copy changed 0 pixels at
+1x, 16383 at 2x, 36862 at 3x and 65532 at 4x (64x64 logical surfaces).
+The renderer now retains edge coordinates for four-corner, half-pixel-adjusted
+rectangles submitted through the verified SDK screen-position programs.
+Ordinary UI vertices keep the center correction. Classification is bounded,
+allocates nothing and does not depend on scene, shader handle or texture ID.
+The build checks all three SDK program keys against the original XBE bytes.
+
+The existing render suite checks twelve successive GPU framebuffer copies at
+each scale, including six subtractive fades, every RGB pixel and all four
+edges. Packed-stream copies and expanded fade vertices exercise both paths.
+Ordinary UI bounds remain covered by the four existing origin cases.
+After the correction the bounded reproduction changes zero pixels at all four
+scales. All 178 render cases pass on RTX 5060 Ti and WARP without D3D11 debug
+messages. The rebuilt game's hidden window check passes with no runtime shader
+compilations; in-game transition verification remains a manual check.
+
 The general shader retains raw pass-through texture coordinates; combiner input
 mapping controls their range. Texture alpha kill applies only to a fetch, so it
 does not discard a clip-plane or coordinate pass-through stage. Disabled texture

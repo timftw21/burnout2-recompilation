@@ -29,6 +29,7 @@ struct VertexTranslation {
 // Translation belongs to the native build tool. Gameplay selects bytecode.
 VertexTranslation translate_vertex_program(const VertexProgram&,bool launch=false);
 VertexProgram normalize_vertex_program(const VertexProgram&);
+std::span<const VertexProgram> screen_vertex_programs(); // Verified SDK XYZ/XYZRHW passthrough records.
 std::string fixed_transform_source(std::uint32_t skin);
 void validate_fixed_transform(const FixedTransform&);
 }

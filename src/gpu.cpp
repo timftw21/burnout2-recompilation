@@ -49,10 +49,17 @@ struct Gpu::Impl {
     std::map<std::array<std::uint32_t,5>,std::uint32_t> textures;
     struct Cubemap {std::uint32_t identifier;std::array<std::uint64_t,6> revisions;};
     std::map<std::array<std::uint32_t,5>,Cubemap> cubemaps;
-    struct Fence {ComPtr<ID3D11Query> query;std::uint32_t address=0,value=0;};
+    struct Fence {
+        ComPtr<ID3D11Query> query;
+        std::uint64_t work=0;
+        std::uint32_t written=0;
+        std::array<std::uint32_t,24> values{};
+    };
     std::array<Fence,64> fences;
     unsigned fence_head=0,fence_count=0;
+    std::uint64_t gpu_work=0;
     GpuStats statistics;
+    Performance* profile=nullptr;
     std::filesystem::path capture_requested,capture_directory;
     std::ostringstream capture_trace;
     unsigned capture_draws=0;
@@ -74,7 +81,7 @@ struct Gpu::Impl {
                 statistics.vertices+=draw.indices.empty()?draw.count:draw.indices.size();++statistics.draws;
             }
         } catch(...) {renderer.end();draw_count=0;throw;}
-        renderer.end();draw_count=0;
+        renderer.end();draw_count=0;++gpu_work;
     }
     bool select_target(std::uint32_t clear_flags=0) {
         const auto horizontal=reg(0x200),vertical=reg(0x204);
@@ -325,24 +332,54 @@ struct Gpu::Impl {
         }
     }
     void fence(std::uint32_t address,std::uint32_t value) {
-        flush();if(fence_count==fences.size()) poll(true);
-        auto& result=fences[(fence_head+fence_count)%fences.size()];result.address=address;result.value=value;
-        renderer.native_context()->End(result.query.Get());++fence_count;++statistics.fences;
-    }
-    void poll(bool wait) {
-        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
-        if(wait) renderer.native_context()->Flush();
-        while(fence_count) {
-            BOOL finished=FALSE;
-            const auto status=renderer.native_context()->GetData(fences[fence_head].query.Get(),&finished,sizeof(finished),wait?0:D3D11_ASYNC_GETDATA_DONOTFLUSH);
-            checked_gpu(status);
-            if(status!=S_OK || !finished) {
-                if(!wait) return;
-                if(std::chrono::steady_clock::now()>=deadline) throw std::runtime_error("Native GPU completion timed out");
-                SwitchToThread();continue;
+        flush();
+        // Semaphore writes at the same GPU command position share completion.
+        // No guest thread runs between these host-side packet methods. Retain
+        // the latest word per slot and publish it only when that query finishes.
+        Fence* result=fence_count?&fences[(fence_head+fence_count-1)%fences.size()]:nullptr;
+        if(!result || result->work!=gpu_work) {
+            if(fence_count==fences.size()) {
+                poll();
+                if(fence_count==fences.size()) {
+                    ++statistics.fence_queue_waits;
+                    await([&]{return fence_count<fences.size();},PerfGpuWait::queue_space);
+                }
             }
-            const auto& completed=fences[fence_head];if(completed.address) memory.store<std::uint32_t>(completed.address,completed.value);
-            fence_head=(fence_head+1)%static_cast<unsigned>(fences.size());--fence_count;
+            result=&fences[(fence_head+fence_count)%fences.size()];result->work=gpu_work;result->written=0;
+            renderer.native_context()->End(result->query.Get());++fence_count;++statistics.fence_queries;
+        }
+        if(address) {const auto slot=(address-semaphore_base)/4;result->values[slot]=value;result->written|=1U<<slot;}
+        ++statistics.fences;
+    }
+    bool retire() {
+        BOOL finished=FALSE;
+        const auto status=renderer.native_context()->GetData(fences[fence_head].query.Get(),&finished,sizeof(finished),D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        checked_gpu(status);
+        if(status!=S_OK || !finished) return false;
+        const auto& completed=fences[fence_head];
+        for(auto slots=completed.written;slots;slots&=slots-1) {
+            const auto slot=std::countr_zero(slots);memory.store<std::uint32_t>(semaphore_base+slot*4,completed.values[slot]);
+        }
+        fence_head=(fence_head+1)%static_cast<unsigned>(fences.size());--fence_count;
+        return true;
+    }
+    void poll() {
+        if(!fence_count) return;
+        PerfScope timing(profile,PerfPhase::gpu_wait,std::uint32_t(PerfGpuWait::poll));
+        while(fence_count && retire()) {}
+    }
+    template<class Complete> void await(Complete complete,PerfGpuWait reason) {
+        PerfScope timing(profile,PerfPhase::gpu_wait,std::uint32_t(reason));
+        if(complete()) return;
+        // Submit once, then observe completion without implicit repeat flushes.
+        renderer.native_context()->Flush();
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        while(!complete()) {
+            if(!fence_count) throw std::runtime_error("Requested GPU fence has no submitted completion point");
+            if(!retire()) {
+                if(std::chrono::steady_clock::now()>=deadline) throw std::runtime_error("Native GPU completion timed out");
+                SwitchToThread();
+            }
         }
     }
     void method(unsigned subchannel,unsigned method,std::uint32_t data) {
@@ -414,6 +451,7 @@ struct Gpu::Impl {
             flush();auto launch=program;launch.start=data;ProgramVertex input{};
             for(unsigned lane=0;lane<4;++lane) input.attributes[0][lane]=real(reg(0x1E80+lane*4));
             renderer.launch_program(renderer.prepare_program(launch,true),constants,input);
+            ++gpu_work;
         } else if(method==0x1D94) {
             flush();const auto complete_clear=select_target(data);
             const auto h=reg(0x1D98),v=reg(0x1D9C);
@@ -428,16 +466,24 @@ struct Gpu::Impl {
                     target,data,json(hex32(reg(0x1D90))),json(hex32(reg(0x208))),rectangle[0],rectangle[1],rectangle[2],rectangle[3]);
             }
             ++statistics.clears;
+            ++gpu_work;
         } else if(method==0x1D70) {
-            if(reg(0x1A4)!=8 || reg(0x1D6C)>92) throw std::runtime_error("Unbound NV097 semaphore DMA range");
+            if(reg(0x1A4)!=8 || reg(0x1D6C)>92 || (reg(0x1D6C)&3)) throw std::runtime_error("Unbound NV097 semaphore DMA range");
             fence(semaphore_base+reg(0x1D6C),data);
-        } else if(method==0x110) {flush();fence(0,0);poll(true);}
-        else if(method==0x12C) {flush();select_target();renderer.copy_to_main();target=0;active_surface=nullptr;++statistics.flips;capture_flip();if(owner.flip) owner.flip();}
+        } else if(method==0x110) {
+            // WAIT_FOR_IDLE orders GPU commands, not the submitting CPU. Our
+            // single immediate context orders draws, copies and resource reuse.
+            // Submit queued draws (and snapshot their RAM) before proceeding;
+            // CPU-visible completion still uses semaphore queries and wait().
+            flush();
+        }
+        else if(method==0x12C) {flush();select_target();renderer.copy_to_main();target=0;active_surface=nullptr;++statistics.flips;++gpu_work;capture_flip();if(owner.flip) owner.flip();}
         if(indices.size()>32768 || inline_words.size()>2*1024*1024) throw std::runtime_error("NV097 inline draw exceeds its bound");
     }
 };
 Gpu::Gpu(Renderer& renderer,Memory& memory,std::uint32_t semaphore_base):impl_(std::make_unique<Impl>(renderer,memory,*this,semaphore_base)) {}
 Gpu::~Gpu()=default;
+void Gpu::performance(Performance* profile) {impl_->profile=profile;}
 void Gpu::capture_frame(const std::filesystem::path& directory) {
     if(directory.empty() || !impl_->capture_requested.empty() || !impl_->capture_directory.empty())
         throw std::runtime_error("A frame capture is already pending");
@@ -445,23 +491,54 @@ void Gpu::capture_frame(const std::filesystem::path& directory) {
 }
 void Gpu::submit(std::uint32_t begin,std::uint32_t end) {
     auto& g=*impl_;
+    PerfScope timing(g.profile,PerfPhase::gpu_commands);
     if(end<begin || ((end-begin)&3) || end-begin>4*1024*1024) throw std::runtime_error("Invalid native GPU submission range");
+    // A push-buffer submission is a bounded RAM range. Validate it once;
+    // individual packet bounds still protect every header and payload read.
+    const auto start=begin;
+    const auto* commands=end==begin?nullptr:static_cast<const std::byte*>(g.memory.access(begin,end-begin));
+    const auto word_at=[&](std::uint32_t address) {std::uint32_t word;std::memcpy(&word,commands+(address-start),4);return word;};
     ++g.statistics.submissions;
     while(begin<end) {
-        const auto header=g.memory.load<std::uint32_t>(begin);begin+=4;++g.statistics.packets;
+        const auto header=word_at(begin);begin+=4;++g.statistics.packets;
         if(header&0xA0030003U) throw std::runtime_error(std::format("Unsupported NV2A packet 0x{:08X} at 0x{:08X}",header,begin-4));
         const auto count=(header>>18)&0x7FF,first=header&0x1FFC,subchannel=(header>>13)&7;
         if(count>(end-begin)/4 || (!(header&0x40000000U) && count && first+(count-1)*4>=0x2000))
             throw std::runtime_error("NV2A packet extends beyond its submission or method bank");
+        if(count && subchannel==0) {
+            const bool repeated=(header&0x40000000U)!=0;
+            if(repeated && first==0x1818) {
+                if(count>2*1024*1024-g.inline_words.size()) throw std::runtime_error("NV097 inline draw exceeds its bound");
+                const auto previous=g.inline_words.size();g.inline_words.resize(previous+count);
+                std::memcpy(g.inline_words.data()+previous,commands+(begin-start),count*4);
+                g.registers[0][first/4]=g.inline_words.back();g.statistics.methods+=count;begin+=count*4;continue;
+            }
+            const bool tokens=first>=0xB00 && first<=0xB7C;
+            const bool constants=first>=0xB80 && first<=0xBFC;
+            if(!repeated && (tokens || constants) && !(first&15) && !(count&3) && first+count*4<=(tokens?0xB80U:0xC00U)) {
+                const auto index=tokens?g.program_load:g.constant_load;
+                const auto limit=tokens?g.program.tokens.size():g.constants.size();
+                if(index>limit || count/4>limit-index) throw std::runtime_error("NV097 shader upload outside its memory bank");
+                const auto* payload=commands+(begin-start);
+                if(tokens) {std::memcpy(g.program.tokens[index].data(),payload,count*4);g.program_load+=count/4;}
+                else {std::memcpy(g.constants[index].data(),payload,count*4);g.constant_load+=count/4;}
+                std::memcpy(g.registers[0].data()+first/4,payload,count*4);g.statistics.methods+=count;begin+=count*4;continue;
+            }
+        }
         for(unsigned word=0;word<count;++word) {
             const auto method=first+((header&0x40000000U)?0:word*4);
-            g.method(subchannel,method,g.memory.load<std::uint32_t>(begin));begin+=4;
+            g.method(subchannel,method,word_at(begin));begin+=4;
         }
     }
-    g.flush();g.renderer.native_context()->Flush();g.poll(false);
+    g.flush();g.renderer.native_context()->Flush();g.poll();
 }
-bool Gpu::busy() {auto& g=*impl_;g.poll(false);return g.fence_count!=0;}
-void Gpu::wait() {auto& g=*impl_;g.flush();g.fence(0,0);g.poll(true);}
+bool Gpu::busy() {auto& g=*impl_;g.poll();return g.fence_count!=0;}
+void Gpu::wait() {auto& g=*impl_;g.flush();g.fence(0,0);g.await([&]{return !g.fence_count;},PerfGpuWait::idle);}
+void Gpu::wait_fence(std::uint32_t value,std::uint32_t issued) {
+    auto& g=*impl_;
+    // Match the SDK's unsigned comparison, including counter wraparound.
+    g.await([&]{return issued-value>=issued-g.memory.load<std::uint32_t>(g.semaphore_base);},PerfGpuWait::semaphore);
+}
 void Gpu::snapshot() {
     auto& g=*impl_;g.flush();
     // Main holds the last presented frame. The bound surface may belong to an

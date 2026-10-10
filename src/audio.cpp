@@ -1,4 +1,5 @@
 #include "audio.h"
+#include "performance.h"
 #include "dsp.h"
 #include "spatial.h"
 #include "file.h"
@@ -339,6 +340,12 @@ Audio::Audio(bool output,float gain) {
     }
 }
 Audio::~Audio(){if(stream_){SDL_DestroyAudioStream(stream_);SDL_QuitSubSystem(SDL_INIT_AUDIO);}}
+void Audio::performance(bool enabled) {
+    StreamLock lock(stream_);
+    if(enabled) {mix_batches_=0;mix_ns_=0;mix_overruns_=0;}
+    performance_enabled_.store(enabled,std::memory_order_relaxed);
+}
+AudioPerformance Audio::performance() const {return {mix_batches_.load(std::memory_order_relaxed),mix_ns_.load(std::memory_order_relaxed),mix_overruns_.load(std::memory_order_relaxed)};}
 void Audio::output_gain(float gain) {
     if(!(gain>=0 && gain<=1)) throw std::runtime_error("Output volume must be between zero and one");
     if(stream_ && !SDL_SetAudioStreamGain(stream_,gain)) throw std::runtime_error(SDL_GetError());
@@ -723,7 +730,13 @@ std::uint32_t Audio::effect_program(std::uint32_t offset,unsigned size) {
 }
 std::string Audio::failure(){StreamLock lock(stream_);return failed_?failure_.data():std::string{};}
 void Audio::mix_unlocked(std::span<float> output) {
-    if(!effects_){mix_sources(output);frames_processed_.fetch_add(static_cast<std::uint32_t>(output.size()/2),std::memory_order_relaxed);return;}
+    const auto started=performance_enabled_.load(std::memory_order_relaxed) && !output.empty()?performance_clock():0;
+    const auto measured=[&] {
+        if(!started) return;const auto elapsed=performance_clock()-started;
+        mix_batches_.fetch_add(1,std::memory_order_relaxed);mix_ns_.fetch_add(elapsed,std::memory_order_relaxed);
+        if(elapsed>(output.size()/2)*1000000000ULL/48000) mix_overruns_.fetch_add(1,std::memory_order_relaxed);
+    };
+    if(!effects_){mix_sources(output);frames_processed_.fetch_add(static_cast<std::uint32_t>(output.size()/2),std::memory_order_relaxed);measured();return;}
     auto& effects=*effects_;
     for(std::size_t frame=0;frame<output.size()/2;++frame) {
         if(!effects.available) {
@@ -748,6 +761,7 @@ void Audio::mix_unlocked(std::span<float> output) {
         output[frame*2]=effects.output[effects.cursor*2];output[frame*2+1]=effects.output[effects.cursor*2+1];
         ++effects.cursor;--effects.available;
     }
+    measured();
 }
 void Audio::mix(std::span<float> output) {
     if(output.size()%2) throw std::runtime_error("Audio mixer requires stereo frames");
@@ -860,6 +874,9 @@ std::string check_audio(const std::filesystem::path& effects_path,const std::fil
             equal&=std::bit_cast<std::int16_t>(u16(replayed,i*2))==static_cast<std::int16_t>(std::clamp(reference[i]*32768.f,-32768.f,32767.f));
         require(equal);
     }
+    audio.performance(true);audio.mix(mixed);
+    const auto recorded=audio.performance();require(recorded.batches==1 && recorded.mix_ns>0);
+    audio.performance(false);audio.mix(mixed);require(audio.performance().batches==1);
     return "{\"format\":\"b2-audio-check-v1\",\"passed\":true,\"game_booted\":false,\"audio_device_opened\":false,\"cases\":"+std::to_string(checks)+"}";
 }
 }

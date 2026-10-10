@@ -13,7 +13,8 @@ with or endorsed by those owners.
 The repository does not provide the game or an Xbox SDK. Users must supply
 their own lawfully obtained inputs. Local game media and extracted content
 remain outside source control. Preserved research references are in
-[knowledge/](knowledge/); their original source revision and extraction hashes
+[knowledge/](https://github.com/timftw21/burnout2-recompilation/tree/main/knowledge);
+their original source revision and extraction hashes
 are recorded in the research manifest.
 
 The native development tools use Zydis and Zycore. Their licenses are reproduced

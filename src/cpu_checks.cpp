@@ -40,6 +40,8 @@ void b2_fp_snapshot(void*);
 }
 
 namespace b2 {
+void guest_00227BD9(Cpu&,Memory&);
+void reference_matrix(Cpu&,Memory&);
 namespace {
 using CarryReference = std::uint32_t (*)(std::uint32_t, std::uint32_t, std::uint32_t);
 using UnaryReference = std::uint32_t (*)(std::uint32_t, std::uint32_t);
@@ -260,6 +262,62 @@ unsigned check_call_chain() {
             "Recovered three-function constructor chain corrupted registers, flags, stack or object data");
     }
     return 2;
+}
+unsigned check_matrix() {
+    constexpr std::uint32_t base=0x1000,stack=0x1380;
+    const auto& matrix=function(0x00227BD9);
+    unsigned checked=0;
+    for(unsigned precision:{0U,2U,3U}) for(unsigned rounding=0;rounding<4;++rounding)
+        for(unsigned alias=0;alias<4;++alias) for(unsigned sample=0;sample<5;++sample) {
+            std::array<std::byte,1024> bytes{};
+            Memory memory(base,bytes);
+            for(unsigned i=0;i<32;++i) {
+                auto value=std::bit_cast<std::uint32_t>(float(int((i*73+sample*37)%101)-50)/17.f);
+                if(sample==3 && i%5==0) value=0x80000000;
+                if(sample==4 && i%7==0) value=i%2?0x7F800000:0x7FC12345;
+                memory.store<std::uint32_t>(base+i*4,value);
+            }
+            const auto destination=alias==1?base:alias==2?base+64:base+128;
+            memory.store<std::uint32_t>(stack,0xABCDEF00);
+            memory.store<std::uint32_t>(stack+4,destination);memory.store<std::uint32_t>(stack+8,base);
+            memory.store<std::uint32_t>(stack+12,alias==3?base:base+64);
+            auto reference_bytes=bytes;Memory reference_memory(base,reference_bytes);
+            Cpu original;
+            for(unsigned i=0;i<8;++i) original.registers[i]=0x13570000+i;
+            original.registers[esp]=stack;original.flags=initial_flags|direction;
+            original.cs_selector=8;original.ds_selector=16;original.ss_selector=24;
+            const auto control=std::uint16_t(0x007F|(precision<<8)|(rounding<<10));
+            std::memcpy(original.floating.image.data(),&control,2);
+            auto cpu=original,reference=original;
+            {FloatingScope scope(reference.floating);reference_matrix(reference,reference_memory);}
+            matrix.run(cpu,memory);
+            require(bytes==reference_bytes && cpu.registers==reference.registers && cpu.flags==reference.flags && cpu.eip==reference.eip &&
+                cpu.floating.instruction==reference.floating.instruction && cpu.floating.opcode==reference.floating.opcode &&
+                cpu.floating.data==reference.floating.data && cpu.floating.code_selector==reference.floating.code_selector &&
+                cpu.floating.data_selector==reference.floating.data_selector &&
+                std::memcmp(cpu.floating.image.data(),reference.floating.image.data(),12)==0,
+                std::format("Fused original matrix differs: precision {}, rounding {}, alias {}, sample {}",precision,rounding,alias,sample));
+            ++checked;
+        }
+    // A failed preflight must execute the individual original instructions,
+    // retaining earlier writes and the exact floating state at the failed load.
+    for(bool bad_output:{false,true}) {
+        std::array<std::byte,1024> bytes{};Memory memory(base,bytes);
+        memory.store<std::uint32_t>(stack,0xABCDEF00);
+        memory.store<std::uint32_t>(stack+4,bad_output?0x13FC:base+128);
+        memory.store<std::uint32_t>(stack+8,base);memory.store<std::uint32_t>(stack+12,bad_output?base+64:0x13FC);
+        auto reference_bytes=bytes;Memory reference_memory(base,reference_bytes);
+        Cpu cpu;cpu.registers[esp]=stack;auto reference=cpu;
+        std::string actual_error,reference_error;
+        try {matrix.run(cpu,memory);} catch(const std::runtime_error& error) {actual_error=error.what();}
+        try {FloatingScope scope(reference.floating);reference_matrix(reference,reference_memory);}
+        catch(const std::runtime_error& error) {reference_error=error.what();}
+        require(!actual_error.empty() && actual_error==reference_error && bytes==reference_bytes &&
+            cpu.floating.instruction==reference.floating.instruction && cpu.floating.data==reference.floating.data &&
+            std::memcmp(cpu.floating.image.data(),reference.floating.image.data(),12)==0,"Fused matrix changed a memory-fault boundary");
+        ++checked;
+    }
+    return checked;
 }
 }
 
@@ -620,7 +678,7 @@ CpuChecks check_cpu_batch() {
 #undef B2_HOST
     result.memory_cases = check_strings<std::uint8_t>() + check_strings<std::uint16_t>() + check_strings<std::uint32_t>();
     result.game_cases = check_compare() + check_call_chain();
-    result.floating_cases=check_floating_contexts()+check_reciprocal_sqrt()+check_vertex_colors()+check_mmx_copy();
+    result.floating_cases=check_floating_contexts()+check_reciprocal_sqrt()+check_vertex_colors()+check_mmx_copy()+check_matrix();
     result.control_cases=check_control_boundaries()+check_compact_jump_table()+check_segment_setup()+check_flags_stack();
     return result;
 }
@@ -728,5 +786,25 @@ CpuTiming benchmark_call_chain(std::uint32_t iterations) {
     run(iterations);
     const auto elapsed = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count();
     return {elapsed / iterations, checksum};
+}
+MatrixTiming benchmark_matrix(std::uint32_t iterations) {
+    std::array<std::byte,1024> bytes{};Memory memory(0x1000,bytes);
+    for(unsigned i=0;i<32;++i) memory.store<std::uint32_t>(0x1000+i*4,std::bit_cast<std::uint32_t>(float(int(i%9)-4)/17.f));
+    memory.store<std::uint32_t>(0x1380,0xABCDEF00);memory.store<std::uint32_t>(0x1384,0x1080);
+    memory.store<std::uint32_t>(0x1388,0x1000);memory.store<std::uint32_t>(0x138C,0x1040);
+    const auto measure=[&](auto run) {
+        Cpu cpu;FloatingScope scope(cpu.floating);std::uint64_t checksum=0;
+        const auto repeat=[&](unsigned count) {
+            for(unsigned i=0;i<count;++i) {
+                cpu.registers[esp]=0x1380;run(cpu,memory);
+                checksum+=memory.load<std::uint32_t>(0x1080+(i%16)*4);
+            }
+        };
+        repeat(1000);checksum=0;
+        const auto started=std::chrono::steady_clock::now();repeat(iterations);
+        const auto ns=std::chrono::duration<double,std::nano>(std::chrono::steady_clock::now()-started).count();
+        return CpuTiming{ns/iterations,checksum};
+    };
+    return {measure(guest_00227BD9),measure(reference_matrix)};
 }
 }

@@ -1,5 +1,6 @@
 #include "recompiler.h"
 #include "native_api.h"
+#include "floating.h"
 #include <algorithm>
 #include <format>
 #include <set>
@@ -31,6 +32,23 @@ std::string type(unsigned bits) {
     if (bits != 8 && bits != 16 && bits != 32) throw std::runtime_error("Unsupported operand width");
     return std::format("std::uint{}_t", bits);
 }
+bool batchable_x87(const Instruction& instruction) {
+    const auto& ins=instruction.decoded;
+    if(ins.opcode_map!=ZYDIS_OPCODE_MAP_DEFAULT || ins.opcode<0xD8 || ins.opcode>0xDF || ins.address_width!=32 ||
+       (ins.attributes&(ZYDIS_ATTRIB_HAS_LOCK|ZYDIS_ATTRIB_HAS_REP|ZYDIS_ATTRIB_HAS_REPE|ZYDIS_ATTRIB_HAS_REPNE))) return false;
+    // Control/environment operations, integer results and CPU flag comparisons
+    // remain individual instructions. These operations only affect x87 state.
+    constexpr std::string_view allowed[]={"fld","fst","fstp","fild","fist","fistp","fisttp","fadd","faddp",
+        "fiadd","fsub","fsubp","fsubr","fsubrp","fisub","fisubr","fmul","fmulp","fimul","fdiv","fdivp",
+        "fdivr","fdivrp","fidiv","fidivr","fsqrt","fchs","fabs","fxch","ffree","fld1","fldz",
+        "fldl2t","fldl2e","fldpi","fldlg2","fldln2","fcom","fcomp","fcompp","fucom","fucomp","fucompp"};
+    if(std::ranges::find(allowed,ZydisMnemonicGetString(ins.mnemonic))==std::end(allowed)) return false;
+    for(unsigned i=0;i<ins.operand_count_visible;++i) if(instruction.operands[i].type==ZYDIS_OPERAND_TYPE_MEMORY) {
+        const auto& operand=instruction.operands[i];
+        if(operand.mem.type!=ZYDIS_MEMOP_TYPE_MEM || !operand.size || operand.size%8) return false;
+    }
+    return true;
+}
 
 class Emitter {
 public:
@@ -41,6 +59,7 @@ public:
     bool returns = false;
     bool floating = false;
     std::set<std::uint32_t> loop_headers;
+    std::map<std::uint32_t,std::vector<const Instruction*>> floating_runs;
     std::map<std::string,std::string> native_helpers;
     std::map<std::string,std::string> native_declarations;
     std::ostringstream body;
@@ -218,6 +237,49 @@ public:
         if (mnemonic=="fnsave" || mnemonic=="fninit")
             body << "    cpu.floating.instruction=cpu.floating.data=0;\n    cpu.floating.opcode=cpu.floating.code_selector=cpu.floating.data_selector=0;\n";
     }
+    void x87_run(const std::vector<const Instruction*>& run) {
+        const auto helper=std::format("b2_x87_run_{:08X}_{:08X}",run.front()->address,run.back()->address);
+        std::string assembly=helper+" PROC\n",ready;
+        unsigned operands=0;
+        body << "    if(!cpu.diagnostic) {\n"
+             << "        struct Operand {void* pointer;std::uint32_t address;std::uint16_t selector;};\n"
+             << "        static_assert(sizeof(Operand)==16);\n";
+        std::ostringstream pointers;
+        for(const auto* instruction:run) {
+            const auto& ins=instruction->decoded;
+            const ZydisDecodedOperand* memory=nullptr;
+            for(unsigned i=0;i<ins.operand_count_visible;++i)
+                if(instruction->operands[i].type==ZYDIS_OPERAND_TYPE_MEMORY) memory=&instruction->operands[i];
+            if(memory) {
+                const auto offset=operands*16;
+                body << "        const auto fp_address_" << operands << '=' << address(*memory) << ";\n";
+                pointers << "            {memory.try_access(fp_address_" << operands << ',' << memory->size/8
+                         << "),fp_address_" << operands << ",cpu."
+                         << (memory->mem.segment==ZYDIS_REGISTER_SS?"ss":memory->mem.segment==ZYDIS_REGISTER_FS?"fs":memory->mem.segment==ZYDIS_REGISTER_GS?"gs":"ds")
+                         << "_selector},\n";
+                if(!ready.empty()) ready+=" && ";
+                ready+=std::format("fp_operands[{}].pointer",operands++);
+                assembly+=std::format("    mov rax,qword ptr [rcx+{}]\n    mov r8d,dword ptr [rcx+{}]\n"
+                    "    mov dword ptr [rdx+{}],r8d\n    mov r8w,word ptr [rcx+{}]\n    mov word ptr [rdx+{}],r8w\n",
+                    offset,offset+8,offsetof(FloatingState,data),offset+12,offsetof(FloatingState,data_selector));
+            }
+            const auto original_modrm=(ins.raw.modrm.mod<<6)|(ins.raw.modrm.reg<<3)|ins.raw.modrm.rm;
+            assembly+=std::format("    mov dword ptr [rdx+{}],0{:08X}h\n    mov word ptr [rdx+{}],0{:04X}h\n"
+                "    db 0{:02X}h,0{:02X}h\n",offsetof(FloatingState,instruction),instruction->address,
+                offsetof(FloatingState,opcode),((ins.opcode&7U)<<8)|original_modrm,ins.opcode,
+                memory?(ins.raw.modrm.reg<<3):original_modrm);
+        }
+        assembly+="    ret\n"+helper+" ENDP\n";
+        native_helpers[helper]=std::move(assembly);
+        native_declarations[helper]="extern \"C\" void "+helper+"(const void*,FloatingState*);\n";
+        if(operands) body << "        const std::array<Operand," << operands << "> fp_operands{{\n" << pointers.str() << "        }};\n";
+        // Failed range checks fall through to the original compiled sequence:
+        // earlier stores, floating state and the failing instruction stay exact.
+        body << "        if(" << (operands?ready:"true") << ") {\n"
+             << "            cpu.floating.code_selector=cpu.cs_selector;\n            " << helper
+             << '(' << (operands?"fp_operands.data()":"nullptr") << ",&cpu.floating);\n"
+             << "            goto " << label(run.back()->address+run.back()->decoded.length) << ";\n        }\n    }\n";
+    }
     void instruction(const Instruction& instruction) {
         const auto& ins = instruction.decoded;
         const auto& operands = instruction.operands;
@@ -238,6 +300,7 @@ public:
         body << label(instruction.address) << ": { // " << instruction.text << '\n';
         if(loop_headers.contains(instruction.address))
             body << "    if(b2::checkpoint_due(cpu)) { commit(); b2::checkpoint(cpu," << constant(instruction.address) << "); }\n";
+        if(const auto run=floating_runs.find(instruction.address);run!=floating_runs.end()) x87_run(run->second);
         bool terminator = false;
         switch (ins.mnemonic) {
         case ZYDIS_MNEMONIC_SAHF:
@@ -719,7 +782,7 @@ public:
 };
 }
 
-LoweredFunction lower(const Function& function) {
+LoweredFunction lower(const Function& function,bool fuse_floating) {
     LoweredFunction result;
     const auto api=std::ranges::find(native_apis,function.entry,&NativeApi::address);
     if(api!=native_apis.end()) {
@@ -739,6 +802,20 @@ LoweredFunction lower(const Function& function) {
         if(edge.to && (edge.kind=="jump" || edge.kind=="conditional" || edge.kind=="table-jump") && *edge.to<=edge.from)
             emitter.loop_headers.insert(*edge.to);
     emitter.calls=!emitter.loop_headers.empty();
+    if(fuse_floating) {
+        std::set<std::uint32_t> targets{function.entry};
+        for(const auto& edge:function.edges) if(edge.to) targets.insert(*edge.to);
+        for(auto current=function.instructions.begin();current!=function.instructions.end();) {
+            std::vector<const Instruction*> run;
+            auto next=current;
+            while(next!=function.instructions.end() && run.size()<32 && batchable_x87(next->second) &&
+                  (run.empty() || (!targets.contains(next->first) && next->first==run.back()->address+run.back()->decoded.length))) {
+                run.push_back(&next->second);++next;
+            }
+            if(run.size()>=4) emitter.floating_runs.emplace(current->first,std::move(run));
+            current=next==current?std::next(current):next;
+        }
+    }
     for (const auto& [pc, instruction] : function.instructions) {
         try { emitter.instruction(instruction); }
         catch (const std::exception& error) {

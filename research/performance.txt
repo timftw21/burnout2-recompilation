@@ -1,0 +1,367 @@
+Performance optimization evidence - 2026-10-10
+
+Input: build/windows/Release/build/captures/performance-62898951800
+Scene: regular race; the user believes Airport Terminal 3. Track unconfirmed.
+CPU: AMD Ryzen 5 5600X, 12 logical processors.
+GPU: NVIDIA GeForce RTX 5060 Ti.
+Settings: 60 Hz, 1x internal resolution, interpolation off, VSync on.
+Target SHA-256: B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF
+The native inspector accepted the recording before and after this batch.
+
+Recording: 16.551 s, 724 source-frame records, no dropped/partial GPU coverage.
+The 723 complete eligible source intervals average 43.748 FPS, calculated from
+their count divided by their summed interval duration; the initial partial frame
+is excluded. This is the pre-optimization baseline used for release 1.1 figures.
+Source interval median 23.117 ms, p99 30.842 ms, maximum 37.365 ms.
+Measured GPU spans: median 7.807 ms, p99 14.858 ms; exclude idle gaps/GUI.
+Exclusive main-thread wall time: guest 6454 ms, uploads 3376 ms, GPU packet
+processing 2255 ms, GPU waits 1766 ms, platform bindings 1318 ms.
+954712 draws, 3800355 buffer maps, 8891751148 uploaded bytes, 88211 fences.
+No gameplay shader compilation or over-budget audio mix batches were recorded.
+RAM peak: 555753472-byte working set, 541007872-byte private allocation.
+Cooperative checkpoint samples indicate addresses, not exact function costs.
+Bounded original-byte analysis identified 0021FA80 as part of the SDK's stream
+binding packet writer in 0021F9C0, rather than a new native platform binding.
+
+Changes:
+- Append vertex/index data using WRITE_NO_OVERWRITE; WRITE_DISCARD only at wrap.
+  Preserve all stream offsets, including the current-attribute stream.
+- Compare constants with CPU copies; upload only changed complete values.
+- Copy complete, aligned shader-bank packets and inline arrays in bounded blocks.
+  Preserve register contents, method counts and partial-upload semantics.
+- Share GPU completion queries only where no intervening guest GPU work exists.
+  Retain each semaphore slot's latest value until its completion query succeeds.
+  Draws, clears, transform launches and flips advance the completion position.
+  This prevents duplicate signals from exhausting the 64-query pool.
+
+Offline hardware comparison, 32770 small queued draws with unchanged constants:
+Before: 404.954 ms submission, 131080 maps, 137634000 uploaded bytes.
+After:  255.055 ms submission, 65542 maps, 11276736 uploaded bytes.
+About 37% less submission time, 50% fewer maps, 92% fewer uploaded bytes.
+This is a component workload, not a measurement of gameplay FPS.
+
+Validation: 181 rendering cases pass on RTX 5060 Ti and WARP with no D3D11
+messages. All 158 comparable before/after PNGs have identical SHA-256 hashes.
+4098 fence requests spanning new GPU work use 3 queries with no pool-capacity
+waits; all 24 semaphore words have the expected final values on both devices.
+Hidden window/presentation checks pass without booting the game.
+Reports: build/checks/perf-opt-render-before, perf-opt-render-after,
+perf-opt-render-warp, perf-opt-window.png.performance, perf-opt-inspect-final.
+The game was not booted for this batch. The following user recording measures
+its effect during gameplay.
+
+Primary interfaces:
+https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_map
+https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-flush
+
+Second recording - 2026-10-10
+
+Input: build/windows/Release/build/captures/performance-48161261900
+Same hardware and 60 Hz/1x/interpolation-off/VSync-on settings as above.
+The user supplied this as the repeat recording; its exact track is unconfirmed.
+13.499 s, 719 source-frame records; complete GPU coverage and no recorder limits.
+The native inspector accepted the binary; build/checks/perf-second-inspect.
+
+                                 First recording       Second recording
+Source interval median          23.117 ms               19.620 ms
+Source interval p99              30.842 ms               21.980 ms
+Source interval maximum          37.365 ms               23.952 ms
+Measured GPU spans median         7.807 ms                2.709 ms
+Measured GPU spans p99           14.858 ms                4.581 ms
+Working-set peak                530.0 MiB               255.9 MiB
+Private-memory peak             515.9 MiB               237.4 MiB
+
+Typical source intervals fell about 15%; the recording still misses 16.67 ms.
+Draw/vertex counts are similar: 954712/165231261 versus 952706/164747322.
+Normalize costs by source frames when comparing recordings of different length.
+Upload wall time fell from 4.663 to 0.838 ms per source-frame record.
+Guest time remains about 8.9 ms; GPU waits grew from 2.439 to 2.858 ms.
+Other second-recording costs: packets 2.674 ms, platform 1.645 ms, draws 1.135 ms,
+resources 0.548 ms per record. Main-thread CPU utilization is 94.5% of one core.
+No shader compilation or over-budget audio mix batches were recorded.
+These measured GPU spans exclude idle gaps and the settings overlay.
+
+Second optimization batch, original-byte evidence:
+- 0021B080 compares (issued - requested) with (issued - completed), unsigned.
+  Its completion word is *[002256C0+30], issued counter [002256C0+2C].
+  It returns for completed fences, and calls 0021AFD0 when requested == issued.
+- 0021AFD0 emits NV097 1D70 with that counter and advances it by two. Its
+  original compiled implementation remains responsible for fence insertion.
+  Native waiting formerly ignored the requested token and drained the GPU.
+- Query-pool exhaustion formerly also drained all pending completions instead
+  of freeing the oldest available slot. The new wait stops at its condition;
+  completion polling uses DONOTFLUSH after one explicit submission flush.
+- Push-buffer RAM is validated once per <=4 MiB submission. Header/payload
+  checks remain per packet, and scalar words use memcpy for unaligned input.
+- 0022EC59 combines listener/source dirty masks. Listener bits are low 7;
+  source bits are high 16. The listener's derived orientation at +44 is kept
+  when valid bit 40 is set. The native wrapper previously erased this state
+  and set both masks to FFFFFFFF on every voice calculation. It now retains
+  listener state and keeps source dirtiness in its original high word.
+  Position, velocity, orientation and factors are compared byte-for-byte;
+  new values still take effect immediately or on the original deferred commit.
+
+Analysis is bounded to those original function entries and verified target bytes.
+Reports: build/perf-second-fence.json, perf-second-fence-insert.json,
+perf-second-spatial.json. Indirect edges are explicitly unresolved in the first
+and third analysis reports; no new invented callback or CPU binding was added.
+Recording keeps its existing binary layout, splits GPU waits by reason, and
+identifies the running executable's PE link stamp instead of the compilation
+time of performance.cpp, which had stayed unchanged between earlier rebuilds.
+
+Additional primary interfaces:
+https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-getdata
+https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_async_getdata_flag
+
+Second-batch validation:
+- Release rebuilt successfully; no game boot or automated gameplay.
+- RTX 5060 Ti and WARP: 182/182 render cases, no D3D11 messages.
+  All 160 comparable first-batch PNGs have identical SHA-256 hashes.
+- 130 ordered clear/fence completion points cross the 32-bit counter boundary
+  and the 64-query pool limit. Waiting for a requested/old token creates no
+  extra query; the final completion word and blue target image match.
+- 54 spatial checks pass, including exact cold/reused SDK output comparisons
+  across all listener fields, source modes, mutable curves and environment.
+  All 31 original listener-binding checks and 44 native audio checks pass.
+  The 1000-call fixed-state microcase was 4.630 ms before and 4.370-5.126 ms
+  after. It does not establish a sound-service timing gain in gameplay.
+- Native recorder checks, the existing recording's binary inspection and the
+  hidden window/presentation/performance-capture checks pass.
+Reports: build/checks/perf-second-render, perf-second-render-warp,
+perf-second-spatial-after, perf-second-audio, perf-second-recorder,
+perf-second-inspect-final and perf-second-window.png.performance.
+Next: a manual F9 recording in the same race/settings must measure this batch's
+real frame-time effect and distinguish GPU polling, capacity and requested waits.
+
+Third recording / regression - 2026-10-10
+
+Input: build/windows/Release/build/captures/performance-48963045700
+Same hardware and 60 Hz/1x/interpolation-off/VSync-on settings as above.
+The user suspects a regression; the exact scene is unconfirmed.
+Executable: PE 6ACA66DA, image 55316480 bytes.
+19.718 s, 731 source-frame records; complete GPU coverage and no recorder limits.
+Native inspection: build/checks/perf-third-inspect.
+
+                                 Second recording       Third recording
+Source interval median          19.620 ms               27.231 ms
+Source interval p99              21.980 ms               30.914 ms
+Source interval maximum          23.952 ms               34.341 ms
+Measured GPU spans median         2.709 ms                2.595 ms
+Measured GPU spans p99             4.581 ms               12.724 ms
+Working-set peak                255.9 MiB               205.3 MiB
+Private-memory peak             237.4 MiB               189.9 MiB
+
+Per source-frame record, guest time is unchanged (8.895 -> 8.888 ms).
+Packet processing improves (2.674 -> 1.984 ms), but GPU-wait wall time grows
+2.858 -> 11.476 ms. The full idle operation runs 85643 times, about 117 per
+frame, taking 8398.133 ms. Similar draws/vertices, no shader compilation,
+no audio budget overruns, and no capture IO explain the frame-time regression.
+
+Root cause: NV097 WAIT_FOR_IDLE (method 0110) was implemented as a D3D11 event
+query plus a blocking CPU wait. Changing completion polling to DONOTFLUSH
+preceded the increase in wait time; its driver cost was not measured separately.
+This push-buffer method orders GPU work;
+it does not ask the submitting CPU to wait. The bridge uses a single immediate
+context, with ordered native draws/copies and owned uploads, so queued draws
+must be submitted before the next method, without a CPU completion query.
+CPU-visible semaphore releases, SDK requested fences, transform-result readback
+and explicit CPU-idle requests retain their actual completion mechanisms.
+The bounded query pool and requested-counter fixes remain in place.
+
+Evidence: xemu's NV097 WAIT_FOR_IDLE handler updates the rendering surface and
+does not invoke its CPU-side fence/wait mechanism. Microsoft specifies that
+UpdateSubresource snapshots its CPU source before returning, including when
+prior GPU work still uses the resource. Our dynamic vertex/index arena appends
+unused space, or discards at wrap, preserving in-flight uploads. The bridge's
+flush() snapshots queued guest vertices/constants into these native buffers.
+All rendering and framebuffer/texture copies use the same immediate context.
+These are GPU interface references, not gameplay visual references.
+https://github.com/xemu-project/xemu/blob/master/hw/xbox/nv2a/pgraph/pgraph.c
+https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-updatesubresource
+https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_map
+
+Reports now show every recorded GPU-wait reason in JSON and the text report,
+including small operations omitted from the top 32 hot operations. Existing
+binary captures remain readable; the recorder's binary layout is unchanged.
+
+Third-batch validation:
+- Release rebuilt successfully. No game boot or automated gameplay.
+- RTX 5060 Ti and WARP: 183/183 render cases, no D3D11 messages.
+  All 164 comparable second-batch PNGs have identical SHA-256 hashes.
+- 1024 partial clears interleaved with WAIT_FOR_IDLE preserve all 64 red/blue
+  rows, use only the one requested semaphore query, and incur no pool waits.
+  CPU submission is 5.433 ms on RTX and 8.793 ms on WARP. These are component
+  timings, not before/after gameplay FPS. Explicit CPU idle still adds its own
+  query; the real semaphore publishes only on completion.
+- The 130 ordered clear/fence points retain exactly 130 semaphore queries with
+  intervening GPU barriers, cross the 64-query pool and 32-bit counter boundary,
+  and preserve the final completion word and blue image.
+- Barriers also run after queued draws and between cubemap face writes;
+  reflection, framebuffer-feedback and shadow cases retain identical images.
+- Native recorder checks and binary inspection of the first and third captures
+  pass. The third capture contains two wait buckets: GPU idle 85643 calls /
+  8398.133 ms; completion polling 3041 calls / 1.900 ms. Other wait types were
+  absent, explaining why optimizing requested fences did not improve this run.
+- Hidden window/presentation/performance-capture checks pass without booting.
+  All 54 tracked worker records were audited; no owned processes remain.
+Reports: build/checks/perf-third-render, perf-third-render-warp,
+perf-third-recorder, perf-third-inspect-final, perf-third-inspect-legacy and
+perf-third-window.png.performance.
+Next: repeat the same manual race/settings and record with F9 to establish
+gameplay frame times after removing the repeated CPU round trips.
+
+Fourth recording / GPU-stall fix confirmed - 2026-10-10
+
+Input: build/windows/Release/build/captures/performance-44328897300
+Same Ryzen 5 5600X / RTX 5060 Ti and 60 Hz/1x/interpolation-off/VSync-on settings.
+The user supplied this as the next repeat recording; exact scene unconfirmed.
+Executable: PE 6ACA6DD6, image 55316480 bytes.
+12.017 s, 705 source-frame records (704 eligible complete intervals).
+Native inspection passes: build/checks/perf-fourth-inspect. No owned workers
+remain. All GPU frames are complete; no capture IO, recorder limit hits,
+gameplay shader compilation or audio mix budget overruns.
+
+                                 Third recording        Fourth recording
+Source interval median          27.231 ms               16.703 ms
+Source interval p99              30.914 ms               19.230 ms
+Source interval maximum          34.341 ms               21.549 ms
+Work wall time median           27.167 ms               15.755 ms
+Work wall time p99               30.838 ms               19.166 ms
+Measured GPU spans median         2.595 ms                4.040 ms
+Measured GPU spans p99           12.724 ms                5.566 ms
+GPU wait per frame record        11.476 ms                0.003 ms
+Working-set peak                205.3 MiB               204.6 MiB
+Private-memory peak             189.9 MiB               187.5 MiB
+
+The typical interval improves about 39% from the regressed run, and about 15%
+from the previous best 19.620 ms recording. Frame volume remains comparable:
+1321 draws/228612 vertices per third-recording frame versus 1321/228433 now.
+GPU idle waits disappear entirely. Only completion polling remains, 3083 calls
+and 2.216 ms over the entire recording. Logical fence requests drop from 87719
+to 2114 across recordings of different length; about 120 -> 3 per frame record.
+
+The 704 complete source intervals average 58.632 FPS. Intentional pacing now
+consumes 1045.700 ms; typical work fits the 16.667 ms budget, but sustained
+60 FPS is not established. 289/704 frames exceed that work budget, 105 exceed
+18 ms of work, and two source intervals exceed 20 ms. A paced 16.703 ms median
+alone is not sufficient to claim a locked frame rate.
+
+Remaining main-thread costs per frame record: compiled guest code 9.221 ms,
+GPU packets 1.950 ms, platform services 1.754 ms, draws 1.125 ms, buffer uploads
+0.808 ms and resources 0.544 ms. Main-thread CPU utilization is 87.5% of one
+core. GPU spans have headroom; the remaining over-budget frames have heavier
+main-thread work. Under-budget frames average 1172 draws and 8.409 ms of guest
+time; over-budget frames average 1533 draws and 10.417 ms of guest time.
+The worst frame has 1530 draws, 10.843 ms guest, 4.302 ms platform, 2.941 ms
+packets and 5.960 ms measured GPU spans. These show workload correlation,
+not precise original-function costs. Cooperative checkpoint addresses remain
+hints; no new native SDK binding or speculative CPU change is justified by
+those sample counts alone. No runtime change or rebuild was needed to verify
+this recording. Additional scene coverage and focused CPU profiling remain
+necessary before claiming the performance target across modes.
+
+2026-10-10: remaining CPU work, static floating-point blocks
+
+The fourth recording's checkpoint hints include 227C14 and 227C7B inside the
+original SDK matrix routine 227BD9. Original generation called a MASM helper
+for every x87 instruction and rewrote floating provenance from C++ each time.
+These hints locate a candidate; their sample counts are not function timings.
+
+The compiler now groups 4..32 consecutive ordinary x87 instructions into one
+native block, without crossing a branch target, integer instruction, control
+operation or CPU-flag comparison. It emits the same arithmetic opcodes and
+order, using validated native pointers in place of guest addressing. Each
+instruction still records its original address, opcode and memory provenance.
+Code remains entirely ahead of time. No added dependency, decoding, runtime
+compilation, mathematical replacement or heap allocation is involved in execution.
+Diagnostic execution retains the individual original compiled instructions.
+Failed memory preflight also takes that path, preserving earlier stores and
+the floating state at the fault. Scheduler checkpoint locations are unchanged.
+
+7392 blocks are emitted across the existing 36047-function native table.
+A small unfused copy of the original matrix routine supports offline comparison
+and timing. The checks cover 24/53/64-bit precision, four rounding modes, four
+input/output alias layouts, finite values, signed zero, infinity and NaN; plus
+invalid input/output boundaries. All 242 comparisons pass, including memory,
+integer registers/flags, return state, floating status/tags and provenance.
+
+Ryzen 5 5600X component timings, including call setup and output checksum:
+                         Fused             Unfused
+100000 matrix calls      300.473 ns/call   568.405 ns/call
+1000000 matrix calls     304.392 ns/call   573.426 ns/call
+Matching checksums in both runs; approximately 47% less matrix CPU time.
+This is a component result, not a measurement or prediction of gameplay FPS.
+
+Build: PE 6ACA7902, image 61521920 bytes, executable 61496320 bytes.
+The added static blocks increase the executable by 6208000 bytes; operand
+descriptors use bounded temporary stack space, with no new persistent buffer or
+per-frame heap allocation. Full static rebuild succeeds.
+745 recorded build-worker identities were checked after completion: none remain.
+
+Offline CPU validation passes: 52 game cases, 21976 instruction cases, 469 memory
+cases, 6482 floating cases and 109 control cases. Audio passes 44 cases; spatial
+sound passes 54 cases and the original listener binding checks pass 31 cases.
+The performance recorder check and reinspection of the fourth recording pass.
+Rendering passes all 183 cases on RTX 5060 Ti with no D3D11 warnings; all 165
+shared output PNGs match the preceding render run byte for byte.
+No game boot or computer use was performed. Repeat the same busy gameplay
+section at 60 Hz/1x/interpolation off to establish the actual frame-time change
+and identify any further bottleneck; a sustained 60 FPS claim still needs that
+manual capture and broader scene coverage.
+
+Fifth recording / static floating-point batching confirmed - 2026-10-10
+
+Input: build/windows/Release/build/captures/performance-44743569200
+Same Ryzen 5 5600X / RTX 5060 Ti, 60 Hz/1x/interpolation-off/VSync-on settings.
+Executable PE 6ACA7902, image 61521920 bytes matches the floating-block build.
+11.945 s, 717 frame records; the initial partial frame is excluded, leaving
+716 complete source intervals. Native binary inspection succeeds:
+build/checks/perf-fifth-inspect. The native tool exits successfully, with no
+owned worker remaining. All 717 GPU records are complete, with no missing
+spans, recorder limit hits, capture IO, shader compilation or audio overruns.
+Exact track remains unconfirmed. Comparisons use the supplied repeat recording
+and measured workload, rather than assuming identical gameplay.
+
+                                Fourth recording        Fifth recording
+Average complete-interval FPS    58.632                  60.017
+Source interval median          16.703 ms               16.667 ms
+Source interval p95             18.649 ms               17.606 ms
+Source interval p99             19.230 ms               17.953 ms
+Source interval maximum         21.549 ms               19.153 ms
+Work wall time mean             15.503 ms               14.766 ms
+Work wall time median           15.755 ms               15.136 ms
+Work wall time p99              19.166 ms               17.874 ms
+Guest code per complete frame    9.233 ms                8.505 ms
+Main thread, percent of a core  87.495%                 81.997%
+Working-set peak               204.6 MiB               204.4 MiB
+Private-memory peak            187.5 MiB               187.5 MiB
+Measured GPU spans median        4.040 ms                4.182 ms
+Measured GPU spans p99           5.566 ms                5.567 ms
+
+Average FPS uses eligible-frame count / sum of eligible source intervals.
+Work subtracts recorded pacing, scheduler idle and recorder overhead from each
+eligible interval, matching the native inspector's median and p99. This is
+main-thread wall time, not a per-function CPU measurement.
+
+Complete frames average 1320.49 -> 1319.93 draws and 228387 -> 228392 vertices;
+the workload is comparable. Guest wall time falls about 7.9% overall. Matching
+density bands also improve: below 1200 draws, 7.992 -> 7.421 ms guest time;
+1200..1499 draws, 9.013 -> 8.321 ms; at least 1500 draws, 10.403 -> 9.531 ms.
+The heavy band averages 1535.35 -> 1534.87 draws across 329 -> 334 frames.
+Its mean work drops 17.468 -> 16.461 ms, bringing the average below 16.667 ms.
+Cooperative checkpoint sample counts are still only hints, not function costs.
+
+Frames exceeding the 16.667 ms work budget drop 289/704 (41.1%) -> 131/716
+(18.3%); 130 of the remaining 131 are in the heavy band. Frames exceeding
+18 ms of work drop 105 -> 5, and intervals above 18 ms drop 108 -> 6. No new
+interval exceeds 20 ms (previously two). The slowest new frame has 1549 draws,
+19.055 ms work, 9.719 ms guest, 4.098 ms platform, 2.208 ms packet processing
+and 4.848 ms measured GPU spans. GPU waits remain about 0.003 ms/frame,
+entirely completion polling: 3135 calls / 2.254 ms across the recording.
+
+This confirms useful gameplay savings from the CPU batching and reaches a
+60 FPS average in the recorded scene without increased peak RAM. Heavy frames
+still occasionally miss the individual-frame budget; this is not evidence of
+locked 60 FPS in every frame or across other modes. No additional runtime change,
+build or test was needed to inspect the recording. Comparison detail is in the
+ignored build/perf-fifth-comparison.json; preserve the supplied private capture.

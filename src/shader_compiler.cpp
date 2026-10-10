@@ -72,12 +72,15 @@ std::string compile_shaders(const std::filesystem::path& executable,const std::f
         0x0033E618U,0x0033E8C0U,0x0033EA68U,0x0033EC70U,0x0033EED8U,0x0033F040U,0x0033F278U,
         0x0033F3F0U,0x0033F498U,0x0033F540U,0x0033F798U,0x0033FA78U};
     std::vector<StaticVertex> vertices;
+    constexpr std::array sdk_addresses{0x00223108U,0x002231C8U,0x00223278U};
     const auto add=[&](std::uint32_t address,unsigned count,bool launch) {
         if(!count || count>136) throw std::runtime_error("Invalid original shader length");
         const auto bytes=image.data(address,count*16);StaticVertex value{{},launch};
         for(unsigned slot=0;slot<count;++slot) for(unsigned word=0;word<4;++word) value.program.tokens[slot][word]=u32(bytes,slot*16+word*4);
         if(!(value.program.tokens[count-1][3]&1)) throw std::runtime_error("Original shader lacks its final marker at "+hex32(address));
         value.program=normalize_vertex_program(value.program);
+        for(unsigned i=0;i<sdk_addresses.size();++i) if(address==sdk_addresses[i] && value.program!=screen_vertex_programs()[i])
+            throw std::runtime_error("SDK screen-position metadata differs from original bytes at "+hex32(address));
         shader_binary(launch?ShaderKind::launch:ShaderKind::vertex,&value.program);
         if(std::ranges::none_of(vertices,[&](const StaticVertex& prior){return prior.launch==launch && prior.program==value.program;}))
             vertices.push_back(value);
@@ -87,7 +90,8 @@ std::string compile_shaders(const std::filesystem::path& executable,const std::f
         if(version!=0x2078) throw std::runtime_error("Original shader version changed at "+hex32(address));
         add(address+4,u16(header,2),false);
     }
-    add(0x00223108,12,false);add(0x002231C8,11,false);add(0x00223278,12,false);
+    constexpr std::array sdk_lengths{12U,11U,12U};
+    for(unsigned i=0;i<sdk_addresses.size();++i) add(sdk_addresses[i],sdk_lengths[i],false);
     std::ostringstream output;output<<"// Generated ahead of time from the verified XBE and native HLSL.\n#include \"shaders.h\"\n#include <stdexcept>\nnamespace b2 {namespace {\n";
     std::size_t total=0;
     for(unsigned i=0;i<unsigned(ShaderKind::count);++i) {

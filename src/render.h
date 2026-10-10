@@ -1,6 +1,7 @@
 #pragma once
 #include "file.h"
 #include "vertex_program.h"
+#include "performance.h"
 #include <array>
 #include <memory>
 
@@ -84,14 +85,20 @@ struct VertexStream { Bytes bytes;std::uint32_t stride; };
 
 struct RenderStats {
     std::uint64_t draws = 0, vertices = 0, shader_compilations = 0, vertex_bytes = 0;
+    std::uint64_t published_frames = 0, interpolated_frames = 0;
     double gpu_ms = 0;
     bool gpu_timing_valid = false;
+    PerfCounters counters{};
+};
+struct RenderResources {
+    std::uint64_t local=0,budget=0,shared=0,textures=0,targets=0,texture_bytes=0,target_bytes=0;
+    bool gpu_valid=false;
 };
 
 class Renderer {
 public:
     explicit Renderer(std::uint32_t width, std::uint32_t height,
-                      bool warp = false, bool debug = false);
+                      bool warp = false, bool debug = false,unsigned resolution_scale = 1);
     ~Renderer();
     Renderer(const Renderer&) = delete;
     Renderer& operator=(const Renderer&) = delete;
@@ -104,9 +111,14 @@ public:
     std::uint32_t copy_cubemap(const std::array<std::uint32_t,6>& faces,std::uint32_t destination=0);
     void copy_to_main();
     void resize(std::uint32_t width, std::uint32_t height);
+    void reset(unsigned resolution_scale); // New session: discard game targets/textures, retain native pipelines.
     void attach_window(void* native_window);
-    bool display(); // Scale the main image to the window and bind its overlay target.
+    void interpolation(bool enabled); // Allocate history only when explicitly enabled.
+    void publish_frame(bool reset = false); // Snapshot a completed game frame.
+    bool display(float phase = 1); // Scale the main image and bind its overlay target.
     void present(bool vsync);
+    void performance(Performance*); // Opt-in, bounded queries; never waits for results.
+    RenderResources resources() const;
     ID3D11Device* native_device() const;
     ID3D11DeviceContext* native_context() const;
     void prepare(const RenderState&); // Cached D3D11 states; shaders are built ahead of time.

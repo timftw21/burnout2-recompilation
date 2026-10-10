@@ -3,6 +3,37 @@
 #include <stdexcept>
 
 namespace b2 {
+std::span<const VertexProgram> screen_vertex_programs() {
+    // Original SDK records at 00223108, 002231C8 and 00223278. Match bytes,
+    // rather than decoding or guessing a shader's position convention at run time.
+    static constexpr auto programs=[] {
+        std::array<VertexProgram,3> result{};
+        constexpr std::array<std::array<std::uint32_t,4>,12> tokens{{
+            {0,0x0020001B,0x0836106C,0x2F100FF8},
+            {0,0x0420061B,0x083613FC,0x5011F818},
+            {0,0x0400001B,0x083613FC,0x2070F82C},
+            {0,0x0240081B,0x1436186C,0x2F20F824},
+            {0,0x0060201B,0x2436106C,0x3070F800},
+            {0,0x00200200,0x0836106C,0x2070F830},
+            {0,0x00200E1B,0x0836106C,0x2070F838},
+            {0,0x0020101B,0x0836106C,0x2070F840},
+            {0,0x0020121B,0x0836106C,0x2070F848},
+            {0,0x0020141B,0x0836106C,0x2070F850},
+            {0,0x0020161B,0x0836106C,0x2070F858},
+            {0,0x0020181B,0x0836106C,0x2070F861}
+        }};
+        for(unsigned i=0;i<tokens.size();++i) result[0].tokens[i]=tokens[i];
+        result[2]=result[0];result[2].tokens[2]={0,0x002008FF,0x0836106C,0x2070F828};
+        result[1].tokens[0]={0,0x022000AA,0x0836086C,0x201FF828};
+        result[1].tokens[1]={0,0x0020081B,0x0836106C,0x2070F820};
+        result[1].tokens[2]=tokens[1];result[1].tokens[3]=tokens[6];
+        result[1].tokens[4]={0,0x0240021B,0x14361800,0x2F20F834};
+        result[1].tokens[5]=tokens[4];
+        for(unsigned i=6;i<11;++i) result[1].tokens[i]=tokens[i+1];
+        return result;
+    }();
+    return programs;
+}
 namespace {
 unsigned bits(std::uint32_t value,unsigned first,unsigned count) { return (value>>first)&((1U<<count)-1); }
 std::string lanes(unsigned mask) {

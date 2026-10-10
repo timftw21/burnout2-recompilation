@@ -144,9 +144,10 @@ float4 main(P p):SV_Target {
 }
 ID3DBlob* shader_blob(ShaderKind kind) {return new ShaderBlob(shader_binary(kind).bytes);}
 const char* shader_profile(ShaderKind kind) {
-    if(kind==ShaderKind::launch) return "cs_5_0";
+    if(kind==ShaderKind::launch || kind==ShaderKind::flow_estimate || kind==ShaderKind::flow_cut) return "cs_5_0";
     if(kind==ShaderKind::clear_pixel || kind==ShaderKind::display_pixel || kind==ShaderKind::gui_pixel ||
        (kind>=ShaderKind::combiner0 && kind<=ShaderKind::combiner8) ||
+       kind==ShaderKind::flow_luma || kind==ShaderKind::flow_interpolate ||
        (kind>=ShaderKind::color && kind<=ShaderKind::modulate3d)) return "ps_5_0";
     return "vs_5_0";
 }
@@ -181,6 +182,69 @@ P main(uint id:SV_VertexID) {P o;o.uv=float2((id<<1)&2,id&2);o.p=float4(o.uv*flo
     case ShaderKind::display_pixel:return R"(
 Texture2D image:register(t0);SamplerState filter:register(s0);
 float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target{return image.Sample(filter,uv);})";
+    case ShaderKind::flow_luma:return R"(
+Texture2D image:register(t0);SamplerState filter:register(s0);
+float main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target {
+ float2 d=float2(0.25/160,0.25/120);
+ float3 c=(image.Sample(filter,uv+d).rgb+image.Sample(filter,uv-d).rgb+
+  image.Sample(filter,uv+float2(d.x,-d.y)).rgb+image.Sample(filter,uv+float2(-d.x,d.y)).rgb)*0.25;
+ return dot(c,float3(0.299,0.587,0.114));})";
+    case ShaderKind::flow_estimate:return R"(
+Texture2D<float> source:register(t0),destination:register(t1);
+Texture2D<float4> coarse:register(t2);RWTexture2D<float4> motion:register(u0);SamplerState filter:register(s0);
+cbuffer C:register(b0){float phase;uint level;uint first;uint spare;}
+[numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID) {
+ uint width,height;motion.GetDimensions(width,height);if(id.x>=width || id.y>=height) return;
+ float2 size=float2(width,height),step=1/size,uv=(float2(id.xy)+0.5)*step;
+ float2 v=first?float2(0,0):coarse.SampleLevel(filter,uv,0).xy;
+ float residual=0,energy=0,bestResidual=1e9,bestEnergy=0,relaxation=1;float2 best=v;
+ [loop] for(uint iteration=0;iteration<6;iteration++) {
+  float a=0.0005,b=0,c=0.0005;float2 rhs=0;residual=0;energy=0;
+  [unroll] for(int y=-2;y<=2;y++) [unroll] for(int x=-2;x<=2;x++) {
+   float2 p=uv+float2(x,y)*step,q=p+v;
+   float s=source.SampleLevel(filter,p,level),d=destination.SampleLevel(filter,q,level),error=d-s;
+   float2 g=0.5*float2(destination.SampleLevel(filter,q+float2(step.x,0),level)-destination.SampleLevel(filter,q-float2(step.x,0),level),
+    destination.SampleLevel(filter,q+float2(0,step.y),level)-destination.SampleLevel(filter,q-float2(0,step.y),level));
+   float weight=1/(1+abs(error)*8);a+=weight*g.x*g.x;b+=weight*g.x*g.y;c+=weight*g.y*g.y;
+   rhs-=weight*g*error;residual+=abs(error);energy+=dot(g,g);
+  }
+  // Keep measured candidates: the last Newton step has not yet been evaluated.
+  // Back off a step that worsens the match instead of warping with false confidence.
+  if(residual<=bestResidual) {best=v;bestResidual=residual;bestEnergy=energy;}
+  else {v=best;relaxation*=0.5;continue;}
+  float determinant=a*c-b*b;
+  float2 delta=float2(c*rhs.x-b*rhs.y,a*rhs.y-b*rhs.x)/max(determinant,1e-8);
+  v=clamp(v+clamp(delta,-1.5,1.5)*step*relaxation,-0.25,0.25);
+ }
+ v=best;float confidence=saturate(1-bestResidual/(25*0.12))*saturate(bestEnergy/0.002);
+ if(any(uv+v<0) || any(uv+v>1)) confidence=0;
+ motion[id.xy]=float4(v,confidence,bestResidual/25);
+})";
+    case ShaderKind::flow_cut:return R"(
+Texture2D<float> previous:register(t0),current:register(t1);Texture2D<float4> motion:register(t2);
+RWTexture2D<float> cut:register(u0);SamplerState filter:register(s0);groupshared float2 differences[256];
+[numthreads(16,16,1)] void main(uint3 id:SV_GroupThreadID,uint index:SV_GroupIndex) {
+ float2 uv=(float2(id.xy)+0.5)/16;float p=previous.SampleLevel(filter,uv,0);
+ float raw=abs(current.SampleLevel(filter,uv,0)-p);
+ float warped=abs(current.SampleLevel(filter,uv+motion.SampleLevel(filter,uv,0).xy,0)-p);
+ differences[index]=float2(raw,warped);GroupMemoryBarrierWithGroupSync();
+ [unroll] for(uint stride=128;stride>0;stride>>=1) {if(index<stride) differences[index]+=differences[index+stride];GroupMemoryBarrierWithGroupSync();}
+ if(index==0) cut[uint2(0,0)]=(differences[0].x>256*0.20 && differences[0].y>256*0.15)?1:0;
+})";
+    case ShaderKind::flow_interpolate:return R"(
+Texture2D previous:register(t0),current:register(t1);Texture2D<float4> forward:register(t2),backward:register(t3);
+Texture2D<float> cut:register(t4);SamplerState filter:register(s0);
+cbuffer C:register(b0){float phase;uint level;uint first;uint spare;}
+float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target {
+ float4 latest=current.Sample(filter,uv);if(cut.Load(int3(0,0,0))>0.5) return latest;
+ float2 a=uv,b=uv;
+ [unroll] for(uint i=0;i<3;i++) {a=uv-phase*forward.SampleLevel(filter,a,0).xy;b=uv-(1-phase)*backward.SampleLevel(filter,b,0).xy;}
+ float4 f=forward.SampleLevel(filter,a,0),r=backward.SampleLevel(filter,b,0);
+ if(any(a<0)||any(a>1)||any(b<0)||any(b>1)||min(f.z,r.z)<0.2 || length((f.xy+r.xy)*float2(160,120))>1.5) return latest;
+ float4 old=previous.Sample(filter,a),next=current.Sample(filter,b);
+ if(dot(abs(old.rgb-next.rgb),float3(0.299,0.587,0.114))>0.12) return latest;
+ return lerp(old,next,phase);
+})";
     default:throw std::runtime_error("Shader source requires a vertex program or the pinned GUI backend");
     }
 }

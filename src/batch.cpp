@@ -96,6 +96,16 @@ Batch recompile_batch(Xbe& image, std::span<const std::uint32_t> seeds,
             unit.calls.erase(std::unique(unit.calls.begin(), unit.calls.end()), unit.calls.end());
             auto lowered = lower(function);
             unit.source = std::move(lowered.source);
+            // A small unfused reference for the matrix routine sampled in races.
+            // Offline diagnostics compare identical original instructions, not a
+            // replacement mathematical formula or a different precision model.
+            if(function.entry==0x00227BD9) {
+                auto reference=lower(function,false);
+                const auto name=reference.source.find("void guest_00227BD9(");
+                if(name==std::string::npos || !reference.issues.empty()) throw std::runtime_error("Matrix reference lowering failed");
+                reference.source.replace(name,std::string_view("void guest_00227BD9(").size(),"void reference_matrix(");
+                unit.source+=reference.source;
+            }
             unit.native_helpers=std::move(lowered.native_helpers);
             unit.floating=lowered.floating;
             unit.native_api=std::move(lowered.native_api);

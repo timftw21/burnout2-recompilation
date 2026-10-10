@@ -80,6 +80,12 @@ CPU, loader and original startup
 CPU checks use native instruction references, original helpers, memory overlap
 and alignment, floating state, TLS and fixed dispatch. Direct native calls retain
 guest floating state; host services suspend it. Helper benchmarks are not FPS.
+Consecutive x87 calculations compile into native instruction blocks, preserving
+the original precision, order and floating exception state. Blocks stop at
+branches and control operations; diagnostics and invalid memory retain the
+individual compiled instructions. The CPU matrix check compares results and
+state against unfused original code across rounding modes and overlapping
+inputs. --bench-cpu reports both versions' timings and matching checksums.
 Image checks also replay the original Crash-mode UI queue for empty, full and
 partial bars, checking the compiled callback, vertices, colours and return stack
 without booting. The user confirmed that Crash mode loads after the missing
@@ -211,10 +217,11 @@ Prepare resources before submission. Readback is an explicit offline operation.
 The native tool retains its shader compiler for standalone component diagnostics.
 For shader-bank research, use b2-tool compile-shaders XBE OUTPUT.cpp --replace.
 
-The component suite passed 158 cases on RTX 5060 Ti and WARP with no D3D11
+The component suite passed 183 cases on RTX 5060 Ti and WARP with no D3D11
 warnings, including relocated vertex programs, unused instruction slots and
 mapped alpha output, linear surface coordinates, XRGB/ARGB alpha kill and
-GPU cubemap face updates, shadow clear aliases and distant texture sampling.
+GPU cubemap face updates, shadow clear aliases, distant texture sampling,
+scaled UI alignment and repeated framebuffer copies/fades at 1x through 4x.
 Components do not establish scene parity or game FPS. Remaining graphics
 work includes fixed lighting, other dependent texture modes and scene verification.
 Fixed transforms support all seven skin modes, transformed/normalized normals,
@@ -233,16 +240,47 @@ The native RenderWare reader rendered all 120 global.dic and 80 frontend.dic
 textures. Compare aligned original Xbox video screenshots; record source,
 timestamp and viewpoint. Asset rendering alone is not frame parity.
 
-SDL3 input supports Xbox gamepads and keyboard controls; 47 offline checks passed.
+SDL3 input supports Xbox gamepads and custom keyboard controls. Offline checks
+cover remapping, cleared bindings, stick directions and unchanged gamepad input.
 The executable opens an SDL3 window with persistent Dear ImGui settings in General,
 Audio, Graphics and Controls tabs. Esc toggles settings; F1 remains an alias.
 General selects the presentation limit, defaulting to 60 Hz independently of the
-monitor. Absolute SDL3 deadlines cap frames with or without V-sync; stalls and
-rate changes reset the schedule. The original Xbox video clock remains 60 Hz.
-Audio controls master volume and mute through SDL3's output gain; Graphics has
-V-sync and fullscreen, and Controls has keyboard input and a key reference.
-Settings are saved in data/local/settings.cfg. Hidden window diagnostics use
-defaults and check all four tabs, Esc and 60/120 Hz pacing without booting.
+monitor, and has interpolation and frame-rate counter toggles. Selecting a rate
+above 60 Hz enables interpolation; selecting 60 Hz or lower disables it. Manual
+opt-outs survive save/load until another rate is selected. Original frames have
+a separate 60 Hz limit. Absolute SDL3 deadlines avoid catch-up bursts after stalls
+or rate changes; guest video stays at 60 Hz.
+The scheduler presents additional images while servicing events/input between
+original frames. V-sync can still limit presentation to the physical display.
+Audio controls master volume and mute through SDL3's output gain. Graphics has
+V-sync, fullscreen and internal resolution (1x-4x).
+Resolution scales colour/depth/feedback targets and raster/scissor rectangles;
+guest coordinates, texture addresses and gameplay are unchanged. Vertex mapping
+keeps the host half-pixel origin independent of scale. Targets are created at
+the selected scale when starting a game; changes during play require
+a new game session or app restart. Diagnostic readback storage is allocated only
+on request. The render-target budget accounts for scale and stays bounded.
+The FPS overlay measures display and original-game frames separately over half
+a second and is drawn at window resolution, after interpolation.
+Controls allows a key per action, clearing bindings and restoring defaults.
+Esc cancels an active key change; Esc/F1/F8/F9 remain reserved for the interface.
+Settings, including scancodes, are saved in data/local/settings.cfg.
+
+Interpolation is a D3D11 image pass, inactive at the default 60 Hz. It stores two
+completed frames, estimates motion in both directions with four fixed-size
+luminance levels, then warps them to the requested time. Weak/inconsistent motion and new
+occlusions retain current pixels; scene changes and long gaps reset continuity.
+ImGui is drawn afterwards. The additional display delay is about one source
+frame. This improves presentation smoothness without raising gameplay speed;
+occlusions/fast movement can still produce artifacts. All shaders compile during
+the build, and disabling the feature avoids history copies and motion passes.
+Hidden window diagnostics check saved/invalid bindings and settings, automatic
+interpolation selection and saved opt-outs, the counter, all four tabs, Esc,
+scaled targets, 60/120 Hz pacing, 60 Hz source frames at 120/144 Hz
+presentation, translated images, endpoints, stationary HUD, new occlusions,
+scene cuts and history reset. They export images and component GPU timing without
+booting. These measurements do not establish gameplay FPS or visual parity.
+Live logs report source FPS separately from presented FPS and generated frames.
 F8, or Capture frame in Graphics, records the next complete GPU frame under
 build/captures. It exports target images and streaming draws.jsonl records with
 the original registers, shader tokens, constants and bounded vertex prefixes,
@@ -262,6 +300,76 @@ Use a fresh output directory. report.json shows source, routed and processed
 signal levels, controls and failures; scene.wav replays two seconds of the saved
 scene with frozen controls, before master volume. It does not replay game events.
 GPU captures are opt-in, bounded to 1024 draws/32 MiB, and report truncation explicitly.
+
+Performance recording
+
+Press F9 during play to start, reproduce the slowdown, then press F9 again to
+save. Graphics / Performance diagnostics has the same controls. Recording stops
+and saves after 60 seconds or at game exit. F8 also saves the current recording
+alongside the frame/audio capture. performance-* folders contain performance.bin,
+performance.json and a short performance.txt, under the usual build/captures path.
+
+Recording measures exclusive main-thread wall time for guest code, kernel and
+platform services, GPU command processing, drawing, buffer/texture uploads,
+resource preparation, GPU waits, publication, display/interpolation, Present,
+UI, pacing and scheduler idle. It records source-frame intervals and counters
+for draw/vertex volume, uploads, cache misses, copies, packets, fences and
+presented/generated frames. Intentional pacing, scheduler idle and recorder
+overhead are separated from work; frame/audio capture stalls are marked and
+excluded from frame-percentile summaries. Service callbacks retain their parent
+service category. CPU wall time includes host scheduling delays.
+
+Guest checkpoints are sampled cooperatively at most once per millisecond;
+original addresses and guest thread IDs guide bounded code analysis. They are
+not per-function CPU timings. Twice per second, Windows resource samples record
+process/main-thread CPU time, working set, private memory, page faults, handles,
+I/O totals, resource counts and the process's local/shared GPU memory usage and
+budget. Validity flags preserve unavailable measurements. Audio mix batches have
+separate atomic elapsed-time and budget-overrun counters.
+
+GPU timestamps sum nonoverlapping render, copy/resource and display/interpolation
+spans, excluding idle gaps and the ImGui overlay. An opt-in pool of eight frames
+with 64 spans each avoids waits/flushes for timing; missing spans, invalid clocks
+and results still pending at save are explicit. Normal play allocates no recorder
+or extra timing pool and performs no sampling or per-frame disk writes.
+Recorder capacity is 4096 source frames, 65536 checkpoint samples, 128 resource
+samples and 2048 operation buckets; bound hits are reported.
+
+Offline inspection and focused recorder validation require no game boot:
+
+& .\build\windows\Release\b2-tool.exe inspect-performance CAPTURE/performance.bin build/checks/performance-report
+& .\build\windows\Release\b2-tool.exe check-performance build/checks/performance
+
+Use fresh output directories. Inspection rejects unsupported layouts, truncation
+and oversized input before allocating bounded storage. Hidden window checks also
+exercise source/display recording and nonblocking GPU result association.
+Recorded CPU/GPU model, executable link stamp and display settings identify each run.
+Component checks and instrumentation do not establish gameplay performance.
+
+Dynamic vertex/index uploads append to unused buffer space and discard only
+when wrapping, preserving in-flight draws. Identical shader constants reuse
+their previous upload. Complete shader-upload packets copy in bounded blocks;
+partial uploads retain their original lane/load-index behavior. Semaphore writes
+at the same guest GPU command position share an event query, with separate
+completion points for subsequent draws, clears, launches and flips. Offline
+checks cover buffer wrapping, current attributes, shader-bank uploads and a
+4096-write semaphore burst. Requested SDK fences wait only for their semaphore
+value, using the original unsigned counter comparison across wraparound; an
+already completed fence returns immediately. Query-pool capacity waits retire
+only enough work to free a slot. Recording separates completion polling,
+capacity waits, requested fences and full CPU-requested GPU-idle waits. Every
+wait reason appears in the report, even below the hot-operation list's cutoff.
+NV097 WAIT_FOR_IDLE submits queued draws in GPU order without stopping the CPU;
+CPU-visible semaphores and explicit idle requests retain completion queries.
+An offline 1024-barrier workload checks ordered output and one requested
+semaphore, without creating completion queries for the GPU barriers.
+Push-buffer RAM is validated once per bounded submission, with packet boundaries
+still checked.
+The original audio calculator retains derived listener orientation between
+sources; moving listeners and immediate/deferred settings remain effective.
+research/performance.txt records measured optimization batches; repeat gameplay
+captures are still needed to establish sustained 60 FPS.
+
 Live execution reaches the original Press START, Load/Save and Single Player menus
 and the first driving lesson.
 Original sound-device creation now opens SDL3 audio. Boot uploads and replaces
