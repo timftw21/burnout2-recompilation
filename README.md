@@ -3,8 +3,13 @@
 An unofficial Windows version of the original Xbox game, focused on fast gameplay
 and preserving its look and feel.
 
-<i>Still in development: menus and driving lessons work. The rest of the
+<i>Still in development: While gameplay is quite stable, the rest of the
 game is still being tested.</i>
+
+## AI Disclosure
+
+Yes, AI was used in the development of this project. No, this project was not blindly thrown together.
+If you're skeptical, I implore you to try the recompilation for yourself. I take quality control quite seriously!😊
 
 ## What's new in 1.1
 
