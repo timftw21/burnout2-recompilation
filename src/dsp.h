@@ -7,6 +7,9 @@ namespace b2 {
 // Native state used by the ahead-of-time effect functions. No program decoder is
 // present in the player; generated functions access registers and samples directly.
 struct Dsp {
+    // A frame's continuous controls span 800 samples at the native 48 kHz
+    // mix rate. API readback still exposes the committed target immediately.
+    static constexpr unsigned coefficient_capacity=128,coefficient_blocks=25;
     std::array<std::uint32_t,6144> x{};
     std::array<std::uint32_t,64> registers{};
     std::array<std::int64_t,2> accumulators{};
@@ -15,6 +18,8 @@ struct Dsp {
     std::uint64_t transferred_words=0;
     std::uint32_t work_remaining=100000,active_effect=0;
     bool negative=false,zero=false,overflow=false;
+    std::array<std::uint32_t,coefficient_capacity> coefficient_origins{};
+    std::array<std::uint8_t,coefficient_capacity> coefficient_remaining{};
 
     explicit Dsp(const EffectsImage&);
     static std::int32_t signed24(std::uint32_t value) {return static_cast<std::int32_t>(value<<8)>>8;}
@@ -23,6 +28,9 @@ struct Dsp {
     void write(unsigned,std::uint32_t);
     std::uint32_t load(std::uint32_t);
     void store(std::uint32_t,std::uint32_t);
+    void parameter(std::uint32_t address,std::uint32_t value,bool continuous);
+    std::uint32_t coefficient(unsigned index) const;
+    void advance_coefficients();
     std::uint32_t ea(unsigned index,unsigned mode);
     std::int64_t operand(unsigned);
     void add(unsigned,std::int64_t,bool subtract=false,bool save=true);
@@ -42,6 +50,7 @@ private:
 };
 // Supplied by b2-tool's bounded, native build-time generator.
 bool compiled_effects_match(const EffectsImage&);
+std::span<const std::uint32_t> compiled_effect_coefficients();
 void run_effect(Dsp&,unsigned index);
 std::string check_effects(const std::filesystem::path&);
 }

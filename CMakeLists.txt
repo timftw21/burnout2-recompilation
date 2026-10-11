@@ -1,5 +1,5 @@
-cmake_minimum_required(VERSION 3.28)
-project(burnout2 VERSION 1.1.0 LANGUAGES C CXX)
+cmake_minimum_required(VERSION 4.2)
+project(burnout2 VERSION 1.2.0 LANGUAGES C CXX)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "The initial target is Windows x64.")
@@ -67,6 +67,12 @@ if(B2_XBE)
         message(FATAL_ERROR "B2_XBE does not exist; extract default.xbe with b2-tool first.")
     endif()
     enable_language(ASM_MASM RC)
+    # MASM uses legacy path encoding; relative inputs also work in Unicode folders.
+    foreach(assembly IN ITEMS src/cpu_floating.asm src/cpu_reference.asm)
+        file(RELATIVE_PATH assembly_input "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/${assembly}")
+        set_source_files_properties("${assembly}" PROPERTIES VS_SETTINGS
+            "CommandLineTemplate=ml64.exe /c [AllOptions] [AdditionalOptions] /Ta\"${assembly_input}\"")
+    endforeach()
     foreach(option IN ITEMS SDL_SHARED SDL_TEST_LIBRARY SDL_TESTS SDL_EXAMPLES SDL_INSTALL SDL_GPU SDL_RENDER SDL_OPENGL SDL_OPENGLES SDL_VULKAN)
         set(${option} OFF CACHE BOOL "" FORCE)
     endforeach()
@@ -76,6 +82,8 @@ if(B2_XBE)
         URL_HASH SHA256=48E15CF1A6928453D77AFA955D1FDFBBCA9169E2BC3D76D111ACB9B8BB076D66
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
     FetchContent_MakeAvailable(sdl3)
+    # Keep non-ASCII installation paths out of CMake's ANSI-encoded MSVC PCH header.
+    set_property(TARGET SDL3-static PROPERTY PRECOMPILE_HEADERS "<SDL_internal.h>")
     FetchContent_Declare(imgui
         URL https://github.com/ocornut/imgui/archive/f1cc2ae15e53a861a874c3034aae6798fde194ab.tar.gz
         URL_HASH SHA256=F30BE7F3E2136615B1848A9AFB72F6DFD8A60820DDF1C1A85997BF3B722E7CFC
@@ -159,6 +167,12 @@ if(B2_XBE)
     endforeach()
     configure_file(cmake/cpu-seeds.txt.in generated/cpu-seeds.txt @ONLY)
     set(native_cpu "${CMAKE_CURRENT_BINARY_DIR}/generated/$<CONFIG>/native_cpu.cpp")
+    # MASM does not create nested object directories on a fresh Visual Studio build.
+    foreach(config IN LISTS CMAKE_CONFIGURATION_TYPES)
+        set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/generated/${config}/native_cpu.cpp.asm"
+            PROPERTIES OBJECT_NAME native_cpu_assembly VS_SETTINGS
+            "CommandLineTemplate=ml64.exe /c [AllOptions] [AdditionalOptions] /Ta\"generated/${config}/native_cpu.cpp.asm\"")
+    endforeach()
     set(native_shards "")
     foreach(index RANGE 0 511)
         if(index LESS 10)

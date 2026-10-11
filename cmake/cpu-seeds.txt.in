@@ -80,8 +80,6 @@ table 0x00223428 0x002234A0
 # Thread entry from E2555; original CRT table bounds from E64E6/E653E.
 0x000E24E1
 0x000E682C
-# Original timer callback supplied to KeInitializeDpc by E6C26.
-0x000E6C14
 table 0x002CD660 0x002CD66C
 table 0x002E98F8 0x002E990C
 # Original startup callback table read by E0254 (one null, one function).

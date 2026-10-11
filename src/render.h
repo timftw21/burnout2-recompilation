@@ -115,8 +115,8 @@ public:
     void attach_window(void* native_window);
     void interpolation(bool enabled); // Allocate history only when explicitly enabled.
     void publish_frame(bool reset = false); // Snapshot a completed game frame.
-    bool display(float phase = 1); // Scale the main image and bind its overlay target.
-    void present(bool vsync);
+    bool display(float phase = 1,bool wait = true); // Scale the main image when a window buffer is available.
+    bool present(bool vsync,bool wait = true);
     void performance(Performance*); // Opt-in, bounded queries; never waits for results.
     RenderResources resources() const;
     ID3D11Device* native_device() const;

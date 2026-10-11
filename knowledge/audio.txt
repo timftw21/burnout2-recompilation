@@ -769,3 +769,93 @@ invalid:
     return invalid_call;
 }
 
+
+Fresh-start packet-stream investigation (2026-10-10)
+Verified target SHA256 B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+Burnout 1 tracks exist on the supported disc in music1/b1wma/01.wma..12.wma.
+Title C6190 calls C5710 -> XACT 20DD12 -> 20FB1E. XACT's original
+210853 calls DirectSoundStreamCreate 22F90E for streaming voices. The native
+DirectSound device previously supported buffers only; running the original
+stream factory instead reaches the uninitialized physical-audio SDK path.
+
+22F90E is stdcall(device, descriptor, output, aggregation), ret 10h;
+22F312 reads descriptor flags/+0, capacity/+4, format/+8, callback/+Ch,
+context/+10h and mix bins/+14h. Stream object vtable is 2C948C, with
+AddRef 22CBC4, Release 22CC0B, GetInfo 22CC59, GetStatus 22CD58,
+Process 22CDA9, Discontinuity 22CCC0 and Flush 22CD0D.
+GetInfo reports flags 5, block alignment and twice the larger of alignment
+and 32 samples of encoded channel data (22C0E2/22CC59).
+232402 copies the 24-byte packet and sets E_PENDING (8000000Ah).
+231C94/2317E9 publish submitted size and status, then call the descriptor's
+actual callback(context, packet_context, status), or signal the packet event.
+232059 flushes with E_ABORT (80004004h); the submitted size is still published.
+22C150/232635 convert frequency to 4096*log2(frequency/48000); 233229 clamps
+pitch to -32767..8191. Stream volume 22D4DE, pitch 22D48C, headroom 22D626,
+output buffer 22E694, mix bins 22E6E6, format 22EF6B; common voice mix-bin
+volumes use 22D3F0. Original entry prefixes are checked in src/native_api.h.
+These APIs feed bounded native queues into the existing SDL/DSP mixer, keeping
+the original WMA software code compiled ahead of time. Physical-device emulation
+and substituted music files are not used. Zero-time FlushEx supports asynchronous
+packet publication and the default zero-release envelope, including retained
+ENVELOPECOMPLETE state for ENVELOPE2. Regular Flush resets that state. 3D streams,
+timestamped flushes, custom release envelopes and synchronized pause remain
+unsupported.
+ABI cross-check only (no implementation copied):
+https://raw.githubusercontent.com/Cxbx-Reloaded/Cxbx-Reloaded-legacy/master/src/core/hle/DSOUND/XbDSoundTypes.h
+
+Idle captures frame-38593795300 and frame-45016766800 use PCM engine samples,
+not ADPCM. Frozen 2-second replay peaks are 0.191 and 0.206, with no clipping
+or decoder failures. This does not establish live playback continuity. F8 now
+arms a bounded actual-output/timing recording for the next capture, preserving
+existing B2AUD001 snapshots and adding volume/frequency event tracing.
+
+The first live WMA attempt stopped at 24CB5B (log b2-20261011-003622-4152.log),
+called indirectly at 251260. Original 24CE8D supplies that reader as argument 3
+of 24E49E; 24E49E forwards it as argument 10 of 24F250, which stores it at +30h.
+24F250 also installs decoder methods at +164h/+198h/+19Ch/+3F4h and the default
+input reader 24F203. Discovery follows these verified registrations together.
+Its +14h/+18h/+1Ch references are Huffman data tables, despite being located in
+the executable WMA section: 253879 passes +14h to 256797, and 253965/253979
+read +18h/+1Ch as indexed 16-bit values. They must not become compiled entries.
+All addresses and layouts above come from bounded native analysis of original
+bytes; callback discovery checks the initializer and indirect-call signatures.
+
+Log b2-20261011-004905-10456.log next stopped at 252E59, called by 250E69
+through decoder+3F8h. The original 250EC4 format initializer additionally stores
+250DE0/2537D4/252E59 at +3F8h, 255793 at +3FCh and E6ECC at +3ECh.
+251177 masks EAX with 254CE3 before storing +3ECh; 2511AE/2511B5 select
+2552C1/255597 before storing +400h. Discovery includes these actual code
+references, covering the alternate output and conversion branches together.
+
+252E59 uses MOVD, CVTPS2PI, PADDD, PACKSSDW, PSLLD, PSRAW and PSRLD.
+These now compile to native MMX instructions, preserving the shared x87/MMX
+registers and the guest MXCSR rounding mode. XMM/GPR source bits are supplied
+through the equivalent memory operand; MOVD transfers exactly four bytes.
+Instruction reference: Intel C++ Intrinsics Reference,
+https://www.intel.com/content/dam/develop/external/us/en/documents/18072-347603.pdf
+
+The offline music check uses the same WMA file factory as XACT 213A72 (24C13F),
+with its verified four-word file descriptor and original XMO GetInfo/GetStatus/
+Process/DoWork/Release methods. C50E reads the original ASF rate/+2Ch and
+channels/+38h. The check opens all twelve disc files, decodes bounded packets,
+passes them to the native DirectSound stream and exports two seconds of mixed
+audio per track. No game startup, sound device or replacement decoder is used.
+
+The first offline track decoded successfully but its Release exposed 128CF8,
+the original CancelIo wrapper called at 24BC38. It references a real file
+object, scans IdexChannelObject+28h for that object's requests, cancels them,
+waits for completion and returns BOOL with ret 4. Following the physical Xbox
+disc queue is inappropriate for the native file provider. A prefix-verified
+binding cancels only matching native pending requests, waits for their actual
+completion and publishes status/events through the existing I/O service.
+Windows cancellation/completion references:
+https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-cancelioex
+https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-getoverlappedresult
+
+Offline validation: all twelve music1/b1wma tracks decode at their original
+44100 Hz stereo format and produce finite, nonzero mixed audio. Each run mixes
+96000 output frames from 44 original decoded packets, then releases both the
+native stream and original decoder successfully. CPU, 66 audio/effects checks,
+54 spatial checks and 41 native audio bindings also pass. This verifies the
+bounded decoding/playback/cleanup path; full-song and live gameplay acceptance
+remain manual. Engine crackling still requires the live two-capture recording.

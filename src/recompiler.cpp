@@ -162,25 +162,41 @@ public:
         const auto& ins=instruction.decoded;
         const ZydisDecodedOperand* memory_operand=nullptr;
         const ZydisDecodedOperand* immediate=nullptr;
+        const ZydisDecodedOperand* register_operand=nullptr;
+        std::string pointer;
         for(unsigned i=0;i<ins.operand_count_visible;++i) {
             const auto& operand=instruction.operands[i];
             if(operand.type==ZYDIS_OPERAND_TYPE_MEMORY) memory_operand=&operand;
             else if(operand.type==ZYDIS_OPERAND_TYPE_IMMEDIATE && operand.size==8) immediate=&operand;
+            else if(operand.type==ZYDIS_OPERAND_TYPE_REGISTER && ins.mnemonic==ZYDIS_MNEMONIC_MOVD &&
+                operand.reg.value>=ZYDIS_REGISTER_EAX && operand.reg.value<=ZYDIS_REGISTER_EDI) register_operand=&operand;
+            else if(i==1 && operand.type==ZYDIS_OPERAND_TYPE_REGISTER && ins.mnemonic==ZYDIS_MNEMONIC_CVTPS2PI)
+                pointer="cpu.floating.xmm["+std::to_string(xmm_register(operand.reg.value))+"].data()";
             else if(operand.type!=ZYDIS_OPERAND_TYPE_REGISTER || operand.reg.value<ZYDIS_REGISTER_MM0 || operand.reg.value>ZYDIS_REGISTER_MM7)
                 throw std::runtime_error("Expected an MMX register or memory operand");
         }
-        if(memory_operand && memory_operand->size!=64) throw std::runtime_error("Expected a 64-bit MMX memory operand");
+        const auto width=ins.mnemonic==ZYDIS_MNEMONIC_MOVD?4U:8U;
+        if(memory_operand) {
+            if(memory_operand->size!=width*8) throw std::runtime_error("Unexpected MMX memory width");
+            pointer="memory.access("+address(*memory_operand)+','+std::to_string(width)+')';
+        }
+        const bool register_write=register_operand==&instruction.operands[0];
+        if(register_operand) {
+            body << "    std::uint32_t mmx_word=" << (register_write?"0U":read(*register_operand)) << ";\n";
+            pointer="&mmx_word";
+        }
         floating=true;
-        const unsigned modrm=memory_operand?(ins.raw.modrm.reg<<3)|1:(3U<<6)|(ins.raw.modrm.reg<<3)|ins.raw.modrm.rm;
+        // Guest XMM/GPR operands live in C++ state; present their original
+        // bits as memory while MMX continues to share the resident x87 state.
+        const unsigned modrm=!pointer.empty()?(ins.raw.modrm.reg<<3)|1:(3U<<6)|(ins.raw.modrm.reg<<3)|ins.raw.modrm.rm;
         const bool empty=ins.mnemonic==ZYDIS_MNEMONIC_EMMS;
         const auto helper=(empty?std::string("b2_mmx_77"):std::format("b2_mmx_{:02X}{:02X}",ins.opcode,modrm))+
             (immediate?std::format("_{:02X}",immediate->imm.value.u):"");
         native_helpers[helper]=helper+" PROC\n    db 00Fh,"+std::format("0{:02X}h",ins.opcode)+
             (empty?"":std::format(",0{:02X}h",modrm))+(immediate?std::format(",0{:02X}h",immediate->imm.value.u):"")+"\n    ret\n"+helper+" ENDP\n";
-        native_declarations[helper]="extern \"C\" void "+helper+'('+(memory_operand?"void*":"")+");\n";
-        body << "    " << helper << '(';
-        if(memory_operand) body << "memory.access(" << address(*memory_operand) << ",8)";
-        body << ");\n";
+        native_declarations[helper]="extern \"C\" void "+helper+'('+(!pointer.empty()?"void*":"")+");\n";
+        body << "    " << helper << '(' << pointer << ");\n";
+        if(register_write) write(*register_operand,"mmx_word");
     }
     void x87(const Instruction& instruction) {
         const auto& ins=instruction.decoded;
@@ -395,6 +411,9 @@ public:
         case ZYDIS_MNEMONIC_MOVQ: case ZYDIS_MNEMONIC_MOVNTQ: case ZYDIS_MNEMONIC_EMMS:
         case ZYDIS_MNEMONIC_PSHUFW: case ZYDIS_MNEMONIC_PUNPCKLWD: case ZYDIS_MNEMONIC_PUNPCKHWD:
         case ZYDIS_MNEMONIC_PUNPCKLDQ: case ZYDIS_MNEMONIC_PUNPCKHDQ:
+        case ZYDIS_MNEMONIC_MOVD: case ZYDIS_MNEMONIC_CVTPS2PI:
+        case ZYDIS_MNEMONIC_PACKSSDW: case ZYDIS_MNEMONIC_PADDD:
+        case ZYDIS_MNEMONIC_PSLLD: case ZYDIS_MNEMONIC_PSRAW: case ZYDIS_MNEMONIC_PSRLD:
             mmx(instruction); break;
         case ZYDIS_MNEMONIC_SHUFPS: case ZYDIS_MNEMONIC_UNPCKLPS: case ZYDIS_MNEMONIC_UNPCKHPS:
         case ZYDIS_MNEMONIC_MOVHLPS: case ZYDIS_MNEMONIC_MOVLHPS: {

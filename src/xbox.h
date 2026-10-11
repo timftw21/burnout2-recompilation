@@ -70,10 +70,12 @@ private:
     friend std::string check_storage(const std::filesystem::path&,const std::filesystem::path&);
     friend std::string check_replays(const std::filesystem::path&,const std::filesystem::path&,const std::filesystem::path&);
     friend std::string check_audio_listener(const std::filesystem::path&,const std::filesystem::path&);
+    friend std::string check_music(const std::filesystem::path&,const std::filesystem::path&,const std::filesystem::path&);
     struct State;
     std::unique_ptr<State> state_;
 };
 std::string check_storage(const std::filesystem::path& xbe,const std::filesystem::path& output);
 std::string check_replays(const std::filesystem::path& xbe,const std::filesystem::path& disc,const std::filesystem::path& output);
 std::string check_audio_listener(const std::filesystem::path& xbe,const std::filesystem::path& output);
+std::string check_music(const std::filesystem::path& xbe,const std::filesystem::path& disc,const std::filesystem::path& output);
 }

@@ -373,3 +373,120 @@ The release passes 31 binding comparisons/commit cases, 12 spatial cases with
 65 original effect checks and the existing CPU checks. Original deferred setters
 are invoked with their supported DPC guard (FS:+24 = 1) to skip the device mutex;
 they copy the actual settings fields without hardware, a scheduler or game boot.
+
+Race music stream stop (2026-10-10)
+
+Log b2-20261011-012421-4324.log stops at 22CE71 with arguments
+{stream=0114A000, time low=0, time high=0, flags=5}. The return address 22D9C2
+belongs to the original four-word adapter 22D9AD, ending C21000 (RET 10h).
+XACT 210A20 chooses flags 5 at 210A53..210A62 for an envelope stream stop.
+The native binding rejected every nonzero flag, including this immediate request.
+
+Original 22CE71 branches to 231E29 for nonzero flags and to synchronous 232059
+for flags zero; the latter ignores the timestamp. 231E29 uses 231963 directly
+when both timestamp words are zero, otherwise it schedules command 4. 231963
+tests envelope bits 6 at 231982 and retained-envelope bit 4 at 231988. Bit 4
+sets internal 1000h at 231992 and calls release helper 233553; other modes
+enqueue command 3 to flush the queue. Default release durations are zero:
+22F34B allocates the cleared descriptor through 22BE7F/22FD25; 22F0B3 leaves
+its envelope selectors at +28h and parameter arrays at +30h zero. 232FED
+converts those parameters for the hardware voice. No custom envelope provider
+is currently supported.
+
+23214A completes released active packets with success through 231F96 (push 0
+at 232185), then changes internal 1000h to 2000h at 2321A9..2321B7. GetStatus
+2319D5 maps 2000h to public 80000h at 2319EA..2319F1. 232402 and 23214A
+skip activation while that bit is retained: free slots can accept packets,
+but those packets cannot restart the stopped stream. Repeating ENVELOPE2
+retains that state. Synchronous 232059 aborts queued packets with 80004004h
+and clears 3000h at 232130. 231C94 publishes the original submitted size.
+
+The native zero-release path stops mixing, defers packet publication to DoWork,
+retains envelope completion and prevents restart until regular Flush. Existing
+offline binding checks exercise the logged adapter, deferred completion, stream
+reuse and queued packets after completion. All twelve original WMA track checks
+also execute the same stop operation. Timestamp scheduling and custom release
+envelopes remain unsupported; no hardware register emulation or invented fade
+is added. ABI constants cross-check only, with no implementation copied:
+https://raw.githubusercontent.com/Cxbx-Reloaded/Cxbx-Reloaded/master/src/core/hle/DSOUND/XbDSoundTypes.h
+
+Validation: release rebuild succeeded; 74 native binding checks, 54 spatial
+cases/1000 original calculations, 64 audio cases and the existing CPU suite
+pass. All twelve WMA tracks pass the logged stop operation after 96000 mixed
+frames each. Reports are under build/checks/crash-stream-flush (binding results
+in bindings-final). The user must verify the live race transition separately.
+
+Live SFX crackling investigation (2026-10-10, incomplete)
+
+User captures frame-209744663700 and frame-214498810300 have music disabled.
+The second includes 228000 actual mixed frames and 475 WASAPI callbacks at
+48000 Hz, with a 480-frame device buffer. Callback work averages 1.357 ms,
+peaks at 2.092 ms, and never exceeds its 10 ms audio budget. The largest
+callback start gap is 10.13 ms. The raw output peak is below 0.062 before
+master gain 0.5; this recording does not show output clipping or starvation.
+
+The live PCM16 left channel contains 68 sample jumps over 150 units at
+callback offset 32; the largest is 722 at frame 56672. Other samples have
+first-difference RMS 10.75 units, versus 167.32 at those boundaries. This
+locates the recorded discontinuities in the shared native mix, before device
+output. Both frozen two-second replays are smooth: maximum sample differences
+83 and 53. Their output peaks are 0.061448 and 0.059092.
+
+A bounded native diagnostic replay of the first snapshot plus the second
+capture's 8136 volume/frequency events yields maximum difference 0.002483
+(about 81 PCM16 units). This trace is truncated and excludes effect updates;
+it cannot reproduce all live controls or prove an effect implementation fault.
+The original D2D05..D2E22 submits seven effect-1 parameter words through
+10A720/22D734; 10AE22 commits through 22D75E. The two snapshots contain different
+coefficients, including X:BB values 5FFFFF and 2FFFFF, but provide no update
+history. The shared trace now records these APIs with their actual payloads,
+processing clocks and callers, capped at 64 payload bytes per write. No engine
+exception, gain adjustment, smoothing or speculative timing change was added.
+Need another short F8 pair to establish the changing parameter and its cause.
+
+Offline capture/audio: 66 cases pass; original compiled effects: 65 checks pass;
+spatial calculations: 54 cases / 1000 calls pass; native bindings: 74 cases pass.
+
+Live control continuity correction (2026-10-10)
+
+The next two user captures are frame-58706835200 and frame-61290717700.
+Music is disabled. The latter contains 123840 live frames, 5897 untruncated
+control events, 1015 four-byte effect writes and 145 effect commits. Replaying
+the first snapshot with every recorded volume, frequency and effect update
+reproduces the live recording within one PCM16 unit, after its 480-frame lead.
+This ties the clicks to native processing rather than a device dropout.
+
+Effect 1 offset 34h changes between 2FFFFFh and 5FFFFFh, with intermediate
+values. Original D2DED submits that word through 10A720/22D734. Original DSP
+P:73..80 loads it as a fractional multiplier for the processed signal. Holding
+only this parameter constant removes the large discontinuities; holding offset
+1Ch does not. The original SDK commit copies words and this effect contains no
+gain ramp. No incorrect original arithmetic or timer behavior was established.
+
+The native control boundary now transitions continuous effect coefficients
+over 800 samples (25 original 32-sample blocks). Interrupted transitions start
+from their current value; identical repeated targets do not restart them.
+Committed target readback and immediate/deferred visibility remain intact.
+Build-time analysis marks only read-only state used in fractional products;
+the verified image selects X:B5/B6/B7/B8/B9/BB/BD. Routing pointers, flags,
+loop counts and writable filter history keep their original semantics. This is
+native control interpolation, not a claim of recovered console gain-ramp code.
+
+Every voice also interpolates changes in its combined volume, headroom, spatial
+and send gains across a 32-sample block. This includes routed sources and FXIN
+returns, without a sound ID or engine-specific condition. Original targets,
+source phase, pitch and sample data are retained. Starts and explicit seeks use
+their new controls immediately. No output filter or volume reduction is used.
+
+During the recorded interval, maximum PCM16 sample difference falls from 667
+to 90. Difference RMS at the affected callback offset falls from 149.28 to
+15.21; elsewhere it remains 10.59 versus 10.54. Replay peak remains 1913.
+Three snapshots taken during event replay restore to identical floating output,
+including pending coefficient transitions. New captures serialize that state
+and prior B2AUD001 voice/effect layouts remain readable.
+
+Release rebuild succeeds. Both new frozen captures replay 96000 frames with no
+failures. Existing diagnostics pass 67 audio cases with capture, 65 effects,
+54 spatial cases / 1000 original calculations, 74 bindings, 52 CPU cases and
+all twelve original WMA tracks. Evidence and native replay files are ignored
+under build/checks/sfx-crackle. Live listening remains the user's manual check.

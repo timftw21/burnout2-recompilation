@@ -291,12 +291,14 @@ int main(int argc, char** argv) {
                          "  b2 --inspect-effects XBE IMAGE OUTPUT_DIRECTORY\n"
                          "  b2 --check-storage XBE OUTPUT_DIRECTORY\n"
                          "  b2 --check-replays XBE ISO OUTPUT_DIRECTORY\n"
+                         "  b2 --check-music XBE ISO OUTPUT_DIRECTORY\n"
                          "  b2 --inspect-audio CAPTURE.bin EFFECTS_IMAGE OUTPUT_DIRECTORY\n";
             return 0;
         }
         const auto command = std::string_view(argv[1]);
         if(command=="--check-storage" && argc==4) {std::cout<<b2::check_storage(argv[2],argv[3])<<'\n';return 0;}
         if(command=="--check-replays" && argc==5) {std::cout<<b2::check_replays(argv[2],argv[3],argv[4])<<'\n';return 0;}
+        if(command=="--check-music" && argc==5) {std::cout<<b2::check_music(argv[2],argv[3],argv[4])<<'\n';return 0;}
         if(command=="--inspect-audio" && argc==5) {
             const auto report=b2::Audio::inspect_capture(argv[2],argv[3],argv[4]);std::cout<<report<<'\n';
             return report.find("\"passed\":true")!=std::string::npos?0:1;

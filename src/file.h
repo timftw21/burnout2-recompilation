@@ -26,6 +26,7 @@ private:
 std::uint16_t u16(Bytes bytes, std::size_t offset);
 std::uint32_t u32(Bytes bytes, std::size_t offset);
 std::string utf8(std::wstring_view text);
+std::filesystem::path utf8_path(std::string_view text);
 std::string json(std::string_view text);
 std::string hex32(std::uint32_t value);
 std::string hex_bytes(Bytes bytes);

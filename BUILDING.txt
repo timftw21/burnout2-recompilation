@@ -7,14 +7,31 @@ the build. Click Open game folder and double-click b2.exe. No commands are neede
 
 The builder uses the native b2-tool to extract and verify the game executable
 and read the effects image. It prepares data/local, configures and builds Release,
-and seeds game-file settings beside b2.exe only when settings do not already exist.
-Existing settings and saves are preserved. Build progress appears in a small
+and updates game-file locations beside b2.exe after a successful build.
+Other settings and saves are preserved. Use a partition-only Xbox XISO image;
+full-disc dumps require conversion first. One build runs per source folder.
+Build progress appears in a small
 window; Open build log shows details from build/setup/build.log. Closing the
 window cancels the build and stops only workers started by the builder.
 
 The first build downloads pinned dependencies and compiles the game ahead of
 time. Later builds reuse unchanged outputs. Keep the source and build folders
 to avoid starting over. Private game files, logs and output remain ignored.
+
+Installation validation (2026-10-10)
+
+Issue #13 was reproduced in a fresh Visual Studio build: MASM cannot create the
+nested generated object directory. Generated assembly now uses a unique object
+name directly in the existing intermediate directory. Relative assembly inputs
+also avoid MASM's legacy encoding of non-English folder names. SDL's precompiled
+header uses its include search path, avoiding an ANSI-encoded absolute filename.
+A full Installation.zip setup passed through Windows PowerShell 5.1 with spaces,
+Japanese and accented characters in the source and disc paths, using CMake 4.3.3,
+MSVC 19.51 and Windows SDK 10.0.26100.0. All 52 installed CPU checks passed.
+Repeat setup passed with downloads blocked, refreshed disc locations and preserved
+other settings and saves. Invalid images preserved existing files. Separate checks
+covered old CMake versions on PATH, duplicate builds, moved/valid build caches,
+cancellation logs and worker cleanup, and failed/absolute-path archive creation.
 
 Developer commands and native diagnostics
 
@@ -72,6 +89,7 @@ CPU, loader and original startup
 & .\build\windows\Release\b2.exe --check-audio data/local/b2distfx.bin build/checks/audio-capture
 & .\build\windows\Release\b2.exe --check-spatial data/local/default.xbe
 & .\build\windows\Release\b2.exe --check-spatial data/local/default.xbe build/checks/audio-bindings
+& .\build\windows\Release\b2.exe --check-music data/local/default.xbe 'Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso' build/checks/music
 & .\build\windows\Release\b2.exe --check-effects data/local/b2distfx.bin
 & .\build\windows\Release\b2.exe --bench-cpu
 & .\build\windows\Release\b2-tool.exe check-image data/local/default.xbe
@@ -98,10 +116,16 @@ Audio checks exercise the shared PCM/Xbox ADPCM decoder and mixer without a game
 or sound device. Native SDL3 playback supports buffers, loops, gain, frequency and
 output routing. All five original DSP programs compile ahead of time into native
 C++ functions (1754 instructions), with real delay-buffer transfers and shared
-SDL3 processing. Sixty-five offline effects checks and forty audio checks pass,
+SDL3 processing. Sixty-five offline effects checks and sixty-five audio checks pass,
 including all 32 mix bins, headroom and replacement of the native effects image.
 Play and write positions follow the original codec-block lead and loop wrapping;
 play-region changes reset the loop region and normalize zero lengths.
+Music checks open all twelve Burnout 1 tracks through the original compiled WMA
+file decoder, feed its packets through the native sound stream and mix two seconds
+per track without booting or opening a sound device. They export WAV files and a
+JSON report, with bounded reads, timeouts and an execution budget. Each track also
+uses the original XACT asynchronous envelope-stop adapter and verifies packet
+completion before releasing the native stream.
 Public effect-data updates, reads and commits use the native DSP state. Deferred
 updates wait for commit; they do not enter private MCPX hardware paths or overwrite
 the game's sample memory. Seven additional effect cases cover those operations.
@@ -120,8 +144,8 @@ playback, including saved DSP history and a partially consumed output block.
 The optional spatial-check output compares all six native listener setters with
 the original SDK's software-only setters and checks immediate/deferred commits.
 Both require fresh output directories and open no audio device.
-The binding check passes 31 cases against six original setters; the capture
-roundtrip brings the optional audio check to 42 cases. Correct listener bindings
+The binding check passes 74 cases, including six original listener setters; the
+capture roundtrip brings the optional audio check to 67 cases. Correct listener bindings
 keep position, velocity, distance, rolloff and Doppler separate across all SFX.
 Use --inspect-effects XBE IMAGE OUTPUT_DIRECTORY to decode bounded Xbox effects
 images through the original SDK's compiled routines without booting. It exports
@@ -247,10 +271,12 @@ Audio, Graphics and Controls tabs. Esc toggles settings; F1 remains an alias.
 General selects the presentation limit, defaulting to 60 Hz independently of the
 monitor, and has interpolation and frame-rate counter toggles. Selecting a rate
 above 60 Hz enables interpolation; selecting 60 Hz or lower disables it. Manual
-opt-outs survive save/load until another rate is selected. Original frames have
-a separate 60 Hz limit. Absolute SDL3 deadlines avoid catch-up bursts after stalls
-or rate changes; guest video stays at 60 Hz.
-The scheduler presents additional images while servicing events/input between
+opt-outs survive save/load until another rate is selected. Interpolation keeps
+original frames at 60 Hz and adds display images. With interpolation off, original
+frames run at the selected rate and are presented once each; higher rates can
+speed up movement. Absolute SDL3 deadlines avoid catch-up bursts after stalls
+or rate changes; the guest video callback stays at 60 Hz.
+The scheduler presents interpolated images while servicing events/input between
 original frames. V-sync can still limit presentation to the physical display.
 Audio controls master volume and mute through SDL3's output gain. Graphics has
 V-sync, fullscreen and internal resolution (1x-4x).
@@ -276,8 +302,9 @@ occlusions/fast movement can still produce artifacts. All shaders compile during
 the build, and disabling the feature avoids history copies and motion passes.
 Hidden window diagnostics check saved/invalid bindings and settings, automatic
 interpolation selection and saved opt-outs, the counter, all four tabs, Esc,
-scaled targets, 60/120 Hz pacing, 60 Hz source frames at 120/144 Hz
-presentation, translated images, endpoints, stationary HUD, new occlusions,
+scaled targets, 60/120 Hz pacing, original frames at 120/144 Hz with interpolation
+off, 60 Hz source frames with interpolation on, live opt-outs, translated images,
+endpoints, stationary HUD, new occlusions,
 scene cuts and history reset. They export images and component GPU timing without
 booting. These measurements do not establish gameplay FPS or visual parity.
 Live logs report source FPS separately from presented FPS and generated frames.
@@ -291,7 +318,16 @@ audio.bin saves sample banks, voice controls, routing and DSP history at the
 request. Shared banks are copied once, bounded to 64 MiB plus 16 MiB DSP scratch.
 audio-game-state.json records listener/source parameters and audio failures.
 F8 also enables a bounded 10-second playback-event trace; the next capture saves
-up to 512 events and reports truncation. Normal play leaves this tracing disabled.
+up to 8192 events and reports truncation, including volume, frequency, effect
+writes and effect commits. Effect writes retain the first 64 parameter bytes
+and report larger payload truncation.
+The next capture also saves audio-live.wav (up to ten seconds of the actual mix)
+and audio-live.json with callback timing, requests and device buffer information.
+These recordings precede master volume. Capture once to arm recording, then again
+after two seconds of the problem to retain the update history. Normal play
+leaves this tracing disabled.
+The game-state capture includes original music state; audio-game-state.json lists
+packet streams, submitted/completed packets and playback status.
 Inspect a captured audio.bin without booting or opening an audio device:
 
 & .\build\windows\Release\b2.exe --inspect-audio CAPTURE/audio.bin data/local/b2distfx.bin build/checks/audio-scene
@@ -369,6 +405,12 @@ The original audio calculator retains derived listener orientation between
 sources; moving listeners and immediate/deferred settings remain effective.
 research/performance.txt records measured optimization batches; repeat gameplay
 captures are still needed to establish sustained 60 FPS.
+
+Interpolated presentation checks DXGI frame availability without waiting and
+uses nonblocking Present. A busy display queue leaves the game running until
+the next display opportunity. VSync remains enabled when selected. Hidden
+window checks include a 1000 Hz presentation workload with simulated CPU work
+to verify that display backpressure does not starve the 60 Hz source cadence.
 
 Live execution reaches the original Press START, Load/Save and Single Player menus
 and the first driving lesson.

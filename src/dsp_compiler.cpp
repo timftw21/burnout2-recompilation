@@ -1,4 +1,5 @@
 #include "dsp_compiler.h"
+#include "dsp.h"
 #include <algorithm>
 #include <format>
 #include <map>
@@ -42,6 +43,9 @@ struct Instruction {
     std::uint32_t opcode=0;
     std::string body,test,count;
     Flow flow=Flow::next;
+    int state_read=-1,state_write=-1,read_register=-1;
+    unsigned written_register=64;
+    std::array<int,2> product_registers{-1,-1};
 };
 std::string alu(std::uint32_t byte) {
     if(!byte) return {};
@@ -71,7 +75,7 @@ Instruction decode(Bytes bytes,unsigned pc) {
     const auto extension=[&](){out.size=2;return u32(bytes,(pc+1)*4)&0xFFFFFF;};
     const auto match=[&](std::string_view text){return Pattern(text).matches(opcode);};
     const auto field=[&](std::string_view text,char name){return Pattern(text).field(name,opcode);};
-    const auto move=[&](unsigned destination,std::string source){return std::format("d.write({}, {});",destination,source);};
+    const auto move=[&](unsigned destination,std::string source){out.written_register=destination;return std::format("d.write({}, {});",destination,source);};
     const auto memory_move=[&](unsigned number,std::string address,bool read) {
         return read?move(number,"d.load("+address+")"):"d.store("+address+", "+reg(number)+");";
     };
@@ -80,6 +84,10 @@ Instruction decode(Bytes bytes,unsigned pc) {
     if(opcode>=0x100000) {
         const auto group=opcode>>20,low=opcode&255U,upper=opcode>>8;
         out.body=alu(low);
+        if(low&128) {
+            constexpr int pairs[][2]={{4,4},{6,6},{5,4},{7,6},{4,7},{6,4},{5,6},{7,5}};
+            const auto& pair=pairs[(low>>4)&7U];out.product_registers={pair[0],pair[1]};
+        }
         if(group==2 || group==3) {
             if(upper==0x2000) return out;
             if((upper&0xFFF0)==0x2020) {out.body="if("+condition(upper&15)+") {"+out.body+"}";return out;}
@@ -116,6 +124,10 @@ Instruction decode(Bytes bytes,unsigned pc) {
         const auto raw=pattern==short_displacement?field(pattern,'a'):extension();
         const auto offset=pattern==short_displacement?static_cast<std::int32_t>(raw<<25)>>25:signed24(raw);
         const auto address=std::format("({}+{})",reg(16+field(pattern,'R')),literal(static_cast<std::uint32_t>(offset)));
+        if(field(pattern,'R')==5 && offset>=0) {
+            if(field(pattern,'W')) {out.state_read=offset;out.read_register=field(pattern,'D');}
+            else out.state_write=offset;
+        }
         out.body=memory_move(field(pattern,'D'),address,field(pattern,'W')!=0);return out;
     }
     constexpr std::string_view movec_reg="00000100W1eeeeee101ddddd",movec_ea="00000101W1MMMRRR0s1ddddd";
@@ -190,6 +202,7 @@ Instruction decode(Bytes bytes,unsigned pc) {
     constexpr std::string_view mpy_immediate="000000010100000111qqdk00";
     if(match(mpy_immediate)) {
         constexpr unsigned sources[]={4,6,5,7};
+        out.product_registers[0]=sources[field(mpy_immediate,'q')];
         out.body=std::format("d.multiply({}, {}, {}, false, false, {});",field(mpy_immediate,'d'),literal(extension()),
             reg(sources[field(mpy_immediate,'q')]),field(mpy_immediate,'k')!=0);return out;
     }
@@ -212,7 +225,7 @@ std::string label(unsigned address){return std::format("L{:X}",address);}
 std::string compile_effects(const std::filesystem::path& source,const std::filesystem::path& output,bool replace) {
     File file(source);if(file.size()>65536) throw std::runtime_error("DSP image exceeds 64 KiB build limit");
     const auto image=decode_effects(file.read(0,static_cast<std::size_t>(file.size())));
-    std::ostringstream code,report;unsigned total=0;
+    std::ostringstream code,report;unsigned total=0;std::vector<std::uint32_t> coefficients;
     code<<"// Generated from local game media by the native DSP compiler.\n#include \"dsp.h\"\n#include <stdexcept>\nnamespace b2 {\nnamespace {\n";
     report<<"{\"format\":\"b2-static-effects-v1\",\"source_sha256\":"<<json(hash(file,0,file.size()))<<",\"effects\":[";
     for(unsigned effect=0;effect<image.effects.size();++effect) {
@@ -228,6 +241,28 @@ std::string compile_effects(const std::filesystem::path& source,const std::files
         for(const auto& [pc,instruction]:instructions) if(instruction.flow!=Flow::next && instruction.flow!=Flow::ret &&
             !instructions.contains(instruction.target) && instruction.target!=end)
             throw std::runtime_error(std::format("Effect {} P:{:06X} targets an instruction interior",effect,pc));
+        // Only read-only state consumed as a fractional multiplier is a
+        // continuous control. Pointers, loop counts, flags and filter history
+        // retain their original integer/state semantics.
+        std::set<int> candidates,writes,integers;std::array<int,64> origins;origins.fill(-1);
+        for(const auto& [pc,instruction]:instructions) {
+            for(const auto number:instruction.product_registers) if(number>=0 && origins[number]>=7) candidates.insert(origins[number]);
+            if(instruction.state_write>=0) writes.insert(instruction.state_write);
+            if(instruction.state_read>=0 && (instruction.read_register<4 || instruction.read_register>7)) integers.insert(instruction.state_read);
+            if(instruction.written_register<64) origins[instruction.written_register]=-1;
+            if(instruction.state_read>=0 && instruction.read_register>=4 && instruction.read_register<=7)
+                origins[instruction.read_register]=instruction.state_read;
+            if(instruction.flow==Flow::call || instruction.flow==Flow::jump || instruction.flow==Flow::branch || instruction.flow==Flow::ret) origins.fill(-1);
+        }
+        for(const auto offset:writes) candidates.erase(offset);
+        for(const auto offset:integers) candidates.erase(offset);
+        const auto state_base=0x80+(program.descriptor[2]-image.data_file_offset)/4;
+        for(const auto offset:candidates) {
+            if(static_cast<unsigned>(offset)>=program.descriptor[3]/4) throw std::runtime_error("DSP coefficient exceeds its declared state");
+            const auto index=coefficients.size();coefficients.push_back(state_base+offset);
+            for(auto& [pc,instruction]:instructions) if(instruction.state_read==offset)
+                instruction.body=std::format("d.write({}, d.coefficient({}));",instruction.read_register,index);
+        }
         for(auto entry:entries) code<<"void "<<routine_name(effect,entry)<<"(Dsp&);\n";
         for(auto entry:entries) {
             std::set<unsigned> reached;std::vector<unsigned> pending{entry};
@@ -271,7 +306,10 @@ std::string compile_effects(const std::filesystem::path& source,const std::files
         report<<"{\"index\":"<<effect<<",\"words\":"<<program.code.size()/4<<",\"instructions\":"<<instructions.size()<<",\"routines\":"<<entries.size()<<'}';
         total+=static_cast<unsigned>(instructions.size());
     }
-    code<<"}\nbool compiled_effects_match(const EffectsImage& image) {\nif(image.effects.size()!="<<image.effects.size()<<") return false;\n";
+    if(coefficients.size()>Dsp::coefficient_capacity) throw std::runtime_error("DSP coefficient count exceeds its bounded capacity");
+    code<<"}\nstd::span<const std::uint32_t> compiled_effect_coefficients() {\nstatic constexpr std::array<std::uint32_t,"<<coefficients.size()<<"> words={";
+    for(const auto word:coefficients) code<<literal(word)<<',';
+    code<<"};return words;\n}\nbool compiled_effects_match(const EffectsImage& image) {\nif(image.effects.size()!="<<image.effects.size()<<") return false;\n";
     for(unsigned i=0;i<image.effects.size();++i) {
         code<<"{const auto& bytes=image.effects["<<i<<"].code; if(bytes.size()!="<<image.effects[i].code.size()<<") return false;\n"
             <<"std::uint64_t hash=14695981039346656037ULL;for(auto byte:bytes){hash^=std::to_integer<unsigned>(byte);hash*=1099511628211ULL;}\n"
@@ -281,6 +319,6 @@ std::string compile_effects(const std::filesystem::path& source,const std::files
     for(unsigned i=0;i<image.effects.size();++i) code<<"case "<<i<<":"<<routine_name(i,0)<<"(d);return;\n";
     code<<"default:throw std::runtime_error(\"Invalid static DSP effect\");}}\n}\n";
     write_text(output,code.str(),replace);
-    report<<"],\"instructions\":"<<total<<",\"runtime_decoder\":false,\"unsupported\":0}";return report.str();
+    report<<"],\"instructions\":"<<total<<",\"continuous_coefficients\":"<<coefficients.size()<<",\"runtime_decoder\":false,\"unsupported\":0}";return report.str();
 }
 }

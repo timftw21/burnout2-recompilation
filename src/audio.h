@@ -21,8 +21,10 @@ struct AudioFormat {
 struct MixBin {std::uint32_t bin;std::int32_t volume;};
 struct AudioPosition {std::uint32_t play,write;};
 struct AudioPerformance {std::uint64_t batches=0,mix_ns=0,overruns=0;};
+struct AudioCompletion {std::uint32_t token=0,bytes=0,status=0;};
 enum class AudioBus {none,submix,effects,effects_manual};
 std::vector<float> decode_audio(AudioFormat,std::span<const std::byte>);
+void save_audio_wave(const std::filesystem::path&,std::span<const float> stereo);
 class Audio {
 public:
     explicit Audio(bool output=true,float gain=1);
@@ -46,8 +48,16 @@ public:
     void mixbin_headroom(std::uint32_t bin,std::uint32_t shift);
     void mixbins(std::uint32_t,std::span<const MixBin>,bool volumes_only=false);
     void frequency(std::uint32_t,std::uint32_t hz);
+    void pitch(std::uint32_t,std::int32_t);
     void route(std::uint32_t,std::uint32_t destination);
     void spatial(std::uint32_t,const SpatialResult&);
+    void packets(std::uint32_t,unsigned capacity);
+    bool packet(std::uint32_t,std::span<const std::byte>,std::uint32_t token);
+    unsigned completed(std::uint32_t,std::span<AudioCompletion>);
+    std::uint32_t packet_status(std::uint32_t);
+    void pause(std::uint32_t,unsigned mode);
+    void flush(std::uint32_t,unsigned flags=0);
+    void discontinuity(std::uint32_t);
     void mix(std::span<float> stereo);
     void output_gain(float);
     std::uint32_t sample_clock() const {return frames_processed_.load(std::memory_order_relaxed);}
@@ -70,7 +80,7 @@ public:
                                       const std::filesystem::path& output);
 private:
     friend std::string check_audio(const std::filesystem::path&,const std::filesystem::path&);
-    struct VoiceState {
+    struct VoiceControls {
         AudioFormat format;
         std::array<float,128> block{};
         std::uint32_t cached_block=UINT32_MAX,source_address=0;
@@ -87,9 +97,15 @@ private:
         AudioBus bus=AudioBus::none;
         bool used=false,playing=false,loop=false;
     };
+    struct VoiceState : VoiceControls {
+        std::array<float,8> previous_gains{};
+        bool gains_ready=false;
+    };
+    struct Packets;
     struct Voice : VoiceState {
         std::vector<std::byte> encoded;
         std::span<const std::byte> source;
+        std::unique_ptr<Packets> packets;
     };
     Voice& voice(std::uint32_t);
     static std::uint32_t frames(AudioFormat,std::uint32_t bytes);
@@ -97,6 +113,7 @@ private:
     void mix_unlocked(std::span<float>);
     void mix_sources(std::span<float>);
     void mix_bins(std::span<float>,unsigned frames);
+    bool next_packet(Voice&);
     void mix_voice(Voice&,std::span<const std::array<float,2>>,std::span<float>,unsigned frames);
     void send_voice(Voice&,std::span<const std::array<float,2>>,std::span<float>,unsigned frames);
     struct Capture;
@@ -106,6 +123,8 @@ private:
     Probe* probe_=nullptr;
     struct Effects;
     std::unique_ptr<Effects> effects_;
+    struct Live;
+    std::unique_ptr<Live> live_;
     SDL_AudioStream* stream_=nullptr;
     std::array<Voice,256> voices_{};
     std::array<std::uint32_t,32> bin_headroom_{};

@@ -113,6 +113,8 @@ struct Preferences {
         if(!file) throw std::runtime_error("Could not save settings");
     }
     void select_refresh_rate(int rate) {refresh_rate=rate;interpolation=rate>60;}
+    bool interpolate() const {return interpolation && refresh_rate>60;}
+    int source_rate() const {return interpolate()?60:refresh_rate;}
 };
 struct FrameRate {
     std::uint64_t started=0,frames=0;
@@ -207,7 +209,7 @@ struct App {
         if(performance.active()) {stop_performance();return;}if(!playing) return;
         try {
             renderer->performance(&performance);if(game) game->performance_recording(true);
-            performance.start(renderer->adapter(),settings.refresh_rate,active_scale,settings.interpolation && settings.refresh_rate>60,settings.vsync,performance_counters());
+            performance.start(renderer->adapter(),settings.refresh_rate,active_scale,settings.interpolate(),settings.vsync,performance_counters());
             status="Recording performance. F9 saves; recording stops after 60 seconds.";
         } catch(const std::exception& error) {renderer->performance(nullptr);if(game) game->performance_recording(false);performance.reset();status=error.what();}
     }
@@ -298,7 +300,7 @@ struct App {
                             ImGui::EndCombo();
                         }
                         ImGui::Checkbox("Frame interpolation",&settings.interpolation);
-                        ImGui::TextWrapped("Turns on when you select a rate above 60 Hz. Uncheck to turn it off. Gameplay stays at 60 Hz; interpolation adds one game frame of display delay.");
+                        ImGui::TextWrapped("Turns on when you select a rate above 60 Hz. Interpolation keeps normal game speed and adds one game frame of display delay. Uncheck to run original frames at the selected rate; higher rates can speed up movement.");
                         if(settings.interpolation && settings.refresh_rate<=60) ImGui::TextWrapped("Choose a rate above 60 Hz to activate interpolation.");
                         ImGui::Checkbox("Show frame rate",&settings.show_fps);
                         if(!playing) {
@@ -374,7 +376,7 @@ struct App {
             if(playing && ImGui::Button("Return to game",{160,0})) {show_settings=false;binding_action=-1;}
             ImGui::SameLine();if(ImGui::Button("Save settings")) {settings.save();status="Settings saved.";}
             ImGui::End();
-            if(playing) renderer->interpolation(settings.interpolation && settings.refresh_rate>60);
+            if(playing) renderer->interpolation(settings.interpolate());
         }
         if(playing && settings.show_fps) {
             const auto* viewport=ImGui::GetMainViewport();
@@ -404,45 +406,49 @@ struct App {
             if(playing) frame_presented();
         } else pacer.wait(settings.refresh_rate);
     }
-    void display_due() {
+    void display_due(bool source_frame=false) {
+        const bool interpolate=settings.interpolate();
+        if(!interpolate && !source_frame) return;
         const auto now=SDL_GetTicksNS();
-        if(!pacer.due(settings.refresh_rate,now)) return;
+        if(interpolate && !pacer.due(settings.refresh_rate,now)) return;
         // Interpolate the two completed frames one source interval behind the
         // simulation. Menus/settings are drawn afterwards at the display rate.
-        const auto phase=settings.interpolation && settings.refresh_rate>60?std::clamp(float(double(now-published_at)/source_interval),0.0f,1.0f):1.0f;
-        if(renderer->display(phase)) {
-            settings_interface();renderer->present(settings.vsync);
-            frame_presented();
+        const auto phase=interpolate?std::clamp(float(double(now-published_at)/source_interval),0.0f,1.0f):1.0f;
+        // Extra presentations run between guest checkpoints. Waiting for a
+        // full display queue here can consume every slice of game execution.
+        if(renderer->display(phase,!interpolate)) {
+            settings_interface();
+            if(renderer->present(settings.vsync,!interpolate)) frame_presented();
         }
-        pacer.advance();
+        if(interpolate) pacer.advance();
     }
     void game_flip() {
-        // Keep original frames at 60 Hz independently of presentation. Polling
-        // during the wait also presents intermediate frames and reads input.
-        auto now=SDL_GetTicksNS();source_pacer.due(60,now);
+        // Interpolation presents extra images between 60 Hz original frames.
+        // Without it, each original frame uses the selected refresh rate.
+        auto now=SDL_GetTicksNS();source_pacer.due(settings.source_rate(),now);
         while(running && now<source_pacer.next) {
             if(!poll()) return;
-            now=SDL_GetTicksNS();
+            now=SDL_GetTicksNS();source_pacer.due(settings.source_rate(),now);
             auto deadline=source_pacer.next;
-            if(published_at && pacer.next>now) deadline=std::min(deadline,pacer.next);
+            if(settings.interpolate() && published_at && pacer.next>now) deadline=std::min(deadline,pacer.next);
             if(now<deadline) {PerfScope wait(&performance,PerfPhase::pacing);SDL_DelayPrecise(deadline-now);}
             now=SDL_GetTicksNS();
         }
         if(!running) return;
         const bool reset=!published_at || now-published_at>100000000;
-        source_interval=reset?1000000000ULL/60:now-published_at;published_at=now;
+        source_interval=reset?1000000000ULL/settings.source_rate():now-published_at;published_at=now;
         if(performance.active()) performance.source_frame(renderer->stats().published_frames+1,performance_counters());
         renderer->publish_frame(reset);source_pacer.advance();
         game_rate.sample(now);
         if(!first_source) first_source=now;last_source=now;
         if(controls && !controls->started) controls->started=now;
-        display_due();
+        display_due(true);
     }
     void configure_graphics() {
         // Preserve pipelines/UI while discarding the previous game's resources.
         // Mid-race recreation would lose feedback, depth and texture identities.
         renderer->reset(settings.resolution_scale);active_scale=settings.resolution_scale;
-        renderer->interpolation(settings.interpolation && settings.refresh_rate>60);
+        renderer->interpolation(settings.interpolate());
     }
     BootResult play(const std::filesystem::path& executable,const std::filesystem::path& disc,const std::filesystem::path& frame,
                     std::span<const MemorySlice> slices={},bool trace_io=false) {
@@ -497,13 +503,19 @@ struct App {
         const auto fps=last_frame>first_frame?(frames-1)*1000000000.0/(last_frame-first_frame):0;
         const auto source_fps=last_source>first_source?(stats.published_frames-1)*1000000000.0/(last_source-first_source):0;
         report<<std::format("],\"adapter\":{},\"shader_compilations\":{},\"uploaded_vertex_bytes\":{},\"vblank_callbacks\":{},\"refresh_rate\":{},\"resolution_scale\":{},\"interpolation\":{},\"interpolation_active\":{},\"source_fps\":{:.3f},\"interpolated_frames\":{},\"presented_fps\":{:.3f},\"memory\":{}}}",
-            json(result.graphics_adapter),stats.shader_compilations,stats.vertex_bytes,result.vblank_callbacks,settings.refresh_rate,active_scale,settings.interpolation,settings.interpolation && settings.refresh_rate>60,source_fps,stats.interpolated_frames,fps,memory_snapshot);
+            json(result.graphics_adapter),stats.shader_compilations,stats.vertex_bytes,result.vblank_callbacks,settings.refresh_rate,active_scale,settings.interpolation,settings.interpolate(),source_fps,stats.interpolated_frames,fps,memory_snapshot);
         return report.str();
     }
 };
 }
 int run_app(const std::filesystem::path& xbe,const std::filesystem::path& disc,unsigned seconds,const std::filesystem::path& frame,
             const std::filesystem::path& controls,std::span<const MemorySlice> slices,bool trace_io) {
+    if(xbe.empty()) {
+        std::array<wchar_t,32768> module{};
+        const auto length=GetModuleFileNameW(nullptr,module.data(),static_cast<DWORD>(module.size()));
+        if(!length || length==module.size()) throw std::runtime_error("Cannot locate the game folder");
+        std::filesystem::current_path(std::filesystem::path(std::wstring_view(module.data(),length)).parent_path());
+    }
     App app(false,false,controls);
     if(seconds) app.stop_at=SDL_GetTicksNS()+std::uint64_t(seconds)*1000000000;
     if(!xbe.empty()) {
@@ -515,7 +527,7 @@ int run_app(const std::filesystem::path& xbe,const std::filesystem::path& disc,u
         app.display(true);
         if(app.launch) {
             app.launch=false;app.status="Starting game...";app.display(true);
-            try {const auto result=app.play(app.settings.xbe.data(),app.settings.disc.data(),{});app.status=result.boundary.empty()?"Game exited.":result.boundary;}
+            try {const auto result=app.play(utf8_path(app.settings.xbe.data()),utf8_path(app.settings.disc.data()),{});app.status=result.boundary.empty()?"Game exited.":result.boundary;}
             catch(const std::exception& error) {
                 diagnostic_record("{\"type\":\"game_error\",\"message\":"+json(error.what())+'}');
                 app.playing=false;app.show_settings=true;app.status=error.what();
@@ -600,6 +612,7 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     std::array<double,2> source_rates{},display_rates{};
     for(unsigned test=0;test<2;++test) {
         app.settings.refresh_rate=test?144:120;app.playing=true;app.pacer={};app.source_pacer={};app.published_at=app.frames=0;
+        app.settings.interpolation=false;const auto generated_before=app.renderer->stats().interpolated_frames;
         std::uint64_t started=0;
         for(unsigned source=0;source<=30;++source) {
             app.renderer->set_target();app.renderer->begin(source&1?0xFF16344A:0xFF345616);app.renderer->end();app.game_flip();
@@ -607,8 +620,8 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
         }
         source_rates[test]=30*1000000000.0/(app.published_at-started);
         display_rates[test]=(app.frames-1)*1000000000.0/(app.last_frame-app.first_frame);
-        if(std::abs(source_rates[test]-60)>4 || std::abs(display_rates[test]-app.settings.refresh_rate)>app.settings.refresh_rate*0.08 || app.frames<50)
-            throw std::runtime_error(std::format("Separated timing: source {:.2f}, display {:.2f}",source_rates[test],display_rates[test]));
+        if(std::abs(source_rates[test]-app.settings.refresh_rate)>app.settings.refresh_rate*0.08 || std::abs(display_rates[test]-app.settings.refresh_rate)>app.settings.refresh_rate*0.08 || app.frames!=31 || app.renderer->stats().interpolated_frames!=generated_before)
+            throw std::runtime_error(std::format("Original-frame timing: source {:.2f}, display {:.2f}",source_rates[test],display_rates[test]));
         app.playing=false;app.published_at=0;
     }
     if(const auto messages=app.renderer->errors();!messages.empty()) throw std::runtime_error("Settings validation: "+messages.front());
@@ -696,7 +709,7 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     renderer.begin(0xFF000000);renderer.end();renderer.publish_frame(true);
     const auto reset=read(0.5f,"reset");
     if(unsigned(reset.rgba[0])!=0) throw std::runtime_error("Interpolation reset retained old history");
-    std::string generated_rate="null",generated_source_rate="null";
+    std::string generated_rate="null",generated_source_rate="null",backpressure_source_rate="null";
     if(!warp) {
         // Validate the app's actual extra-frame path, as well as the GPU pass.
         // Software rendering above is a correctness check, not a speed target.
@@ -715,7 +728,39 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
             throw std::runtime_error(std::format("Generated presentation: source {:.2f}, display {:.2f}",source_hz,display_hz));
         generated_rate=std::format("{:.3f}",display_hz);generated_source_rate=std::format("{:.3f}",source_hz);
         app.playing=false;app.published_at=0;
+        // Saturate presentation while doing nine 1 ms slices of work per
+        // source frame. A display wait must not starve that simulated work.
+        app.settings.vsync=true;app.settings.refresh_rate=1000;app.playing=true;
+        app.pacer={};app.source_pacer={};app.published_at=0;
+        for(unsigned source=0;source<31;++source) {
+            for(unsigned slice=0;slice<9;++slice) {
+                app.poll();const auto until=SDL_GetTicksNS()+1000000;
+                while(SDL_GetTicksNS()<until) {}
+            }
+            draw(source&1?current_texture:previous_texture);app.game_flip();
+            if(!source) started=app.published_at;
+        }
+        const auto busy_source_hz=30*1000000000.0/(app.published_at-started);
+        if(std::abs(busy_source_hz-60)>4)
+            throw std::runtime_error(std::format("Presentation backpressure starved source work: {:.2f} Hz",busy_source_hz));
+        backpressure_source_rate=std::format("{:.3f}",busy_source_hz);
+        app.settings.vsync=false;app.playing=false;app.published_at=0;
     }
+    // Apply a live opt-out through the same settings path as the checkbox.
+    app.settings.interpolation=false;app.settings.refresh_rate=144;app.playing=true;app.show_settings=true;
+    renderer.display();app.settings_interface();renderer.present(false);app.show_settings=false;
+    const auto generated_before_opt_out=renderer.stats().interpolated_frames,presented_before_opt_out=app.frames;
+    std::uint64_t opt_out_started=0;
+    for(unsigned source=0;source<12;++source) {
+        draw(source&1?current_texture:previous_texture);app.game_flip();
+        if(!source) opt_out_started=app.published_at;
+        const auto presented=app.frames;app.pacer.next=0;app.poll();
+        if(app.frames!=presented) throw std::runtime_error("Disabled interpolation presented an extra image between original frames");
+    }
+    const auto opt_out_source_hz=11*1000000000.0/(app.published_at-opt_out_started);
+    if(std::abs(opt_out_source_hz-144)>12 || app.frames-presented_before_opt_out!=12 || renderer.stats().interpolated_frames!=generated_before_opt_out)
+        throw std::runtime_error(std::format("Live interpolation opt-out: source {:.2f}, displayed {}, generated {}",opt_out_source_hz,app.frames-presented_before_opt_out,renderer.stats().interpolated_frames-generated_before_opt_out));
+    app.playing=false;app.published_at=0;
     // Exercise the actual opt-in recorder, source/display separation, GPU
     // query association and no-boot export through the same app path.
     renderer.interpolation(false);app.settings.interpolation=false;app.settings.refresh_rate=60;app.playing=true;
@@ -734,9 +779,9 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     const auto messages=app.renderer->errors();
     if(!messages.empty()) throw std::runtime_error("SDL3/ImGui validation: "+messages.front());
     return std::format("{{\"format\":\"b2-window-check-v3\",\"passed\":true,\"backend\":\"SDL3/D3D11/ImGui\",\"adapter\":{},\"default_refresh_rate\":60,"
-        "\"bindings_and_settings\":true,\"automatic_interpolation\":true,\"frame_counter\":true,\"counter_image\":{},\"escape_toggle\":true,\"resolution_change\":true,"
-        "\"pacing_60_hz\":{:.3f},\"pacing_120_hz\":{:.3f},\"source_at_120_hz\":{:.3f},\"source_at_144_hz\":{:.3f},\"display_120_hz\":{:.3f},\"display_144_hz\":{:.3f},\"generated_display_hz\":{},\"source_hz_with_interpolation\":{},"
+        "\"bindings_and_settings\":true,\"automatic_interpolation\":true,\"interpolation_opt_out\":true,\"source_hz_after_opt_out\":{:.3f},\"frame_counter\":true,\"counter_image\":{},\"escape_toggle\":true,\"resolution_change\":true,"
+        "\"pacing_60_hz\":{:.3f},\"pacing_120_hz\":{:.3f},\"source_at_120_hz\":{:.3f},\"source_at_144_hz\":{:.3f},\"display_120_hz\":{:.3f},\"display_144_hz\":{:.3f},\"generated_display_hz\":{},\"source_hz_with_interpolation\":{},\"source_hz_under_presentation_backpressure\":{},"
         "\"performance_capture\":true,\"interpolation\":{{\"motion\":true,\"endpoints\":true,\"stationary_hud\":true,\"disocclusion\":true,\"scene_cut\":true,\"reset\":true,\"gpu_ms\":{:.3f},\"mean_error\":{:.3f},\"shader_compilations\":0}},\"game_booted\":false,\"game_fps_established\":false,\"images\":{}}}",
-        json(renderer.adapter()),json(utf8(counter_image.wstring())),measured[0],measured[1],source_rates[0],source_rates[1],display_rates[0],display_rates[1],generated_rate,generated_source_rate,gpu_ms,interpolated_error/(368*576),images.str());
+        json(renderer.adapter()),opt_out_source_hz,json(utf8(counter_image.wstring())),measured[0],measured[1],source_rates[0],source_rates[1],display_rates[0],display_rates[1],generated_rate,generated_source_rate,backpressure_source_rate,gpu_ms,interpolated_error/(368*576),images.str());
 }
 }

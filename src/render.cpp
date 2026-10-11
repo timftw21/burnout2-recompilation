@@ -394,7 +394,9 @@ struct Renderer::Impl {
     std::uint32_t current_target=0;
     std::size_t target_bytes=0;
     HWND window=nullptr;
-    ComPtr<IDXGISwapChain1> swapchain;
+    ComPtr<IDXGISwapChain2> swapchain;
+    HANDLE frame_ready=nullptr;
+    bool frame_acquired=false;
     ComPtr<ID3D11RenderTargetView> window_view;
     ComPtr<ID3D11VertexShader> display_vs;
     ComPtr<ID3D11PixelShader> display_ps;
@@ -571,6 +573,7 @@ struct Renderer::Impl {
         clear_desc.DepthClipEnable=clear_desc.ScissorEnable=TRUE;
         checked(device->CreateRasterizerState(&clear_desc,&clear_raster),"Clear rectangle state");
     }
+    ~Impl() {if(frame_ready) CloseHandle(frame_ready);}
     void collect_timings() {
         for(auto& timing:timings) if(timing.pending) {
             D3D11_QUERY_DATA_TIMESTAMP_DISJOINT result{};UINT64 start=0,finish=0;
@@ -799,7 +802,13 @@ void Renderer::attach_window(void* native_window) {
     description.Width=r.width;description.Height=r.height;description.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
     description.SampleDesc.Count=1;description.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
     description.BufferCount=2;description.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;description.Scaling=DXGI_SCALING_STRETCH;
-    checked(factory->CreateSwapChainForHwnd(r.device.Get(),window,&description,nullptr,nullptr,&r.swapchain),"Window swapchain");
+    description.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    ComPtr<IDXGISwapChain1> swapchain;
+    checked(factory->CreateSwapChainForHwnd(r.device.Get(),window,&description,nullptr,nullptr,&swapchain),"Window swapchain");
+    checked(swapchain.As(&r.swapchain),"Window frame latency interface");
+    checked(r.swapchain->SetMaximumFrameLatency(1),"Window frame latency");
+    r.frame_ready=r.swapchain->GetFrameLatencyWaitableObject();
+    if(!r.frame_ready) throw std::runtime_error("Window frame availability handle is missing");
     checked(factory->MakeWindowAssociation(window,DXGI_MWA_NO_ALT_ENTER),"Window association");
     const auto vs=r.shader(ShaderKind::display_vertex),ps=r.shader(ShaderKind::display_pixel);
     checked(r.device->CreateVertexShader(vs.data(),vs.size(),nullptr,&r.display_vs),"Display vertex shader");
@@ -833,18 +842,26 @@ void Renderer::publish_frame(bool reset) {
     ++r.stats.published_frames;
     if(r.gpu_meter) r.gpu_meter->boundary(r.stats.published_frames+1);
 }
-bool Renderer::display(float phase) {
+bool Renderer::display(float phase,bool wait) {
     auto& r=*impl_;
-    PerfScope timing(r.profile,PerfPhase::display);GpuSpan gpu(r.gpu_meter.get(),2);
+    PerfScope timing(r.profile,PerfPhase::display);
     if(!r.window || !r.ended || r.recording || !std::isfinite(phase) || phase<0 || phase>1)
         throw std::runtime_error("Display a completed main image with a phase between 0 and 1");
     RECT rectangle{};if(!GetClientRect(r.window,&rectangle)) throw std::runtime_error("Cannot read window dimensions");
     const auto width=static_cast<std::uint32_t>(rectangle.right),height=static_cast<std::uint32_t>(rectangle.bottom);
     if(!width || !height) return false;
     extent(width,height);
+    if(!r.frame_acquired) {
+        PerfScope availability(r.profile,PerfPhase::present);
+        const auto result=WaitForSingleObject(r.frame_ready,wait?INFINITE:0);
+        if(result==WAIT_TIMEOUT) return false;
+        if(result!=WAIT_OBJECT_0) throw std::runtime_error("Window frame availability wait failed");
+        r.frame_acquired=true;
+    }
+    GpuSpan gpu(r.gpu_meter.get(),2);
     r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
     if(!r.window_view || r.window_width!=width || r.window_height!=height) {
-        r.window_view.Reset();checked(r.swapchain->ResizeBuffers(0,width,height,DXGI_FORMAT_UNKNOWN,0),"Window resize");
+        r.window_view.Reset();checked(r.swapchain->ResizeBuffers(0,width,height,DXGI_FORMAT_UNKNOWN,DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT),"Window resize");
         ComPtr<ID3D11Texture2D> buffer;checked(r.swapchain->GetBuffer(0,IID_PPV_ARGS(&buffer)),"Window buffer");
         checked(r.device->CreateRenderTargetView(buffer.Get(),nullptr,&r.window_view),"Window render target");
         r.window_width=width;r.window_height=height;
@@ -869,11 +886,14 @@ bool Renderer::display(float phase) {
     r.context->PSSetSamplers(0,1,&sampler);r.context->Draw(3,0);
     r.unbind_textures();r.displaying=true;return true;
 }
-void Renderer::present(bool vsync) {
+bool Renderer::present(bool vsync,bool wait) {
     auto& r=*impl_;
     PerfScope timing(r.profile,PerfPhase::present);
     if(!r.displaying) throw std::runtime_error("Display a frame before presenting");
-    checked(r.swapchain->Present(vsync?1:0,0),"Window presentation");r.displaying=false;
+    const auto result=r.swapchain->Present(vsync?1:0,wait?0:DXGI_PRESENT_DO_NOT_WAIT);
+    r.displaying=false;
+    if(!wait && result==DXGI_ERROR_WAS_STILL_DRAWING) return false;
+    checked(result,"Window presentation");r.frame_acquired=false;return true;
 }
 void Renderer::performance(Performance* profile) {
     auto& r=*impl_;if(r.gpu_meter) r.gpu_meter->collect();r.gpu_meter.reset();r.profile=profile;

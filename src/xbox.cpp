@@ -130,6 +130,13 @@ struct Xbox::State {
         bool has_spatial=false,pending_spatial=false,pending_curve=false,pending_environment=false;
     };
     std::map<std::uint32_t,AudioBuffer> audio_buffers;
+    struct AudioStream {
+        std::uint32_t raw=0,descriptor=0,identifier=0,references=1,callback=0,context=0;
+        AudioFormat format;
+        std::vector<std::array<std::uint32_t,6>> packets;
+        std::uint64_t submitted=0,completed=0;
+    };
+    std::map<std::uint32_t,AudioStream> audio_streams;
     std::uint32_t audio_device=0,audio_references=0;
     std::uint32_t audio_effect_descriptor=0,audio_effect_count=0;
     std::uint32_t audio_effect_program_words=0,audio_effect_scratch_bytes=0;
@@ -139,8 +146,10 @@ struct Xbox::State {
     struct AudioEvent {
         std::uint32_t clock=0,address=0,caller=0,count=0,identifier=0,source=0,start=0,bytes=0;
         std::array<std::uint32_t,6> arguments{};
+        std::array<std::byte,64> effect_data{};
+        std::uint32_t effect_bytes=0;
     };
-    std::array<AudioEvent,512> audio_events{};
+    std::array<AudioEvent,8192> audio_events{};
     std::uint32_t audio_event_count=0,audio_trace_until=0;
     bool audio_trace=false;
     bool ethernet_initialized=false;
@@ -354,6 +363,12 @@ struct Xbox::State {
         return address-found->first<found->second.size?found:allocations.end();
     }
     std::uint32_t argument(const Cpu& cpu,unsigned index) { return memory.load<std::uint32_t>(cpu.registers[esp]+4+index*4); }
+    void set_last_error(Cpu& cpu,std::uint32_t error) {
+        const auto stack_base=memory.load<std::uint32_t>(cpu.fs_base+4);
+        const auto index=memory.load<std::uint32_t>(image.tls->index_address);
+        const auto tls=memory.load<std::uint32_t>(stack_base+index*4);
+        memory.store<std::uint32_t>(tls+4,error);
+    }
     void finish(Cpu& cpu,unsigned cleanup,std::optional<std::uint64_t> result=std::nullopt,bool wide=false) {
         cpu.eip=memory.load<std::uint32_t>(cpu.registers[esp]);
         cpu.registers[esp]+=4+cleanup;
@@ -691,10 +706,7 @@ struct Xbox::State {
             memory.access(value,12);return value;
         };
         const auto last_error=[&](std::uint32_t error) {
-            const auto stack_base=memory.load<std::uint32_t>(cpu.fs_base+4);
-            const auto index=memory.load<std::uint32_t>(image.tls->index_address);
-            const auto tls=memory.load<std::uint32_t>(stack_base+index*4);
-            memory.store<std::uint32_t>(tls+4,error);
+            set_last_error(cpu,error);
         };
         if(address==0x0028D27D) {
             const auto count=argument(cpu,0),array=argument(cpu,1);
@@ -822,6 +834,134 @@ struct Xbox::State {
             if(changed) update_spatial(buffer);
         }
     }
+    void publish_audio_packets(Cpu& cpu,std::uint32_t object) {
+        const auto found=audio_streams.find(object);if(found==audio_streams.end()) return;
+        std::array<AudioCompletion,256> completed{};
+        const auto count=audio->completed(found->second.identifier,completed);
+        const auto routine=found->second.callback,context=found->second.context;
+        std::array<std::array<std::uint32_t,6>,256> packets{};
+        for(unsigned i=0;i<count;++i) {
+            auto& attached=found->second.packets.at(completed[i].token-1);packets[i]=attached;attached={};
+            ++found->second.completed;
+        }
+        for(unsigned i=0;i<count;++i) {
+            const auto& packet=packets[i];const auto result=completed[i];
+            if(packet[2]) memory.store<std::uint32_t>(packet[2],result.bytes);
+            if(packet[3]) memory.store<std::uint32_t>(packet[3],result.status);
+            if(routine) {
+                // Original 2317E9 uses this stdcall ABI. Guest callbacks run
+                // here on the game thread, never inside SDL's audio callback.
+                auto callback=cpu;callback.floating.active=false;callback.floating.host_context=nullptr;
+                callback.preempt=nullptr;callback.registers[esp]-=64;const auto stack=callback.registers[esp];
+                memory.store<std::uint32_t>(stack,return_sentinel);memory.store<std::uint32_t>(stack+4,context);
+                memory.store<std::uint32_t>(stack+8,packet[4]);memory.store<std::uint32_t>(stack+12,result.status);
+                invoke_native(callback,memory,routine);
+                if(callback.eip!=return_sentinel || callback.registers[esp]!=stack+16)
+                    throw NativeBoundary(routine,"audio packet callback returned outside its native continuation");
+            } else if(packet[4]) {
+                const auto event=handles.find(packet[4]);
+                if(event==handles.end() || event->second.kind!=Object::Kind::event)
+                    throw NativeBoundary(0x002317E9,"audio packet completion event is invalid");
+                memory.store<std::uint32_t>(event->second.address+4,1);
+            }
+        }
+    }
+    bool audio_stream_api(Cpu& cpu,std::uint32_t address) {
+        if(address==0x0022F90E) {
+            if(argument(cpu,0)!=audio_device || argument(cpu,3)) throw NativeBoundary(address,"invalid sound-stream device or aggregation");
+            const auto descriptor=argument(cpu,1),output=argument(cpu,2);
+            memory.access(descriptor,24);memory.store<std::uint32_t>(output,0);
+            const auto flags=memory.load<std::uint32_t>(descriptor),capacity=memory.load<std::uint32_t>(descriptor+4);
+            if(flags&0x10) throw NativeBoundary(address,"3D packet audio streams are unsupported");
+            const auto format=audio_format(memory.load<std::uint32_t>(descriptor+8));
+            if(!capacity || capacity>256) {finish(cpu,16,0x88780032U);return true;}
+            const auto identifier=audio->create(format);audio->packets(identifier,capacity);audio->headroom(identifier,600);
+            if(const auto bins=memory.load<std::uint32_t>(descriptor+20)) audio_mixbins(identifier,bins);
+            const auto raw=allocate(page,page,true,PAGE_READWRITE);
+            if(!raw) {audio->release(identifier);finish(cpu,16,0x8007000EU);return true;}
+            const auto body=raw+64,voice=raw+320;
+            memory.store<std::uint32_t>(raw,0x002C948C);memory.store<std::uint32_t>(raw+4,0x002C9480);
+            memory.store<std::uint32_t>(raw+8,1);memory.store<std::uint32_t>(raw+0x10,voice);
+            memory.store<std::uint32_t>(raw+0x14,body);memory.store<std::uint32_t>(raw+0x20,body);memory.store<std::uint32_t>(raw+0x24,voice);
+            memory.store<std::uint32_t>(body,0x002C94B4);memory.store<std::uint32_t>(body+8,flags);
+            memory.store<std::uint32_t>(body+0x10,format.rate);memory.store<std::uint32_t>(body+0x14,format.block_align);
+            memory.store<std::uint32_t>(body+0xB8,capacity);
+            auto& stream=audio_streams[raw];stream.raw=raw;stream.descriptor=body;stream.identifier=identifier;stream.format=format;
+            stream.callback=memory.load<std::uint32_t>(descriptor+12);stream.context=memory.load<std::uint32_t>(descriptor+16);
+            stream.packets.resize(capacity);memory.store<std::uint32_t>(output,raw);finish(cpu,16,success);return true;
+        }
+        auto object=argument(cpu,0);
+        if(address==0x0022D3F0) object-=4;
+        const auto found=audio_streams.find(object);if(found==audio_streams.end()) return false;
+        auto& stream=found->second;
+        switch(address) {
+        case 0x0022CBC4:finish(cpu,4,++stream.references);return true;
+        case 0x0022CC0B: {
+            const auto references=--stream.references;
+            if(!references) {
+                const auto identifier=stream.identifier,raw=stream.raw;
+                audio->flush(identifier);publish_audio_packets(cpu,object);
+                audio->release(identifier);allocations.erase(raw);audio_streams.erase(object);
+            }
+            finish(cpu,4,references);return true;
+        }
+        case 0x0022CC59: {
+            const auto output=argument(cpu,1),lookahead=2*std::max<std::uint32_t>(stream.format.block_align,32*stream.format.channels*stream.format.bits/8);
+            memory.store<std::uint32_t>(output,5);memory.store<std::uint32_t>(output+4,stream.format.block_align);
+            memory.store<std::uint32_t>(output+8,0);memory.store<std::uint32_t>(output+12,lookahead);
+            finish(cpu,8,success);return true;
+        }
+        case 0x0022CD58: {
+            memory.store<std::uint32_t>(argument(cpu,1),audio->packet_status(stream.identifier));finish(cpu,8,success);return true;
+        }
+        case 0x0022CDA9: {
+            if(argument(cpu,2)) throw NativeBoundary(address,"sound streams accept input packets only");
+            const auto input=argument(cpu,1);std::array<std::uint32_t,6> packet{};
+            std::memcpy(packet.data(),memory.access(input,sizeof(packet)),sizeof(packet));
+            const auto slot=std::ranges::find_if(stream.packets,[](const auto& attached){return !attached[0];});
+            if(slot==stream.packets.end()) {finish(cpu,12,0x88780032U);return true;}
+            const auto data=std::span(static_cast<const std::byte*>(memory.access(packet[0],packet[1])),packet[1]);
+            if(!audio->packet(stream.identifier,data,static_cast<std::uint32_t>(slot-stream.packets.begin()+1))) {finish(cpu,12,0x88780032U);return true;}
+            *slot=packet;++stream.submitted;
+            if(packet[2]) memory.store<std::uint32_t>(packet[2],0);
+            if(packet[3]) memory.store<std::uint32_t>(packet[3],0x8000000A);
+            finish(cpu,12,success);return true;
+        }
+        case 0x0022CCC0:audio->discontinuity(stream.identifier);finish(cpu,4,success);return true;
+        case 0x0022CD0D:case 0x0022CE71: {
+            const auto flags=address==0x0022CE71?argument(cpu,3):0U;
+            if(flags && (argument(cpu,1) || argument(cpu,2)))
+                throw NativeBoundary(address,"scheduled stream flush is unsupported");
+            if(flags&~7U) throw NativeBoundary(address,"unsupported stream flush flags");
+            audio->flush(stream.identifier,flags);
+            // 22CE71 uses the asynchronous SDK path for nonzero flags.
+            // Packet callbacks and events are then published by DoWork.
+            if(!flags) publish_audio_packets(cpu,object);
+            finish(cpu,address==0x0022CD0D?4:16,success);return true;
+        }
+        case 0x0022CE20: {
+            const auto mode=argument(cpu,1);
+            if(mode>3 || mode==2) throw NativeBoundary(address,"synchronized stream pause is unsupported");
+            audio->pause(stream.identifier,mode);finish(cpu,8,success);return true;
+        }
+        case 0x0022D48C:audio->pitch(stream.identifier,std::bit_cast<std::int32_t>(argument(cpu,1)));finish(cpu,8,success);return true;
+        case 0x0022D4DE:audio->volume(stream.identifier,std::bit_cast<std::int32_t>(argument(cpu,1)));finish(cpu,8,success);return true;
+        case 0x0022D626:audio->headroom(stream.identifier,argument(cpu,1));finish(cpu,8,success);return true;
+        case 0x0022D3F0:audio_mixbins(stream.identifier,argument(cpu,1),true);finish(cpu,8,success);return true;
+        case 0x0022E6E6:audio_mixbins(stream.identifier,argument(cpu,1));finish(cpu,8,success);return true;
+        case 0x0022E694: {
+            const auto destination=argument(cpu,1);const auto target=audio_buffers.find(destination);
+            if(destination && target==audio_buffers.end()) throw NativeBoundary(address,"invalid stream output buffer");
+            audio->route(stream.identifier,destination?target->second.identifier:0);finish(cpu,8,success);return true;
+        }
+        case 0x0022EF6B: {
+            const auto format=audio_format(argument(cpu,1));audio->format(stream.identifier,format);stream.format=format;
+            memory.store<std::uint32_t>(stream.descriptor+0x10,format.rate);memory.store<std::uint32_t>(stream.descriptor+0x14,format.block_align);
+            finish(cpu,8,success);return true;
+        }
+        default:throw NativeBoundary(address,"unsupported native sound-stream method");
+        }
+    }
     void audio_api(Cpu& cpu,std::uint32_t address) {
         if(audio_trace && audio) {
             const auto sample_clock=audio->sample_clock();
@@ -829,22 +969,30 @@ struct Xbox::State {
             else {
                 unsigned count=0;
                 switch(address) {
-                case 0x0022D896:case 0x0022D8D2:case 0x0022F8EA:count=4;break;
+                case 0x0022D734:count=6;break;
+                case 0x0022D75E:count=1;break;
+                case 0x0022D896:case 0x0022D8D2:case 0x0022F8EA:case 0x0022F90E:count=4;break;
                 case 0x0022EF4B:case 0x0022E908:case 0x0022D8F6:count=3;break;
-                case 0x0022EF2F:case 0x0022E754:case 0x0022E770:case 0x0022D952:count=2;break;
+                case 0x0022EF2F:case 0x0022E754:case 0x0022E770:case 0x0022D952:
+                case 0x0022D7D2:case 0x0022E738:case 0x0022D4DE:case 0x0022D48C:case 0x0022CE20:count=2;break;
+                case 0x0022CDA9:count=3;break;
                 case 0x0022D8BA:case 0x0022C11B:count=1;break;
                 }
                 if(count) {
                     auto& event=audio_events[audio_event_count++%audio_events.size()];event={};
                     event.clock=sample_clock;event.address=address;event.caller=memory.load<std::uint32_t>(cpu.registers[esp]);event.count=count;
                     for(unsigned i=0;i<count;++i) event.arguments[i]=argument(cpu,i);
+                    if(address==0x0022D734) {
+                        event.effect_bytes=std::min<std::uint32_t>(event.arguments[4],static_cast<std::uint32_t>(event.effect_data.size()));
+                        if(event.effect_bytes) std::memcpy(event.effect_data.data(),memory.access(event.arguments[3],event.effect_bytes),event.effect_bytes);
+                    }
                     const auto found=audio_buffers.find(event.arguments[0]);
                     if(found!=audio_buffers.end()) {
                         const auto& buffer=found->second;event.identifier=buffer.identifier;
                         event.source=memory.load<std::uint32_t>(buffer.descriptor+0xB8);
                         event.start=memory.load<std::uint32_t>(buffer.descriptor+0xC0);
                         event.bytes=memory.load<std::uint32_t>(buffer.descriptor+0xC4);
-                    }
+                    } else if(const auto stream=audio_streams.find(event.arguments[0]);stream!=audio_streams.end()) event.identifier=stream->second.identifier;
                 }
             }
         }
@@ -857,6 +1005,9 @@ struct Xbox::State {
                 for(const auto& [object,buffer]:audio_buffers) {
                     const auto status=audio->status(buffer.identifier);
                     memory.store<std::uint16_t>(buffer.voice+18,static_cast<std::uint16_t>((status&1)?3:1));
+                }
+                for(auto item=audio_streams.begin();item!=audio_streams.end();) {
+                    const auto object=item->first;publish_audio_packets(cpu,object);item=audio_streams.upper_bound(object);
                 }
             }
             finish(cpu,0);return;
@@ -887,7 +1038,8 @@ struct Xbox::State {
             ++audio_references;memory.store<std::uint32_t>(argument(cpu,1),audio_device);finish(cpu,12,success);return;
         }
         if(!audio) throw NativeBoundary(address,"native audio device has not been created");
-        const auto object=argument(cpu,0);
+        if(audio_stream_api(cpu,address)) return;
+        const auto object=argument(cpu,0)+(address==0x0022D3F0?28:0);
         if(address==0x0022D792) {
             if(object!=audio_device) throw NativeBoundary(address,"invalid native sound device");
             audio->mixbin_headroom(argument(cpu,1),argument(cpu,2));finish(cpu,12,success);return;
@@ -1050,7 +1202,7 @@ struct Xbox::State {
         case 0x0022D7D2:audio->volume(buffer.identifier,std::bit_cast<std::int32_t>(argument(cpu,1)));finish(cpu,8,success);return;
         case 0x0022D85E:audio->headroom(buffer.identifier,argument(cpu,1));finish(cpu,8,success);return;
         case 0x0022E770:audio_mixbins(buffer.identifier,argument(cpu,1));finish(cpu,8,success);return;
-        case 0x0022D87A:audio_mixbins(buffer.identifier,argument(cpu,1),true);finish(cpu,8,success);return;
+        case 0x0022D87A:case 0x0022D3F0:audio_mixbins(buffer.identifier,argument(cpu,1),true);finish(cpu,8,success);return;
         case 0x0022E738:audio->frequency(buffer.identifier,argument(cpu,1));finish(cpu,8,success);return;
         case 0x0022E754: {
             const auto destination=argument(cpu,1);
@@ -1199,6 +1351,11 @@ struct Xbox::State {
         if(memory.load<std::uint32_t>(0x00225210)) {gpu->wait();memory.store<std::uint32_t>(context+8,flags|0x2000);}
     }
     void platform(Cpu& cpu,std::uint32_t address) {
+        if(address==0x00128CF8) {
+            const auto error=cancel_io(argument(cpu,0));
+            if(error) set_last_error(cpu,error);
+            finish(cpu,4,error?0U:1U);return;
+        }
         if(address>=0x0022C11B && address<=0x0022FC18) {audio_api(cpu,address);return;}
         if(host.poll && !host.poll()) throw NativeBoundary(address,"Native window closed");
         if(address==0x0021A400) {initialize_graphics(cpu);return;}
@@ -1442,6 +1599,20 @@ struct Xbox::State {
             }
             request.file.reset();request.active=false;--pending_io_count;
         }
+    }
+    std::uint32_t cancel_io(std::uint32_t handle) {
+        const auto file=handles.find(handle);
+        if(file==handles.end() || file->second.kind!=Object::Kind::file) return ERROR_INVALID_HANDLE;
+        for(auto& request:pending_io) if(request.active && request.file_object==file->second.address) {
+            if(!CancelIoEx(request.native,&request.overlap)) {
+                const auto error=GetLastError();if(error!=ERROR_NOT_FOUND) return error;
+            }
+            // Xbox CancelIo waits for its cancelled disc requests. Keep their
+            // buffers alive until Windows completes, then publish real status
+            // and signal the same guest events as ordinary I/O completion.
+            DWORD transferred=0;GetOverlappedResult(request.native,&request.overlap,&transferred,TRUE);
+        }
+        dispatch_io();return ERROR_SUCCESS;
     }
     std::uint32_t open_file(Cpu& cpu,unsigned options_index,unsigned share_index,std::uint32_t disposition,std::uint32_t& information) {
         const auto name=object_name(argument(cpu,2));
@@ -2314,7 +2485,8 @@ void Xbox::capture_frame(const std::filesystem::path& directory) {
         memory.load<std::uint32_t>(0x002FFD7C),memory.load<std::uint32_t>(0x002FFD80),json(hex32(memory.load<std::uint32_t>(0x00522358))));
     // Bounded original title state; collecting it requires an explicit capture.
     constexpr std::pair<std::uint32_t,unsigned> slices[]={{0x002FFD68,0xA0},{0x002FE370,16},{0x00300080,0x60},
-        {0x0034AB40,0x40},{0x003525E0,0x144},{0x0048A150,16},{0x004CD800,32},{0x00522358,12},{0x00489F70,5*0x50}};
+        {0x0034AB40,0x40},{0x003525E0,0x144},{0x0048A150,16},{0x004CD800,32},{0x00522358,12},{0x00489F70,5*0x50},
+        {0x0057C190,0x100},{0x002145A4,4},{0x0024A630,8}};
     for(unsigned i=0;i<std::size(slices);++i) {
         if(i) snapshot<<',';const auto [address,size]=slices[i];
         snapshot<<std::format("{{\"address\":{},\"bytes\":{}}}",json(hex32(address)),json(hex_bytes({static_cast<const std::byte*>(memory.access(address,size)),size})));
@@ -2343,6 +2515,13 @@ void Xbox::capture_frame(const std::filesystem::path& directory) {
                 buffer.identifier,json(hex32(object)),json(hex32(buffer.flags)),json(hex_bytes(std::as_bytes(std::span(buffer.spatial)))),
                 json(hex_bytes(std::as_bytes(std::span(buffer.environment)))),json(hex32(buffer.curve)),buffer.curve_count,json(hex_bytes(curve)),buffer.pending_spatial,buffer.pending_environment);
         }
+        report<<"],\"streams\":[";index=0;
+        for(const auto& [object,stream]:state_->audio_streams) {
+            if(index++) report<<',';
+            report<<std::format("{{\"id\":{},\"object\":{},\"codec\":{},\"channels\":{},\"rate\":{},\"capacity\":{},\"submitted\":{},\"completed\":{},\"status\":{},\"callback\":{},\"context\":{}}}",
+                stream.identifier,json(hex32(object)),stream.format.tag,stream.format.channels,stream.format.rate,
+                stream.packets.size(),stream.submitted,stream.completed,json(hex32(state_->audio->packet_status(stream.identifier))),json(hex32(stream.callback)),json(hex32(stream.context)));
+        }
         const auto count=std::min<std::uint32_t>(state_->audio_event_count,static_cast<std::uint32_t>(state_->audio_events.size()));
         report<<std::format("],\"events_truncated\":{},\"events\":[",state_->audio_event_count>count);
         for(unsigned i=0;i<count;++i) {
@@ -2351,7 +2530,11 @@ void Xbox::capture_frame(const std::filesystem::path& directory) {
             report<<std::format("{{\"clock\":{},\"api\":{},\"caller\":{},\"id\":{},\"source\":{},\"start\":{},\"bytes\":{},\"arguments\":[",
                 event.clock,json(hex32(event.address)),json(hex32(event.caller)),event.identifier,json(hex32(event.source)),event.start,event.bytes);
             for(unsigned a=0;a<event.count;++a) {if(a) report<<',';report<<json(hex32(event.arguments[a]));}
-            report<<"]}";
+            report<<']';
+            if(event.address==0x0022D734)
+                report<<std::format(",\"effect_data\":{},\"effect_data_truncated\":{}",
+                    json(hex_bytes(std::span(event.effect_data).first(event.effect_bytes))),event.effect_bytes<event.arguments[4]);
+            report<<'}';
         }
         report<<"]}";write_text(directory/"audio-game-state.json",report.view(),false);
         state_->audio_event_count=0;state_->audio_trace_until=state_->audio->sample_clock()+480000;state_->audio_trace=true;
@@ -2418,12 +2601,142 @@ std::string check_audio_listener(const std::filesystem::path& executable,const s
     require(state.audio_listener.position==position && state.audio_listener.velocity==std::array<float,3>{} && state.audio_pending_listener==1,"immediate velocity preserves deferred position");
     invoke(0x0022F3F5,std::array<std::uint32_t,1>{state.audio_device});
     require(state.audio_listener.position==std::array<float,3>{} && !state.audio_pending_listener,"mixed immediate/deferred commit");
+    constexpr std::uint32_t descriptor=0xE000,format=0xE040,result=0xE080,packet=0xE100,data=0xE200,completed=0xE300,status=0xE304;
+    memory.store<std::uint32_t>(descriptor,0x20000000);memory.store<std::uint32_t>(descriptor+4,2);memory.store<std::uint32_t>(descriptor+8,format);
+    memory.store<std::uint16_t>(format,1);memory.store<std::uint16_t>(format+2,2);memory.store<std::uint32_t>(format+4,48000);
+    memory.store<std::uint16_t>(format+12,4);memory.store<std::uint16_t>(format+14,16);
+    invoke(0x0022F90E,std::array<std::uint32_t,4>{state.audio_device,descriptor,result,0});
+    const auto stream=memory.load<std::uint32_t>(result),vtable=memory.load<std::uint32_t>(stream);
+    invoke(memory.load<std::uint32_t>(vtable+8),std::array<std::uint32_t,2>{stream,result});
+    require(memory.load<std::uint32_t>(result)==5 && memory.load<std::uint32_t>(result+4)==4 && memory.load<std::uint32_t>(result+12)==256,"original stream info layout and lookahead");
+    const std::array<std::int16_t,8> samples{8192,-8192,4096,-4096,8192,-8192,4096,-4096};std::memcpy(memory.access(data,sizeof(samples)),samples.data(),sizeof(samples));
+    for(unsigned i=0;i<2;++i) {
+        memory.store<std::uint32_t>(packet,data+i*8);memory.store<std::uint32_t>(packet+4,8);
+        memory.store<std::uint32_t>(packet+8,completed+i*8);memory.store<std::uint32_t>(packet+12,status+i*8);
+        invoke(memory.load<std::uint32_t>(vtable+16),std::array<std::uint32_t,3>{stream,packet,0});
+        require(!memory.load<std::uint32_t>(completed+i*8) && memory.load<std::uint32_t>(status+i*8)==0x8000000A,"stream packet remains pending until consumption");
+    }
+    std::array<float,8> mixed{};state.audio->mix(mixed);invoke(0x0022D9CA,{});
+    require(memory.load<std::uint32_t>(completed)==8 && !memory.load<std::uint32_t>(status) && memory.load<std::uint32_t>(completed+8)==8 && !memory.load<std::uint32_t>(status+8),"stream packet completion ABI");
+    require(std::abs(mixed[0]-0.25f*std::pow(10.f,-600.f/2000.f))<0.000001f && mixed[1]==-mixed[0],"stream routing and default headroom");
+    for(const auto flags:std::array<std::uint32_t,3>{1,3,5}) {
+        invoke(0x0022CDA9,std::array<std::uint32_t,3>{stream,packet,0});
+        // The original adapter and these four arguments match the live crash.
+        invoke(0x0022D9AD,std::array<std::uint32_t,4>{stream,0,0,flags});
+        require(!memory.load<std::uint32_t>(completed+8) && memory.load<std::uint32_t>(status+8)==0x8000000A,"asynchronous flush defers packet publication");
+        state.audio->mix(mixed);require(std::ranges::all_of(mixed,[](float value){return value==0;}),"released stream stops mixing");
+        invoke(0x0022D9CA,{});
+        require(memory.load<std::uint32_t>(completed+8)==8 && memory.load<std::uint32_t>(status+8)==(flags&4?0:0x80004004U),"asynchronous flush completion status and size");
+        invoke(0x0022CD58,std::array<std::uint32_t,2>{stream,result});
+        require(memory.load<std::uint32_t>(result)==(flags&4?0x80001U:1U),"stream envelope completion status");
+    }
+    invoke(0x0022CDA9,std::array<std::uint32_t,3>{stream,packet,0});
+    invoke(0x0022D9AD,std::array<std::uint32_t,4>{stream,0,0,5});
+    state.audio->mix(mixed);invoke(0x0022D9CA,{});
+    require(std::ranges::all_of(mixed,[](float value){return value==0;}) && memory.load<std::uint32_t>(status+8)==0x8000000A,"completed envelope retains queued packets without restarting");
+    invoke(0x0022CD0D,std::array<std::uint32_t,1>{stream});
+    require(memory.load<std::uint32_t>(completed+8)==8 && memory.load<std::uint32_t>(status+8)==0x80004004,"regular flush publishes pending packets synchronously");
+    invoke(0x0022CDA9,std::array<std::uint32_t,3>{stream,packet,0});state.audio->mix(mixed);invoke(0x0022D9CA,{});
+    require(mixed[0]!=0 && !memory.load<std::uint32_t>(status+8),"regular flush resets envelope completion for stream reuse");
     const auto report=std::format("{{\"format\":\"b2-audio-binding-check-v1\",\"passed\":true,\"game_booted\":false,\"audio_device_opened\":false,\"cases\":{},\"original_setters\":6}}",checks);
     write_text(output/"audio-bindings.json",report,false);return report;
 }
 bool Xbox::save_frame(const std::filesystem::path& path) {
     if(!state_->gpu || (!state_->gpu->stats().clears && !state_->gpu->stats().draws)) return false;
     state_->gpu->snapshot();save_png(state_->graphics->readback(),path);return true;
+}
+std::string check_music(const std::filesystem::path& executable,const std::filesystem::path& disc_path,const std::filesystem::path& output) {
+    Xbe image(executable);
+    if(!image.supported() || std::filesystem::exists(output)) throw std::runtime_error("Music checks require the verified XBE and a fresh output directory");
+    std::vector<std::byte> ram(64*1024*1024);image.load(std::span(ram).subspan(image.base,image.image_size));Memory memory(0,ram);
+    XboxHost provider;provider.storage_root=output;Xbox xbox(image,memory,ram,disc_path,std::move(provider));auto& state=*xbox.state_;
+    auto& thread=state.create(0,0,0,image.stack_commit,0,false);state.current=&thread;
+    auto& cpu=thread.cpu;cpu.preempt=nullptr;state.diagnostic.remaining=2000000;diagnostic_guest(&cpu);
+    const auto stack=cpu.registers[esp]-4096;
+    const auto invoke=[&](std::uint32_t address,std::initializer_list<std::uint32_t> arguments) {
+        cpu.registers[esp]=stack;memory.store<std::uint32_t>(stack,return_sentinel);
+        unsigned index=0;for(auto value:arguments) memory.store<std::uint32_t>(stack+4+index++*4,value);
+        try {invoke_native(cpu,memory,address);}
+        catch(const std::exception& error) {
+            std::ostringstream failure;
+            failure<<"{\"type\":\"music_check_failure\",\"call\":"<<json(hex32(address))<<",\"eip\":"<<json(hex32(cpu.eip))
+                <<",\"error\":"<<json(error.what())<<",\"registers\":[";
+            for(unsigned i=0;i<8;++i) failure<<(i?",":"")<<json(hex32(cpu.registers[i]));
+            failure<<"],\"stack\":[";
+            for(unsigned i=0;i<16 && memory.try_access(cpu.registers[esp]+i*4,4);++i)
+                failure<<(i?",":"")<<json(hex32(memory.load<std::uint32_t>(cpu.registers[esp]+i*4)));
+            failure<<"]}";diagnostic_record(failure.str());write_text(output/"failure.json",failure.str(),false);throw;
+        }
+        if(cpu.eip!=return_sentinel || cpu.registers[esp]!=stack+4+arguments.size()*4)
+            throw std::runtime_error("Music check calling convention differs at "+hex32(address));
+        return cpu.registers[eax];
+    };
+    const auto require=[](bool passed,std::string_view name) {if(!passed) throw std::runtime_error("Music check failed: "+std::string(name));};
+    memory.store<std::uint32_t>(0xA000,0x30);
+    const auto heap=invoke(0x000E435A,{2,0,image.heap_reserve,image.heap_commit,0,0xA000});
+    require(heap!=0,"original SDK heap initialization");memory.store<std::uint32_t>(0x005A8974,heap);
+    state.audio=std::make_unique<Audio>(false);state.audio_device=0xA008;
+    constexpr std::uint32_t descriptor=0xB000,path=0xB100,result=0xB200,info=0xB240,format=0xB280,stream_descriptor=0xB300,packets=0xB400;
+    const auto buffers=state.allocate(65536*2,page,true,PAGE_READWRITE);require(buffers!=0,"bounded packet buffers");
+    std::ostringstream tracks;
+    for(unsigned track=1;track<=12;++track) {
+        const auto name=std::format("D:\\music1\\b1wma\\{:02}.wma",track);std::memcpy(memory.access(path,name.size()+1),name.c_str(),name.size()+1);
+        diagnostic_record("{\"type\":\"music_check_track\",\"path\":"+json(name)+'}');state.diagnostic.remaining=2000000;
+        // XACT 213A72 uses this original WMA file decoder. Its descriptor is
+        // {filename, existing_handle, offset, lookahead_bytes}; use the real
+        // file provider and its asynchronous reads, without game startup.
+        memory.fill_elements<std::uint32_t>(descriptor,0,4,false);
+        memory.store<std::uint32_t>(descriptor,path);memory.store<std::uint32_t>(descriptor+12,0x20000);
+        require(invoke(0x0024C13F,{descriptor,result})==0,"original WMA file creation");
+        const auto source=memory.load<std::uint32_t>(result),vtable=memory.load<std::uint32_t>(source);
+        const auto ready=[&] {
+            const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+            do {
+                state.dispatch_io();invoke(memory.load<std::uint32_t>(vtable+0x24),{source});
+                require(invoke(memory.load<std::uint32_t>(vtable+12),{source,result})==0,"original WMA status");
+                if(memory.load<std::uint32_t>(result)&2) return;
+                Sleep(1);
+            } while(std::chrono::steady_clock::now()<deadline);
+            throw std::runtime_error("Music check timed out waiting for original WMA input");
+        };
+        ready();require(invoke(memory.load<std::uint32_t>(vtable+8),{source,info})==0,"original WMA packet info");
+        const auto parser=memory.load<std::uint32_t>(source+0x30),rate=memory.load<std::uint32_t>(parser+0x2C);
+        const auto channels=memory.load<std::uint16_t>(parser+0x38),alignment=static_cast<std::uint16_t>(channels*2);
+        const auto packet_bytes=memory.load<std::uint32_t>(info+8);
+        require((channels==1 || channels==2) && rate>=8000 && rate<=48000 && packet_bytes && packet_bytes<=65536 && !(packet_bytes%alignment),"decoded PCM format and packet bounds");
+        memory.store<std::uint16_t>(format,1);memory.store<std::uint16_t>(format+2,channels);memory.store<std::uint32_t>(format+4,rate);
+        memory.store<std::uint32_t>(format+8,rate*alignment);memory.store<std::uint16_t>(format+12,alignment);memory.store<std::uint16_t>(format+14,16);
+        memory.fill_elements<std::uint32_t>(stream_descriptor,0,6,false);memory.store<std::uint32_t>(stream_descriptor,0x20000000);
+        memory.store<std::uint32_t>(stream_descriptor+4,2);memory.store<std::uint32_t>(stream_descriptor+8,format);
+        require(invoke(0x0022F90E,{state.audio_device,stream_descriptor,result,0})==0,"native packet stream creation");
+        const auto stream=memory.load<std::uint32_t>(result);memory.fill_elements<std::uint32_t>(packets,0,32,false);
+        std::vector<float> mixed(96000*2);std::uint64_t decoded_bytes=0;unsigned submissions=0;
+        const auto started=std::chrono::steady_clock::now();
+        for(unsigned frame=0;frame<96000;frame+=512) {
+            for(unsigned slot=0;slot<2;++slot) {
+                const auto packet=packets+slot*64,completed=packet+24,status=packet+28;
+                if(memory.load<std::uint32_t>(status)==0x8000000A) continue;
+                ready();memory.store<std::uint32_t>(packet,buffers+slot*65536);memory.store<std::uint32_t>(packet+4,packet_bytes);
+                memory.store<std::uint32_t>(packet+8,completed);memory.store<std::uint32_t>(packet+12,status);
+                require(invoke(memory.load<std::uint32_t>(vtable+16),{source,0,packet})==0 && memory.load<std::uint32_t>(status)==0,"original WMA decoding");
+                const auto produced=memory.load<std::uint32_t>(completed);require(produced && produced<=packet_bytes && !(produced%alignment),"decoded packet completion");
+                decoded_bytes+=produced;++submissions;memory.store<std::uint32_t>(packet+4,produced);
+                require(invoke(0x0022CDA9,{stream,packet,0})==0,"native PCM packet submission");
+            }
+            state.audio->mix(std::span(mixed).subspan(frame*2,std::min(512U,96000-frame)*2));invoke(0x0022D9CA,{});
+        }
+        double energy=0;float peak=0;for(float value:mixed) {require(std::isfinite(value),"finite mixed output");energy+=double(value)*value;peak=std::max(peak,std::abs(value));}
+        require(peak>0,"audible music output");save_audio_wave(output/std::format("burnout1-{:02}.wav",track),mixed);
+        if(track>1) tracks<<',';
+        tracks<<std::format("{{\"track\":{},\"rate\":{},\"channels\":{},\"frames\":96000,\"packets\":{},\"decoded_bytes\":{},\"peak\":{},\"rms\":{},\"processing_ms\":{}}}",
+            track,rate,channels,submissions,decoded_bytes,peak,std::sqrt(energy/mixed.size()),std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count());
+        require(invoke(0x0022D9AD,{stream,0,0,5})==0,"original XACT asynchronous envelope stop adapter");invoke(0x0022D9CA,{});
+        require(state.audio->packet_status(state.audio_streams.at(stream).identifier)==0x80001,"music stream envelope completion");
+        require(std::ranges::all_of(state.audio_streams.at(stream).packets,[](const auto& packet){return !packet[0];}),"music stop packet publication");
+        require(invoke(0x0022CC0B,{stream})==0,"native stream release");invoke(memory.load<std::uint32_t>(vtable+4),{source});
+    }
+    const auto report=std::format("{{\"format\":\"b2-music-check-v1\",\"passed\":true,\"game_booted\":false,\"audio_device_opened\":false,\"runtime_decoder\":false,\"tracks\":[{}]}}",tracks.view());
+    write_text(output/"music.json",report,false);return report;
 }
 std::string check_storage(const std::filesystem::path& executable,const std::filesystem::path& output) {
     Xbe image(executable);

@@ -6,9 +6,8 @@ Set-Location -LiteralPath $projectRoot
 $buildRoot = Join-Path $projectRoot 'build'
 $logRoot = Join-Path $buildRoot 'setup'
 $gameDirectory = Join-Path $buildRoot 'windows\Release'
-[IO.Directory]::CreateDirectory($logRoot) | Out-Null
 $logPath = Join-Path $logRoot 'build.log'
-[IO.File]::WriteAllText($logPath, '', [Text.UTF8Encoding]::new($false))
+$buildLock = $null
 $workers = [Collections.Generic.Dictionary[int,object]]::new()
 $cancelled = $false
 $busy = $true
@@ -16,7 +15,7 @@ $step = 0
 $form = $null
 
 function Show-Status([string]$message) {
-    [IO.File]::AppendAllText($logPath, "$message`r`n")
+    if ($buildLock) { [IO.File]::AppendAllText($logPath, "$message`r`n") }
     if ($NoGui) { Write-Host $message }
     else { $status.Text = $message; [Windows.Forms.Application]::DoEvents() }
 }
@@ -40,6 +39,7 @@ function Record-Workers($process) {
 }
 
 function Stop-Workers {
+    if (!$workers.Count) { return }
     foreach ($record in $workers.Values) {
         $live = Get-CimInstance Win32_Process -Filter "ProcessId=$($record.Id)"
         if ($live -and $live.CreationDate.ToUniversalTime().Ticks -eq $record.Ticks) {
@@ -47,6 +47,7 @@ function Stop-Workers {
         }
     }
     @($workers.Values) | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $logRoot 'workers.json')
+    $workers.Clear()
 }
 
 function Run-Step([string]$message, [string]$program, [string[]]$arguments) {
@@ -72,20 +73,58 @@ function Run-Step([string]$message, [string]$program, [string[]]$arguments) {
             }
         }
         $process.WaitForExit()
-        foreach ($path in @($outputPath, $errorPath)) {
-            $source = [IO.File]::OpenRead($path)
-            $destination = [IO.File]::Open($logPath, [IO.FileMode]::Append, [IO.FileAccess]::Write)
-            try { $source.CopyTo($destination) } finally { $source.Dispose(); $destination.Dispose() }
-        }
         if ($process.ExitCode -ne 0) { throw "$message failed. Open the build log for details." }
-    } finally { Stop-Workers; $process.Dispose() }
+    } finally {
+        try {
+            Record-Workers $process
+            Stop-Workers
+            if (!$process.HasExited) { $process.Kill() }
+            $process.WaitForExit()
+            foreach ($path in @($outputPath, $errorPath)) {
+                $source = [IO.File]::OpenRead($path)
+                $destination = [IO.File]::Open($logPath, [IO.FileMode]::Append, [IO.FileAccess]::Write)
+                try { $source.CopyTo($destination) } finally { $source.Dispose(); $destination.Dispose() }
+            }
+        } finally { $process.Dispose() }
+    }
 }
 
-function Find-Program([string]$name, [string[]]$candidates) {
-    $command = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($command) { return $command.Source }
-    foreach ($candidate in $candidates) { if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate } }
+function Find-Program([string]$name, [string[]]$candidates, [version]$minimum) {
+    $paths = @((Get-Command $name -CommandType Application -All -ErrorAction SilentlyContinue).Source) + $candidates
+    foreach ($candidate in $paths | Select-Object -Unique) {
+        if (!$candidate -or !(Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        if ($minimum) {
+            $versionLine = @(& $candidate --version)[0]
+            if ($LASTEXITCODE -ne 0 -or $versionLine -notmatch 'cmake version (\d+\.\d+\.\d+)' -or [version]$Matches[1] -lt $minimum) { continue }
+        }
+        return $candidate
+    }
+    if ($minimum) { throw "$name $minimum or newer is required. Install it from the link in README.md." }
     throw "$name is missing. Install the build requirements listed in README.md."
+}
+
+function Configure-Step([string]$message, [string]$directory, [string[]]$arguments) {
+    $directory = [IO.Path]::GetFullPath($directory)
+    if (!$directory.StartsWith("$buildRoot\", [StringComparison]::OrdinalIgnoreCase)) { throw 'Invalid build directory.' }
+    $cachePath = Join-Path $directory 'CMakeCache.txt'
+    if (Test-Path -LiteralPath $cachePath) {
+        $cached = @{}
+        foreach ($line in [IO.File]::ReadAllLines($cachePath)) {
+            if ($line -match '^(CMAKE_HOME_DIRECTORY|CMAKE_CACHEFILE_DIR|CMAKE_GENERATOR|CMAKE_GENERATOR_PLATFORM|CMAKE_GENERATOR_INSTANCE):[^=]+=(.*)$') {
+                $cached[$Matches[1]] = $Matches[2]
+            }
+        }
+        $expected = @{ CMAKE_HOME_DIRECTORY=$projectRoot; CMAKE_CACHEFILE_DIR=$directory;
+            CMAKE_GENERATOR='Visual Studio 18 2026'; CMAKE_GENERATOR_PLATFORM='x64'; CMAKE_GENERATOR_INSTANCE=$visualStudio }
+        foreach ($key in $expected.Keys) {
+            if (!$cached.ContainsKey($key) -or $cached[$key].Replace('\', '/') -ne $expected[$key].Replace('\', '/')) {
+                # CMake clears only its own configuration metadata, preserving game files and saves.
+                $arguments = @('--fresh') + $arguments
+                break
+            }
+        }
+    }
+    Run-Step $message $cmake $arguments
 }
 
 function Copy-Changed([string]$source, [string]$destination) {
@@ -130,23 +169,27 @@ if (!$NoGui) {
 $importDirectory = $null
 $exitCode = 0
 try {
+    [IO.Directory]::CreateDirectory($logRoot) | Out-Null
+    try {
+        $buildLock = [IO.File]::Open((Join-Path $logRoot 'build.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    } catch [IO.IOException] {
+        if (($_.Exception.HResult -band 0xffff) -in 32, 33) { throw 'A build is already running in this folder. Wait for it to finish.' }
+        throw
+    }
+    [IO.File]::WriteAllText($logPath, '', [Text.UTF8Encoding]::new($false))
     Show-Status 'Checking build requirements...'
     if (![Environment]::Is64BitOperatingSystem) { throw 'A 64-bit Windows PC is required.' }
     $vswhere = Find-Program 'vswhere.exe' @("${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe")
     $visualStudio = & $vswhere -latest -products '*' -version '[18.0,19.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
     if (!$visualStudio) { throw 'Install Visual Studio 2026 with Desktop development with C++, including the Windows SDK.' }
-    $cmake = Find-Program 'cmake.exe' @("$env:ProgramFiles\CMake\bin\cmake.exe", "$visualStudio\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe")
-    $versionLine = (& $cmake --version)[0]
-    if ($versionLine -notmatch 'cmake version (\d+\.\d+\.\d+)' -or [version]$Matches[1] -lt [version]'4.2.0') {
-        throw 'CMake 4.2 or newer is required. Install it from the link in README.md.'
-    }
+    $cmake = Find-Program 'cmake.exe' @("$env:ProgramFiles\CMake\bin\cmake.exe", "$visualStudio\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe") ([version]'4.2.0')
     $git = Find-Program 'git.exe' @("$env:ProgramFiles\Git\cmd\git.exe", "$visualStudio\Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\Git\cmd\git.exe")
     $env:PATH = "$(Split-Path -Parent $cmake);$(Split-Path -Parent $git);$env:PATH"
     $env:MSBUILDDISABLENODEREUSE = '1'
     if (!$DiscImage) {
         if ($NoGui) { throw 'Specify -DiscImage for a build without the file picker.' }
         $picker = [Windows.Forms.OpenFileDialog]::new()
-        $picker.Title = 'Select your US Burnout 2 Xbox disc image'
+        $picker.Title = 'Select your US Burnout 2 Xbox XISO disc image'
         $picker.Filter = 'Xbox disc images (*.iso;*.xiso)|*.iso;*.xiso'
         try {
             if ($picker.ShowDialog($form) -ne 'OK') { $script:cancelled = $true; throw 'Build cancelled.' }
@@ -154,8 +197,9 @@ try {
         } finally { $picker.Dispose() }
     }
     $DiscImage = (Resolve-Path -LiteralPath $DiscImage).Path
+    if (!(Test-Path -LiteralPath $DiscImage -PathType Leaf)) { throw 'Select an Xbox XISO disc image file.' }
     $bootstrap = Join-Path $buildRoot 'bootstrap'
-    Run-Step 'Preparing the build tools...' $cmake @('--preset', 'windows', '-B', $bootstrap, '-DB2_XBE=', "-DCMAKE_GENERATOR_INSTANCE=$visualStudio")
+    Configure-Step 'Preparing the build tools...' $bootstrap @('--preset', 'windows', '-B', $bootstrap, '-DB2_XBE=', "-DCMAKE_GENERATOR_INSTANCE=$visualStudio")
     Run-Step 'Building the game-file reader...' $cmake @('--build', $bootstrap, '--config', 'Release', '--target', 'b2-tool', '--parallel', '2', '--', '/nodeReuse:false')
     $tool = Join-Path $bootstrap 'Release\b2-tool.exe'
     $importDirectory = Join-Path $logRoot ([Guid]::NewGuid().ToString())
@@ -171,15 +215,16 @@ try {
     $localEffects = Join-Path $localDirectory 'b2distfx.bin'
     Copy-Changed $importXbe $localXbe
     Copy-Changed $importEffects $localEffects
-    Run-Step 'Preparing the game build...' $cmake @('--preset', 'windows', "-DB2_XBE=$localXbe", "-DB2_EFFECTS=$localEffects", "-DCMAKE_GENERATOR_INSTANCE=$visualStudio")
+    Configure-Step 'Preparing the game build...' (Join-Path $buildRoot 'windows') @('--preset', 'windows', "-DB2_XBE=$localXbe", "-DB2_EFFECTS=$localEffects", "-DCMAKE_GENERATOR_INSTANCE=$visualStudio")
     Run-Step 'Building the game. The first build can take a while...' $cmake @('--build', '--preset', 'release')
     $runtimeLocal = Join-Path $gameDirectory 'data\local'
     [IO.Directory]::CreateDirectory($runtimeLocal) | Out-Null
     Copy-Changed $localXbe (Join-Path $runtimeLocal 'default.xbe')
     $settingsPath = Join-Path $runtimeLocal 'settings.cfg'
-    if (!(Test-Path -LiteralPath $settingsPath)) {
-        [IO.File]::WriteAllLines($settingsPath, @("xbe=$(Join-Path $runtimeLocal 'default.xbe')", "disc=$DiscImage"), [Text.UTF8Encoding]::new($false))
-    }
+    $settings = @()
+    if (Test-Path -LiteralPath $settingsPath) { $settings = [IO.File]::ReadAllLines($settingsPath) }
+    $settings = @('xbe=data/local/default.xbe', "disc=$DiscImage") + @($settings | Where-Object { $_ -notmatch '^(xbe|disc)=' })
+    [IO.File]::WriteAllLines($settingsPath, $settings, [Text.UTF8Encoding]::new($false))
     Show-Status 'Ready. Open the game folder and double-click b2.exe.'
     if (!$NoGui) { $openButton.Enabled = $true }
 } catch {
@@ -194,6 +239,7 @@ try {
         }
         Remove-Item -LiteralPath $importDirectory
     }
+    if ($buildLock) { $buildLock.Dispose(); $buildLock = $null }
     $busy = $false
 }
 if (!$NoGui) {

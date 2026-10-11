@@ -11,7 +11,19 @@ game is still being tested.</i>
 Yes, AI was used in the development of this project. No, this project was not blindly thrown together.
 If you're skeptical, I implore you to try the recompilation for yourself. I take quality control quite seriously!😊
 
-## What's new in 1.1
+## What's new in 1.2
+
+- Fixed crashes when starting races and proceeding with Burnout 1 music enabled.
+- Fixed crackling caused by abrupt sound and effect control changes across the
+  shared audio mixer.
+- Disabling frame interpolation now allows gameplay to run at the selected rate
+  above 60 Hz. Higher rates speed up gameplay when interpolation is off.
+- Fixed intermittent slowdowns caused by interpolated frames blocking gameplay.
+- Fixed fresh-install build failures from issue #13, including build folders with
+  non-English names. Setup now handles outdated tools, repeated builds, moved
+  folders and cancellation more reliably, while preserving settings and saves.
+
+## Performance improvements in 1.1
 
 **Major performance improvements:** typical frame time fell from **23.12 to
 16.67 ms**, slow-frame time (99th percentile) from **30.84 to 17.95 ms**, and
@@ -68,7 +80,8 @@ own copy of the US Xbox release. Game files are not included.
    [Git for Windows](https://git-scm.com/downloads/win).
 2. Download [Installation.zip](https://github.com/timftw21/burnout2-recompilation/releases/latest/download/Installation.zip)
    and extract it, or clone the repository.
-3. Double-click **Build.cmd** and select your US Xbox disc image (`.iso` or `.xiso`).
+3. Double-click **Build.cmd** and select your US Xbox XISO disc image (`.iso` or `.xiso`).
+   Use a partition-only XISO; full-disc dumps need conversion to XISO first.
    The builder prepares the game files, downloads dependencies and builds the app.
    The first build can take a while; later builds reuse previous work.
 4. Click **Open game folder**, then double-click **b2.exe**.
@@ -77,7 +90,8 @@ There are no commands to type. If building fails, click **Open build log**.
 The [developer build instructions](https://github.com/timftw21/burnout2-recompilation/blob/main/BUILDING.txt)
 also cover offline debugging.
 
-The builder fills in the game-file locations on first setup. Click **Start game**
+The builder updates the game-file locations after each successful build while
+keeping your other settings and saves. Click **Start game**
 in the settings window. Press **Esc** to open or close settings, with
 **General**, **Audio**, **Graphics** and **Controls** tabs. The game defaults to
 **60 Hz**; choose another rate in General. Click **Save settings** to keep changes.
@@ -91,8 +105,9 @@ In **Graphics**, choose **Internal resolution** from 1× (640 × 480) to
 Resolution changes apply when you start the game. If you change it while playing,
 save your settings and restart the app.
 In **General**, selecting a rate above 60 Hz turns on **Frame interpolation**.
-Uncheck it if you prefer to keep it off, then save your settings. Gameplay stays
-at 60 Hz. Interpolation adds about one frame of display delay and may show
+Uncheck it if you prefer to keep it off, then save your settings. With interpolation
+on, gameplay stays at 60 Hz; with it off, higher rates speed up gameplay.
+Interpolation adds about one frame of display delay and may show
 artifacts around fast movement. **Show frame rate** displays the current game
 and display FPS in the upper-right corner.
 

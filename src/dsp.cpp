@@ -61,6 +61,29 @@ std::uint32_t Dsp::load(std::uint32_t address) {
     if(address==0xFFFFC5) return interrupts;
     throw std::runtime_error(std::format("Unbound DSP X read {:06X}",address));
 }
+std::uint32_t Dsp::coefficient(unsigned index) const {
+    const auto target=x[compiled_effect_coefficients()[index]];
+    const auto remaining=coefficient_remaining[index];
+    if(!remaining) return target;
+    const auto origin=signed24(coefficient_origins[index]);
+    return static_cast<std::uint32_t>(origin+(static_cast<std::int64_t>(signed24(target))-origin)*
+        (coefficient_blocks-remaining)/coefficient_blocks)&0xFFFFFF;
+}
+void Dsp::parameter(std::uint32_t address,std::uint32_t value,bool continuous) {
+    const auto words=compiled_effect_coefficients();
+    const auto found=std::ranges::find(words,address);
+    if(found!=words.end()) {
+        const auto index=static_cast<unsigned>(found-words.begin());
+        if(!continuous) coefficient_remaining[index]=0;
+        else if(load(address)!=(value&0xFFFFFF)) {
+            coefficient_origins[index]=coefficient(index);coefficient_remaining[index]=coefficient_blocks;
+        }
+    }
+    store(address,value);
+}
+void Dsp::advance_coefficients() {
+    for(unsigned i=0;i<compiled_effect_coefficients().size();++i) if(coefficient_remaining[i]) --coefficient_remaining[i];
+}
 void Dsp::store(std::uint32_t address,std::uint32_t value) {
     address&=0xFFFFFF;value&=0xFFFFFF;
     if(address>=0x1400 && address<0x1800) address-=0x800;

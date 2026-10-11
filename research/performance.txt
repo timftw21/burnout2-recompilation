@@ -365,3 +365,69 @@ still occasionally miss the individual-frame budget; this is not evidence of
 locked 60 FPS in every frame or across other modes. No additional runtime change,
 build or test was needed to inspect the recording. Comparison detail is in the
 ignored build/perf-fifth-comparison.json; preserve the supplied private capture.
+
+2026-10-10: intermittent interpolation / VSync presentation starvation
+
+The four latest F8 captures are frame-42608555900, frame-45038849300,
+frame-51858295000 and frame-63992850700. They contain 684, 712, 707 and
+742 draws respectively, without truncation. Their audio callbacks remain below
+2.143 ms within a 10 ms budget. F8 was used without F9, so these snapshots do
+not provide frame timing or identify the cost of the slowdown by themselves.
+
+The user reproduced the slowdown in performance-42771140900. The native
+inspector accepts its binary. Ryzen 5 5600X / RTX 5060 Ti, 144 Hz, 1x,
+interpolation on, VSync on, executable PE 6ACAFB59 / image 62300160 bytes.
+44 frame records, 43 complete intervals, 4.637 seconds; no capture IO, recorder
+capacity loss, resource/shader creation or over-budget audio batches.
+Complete intervals average 9.439 FPS, median 110.566 ms, maximum 208.368 ms.
+Present consumes 4155.903 ms / 91.230% of their wall time. Everything outside
+Present averages 9.291 ms per complete frame. The slowest frame has 22 display
+presentations taking 196.740 ms, with only 653 game draws.
+
+Root cause: extra-frame presentation happens in the same main-thread poll
+used between guest execution slices and platform calls. Synchronous VSync
+Present can block until the previous display entry completes. Once the queue
+backs up, each poll can consume another display interval. Original game work
+continues only in the small gaps, explaining low CPU usage and normal per-frame
+game work despite very long source intervals. The old hidden-window timing
+checks used VSync off and no work between source flips, missing this condition.
+
+The window swap chain now exposes its frame-latency availability handle with
+one queued frame. Interpolated display checks it with a zero timeout before
+touching the back buffer and uses DXGI_PRESENT_DO_NOT_WAIT for submission.
+A busy queue skips that display opportunity; it never blocks guest execution.
+VSync stays selected and source pacing retains its 60 Hz interpolated cadence
+and selected-rate interpolation-off behavior. If a nonblocking Present cannot
+submit, the acquired frame slot remains available for the next attempt. Only
+successful submissions advance the presented-frame counter. Window resizing
+preserves the required swap-chain flag; the owned handle closes on destruction.
+
+The existing hidden-window diagnostic now combines nine 1 ms CPU work slices
+per source frame with a 1000 Hz / VSync-on extra-frame workload. This is a
+bounded component check without game boot, not a gameplay FPS measurement.
+Availability waits remain accounted to Present and are outside GPU spans.
+Baseline report: build/checks/present-stall-baseline.
+
+Primary API contracts:
+https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/dxgi-present
+https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-getframelatencywaitableobject
+https://learn.microsoft.com/en-us/windows/uwp/gaming/reduce-latency-with-dxgi-1-3-swap-chains
+
+Validation of the presentation change:
+- Release rebuild succeeds; no owned compiler, linker or diagnostic workers
+  remain. No game boot or computer use was performed.
+- RTX 5060 Ti hidden-window checks pass: 59.937 Hz source cadence under the
+  VSync-on 1000 Hz presentation workload, 60.000 Hz source / 144.020 Hz display
+  in the normal interpolation case, and original 120.000/144.000 Hz when off.
+  The live checkbox opt-out measures 143.999 Hz with no extra images.
+- WARP hidden-window checks pass for settings, resizing, interpolation images,
+  selected-rate pacing and opt-out. Performance stress is hardware-only.
+- All 183 hardware rendering cases pass with no D3D11 messages. All 162 shared
+  output PNGs match the previous perf-third-render outputs byte for byte.
+- The new window recording passes native binary inspection, with a 16.667 ms
+  median source interval. Its intentional GPU-span overflow remains explicitly
+  partial; recorder frame/sample/cost/resource capacities were not exceeded.
+Reports: build/checks/present-stall-window.png.performance,
+present-stall-window-warp.png.performance, present-stall-window-inspect and
+present-stall-render. A manual recording must measure gameplay after the fix;
+these offline results do not establish in-game FPS.

@@ -63,6 +63,10 @@ std::string utf8(std::wstring_view text) {
     return result;
 }
 
+std::filesystem::path utf8_path(std::string_view text) {
+    return std::filesystem::path(std::u8string_view(reinterpret_cast<const char8_t*>(text.data()),text.size()));
+}
+
 std::string json(std::string_view text) {
     std::string result = "\"";
     for (unsigned char c : text) {

@@ -1,9 +1,11 @@
 Optional presentation interpolation
 
-The GUI presents completed original frames at an independent display rate.
-Source flips and the existing Xbox video callback stay at 60 Hz. Interpolation
-is enabled when selecting a rate above 60 Hz; a manual opt-out persists until
-another rate is selected. It adds approximately one source frame of display
+With interpolation on, the GUI presents completed original frames at an
+independent display rate and source flips stay at 60 Hz. With interpolation off,
+source flips use the selected rate and each original frame is presented once.
+The existing Xbox video callback stays at 60 Hz. Interpolation is enabled when
+selecting a rate above 60 Hz; a manual opt-out persists until another rate is
+selected. It adds approximately one source frame of display
 delay: after the latest source frame arrives, display times traverse the
 previous/latest pair.
 Stalls over 100 ms, new sessions and enabling the feature reset its history.
@@ -47,3 +49,27 @@ The method cannot reconstruct unseen geometry or ensure artifact-free fast motio
 The Microsoft software renderer also passes the image checks, with 139.944 ms
 component time; its high-rate timing cases use unmodified frames. These are
 synthetic component checks, not game FPS measurements.
+
+2026-10-10 manual opt-out pacing correction:
+The user's 144 Hz/interpolation-off log b2-20261011-014158-17388.log reports
+59.756 source FPS, 143.970 presented FPS and zero generated frames. The renderer
+was disabled correctly, but App::game_flip always paced original frames at
+60 Hz. The user explicitly requested original frames at the selected higher
+rate with interpolation disabled, including the resulting movement speedup.
+Choose the source pacing rate from the active mode: 60 for interpolation, the
+selected rate otherwise. The disabled path presents only on original flips;
+polling still handles input but does not present duplicate frames. Settings
+changes during pacing re-evaluate the source rate without a catch-up burst.
+The existing hidden-window diagnostic checks original 120/144 Hz pacing, the
+unchanged interpolated 60/144 Hz path, and a live checkbox-path opt-out at
+144 Hz with no generated or repeated images. These remain no-boot component
+checks; live movement behavior still requires manual verification.
+
+Validation: release build and hidden-window checks pass on RTX 5060 Ti and
+Microsoft's software renderer. With interpolation off, original-frame cadence
+is 120.000/144.000 Hz; hardware presentation is 120.021/144.025 Hz. A live
+opt-out changes original-frame cadence to 143.999 Hz, generating no additional
+images. With interpolation on, original frames remain 60.000 Hz and hardware
+presentation is 144.031 Hz. No D3D11 warnings or runtime shader compilations.
+Reports/images: build/checks/interpolation-opt-out. No game boot, computer use
+or edits to saved player preferences; no owned workers survive the checks.

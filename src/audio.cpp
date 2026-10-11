@@ -83,11 +83,12 @@ struct Audio::Effects {
         for(const auto& effect:image.effects) program.insert(program.end(),effect.code.begin(),effect.code.end());
         program.resize(image.program_words*4);
     }
-    auto fields() {
+    auto legacy_fields() {
         return std::tie(state.x,state.registers,state.accumulators,state.dma_next,state.dma_control,state.interrupts,
             state.transferred_words,state.work_remaining,state.active_effect,state.negative,state.zero,state.overflow,
             pending,dirty,dirty_first,dirty_end,count,available,cursor,reverb,output);
     }
+    auto fields() {return std::tuple_cat(legacy_fields(),std::tie(state.coefficient_origins,state.coefficient_remaining));}
 };
 namespace {
 struct Level {
@@ -120,6 +121,20 @@ struct Audio::Probe {
     std::array<Level,256> decoded,sent;
     std::array<Level,32> bins,dsp;
 };
+void save_audio_wave(const std::filesystem::path& path,std::span<const float> stereo) {write_wav(path,stereo);}
+struct Audio::Packets {
+    struct Packet {std::span<const std::byte> data;AudioCompletion completion;};
+    std::vector<Packet> slots;
+    unsigned head=0,count=0,done=0;
+    bool paused=false,started=false,discontinuous=false,envelope_complete=false;
+    explicit Packets(unsigned capacity):slots(capacity) {}
+};
+struct Audio::Live {
+    struct Callback {std::uint64_t start=0,elapsed=0;std::uint32_t clock=0,requested=0,delivered=0;};
+    std::vector<float> samples=std::vector<float>(48000*2*10);
+    std::array<Callback,2048> callbacks{};
+    unsigned sample_count=0,callback_count=0;
+};
 struct Audio::Capture {
     std::array<VoiceState,256> voices{};
     std::array<std::uint32_t,256> offsets{};
@@ -131,11 +146,21 @@ struct Audio::Capture {
 std::unique_ptr<Audio::Capture> Audio::snapshot() {
     auto capture=std::make_unique<Capture>();
     std::array<std::span<const std::byte>,256> sources;
+    std::array<std::vector<std::byte>,256> queued;
     std::vector<std::pair<std::uintptr_t,std::uintptr_t>> ranges;ranges.reserve(256);
     {
         StreamLock lock(stream_);
         for(unsigned i=0;i<voices_.size();++i) {
             capture->voices[i]=static_cast<const VoiceState&>(voices_[i]);sources[i]=voices_[i].source;
+            if(const auto* packets=voices_[i].packets.get()) {
+                for(unsigned n=packets->done;n<packets->count;++n) {
+                    const auto data=packets->slots[(packets->head+n)%packets->slots.size()].data;
+                    queued[i].insert(queued[i].end(),data.begin(),data.end());
+                }
+                sources[i]=queued[i];auto& state=capture->voices[i];
+                state.source_address=0;state.play_start=0;state.byte_count=static_cast<std::uint32_t>(sources[i].size());
+                state.play_frames=frames(state.format,state.byte_count);state.loop_frames=state.play_frames;
+            }
             if(!sources[i].empty()) {
                 const auto first=reinterpret_cast<std::uintptr_t>(sources[i].data());
                 ranges.emplace_back(first,first+sources[i].size());
@@ -178,6 +203,7 @@ void Audio::restore(const Capture& capture) {
             !std::isfinite(value.cursor) || value.cursor<0 || !std::isfinite(value.step) || value.step<=0 ||
             !std::isfinite(value.spatial_pitch) || value.spatial_pitch<=0 ||
             invalid(value.gain) || invalid(value.headroom) || invalid(value.spatial_gain) ||
+            std::ranges::any_of(value.previous_gains,invalid) ||
             std::ranges::any_of(value.block,invalid) || std::ranges::any_of(value.bin_gains,invalid) ||
             std::ranges::any_of(value.spatial_pan,invalid) || std::ranges::any_of(value.front_back,invalid) ||
             std::ranges::any_of(value.environment_gain,invalid) ||
@@ -225,28 +251,50 @@ void Audio::capture(const std::filesystem::path& directory) {
     }
     file.write(reinterpret_cast<const char*>(saved->data.data()),saved->data.size());
     if(!file) throw std::runtime_error("Audio capture write failed");
+    auto next=stream_?std::make_unique<Live>():nullptr;
+    {StreamLock lock(stream_);next.swap(live_);}
+    if(next) {
+        write_wav(directory/"audio-live.wav",std::span(next->samples).first(next->sample_count));
+        std::string callbacks;
+        for(unsigned i=0;i<next->callback_count;++i) {
+            const auto& item=next->callbacks[i];if(i) callbacks+=',';
+            callbacks+=std::format("{{\"start_ns\":{},\"elapsed_ns\":{},\"clock\":{},\"requested_bytes\":{},\"delivered_frames\":{}}}",
+                item.start,item.elapsed,item.clock,item.requested,item.delivered);
+        }
+        SDL_AudioSpec device{};int device_frames=0;
+        const bool known=stream_ && SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(stream_),&device,&device_frames);
+        write_text(directory/"audio-live.json",std::format("{{\"format\":\"b2-live-audio-v1\",\"frames\":{},\"rate\":48000,\"master_gain_applied\":false,\"device_driver\":{},\"device_rate\":{},\"device_buffer_frames\":{},\"callbacks\":[{}]}}",
+            next->sample_count/2,json(stream_?SDL_GetCurrentAudioDriver():"offline"),known?device.freq:0,known?device_frames:0,callbacks),false);
+    }
 }
 std::string Audio::inspect_capture(const std::filesystem::path& source,const std::filesystem::path& image_path,
                                  const std::filesystem::path& output) {
     if(std::filesystem::exists(output)) throw std::runtime_error("Audio inspection requires a fresh output directory");
     File file(source);const auto header=file.read(0,32);
-    if(std::memcmp(header.data(),"B2AUD001",8) || u32(header,8)!=sizeof(VoiceState) || u32(header,28)!=256 ||
+    if(std::memcmp(header.data(),"B2AUD001",8) || (u32(header,8)!=sizeof(VoiceState) && u32(header,8)!=sizeof(VoiceControls)) || u32(header,28)!=256 ||
         u32(header,12)>64*1024*1024 || u32(header,24)>16*1024*1024)
         throw std::runtime_error("Unsupported audio capture format or bounds");
     auto saved=std::make_unique<Capture>();saved->clock=u32(header,16);std::uint64_t position=32;
     const auto read=[&](auto& value){file.read(position,std::as_writable_bytes(std::span(&value,1)));position+=sizeof(value);};
-    read(saved->voices);read(saved->offsets);read(saved->headroom);
+    if(u32(header,8)==sizeof(VoiceState)) read(saved->voices);
+    else for(auto& voice:saved->voices) read(static_cast<VoiceControls&>(voice));
+    read(saved->offsets);read(saved->headroom);
     if(u32(header,20)) {
         File effects_file(image_path);if(effects_file.size()>65536) throw std::runtime_error("Captured audio effect image exceeds 64 KiB");
         const auto image=decode_effects(effects_file.read(0,static_cast<std::size_t>(effects_file.size())));
         if(!compiled_effects_match(image)) throw std::runtime_error("Captured audio needs its statically compiled effect image");
         saved->effects=std::make_unique<Effects>(image,UINT32_MAX);
-        if(u32(header,20)!=field_size(saved->effects->fields()) || u32(header,24)!=saved->effects->state.scratch.size())
+        if((u32(header,20)!=field_size(saved->effects->fields()) && u32(header,20)!=field_size(saved->effects->legacy_fields())) ||
+            u32(header,24)!=saved->effects->state.scratch.size())
             throw std::runtime_error("Captured audio effect layout differs from this build");
-        std::apply([&](auto&... value){(read(value),...);},saved->effects->fields());
+        std::apply([&](auto&... value){(read(value),...);},saved->effects->legacy_fields());
+        if(u32(header,20)==field_size(saved->effects->fields())) {
+            read(saved->effects->state.coefficient_origins);read(saved->effects->state.coefficient_remaining);
+        }
         auto& effect=*saved->effects;
         if(effect.count!=image.effects.size() || effect.available>32 || effect.cursor>32 || effect.available+effect.cursor>32 ||
             effect.dirty_first>0x6000 || effect.dirty_end>0x6000 ||
+            std::ranges::any_of(effect.state.coefficient_remaining,[](unsigned count){return count>Dsp::coefficient_blocks;}) ||
             std::ranges::any_of(effect.output,[](float sample){return !std::isfinite(sample);}))
             throw std::runtime_error("Invalid captured audio effect block");
         file.read(position,effect.state.scratch);position+=effect.state.scratch.size();
@@ -279,9 +327,9 @@ std::string Audio::inspect_capture(const std::filesystem::path& source,const std
             if(n) assignments+=',';const auto bin=voice.bins[n];
             assignments+=std::format("{{\"bin\":{},\"gain\":{},\"headroom_shift\":{}}}",bin,voice.bin_gains[bin],saved->headroom[bin]);
         }
-        voices+=std::format("{{\"id\":{},\"playing\":{},\"loop\":{},\"bus\":{},\"input_bin\":{},\"route\":{},\"source_address\":{},\"bytes\":{},\"codec\":{},\"channels\":{},\"rate\":{},\"cursor\":{},\"play_start\":{},\"play_frames\":{},\"loop_start\":{},\"loop_frames\":{},\"gain\":{},\"headroom\":{},\"spatial_gain\":{},\"pan\":[{},{}],\"environment_gain\":[{},{}],\"front_back\":[{},{}],\"bins\":[{}],\"payload\":{},\"decoded\":{},\"sent\":{}}}",
+        voices+=std::format("{{\"id\":{},\"playing\":{},\"loop\":{},\"bus\":{},\"input_bin\":{},\"route\":{},\"source_address\":{},\"bytes\":{},\"codec\":{},\"channels\":{},\"rate\":{},\"step\":{},\"spatial_pitch\":{},\"cursor\":{},\"play_start\":{},\"play_frames\":{},\"loop_start\":{},\"loop_frames\":{},\"gain\":{},\"headroom\":{},\"spatial_gain\":{},\"pan\":[{},{}],\"environment_gain\":[{},{}],\"front_back\":[{},{}],\"bins\":[{}],\"payload\":{},\"decoded\":{},\"sent\":{}}}",
             i+1,voice.playing,voice.loop,static_cast<unsigned>(voice.bus),voice.input_bin,voice.route,json(hex32(voice.source_address)),voice.byte_count,
-            voice.format.tag,voice.format.channels,voice.format.rate,voice.cursor,voice.play_start,voice.play_frames,voice.loop_start,voice.loop_frames,
+            voice.format.tag,voice.format.channels,voice.format.rate,voice.step,voice.spatial_pitch,voice.cursor,voice.play_start,voice.play_frames,voice.loop_start,voice.loop_frames,
             voice.gain,voice.headroom,voice.spatial_gain,voice.spatial_pan[0],voice.spatial_pan[1],voice.environment_gain[0],voice.environment_gain[1],
             voice.front_back[0],voice.front_back[1],assignments,payload[i].report(),probe.decoded[i].report(),probe.sent[i].report());
     }
@@ -320,6 +368,11 @@ Audio::Audio(bool output,float gain) {
     stream_=SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,&specification,
         [](void* context,SDL_AudioStream* stream,int additional,int) {
             auto& audio=*static_cast<Audio*>(context);
+            auto* live=audio.live_.get();Live::Callback* recorded=nullptr;
+            if(live && live->sample_count<live->samples.size() && live->callback_count<live->callbacks.size()) {
+                recorded=&live->callbacks[live->callback_count++];
+                *recorded={performance_clock(),0,audio.sample_clock(),static_cast<std::uint32_t>(std::max(additional,0)),0};
+            }
             std::array<float,1024> buffer{};
             while(additional>0) {
                 const auto frames=std::min<std::size_t>((static_cast<unsigned>(additional)+7)/8,buffer.size()/2);
@@ -330,8 +383,14 @@ Audio::Audio(bool output,float gain) {
                 const int bytes=static_cast<int>(frames*2*sizeof(float));
                 if(!SDL_PutAudioStreamData(stream,buffer.data(),bytes)) {audio.failed_=true;
                     std::snprintf(audio.failure_.data(),audio.failure_.size(),"%s",SDL_GetError());break;}
+                if(recorded) {
+                    const auto count=std::min<std::size_t>(frames*2,live->samples.size()-live->sample_count);
+                    std::copy_n(buffer.data(),count,live->samples.data()+live->sample_count);live->sample_count+=static_cast<unsigned>(count);
+                    recorded->delivered+=static_cast<std::uint32_t>(frames);
+                }
                 additional-=bytes;
             }
+            if(recorded) recorded->elapsed=performance_clock()-recorded->start;
         },this);
     if(!stream_) {const std::string error=SDL_GetError();SDL_QuitSubSystem(SDL_INIT_AUDIO);throw std::runtime_error(error);}
     if(!SDL_SetAudioStreamGain(stream_,gain) || !SDL_ResumeAudioStreamDevice(stream_)) {
@@ -400,6 +459,7 @@ void Audio::bind(std::uint32_t id,std::span<const std::byte> bytes,std::uint32_t
 void Audio::format(std::uint32_t id,AudioFormat format) {
     StreamLock lock(stream_);auto& value=voice(id);validate(format,value.bus!=AudioBus::none);
     if(value.format==format) {value.step=format.rate/48000.0;return;}
+    if(value.packets && value.packets->count>value.packets->done) throw std::runtime_error("Cannot change the format of queued audio packets");
     const auto bytes=[&](std::uint32_t count){return count/(value.format.tag==0x69?64:1)*value.format.block_align;};
     // The bound size is memory capacity; only complete codec blocks are playable.
     // Default regions can include allocation padding after the last block.
@@ -442,11 +502,12 @@ std::array<float,2> Audio::sample(Voice& value,std::uint32_t frame) {
 }
 void Audio::play(std::uint32_t id,bool loop) {
     StreamLock lock(stream_);auto& value=voice(id);
+    if(!value.playing) value.gains_ready=false;
     if(value.bus==AudioBus::none && !value.play_frames) throw std::runtime_error("Cannot play an empty audio buffer");
     if(value.cursor>=value.play_frames) value.cursor=0;
     value.loop=loop;value.playing=true;value.cached_block=UINT32_MAX;
 }
-void Audio::stop(std::uint32_t id){StreamLock lock(stream_);voice(id).playing=false;}
+void Audio::stop(std::uint32_t id){StreamLock lock(stream_);auto& value=voice(id);value.playing=false;value.gains_ready=false;}
 std::uint32_t Audio::status(std::uint32_t id){StreamLock lock(stream_);const auto& value=voice(id);return value.playing?(value.loop?5:1):0;}
 AudioPosition Audio::positions(std::uint32_t id) {
     StreamLock lock(stream_);const auto& value=voice(id);
@@ -469,7 +530,7 @@ void Audio::position(std::uint32_t id,std::uint32_t bytes) {
     const auto frame=frames(value.format,bytes);
     if(frame>value.play_frames) throw std::runtime_error("Audio position exceeds the play region");
     value.cursor=frame;value.cached_block=UINT32_MAX;
-    value.environment_history={};
+    value.environment_history={};value.gains_ready=false;
 }
 void Audio::region(std::uint32_t id,bool loop,std::uint32_t start,std::uint32_t bytes) {
     StreamLock lock(stream_);auto& value=voice(id);
@@ -496,7 +557,11 @@ void Audio::mixbins(std::uint32_t id,std::span<const MixBin> bins,bool volumes_o
     for(const auto& bin:bins) if(bin.bin>=32 || bin.volume>0 || bin.volume<-10000)
         throw std::runtime_error("Invalid audio mix-bin assignment or volume");
     StreamLock lock(stream_);auto& value=voice(id);
-    if(!volumes_only) value.bin_count=static_cast<std::uint32_t>(bins.size());
+    if(!volumes_only) {
+        bool changed=value.bin_count!=bins.size();
+        for(unsigned i=0;i<bins.size();++i) changed|=value.bins[i]!=bins[i].bin;
+        value.bin_count=static_cast<std::uint32_t>(bins.size());if(changed) value.gains_ready=false;
+    }
     for(unsigned i=0;i<bins.size();++i) {
         const auto& bin=bins[i];
         if(!volumes_only) value.bins[i]=bin.bin;
@@ -509,11 +574,18 @@ void Audio::frequency(std::uint32_t id,std::uint32_t hz) {
     if(hz<100 || hz>200000) throw std::runtime_error("Audio frequency is outside 100..200000");
     value.step=hz/48000.0;
 }
+void Audio::pitch(std::uint32_t id,std::int32_t pitch) {
+    // Original 22C150/232635: 4096 * log2(frequency / 48000).
+    if(pitch<-32767 || pitch>8191) throw std::runtime_error("Audio pitch is outside -32767..8191");
+    StreamLock lock(stream_);voice(id).step=std::exp2(pitch/4096.0);
+}
 void Audio::route(std::uint32_t id,std::uint32_t destination) {
     StreamLock lock(stream_);auto& value=voice(id);
+    if(value.route==destination) return;
     for(auto cursor=destination;cursor;cursor=voice(cursor).route) if(cursor==id)
         throw std::runtime_error("Audio routing contains a cycle");
     value.route=destination;
+    value.gains_ready=false;
 }
 void Audio::spatial(std::uint32_t id,const SpatialResult& adjustment) {
     const auto unit=[](float value){return !std::isfinite(value) || value<0 || value>1;};
@@ -525,6 +597,79 @@ void Audio::spatial(std::uint32_t id,const SpatialResult& adjustment) {
     StreamLock lock(stream_);auto& value=voice(id);
     value.spatial_gain=adjustment.gain;value.spatial_pan=adjustment.pan;value.spatial_pitch=adjustment.pitch;
     value.front_back=adjustment.front_back;value.environment_gain=adjustment.environment_gain;value.environment_pole=adjustment.environment_pole;
+}
+void Audio::packets(std::uint32_t id,unsigned capacity) {
+    if(!capacity || capacity>256) throw std::runtime_error("Audio packet capacity is outside 1..256");
+    auto packets=std::make_unique<Packets>(capacity);StreamLock lock(stream_);auto& value=voice(id);
+    if(value.bus!=AudioBus::none || !value.source.empty() || value.packets) throw std::runtime_error("Invalid packet-stream voice");
+    value.packets=std::move(packets);
+}
+bool Audio::packet(std::uint32_t id,std::span<const std::byte> data,std::uint32_t token) {
+    StreamLock lock(stream_);auto& value=voice(id);auto& packets=*value.packets;
+    if(data.empty()) throw std::runtime_error("Cannot submit an empty audio packet");
+    const auto count=frames(value.format,static_cast<std::uint32_t>(data.size()));
+    if(packets.count==packets.slots.size()) return false;
+    packets.slots[(packets.head+packets.count)%packets.slots.size()]={data,{token,static_cast<std::uint32_t>(data.size()),0}};
+    if(packets.count++==packets.done) {
+        value.source=data;value.byte_count=static_cast<std::uint32_t>(data.size());value.play_frames=count;
+        value.play_start=0;value.cursor=0;value.cached_block=UINT32_MAX;
+    }
+    packets.started=true;packets.discontinuous=false;
+    value.playing=!packets.paused && !packets.envelope_complete;return true;
+}
+unsigned Audio::completed(std::uint32_t id,std::span<AudioCompletion> output) {
+    StreamLock lock(stream_);auto& packets=*voice(id).packets;
+    const auto count=std::min<unsigned>(packets.done,static_cast<unsigned>(output.size()));
+    for(unsigned i=0;i<count;++i) {
+        auto& item=packets.slots[(packets.head+i)%packets.slots.size()];output[i]=item.completion;item={};
+    }
+    packets.head=(packets.head+count)%packets.slots.size();packets.count-=count;packets.done-=count;return count;
+}
+std::uint32_t Audio::packet_status(std::uint32_t id) {
+    StreamLock lock(stream_);const auto& value=voice(id);const auto& packets=*value.packets;
+    std::uint32_t status=packets.count<packets.slots.size()?1:0;
+    if(packets.paused) status|=0x20000;
+    else if(value.playing) status|=0x10000;
+    else if(packets.started && !packets.discontinuous && !packets.envelope_complete) status|=0x60000;
+    if(packets.envelope_complete) status|=0x80000;
+    return status;
+}
+void Audio::pause(std::uint32_t id,unsigned mode) {
+    StreamLock lock(stream_);auto& value=voice(id);auto& packets=*value.packets;
+    if(mode!=0 && mode!=1 && mode!=3) throw std::runtime_error("Unsupported audio stream pause mode");
+    packets.paused=mode==1 || (mode==3 && !packets.started);
+    value.playing=!packets.paused && !packets.envelope_complete && packets.count>packets.done;
+}
+void Audio::flush(std::uint32_t id,unsigned flags) {
+    if(flags&~7U) throw std::runtime_error("Unsupported audio stream flush flags");
+    StreamLock lock(stream_);auto& value=voice(id);auto& packets=*value.packets;
+    // Original default stream envelopes have zero release time. ENVELOPE2
+    // retains completion and prevents reactivation until a regular Flush.
+    if((flags&4) && (packets.envelope_complete || !packets.started)) return;
+    packets.envelope_complete=(flags&4) && packets.started;
+    for(unsigned n=packets.done;n<packets.count;++n) {
+        auto& item=packets.slots[(packets.head+n)%packets.slots.size()];
+        // 23214A retires released ENVELOPE2 packets with success; regular
+        // flushes use E_ABORT through 232059.
+        item.completion.status=(flags&4)?0:0x80004004;
+        // 231C94 publishes the submitted size, including flushed packets.
+        item.completion.bytes=static_cast<std::uint32_t>(item.data.size());
+    }
+    packets.done=packets.count;packets.started=false;packets.discontinuous=false;packets.paused=false;
+    value.playing=false;value.source={};value.cursor=0;value.play_frames=0;value.byte_count=0;value.cached_block=UINT32_MAX;
+}
+void Audio::discontinuity(std::uint32_t id) {
+    StreamLock lock(stream_);voice(id).packets->discontinuous=true;
+}
+bool Audio::next_packet(Voice& value) {
+    auto& packets=*value.packets;
+    while(value.cursor>=value.play_frames) {
+        value.cursor-=value.play_frames;++packets.done;value.cached_block=UINT32_MAX;
+        if(packets.done==packets.count) {value.source={};value.byte_count=0;value.play_frames=0;value.cursor=0;value.playing=false;return false;}
+        value.source=packets.slots[(packets.head+packets.done)%packets.slots.size()].data;
+        value.byte_count=static_cast<std::uint32_t>(value.source.size());value.play_frames=frames(value.format,value.byte_count);
+    }
+    return true;
 }
 void Audio::mix_voice(Voice& value,std::span<const std::array<float,2>> samples,std::span<float> output,unsigned frame_count) {
     if(!probe_) {send_voice(value,samples,output,frame_count);return;}
@@ -550,8 +695,12 @@ void Audio::send_voice(Voice& value,std::span<const std::array<float,2>> samples
     }
     const auto channels=value.format.channels;
     if(effect_bus) {
+        if(!value.gains_ready) {value.previous_gains[0]=gain;value.gains_ready=true;}
+        const auto previous=value.previous_gains[0],step=(gain-previous)/frame_count;
         for(unsigned frame=0;frame<samples.size();++frame)
-            output[sink->input_bin*frame_count+frame]+=(samples[frame][0]+(channels==2?samples[frame][1]:0))*gain/channels;
+            output[sink->input_bin*frame_count+frame]+=(samples[frame][0]+(channels==2?samples[frame][1]:0))*
+                (previous+step*(frame+1))/channels;
+        value.previous_gains[0]=gain;
         return;
     }
     std::array<float,8> gains{};
@@ -565,6 +714,9 @@ void Audio::send_voice(Voice& value,std::span<const std::array<float,2>> samples
             if(gains[i] && (!effects_ || !effects_->reverb)) throw std::runtime_error("Environmental audio requires an assigned reverb effect");
         }
     }
+    if(!value.gains_ready) {value.previous_gains=gains;value.gains_ready=true;}
+    std::array<float,8> gain_steps{};
+    for(unsigned i=0;i<sink->bin_count;++i) gain_steps[i]=(gains[i]-value.previous_gains[i])/frame_count;
     for(unsigned frame=0;frame<samples.size();++frame) {
         std::array<std::array<float,2>,2> filtered{};
         for(unsigned path=0;path<2;++path) for(unsigned channel=0;channel<channels;++channel) {
@@ -575,9 +727,10 @@ void Audio::send_voice(Voice& value,std::span<const std::array<float,2>> samples
         for(unsigned bin=0;bin<sink->bin_count;++bin) {
             const auto target=sink->bins[bin];
             const auto& signal=target==10?filtered[1]:(target==2 || (target>=6 && target<=9))?filtered[0]:samples[frame];
-            output[target*frame_count+frame]+=signal[bin%channels]*gains[bin];
+            output[target*frame_count+frame]+=signal[bin%channels]*(value.previous_gains[bin]+gain_steps[bin]*(frame+1));
         }
     }
+    value.previous_gains=gains;
 }
 void Audio::mix_bins(std::span<float> output,unsigned frame_count) {
     std::fill(output.begin(),output.end(),0.0f);
@@ -590,6 +743,7 @@ void Audio::mix_bins(std::span<float> output,unsigned frame_count) {
         const auto channels=value.format.channels;
         std::array<std::array<float,2>,32> samples;unsigned count=0;
         for(;count<frame_count;++count) {
+            if(value.packets && !next_packet(value)) break;
             if(value.cursor>=value.play_frames) {
                 if(!value.loop || !value.loop_frames){value.playing=false;break;}
                 value.cursor=value.loop_start+std::fmod(value.cursor-value.loop_start,static_cast<double>(value.loop_frames));
@@ -604,12 +758,20 @@ void Audio::mix_bins(std::span<float> output,unsigned frame_count) {
             if(value.loop && second>=value.loop_start+value.loop_frames) second=value.loop_start;
             else second=std::min(second,value.play_frames-1);
             const auto blend=static_cast<float>(value.cursor-first);
-            const auto a=sample(value,value.play_start+first),b=sample(value,value.play_start+second);
+            const auto a=sample(value,value.play_start+first);auto b=sample(value,value.play_start+second);
+            if(value.packets && first+1==value.play_frames) {
+                const auto& packets=*value.packets;
+                if(packets.done+1<packets.count) {
+                    const auto saved=value.source;value.source=packets.slots[(packets.head+packets.done+1)%packets.slots.size()].data;
+                    value.cached_block=UINT32_MAX;b=sample(value,0);value.source=saved;value.cached_block=UINT32_MAX;
+                }
+            }
             for(unsigned channel=0;channel<channels;++channel) samples[count][channel]=a[channel]+(b[channel]-a[channel])*blend;
             value.cursor+=value.step*value.spatial_pitch;
         }
         mix_voice(value,std::span(samples).first(count),output,frame_count);
-        if(!value.loop && value.cursor>=value.play_frames){value.cursor=value.play_frames;value.playing=false;}
+        if(value.packets) {if(value.playing) next_packet(value);}
+        else if(!value.loop && value.cursor>=value.play_frames){value.cursor=value.play_frames;value.playing=false;}
     }
     for(unsigned id=0;id<voices_.size();++id) {
         auto& value=voices_[id];
@@ -676,11 +838,12 @@ void Audio::effect_data(std::uint32_t offset,std::span<const std::byte> source,b
         effect.dirty_end=std::max(effect.dirty_end,(offset+static_cast<std::uint32_t>(source.size())+3)&~3U);
         return;
     }
+    const bool continuous=std::ranges::any_of(voices_,[](const Voice& value){return value.used && value.playing;});
     while(!source.empty()) {
         const auto size=std::min<std::size_t>(4-offset%4,source.size());
         auto value=effect.state.load(offset/4);
         std::memcpy(reinterpret_cast<std::byte*>(&value)+offset%4,source.data(),size);
-        effect.state.store(offset/4,value);
+        effect.state.parameter(offset/4,value,continuous);
         for(std::size_t i=0;i<size;++i) effect.dirty.reset(offset+i);
         source=source.subspan(size);offset+=static_cast<std::uint32_t>(size);
     }
@@ -688,12 +851,13 @@ void Audio::effect_data(std::uint32_t offset,std::span<const std::byte> source,b
 void Audio::commit_effects() {
     StreamLock lock(stream_);if(!effects_) return;
     auto& effect=*effects_;
+    const bool continuous=std::ranges::any_of(voices_,[](const Voice& value){return value.used && value.playing;});
     for(auto offset=effect.dirty_first;offset<effect.dirty_end;offset+=4) {
         auto value=effect.state.load(offset/4);bool changed=false;
         for(unsigned i=0;i<4;++i) if(effect.dirty[offset+i]) {
             reinterpret_cast<std::byte*>(&value)[i]=effect.pending[offset+i];changed=true;
         }
-        if(changed) effect.state.store(offset/4,value);
+        if(changed) effect.state.parameter(offset/4,value,continuous);
     }
     effect.dirty.reset();effect.dirty_first=0x6000;effect.dirty_end=0;
 }
@@ -708,7 +872,9 @@ void Audio::effect_x(std::uint32_t offset,unsigned size,std::uint32_t value) {
     if(!effects_ || size>4 || !size || offset>=effects_->state.x.size()*4 || offset/4!=(offset+size-1)/4)
         throw std::runtime_error("Invalid native DSP X write");
     const auto mask=size==4?0xFFFFFFFFU:(1U<<(size*8))-1,shift=offset%4*8;
-    auto& state=effects_->state;state.store(offset/4,(state.load(offset/4)&~(mask<<shift))|((value&mask)<<shift));
+    auto& state=effects_->state;
+    state.parameter(offset/4,(state.load(offset/4)&~(mask<<shift))|((value&mask)<<shift),
+        std::ranges::any_of(voices_,[](const Voice& voice){return voice.used && voice.playing;}));
 }
 std::uint32_t Audio::effect_scratch(std::uint32_t offset,unsigned size) {
     StreamLock lock(stream_);
@@ -746,6 +912,7 @@ void Audio::mix_unlocked(std::span<float> output) {
                 const auto sample=static_cast<std::int32_t>(std::clamp(bins[bin*32+i]*8388608.0f,-8388608.0f,8388607.0f));
                 state.store(0x1400+bin*32+i,static_cast<std::uint32_t>(sample));
             }
+            state.advance_coefficients();
             for(unsigned i=0;i<effects.count;++i) run_effect(state,i);
             if(probe_) for(unsigned bin=0;bin<32;++bin) for(unsigned i=0;i<32;++i)
                 probe_->dsp[bin].add(Dsp::signed24(state.load(0xC00+bin*32+i))/8388608.0f);
@@ -769,7 +936,7 @@ void Audio::mix(std::span<float> output) {
 }
 std::string check_audio(const std::filesystem::path& effects_path,const std::filesystem::path& output) {
     unsigned checks=0;
-    const auto require=[&](bool condition){++checks;if(!condition) throw std::runtime_error("Offline audio check failed");};
+    const auto require=[&](bool condition){++checks;if(!condition) throw std::runtime_error(std::format("Offline audio check {} failed",checks));};
     const AudioFormat pcm{1,1,2,16,0,48000},stereo{1,2,4,16,0,48000},adpcm{0x69,1,36,4,64,48000};
     const std::array<std::int16_t,4> samples{8192,-8192,16384,-16384};
     const auto bytes=std::as_bytes(std::span(samples));
@@ -829,7 +996,8 @@ std::string check_audio(const std::filesystem::path& effects_path,const std::fil
     audio.stop(source);audio.position(source,0);audio.headroom(source,0);audio.mixbin_headroom(1,1);audio.play(source,true);audio.mix(mixed);
     require(mixed[0]==0 && std::abs(mixed[1]-0.0125f)<0.000001f);
     const std::array<MixBin,1> mute_right{{{1,-10000}}};audio.mixbins(source,mute_right,true);audio.mix(mixed);
-    require(std::ranges::all_of(mixed,[](float value){return value==0;}));
+    require(mixed[1]!=0 && mixed[6]==0 && mixed[7]==0);
+    audio.mix(mixed);require(std::ranges::all_of(mixed,[](float value){return value==0;}));
     rejected=false;try{audio.mixbin_headroom(32,0);}catch(const std::exception&){rejected=true;}require(rejected);
     rejected=false;try{const std::array<MixBin,1> invalid{{{1,1}}};audio.mixbins(source,invalid);}catch(const std::exception&){rejected=true;}require(rejected);
     audio.mixbins(source,{});audio.mix(mixed);require(std::ranges::all_of(mixed,[](float value){return value==0;}));
@@ -853,6 +1021,30 @@ std::string check_audio(const std::filesystem::path& effects_path,const std::fil
     auto restored=std::make_unique<Audio>(false);restored->restore(*merged);restored->play(first,true);restored->play(second,true);
     Audio::Probe probe;restored->probe_=&probe;restored->mix(captured);
     require(probe.decoded[first-1].peak==0.5f && probe.decoded[second-1].peak==0.5f && probe.sent[first-1].peak==0.5f);
+    // Packet boundaries must preserve the same resampling phase and samples
+    // as an uninterrupted source, for both PCM and compressed audio.
+    for(const auto format:std::array{pcm,AudioFormat{0x69,2,72,4,64,48000}}) {
+        auto queued=std::make_unique<Audio>(false),continuous=std::make_unique<Audio>(false);
+        const auto stream=queued->create(format),buffer=continuous->create(format);queued->packets(stream,2);
+        std::array<std::int16_t,16> pcm_samples{};
+        for(unsigned i=0;i<pcm_samples.size();++i) pcm_samples[i]=static_cast<std::int16_t>(i*1024-8192);
+        std::array<std::byte,144> blocks{};const std::int16_t a=8192,b=-4096;
+        std::memcpy(blocks.data(),&a,2);std::memcpy(blocks.data()+72,&b,2);
+        const auto packet_bytes=format.tag==1?std::as_bytes(std::span(pcm_samples)):std::span<const std::byte>(blocks);
+        const auto half=packet_bytes.size()/2;continuous->data(buffer,packet_bytes);continuous->frequency(buffer,36000);continuous->play(buffer,false);
+        queued->frequency(stream,36000);require(queued->packet(stream,packet_bytes.first(half),11) && queued->packet(stream,packet_bytes.subspan(half),22));
+        require(!queued->packet(stream,packet_bytes.first(half),33) && !(queued->packet_status(stream)&1));
+        std::vector<float> expected(512),actual(512);continuous->mix(expected);queued->mix(actual);require(expected==actual);
+        std::array<AudioCompletion,2> completed{};require(queued->completed(stream,completed)==2);
+        require(completed[0].token==11 && completed[1].token==22 && completed[0].bytes==half && !completed[0].status && !completed[1].status);
+        require((queued->packet_status(stream)&0x40001)==0x40001);
+        queued->discontinuity(stream);require(queued->packet_status(stream)==1);
+        require(queued->packet(stream,packet_bytes.first(half),44));queued->pause(stream,1);queued->mix(actual);
+        require(std::ranges::all_of(actual,[](float value){return value==0;}) && (queued->packet_status(stream)&0x20000));
+        queued->pause(stream,0);queued->mix(std::span(actual).first(2));queued->flush(stream);
+        require(queued->completed(stream,completed)==1 && completed[0].token==44 && completed[0].status==0x80004004 && completed[0].bytes==half);
+        require(queued->packet_status(stream)==1);
+    }
     if(!output.empty()) {
         if(std::filesystem::exists(output)) throw std::runtime_error("Audio checks require a fresh output directory");
         File file(effects_path);if(file.size()>65536) throw std::runtime_error("Effects image exceeds 64 KiB");

@@ -749,6 +749,9 @@ Function recover(Xbe& image, std::uint32_t address, std::uint32_t instruction_bu
     struct CallbackApi {unsigned first=0,count=0;int incoming_register=-1,record_argument=-1;std::uint32_t record_offset=4;};
     const auto callback_api=[&](std::uint32_t target)->CallbackApi {
         if(target==0x000F2930) return {3,6};
+        // Stream descriptor +0Ch is consumed by 22F312 and called with the
+        // stream context, packet context and status at 2317E9.
+        if(target==0x0022F90EU) return {0,0,-1,1,12};
         // 10C650 takes its request as argument 4 and forwards request+4 as
         // argument 4 of 109EC0 (10C6BE/10C6C8/10C6D1 -> 109FD7).
         if(target==0x0010C650U) {
@@ -765,6 +768,10 @@ Function recover(Xbe& image, std::uint32_t address, std::uint32_t instruction_bu
         // argument 4 into EBP at 109FA7 and passes argument 5 as its context.
         struct Consumer {std::uint32_t address;std::string_view prefix;CallbackApi callbacks;};
         constexpr Consumer consumers[]={
+            // WMA initialization forwards argument 3 to argument 10 of
+            // 24F250, which installs it at +30h for the call at 251260.
+            {0x0024E49E,"558BEC566A04E8EF0EEDFF",{2,3}},
+            {0x0024F250,"558BEC518365FC0053568B7508",{9,10}},
             // The stream registrar stores arguments 3..5 in plugin fields
             // +0Ch/+10h/+14h. F6DB0 invokes the read callback at F6EAD.
             {0x000F6D70,"8B4424048B401085C07411",{2,5}},
@@ -894,7 +901,8 @@ Function recover(Xbe& image, std::uint32_t address, std::uint32_t instruction_bu
             add_vtable(static_cast<std::uint32_t>(method.mem.disp.value),0,true);
     }
     for(const auto& [pc,instruction]:function.instructions) {
-        if(instruction.decoded.meta.category!=ZYDIS_CATEGORY_CALL || !instruction.target()) continue;
+        if(instruction.decoded.meta.category!=ZYDIS_CATEGORY_CALL ||
+           (!instruction.target() && instruction.kernel_ordinal!=107U)) continue;
         if(instruction.target()==0x000E67A7U) {
             // XapiRegisterThreadNotifyRoutine links an eight-byte LIST_ENTRY
             // followed by its callback. E6690 walks that list and calls +8.
@@ -983,7 +991,10 @@ Function recover(Xbe& image, std::uint32_t address, std::uint32_t instruction_bu
                 } catch(const std::exception&) {}
             }
         }
-        const auto [first,count,callback_register,record_argument,record_offset]=callback_api(*instruction.target());
+        // KeInitializeDpc stores argument 2 as KDPC+0Ch; the scheduler invokes
+        // it with {dpc, context, argument1, argument2}. Follow every registration.
+        const auto [first,count,callback_register,record_argument,record_offset]=instruction.kernel_ordinal==107U
+            ? CallbackApi{1,2} : callback_api(*instruction.target());
         if(record_argument>=0) {
             // Follow this particular stack argument back to a local request,
             // then find the last write to its callback field. The verified
@@ -1096,6 +1107,44 @@ Function recover(Xbe& image, std::uint32_t address, std::uint32_t instruction_bu
             value=previous(function,value->address);
         }
         register_callbacks(pc,callback_register);
+    }
+    if(function.entry==0x0024F250U) {
+        // WMA installs its input reader and decoder methods in object fields.
+        // +14h/+18h/+1Ch hold Huffman tables, read as indexed words by
+        // 256797/253965/253979; those are data, despite the executable section.
+        constexpr std::string_view prefix="558BEC518365FC0053568B7508";
+        if(hex_bytes(image.data(0x0024F250,prefix.size()/2))!=prefix ||
+           hex_bytes(image.data(0x0024F304,2))!="8907" || hex_bytes(image.data(0x00251260,2))!="FF16")
+            throw std::runtime_error("WMA callback initializer differs from its verified ABI");
+        constexpr std::array<std::int64_t,4> fields{0x164,0x198,0x19C,0x3F4};
+        for(const auto& [pc,instruction]:function.instructions) {
+            const auto& output=instruction.operands[0];const auto& input=instruction.operands[1];
+            if(instruction.decoded.mnemonic!=ZYDIS_MNEMONIC_MOV || input.type!=ZYDIS_OPERAND_TYPE_IMMEDIATE) continue;
+            if(pc==0x0024F2F8U || (output.type==ZYDIS_OPERAND_TYPE_MEMORY && output.size==32 &&
+                output.mem.segment==ZYDIS_REGISTER_DS && output.mem.base!=ZYDIS_REGISTER_NONE &&
+                output.mem.index==ZYDIS_REGISTER_NONE && std::ranges::find(fields,output.mem.disp.value)!=fields.end()))
+                add_callback(static_cast<std::uint32_t>(input.imm.value.u));
+        }
+    }
+    if(function.entry==0x00250EC4U) {
+        // The format initializer installs PCM output/conversion methods.
+        // 250E69 calls +3F8h; +3ECh and +400h also receive conditional
+        // code addresses through EAX, rather than immediate object stores.
+        constexpr std::string_view prefix="558BEC5151";
+        if(hex_bytes(image.data(function.entry,prefix.size()/2))!=prefix ||
+           hex_bytes(image.data(0x00250E69,6))!="FF96F8030000" ||
+           hex_bytes(image.data(0x002511BF,6))!="898600040000")
+            throw std::runtime_error("WMA output initializer differs from its verified ABI");
+        constexpr std::array<std::int64_t,3> fields{0x3EC,0x3F8,0x3FC};
+        for(const auto& [pc,instruction]:function.instructions) {
+            const auto& output=instruction.operands[0];const auto& input=instruction.operands[1];
+            if(input.type!=ZYDIS_OPERAND_TYPE_IMMEDIATE) continue;
+            if(pc==0x00251177U || pc==0x002511AEU || pc==0x002511B5U ||
+               (instruction.decoded.mnemonic==ZYDIS_MNEMONIC_MOV && output.type==ZYDIS_OPERAND_TYPE_MEMORY &&
+                output.size==32 && output.mem.base==ZYDIS_REGISTER_ESI && output.mem.index==ZYDIS_REGISTER_NONE &&
+                std::ranges::find(fields,output.mem.disp.value)!=fields.end()))
+                add_callback(static_cast<std::uint32_t>(input.imm.value.u));
+        }
     }
     // Source-action initializers bind a three-word {object, method, context}
     // record through 11B620. Specialized sources replace its +4h method.

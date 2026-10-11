@@ -186,3 +186,22 @@ Complete CRT conversion interface
 and the original executable. Discovery retains the whole verified interface,
 including 121561 and 12157B, whose cells have no currently observed call. The
 individual absolute stores still remain available for cross-function call proofs.
+
+Kernel timer callbacks
+
+Log b2-20261011-011408-13744.log stopped at XACT callback 211995, absent from
+the fixed native table. Original engine constructor 20DE0C pushes its context
+at 20DEA4, method 211995 at 20DEA5 (6895192100), and DPC engine+B8h at 20DEAA.
+20DEB1 calls kernel thunk 293D64 (FF15643D2900), verified ordinal 107,
+KeInitializeDpc. Its second argument becomes KDPC+0Ch; native timer dispatch
+invokes it with {dpc, context, argument1, argument2}. 211995 calls the context's
+original virtual method +4h at 21199C (FF5104), then returns with RET 10h.
+
+Callback discovery now follows argument 2 of resolved KeInitializeDpc calls
+through the existing bounded argument/origin walk. This includes XACT's timer
+and the original CRT timer installed by E6C26, so E6C14 no longer needs a manual
+seed. Runtime scheduling and original callback behavior are unchanged.
+Release generation compiles 36149 functions, including both callbacks, with no
+unsupported instructions or missing direct callees. Existing offline CPU checks,
+64 audio cases and all twelve WMA music checks pass; the live crash scenario
+still needs a manual retry.
