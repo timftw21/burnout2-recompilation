@@ -3,8 +3,8 @@
 An unofficial Windows version of the original Xbox game, focused on fast gameplay
 and preserving its look and feel.
 
-<i>Still in development: While gameplay is quite stable, the rest of the
-game is still being tested.</i>
+<i>Still in development: Slowdown, bugs, and crashes are possible. Open an issue if you experience a problem, and
+I'll try to respond in a timely manner.</i>
 
 ## AI Disclosure
 
