@@ -75,6 +75,8 @@ own copy of the US Xbox release. Game files are not included.
    [CMake 4.2 or newer](https://cmake.org/download/), and
    [Git for Windows](https://git-scm.com/downloads/win).
    Also install the Windows x64 version of [LLVM 22.1 or newer](https://github.com/llvm/llvm-project/releases).
+   **[Ninja](https://github.com/ninja-build/ninja/releases/latest)** (`ninja.exe`)
+   is also required. Visual Studio includes it with **C++ CMake tools for Windows**.
 2. Download [Installation.zip](https://github.com/timftw21/burnout2-recompilation/releases/latest/download/Installation.zip)
    and extract it, or clone the repository.
 3. Double-click **Build.cmd** and select your US Xbox XISO disc image (`.iso` or `.xiso`).
@@ -86,6 +88,13 @@ own copy of the US Xbox release. Game files are not included.
 There are no commands to type. If building fails, click **Open build log**.
 The [developer build instructions](https://github.com/timftw21/burnout2-recompilation/blob/main/BUILDING.txt)
 also cover offline debugging.
+
+If the builder reports **ninja.exe is missing**, open **Visual Studio Installer**,
+click **Modify** for Visual Studio 2026, and install **C++ CMake tools for Windows**
+under **Individual components**. Alternatively, download **ninja-win.zip** from
+the [official Ninja releases](https://github.com/ninja-build/ninja/releases/latest),
+extract it, and add the folder containing `ninja.exe` to your Windows **Path**
+environment variable. Close and reopen **Build.cmd** after installing it.
 
 ### Upgrading to 1.3
 

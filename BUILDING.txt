@@ -2,7 +2,12 @@ Building the game
 
 Install Visual Studio 2026 with Desktop development with C++, C++ CMake tools
 for Windows and its Windows SDK, LLVM 22.1 or newer (Windows x64), CMake 4.2 or
-newer, and Git for Windows.
+newer, Git for Windows, and Ninja (ninja.exe).
+Ninja is included with Visual Studio's C++ CMake tools for Windows component.
+If it is missing, open Visual Studio Installer, choose Modify for Visual Studio
+2026, and install that component under Individual components. Alternatively,
+download ninja-win.zip from https://github.com/ninja-build/ninja/releases/latest,
+extract it and add its folder to PATH. Reopen Build.cmd after installing it.
 Download and extract the project source.
 Double-click Build.cmd, select the supported US Xbox disc image, and wait for
 the build. Click Open game folder and double-click b2.exe. No commands are needed.

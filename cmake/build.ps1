@@ -99,6 +99,7 @@ function Find-Program([string]$name, [string[]]$candidates, [version]$minimum) {
         }
         return $candidate
     }
+    if ($name -eq 'ninja.exe') { throw 'Ninja (ninja.exe) is missing. Open Visual Studio Installer, choose Modify and install C++ CMake tools for Windows. For a standalone Ninja download, see README.md.' }
     if ($minimum) { throw "$name $minimum or newer is required. Install it from the link in README.md." }
     throw "$name is missing. Install the build requirements listed in README.md."
 }
