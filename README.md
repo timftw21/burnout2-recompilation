@@ -30,31 +30,6 @@ installations default to V-sync off; existing saved settings keep their value.
 extract the new **Installation.zip**, and run **Build.cmd** again. See the
 upgrade instructions below to keep your saves and settings.
 
-## Previous changes in 1.2
-
-- Fixed crashes when starting races and proceeding with Burnout 1 music enabled.
-- Fixed crackling caused by abrupt sound and effect control changes across the
-  shared audio mixer.
-- Disabling frame interpolation now allows gameplay to run at the selected rate
-  above 60 Hz. Higher rates speed up gameplay when interpolation is off.
-- Fixed intermittent slowdowns caused by interpolated frames blocking gameplay.
-- Fixed fresh-install build failures from issue #13, including build folders with
-  non-English names. Setup now handles outdated tools, repeated builds, moved
-  folders and cancellation more reliably, while preserving settings and saves.
-
-## Performance improvements in 1.1
-
-**Major performance improvements:** typical frame time fell from **23.12 to
-16.67 ms**, slow-frame time (99th percentile) from **30.84 to 17.95 ms**, and
-peak RAM from **530 to 204 MiB** in comparable manual race recordings.
-Average frame rate rose from **43.75 to 60.02 FPS** on a Ryzen 5 5600X and RTX 5060 Ti
-at 60 Hz and native resolution. Heavy scenes still have occasional dips;
-testing across the whole game continues.
-
-Version 1.1 also added custom keyboard bindings, internal resolution scaling,
-frame interpolation for higher refresh rates, a frame rate counter, performance
-recording and an application icon.
-
 ## Screenshots
 
 <p>
