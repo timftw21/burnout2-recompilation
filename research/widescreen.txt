@@ -1,0 +1,41 @@
+Native widescreen selection, 2026-10-11
+
+Supported US XBE SHA-256:
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF
+
+The game's original initializer at 18390 calls SDK helper E00AF, masks its result
+with 1 and stores it at 4D03F8. E00AF queries ExQueryNonVolatileSetting, index 8,
+through E72B4 / import slot 293CC4. It shifts the saved flags right by 16 and masks
+with 5F. Widescreen therefore uses saved bit 00010000. The existing native provider
+returned zero at index 8 and omitted that bit from AV encoder capabilities.
+
+183B0 passes the selected value and object 3D8570 to the original B8700 setter.
+Its two view-aspect fields are at object+6AC84 and +6AC84+660. Original stores:
+B8713 C700ABAAAA3F -> 3FAAAAAB, 4:3.
+B8739 C700398E633F -> 3F638E39, 8:9 for widescreen split mode 2.
+B8741 C700398EE33F -> 3FE38E39, 16:9 for the full widescreen view.
+The original initializer, apply routine and these stores are checked from XBE
+bytes in the existing native service diagnostics. All functions were already
+compiled; no game-memory patch or new runtime decoding is involved.
+
+The per-session host option supplies bit 00010000 in video settings and AV encoder
+option 6. Settings changes apply at session start/restart so the game and renderer
+agree. The raster remains the game's original 640x480, optionally scaled internally.
+Only final presentation maps its anamorphic pixels into a fitted 16:9 viewport.
+It letterboxes 4:3 windows and pillarboxes wider windows; the ImGui layer retains
+its normal proportions. Captures and live-run reports record the active option.
+
+Discovery used bounded native decoding at E00AF, 18390 and B8700, and indexed
+searches of the existing generated source. No binary-wide disassembly was used.
+
+Validation: the existing native window suite passed settings save/load, 16:9
+presentation in 960x720 and 1280x540 windows, interpolation and game-button checks.
+The service suite passed 117 cases, including fresh standard/wide/standard
+sessions, original SDK flags, game selection and full/split-screen camera fields.
+All 184 hardware rendering cases passed with the debug layer. The rendered
+Graphics tab and both fitted aspect outputs were inspected. Actual user settings
+were preserved. No game boot was needed, and no owned workers remained.
+Private outputs: build/checks/widescreen-20261011-205100.
+
+Primary SDK reference confirming encoder option 6 and VIDEO_WIDESCREEN=010000:
+https://github.com/XboxDev/nxdk/blob/master/lib/hal/video.h

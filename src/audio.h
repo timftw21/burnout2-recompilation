@@ -51,6 +51,7 @@ public:
     void pitch(std::uint32_t,std::int32_t);
     void route(std::uint32_t,std::uint32_t destination);
     void spatial(std::uint32_t,const SpatialResult&);
+    void spatial(std::span<const std::uint32_t>,std::span<const SpatialResult>);
     void packets(std::uint32_t,unsigned capacity);
     bool packet(std::uint32_t,std::span<const std::byte>,std::uint32_t token);
     unsigned completed(std::uint32_t,std::span<AudioCompletion>);
@@ -108,6 +109,12 @@ private:
         std::unique_ptr<Packets> packets;
     };
     Voice& voice(std::uint32_t);
+    void publish_status(const Voice&);
+    void publish_statuses();
+    void publish_position(const Voice&);
+    static AudioPosition current_position(const Voice&);
+    std::uint32_t reserve_controls(unsigned count);
+    void apply_controls(); // Consumer holds the SDL stream lock.
     static std::uint32_t frames(AudioFormat,std::uint32_t bytes);
     std::array<float,2> sample(Voice&,std::uint32_t frame);
     void mix_unlocked(std::span<float>);
@@ -126,12 +133,16 @@ private:
     struct Live;
     std::unique_ptr<Live> live_;
     SDL_AudioStream* stream_=nullptr;
-    std::array<Voice,256> voices_{};
+    std::array<Voice,256> voices_;
+    std::array<std::atomic<std::uint32_t>,256> statuses_{};
+    std::array<std::atomic<std::uint64_t>,256> positions_{};
+    struct ControlQueue;
+    std::unique_ptr<ControlQueue> controls_; // Game-thread producer, audio-thread consumer.
     std::array<std::uint32_t,32> bin_headroom_{};
     std::atomic<std::uint32_t> frames_processed_{0};
     std::atomic<bool> performance_enabled_{false};
     std::atomic<std::uint64_t> mix_batches_{0},mix_ns_{0},mix_overruns_{0};
-    bool failed_=false;
+    std::atomic<bool> failed_{false};
     std::array<char,256> failure_{};
 };
 std::string check_audio(const std::filesystem::path& effects={},const std::filesystem::path& output={});

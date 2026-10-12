@@ -1,11 +1,13 @@
 #pragma once
 #include "floating.h"
+#include "performance.h"
 #include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <format>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -57,6 +59,7 @@ struct Cpu {
     std::uint32_t quantum_remaining = 1024;
     std::uint32_t gdt_base = 0;
     std::uint16_t gdt_limit = 0;
+    Performance* profile = nullptr;
 };
 
 class NativeBoundary : public std::runtime_error {
@@ -111,9 +114,73 @@ template<std::uint32_t Ordinal> void call_kernel(Cpu& cpu, Memory& memory) {
 
 class Memory {
 public:
+    class Primary {
+        friend class Memory;
+        Memory& owner_;
+        const std::uint32_t base_,alias_mask_,alias_begin_;
+        const std::span<std::byte> bytes_;
+        const std::uint32_t word_limit_;
+        explicit Primary(Memory& owner):owner_(owner),base_(owner.base_),alias_mask_(owner.primary_alias_mask_),
+            alias_begin_(owner.primary_alias_begin_),bytes_(owner.bytes_),word_limit_(bytes_.size()>=4?static_cast<std::uint32_t>(bytes_.size()-3):0) {}
+        __forceinline void* pointer(std::uint32_t address,std::size_t size) const {
+            const auto folded=address&alias_mask_;
+            const auto offset=std::uint64_t(folded>=alias_begin_?folded:address)-base_;
+            if(offset<=bytes_.size() && size<=bytes_.size()-offset) return bytes_.data()+offset;
+            return nullptr;
+        }
+        template<class T> __forceinline bool element(std::uint32_t address,std::byte*& output) const {
+            const auto folded=address&alias_mask_,physical=folded>=alias_begin_?folded:address;
+            if constexpr(sizeof(T)==4) {
+                // Memory rejects spans that wrap 32 bits. Underflow offsets
+                // therefore exceed this limit even with 32-bit subtraction.
+                const auto offset=physical-base_;
+                if(offset>=word_limit_) return false;
+                output=bytes_.data()+offset;
+            } else {
+                const auto offset=std::uint64_t(physical)-base_;
+                if(offset>bytes_.size() || sizeof(T)>bytes_.size()-offset) return false;
+                output=bytes_.data()+offset;
+            }
+            return true;
+        }
+        template<class T> static __declspec(noinline) T load_other(Memory& owner,std::uint32_t address) {return owner.load<T>(address);}
+        template<class T> static __declspec(noinline) void store_other(Memory& owner,std::uint32_t address,T value) {owner.store<T>(address,value);}
+        static __declspec(noinline) void* access_other(Memory& owner,std::uint32_t address,std::size_t size) {return owner.access(address,size);}
+    public:
+        __forceinline void* access(std::uint32_t address,std::size_t size) const {
+            if(auto* p=pointer(address,size)) return p;
+            return access_other(owner_,address,size);
+        }
+        template<class T> __forceinline T load(std::uint32_t address) const {
+            static_assert(std::is_unsigned_v<T>);
+            std::byte* p;
+            if(element<T>(address,p)) {
+                T value;std::memcpy(&value,p,sizeof(T));
+                if constexpr(std::endian::native==std::endian::big) value=std::byteswap(value);
+                return value;
+            }
+            return load_other<T>(owner_,address);
+        }
+        template<class T> __forceinline void store(std::uint32_t address,T value) const {
+            static_assert(std::is_unsigned_v<T>);
+            std::byte* p;
+            if(element<T>(address,p)) {
+                if constexpr(std::endian::native==std::endian::big) value=std::byteswap(value);
+                std::memcpy(p,&value,sizeof(T));
+            } else store_other(owner_,address,value);
+        }
+    };
+    // Primary storage cannot be rebound. Mappings are appended, never removed,
+    // so an already-verified primary alias remains valid for a native function.
+    __forceinline Primary primary() {return Primary(*this);}
     Memory(std::uint32_t base, std::span<std::byte> bytes) : base_(base), bytes_(bytes) {
         if (bytes.size() > 0x100000000ULL - base)
             throw std::runtime_error("Guest memory wraps the address space");
+    }
+    Memory(std::uint32_t base,std::span<std::byte> bytes,const Memory& parent):Memory(base,bytes) {
+        map(parent.base_,parent.bytes_);
+        for(unsigned i=0;i<parent.region_count_;++i) map(parent.regions_[i].base,parent.regions_[i].bytes);
+        io_=parent.io_;io_count_=parent.io_count_;io_floor_=parent.io_floor_;
     }
     void map(std::uint32_t base,std::span<std::byte> bytes) {
         const auto end=static_cast<std::uint64_t>(base)+bytes.size();
@@ -126,19 +193,24 @@ public:
         for(unsigned i=0;i<region_count_;++i) if(overlaps(regions_[i].base,regions_[i].bytes.size()))
             throw std::runtime_error("Guest mappings overlap");
         regions_[region_count_++]={base,bytes};
+        // Fold only a verified suffix alias of primary storage. Earlier addresses
+        // can belong to a separate kernel image and must keep their own mapping.
+        if(bytes.size()<=bytes_.size() && bytes.data()==bytes_.data()+bytes_.size()-bytes.size()) {
+            const auto physical=base_+static_cast<std::uint32_t>(bytes_.size()-bytes.size());
+            const auto bit=base^physical;
+            if(std::has_single_bit(bit) && physical<bit && std::uint64_t(base_)+bytes_.size()<bit) {
+                primary_alias_mask_=~bit;primary_alias_begin_=physical;
+            }
+        }
     }
     void* access(std::uint32_t address, std::size_t size) const { return pointer(address,size); }
-    void* try_access(std::uint32_t address,std::size_t size) const noexcept {
-        if(address>=base_ && address-base_<=bytes_.size() && size<=bytes_.size()-(address-base_))
-            return bytes_.data()+(address-base_);
-        for(unsigned i=0;i<region_count_;++i) {
-            const auto& region=regions_[i];
-            if(address>=region.base && address-region.base<=region.bytes.size() && size<=region.bytes.size()-(address-region.base))
-                return region.bytes.data()+(address-region.base);
-        }
-        return nullptr;
+    __forceinline void* try_access(std::uint32_t address,std::size_t size) const noexcept {
+        const auto offset=static_cast<std::uint64_t>(primary_address(address))-base_;
+        if(offset<=bytes_.size() && size<=bytes_.size()-offset) return bytes_.data()+offset;
+        return try_mapped(address,size);
     }
     void prefetch(std::uint32_t address) const {
+        address=primary_address(address);
         if(address>=base_ && static_cast<std::uint64_t>(address)-base_<bytes_.size())
             _mm_prefetch(reinterpret_cast<const char*>(bytes_.data()+address-base_),_MM_HINT_NTA);
     }
@@ -160,26 +232,17 @@ public:
         else if constexpr(sizeof(T)==2) return static_cast<T>(b2_compare_exchange16(target,expected,desired));
         else { static_assert(sizeof(T)==4); return b2_compare_exchange32(target,expected,desired); }
     }
-    template<class T> T load(std::uint32_t address) const {
+    template<class T> __forceinline T load(std::uint32_t address) const {
         static_assert(std::is_unsigned_v<T>);
-        if(address>=io_floor_) if(const auto* io=find_io(address,sizeof(T))) {
-            if constexpr(sizeof(T)<=4) return static_cast<T>(io->read(io->context,address-io->base,sizeof(T)));
-            else {static_assert(sizeof(T)==8);return static_cast<T>(io->read(io->context,address-io->base,4))|
-                (static_cast<T>(io->read(io->context,address-io->base+4,4))<<32);}
-        }
+        if(address>=io_floor_) return load_io<T>(address);
         T value;
         std::memcpy(&value, pointer(address, sizeof(T)), sizeof(T));
         if constexpr (std::endian::native == std::endian::big) value = std::byteswap(value);
         return value;
     }
-    template<class T> void store(std::uint32_t address, T value) {
+    template<class T> __forceinline void store(std::uint32_t address, T value) {
         static_assert(std::is_unsigned_v<T>);
-        if(address>=io_floor_) if(const auto* io=find_io(address,sizeof(T))) {
-            if constexpr(sizeof(T)<=4) io->write(io->context,address-io->base,sizeof(T),static_cast<std::uint32_t>(value));
-            else {static_assert(sizeof(T)==8);io->write(io->context,address-io->base,4,static_cast<std::uint32_t>(value));
-                io->write(io->context,address-io->base+4,4,static_cast<std::uint32_t>(value>>32));}
-            return;
-        }
+        if(address>=io_floor_) {store_io(address,value);return;}
         if constexpr (std::endian::native == std::endian::big) value = std::byteswap(value);
         std::memcpy(pointer(address, sizeof(T)), &value, sizeof(T));
     }
@@ -240,6 +303,28 @@ public:
         io_[io_count_++]={base,size,context,read,write};io_floor_=std::min(io_floor_,base);
     }
 private:
+    // Keep device dispatch and failure formatting out of the inlined RAM path.
+    // Memory bounds and mapping checks remain intact.
+    template<class T> __declspec(noinline) T load_io(std::uint32_t address) const {
+        if(const auto* io=find_io(address,sizeof(T))) {
+            if constexpr(sizeof(T)<=4) return static_cast<T>(io->read(io->context,address-io->base,sizeof(T)));
+            else {static_assert(sizeof(T)==8);return static_cast<T>(io->read(io->context,address-io->base,4))|
+                (static_cast<T>(io->read(io->context,address-io->base+4,4))<<32);}
+        }
+        T value;std::memcpy(&value,pointer(address,sizeof(T)),sizeof(T));
+        if constexpr(std::endian::native==std::endian::big) value=std::byteswap(value);
+        return value;
+    }
+    template<class T> __declspec(noinline) void store_io(std::uint32_t address,T value) {
+        if(const auto* io=find_io(address,sizeof(T))) {
+            if constexpr(sizeof(T)<=4) io->write(io->context,address-io->base,sizeof(T),static_cast<std::uint32_t>(value));
+            else {static_assert(sizeof(T)==8);io->write(io->context,address-io->base,4,static_cast<std::uint32_t>(value));
+                io->write(io->context,address-io->base+4,4,static_cast<std::uint32_t>(value>>32));}
+            return;
+        }
+        if constexpr(std::endian::native==std::endian::big) value=std::byteswap(value);
+        std::memcpy(pointer(address,sizeof(T)),&value,sizeof(T));
+    }
     struct IoRegion {std::uint32_t base,size;void* context;IoRead read;IoWrite write;};
     const IoRegion* find_io(std::uint32_t address,std::uint64_t size) const {
         for(unsigned i=0;i<io_count_;++i) {
@@ -248,18 +333,30 @@ private:
         }
         return nullptr;
     }
-    std::byte* pointer(std::uint32_t address, std::size_t size) const {
-        if(address>=base_ && address-base_<=bytes_.size() && size<=bytes_.size()-(address-base_))
-            return bytes_.data()+(address-base_);
+    __declspec(noinline) std::byte* try_mapped(std::uint32_t address,std::size_t size) const noexcept {
         for(unsigned i=0;i<region_count_;++i) {
             const auto& region=regions_[i];
             if(address>=region.base && address-region.base<=region.bytes.size() && size<=region.bytes.size()-(address-region.base))
                 return region.bytes.data()+(address-region.base);
         }
-        throw std::runtime_error(std::format("Guest memory access at 0x{:08X}, {} bytes, outside the mapped regions", address, size));
+        return nullptr;
     }
-    std::uint32_t base_;
-    std::span<std::byte> bytes_;
+    __forceinline std::uint32_t primary_address(std::uint32_t address) const noexcept {
+        const auto folded=address&primary_alias_mask_;
+        return folded>=primary_alias_begin_?folded:address;
+    }
+    __forceinline std::byte* pointer(std::uint32_t address,std::size_t size) const {
+        const auto offset=static_cast<std::uint64_t>(primary_address(address))-base_;
+        if(offset<=bytes_.size() && size<=bytes_.size()-offset) return bytes_.data()+offset;
+        if(auto* result=try_mapped(address,size)) return result;
+        invalid_access(address,size);
+    }
+    [[noreturn]] __declspec(noinline) static void invalid_access(std::uint32_t address,std::size_t size) {
+        throw std::runtime_error(std::format("Guest memory access at 0x{:08X}, {} bytes, outside the mapped regions",address,size));
+    }
+    const std::uint32_t base_;
+    const std::span<std::byte> bytes_;
+    std::uint32_t primary_alias_mask_=UINT32_MAX,primary_alias_begin_=0;
     struct Region { std::uint32_t base; std::span<std::byte> bytes; };
     std::array<Region,8> regions_{};
     unsigned region_count_=0;
@@ -285,15 +382,15 @@ inline void load_code_selector(Cpu& cpu,const Memory& memory,std::uint16_t selec
 inline __m128 scalar_vector(std::uint32_t bits) {
     return _mm_castsi128_ps(_mm_cvtsi32_si128(std::bit_cast<std::int32_t>(bits)));
 }
-inline __m128 load_vector(const Memory& memory,std::uint32_t address) {
+template<class MemoryType> inline __m128 load_vector(const MemoryType& memory,std::uint32_t address) {
     __m128 value;
     std::memcpy(&value,memory.access(address,16),16);
     return value;
 }
-inline void store_vector(Memory& memory,std::uint32_t address,__m128 value,bool scalar) {
+template<class MemoryType> inline void store_vector(MemoryType& memory,std::uint32_t address,__m128 value,bool scalar) {
     std::memcpy(memory.access(address,scalar?4:16),&value,scalar?4:16);
 }
-inline void stream_vector(Memory& memory,std::uint32_t address,__m128 value) {
+template<class MemoryType> inline void stream_vector(MemoryType& memory,std::uint32_t address,__m128 value) {
     if(address&15U) throw std::runtime_error("Unaligned guest MOVNTPS");
     auto* target=memory.access(address,16);
     if(reinterpret_cast<std::uintptr_t>(target)&15U) std::memcpy(target,&value,16);
@@ -303,6 +400,33 @@ inline void stream_vector(Memory& memory,std::uint32_t address,__m128 value) {
 inline constexpr std::uint32_t carry = 1, parity = 4, auxiliary = 16,
     zero = 64, sign = 128, direction = 1024, overflow = 2048;
 inline constexpr std::uint32_t arithmetic_flags = carry | parity | auxiliary | zero | sign | overflow;
+
+#if defined(__clang__) && defined(_M_X64)
+template<unsigned Bits,bool Subtract> __forceinline std::uint32_t native_arithmetic_flags(
+    std::uint32_t flags,std::uint32_t a,std::uint32_t b,std::uint32_t input_carry) {
+    std::uint32_t low;bool signed_overflow;
+    // LAHF leaves OF intact; the flag output captures it without touching the
+    // host stack or the guest's floating-point state.
+#define B2_ALU_FLAGS(Plain,WithCarry) \
+    if(input_carry) __asm__("btl $0, %4; " WithCarry "; lahf" \
+        : "=a"(low), "=@cco"(signed_overflow), "+r"(a) : "r"(b), "r"(input_carry) : "cc"); \
+    else __asm__(Plain "; lahf" \
+        : "=a"(low), "=@cco"(signed_overflow), "+r"(a) : "r"(b) : "cc")
+    if constexpr(Bits==8) {
+        if constexpr(Subtract) {B2_ALU_FLAGS("subb %b3, %b2","sbbb %b3, %b2");}
+        else {B2_ALU_FLAGS("addb %b3, %b2","adcb %b3, %b2");}
+    } else if constexpr(Bits==16) {
+        if constexpr(Subtract) {B2_ALU_FLAGS("subw %w3, %w2","sbbw %w3, %w2");}
+        else {B2_ALU_FLAGS("addw %w3, %w2","adcw %w3, %w2");}
+    } else {
+        static_assert(Bits==32);
+        if constexpr(Subtract) {B2_ALU_FLAGS("subl %3, %2","sbbl %3, %2");}
+        else {B2_ALU_FLAGS("addl %3, %2","adcl %3, %2");}
+    }
+#undef B2_ALU_FLAGS
+    return (flags&~arithmetic_flags)|((low>>8)&0xD5U)|(signed_overflow?overflow:0);
+}
+#endif
 
 template<unsigned Bits> constexpr std::uint32_t mask = static_cast<std::uint32_t>((1ULL << Bits) - 1);
 template<unsigned Bits> constexpr std::uint32_t szp(std::uint32_t value) {
@@ -316,6 +440,9 @@ template<unsigned Bits> constexpr std::uint32_t logic_flags(std::uint32_t flags,
 }
 template<unsigned Bits> constexpr std::uint32_t sub_flags(std::uint32_t flags, std::uint32_t a, std::uint32_t b,
                                                         std::uint32_t borrow = 0) {
+#if defined(__clang__) && defined(_M_X64)
+    if(!std::is_constant_evaluated() && borrow<=1) return native_arithmetic_flags<Bits,true>(flags,a,b,borrow);
+#endif
     a &= mask<Bits>; b &= mask<Bits>;
     const auto result = (a - b - borrow) & mask<Bits>;
     return (flags & ~arithmetic_flags) | szp<Bits>(result) |
@@ -325,6 +452,9 @@ template<unsigned Bits> constexpr std::uint32_t sub_flags(std::uint32_t flags, s
 }
 template<unsigned Bits> constexpr std::uint32_t add_flags(std::uint32_t flags, std::uint32_t a, std::uint32_t b,
                                                         std::uint32_t input_carry = 0) {
+#if defined(__clang__) && defined(_M_X64)
+    if(!std::is_constant_evaluated() && input_carry<=1) return native_arithmetic_flags<Bits,false>(flags,a,b,input_carry);
+#endif
     a &= mask<Bits>; b &= mask<Bits>;
     const auto sum = static_cast<std::uint64_t>(a) + b + input_carry;
     const auto result = static_cast<std::uint32_t>(sum) & mask<Bits>;

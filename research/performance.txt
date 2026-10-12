@@ -431,3 +431,760 @@ Reports: build/checks/present-stall-window.png.performance,
 present-stall-window-warp.png.performance, present-stall-window-inspect and
 present-stall-render. A manual recording must measure gameplay after the fix;
 these offline results do not establish in-game FPS.
+
+2026-10-11: release 1.3, native 120 Hz performance target
+
+The user raised the target to sustained 120 FPS or higher at native resolution,
+with interpolation disabled. Keep the selected-rate game cadence when off.
+120 FPS requires 8.333 ms per source frame; the supplied 144 Hz recording has
+a 6.944 ms selected-rate budget. Performance summaries now report that budget
+and the number of eligible source intervals that exceed it. Existing binary
+recordings remain readable; interpolation-on retains its 16.667 ms source budget.
+
+Baseline: build/windows/Release/build/captures/performance-132057387600,
+inspected into build/checks/perf-120-baseline. Ryzen 5 5600X / RTX 5060 Ti,
+144 Hz, 1x, interpolation off, VSync on; PE 6ACAFFB4, image 62300160 bytes.
+735 records / 734 eligible intervals, 10.885 seconds, 7001 cooperative samples.
+Average 67.572 FPS, median interval 15.244 ms, p99 18.058 ms, max 19.714 ms.
+Median work 15.188 ms; measured GPU spans median 3.309 ms, p99 4.804 ms.
+Main-thread utilization is 96.1% of one logical processor. Per eligible frame:
+8.262 ms guest, 1.880 ms command processing, 1.855 ms platform, 1.273 ms draw,
+0.787 ms upload and 0.597 ms resource work. Present is only 0.044 ms;
+GPU completion polling is 0.003 ms, with no intentional pacing. No shader
+compilation, capacity loss or over-budget audio callbacks occurred.
+The recording is CPU-limited; checkpoint addresses are hints, not cost rankings.
+
+The compiled game's common RAM access now inlines only its primary range check
+and value transfer. Device dispatch, secondary mappings and error construction
+are outlined, preserving bounds, unsigned wrap rejection, endian conversion,
+64-bit split device accesses and diagnostic messages. A bounded native comparison
+uses the original compiled SDK vertex packet writer at 0x0021F9C0, found through
+the 0x0021FA80 checkpoint samples. It changes only the Memory implementation.
+Both first-vertex paths produce identical CPU/output checksums. Initial paired
+trials take about 34% less time with first vertex 0 and 37% less with vertex 17.
+Temporary comparison sources and logs remain ignored under
+build/checks/perf-120-memory. Added boundary/alias/device comparisons agree,
+including an empty primary mapping's valid zero-length access.
+
+Fused x87 blocks keep their original instruction bytes and ordering. With all
+six exceptions masked and every memory operand validated, only final instruction
+and last memory provenance need publication. Controls permitting an exception
+retain publication before each original instruction. Existing matrix reference
+checks now cover both paths, all three precisions, four rounding modes, four
+input/output alias arrangements and five input classes. No arithmetic or guest
+function was replaced. The Windows assembly prologue has unwind metadata.
+
+Primary instruction and unwind contracts:
+https://cdrdv2-public.intel.com/782156/325383-sdm-vol-2abcd.pdf
+https://learn.microsoft.com/en-us/cpp/build/exception-handling-x64
+
+Vertex-array state packets now copy their validated contiguous register payload
+without dispatching each word through the general method handler. Nonincrementing
+16-bit and 32-bit element packets append in bulk, retain the last register value
+and preserve method counts and existing capacity failures. Their valid index
+capacity is reserved at device creation. Existing render checks include a 32-bit
+element replay alongside the 16-bit replay.
+
+First candidate CPU checks pass: 52 cases, 21976 instruction, 469 memory,
+6722 floating and 109 control assertions against the verified original XBE.
+One-million-call benchmarks retain matching checksums: 0x00012BC0 falls from
+106.132 to 64.369 ns/call, and fused 0x00227BD9 from 301.429 to 187.911 ns/call.
+The 54 spatial cases and 74 native audio binding cases pass. These are bounded
+component measurements; they do not establish a gameplay frame rate. Final
+build validation and a new user gameplay capture are still required.
+
+First-pass validation completed (build/checks/perf-120-final): production build
+succeeds, with no owned workers left. CPU checks retain the counts above; the
+final call-chain and fused matrix timings are 58.971 and 194.434 ns/call.
+Both hardware and WARP pass 184 rendering cases with no debug messages. All
+162 shared PNGs match present-stall-render byte for byte. Spatial 54, native
+bindings 74, audio 67, DSP 65 and all 12 music tracks pass. Hidden windows retain
+120/144 Hz source pacing with interpolation off, 60 Hz source pacing when on,
+and 59.998 Hz source cadence under presentation backpressure. Recorder checks
+and old-capture inspection pass. Preferences remain unchanged. b2.exe is
+96612352 bytes (previous 62274560); mapped code size increases while the
+recorded private-memory peak below decreases. Component checks do not prove FPS.
+
+The user supplied performance-38715742800, then replaced the comparison with
+performance-27847321800. Preserve both. The replacement has the same hardware,
+144 Hz / 1x / interpolation off / VSync on, PE 6ACBD073, image 96641024 bytes.
+710 eligible intervals average 74.404 FPS, versus 67.572 in the baseline.
+Draws average 1320.21 versus 1312.97, a comparable workload. Median interval
+falls 15.244 -> 13.953 ms; p99 18.058 -> 16.090 ms; max 19.714 -> 17.123 ms.
+Mean guest work 8.262 -> 7.872 ms, command processing 1.880 -> 1.233 ms,
+platform 1.855 -> 1.693 ms, draw submission 1.273 -> 1.127 ms,
+resource preparation 0.597 -> 0.540 ms and uploads 0.787 -> 0.824 ms.
+Every eligible interval still exceeds the 8.333 ms / 120 Hz budget. Main-thread
+utilization remains 95.1% of one processor; the measured GPU-span median is
+2.799 ms. No recording limits, shader compilations or audio overruns occurred.
+Comparison: build/checks/perf-120-comparison.json. This confirms about 10.1%
+more gameplay FPS, not the full 120 Hz target. It also shows why component
+speedups must not be extrapolated to overall game-code cost.
+
+Existing F8 snapshots contain high RAM aliases (for example 0x82D10000), and
+kernel allocation bindings return 0x80000000 aliases. The initial packet-writer
+fixture used low addresses. A second bounded fixture tests a high alias behind
+a separate kernel mapping. Inlining the existing mapped-region lookup retains
+all its checks and saves about 11-15% on that fixture versus the first pass,
+with identical output and boundary/device checks. Primary fixtures also improve.
+This remains a component result; gameplay must be measured again.
+
+Five repeatedly sampled original functions now have opt-in exclusive timing
+in F9 recordings: 0x0021F9C0, 0x00227BD9, 0x00219750, 0x000ED570 and
+0x00109B40. Their containing entries were verified from generated original
+instruction labels. This uses the existing bounded recorder, not a CPU fallback
+or replacement function. Timing pointers are absent during ordinary play and
+cleared from snapshots. Newly created threads inherit recording state. Matrix
+reference checks exercise recording while calculating NaN inputs. Cooperative
+checkpoint counts remain hints; new function timings provide measured costs.
+
+The mapped-memory/profiled build completed on 2026-10-11. Its executable is
+130704896 bytes, versus 96612352 bytes for the first pass; inlining expands
+the code, so the tradeoff still needs a gameplay measurement. Native CPU
+checks again pass 52 cases, 21976 instructions, 469 memory cases, 6722 floating
+cases and 109 control cases, including active recording with NaN matrix inputs.
+The million-call benchmarks measure 9.8395 ns for the basic function, 57.5776 ns
+for the call chain, and 196.641/434.555 ns for fused/unfused matrix calls, with
+unchanged checksums. These are component measurements, not race FPS.
+
+Hardware and WARP render checks both pass all 184 cases without debug messages.
+All 166 shared PNGs per adapter are byte-identical to the first-pass final
+checks. Audio, effects, all twelve music tracks, spatial/native bindings,
+recorder, old capture inspection and both hidden-window checks pass. Hardware
+source pacing remains 120/144 Hz with interpolation off, 60 Hz with it on,
+143.999 Hz after opt-out and 59.994 Hz under presentation backpressure.
+All existing preferences match. Owned build and diagnostic workers have exited.
+
+A separate bounded native benchmark of the exact optional timing hook measures
+52.689 ns per active scope (median of five two-million-call trials), cycling
+through the five selected IDs. Its null-hook empty loop is optimized away;
+that is not a measurement of the branch inside an actual game function.
+Recording overhead can be related to the observed function counts in the next
+capture. The rebuilt game is ready for the user's matching race recording;
+the last verified gameplay result remains 74.404 FPS, below the 120 FPS target.
+
+The user's performance-28815816100 recording identifies a regression in the
+mapped-memory/profiled candidate: 55.073 FPS, median 18.5348 ms, p99 20.6889 ms,
+maximum 22.7506 ms. Its 1320.60 draws/frame match the previous 1320.21. Eligible
+guest time rises from 7.872 to 9.991 ms/frame and platform services from 1.693
+to 4.155 ms/frame; GPU command/upload costs and workload remain comparable.
+All GPU spans are complete, with no recorder drops or audio overruns. The
+candidate therefore does not establish an improvement despite its component
+result; broad mapped-lookup inlining is removed from the next build.
+
+Exact selected costs in that recording: shader constants (0x00219750), 955.790
+ms/934107 calls; vertex packets (0x0021F9C0), 601.362 ms/934107; state flush
+(0x000ED570), 257.890 ms/972755; state update (0x00109B40), 191.282 ms/4939;
+matrix (0x00227BD9), 148.258 ms/549322. General unselected guest work is still
+5102.565 ms. Further opt-in timings cover verified parents 0x00090420,
+0x00090660, 0x00090A50, 0x000BDEE0, 0x0010DA90 and 0x00219370.
+
+Spatial's SDK calculator previously mapped its own 8 KiB scratch area into the
+shared game's memory after kernel and heap aliases. Its stack and parameter
+reads consequently required secondary-map lookups; that mapping also stayed
+in the parent after the Spatial object died. It now owns a memory view with
+scratch as primary, borrowing the existing game buffers/mappings and device
+bindings. Original math dispatch/table writes still reach the same RAM; no
+calculation or immediate/deferred audio behavior is replaced.
+
+The measured shader-copy path contains contiguous original MMX MOVQ/MOVNTQ
+blocks. Native batching checks complete source/destination spans once, then
+executes those same operations in order, including overlapping data. Registers,
+flags, EMMS and fence operations retain their original behavior. Diagnostic
+mode and failed preflight retain individual instructions and partial writes.
+The existing MMX copy check now compares both paths at varied sizes, alignment
+and high aliases, plus a failing destination's partial stores and floating state.
+These changes are being built and require CPU/audio checks and another race
+capture before any performance conclusion or release.
+
+The private-spatial-view/MMX build completed on 2026-10-11 at 15:12 local.
+Its executable is 96628736 bytes, close to the first-pass 96612352 bytes;
+the regressed mapped-inline candidate was 130704896 bytes. The build exits
+successfully, with no surviving owned workers. CPU checks pass 52 cases,
+21976 instructions, 469 memory cases, 6744 floating cases and 109 control
+cases, including the MMX reference/alias/partial-failure comparisons.
+Million-call component timings are 9.1885 ns for the basic function,
+63.9134 ns for the call chain, and 199.533/365.001 ns for fused/unfused
+matrix calls. Existing checksums match; these do not establish race FPS.
+
+Spatial checks pass 54 cases and 74 native binding cases. Its 1000-call
+calculation benchmark now takes 2.9257 ms versus 5.5688 ms in the regressed
+candidate. Audio passes 67 cases, effects 65 checks, and all twelve music
+tracks pass. Hardware and WARP rendering pass 184 cases without debug
+messages; all 166 shared PNGs per adapter are byte-identical to the previous
+candidate. Recorder, old capture inspection and hidden-window checks pass.
+Hardware source pacing is 120/144 Hz with interpolation off, 144 Hz after
+opt-out, 59.951 Hz with interpolation, and 59.992 Hz under backpressure.
+Other preferences match the saved settings, and all diagnostic workers exit.
+Reports are in build/checks/perf-120-direct. The user has been asked for a
+matching 144 Hz busy-race capture with interpolation and music disabled;
+the 120 FPS gameplay target remains unverified.
+
+The user's performance-28378107400 capture confirms recovery on the latest
+build (PE 6ACBEDAC, image 96657408 bytes). Ryzen 5 5600X / RTX 5060 Ti,
+144 Hz, 1x resolution, interpolation off, VSync on: 710 records, 709 complete
+eligible intervals, 9.190596 seconds. Average native rate is 77.272 FPS,
+3.854% above the first-pass 74.404 FPS and 14.355% above the original 67.572
+FPS; the regressed candidate was 55.073 FPS. Draw density is 1324.74/frame,
+versus 1320.21 in the first pass. No generated frames, shader compilations,
+recorder drops, incomplete GPU spans or audio overruns occurred. The target
+SHA-256 matches. The native inspection worker exited.
+
+Intervals: median 13.4581 ms, p95 15.5365 ms, p99 17.1517 ms, maximum
+21.3924 ms. Median work is 13.4449 ms; GPU median 2.783392 ms and p99
+4.055872 ms. All 709 eligible intervals exceed the 8.333 ms / 120 Hz budget.
+Average throughput improves, but p99/max intervals are higher than the
+first-pass recording's 16.0903/17.1228 ms; sustained 120 FPS is not achieved.
+
+Eligible exclusive means: guest 7.901 ms/frame, platform services 1.177,
+GPU commands 1.235, draw submission 1.157, resources 0.544, buffer uploads
+0.828. Platform time improves from first-pass 1.693 and regressed 4.155
+ms/frame; guest time is close to first-pass 7.872. Main-thread utilization
+is 96.676% of one core. GPU and draw workload remain similar, so the next
+performance work should use these CPU costs. Peak working/private memory
+is 228831232/194990080 bytes; peak local GPU memory is 31383552 bytes.
+
+Selected original guest costs, exclusive ms / calls:
+  0x0021F9C0: 504.4203 / 916349; 0x00219750: 423.3483 / 916349;
+  0x00090A50: 336.5599 / 200899; 0x00090420: 277.1498 / 5679;
+  0x000ED570: 227.7811 / 954139; 0x00090660: 161.6577 / 370119;
+  0x00227BD9: 145.5416 / 540181; 0x00109B40: 120.6295 / 3930;
+  0x000BDEE0: 86.9884 / 710; 0x0010DA90: 20.0231 / 139160.
+Unselected guest time totals 3300.4547 ms. Additional selected scopes mean
+this bucket is not directly comparable to the five-scope candidate.
+SetAllParameters takes 168.5151 ms / 27951 calls; listener orientation,
+position and velocity take 139.6994, 135.7080 and 128.9898 ms / 710 each.
+Audio callbacks total 1.4385316 seconds over 918 batches, with no overruns.
+
+Full reports: build/checks/perf-120-direct/new-race and new-race-summary.json.
+The user confirmed the improvement and requested further optimization some
+other time. Work stops at this measured state; no 1.3 release is published.
+
+2026-10-11: overnight 240 Hz optimization (in progress)
+
+Goal: Airport Terminal 3, 1x native resolution, widescreen, interpolation off,
+V-sync off. Use game automation. Every measured benchmark is <=30 seconds;
+F9 remains available for performance diagnostics. Computer use only if necessary.
+These preferences are also retained in AGENTS.md.
+
+The existing LLVM 22.1.8 / Ninja / LLD default is retained. Prior verified build
+measurements and installation checks are in research/build-time.txt. New work
+uses the same compiler and audits only its owned workers after each command.
+
+The native --controls script now accepts performance 1/0 to start/save the same
+recorder as F9. Inputs use a separate virtual controller; user bindings and
+physical controllers are untouched. Startup and menu selection precede timing.
+The shorter startup script reaches the actual Airport Terminal 3 starting grid;
+its 30-second saved frame shows the original HUD/countdown. A subsequent saved
+frame shows driving with the race HUD, 85 mph, and airport-terminal signs.
+
+Actual baseline: build/windows/Release/build/captures/performance-49376133200.
+Automated sequence: build/checks/overnight-240/race-baseline.controls.
+Ryzen 5 5600X / RTX 5060 Ti; verified supported XBE SHA-256. 14.997719-second
+recording, 2040 eligible source intervals, 136.122581 FPS. Median 7.5675 ms,
+p99 9.4183 ms, maximum 9.8397 ms. All exceed the 4.166667 ms target budget.
+949.24755 draws and 187758.38088 vertices per eligible frame. GPU span median
+2.135968 ms, p99 2.690560 ms. No recorder drops or partial GPU spans reported.
+Earlier title/preview captures do not establish race FPS and are not baselines.
+
+Candidate changes, not yet accepted: exact shader keys use an ordered lookup;
+primary-storage suffix aliases can fold a single address bit after their mapping
+is verified. This does not fold the earlier, separate kernel image or unmapped
+holes. Xbox maps the heap suffix at 80000000+heap_begin and F0000000+heap_begin;
+only the verified single-bit alias uses the shortcut. Other mappings retain the
+existing bounded lookup. Five comparisons per integer size check shared stores,
+separate kernel storage, the preceding hole, end bounds, and unmapped aliases.
+The connected Release build is currently compiling/linking these changes.
+No 240 Hz claim is made. Further measured race runs and validation are required.
+
+The ordered shader-key map is rejected: performance-49555806800 recorded
+117.512888 FPS (8.2191 ms median, 10.353 ms p99) and doubled resource-preparation
+cost per draw. Its 1052.14 draws/frame differ from the baseline's 949.25, so
+aggregate FPS is not an equal-workload comparison. The original vector lookup
+is restored. All 163 comparable hardware PNGs match the previous widescreen
+validation byte for byte.
+
+A native-call index now replaces repeated binary searches of the immutable
+compiled-function list. The build tool emits a 131072-slot index (512 KiB),
+using complete guest addresses and checking exact matches after collisions.
+The function list and native entry functions are unchanged. The CPU diagnostic
+checks every one of 36149 entries plus both adjacent addresses against the
+existing sorted list. Missing targets keep the same explicit error.
+CPU, 184 WARP rendering cases, spatial/native bindings and recorder checks pass.
+The index build took 227.817 s; the boundary/alias build took 375.636 s. All
+commands use tracked PID/creation-time ownership and sequential diagnostics.
+
+performance-49544515600 is a 14.998345-second automated driving recording of the
+index candidate: 128.376865 FPS, median 7.6719 ms, p99 9.6041 ms, 1011.99
+draws/frame. Resource preparation returns to 0.498 ms/frame; guest work is
+3.804 ms/frame. These records do not establish the requested 240 Hz target.
+A conservative alias-end check now excludes a mapping that abuts primary RAM,
+preserving the original zero-length end pointer. Its connected rebuild is active.
+A bounded native PC sampler was compiled under build/checks/overnight-240 to
+locate remaining native costs; it has not been run and is not a release program.
+The next step is native profiling after the build, then measured improvements.
+
+Native profiling: private profile-sample collected 812 bounded main-thread PCs
+from the active Airport run, with one terminal-thread read failure. This is
+sampling evidence, not exact function timings or an FPS benchmark. Renderer
+submission and nested integer-array comparison routines were prominent. System
+symbols were unresolved; do not assign those waits to a particular caller.
+The private sampler is not shipped or required by the game/build.
+
+Shader/layout equality now compares the fixed-size integer storage directly;
+compile-time size checks exclude padding. Hardware passes all 184 render cases,
+and 163 comparable PNGs match the previous candidate exactly. The automatic
+15-second performance-49524231600 capture measures 130.932672 FPS, median
+7.5474 ms, p99 9.3299 ms, and 991.64 draws/frame. Varied traffic/crashes and draw
+counts prevent attributing small aggregate changes to individual optimizations.
+
+The common programmable shader path now borrows its already-built uniforms;
+only fixed transforms need the adjusted local copy. Hardware and WARP pass all
+184 rendering cases, with no debug errors. All 163 comparable hardware PNGs
+remain identical. The hidden-window/settings/recorder suite also passes.
+performance-49553618100: 14.998651-second Airport driving capture, 130.261323
+FPS, median 7.5777 ms, p99 9.4105 ms, 1001.37 draws/frame. No capture limits
+or partial GPU spans. Sustained 240 Hz is still not achieved.
+
+Incremental build root cause: shader generation depended on the entire tool
+executable, which includes the shared renderer. Every renderer rebuild therefore
+recompiled unchanged HLSL for about 49 seconds. CMake now depends on the actual
+shader-generator inputs, project headers, target/GUI headers, XBE and build
+configuration; COMMAND retains tool build ordering. A timestamp-only renderer
+rebuild passed in 8.553 s versus 59.292 s before, with the shader stamp unchanged.
+It retained ordinary compilation/linking and verified original CPU generation.
+Reconfiguration must use the documented Visual Studio SDK environment: outside
+it CMake incorrectly selected LLVM preprocessing for the cached Microsoft RC.
+Reconfiguration under the SDK and the subsequent resource compilation pass.
+
+Current canonical executable: build/windows/Release/b2.exe, with LLVM/Ninja/LLD,
+static dispatch index, validated primary suffix alias, integer cache comparisons
+and the conditional uniform copy. CPU checks pass 52 cases / 487 memory checks;
+lookup checks cover all original entries and adjacent addresses. Hardware/WARP
+and settings pass. Next required work: larger measured CPU/submission savings,
+repeat <=30-second automated Airport benchmarks, and final acceptance at 240 Hz.
+Do not mark the goal complete or infer success from component checks.
+
+Native arithmetic candidate: Clang x64 uses ADD/ADC/SUB/SBB/TEST and LAHF,
+with OF captured separately, instead of rebuilding every architectural flag
+in C++. Constant evaluation and other compilers retain the verified formulas.
+The existing hardware-instruction comparisons pass all 21976 integer cases,
+including 8/16/32-bit ADC/SBB and preserved flags. All 52 CPU cases pass.
+The 14.998144-second automated Airport recording performance-49573970500 is
+131.573636 FPS, median 7.4882 ms, p99 9.6707 ms, 981.80 draws/frame; guest
+work is 3.681 ms/frame. No dropped frames; every source interval exceeds the
+240 Hz budget. This is a small, workload-dependent change, not acceptance.
+Renderer binding work is now being validated: repeated identical driver
+bindings are skipped within a draw batch, and state is invalidated at each
+batch boundary or explicit texture unbind. The connected rebuild passed in
+13.696 seconds without shader recompilation. Further race measurement required.
+
+The binding cache passes 184 hardware render cases with no debug errors; all
+163 comparable PNGs are identical. performance-49524535400 records a 14.997309-
+second automated Airport run: 135.245953 FPS, median 7.274 ms, p99 9.0458 ms,
+965.47 draws/frame. Draw submission is 0.695 ms/frame. Target remains unmet.
+
+GPU shader selection now reuses the prepared shader until its start or uploaded
+tokens actually change. Both single-word and bulk upload paths track exact byte
+changes. Fixed-transform and consecutive vertex-layout inputs reuse their IDs;
+renderer caches remain persistent across session reset. All 184 hardware cases
+pass, with no debug errors and 163 identical comparable PNGs. The race capture
+is performance-49531170900. This candidate still needs repeated acceptance.
+
+Next compiler experiment is optional LLVM IR profile-guided optimization,
+trained by native Airport gameplay. This records actual hot branches/calls for
+compile-time optimization and adds no runtime decoder or interpreter. Default
+builds keep profiling disabled. LLVM references:
+https://clang.llvm.org/docs/UsersManual.html#profile-guided-optimization
+https://llvm.org/docs/CommandGuide/llvm-profdata.html
+
+LLVM IR instrumentation build passed in 408.469 s; the recording reset hook
+relinked in 9.221 s. Instrumented CPU diagnostics still pass all 52 cases and
+21976 integer comparisons. The automated Airport training used the same native
+controller script, with a 15-second F9-equivalent recording and normal exit two
+seconds later. Its final native PNG shows active Airport racing. All 17 timed
+controls applied; native resolution/widescreen/interpolation-off settings match.
+F9 resets counters at recording start in instrumented builds, excluding setup.
+Owned compiler workers were audited gone before game execution. Profile output
+airport-15384.profraw (35,964,984 bytes) merged successfully to airport.profdata.
+The indexed profile contains 58,137 functions and 2,011,605 blocks. Renderer
+submission, Memory::access, GPU command submission and the audio worker are
+frequent paths. Counts identify work; they are not per-function timings or FPS.
+The optimized (counter-free) build is now compiling against this profile.
+
+Counter-free LLVM PGO build passed in 336.459 s. CPU diagnostics pass all 52
+cases, 21976 integer / 487 memory / 6744 floating comparisons and 36149 native
+entries. Hardware passes 184 render cases without debug errors; all 163
+comparable PNGs remain identical. performance-49539324200 is a 14.997506-second
+Airport run: 144.038709 FPS, median 6.9515 ms, p99 8.3847 ms, 956.22 draws/frame.
+Guest CPU work falls to 2.411 ms/frame from 3.632 ms/frame before PGO. Present
+now consumes 1.347 ms/frame and the main thread is only 80.65% busy, revealing
+another bottleneck: the windowed flip swapchain lacks ALLOW_TEARING despite
+sync interval zero. The supported capability, creation, resize and presentation
+flags are now being corrected together. The frame-availability queue remains
+bounded. Microsoft reference:
+https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/variable-refresh-rate-displays
+
+A private controlled memory probe finds ordinary mapping reads/writes at 5.122
+ns/iteration versus 1.234 ns with a cached, bounded primary mapping, with the
+same nonzero checksum. This is component evidence, not game FPS; no primary
+mapping snapshot has been added to the production CPU yet. Measure after the
+presentation correction before choosing the next CPU change.
+
+The capability-based tearing fix passes the hidden-window/settings/recorder
+suite. performance-49548244000 records a 14.998481-second Airport run at
+180.822987 FPS, median 5.518 ms, p99 7.4319 ms, 1029.09 draws/frame. Presentation
+falls to 0.0307 ms/frame; guest CPU work is 2.260 ms/frame. No dropped frames.
+The target remains unmet. Source and presentation continue at each actual flip.
+
+The next CPU candidate caches only the immutable primary span/base and one
+already-verified suffix alias in each native function. Primary storage is const;
+additional mappings are appended and cannot invalidate existing ones. All RAM
+bounds remain checked. Misses delegate to the current Memory instance, including
+new mappings and device callbacks. The snapshot itself never escapes to cold
+helpers, allowing the compiler to keep its fields in registers. A controlled
+probe of the production implementation measures 1.083 ns/iteration versus
+4.956 ns normally, with identical nonzero checksums. This is not an FPS claim.
+Eight necessary checks per integer width cover shared/separate mappings, later
+aliases, holes, end bounds, invalid tags, empty accesses and later device binding.
+The native lowering now uses this snapshot for integer/raw floating accesses;
+verified calls and existing atomic/string/vector helpers retain the live Memory.
+A fresh instrumented training build is required; do not reuse stale profiles.
+
+The first snapshot training build passed in 369.469 s. CPU checks pass all 52
+cases, including the new cached mapping/device checks (511 memory checks for
+8/16/32-bit paths). Before collecting profiles, SIMD raw loads/stores are now
+using the same snapshot too; the helpers remain statically typed and preserve
+all original alignment/size rules. The mapping checks are also applied to the
+64-bit helper path, including its two-part device access. This requires one
+connected rebuild before training. No stale compiler profile is accepted.
+The LLD cache was 1,249 MiB despite its 1 GiB target. Its modest target is now
+3 GiB to retain more native rebuilds; D: has over 1 TiB free. Workers were gone
+before diagnostics. The final counter-free race result is still outstanding.
+
+The SIMD snapshot build passed in 231.174 s; all CPU checks pass, now including
+525 memory comparisons and 6744 floating comparisons. A fresh 15-second native
+Airport training recording completed normally, with all 17 controls applied and
+no audio error. The final native image shows active Airport racing. Its new
+36,573,256-byte primary-airport-17864.profraw merged successfully. The optimized
+build passed in 305.814 s; counter-free CPU diagnostics again pass all 52 cases.
+The actual race acceptance recording is now running. No 240 Hz claim yet.
+
+Shader dependency refinement: inspected the generator's real include graph.
+Its project inputs are file/xbe/shaders/vertex_program sources and headers,
+tool/shader_compiler sources, plus generated GUI/target/kernel-name headers and
+the XBE. CPU/audio headers and compiler-profile cache settings do not affect its
+HLSL output. The dependency list now names those actual inputs; Ninja tracks
+command changes itself. Verification after the active race is required. This
+avoids another roughly 49-second shader rebuild on unrelated CPU/profile work.
+
+performance-49545945800: 14.996612-second automated Airport recording of the
+counter-free primary snapshot candidate, 179.991802 FPS, median 5.5659 ms,
+p99 7.3956 ms, 1023.18 draws/frame. Guest work is 2.304 ms/frame; no clear race
+improvement versus 180.823 FPS / 2.260 ms previously. Do not infer game gains
+from the 4x component result. Hardware passes 184 cases, no debug errors, and
+all 163 comparable PNGs are identical. Target remains unmet.
+
+GPU command candidate: a 4 KiB constexpr prefix table identifies methods with
+immediate effects (draws, constants, program uploads, current attributes,
+fences, flips, clears and object binding). Ordinary register-only packets now
+copy once; repeated ordinary writes retain the last word. Object validation,
+method-bank/packet bounds, special actions and statistics remain intact. The
+same effect classification gates the individual method handler. All action
+ranges were checked against that handler. Hardware validation is running.
+The connected rebuild passed in 13.494 s without generating shaders, verifying
+the refined shader dependency graph on a real GPU-code/configuration change.
+
+Current canonical executable: counter-free LLVM PGO using primary-airport.profdata,
+primary mapping snapshots (including SIMD), capability-based V-sync-off tearing,
+shader/layout memoization, draw binding cache and GPU register-packet batching.
+CPU passes 52 cases / 21976 integer / 525 memory / 6744 floating / 109 control
+checks; all 36149 native entries remain verified. Hardware passes 184 cases,
+with 163 identical comparable PNGs and no debug errors.
+performance-49563453100: 14.997311-second Airport recording, 180.575156 FPS,
+median 5.5253 ms, p99 7.3799 ms, 1027.37 draws/frame. Guest 2.330 ms/frame;
+GPU commands 0.856 ms; draw 0.729 ms; resource preparation 0.359 ms; uploads
+0.609 ms; Present 0.0313 ms. No dropped frames. Stable 240 Hz remains unmet.
+
+A bounded native sampler now uses a per-process 1 ms timer and indexed x64
+unwind ranges to validate function extents. Native-unwind-sample collected
+7665 PCs in 15 seconds, with no failures, using the same autonomous Airport
+controller script and no F9 recorder overhead. Sampling perturbs execution and
+is not an FPS acceptance result. Renderer::draw_streams accounts for 709 PCs,
+integer-array mismatch 526, Renderer::prepare 246, GPU::submit 221, original
+219750/21F9C0 about 197/195. VCRUNTIME had 645 unresolved PCs; unresolved names
+must not be assigned to a particular routine. These are location hints, not
+inclusive timings. Raw PCs and the complete report are private native-unwind.txt.
+
+Next evidence-driven work: resolve source lines for the renderer samples, then
+avoid resolving the same pipeline/samplers again when submitting already-prepared
+queued draws. Consider batched buffer uploads only if measured costs justify it.
+Do not assume a component improvement establishes FPS. The primary snapshot
+showed no clear race gain; retain/reject it based on repeated game measurements
+and memory/loading evidence. Retest CPU/render/window paths for subsequent edits.
+All measured game captures remain 15 seconds; preparation precedes recording.
+Goal remains active. Do not mark complete until sustained 240 Hz is demonstrated
+on Airport Terminal 3 with 1x/widescreen/interpolation off/V-sync off.
+
+Prepared graphics state: queued GPU draws now retain the pipeline and four
+sampler bindings already resolved by Renderer::prepare. Immutable map entries
+remain valid across resets; descriptors verify renderer ownership. Submission
+avoids repeating five map lookups per draw. Ordinary diagnostic draw APIs keep
+their original lookup/validation path. Build passed in 17.122 s; all CPU cases
+pass, and hardware passes 184 cases with no errors and 163 identical PNGs.
+performance-49562717800 measures 188.060910 FPS, median 5.3103 ms, p99 7.0267 ms,
+1050.48 draws/frame. Draw submission falls from 0.729 to 0.425 ms/frame.
+Target remains unmet. Other measured costs: guest 2.345, commands 0.858,
+resource preparation 0.377, buffer uploads 0.637, Present 0.0299 ms/frame.
+
+Recorder clock uses exact multiplication on the verified Windows 10 MHz QPC
+counter instead of two repeated integer divisions. Non-divisor frequencies
+retain the general exact formula. The recorder/inspection check passes.
+
+A separate low-overhead original-frame capture measures normal gameplay without
+per-operation timing/query instrumentation. It records the existing flip clock
+into a pre-reserved 8192-element buffer, auto-stops at 30 seconds, saves raw
+intervals and configuration, and is exclusive with F9 diagnostics. Data is only
+written after measurement. Timed scripts use benchmark 1/0; the game automation
+and settings are otherwise identical. benchmark-49524397700: 15.000481 seconds,
+14.989980 measured seconds, 2988 actual intervals, 199.333151 FPS, median
+5.0604 ms, p95 5.7845 ms, p99 6.7022 ms, max 8.2019 ms, no dropped frames,
+settings unchanged. This still does not meet stable 240 Hz. Interval count,
+summed duration and computed FPS were independently checked against raw data.
+The metadata build adds CPU/build identity and enforces the sampling deadline.
+The hidden-window/settings/recorder check passes; all owned workers are gone.
+
+Current canonical build: counter-free PGO primary-airport.profdata, prepared
+bindings, exact recorder clock and frame-only script benchmarking. No changes
+to source rendering resolution, widescreen or interpolation quality. Future
+240 Hz acceptance must use real game intervals, not component timings.
+Next substantial target: reduce per-draw dynamic-buffer upload/rename work.
+Consider a capability-checked D3D11.1 constant-buffer ring/ranged binding, then
+batch vertex uploads across the existing queued draw group. Preserve original
+pixels and validate hardware/WARP, bounds and native fences. Do not invent an
+ABI assumption, drop game work, enable interpolation, or weaken success criteria.
+The goal remains active and unmet. Existing primary snapshots have no proven
+race FPS benefit; reassess them using game/memory/loading evidence.
+
+D3D11.1 constant-buffer ring: capability-check constant offsetting and dynamic
+NO_OVERWRITE support; use aligned 64 KiB rings with DISCARD only on wrapping,
+and bind 256-byte-aligned ranges. Unsupported devices keep the previous path.
+Hardware and WARP expose the required capabilities. Both pass all 184 checks
+without debug messages, including 32770 queued draws with changing pixel
+constants, positions and colours. All 163 baseline PNGs match.
+benchmark-49534434700: 200.015809 FPS, median 5.0491 ms, p99 6.612 ms, max
+7.3179 ms, 2999 intervals over 14.993815 measured seconds; no drops, settings
+unchanged. CPU/GPU/build identity is recorded. This is not a clear improvement
+over 199.333 FPS, and stable 240 Hz remains unmet. performance-49507656600:
+189.131521 FPS with detailed recording, guest 2.313, platform 0.558, GPU
+commands 0.852, draw submission 0.452, resources 0.378, uploads 0.613 ms/frame.
+No runtime shader compilation or GPU waiting bottleneck was observed.
+
+Consecutive graphics-state reuse removes redundant pipeline/sampler map
+lookups without skipping fragment or resource validation. All 184 hardware
+cases pass and 163 PNGs match. Build 13.789 s. benchmark-49548042000 measures
+204.390549 FPS, median 4.9272 ms, p99 6.5376 ms, max 8.11 ms, no drops.
+
+Queued vertex uploads: Renderer accepts the existing 256-draw GPU group,
+validates and packs each native stream once, and maps its vertex buffer once
+per bounded group. Groups split before exhausting storage; DISCARD retains
+earlier submitted allocations. Single-draw diagnostics share the same packing
+helper. Builds 17.118 s / 11.112 s, all 184 hardware/WARP cases pass, no debug
+messages, and 163 PNGs match. The existing wrap case now submits queued groups
+and reads changing program and pixel constants, rather than merely varying
+vertex colours; it forces both constant rings to wrap as well as vertex/index
+storage. benchmark-49546758000: 209.642375 FPS, median 4.757 ms,
+p99 5.9758 ms, max 6.8778 ms, 3143 intervals over 14.992198 measured seconds,
+no dropped frames or configuration changes. Stable 240 Hz remains unmet.
+
+Shader constants can now share one map per bounded queued group. Equal
+consecutive values share a range; groups split before either 64 KiB ring is
+full. Legacy devices retain individual uploads. Failed submission invalidates
+the retained values. The wrap case falls from 99335 to 38917 maps, preserving
+all pixels and 184 hardware/WARP checks. benchmark-49547946400 is 207.714559
+FPS, median 4.8166 ms, p99 6.0492 ms, max 7.6324 ms. No clear FPS gain yet.
+performance-49499777200 is 201.706457 FPS, 1074.17 draws/frame, 1134.40 maps/
+frame. Draw submission 0.301, resources 0.118, uploads 0.404, GPU commands
+1.061, guest 2.351, platform 0.589 ms/frame. Preparation moved some work out
+of individual draw timing; phase changes alone do not establish a speedup.
+
+Direct uniform construction, retained per-layout stream sizes and borrowed
+upload offsets avoid temporary copies and repeated format calculations. All
+184 hardware/WARP cases pass without errors, with identical PNGs.
+benchmark-49548705000: 211.324757 FPS, median 4.6825 ms, p99 6.0093 ms,
+max 7.8926 ms, 3169 intervals / 14.995877 measured seconds, no drops, settings
+unchanged. Stable 240 Hz remains unmet. Next CPU experiment: preserve ordinary
+C++ logic-flag expressions so LLVM can fold branches and discard unused flag
+bits, which opaque inline TEST/LAHF prevents. Flag semantics remain identical.
+
+Logic-flag folding: removing inline TEST/LAHF retains the identical C++ flag
+formula. All 52 CPU groups, 21976 instruction, 525 memory, 6744 floating and
+109 control cases pass, plus original spatial calculations/bindings. Rebuild
+229.507 s. benchmark-49551478700: 208.197050 FPS, median 4.7965, p99 6.1193,
+max 7.1955 ms. No demonstrated FPS benefit; reassess with matched scenes.
+
+Audio synchronization: playback status is published with lock-free integers
+at creation, playback changes, completion and release. Healthy error queries
+also avoid the mixer mutex. Listener updates calculate all affected sources
+before one validated batch, avoiding partly updated listeners in a callback.
+Mixer checks and all 74 SDK binding cases pass. benchmark-49523481000:
+209.521213 FPS, median 4.7654, p99 5.9343, max 7.0408 ms, no audio errors.
+
+Bounded native sampling (15 s) confirms SDL audio mutex waits and copy costs.
+Size-less symbol names are only hints. Raw Windows syscall stubs and memcpy
+implementation ranges were checked in small native disassembly ranges. Stack
+walking is bounded to four frames; source-line data is absent for our Release
+objects, so nearest public symbols cannot establish exact callers. Sampling is
+diagnostic, never an FPS acceptance result; all owned sampling workers exited.
+
+Audio controls now use a fixed 4096-entry single-producer/consumer queue for
+frequency, pitch, spatial, volume and headroom. The game validates and publishes
+groups atomically; the mixer consumes them before a batch. Capture, format
+changes and voice release/reuse drain pending controls while locked. Rare full
+queues drain synchronously rather than dropping commands. No gameplay-path
+allocation. All 72 mixer checks pass, including queued control wrapping,
+backpressure, format reset and reused voices; all 74 SDK binding checks pass.
+benchmark-49531011000: 210.100222 FPS, median 4.7477, p99 5.9467, max 6.8698 ms,
+no dropped frames, unchanged settings, no audio errors. Stable 240 Hz is unmet.
+
+Compiler check: clang-cl /O2 already selects frontend -O3 (verified with -###
+and https://clang.llvm.org/docs/UsersManual.html). Do not add redundant frontend
+flags. The next experiment selects /opt:lldlto=3 for LLD's final optimization,
+supported by the installed LLVM 22.1.8 driver, and refreshes the gameplay profile
+for changed GPU/audio paths. Keep this only if actual game timings justify it.
+
+Refreshed profile: updated-airport-15508.profraw (36591664 bytes), merged to
+updated-airport.profdata. Training build 301.083 s; counter-free use build
+243.183 s, with only a zero-count shader_binary profile mismatch. CPU, 72 audio,
+74 SDK binding and 184 hardware checks pass; 163 PNGs match. benchmark-
+49551314000 measures 211.232756 FPS, median 4.6948, p99 5.9434, max 6.8473 ms,
+no audio errors or drops. Target remains unmet.
+
+Index uploads now share the same bounded draw groups as vertices/constants.
+One checked plan preserves each primitive's original topology and index order;
+conversion writes directly into mapped storage. Groups split before capacity
+is exhausted. Single-draw APIs share planning/conversion. All 184 hardware/
+WARP checks pass with no errors, and PNGs match. The wrap diagnostic drops from
+38917 to 8196 total maps. benchmark-49556323600: 211.607347 FPS, median 4.6449,
+p99 6.132, max 10.3124 ms. performance-49511804600: 205.018483 FPS,
+1078.45 draws/frame, 125.52 maps/frame, guest 2.448, platform 0.592, commands
+1.036, draw submission 0.203, resources 0.114, uploads 0.344 ms/frame. No audio
+overruns. This map reduction has not established a substantial FPS increase.
+
+GetPosition became the largest remaining audio-service wait: 0.130 ms/frame
+over 52 calls/frame in the latest F9 recording. Playback/write cursors now
+publish as one lock-free 64-bit value after each mixed block and after playback,
+seek, region, format and lifecycle changes. Getters retain validation and the
+original codec/loop/capacity calculations. All 72 mixer and 74 SDK cases pass.
+benchmark-49551851500: 209.856118 FPS, median 4.7455, p99 6.0636, max 6.9311 ms,
+no drops, configuration changes or audio errors. No clear FPS gain yet.
+
+Next compiler experiment: optional B2_AVX2 Release target, default OFF. Windows
+IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE) confirms OS AVX2
+support on the named Ryzen 5600X. Keep the portable binary for comparison; an
+AVX2 build requires this CPU/OS feature. Do not claim component/ISA capability
+as an actual FPS improvement. Goal remains active and unmet.
+
+AVX2 experiment: build 266.547 s; all 21976 instruction, 525 memory, 6744
+floating, 109 control, 72 audio, 74 SDK and 184 hardware cases pass; PNGs match.
+benchmark-49536262100: 204.039664 FPS, median 4.9271, p99 6.4372, max 7.3156 ms,
+no dropped frames or audio errors. 4232 generated-function profile mismatches
+mean this needs an architecture-matched profile before a clean comparison.
+Restore B2_AVX2=OFF for the current user executable; retain the optional switch
+for controlled experiments, default OFF. Do not claim an AVX2 improvement.
+
+Current work remains active: about 210-212 FPS in the named actual race, not
+stable 240 Hz. Shader-constant snapshots still copy/compare all 192 rows per
+draw. A future reduction must derive live constant ranges in the existing build
+translator, retain all rows for relative addressing, preserve CPU viewport/fixed
+transform consumers, and keep current captures accurate. Runtime token decoding
+and guessed ABI/alias rules are not acceptable. Also reassess unproven earlier
+changes with matched game workloads; do not confuse reduced API counts with FPS.
+
+Portable restoration complete: AVX2 OFF, profile generation OFF, updated-airport
+profile use ON, LLD final optimization level 3. Restoration 102.691 s. All CPU
+cases and the hidden window/settings/recorder checks pass. No owned completed
+build/diagnostic workers remain. Canonical executable is counter-free and uses
+the requested 240 Hz / 1x / widescreen / interpolation off / V-sync off settings.
+The measured race target is still unmet; do not mark the goal complete.
+
+Shader constant ranges are now derived by the existing build translator and
+stored with the compiled shader bytes. Relative addressing and launch programs
+retain all 192 rows. Fixed transforms retain rows 0..95; CPU viewport consumers
+remain included. Draw snapshots and comparisons use the recorded range, with
+unused rows cleared on program changes. All 184 hardware and WARP checks pass;
+all 166 comparison PNGs match. Build 64.212 s. benchmark-49525383500:
+212.802423 FPS, median 4.6531, p99 5.974, max 7.9324 ms, no drops/audio errors.
+
+A packet-wide shader-upload experiment passed the same checks/images but did
+not establish a game benefit: benchmark-49560119800, 211.797237 FPS, median
+4.66, p99 5.9991, max 6.8075 ms. Removed that fast path. Existing packet checks
+now also cover partial instruction/context uploads and their cursor advances.
+performance-49518163900 measured 1059.83 draws and 124.64 maps/frame;
+guest 2.615, commands 1.189, platform 0.538, uploads 0.383 ms/frame.
+
+Common 32-bit RAM accesses previously compiled to two bounds checks, combining
+SETB results, followed by a redundant pointer-null check. A cached word limit
+replaces the bounds work with one comparison. Small/empty mappings and their
+ends are checked near UINT32_MAX; all 21976 instruction, 579 memory, 6744
+floating and 109 control cases pass. Build 213.309 s. benchmark-49554427300:
+218.134822 FPS, median 4.4664, p99 5.8523, max 6.7389 ms, no drops.
+
+The next revision returns range validity directly and uses checked 32-bit
+offsets for words. Memory's constructor forbids wrapping spans, so underflow
+offsets are beyond the word limit. The bounded native assembly probe confirms
+one comparison without the pointer-null branch. This changes 36089 profile
+hashes: refresh the compiler profile before assessing the final revision.
+
+The direct read/write revision passes all CPU cases, 72 audio checks and 74
+audio binding checks. Refreshed direct-airport-13384.profraw (32564744 bytes)
+to direct-airport.profdata (19939672 bytes). Training build 272.004 s; use build
+235.412 s, with one zero-count shader_binary profile mismatch. The counter-free
+use build passes 184 hardware render cases and all 166 PNGs match. benchmark-
+49541609400: 224.711398 FPS, median 4.3257, p99 5.8084, max 6.9813 ms.
+Requested settings unchanged, no drops or audio errors. Stable 240 Hz unmet.
+
+Shader uploads now pack the compiled constant range followed by the unchanged
+viewport/fog/texture/input fields. HLSL uses the same recorded range and offset;
+relative addressing and launch programs retain their full context. Queue groups
+and D3D11.1 bindings use each program's actual aligned size. CPU snapshot ranges
+remain separate to retain viewport consumers. Legacy buffer uploads share the
+packing code. Existing wrap checks now switch between programs with zero/one
+constant, while retaining changes within the same program. All 184 hardware
+and WARP checks pass, all 166 PNGs match. The wrap case uses 4100 maps instead
+of 8196; this does not by itself establish a game FPS gain. Builds 61.526 s
+and 11.312 s for the added diagnostic coverage. Actual race measurement next.
+
+benchmark-49423548600: 224.690378 FPS, median 4.3351, p99 5.7839, max
+6.5416 ms, no drops or changed settings. No FPS gain established for packing.
+The hidden window/settings checks pass. performance-49390696400 records
+1096.48 draws and 108.88 maps/frame, 7191619 upload bytes/frame. Guest 2.255,
+commands 1.021, platform 0.552, uploads 0.348 ms/frame; GPU median 1.393 and
+p99 1.843 ms. Audio error remains empty. The two changed draw functions have
+profile hash mismatches, so a matching profile is needed before deciding whether
+to retain the packed upload change. CPU function profiles still match.
+
+Repeat benchmark-49377179400 confirms 224.800691 FPS, median 4.3334,
+p99 5.7788, max 6.1956 ms, no drops. Stable 240 Hz remains unmet. Latest F9
+audio hot operation is CommitEffectData: 344.567 ms across 3205 calls (~0.108
+ms/frame), followed by the three listener updates (~0.088 ms/frame each).
+Investigate actual mixer synchronization before changing those semantics.
+Canonical b2.exe is portable (AVX2 OFF), counter-free (profile generation OFF),
+using direct-airport.profdata. All completed owned workers and games have exited.
+Next: resolve the two changed draw-function profile mismatches, reassess packed
+uploads in the actual race, and use the current F9 costs to choose the next root
+cause. Do not infer game FPS from upload counts or mark the goal complete.
+
+2026-10-12: the user accepted the overnight improvement as sufficient for the
+upcoming release and withdrew the requirement to reach 240 Hz in this run.
+Optimization stopped at that acceptance. Latest repeat: 224.800691 FPS,
+p99 5.7788 ms, requested settings unchanged. Stable 240 Hz is not established.
+No owned benchmark or build processes remain running.
+
+Cleanup requested after acceptance: removed 39 comparison/training executables
+from Release and obsolete scratch programs, objects, symbols, raw/unused
+profiles, worker markers and duplicate diagnostics (4250019225 bytes total).
+Release retains b2.exe and b2-tool.exe. Their hashes, the current symbols,
+settings, inputs and active direct-airport.profdata are unchanged; save/data
+files are intact. Benchmark captures, final validation output, reusable controls,
+timings and the initial source snapshot remain. CMake configuration still passes.

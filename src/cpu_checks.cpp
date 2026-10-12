@@ -42,6 +42,7 @@ void b2_fp_snapshot(void*);
 namespace b2 {
 void guest_00227BD9(Cpu&,Memory&);
 void reference_matrix(Cpu&,Memory&);
+const CompiledFunction* lookup_native(std::uint32_t) noexcept;
 namespace {
 using CarryReference = std::uint32_t (*)(std::uint32_t, std::uint32_t, std::uint32_t);
 using UnaryReference = std::uint32_t (*)(std::uint32_t, std::uint32_t);
@@ -149,9 +150,74 @@ template<unsigned Bits> unsigned check_instructions(const References& host) {
     return checked;
 }
 
-template<class T> unsigned check_strings() {
+template<class T> unsigned check_primary() {
     unsigned checked = 0;
-    constexpr std::uint32_t base = 0x1000, source = 80;
+    constexpr std::uint32_t base = 0x1000;
+    if constexpr(sizeof(T)==4) for(unsigned size=0;size<=5;++size) {
+        std::array<std::byte,8> bytes{};
+        Memory memory(UINT32_MAX-7,std::span(bytes).first(size));const auto ram=memory.primary();
+        for(unsigned offset=0;offset<=size+1;++offset) for(bool write:{false,true}) {
+            bool completed=false;
+            try {
+                if(write) ram.store<T>(UINT32_MAX-7+offset,0x12345678);
+                else (void)ram.load<T>(UINT32_MAX-7+offset);
+                completed=true;
+            } catch(const std::runtime_error&) {}
+            require(completed==(offset<=size && sizeof(T)<=size-offset),"Cached word access changed a small mapping boundary");++checked;
+        }
+    }
+    {
+        std::array<std::byte,256> primary{};
+        std::array<std::byte,64> kernel{};
+        Memory memory(base,primary);
+        memory.map(0x80000000U+base,kernel);
+        memory.map(0x80000000U+base+128,std::span(primary).subspan(128));
+        const auto ram=memory.primary();
+        memory.store<T>(0x80000000U+base+128,static_cast<T>(0xAABBCCDD));
+        require(memory.load<T>(base+128)==static_cast<T>(0xAABBCCDD),"Primary suffix alias lost its shared storage");
+        memory.store<T>(0x80000000U+base,static_cast<T>(0x11223344));
+        require(memory.load<T>(base)==0 && std::memcmp(kernel.data(),primary.data()+128,sizeof(T))!=0,
+            "Primary alias replaced the separate kernel mapping");
+        require(!memory.try_access(0x80000000U+base+64,1),"Primary alias mapped the hole before its suffix");
+        require(memory.try_access(0x80000000U+base+255,1)==primary.data()+255 &&
+            !memory.try_access(0x80000000U+base+255,2) && !memory.try_access(0x80000000U+base+256,1),
+            "Primary alias changed its end boundary");
+        require(memory.try_access(0x80000000U+base+256,0)==primary.data()+256 &&
+            !memory.try_access(0xC0000000U+base+128,1),"Primary alias invented a mapping");
+        std::array<std::byte,2> adjacent{};
+        Memory edge(0,std::span(adjacent).first(1));edge.map(1,std::span(adjacent).first(1));
+        require(edge.try_access(1,0)==adjacent.data()+1,"Adjacent alias changed an empty primary-end access");
+        checked+=6;
+        ram.store<T>(0x80000000U+base+128,static_cast<T>(0x55667788));
+        require(ram.load<T>(base+128)==static_cast<T>(0x55667788) && ram.load<T>(0x80000000U+base)==static_cast<T>(0x11223344),
+            "Cached primary storage replaced a separate mapping");++checked;
+        memory.map(0x40000000U+base+128,std::span(primary).subspan(128));
+        ram.store<T>(0x40000000U+base+128,static_cast<T>(0x99AABBCC));
+        require(ram.load<T>(0x80000000U+base+128)==static_cast<T>(0x99AABBCC),"Cached primary lost a later alias");++checked;
+        for(const auto address:{0x80000000U+base+64,0x80000000U+base+256,0xC0000000U+base+128}) {
+            bool raised=false;try {ram.access(address,1);} catch(const std::runtime_error&) {raised=true;}
+            require(raised,"Cached primary bypassed a mapping boundary");++checked;
+        }
+        require(ram.access(0x80000000U+base+256,0)==primary.data()+256,"Cached primary changed an empty alias-end access");++checked;
+        require(edge.primary().access(1,0)==adjacent.data()+1,"Cached adjacent mapping changed an empty primary-end access");++checked;
+        struct Device {std::array<std::byte,16> bytes{};unsigned reads=0,writes=0;} device;
+        memory.map_io(0xFD000000,16,&device,
+            [](void* context,std::uint32_t offset,unsigned width) {
+                auto& device=*static_cast<Device*>(context);std::uint32_t value=0;++device.reads;
+                std::memcpy(&value,device.bytes.data()+offset,width);return value;
+            },
+            [](void* context,std::uint32_t offset,unsigned width,std::uint32_t value) {
+                auto& device=*static_cast<Device*>(context);++device.writes;std::memcpy(device.bytes.data()+offset,&value,width);
+            });
+        ram.store<T>(0xFD000000,static_cast<T>(0x12345678));
+        require(ram.load<T>(0xFD000000)==static_cast<T>(0x12345678) &&
+            device.reads==(sizeof(T)==8?2U:1U) && device.writes==device.reads,"Cached primary bypassed later device bindings");++checked;
+    }
+    return checked;
+}
+template<class T> unsigned check_strings() {
+    unsigned checked=check_primary<T>();
+    constexpr std::uint32_t base=0x1000,source=80;
     for (const bool descending : {false, true}) {
         for (const std::uint32_t destination : {20U, 79U, 80U, 81U, 120U}) {
             for (const std::uint32_t count : {0U, 1U, 7U, 16U}) {
@@ -266,8 +332,9 @@ unsigned check_call_chain() {
 unsigned check_matrix() {
     constexpr std::uint32_t base=0x1000,stack=0x1380;
     const auto& matrix=function(0x00227BD9);
+    Performance profile;profile.start("CPU diagnostic",144,1,false,false,{});
     unsigned checked=0;
-    for(unsigned precision:{0U,2U,3U}) for(unsigned rounding=0;rounding<4;++rounding)
+    for(unsigned masks:{0x3FU,0x37U}) for(unsigned precision:{0U,2U,3U}) for(unsigned rounding=0;rounding<4;++rounding)
         for(unsigned alias=0;alias<4;++alias) for(unsigned sample=0;sample<5;++sample) {
             std::array<std::byte,1024> bytes{};
             Memory memory(base,bytes);
@@ -286,9 +353,10 @@ unsigned check_matrix() {
             for(unsigned i=0;i<8;++i) original.registers[i]=0x13570000+i;
             original.registers[esp]=stack;original.flags=initial_flags|direction;
             original.cs_selector=8;original.ds_selector=16;original.ss_selector=24;
-            const auto control=std::uint16_t(0x007F|(precision<<8)|(rounding<<10));
+            const auto control=std::uint16_t(0x0040|masks|(precision<<8)|(rounding<<10));
             std::memcpy(original.floating.image.data(),&control,2);
             auto cpu=original,reference=original;
+            if(sample==4) cpu.profile=&profile;
             {FloatingScope scope(reference.floating);reference_matrix(reference,reference_memory);}
             matrix.run(cpu,memory);
             require(bytes==reference_bytes && cpu.registers==reference.registers && cpu.flags==reference.flags && cpu.eip==reference.eip &&
@@ -296,7 +364,7 @@ unsigned check_matrix() {
                 cpu.floating.data==reference.floating.data && cpu.floating.code_selector==reference.floating.code_selector &&
                 cpu.floating.data_selector==reference.floating.data_selector &&
                 std::memcmp(cpu.floating.image.data(),reference.floating.image.data(),12)==0,
-                std::format("Fused original matrix differs: precision {}, rounding {}, alias {}, sample {}",precision,rounding,alias,sample));
+                std::format("Fused original matrix differs: masks {}, precision {}, rounding {}, alias {}, sample {}",masks,precision,rounding,alias,sample));
             ++checked;
         }
     // A failed preflight must execute the individual original instructions,
@@ -438,6 +506,14 @@ unsigned check_vertex_colors() {
     return count;
 }
 unsigned check_control_boundaries() {
+    for(const auto& entry:compiled_batch) {
+        require(lookup_native(entry.address)==&entry,"Static dispatch index lost a compiled function");
+        for(const auto address:{entry.address-1,entry.address+1}) {
+            const auto expected=std::ranges::lower_bound(compiled_batch,address,{},&CompiledFunction::address);
+            require(lookup_native(address)==(expected!=compiled_batch.end() && expected->address==address?&*expected:nullptr),
+                "Static dispatch index changed an adjacent target");
+        }
+    }
     constexpr std::uint32_t stack=0x1000, ticks=0x005A7C18, tls_index=0x005A61F0;
     std::vector<std::byte> bytes(0x005ADCC0);
     Memory memory(0,bytes);
@@ -648,23 +724,44 @@ unsigned check_mmx_copy() {
     constexpr std::uint32_t stack=0x1000,source=0x200,destination=0x600;
     std::vector<std::byte> bytes(0x2000);
     Memory memory(0,bytes);
+    memory.map(0x80000000U,bytes);
     unsigned checked=0;
-    for(const auto offset : {0U,4U,28U}) for(const auto words : {0U,1U,15U,16U,17U,64U,96U}) {
+    for(const auto alias : {0U,0x80000000U}) for(const auto offset : {0U,4U,28U}) for(const auto words : {0U,1U,15U,16U,17U,64U,96U}) {
         std::ranges::fill(bytes,std::byte{0xCD});
         for(unsigned i=0;i<words*4;++i) bytes[source+i]=static_cast<std::byte>((i*73)^0xB9);
         memory.store<std::uint32_t>(stack,0xABCDEF00);
-        memory.store<std::uint32_t>(stack+4,destination+offset);
-        memory.store<std::uint32_t>(stack+8,source);
+        memory.store<std::uint32_t>(stack+4,(destination+offset)|alias);
+        memory.store<std::uint32_t>(stack+8,source|alias);
         memory.store<std::uint32_t>(stack+12,words);
         Cpu cpu; cpu.registers[esp]=stack;
+        auto reference_bytes=bytes;
+        Memory reference_memory(0,reference_bytes);reference_memory.map(0x80000000U,reference_bytes);
+        auto reference=cpu;ExecutionDiagnostic diagnostic;reference.diagnostic=&diagnostic;
+        function(0x00219370).run(reference,reference_memory);_mm_sfence();
         function(0x00219370).run(cpu,memory);
         _mm_sfence();
+        require(bytes==reference_bytes && cpu.registers==reference.registers && cpu.flags==reference.flags && cpu.eip==reference.eip &&
+            cpu.floating.image==reference.floating.image,"Batched original MMX copy differs from individual instructions");
         require(std::equal(bytes.begin()+source,bytes.begin()+source+words*4,bytes.begin()+destination+offset) &&
             cpu.registers[esp]==stack+16 && cpu.eip==0xABCDEF00,"Original MMX copy changed bytes or its native call boundary");
         require(std::uint16_t(cpu.floating.image[8])==255 && std::uint16_t(cpu.floating.image[9])==255,
             "EMMS did not empty the shared x87/MMX register tags");
         ++checked;
     }
+    // Range preflight must retain earlier stores if a later MMX store fails.
+    std::ranges::fill(bytes,std::byte{0xCD});
+    memory.store<std::uint32_t>(stack,0xABCDEF00);memory.store<std::uint32_t>(stack+4,0x1FE0);
+    memory.store<std::uint32_t>(stack+8,source);memory.store<std::uint32_t>(stack+12,16);
+    auto reference_bytes=bytes;Memory reference_memory(0,reference_bytes);
+    Cpu cpu;cpu.registers[esp]=stack;auto reference=cpu;ExecutionDiagnostic diagnostic;reference.diagnostic=&diagnostic;
+    std::string actual_error,reference_error;
+    try {function(0x00219370).run(reference,reference_memory);} catch(const std::exception& error) {reference_error=error.what();}
+    _mm_sfence();
+    try {function(0x00219370).run(cpu,memory);} catch(const std::exception& error) {actual_error=error.what();}
+    _mm_sfence();
+    require(!actual_error.empty() && actual_error==reference_error && bytes==reference_bytes && cpu.floating.image==reference.floating.image,
+        "Batched MMX range failure changed the original partial stores or floating state");
+    ++checked;
     return checked;
 }
 CpuChecks check_cpu_batch() {
@@ -676,7 +773,7 @@ CpuChecks check_cpu_batch() {
         check_rotates<8,true>(b2_rol8,b2_rcl8)+check_rotates<16,true>(b2_rol16,b2_rcl16)+check_rotates<32,true>(b2_rol32,b2_rcl32)+
         check_double_shifts<16>(b2_shld16,b2_shrd16)+check_double_shifts<32>(b2_shld32,b2_shrd32);
 #undef B2_HOST
-    result.memory_cases = check_strings<std::uint8_t>() + check_strings<std::uint16_t>() + check_strings<std::uint32_t>();
+    result.memory_cases = check_strings<std::uint8_t>() + check_strings<std::uint16_t>() + check_strings<std::uint32_t>() + check_primary<std::uint64_t>();
     result.game_cases = check_compare() + check_call_chain();
     result.floating_cases=check_floating_contexts()+check_reciprocal_sqrt()+check_vertex_colors()+check_mmx_copy()+check_matrix();
     result.control_cases=check_control_boundaries()+check_compact_jump_table()+check_segment_setup()+check_flags_stack();

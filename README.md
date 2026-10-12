@@ -11,7 +11,26 @@ I'll try to respond in a timely manner.</i>
 Yes, AI was used in the development of this project. No, this project was not blindly thrown together.
 If you're skeptical, I implore you to try the recompilation for yourself. I take quality control quite seriously!😊
 
-## What's new in 1.2
+## What's new in 1.3
+
+- Faster gameplay and more consistent frame times, with improvements to game
+  code, graphics processing and audio.
+- Fixed missing engine sounds.
+- Fixed stale graphics resources that could cause incorrect textures and growing
+  memory use after extended play.
+- Sharper frame interpolation, with fewer distorted moving edges and steadier
+  text. Some artifacts remain on fine details and transparent overlays.
+- Native **Widescreen (16:9)** support.
+- Faster compilation and linking with the new LLVM/Clang compiler and LLD linker.
+
+**Keep V-sync disabled for now:** it has known issues in this release. New
+installations default to V-sync off; existing saved settings keep their value.
+
+**Reinstall when upgrading to 1.3.** Install LLVM 22.1 or newer, download and
+extract the new **Installation.zip**, and run **Build.cmd** again. See the
+upgrade instructions below to keep your saves and settings.
+
+## Previous changes in 1.2
 
 - Fixed crashes when starting races and proceeding with Burnout 1 music enabled.
 - Fixed crackling caused by abrupt sound and effect control changes across the
@@ -32,7 +51,7 @@ Average frame rate rose from **43.75 to 60.02 FPS** on a Ryzen 5 5600X and RTX 5
 at 60 Hz and native resolution. Heavy scenes still have occasional dips;
 testing across the whole game continues.
 
-This release also adds custom keyboard bindings, internal resolution scaling,
+Version 1.1 also added custom keyboard bindings, internal resolution scaling,
 frame interpolation for higher refresh rates, a frame rate counter, performance
 recording and an application icon.
 
@@ -62,12 +81,14 @@ focused on speed and simplicity. I couldn't bear to keep the slop version public
   that defaults to 60 Hz.
 - Custom keyboard bindings, 1×–4× internal resolution, and optional frame
   interpolation for higher display rates.
+- Native widescreen camera and screen layout, presented at 16:9.
 
 ### What still needs work
 
 - Testing all modes, tracks and saved-game progression.
 - Checking sound balance and consistently smooth performance across the whole game.
 - Checking upscaled rendering and frame interpolation across all modes and PCs.
+- Fixing V-sync issues. Keep it disabled for now.
 
 ## Getting started
 
@@ -75,13 +96,14 @@ You need a 64-bit Windows PC, a graphics card that supports DirectX 11, and your
 own copy of the US Xbox release. Game files are not included.
 
 1. Install [Visual Studio 2026 Community](https://visualstudio.microsoft.com/downloads/)
-   with **Desktop development with C++** and the included Windows SDK,
+   with **Desktop development with C++**, **C++ CMake tools for Windows** and the included Windows SDK,
    [CMake 4.2 or newer](https://cmake.org/download/), and
    [Git for Windows](https://git-scm.com/downloads/win).
+   Also install the Windows x64 version of [LLVM 22.1 or newer](https://github.com/llvm/llvm-project/releases).
 2. Download [Installation.zip](https://github.com/timftw21/burnout2-recompilation/releases/latest/download/Installation.zip)
    and extract it, or clone the repository.
 3. Double-click **Build.cmd** and select your US Xbox XISO disc image (`.iso` or `.xiso`).
-   Use a partition-only XISO; full-disc dumps need conversion to XISO first.
+   Use an XISO; full-disc dumps need conversion to XISO first.
    The builder prepares the game files, downloads dependencies and builds the app.
    The first build can take a while; later builds reuse previous work.
 4. Click **Open game folder**, then double-click **b2.exe**.
@@ -90,11 +112,31 @@ There are no commands to type. If building fails, click **Open build log**.
 The [developer build instructions](https://github.com/timftw21/burnout2-recompilation/blob/main/BUILDING.txt)
 also cover offline debugging.
 
+### Upgrading to 1.3
+
+Reinstall the recompilation to switch to the new compiler:
+
+1. Back up `data/user` beside your current `b2.exe` to keep your saves.
+2. Install LLVM 22.1 or newer using the link above. Visual Studio and its Windows
+   SDK are still required.
+3. Download the new **Installation.zip** and extract it into your existing source
+   folder, replacing the previous source files.
+4. Run **Build.cmd** again and select your XISO. The builder switches compilers
+   and rebuilds while preserving your settings and saves.
+
+If you install into a new folder instead, restore your backed-up `data/user`
+folder beside the new `b2.exe` after building, and choose your settings again.
+In **Graphics**, leave **V-sync** disabled even if your saved settings enabled it.
+
+### Game settings
+
 The builder updates the game-file locations after each successful build while
 keeping your other settings and saves. Click **Start game**
 in the settings window. Press **Esc** to open or close settings, with
-**General**, **Audio**, **Graphics** and **Controls** tabs. The game defaults to
-**60 Hz**; choose another rate in General. Click **Save settings** to keep changes.
+**Game Files**, **General**, **Audio**, **Graphics**, **Controls** and **Log** tabs. The game
+defaults to **60 Hz**; choose another rate in General. Changes save automatically
+when you finish editing. Hover over a setting to read its description.
+Startup, capture and error messages appear in Log, with the newest messages first.
 
 In **Controls**, click a key beside an action and press its replacement. **Clear**
 removes a binding; **Restore keyboard defaults** resets them. Esc cancels a key
@@ -102,10 +144,20 @@ change. Esc, F1, F8 and F9 stay reserved for settings and captures.
 
 In **Graphics**, choose **Internal resolution** from 1× (640 × 480) to
 4× (2560 × 1920). Higher values give sharper edges and use more graphics power.
+Enable **Widescreen (16:9)** for the game's native widescreen view. It uses the
+original camera and screen layout, with the image fitted to 16:9 within your
+window or display.
+Widescreen keeps the same internal resolution: it renders a wider view into the
+original 640 × 480 buffer, then stretches that image to 16:9 for display.
 Resolution changes apply when you start the game. If you change it while playing,
-save your settings and restart the app.
+click **Restart game** in settings to apply them. Restart game reloads the game
+from the beginning while keeping the window open.
+Widescreen changes also apply when you start or restart the game.
+**Leave V-sync disabled for now; it has known issues.**
+The game buttons share a centered row. **Exit game** saves pending setting
+changes and closes the app.
 In **General**, selecting a rate above 60 Hz turns on **Frame interpolation**.
-Uncheck it if you prefer to keep it off, then save your settings. With interpolation
+Uncheck it if you prefer to keep it off. With interpolation
 on, gameplay stays at 60 Hz; with it off, higher rates speed up gameplay.
 Interpolation adds about one frame of display delay and may show
 artifacts around fast movement. **Show frame rate** displays the current game

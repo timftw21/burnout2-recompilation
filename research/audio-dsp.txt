@@ -210,8 +210,10 @@ direct/room attenuation; +30h/+34h are direct/room filter coefficients. Original
 235982 computes the 16-bit one-pole coefficients; SDL caches them and retains
 fixed filter histories without allocations in the mixing callback. Original
 232FED/233139..23315F establishes which mix bins receive each adjustment:
-6..9 use direct attenuation and front/back gains; bin 10 uses room attenuation;
-both also receive distance/cone attenuation. The native max-distance mute flag
+6/7 use direct attenuation plus output +0Ch/+14h; 8/9 use direct attenuation
+plus output +10h; bin 10 uses room attenuation. Output +18h is the centre
+speaker level, not the rear level (see the 2026-10-11 correction below).
+All also receive distance/cone attenuation. The native max-distance mute flag
 feeds source +58h bit 2 of the original calculation.
 
 The actual upload locations are {reverb=2,crosstalk=4}. Effect 2's original
@@ -490,3 +492,52 @@ failures. Existing diagnostics pass 67 audio cases with capture, 65 effects,
 54 spatial cases / 1000 original calculations, 74 bindings, 52 CPU cases and
 all twelve original WMA tracks. Evidence and native replay files are ignored
 under build/checks/sfx-crackle. Live listening remains the user's manual check.
+
+Engine loudness: original speaker-level mapping (2026-10-11)
+
+User capture frame-35601046600 has the engine FXIN return on voice 1/bin 14.
+Its decoded peak is 0.76699984, return gain 0.5000345, distance/cone gain 1
+and headroom 1. The frozen scene peaks at 0.47416764 before master volume;
+RMS is 0.132351059. This is excess signal gain, not output clipping.
+
+The earlier native interpretation of GetVoiceData +14h/+18h as front/back
+levels was incorrect. Verified original 232FED reads its 3D record at A4h:
+233036..23305E combines output +0Ch, +14h and +1Ch for the front bins;
+233062..23307C combines +10h and +1Ch for the rear bins;
+233080..23309C combines +0Ch, +18h and +1Ch for the centre bin.
+23312F..23315F selects these independent totals for bins 2, 6/7 and 8/9.
+Each also receives the original source volume and distance/cone attenuation.
+
+Native stereo settings leave source +58h bit 0 clear. Original GetVoiceData
+22CFBD..22CFE2 passes that bit to 22C018 -> 230445. Its branch at 230501
+sets output +0Ch to zero and +10h to -10000, silencing the rear pair.
+Output +18h is a separate centre contribution. The captured player return
+had native front/back gains 0.5000345/0.7071312, so the incorrect rear send,
+folded to stereo at sqrt(0.5), added another approximately 0.5 of the signal.
+Correct the shared Spatial result to use amplitude(+0Ch +14h) for the front
+and amplitude(+10h) for the rear. Preserve voice controls, routing, pan,
+effects, environmental sends, music and the existing control transitions.
+This fixes the common calculation used by all 3D sources, not an engine ID.
+
+The SDK's default mix-bin headroom is one, but title 20DF43..20DF50 explicitly
+sets all 32 bins to zero; D2938 also sets bin 14 to zero. Capture values match
+those overrides. Default headroom therefore does not explain this scene.
+The verified original stereo encoder at 5C0058 also uses unity front and
+sqrt(0.5) centre/surround coefficients; stereo folding is not the cause.
+
+Bounded native evidence under build/checks/engine-volume includes disassembly
+of the original functions and small original DSP firmware ranges. A standalone
+diagnostic executes the unchanged generated 232FED function with the original
+stereo levels: its front/rear hardware volumes are 385/4095 (rear mute).
+It then restores the actual capture twice, correcting only the misread rear
+controls on its 13 normal 3D voices. The 96000-frame baseline reproduces the
+inspection exactly. Corrected peak is 0.28362218, RMS 0.071512333, a 5.35 dB
+scene RMS reduction. WAVs and diagnostic sources stay ignored; the user's
+original capture is unchanged. This comparison retains the captured effects
+and room history and excludes master volume. Full HRTF filtering remains an
+explicit approximation; this measurement does not establish full audio parity.
+
+The release rebuild succeeds. Existing checks pass: 54 spatial cases with
+1000 original calculations and the corrected centered-source assertion,
+74 original binding cases, 67 audio cases, 65 effect checks and all 12 WMA
+tracks. The rebuilt build/windows/Release/b2.exe is ready for manual listening.

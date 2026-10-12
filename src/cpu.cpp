@@ -1,7 +1,7 @@
 #include "cpu.h"
-#include <algorithm>
 
 namespace b2 {
+const CompiledFunction* lookup_native(std::uint32_t) noexcept;
 std::uint32_t read_port(Cpu& cpu,std::uint16_t port,unsigned width) {
     if(!cpu.kernel || !cpu.kernel->read_port) throw NativeBoundary(cpu.eip,std::format("unbound {}-bit input port 0x{:04X}",width,port));
     HostFloatingScope host(cpu.floating);
@@ -21,8 +21,8 @@ void invoke_native(Cpu& cpu, Memory& memory, std::uint32_t address) {
         cpu.kernel->entries[ordinal](cpu.kernel->context,cpu,memory);
         return;
     }
-    const auto found = std::ranges::lower_bound(compiled_batch, address, {}, &CompiledFunction::address);
-    if (found == compiled_batch.end() || found->address != address)
+    const auto* found=lookup_native(address);
+    if(!found)
         throw NativeBoundary(address, "function is absent from the fixed native table");
     found->run(cpu, memory);
 }

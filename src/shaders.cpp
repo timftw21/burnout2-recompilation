@@ -144,10 +144,10 @@ float4 main(P p):SV_Target {
 }
 ID3DBlob* shader_blob(ShaderKind kind) {return new ShaderBlob(shader_binary(kind).bytes);}
 const char* shader_profile(ShaderKind kind) {
-    if(kind==ShaderKind::launch || kind==ShaderKind::flow_estimate || kind==ShaderKind::flow_cut) return "cs_5_0";
+    if(kind==ShaderKind::launch || kind==ShaderKind::flow_estimate || kind==ShaderKind::flow_resolve || kind==ShaderKind::flow_cut) return "cs_5_0";
     if(kind==ShaderKind::clear_pixel || kind==ShaderKind::display_pixel || kind==ShaderKind::gui_pixel ||
        (kind>=ShaderKind::combiner0 && kind<=ShaderKind::combiner8) ||
-       kind==ShaderKind::flow_luma || kind==ShaderKind::flow_interpolate ||
+       kind==ShaderKind::flow_colour || kind==ShaderKind::flow_interpolate ||
        (kind>=ShaderKind::color && kind<=ShaderKind::modulate3d)) return "ps_5_0";
     return "vs_5_0";
 }
@@ -182,32 +182,67 @@ P main(uint id:SV_VertexID) {P o;o.uv=float2((id<<1)&2,id&2);o.p=float4(o.uv*flo
     case ShaderKind::display_pixel:return R"(
 Texture2D image:register(t0);SamplerState filter:register(s0);
 float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target{return image.Sample(filter,uv);})";
-    case ShaderKind::flow_luma:return R"(
+    case ShaderKind::flow_colour:return R"(
 Texture2D image:register(t0);SamplerState filter:register(s0);
-float main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target {
- float2 d=float2(0.25/160,0.25/120);
+cbuffer C:register(b0){float phase;uint level;uint first;uint spare;uint2 grid;uint2 padding;}
+float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target {
+ float2 d=0.25/float2(grid);
  float3 c=(image.Sample(filter,uv+d).rgb+image.Sample(filter,uv-d).rgb+
   image.Sample(filter,uv+float2(d.x,-d.y)).rgb+image.Sample(filter,uv+float2(-d.x,d.y)).rgb)*0.25;
- return dot(c,float3(0.299,0.587,0.114));})";
+ return float4(c,1);})";
     case ShaderKind::flow_estimate:return R"(
-Texture2D<float> source:register(t0),destination:register(t1);
+Texture2D source:register(t0),destination:register(t1);
 Texture2D<float4> coarse:register(t2);RWTexture2D<float4> motion:register(u0);SamplerState filter:register(s0);
+Texture2D original_source:register(t3),original_destination:register(t4);
 cbuffer C:register(b0){float phase;uint level;uint first;uint spare;}
+float full_error(float2 uv,float2 v,float2 pixel) {
+ float error=0;
+ const float2 offsets[5]={float2(0,0),float2(2,0),float2(-2,0),float2(0,2),float2(0,-2)};
+ [unroll] for(uint i=0;i<5;i++) {
+  float2 p=uv+offsets[i]*pixel;
+  error+=dot(abs(original_source.SampleLevel(filter,p,0).rgb-original_destination.SampleLevel(filter,p+v,0).rgb),
+    float3(0.299,0.587,0.114))*(i==0?0.5:0.125);
+ }
+ return error;
+}
 [numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID) {
  uint width,height;motion.GetDimensions(width,height);if(id.x>=width || id.y>=height) return;
  float2 size=float2(width,height),step=1/size,uv=(float2(id.xy)+0.5)*step;
- float2 v=first?float2(0,0):coarse.SampleLevel(filter,uv,0).xy;
+ float3 centre=source.SampleLevel(filter,uv,level).rgb;
+ float4 inherited=0;
+ if(!first) {
+  uint coarse_width,coarse_height;coarse.GetDimensions(coarse_width,coarse_height);
+  float2 coarse_size=float2(coarse_width,coarse_height),position=uv*coarse_size-0.5,fraction=frac(position);
+  int2 base=int2(floor(position));float total=0;
+  [unroll] for(uint i=0;i<4;i++) {
+   int2 cell=clamp(base+int2(i&1,i>>1),int2(0,0),int2(coarse_width-1,coarse_height-1));
+   float3 difference=source.SampleLevel(filter,(float2(cell)+0.5)/coarse_size,level+1).rgb-centre;
+   float separation=length(difference-dot(difference,float3(0.299,0.587,0.114)));
+   float weight=(i&1?fraction.x:1-fraction.x)*(i&2?fraction.y:1-fraction.y)/(1+separation*separation*400);
+   inherited+=coarse.Load(int3(cell,0))*weight;total+=weight;
+  }
+  inherited/=max(total,0.0001);
+ }
+ float2 v=inherited.xy;
  float residual=0,energy=0,bestResidual=1e9,bestEnergy=0,relaxation=1;float2 best=v;
  [loop] for(uint iteration=0;iteration<6;iteration++) {
-  float a=0.0005,b=0,c=0.0005;float2 rhs=0;residual=0;energy=0;
+  float a=0.0005,b=0,c=0.0005;float2 rhs=0;residual=0;energy=0;float support=0;
   [unroll] for(int y=-2;y<=2;y++) [unroll] for(int x=-2;x<=2;x++) {
    float2 p=uv+float2(x,y)*step,q=p+v;
-   float s=source.SampleLevel(filter,p,level),d=destination.SampleLevel(filter,q,level),error=d-s;
-   float2 g=0.5*float2(destination.SampleLevel(filter,q+float2(step.x,0),level)-destination.SampleLevel(filter,q-float2(step.x,0),level),
-    destination.SampleLevel(filter,q+float2(0,step.y),level)-destination.SampleLevel(filter,q-float2(0,step.y),level));
-   float weight=1/(1+abs(error)*8);a+=weight*g.x*g.x;b+=weight*g.x*g.y;c+=weight*g.y*g.y;
-   rhs-=weight*g*error;residual+=abs(error);energy+=dot(g,g);
+   float3 s=source.SampleLevel(filter,p,level).rgb,d=destination.SampleLevel(filter,q,level).rgb,error=d-s;
+   float3 gx=0.5*(destination.SampleLevel(filter,q+float2(step.x,0),level).rgb-destination.SampleLevel(filter,q-float2(step.x,0),level).rgb);
+   float3 gy=0.5*(destination.SampleLevel(filter,q+float2(0,step.y),level).rgb-destination.SampleLevel(filter,q-float2(0,step.y),level).rgb);
+   // A motion window must not borrow constraints from the other side of an
+   // object boundary, including boundaries whose colours have equal luminance.
+   float3 separation=s-centre;
+   float local=saturate(1-length(separation-dot(separation,float3(0.299,0.587,0.114)))/0.12);
+   float weight=local*local/(1+dot(abs(error),float3(0.299,0.587,0.114))*8);
+   const float3 channels=float3(0.299,0.587,0.114);
+   a+=weight*dot(gx*channels,gx);b+=weight*dot(gx*channels,gy);c+=weight*dot(gy*channels,gy);
+   rhs-=weight*float2(dot(gx*channels,error),dot(gy*channels,error));
+   residual+=weight*dot(abs(error),channels);energy+=weight*(dot(gx*channels,gx)+dot(gy*channels,gy));support+=weight;
   }
+  residual*=25/max(support,0.001);energy*=25/max(support,0.001);
   // Keep measured candidates: the last Newton step has not yet been evaluated.
   // Back off a step that worsens the match instead of warping with false confidence.
   if(residual<=bestResidual) {best=v;bestResidual=residual;bestEnergy=energy;}
@@ -216,17 +251,87 @@ cbuffer C:register(b0){float phase;uint level;uint first;uint spare;}
   float2 delta=float2(c*rhs.x-b*rhs.y,a*rhs.y-b*rhs.x)/max(determinant,1e-8);
   v=clamp(v+clamp(delta,-1.5,1.5)*step*relaxation,-0.25,0.25);
  }
- v=best;float confidence=saturate(1-bestResidual/(25*0.12))*saturate(bestEnergy/0.002);
+ v=best;float detail_confidence=max(saturate(bestEnergy/0.002),inherited.z);
+ float confidence=saturate(1-bestResidual/(25*0.12))*detail_confidence;
+ if(level==0) {
+  uint full_width,full_height;original_source.GetDimensions(full_width,full_height);
+  float2 pixel=1/float2(full_width,full_height);
+  float error=full_error(uv,v,pixel);
+  float2 spacing=max(pixel,round(step*0.5/pixel)*pixel);
+  // Resolve downsampling/subpixel errors once per source pair, using the
+  // original detail. Keep continuous motion when integer candidates fit worse.
+  [unroll] for(uint refinement=0;refinement<2 && error<0.12;refinement++) {
+   float2 centre=round(v/pixel)*pixel;
+   [unroll] for(int y=-1;y<=1;y++) [unroll] for(int x=-1;x<=1;x++) {
+    float2 candidate=centre+float2(x,y)*spacing;float candidate_error=full_error(uv,candidate,pixel);
+    if(candidate_error+0.000001<error) {v=candidate;error=candidate_error;}
+   }
+   spacing=pixel;
+  }
+  bestResidual=error*25;confidence=detail_confidence;
+ }
  if(any(uv+v<0) || any(uv+v>1)) confidence=0;
  motion[id.xy]=float4(v,confidence,bestResidual/25);
 })";
+    case ShaderKind::flow_resolve:return R"(
+Texture2D source:register(t0),destination:register(t1);
+Texture2D<float4> field:register(t2),opposite:register(t3);
+RWTexture2D<float4> resolved:register(u0);SamplerState filter:register(s0);
+float photo_error(float2 uv,float2 v,float2 pixel) {
+ float error=0;const float2 offsets[5]={float2(0,0),float2(2,0),float2(-2,0),float2(0,2),float2(0,-2)};
+ [unroll] for(uint i=0;i<5;i++) {
+  float2 p=uv+offsets[i]*pixel;
+  error+=dot(abs(source.SampleLevel(filter,p,0).rgb-destination.SampleLevel(filter,p+v,0).rgb),
+   float3(0.299,0.587,0.114))*(i==0?0.5:0.125);
+ }
+ return error;
+}
+[numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID) {
+ uint width,height;resolved.GetDimensions(width,height);if(id.x>=width || id.y>=height) return;
+ uint full_width,full_height;source.GetDimensions(full_width,full_height);
+ float2 size=float2(width,height),full_size=float2(full_width,full_height),pixel=1/full_size,uv=(float2(id.xy)+0.5)/size;
+ float3 colour=source.SampleLevel(filter,uv,0).rgb;
+ float4 own=field.Load(int3(id.xy,0)),best=own,hidden=own;best.z=hidden.z=0;
+ float best_error=0.12;float4 consensus=0;float total=0;
+ const int2 offsets[21]={int2(0,0),int2(2,0),int2(-2,0),int2(0,2),int2(0,-2),
+  int2(2,2),int2(-2,2),int2(2,-2),int2(-2,-2),int2(4,0),int2(-4,0),int2(0,4),int2(0,-4),
+  int2(8,0),int2(-8,0),int2(0,8),int2(0,-8),int2(8,8),int2(-8,8),int2(8,-8),int2(-8,-8)};
+ // Transfer only verified motion from the same surface. A covered pixel has
+ // no endpoint match of its own; colour and distance choose nearby support.
+ [unroll] for(uint i=0;i<21;i++) {
+  int2 cell=clamp(int2(id.xy)+offsets[i]*2,int2(0,0),int2(width-1,height-1));
+  float4 candidate=field.Load(int3(cell,0));if(candidate.z<0.2 || candidate.w>=0.02) continue;
+  float2 location=(float2(cell)+0.5)/size;
+  float4 reverse=opposite.SampleLevel(filter,location+candidate.xy,0);
+  if(reverse.z<0.2 || length((candidate.xy+reverse.xy)*full_size)>1.5) continue;
+  float3 difference=source.SampleLevel(filter,location,0).rgb-colour;
+  float separation=length(difference-dot(difference,float3(0.299,0.587,0.114)));
+  if(separation>=0.12) continue;
+  float error=photo_error(uv,candidate.xy,pixel);
+  float distance=dot(float2(offsets[i]),float2(offsets[i]));
+  float weight=min(candidate.z,reverse.z)/(1+distance*0.0625+separation*separation*400);
+  consensus+=candidate*weight;total+=weight;
+  if(error+0.000001<best_error) {best=candidate;best_error=error;best.w=error;}
+ }
+ if(total>0) {
+  consensus/=total;float error=photo_error(uv,consensus.xy,pixel);
+  float2 rounded=round(consensus.xy/pixel)*pixel;float rounded_error=photo_error(uv,rounded,pixel);
+  if(rounded_error+0.000001<error) {consensus.xy=rounded;error=rounded_error;}
+  consensus.w=error;
+  // Equal local matches are ambiguous on smooth detail. Prefer motion
+  // supported across the surface, while retaining a better individual fit.
+  if(error<=best_error+0.00001) best=consensus;
+  hidden=consensus;
+ }
+ resolved[id.xy]=best.z>=0.2?best:hidden.z>=0.2?hidden:best;
+})";
     case ShaderKind::flow_cut:return R"(
-Texture2D<float> previous:register(t0),current:register(t1);Texture2D<float4> motion:register(t2);
+Texture2D previous:register(t0),current:register(t1);Texture2D<float4> motion:register(t2);
 RWTexture2D<float> cut:register(u0);SamplerState filter:register(s0);groupshared float2 differences[256];
 [numthreads(16,16,1)] void main(uint3 id:SV_GroupThreadID,uint index:SV_GroupIndex) {
- float2 uv=(float2(id.xy)+0.5)/16;float p=previous.SampleLevel(filter,uv,0);
- float raw=abs(current.SampleLevel(filter,uv,0)-p);
- float warped=abs(current.SampleLevel(filter,uv+motion.SampleLevel(filter,uv,0).xy,0)-p);
+ float2 uv=(float2(id.xy)+0.5)/16;float3 p=previous.SampleLevel(filter,uv,0).rgb;
+ float raw=dot(abs(current.SampleLevel(filter,uv,0).rgb-p),float3(0.299,0.587,0.114));
+ float warped=dot(abs(current.SampleLevel(filter,uv+motion.SampleLevel(filter,uv,0).xy,0).rgb-p),float3(0.299,0.587,0.114));
  differences[index]=float2(raw,warped);GroupMemoryBarrierWithGroupSync();
  [unroll] for(uint stride=128;stride>0;stride>>=1) {if(index<stride) differences[index]+=differences[index+stride];GroupMemoryBarrierWithGroupSync();}
  if(index==0) cut[uint2(0,0)]=(differences[0].x>256*0.20 && differences[0].y>256*0.15)?1:0;
@@ -235,15 +340,86 @@ RWTexture2D<float> cut:register(u0);SamplerState filter:register(s0);groupshared
 Texture2D previous:register(t0),current:register(t1);Texture2D<float4> forward:register(t2),backward:register(t3);
 Texture2D<float> cut:register(t4);SamplerState filter:register(s0);
 cbuffer C:register(b0){float phase;uint level;uint first;uint spare;}
+float match(Texture2D source,Texture2D destination,float2 uv,float2 v,float2 pixel) {
+ float error=0;
+ const float2 offsets[5]={float2(0,0),float2(1,0),float2(-1,0),float2(0,1),float2(0,-1)};
+ [unroll] for(uint i=0;i<5;i++) {
+  float2 p=uv+offsets[i]*pixel;
+  float3 difference=abs(source.SampleLevel(filter,p,0).rgb-destination.SampleLevel(filter,p+v,0).rgb);
+  error+=dot(difference,float3(0.299,0.587,0.114))*(i==0?0.5:0.125);
+ }
+ return error;
+}
+float4 motion_at(Texture2D<float4> field,Texture2D source,Texture2D destination,float2 uv,float2 pixel) {
+ uint width,height;field.GetDimensions(width,height);
+ float2 position=uv*float2(width,height)-0.5,fraction=frac(position);int2 base=int2(floor(position));
+ float3 colour=source.SampleLevel(filter,uv,0).rgb;float4 best=0;float total=0;
+ [unroll] for(uint i=0;i<4;i++) {
+  int2 cell=clamp(base+int2(i&1,i>>1),int2(0,0),int2(width-1,height-1));
+  float2 location=(float2(cell)+0.5)/float2(width,height);
+  float difference=dot(abs(source.SampleLevel(filter,location,0).rgb-colour),float3(0.299,0.587,0.114));
+  float agreement=1/(1+difference*difference*400);
+  float weight=(i&1?fraction.x:1-fraction.x)*(i&2?fraction.y:1-fraction.y)*agreement*agreement;
+  best+=field.Load(int3(cell,0))*weight;total+=weight;
+ }
+ if(total<0.001) return float4(0,0,0,0);
+ best/=total;float error=match(source,destination,uv,best.xy,pixel);
+ best.w=error;
+ if(error<0.00002 || error>=0.12) return best;
+ [unroll] for(uint i=0;i<4;i++) {
+  float4 candidate=field.Load(int3(clamp(base+int2(i&1,i>>1),int2(0,0),int2(width-1,height-1)),0));
+  float candidate_error=match(source,destination,uv,candidate.xy,pixel);
+  if(candidate.z>=0.2 && candidate_error+0.000001<error) {best=candidate;error=candidate_error;}
+ }
+ float2 rounded=round(best.xy/pixel)*pixel;float rounded_error=match(source,destination,uv,rounded,pixel);
+ if(rounded_error+0.000001<error) {best.xy=rounded;error=rounded_error;}
+ best.w=error;return best;
+}
 float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target {
- float4 latest=current.Sample(filter,uv);if(cut.Load(int3(0,0,0))>0.5) return latest;
+ float4 latest=current.SampleLevel(filter,uv,0);if(cut.Load(int3(0,0,0))>0.5) return latest;
+ uint width,height;current.GetDimensions(width,height);float2 size=float2(width,height),pixel=1/size;
+ if(match(previous,current,uv,float2(0,0),pixel)<0.0005) return latest;
+ if(dot(abs(previous.SampleLevel(filter,uv,0).rgb-latest.rgb),float3(0.299,0.587,0.114))<0.0005) {
+  uint neighbours=0;bool edge=false;
+  const float2 offsets[4]={float2(1,0),float2(-1,0),float2(0,1),float2(0,-1)};
+  [unroll] for(uint i=0;i<4;i++) {
+   float3 old=previous.SampleLevel(filter,uv+offsets[i]*pixel,0).rgb;
+   float3 next=current.SampleLevel(filter,uv+offsets[i]*pixel,0).rgb;
+   neighbours+=dot(abs(old-next),float3(0.299,0.587,0.114))<0.0005;
+   edge=edge||(min(dot(abs(old-latest.rgb),float3(0.299,0.587,0.114)),dot(abs(next-latest.rgb),float3(0.299,0.587,0.114)))>0.12);
+  }
+  if(neighbours>=2&&edge) return latest;
+ }
+ float4 fallback=phase<0.5?previous.SampleLevel(filter,uv,0):latest;
  float2 a=uv,b=uv;
- [unroll] for(uint i=0;i<3;i++) {a=uv-phase*forward.SampleLevel(filter,a,0).xy;b=uv-(1-phase)*backward.SampleLevel(filter,b,0).xy;}
- float4 f=forward.SampleLevel(filter,a,0),r=backward.SampleLevel(filter,b,0);
- if(any(a<0)||any(a>1)||any(b<0)||any(b>1)||min(f.z,r.z)<0.2 || length((f.xy+r.xy)*float2(160,120))>1.5) return latest;
- float4 old=previous.Sample(filter,a),next=current.Sample(filter,b);
- if(dot(abs(old.rgb-next.rgb),float3(0.299,0.587,0.114))>0.12) return latest;
- return lerp(old,next,phase);
+ [unroll] for(uint i=0;i<3;i++) {
+  a=uv-phase*motion_at(forward,previous,current,a,pixel).xy;
+  b=uv-(1-phase)*motion_at(backward,current,previous,b,pixel).xy;
+ }
+ float4 f=motion_at(forward,previous,current,a,pixel),r=motion_at(backward,current,previous,b,pixel);
+ // Validate each warp at its matching endpoint. Testing only f(a)+r(b)
+ // can accept unrelated foreground/background correspondences at an overlap.
+ float4 reverse=motion_at(backward,current,previous,a+f.xy,pixel);
+ float4 opposite=motion_at(forward,previous,current,b+r.xy,pixel);
+ bool stable_old=all(a>=0)&&all(a<=1)&&f.z>=0.2&&length((a+phase*f.xy-uv)*size)<=0.75;
+ bool stable_next=all(b>=0)&&all(b<=1)&&r.z>=0.2&&length((b+(1-phase)*r.xy-uv)*size)<=0.75;
+ // Resolved motion already has bidirectional support from its source surface.
+ // A sharp endpoint match can remain valid when the reverse lookup lands at
+ // a boundary with no usable local gradient.
+ bool valid_old=stable_old&&(f.w<0.01||(f.w<0.12&&reverse.z>=0.2&&length((f.xy+reverse.xy)*size)<=1.5));
+ bool valid_next=stable_next&&(r.w<0.01||(r.w<0.12&&opposite.z>=0.2&&length((r.xy+opposite.xy)*size)<=1.5));
+ float4 old=previous.SampleLevel(filter,a,0),next=current.SampleLevel(filter,b,0);
+ if(!valid_old&&!valid_next) {
+  if(phase<0.5?f.z<0.2:r.z<0.2) return fallback;
+  if(stable_old&&f.w>=0.12) return old;
+  if(stable_next&&r.w>=0.12) return next;
+  return fallback;
+ }
+ if(!valid_old) return next;if(!valid_next) return old;
+ float difference=dot(abs(old.rgb-next.rgb),float3(0.299,0.587,0.114));
+ // Average only aligned detail. Blending discrepant samples softens edges;
+ // the nearer warped source retains detail and the intended display time.
+ return difference<0.008&&length((a+f.xy-b)*size)<=0.75?lerp(old,next,phase):(phase<0.5?old:next);
 })";
     default:throw std::runtime_error("Shader source requires a vertex program or the pinned GUI backend");
     }

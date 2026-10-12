@@ -97,10 +97,12 @@ std::string ilu_operation(unsigned opcode) {
 }
 }
 namespace {
-std::string draw_source(const std::string& body) {
+std::string draw_source(const std::string& body,unsigned first=0,unsigned count=192) {
     std::string source(helpers);
+    source+=std::format("\n#define B2_CONSTANT_FIRST {}\ncbuffer Program:register(b1) {{ ",first);
+    if(count) source+=std::format("float4 k[{}]; ",count);
     source+=R"(
-cbuffer Program:register(b1) { float4 k[192]; float4 viewport; float4 fog_params; float4 uv_scales[4]; uint4 input_formats[4];
+float4 viewport; float4 fog_params; float4 uv_scales[4]; uint4 input_formats[4];
  uint4 fixed_flags;uint4 fixed_texgen[4];uint4 fixed_matrices; };
 float4 vertex_input(float4 v,uint format) {
  if(format==0) return v;
@@ -197,7 +199,7 @@ if(fixed_flags.y) {
  else if(fixed_flags.z==2) o[5].x=dot(eye.xyz,k[57].xyz)+k[57].w;
  else if(fixed_flags.z==3) o[5].x=abs(dot(eye.xyz,k[57].xyz)+k[57].w);
 })";
-    return draw_source(body);
+    return draw_source(body,0,96);
 }
 VertexProgram normalize_vertex_program(const VertexProgram& program) {
     if(program.start>=program.tokens.size()) throw std::runtime_error("NV2A vertex start exceeds 136 slots");
@@ -229,7 +231,12 @@ VertexTranslation translate_vertex_program(const VertexProgram& program,bool lau
             } else if(type==2) value=std::format("v[{}]",input);
             else if(type==3) {
                 if(!relative && constant>=192) throw std::runtime_error(std::format("NV2A slot {} reads invalid constant {}",slot,constant));
-                value=relative?std::format("((a0+{}>=0 && a0+{}<192)?k[a0+{}]:float4(0,0,0,0))",constant,constant,constant):std::format("k[{}]",constant);
+                if(relative) {result.constant_first=0;result.constant_count=192;}
+                else {
+                    const auto end=result.constant_count?std::max(result.constant_first+result.constant_count,constant+1):constant+1;
+                    result.constant_first=std::min(result.constant_first,constant);result.constant_count=end-result.constant_first;
+                }
+                value=relative?std::format("((a0+{}>=0 && a0+{}<192)?k[a0+{}]:float4(0,0,0,0))",constant,constant,constant):std::format("k[{}-B2_CONSTANT_FIRST]",constant);
             } else throw std::runtime_error(std::format("NV2A slot {} has an absent required input",slot));
             std::string swz;
             for(unsigned lane=0;lane<4;++lane) swz+="xyzw"[(swizzle>>(6-lane*2))&3];
@@ -273,10 +280,10 @@ VertexTranslation translate_vertex_program(const VertexProgram& program,bool lau
     if(result.writes_context && !launch) throw std::runtime_error("A context-writing program requires the transform launch path");
     result.source=std::string(helpers);
     if(launch) {
-        result.source+="RWStructuredBuffer<float4> k:register(u0); StructuredBuffer<float4> inputs:register(t0);\n[numthreads(1,1,1)] void main(uint3 id:SV_DispatchThreadID) { float4 v[16]; [unroll] for(int i=0;i<16;++i) v[i]=inputs[i];\n"+body+"}\n";
+        result.source+="#define B2_CONSTANT_FIRST 0\nRWStructuredBuffer<float4> k:register(u0); StructuredBuffer<float4> inputs:register(t0);\n[numthreads(1,1,1)] void main(uint3 id:SV_DispatchThreadID) { float4 v[16]; [unroll] for(int i=0;i<16;++i) v[i]=inputs[i];\n"+body+"}\n";
     } else {
         if((result.output_masks[0]&14)!=14) throw std::runtime_error("NV2A vertex program does not write complete position XYZ");
-        result.source=draw_source(body);
+        result.source=draw_source(body,result.constant_first,result.constant_count);
     }
     return result;
 }

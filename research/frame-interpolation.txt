@@ -15,28 +15,38 @@ Lucas and Kanade, 1981, "An Iterative Image Registration Technique with an
 Application to Stereo Vision".
 https://publications.ri.cmu.edu/storage/publications/pub_files/pub3/lucas_bruce_d_1981_1/lucas_bruce_d_1981_1.pdf
 
-Our implementation uses dense local 5x5 windows and four luminance levels
-(160x120, 80x60, 40x30, 20x15), with six refinement iterations per level.
-Forward/backward motion, residual error and texture gradients reject unreliable
-warps. Refinement keeps the best measured displacement and backs off steps that
-worsen the match; confidence describes that same displacement. A bounded
-scene-change reduction rejects unrelated image pairs. Missing
-or inconsistent correspondences use the current image. Intermediate frames warp
-both images into alignment; simply blending unaligned frames is not interpolation.
+Our implementation uses colour-aware local 5x5 windows and five RGB levels,
+up to 640x480, 320x240, 160x120, 80x60 and 40x30, with six refinement iterations per level.
+Coarse confidence survives weak fine-level gradients. Original-resolution
+matching refines downsampled motion. A bounded source-frame pass uses nearby
+bidirectionally verified motion with matching colour to support covered surfaces;
+it does not mix different surfaces solely because their motion cells are adjacent.
+Forward/backward endpoint checks and inverse-warp convergence reject unreliable
+warps. Refinement keeps measured candidates and backs off worsening steps.
+A bounded RGB scene-change reduction rejects unrelated image pairs, including
+changes between colours with equal luminance. Missing motion uses the temporally
+nearer endpoint. Intermediate frames warp both images into alignment. Only
+geometrically aligned, closely matching samples are blended; otherwise a valid
+warped source retains detail. Stationary sharp foreground details retain zero
+motion even when their background moves.
 Endpoint images are sampled directly. ImGui is composed after the game image.
 
 Only native D3D11 image operations are added: game functions remain static,
 ahead-of-time recompilations. All new shaders enter the existing build-time shader
 bank. The disabled path makes no history copies and dispatches no motion passes.
 It also stays inactive at presentation limits of 60 Hz or less.
-History uses two full-resolution RGBA8 images plus fixed-size flow/luminance data.
+History uses two full-resolution RGBA8 images plus bounded flow/RGB pyramid data.
 Resolution scaling changes history size, not the motion grid or game timing.
 
 Offline evidence is emitted by b2 --check-window: synthetic known translation,
-exact endpoints, stationary HUD, occlusion, scene change and reset, plus GPU
+sharp detail, independently moving surfaces, opaque/transparent stationary HUD,
+exact endpoints, occlusion, scene changes and reset, plus GPU
 component time and independently measured source/presentation rates. Actual game
 quality/performance still requires manual checks in menu/race/crash scenes.
 The method cannot reconstruct unseen geometry or ensure artifact-free fast motion.
+Opt-in --frame game captures include previous/current window images and their
+generated midpoint when interpolation is active, enabling inspection without
+desktop automation.
 
 2026-10-09 offline check on NVIDIA GeForce RTX 5060 Ti:
 - Source cadence 60.000 Hz with unmodified presentation 120.009/144.022 Hz.
@@ -73,3 +83,79 @@ images. With interpolation on, original frames remain 60.000 Hz and hardware
 presentation is 144.031 Hz. No D3D11 warnings or runtime shader compilations.
 Reports/images: build/checks/interpolation-opt-out. No game boot, computer use
 or edits to saved player preferences; no owned workers survive the checks.
+
+2026-10-12 moving-edge and sharpness audit:
+The user clarified that "tearing" means distorted moving edges, not a horizontal
+scanout split. Presentation/V-sync policy therefore stays unchanged.
+
+Verified faults in the image path:
+- Bilinear motion sampling mixed foreground/background displacement; the
+  original 5x5 motion windows also crossed different coloured surfaces.
+- The reverse check compared vectors at different correspondences and allowed
+  1.5 coarse cells (6 native pixels, 18 pixels at 3x). Inverse iterations could
+  oscillate at an edge without their projection back to the display being checked.
+- A weak finest-level gradient discarded reliable coarse motion. A sampled
+  (32,8) displacement had confidence 0.055 despite nearly zero residual and
+  confidence 1 at a coarser level.
+- Blending tolerated visibly mismatched detail. Unsupported regions jumped to
+  current time while surrounding pixels were at the intermediate display time.
+- Luminance-only matching/cut detection lost colour distinctions. A coarse
+  grid could not keep one-pixel structures separate from their backgrounds.
+
+The corrected path uses a native 640x480 motion grid with five bounded colour
+levels, source-colour guidance, full-resolution refinement and a source-frame
+support pass. That pass accepts only bidirectionally checked nearby motion from
+compatible colours; measured correspondence and surface consensus resolve
+ambiguous local fits. Covered pixels can retain that supported motion.
+Each displayed warp must converge within 0.75 original-image pixels. Independent
+endpoint checks, stationary sharp-detail handling, RGB cuts and selective
+aligned blending preserve sharpness. Unknown motion uses the nearer endpoint.
+All operations remain native D3D11 and all HLSL is compiled at build time.
+
+Focused existing hidden-window diagnostic, RTX 5060 Ti / Ryzen 5 5600X:
+- Sharp translated texture mean absolute error: 6.961 before, 0.033 after
+  (8-bit colour units; latest-only 38.569, unwarped blend 32.027).
+- Independently moving coloured foreground/background error: 5.375 before,
+  0.429 after. Classified foreground perimeter: 816 before, 652 after;
+  the exact reference is 480. Thin stationary white text over a moving
+  background has zero error. Endpoints, reveal, reset and colour cuts pass.
+- Warm publication plus one native warp timestamp span: 3.802 ms.
+  This is a component measurement, not gameplay FPS. First-use driver work
+  is reported separately; cold shader pipelines can add an initial hitch.
+- Hardware source/display cadence: 59.974/144.130 Hz. Opt-out and presentation
+  backpressure checks pass. No D3D11 debug warnings or runtime HLSL compilation.
+- Microsoft's software renderer passes the same checks: detail 0.036,
+  foreground/background 0.523, perimeter 666, stationary text exact. Its
+  4737.415 ms warm component span is a correctness result, not a speed target.
+- All 186 existing native rendering checks also pass.
+
+Automated Airport Terminal 3, 1x native/widescreen/V-sync off:
+- F9 diagnostic: 14.997877 seconds at 144 Hz with interpolation on, 899 source
+  intervals and 2160 presentations. Source median 16.6667 ms, p99 17.1774 ms;
+  GPU spans median 5.562080 ms, p99 6.733632 ms. 899 complete GPU frames and
+  one pending result are explicit. Recorder losses, runtime HLSL compilation
+  and audio overruns are zero. Whole-session presentation was 143.955 Hz.
+- Standard frame-only benchmark: 14.9995351 seconds at 240 Hz with interpolation
+  off: 222.958037 FPS, median 4.3457 ms, p99 5.7728 ms, max 6.4136 ms; no
+  dropped records. The preceding build measured 223.851226 FPS. These remain
+  consistent with the accepted overnight performance, not a sustained 240 claim.
+- Both final recordings identify PE 6ACD1F82, image 80666624 bytes. Track RAM
+  0x0048A150 is 2, confirmed by the Airport race images.
+- Player settings were restored byte-for-byte: SHA256
+  4A658E4F951426C9EB0B09A0347D4A88DEAC143F9E767F0C16E450D93BB3EF7B.
+
+Live source/midpoint captures exposed remaining local distortion on fine
+fencing, changing HUD glyphs and translucent tachometer pixels. The denser grid
+improves the fencing, but two flattened images cannot separate every transparent
+layer or reconstruct unseen geometry. These improvements are not a claim of
+artifact-free interpolation. Game-provided motion/depth and separate HUD
+composition would be required to remove those inherent ambiguities.
+
+Evidence: build/checks/interpolation-audit/validation-summary.json, the preserved
+baseline and final hardware/software images, and final game source/midpoint pairs.
+Final detailed capture: Release/build/captures/performance-151390184500.
+Final original-frame benchmark: Release/build/captures/benchmark-49493613400.
+Intermediate images, helpers, backups and worker markers were removed after
+checking exact owned process IDs and creation times. No owned workers remain;
+Release contains only b2.exe and b2-tool.exe. The active overnight PGO profile,
+player saves, private source media, knowledge and Git history were preserved.

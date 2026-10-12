@@ -1,14 +1,16 @@
 Building the game
 
-Install Visual Studio 2026 with Desktop development with C++ and its Windows SDK,
-CMake 4.2 or newer, and Git for Windows. Download and extract the project source.
+Install Visual Studio 2026 with Desktop development with C++, C++ CMake tools
+for Windows and its Windows SDK, LLVM 22.1 or newer (Windows x64), CMake 4.2 or
+newer, and Git for Windows.
+Download and extract the project source.
 Double-click Build.cmd, select the supported US Xbox disc image, and wait for
 the build. Click Open game folder and double-click b2.exe. No commands are needed.
 
 The builder uses the native b2-tool to extract and verify the game executable
 and read the effects image. It prepares data/local, configures and builds Release,
 and updates game-file locations beside b2.exe after a successful build.
-Other settings and saves are preserved. Use a partition-only Xbox XISO image;
+Other settings and saves are preserved. Use an Xbox XISO image;
 full-disc dumps require conversion first. One build runs per source folder.
 Build progress appears in a small
 window; Open build log shows details from build/setup/build.log. Closing the
@@ -33,12 +35,44 @@ other settings and saves. Invalid images preserved existing files. Separate chec
 covered old CMake versions on PATH, duplicate builds, moved/valid build caches,
 cancellation logs and worker cleanup, and failed/absolute-path archive creation.
 
+Build throughput validation (2026-10-11)
+
+On a Ryzen 5 5600X with 32 GiB RAM, generated game C++ compilation fell from
+7m18s to 1m58s and a cold optimized link from 9m44s to 4m00s. A small source edit
+compiled and linked in 17s. These measure build time, not game frame rate.
+The LLVM/Ninja installation passed fresh and repeated Windows PowerShell 5.1
+setup with Japanese and accented source/disc paths. Cached setup worked without
+downloads, preserved settings and saves, and reused the executable. All 52 CPU
+checks passed from the installed game with an absolute non-English input path.
+The game declares UTF-8 startup encoding so those command-line paths stay intact.
+See research/build-time.txt for measurements and native validation.
+
 Developer commands and native diagnostics
 
-Windows x64, Visual Studio 2026 C++ tools, Windows SDK, CMake 4.2+ and Git are required.
+Windows x64, Visual Studio 2026 C++ tools, Windows SDK, LLVM 22.1+, CMake 4.2+
+and Git are required. The builder loads the x64 SDK environment automatically.
+For the commands below, first open Developer PowerShell for VS 2026, select its
+x64 tool environment, and ensure clang-cl, lld-link, llvm-lib, Ninja and CMake
+4.2+ are on PATH. Ninja is included with Visual Studio's CMake tools.
 Use C++23. Zydis is pinned and linked only into b2-tool, never the game executable.
 Run PowerShell commands from the repository root. Private media and generated
 outputs remain ignored. No Python is required.
+
+Release 1.3 upgrades require reinstalling the source from Installation.zip and
+running Build.cmd again with LLVM 22.1 or newer installed. Extracting over the
+existing source folder and rebuilding preserves settings and saves; back up
+data/user beside b2.exe first. New-folder installations can restore that folder
+beside the new executable after building. Keep V-sync disabled for now because
+it has known issues; existing saved values are preserved.
+
+Release uses clang-cl, Ninja and parallel ThinLTO with a 3 GiB linker cache per
+executable. The generated CPU shards share a precompiled header and emit direct
+fallthrough for consecutive instructions. Real branches and diagnostic checkpoints
+remain explicit. Unchanged builds reuse compilation and link output. When upgrading
+an existing Visual Studio build, Build.cmd refreshes CMake's configuration while
+preserving game files, settings and saves.
+For a manual upgrade from the Visual Studio generator, run
+cmake --preset windows --fresh once before the commands below.
 
 cmake --preset windows
 cmake --build --preset release
@@ -266,8 +300,12 @@ timestamp and viewpoint. Asset rendering alone is not frame parity.
 
 SDL3 input supports Xbox gamepads and custom keyboard controls. Offline checks
 cover remapping, cleared bindings, stick directions and unchanged gamepad input.
-The executable opens an SDL3 window with persistent Dear ImGui settings in General,
-Audio, Graphics and Controls tabs. Esc toggles settings; F1 remains an alias.
+The executable opens an SDL3 window with persistent Dear ImGui settings in Game
+Files, General, Audio, Graphics, Controls and Log tabs. The full game name is in the
+window title, and setting descriptions appear in hover tooltips.
+Log retains the latest 64 startup, capture and error messages, newest first,
+inside the scrolling tab content. Messages do not appear above the game buttons.
+Esc toggles settings; F1 remains an alias.
 General selects the presentation limit, defaulting to 60 Hz independently of the
 monitor, and has interpolation and frame-rate counter toggles. Selecting a rate
 above 60 Hz enables interpolation; selecting 60 Hz or lower disables it. Manual
@@ -279,7 +317,14 @@ or rate changes; the guest video callback stays at 60 Hz.
 The scheduler presents interpolated images while servicing events/input between
 original frames. V-sync can still limit presentation to the physical display.
 Audio controls master volume and mute through SDL3's output gain. Graphics has
-V-sync, fullscreen and internal resolution (1x-4x).
+Widescreen (16:9), V-sync, fullscreen and internal resolution (1x-4x).
+V-sync defaults off for new installations and should remain disabled for now
+because of known issues. Existing saved preferences retain their selected value.
+Widescreen reports the original video-settings bit to the compiled game and
+fits its anamorphic framebuffer to 16:9 at presentation. Native camera, HUD and
+split-screen calculations remain in the original code. The logical framebuffer
+stays 640x480; internal scaling and interpolation are unchanged. The option saves
+automatically and applies when starting or restarting a session. It defaults off.
 Resolution scales colour/depth/feedback targets and raster/scissor rectangles;
 guest coordinates, texture addresses and gameplay are unchanged. Vertex mapping
 keeps the host half-pixel origin independent of scale. Targets are created at
@@ -290,7 +335,15 @@ The FPS overlay measures display and original-game frames separately over half
 a second and is drawn at window resolution, after interpolation.
 Controls allows a key per action, clearing bindings and restoring defaults.
 Esc cancels an active key change; Esc/F1/F8/F9 remain reserved for the interface.
-Settings, including scancodes, are saved in data/local/settings.cfg.
+Settings, including scancodes and game-file paths, save automatically in
+data/local/settings.cfg after editing. Closing settings or the app also saves
+pending edits. Continuous slider/text edits do not write on every frame.
+The game buttons share a centered row. Exit game saves pending setting changes
+and closes the app through the same path as closing the window.
+Restart game ends the current session
+through the native scheduler's cancellation path, releases its audio, pending
+reads and guest stacks, and starts a fresh session in the same window. Saved
+settings, including internal resolution, apply when the new session starts.
 
 Interpolation is a D3D11 image pass, inactive at the default 60 Hz. It stores two
 completed frames, estimates motion in both directions with four fixed-size
@@ -403,8 +456,12 @@ Push-buffer RAM is validated once per bounded submission, with packet boundaries
 still checked.
 The original audio calculator retains derived listener orientation between
 sources; moving listeners and immediate/deferred settings remain effective.
-research/performance.txt records measured optimization batches; repeat gameplay
-captures are still needed to establish sustained 60 FPS.
+research/performance.txt records measured optimization batches. The latest
+15-second Airport Terminal 3 benchmark measured about 223 original FPS on a
+Ryzen 5 5600X and RTX 5060 Ti at 1x, widescreen, 240 Hz selected, interpolation
+off and V-sync off, using the local LLVM profile-guided build. The sustained
+240 FPS goal remains unmet; these measurements do not establish performance
+on every track or an unprofiled installation build.
 
 Interpolated presentation checks DXGI frame availability without waiting and
 uses nonblocking Present. A busy display queue leaves the game running until
@@ -432,8 +489,12 @@ Each text line contains milliseconds, an SDL button/axis name and its value:
 Button values are 0/1; axes use -32768..32767. Events must be ordered, with at most
 128 events and a 16 KiB file. Timing begins with the first original game flip.
 The script owns a separate virtual gamepad and never changes physical controls.
+The name performance accepts 1 to start a recording and 0 to save it. Its times
+use the same first-flip clock, allowing repeatable race recordings without UI input.
 Frame captures retain the last presented image, including when execution stops
 mid-frame or in a smaller offscreen pass. Captures and traces remain opt-in.
+With interpolation active, --frame also saves window images named -previous,
+-interpolated and -current for inspecting the final source pair and its midpoint.
 --memory ADDRESS:BYTES captures up to four selected RAM ranges after a live run,
 with at most 4096 bytes per range. --trace-io includes the last 64 file operations
 with filenames, offsets, transfer sizes and destination addresses in the JSON
@@ -452,3 +513,43 @@ or image captures are added. Full file tracing remains opt-in through --trace-io
 
 DESIGN.txt defines the native service approach. Preserved knowledge is research:
 verify ABI and addresses against original bytes and primary interfaces.
+
+Optional LLVM profile-guided build
+
+Normal builds leave B2_PROFILE_GENERATE off and B2_PROFILE_USE empty. To train
+native compilation on a game scene, configure/build Release with:
+cmake --preset windows -DB2_PROFILE_GENERATE=ON -DB2_PROFILE_USE=
+cmake --build --preset release
+
+Set LLVM_PROFILE_FILE to an absolute private filename containing %p before
+launching the game. Use the normal timed controller/performance script; F9 (or
+its performance control) resets compiler counters when recording starts, so
+startup/menu navigation is excluded. Exit normally within 30 seconds of that
+start. Compiler data is written on exit. This training executable is not an
+FPS acceptance result. Clear the environment variable after training.
+
+Merge the selected game profile, then build the optimized native executable:
+llvm-profdata merge -o PATH/airport.profdata PATH/airport-PID.profraw
+cmake --preset windows -DB2_PROFILE_GENERATE=OFF -DB2_PROFILE_USE=PATH/airport.profdata
+cmake --build --preset release
+
+Use absolute paths. Keep profiles private/generated, and rerun the actual
+Airport benchmark and CPU/render diagnostics before accepting the result.
+The optimized executable has no profiling counters. To restore ordinary
+compilation, configure with both -DB2_PROFILE_GENERATE=OFF -DB2_PROFILE_USE=.
+
+B2_AVX2 is an optional Release compiler target, disabled by default. Enable
+with -DB2_AVX2=ON only for an AVX2-capable CPU and operating system; that binary
+requires AVX2. Rebuild and check CPU, audio, rendering and actual game timings.
+Use -DB2_AVX2=OFF to restore the portable x64 target.
+
+Low-overhead game-frame benchmarking
+
+Timed control scripts also accept benchmark 1 and benchmark 0. These record one
+existing SDL timestamp at each original game flip, with an 8192-frame reserved
+buffer and an automatic 30-second limit. They do not enable detailed per-call
+CPU/GPU tracing. Use the same scene and controller events when comparing builds.
+F9 and performance 1/0 retain the detailed diagnostic and are exclusive with a
+frame-only benchmark. Reports go to build/captures/benchmark-*/benchmark.json,
+including raw frame intervals, CPU/GPU/build identity, settings, dropped frames
+and median/p95/p99/max frame times. Setup/loading precedes the measured segment.

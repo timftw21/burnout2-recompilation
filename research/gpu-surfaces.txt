@@ -56,3 +56,68 @@ They do not promote an unfinished frame or offscreen pass during shutdown. A new
 offline case presents a red frame, starts an unpresented 32x32 RGB565 pass, and
 verifies that capture still returns the complete original 64x64 frame. The full
 141-case suite passes on the RTX 5060 Ti and WARP without validation messages.
+
+Issue 14: graphics storage lifetime (2026-10-12)
+
+The report describes intermittent black sky and vehicle depth artifacts; its
+Discord follow-up gives only an extended period of playtime, with no duration
+or scene-change trigger. Source:
+https://github.com/timftw21/burnout2-recompilation/issues/14
+
+Two concrete cache faults were found. Ordinary textures were uploaded once and
+cached by guest address/descriptor. Neither they nor GPU surfaces/reflection
+copies were retired when their backing guest allocation was freed or decommitted.
+Reusing an address could therefore display its former texture or GPU surface;
+dead views also continued consuming the texture/target budgets and slots.
+Separately, inactive image/pitch/palette registers created distinct keys for
+identical supported textures. Swizzled image size/pitch comes from format, and
+none of the supported formats uses a palette. Those inactive key fields are
+now zero; linear textures retain their actual image dimensions and pitch.
+
+Original-byte corroboration: the verified B5207C40 target's SDK resource destroy
+routine at 002171D0 passes its Data field to MmFreeContiguousMemory at 0021723D
+(FF15AC3C2900). Import 00293CAC contains AB000080, ordinal 171. Bounded native
+analysis decoded 43 instructions through the return at 00217250. No runtime
+CPU decoding or substituted game resource-release routine was added.
+
+Native allocation release/decommit now invalidates overlapping cached graphics
+storage before reuse. Texture payloads, color/depth extents and all cubemap faces
+are covered, including high-address RAM aliases. Queued work is submitted first.
+The renderer unbinds and releases the obsolete views/targets, subtracts their
+budgets and reuses vacant resource slots; unrelated resources stay intact.
+D3D11 context references and deferred resource destruction are documented at:
+https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-pssetshaderresources
+https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-flush
+
+Both final hardware and WARP suites pass all 186 cases without D3D11 validation
+messages. Focused cases exercise partial/aliased allocation replacement, former
+render-target storage reused as an ordinary texture, depth storage release,
+reflection-face replacement and inactive texture registers. A 5000-cycle check
+creates/releases 2D textures, color/depth targets and cubemaps, checking that
+live view counts and resource budgets return to baseline while another texture
+remains usable. All 163 common PNG fixtures match the overnight build exactly.
+CPU (21976 instruction, 579 memory, 6744 floating, 109 control cases), audio,
+117 storage checks and the hidden-window diagnostic also pass.
+
+An automated 601-second session on Ryzen 5 5600X / RTX 5060 Ti used Airport
+Terminal 3, 3x resolution, widescreen, 180 Hz, interpolation on and V-sync off.
+It reached the track-records screen and completed 36034 original frames without
+a crash or reported audio/graphics boundary. Two F9 windows lasted 14.999 and
+14.998 seconds. Between their final samples, targets stayed at 10, target budget
+at 117227520 bytes and local GPU usage near 133 MiB (139354112 to 138948608).
+Views changed from 218 to 225, source texture bytes by only 121152; private RAM
+changed from 325132288 to 338251776 bytes. This session exercised the release
+fix before the separate inactive-key normalization; final suites and the final
+game benchmark also include key normalization. These are bounded observations,
+not proof that every intermittent glitch in the report has been reproduced.
+
+Final executable PE 6ACD0165, image 80429056 bytes: an automated 14.9998-second
+Airport Terminal 3 benchmark at 240 Hz, 1x, widescreen, interpolation/V-sync off
+measured 223.406 FPS, median 4.3646 ms, p99 5.7388 ms, max 7.4992 ms, no dropped
+frames and unchanged benchmark settings. The active overnight PGO profile and
+portable x64 compiler settings are retained. The actual executable's PE identity
+matches the benchmark. Original user settings were restored byte for byte.
+Reports/images/controller script are under build/checks/issue-14; raw game
+captures remain beside the executable under build/captures. No stress/build
+workers remain. The specific reported sky/vehicle glitch still needs confirmation
+on the reporter's machine or a reproducible longer-play sequence.

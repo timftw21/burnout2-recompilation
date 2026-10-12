@@ -7,6 +7,7 @@
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
+struct ID3D11SamplerState;
 
 namespace b2 {
 struct Image {
@@ -96,13 +97,32 @@ struct RenderResources {
 };
 
 class Renderer {
+    struct Impl;
 public:
+    class PreparedState {
+        friend class Renderer;
+        friend struct Impl;
+        const void* owner_=nullptr;
+        const void* pipeline_=nullptr;
+        std::array<ID3D11SamplerState*,4> samplers_{};
+    };
+    struct StreamDraw {
+        const RenderState* state=nullptr;
+        const VertexConstants* constants=nullptr;
+        const ProgramView* view=nullptr;
+        std::span<const VertexStream> streams;
+        const ProgramVertex* current=nullptr;
+        std::span<const std::uint32_t> indices;
+        const PreparedState* bindings=nullptr;
+        std::uint32_t layout=0,count=0;
+    };
     explicit Renderer(std::uint32_t width, std::uint32_t height,
                       bool warp = false, bool debug = false,unsigned resolution_scale = 1);
     ~Renderer();
     Renderer(const Renderer&) = delete;
     Renderer& operator=(const Renderer&) = delete;
     std::uint32_t upload(const TextureData&);
+    void release(std::uint32_t resource); // After queued draws have been submitted; native GPU work retains its references.
     std::uint32_t create_target(std::uint32_t width,std::uint32_t height,
                                 SurfaceColor=SurfaceColor::rgba8,SurfaceDepth=SurfaceDepth::z24s8);
     void grow_target(std::uint32_t target,std::uint32_t width,std::uint32_t height);
@@ -113,6 +133,7 @@ public:
     void resize(std::uint32_t width, std::uint32_t height);
     void reset(unsigned resolution_scale); // New session: discard game targets/textures, retain native pipelines.
     void attach_window(void* native_window);
+    void widescreen(bool enabled); // Present the game's native anamorphic image at 16:9.
     void interpolation(bool enabled); // Allocate history only when explicitly enabled.
     void publish_frame(bool reset = false); // Snapshot a completed game frame.
     bool display(float phase = 1,bool wait = true); // Scale the main image when a window buffer is available.
@@ -121,9 +142,10 @@ public:
     RenderResources resources() const;
     ID3D11Device* native_device() const;
     ID3D11DeviceContext* native_context() const;
-    void prepare(const RenderState&); // Cached D3D11 states; shaders are built ahead of time.
+    PreparedState prepare(const RenderState&); // Borrowed bindings, valid for this renderer's lifetime.
     std::uint32_t prepare_program(const VertexProgram&, bool launch = false);
     std::uint32_t prepare_fixed(const FixedTransform& = {});
+    void snapshot_constants(std::uint32_t program,const VertexConstants& source,VertexConstants& destination,std::uint32_t& previous);
     std::uint32_t prepare_layout(std::uint32_t program,const VertexLayout&);
     void launch_program(std::uint32_t program, VertexConstants&, const ProgramVertex&);
     void begin(std::uint32_t argb = 0xFF000000, float depth = 1, bool clear_target = true);
@@ -136,7 +158,8 @@ public:
                       const ProgramView&, std::span<const ProgramVertex>, std::span<const std::uint32_t> indices = {});
     void draw_streams(const RenderState&,std::uint32_t layout,const VertexConstants&,const ProgramView&,
                       std::span<const VertexStream>,const ProgramVertex& current,std::uint32_t count,
-                      std::span<const std::uint32_t> indices={});
+                      std::span<const std::uint32_t> indices={},const PreparedState* bindings=nullptr);
+    void draw_streams(std::span<const StreamDraw>); // Upload a bounded queued group before submitting it.
     void end();
     Image readback(); // Explicit diagnostic operation; never implicit in draw/present.
     Image read_target(std::uint32_t);
@@ -145,7 +168,6 @@ public:
     std::string adapter() const;
     std::vector<std::string> errors() const;
 private:
-    struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 

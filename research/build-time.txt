@@ -1,0 +1,94 @@
+Build throughput, 2026-10-11
+
+Hardware: Ryzen 5 5600X, 6 cores / 12 threads, 32 GiB RAM, Windows 11.
+Tools: Visual Studio 2026 18 Community, Windows SDK 10.0.26100.0,
+MSVC 19.51.36231, LLVM 22.1.8, Ninja 1.13.2, CMake 4.3.3.
+Supported XBE SHA-256:
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF
+
+Measured builds, optimized Release with full debug symbols
+
+                                   Original MSVC       Final LLVM/Ninja
+All 513 generated C++ files         437.532 s           117.693 s
+Cold whole-program optimized link  583.743 s           239.868 s
+
+Compilation fell by 73%; cold linking fell by 59%. The original compilation
+used /MP2 without a shared header. An intermediate MSVC build with a shared
+header and file-level scheduling compiled in 49.322 s but still linked in
+557.637 s. The LLVM build retains whole-program optimization through ThinLTO.
+These are game-code compilation/link measurements, not whole-install timings
+or game FPS. The independently repeated fresh Unicode installation linked in
+218.729 s; its complete setup took 485.655 s. Complete normal-folder setup took
+487.939 s, including tool/dependency compilation and asset/shader preparation.
+
+A real one-file CLI help edit compiled and linked in 16.921 s, with 15.067 s
+spent linking. Restoring the original source took 3.801 s, with a 1.849 s link.
+An unchanged build reported no work. Link caches are limited to 1 GiB per
+Release executable; the measured game cache occupied about 132 MiB.
+
+Changes
+
+The generated CPU files share a precompiled CPU header. Sequential instructions
+fall through directly; genuine branches, loop checks, discontinuous successors
+and fused-block exits retain explicit labels. Source scopes and overlapping
+instruction streams are preserved. Generated C++ fell from 208,705,445 to
+187,351,403 bytes. LLVM objects occupied 249,499,260 bytes, compared with
+3,037,607,299 bytes for the saved MSVC objects.
+
+The default preset and Build.cmd use clang-cl, Ninja and LLD. The installer
+loads the x64 Visual Studio SDK environment, validates LLVM 22.1+, and refreshes
+incompatible CMake metadata while retaining game files and user data. Six
+compilation workers and cached parallel ThinLTO replace the slow final MSVC
+optimization pass. MASM inputs remain relative, with /Fo before /Ta, so assembly
+works in non-English installation folders. Audio voice initialization moved to
+its constructor where the packet type is complete, preserving initialization.
+
+Changing compilers exposed missing verified UI method registrations. Original
+stores at 23580, 2B87E, 2B903 and 3D66E establish methods 22A60, BFAD0, BFD30
+and BFC70. Their original bytes are checked during callback discovery. Boolean
+membership checks now use ranges::contains. Both builds compile 36,149 functions
+and 713,245 instructions, with 32,619 closed functions. The only per-function
+report differences remove a spurious D7400 callback annotation from 2F050 and
+32B60; D7400 remains compiled through verified startup roots. Existing mutable
+indirect targets remain explicitly unresolved. Generated x87/MMX assembly is
+identical, SHA-256:
+4670BA3EDA91AF7D3C8407C922B64A3034CA3F460C928D76CB3EDE740702C5D5
+
+Validation
+
+Native CPU, spatial, audio/capture, effects, all twelve music tracks, storage,
+replay, original-image/UI, hardware and WARP rendering, recording and hidden
+window checks passed. The baseline and new boot diagnostics both reached main,
+produced 53 flips and stopped at CC5C0 on the configured 1,000,000-checkpoint
+limit. Three-run CPU benchmark medians improved with matching checksums:
+finite helper 9.2234 -> 6.2816 ns, call chain 65.1321 -> 31.5402 ns,
+fused matrix 203.388 -> 197.511 ns. Component timings do not establish game FPS.
+
+Windows PowerShell 5.1 installations passed in normal and Japanese/accented
+source/disc paths. Migration preserved actual settings and six existing saves.
+Repeat Unicode setup passed with downloads blocked, refreshed the disc location,
+preserved settings/saves and reused the executable in 15.970 s. Invalid disc
+input failed at extraction without changing existing settings/saves. Absolute
+Unicode CPU-check input passes with a UTF-8 process manifest; narrow main argv
+previously lost Japanese characters before file opening. No global OS setting
+is changed. Owned build workers were audited by PID and creation time.
+The final canonical installer repeat took 17.797 s and preserved all six saves.
+Its rebuilt executable passed Unicode-path CPU and hidden-window checks; its
+embedded manifest was independently extracted and verified. No workers remained.
+
+Detailed private timing/check logs are in build/checks/build-speed. No runtime
+decoding, interpreter or JIT was added, and no gameplay FPS claim is made.
+
+Toolchain references:
+https://clang.llvm.org/docs/ThinLTO.html
+https://cmake.org/cmake/help/v4.3/command/target_precompile_headers.html
+https://learn.microsoft.com/en-us/windows/apps/design/globalizing/use-utf8-code-page
+
+2026-10-11: runtime edit throughput
+
+Removing the shader stamp's dependency on the whole shared tool avoids a needless
+48-49 second HLSL compile after renderer edits. Actual generator source, headers,
+verified XBE and build settings still invalidate it; tool build ordering remains.
+A timestamp-only renderer rebuild took 8.553 seconds with the shader stamp
+unchanged, compared with 59.292 seconds for the preceding runtime-only edit.
+Configuration and resource compilation passed in the required x64 SDK environment.

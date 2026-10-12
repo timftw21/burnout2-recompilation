@@ -526,16 +526,17 @@ Function recover(Xbe& image, std::uint32_t address, std::uint32_t instruction_bu
         return hex_bytes(image.data(address,expected.size()/2))==expected;
     };
     constexpr std::array ui_initializers{0x0001EF10U,0x0001E720U,0x000229D0U,0x0002EF40U,0x000303B0U,0x000C0E70U,0x000C14A0U};
-    constexpr std::array ui_methods{0x000BFBF0U,0x000BFE70U,0x000C0080U,0x000C0390U,0x000C04A0U,0x000C0890U,0x000C08F0U,0x000C0A60U};
-    const bool ui_producer=std::ranges::find(ui_initializers,function.entry)!=ui_initializers.end() ||
+    constexpr std::array ui_methods{0x000BFBF0U,0x000BFE70U,0x000C0080U,0x000C0390U,0x000C04A0U,0x000C0890U,0x000C08F0U,0x000C0A60U,
+        0x00022A60U,0x000BFAD0U,0x000BFC70U,0x000BFD30U};
+    const bool ui_producer=std::ranges::contains(ui_initializers,function.entry) ||
         std::ranges::any_of(function.instructions,[&](const auto& item) {
             const auto& instruction=item.second;
             if(instruction.decoded.meta.category==ZYDIS_CATEGORY_CALL && instruction.target() &&
-               std::ranges::find(ui_initializers,*instruction.target())!=ui_initializers.end()) return true;
+               std::ranges::contains(ui_initializers,*instruction.target())) return true;
             const auto& output=instruction.operands[0];const auto& input=instruction.operands[1];
             return instruction.decoded.mnemonic==ZYDIS_MNEMONIC_MOV && output.type==ZYDIS_OPERAND_TYPE_MEMORY && output.size==32 &&
                 output.mem.disp.value==0x48 && input.type==ZYDIS_OPERAND_TYPE_IMMEDIATE &&
-                std::ranges::find(ui_methods,static_cast<std::uint32_t>(input.imm.value.u))!=ui_methods.end();
+                std::ranges::contains(ui_methods,static_cast<std::uint32_t>(input.imm.value.u));
         });
     std::vector<std::pair<std::uint32_t,int>> ui_callback_registers;
     if(ui_producer) for(const auto& [pc,instruction]:function.instructions) {
@@ -558,7 +559,11 @@ Function recover(Xbe& image, std::uint32_t address, std::uint32_t instruction_bu
            !matches_bytes(0x000C1057,"C74148F0080C00") ||
            !matches_bytes(0x000C10A7,"C74148600A0C00") ||
            !matches_bytes(0x000C14A0,"8B513C568B742408C1E60403F28D460450E8EA8801008B4C241083C00883C4048970448948405EC20800") ||
-           !matches_bytes(0x000C1306,"FF5650"))
+           !matches_bytes(0x000C1306,"FF5650") ||
+           !matches_bytes(0x00023580,"C74148602A0200") ||
+           !matches_bytes(0x0002B87E,"C74148D0FA0B00") ||
+           !matches_bytes(0x0002B903,"C7464830FD0B00") ||
+           !matches_bytes(0x0003D66E,"C7414870FC0B00"))
             throw std::runtime_error("UI draw callback layout differs from its verified ABI");
         if(input.type==ZYDIS_OPERAND_TYPE_IMMEDIATE) add_callback(static_cast<std::uint32_t>(input.imm.value.u));
         else ui_callback_registers.emplace_back(pc,general(input.reg.value));

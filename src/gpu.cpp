@@ -22,6 +22,21 @@ unsigned attribute_bytes(std::uint32_t format) {
     throw std::runtime_error("Unsupported NV097 vertex attribute format");
 }
 void checked_gpu(HRESULT status) {if(FAILED(status)) throw std::runtime_error(std::format("GPU completion query failed: 0x{:08X}",static_cast<unsigned>(status)));}
+// These methods do more than retain a register value. The prefix counts let a
+// whole packet of ordinary state writes use one copy, including repeated writes.
+constexpr auto method_effects=[] {
+    std::array<std::uint16_t,2049> counts{};
+    constexpr unsigned ranges[][2]={{0,0},{0x110,0x110},{0x12C,0x12C},{0x440,0x7BC},
+        {0x840,0x93C},{0x9D0,0x9DC},{0xA20,0xA2C},{0xA50,0xA5C},{0xAF0,0xBFC},
+        {0x17FC,0x1800},{0x1808,0x1808},{0x1810,0x1810},{0x1818,0x1818},{0x1880,0x1AFC},
+        {0x1D70,0x1D70},{0x1D94,0x1D94},{0x1E90,0x1E90},{0x1E9C,0x1EA4}};
+    for(const auto& range:ranges) for(unsigned method=range[0];method<=range[1];method+=4) counts[method/4+1]=1;
+    for(unsigned i=1;i<counts.size();++i) counts[i]+=counts[i-1];
+    return counts;
+}();
+bool has_method_effect(unsigned method,unsigned words=1) {
+    const auto first=method/4;return method_effects[first]!=method_effects[first+words];
+}
 }
 struct Gpu::Impl {
     Renderer& renderer;Memory& memory;Gpu& owner;
@@ -29,14 +44,18 @@ struct Gpu::Impl {
     std::array<std::array<std::uint32_t,2048>,8> registers{};
     std::array<std::uint32_t,8> objects{};
     VertexProgram program;
+    std::uint32_t draw_program=0,fixed_program=0,layout_program=0,prepared_layout=0;
+    bool program_dirty=true;
+    FixedTransform prepared_fixed{};VertexLayout prepared_attributes{};
     VertexConstants constants{};
     ProgramVertex current{};
     std::uint32_t program_load=0,constant_load=0,primitive=0,target=0;
     std::vector<std::uint32_t> indices,inline_words;
     struct Draw {
         RenderState state;VertexConstants constants;ProgramView view;ProgramVertex current;
+        Renderer::PreparedState bindings;
         std::array<VertexStream,16> streams{};
-        std::uint32_t layout=0,count=0,stream_count=0;
+        std::uint32_t layout=0,count=0,stream_count=0,constant_program=0;
         std::vector<std::uint32_t> indices;
         std::vector<std::uint32_t> packed;
     };
@@ -46,8 +65,9 @@ struct Gpu::Impl {
     Surface* active_surface=nullptr;
     std::uint64_t surface_revision=0;
     std::map<std::array<std::uint32_t,4>,Surface> targets;
-    std::map<std::array<std::uint32_t,5>,std::uint32_t> textures;
-    struct Cubemap {std::uint32_t identifier;std::array<std::uint64_t,6> revisions;};
+    struct Texture {std::uint32_t identifier;std::uint64_t size;};
+    std::map<std::array<std::uint32_t,5>,Texture> textures;
+    struct Cubemap {std::uint32_t identifier;std::array<std::uint64_t,6> revisions;std::uint64_t size;};
     std::map<std::array<std::uint32_t,5>,Cubemap> cubemaps;
     struct Fence {
         ComPtr<ID3D11Query> query;
@@ -66,7 +86,7 @@ struct Gpu::Impl {
     bool capture_truncated=false;
     Impl(Renderer& r,Memory& m,Gpu& o,std::uint32_t base):renderer(r),memory(m),owner(o),semaphore_base(base) {
         for(auto& attribute:current.attributes) attribute={0,0,0,1};
-        current.attributes[3]={1,1,1,1};draws.resize(256);indices.reserve(4096);inline_words.reserve(4096);
+        current.attributes[3]={1,1,1,1};draws.resize(256);indices.reserve(32768);inline_words.reserve(4096);
         const D3D11_QUERY_DESC description{D3D11_QUERY_EVENT,0};
         for(auto& fence:fences) checked_gpu(renderer.native_device()->CreateQuery(&description,&fence.query));
     }
@@ -75,13 +95,51 @@ struct Gpu::Impl {
         if(!draw_count) return;
         renderer.begin(0,1,false);
         try {
+            std::array<Renderer::StreamDraw,256> group{};
+            for(unsigned i=0;i<draw_count;++i) {
+                const auto& draw=draws[i];
+                group[i]={&draw.state,&draw.constants,&draw.view,std::span(draw.streams).first(draw.stream_count),
+                    &draw.current,draw.indices,&draw.bindings,draw.layout,draw.count};
+            }
+            renderer.draw_streams(std::span(group).first(draw_count));
             for(const auto& draw:std::span(draws).first(draw_count)) {
-                renderer.draw_streams(draw.state,draw.layout,draw.constants,draw.view,
-                    std::span(draw.streams).first(draw.stream_count),draw.current,draw.count,draw.indices);
                 statistics.vertices+=draw.indices.empty()?draw.count:draw.indices.size();++statistics.draws;
             }
         } catch(...) {renderer.end();draw_count=0;throw;}
         renderer.end();draw_count=0;++gpu_work;
+    }
+    void invalidate_memory(std::uint32_t address,std::uint32_t size) {
+        if(!size) return;
+        address&=0x0FFFFFFF;
+        const auto end=std::uint64_t(address)+size;
+        if(end>0x10000000ULL) throw std::runtime_error("Invalid GPU storage invalidation range");
+        // Submit borrowed vertex RAM and texture references before the allocator
+        // can overwrite them. Already submitted D3D11 work retains its resources.
+        flush();
+        const auto overlaps=[&](std::uint32_t base,std::uint64_t bytes) {
+            base&=0x0FFFFFFF;return base<end && address<std::uint64_t(base)+bytes;
+        };
+        for(auto found=textures.begin();found!=textures.end();) {
+            if(overlaps(found->first[0],found->second.size)) {renderer.release(found->second.identifier);found=textures.erase(found);}
+            else ++found;
+        }
+        for(auto found=cubemaps.begin();found!=cubemaps.end();) {
+            if(overlaps(found->first[0],found->second.size)) {renderer.release(found->second.identifier);found=cubemaps.erase(found);}
+            else ++found;
+        }
+        for(auto found=targets.begin();found!=targets.end();) {
+            const auto& [key,surface]=*found;
+            const auto format=key[2],pitch=key[3];
+            const bool linear=((format>>8)&15)==1;
+            const auto color_bytes=(format&15)==3?2U:4U,depth_bytes=((format>>4)&15)==1?2U:4U;
+            const auto color_size=std::uint64_t(surface.height-1)*(linear?(pitch&0xFFFF):surface.width*color_bytes)+surface.width*color_bytes;
+            const auto depth_size=std::uint64_t(surface.height-1)*(linear?(pitch>>16):surface.width*depth_bytes)+surface.width*depth_bytes;
+            if(overlaps(key[0],color_size) || (key[1] && overlaps(key[1],depth_size))) {
+                if(active_surface==&surface) active_surface=nullptr;
+                if(target==surface.identifier) target=0;
+                renderer.release(surface.identifier);found=targets.erase(found);
+            } else ++found;
+        }
     }
     bool select_target(std::uint32_t clear_flags=0) {
         const auto horizontal=reg(0x200),vertical=reg(0x204);
@@ -143,7 +201,9 @@ struct Gpu::Impl {
             throw std::runtime_error("Invalid NV097 texture dimensions");
         const bool cube=(format&4)!=0;
         const auto address=reg(method)&0x0FFFFFFF;
-        const std::array key{address,format,image,pitch,reg(method+0x20)};
+        // Swizzled dimensions/pitch come entirely from format. The supported
+        // formats never use a palette; leftover registers must not make aliases.
+        const std::array key{address,format,linear?image:0U,linear?pitch:0U,0U};
         if(linear) view.texture_scales[stage]={1.0f/width,1.0f/height,1.0f/depth,1};
         // Sampling a GPU-produced surface must see its current GPU contents,
         // rather than the original RAM allocation used for ordinary textures.
@@ -187,7 +247,7 @@ struct Gpu::Impl {
                         // subsequent car draws reuse this snapshot until a write.
                         flush();
                         const auto identifier=renderer.copy_cubemap(faces,found==cubemaps.end()?0:found->second.identifier);
-                        found=cubemaps.insert_or_assign(key,Cubemap{identifier,revisions}).first;
+                        found=cubemaps.insert_or_assign(key,Cubemap{identifier,revisions,face_stride*6}).first;
                     }
                     return found->second.identifier;
                 }
@@ -196,10 +256,10 @@ struct Gpu::Impl {
         }
         if(!size || size>64*1024*1024) throw std::runtime_error("NV097 texture payload exceeds its bound");
         auto found=textures.find(key);
-        if(found==textures.end()) found=textures.emplace(key,renderer.upload({width,height,static_cast<TextureFormat>(code),
+        if(found==textures.end()) found=textures.emplace(key,Texture{renderer.upload({width,height,static_cast<TextureFormat>(code),
             Bytes(static_cast<const std::byte*>(memory.access(address,static_cast<std::size_t>(size))),static_cast<std::size_t>(size)),
-            mips,linear?pitch:0,cube,depth})).first;
-        return found->second;
+            mips,linear?pitch:0,cube,depth}),size}).first;
+        return found->second.identifier;
     }
     RenderState state(ProgramView& view) {
         RenderState s;
@@ -242,13 +302,16 @@ struct Gpu::Impl {
         ProgramView view{};
         const auto render_state=state(view); // Resolving feedback can flush pending draws.
         auto& draw=draws[draw_count];draw.stream_count=0;draw.view=view;draw.packed.clear();
-        draw.current=current;draw.constants=constants;draw.count=count;
+        draw.current=current;draw.count=count;
         draw.view.depth_scale=constants[58][2];
         if(draw.view.depth_scale<=0) throw std::runtime_error("NV097 viewport depth scale was not initialized");
         draw.state=render_state;
         const auto mode=reg(0x1E94)&3;
         std::uint32_t shader;
-        if(mode==2) shader=renderer.prepare_program(program);
+        if(mode==2) {
+            if(program_dirty) {draw_program=renderer.prepare_program(program);program_dirty=false;}
+            shader=draw_program;
+        }
         else if(mode==0) {
             if(reg(0x314)) throw std::runtime_error("Fixed lighting requires the corresponding shader path");
             FixedTransform fixed{};fixed.skin=reg(0x328);fixed.normalize=reg(0x3A4)!=0;
@@ -257,8 +320,10 @@ struct Gpu::Impl {
                 fixed.texture_matrix[stage]=reg(0x420+stage*4)!=0;
                 for(unsigned lane=0;lane<4;++lane) fixed.texgen[stage][lane]=reg(0x3C0+stage*16+lane*4);
             }
-            shader=renderer.prepare_fixed(fixed);
+            if(!fixed_program || fixed!=prepared_fixed) {fixed_program=renderer.prepare_fixed(fixed);prepared_fixed=fixed;}
+            shader=fixed_program;
         } else throw std::runtime_error("Unsupported NV097 transform mode");
+        renderer.snapshot_constants(shader,constants,draw.constants,draw.constant_program);
         VertexLayout layout{};
         std::array<std::uint32_t,16> bases{},strides{};
         unsigned inline_stride=0;
@@ -288,7 +353,10 @@ struct Gpu::Impl {
             if(address>UINT32_MAX || size>8*1024*1024) throw std::runtime_error("NV097 vertex stream exceeds its bound");
             draw.streams[stream]={Bytes(static_cast<const std::byte*>(memory.access(static_cast<std::uint32_t>(address),static_cast<std::size_t>(size))),static_cast<std::size_t>(size)),strides[stream]};
         }
-        draw.layout=renderer.prepare_layout(shader,layout);renderer.prepare(draw.state);
+        if(shader!=layout_program || layout!=prepared_attributes) {
+            prepared_layout=renderer.prepare_layout(shader,layout);layout_program=shader;prepared_attributes=layout;
+        }
+        draw.layout=prepared_layout;draw.bindings=renderer.prepare(draw.state);
         if(!capture_directory.empty()) capture_draw(first,draw,shader);
         draw.indices.assign(elements.begin(),elements.end());
         if(draw.state.color_mask) {active_surface->revision=++surface_revision;active_surface->color_cleared=false;}
@@ -392,6 +460,7 @@ struct Gpu::Impl {
         }
         if(method==0x100 && !data) return;
         if(objects[0]!=0xD) throw std::runtime_error(std::format("NV097 object 0x{:X} is unbound at method 0x{:X}, value 0x{:X}",objects[0],method,data));
+        if(!has_method_effect(method)) return;
         if(method==0x17FC) {
             if(data) {if(primitive) throw std::runtime_error("Nested NV097 begin/end");primitive=data;indices.clear();inline_words.clear();}
             else {
@@ -439,11 +508,12 @@ struct Gpu::Impl {
         else if(method>=0xA20 && method<=0xA2C) constants[59][(method-0xA20)/4]=real(data);
         else if(method>=0xAF0 && method<=0xAFC) constants[58][(method-0xAF0)/4]=real(data);
         else if(method==0x1E9C) program_load=data;
-        else if(method==0x1EA0) program.start=data;
+        else if(method==0x1EA0) {program_dirty|=program.start!=data;program.start=data;}
         else if(method==0x1EA4) constant_load=data;
         else if(method>=0xB00 && method<=0xB7C) {
             if(program_load>=program.tokens.size()) throw std::runtime_error("NV097 program upload outside instruction memory");
-            const auto lane=((method-0xB00)/4)%4;program.tokens[program_load][lane]=data;if(lane==3) ++program_load;
+            const auto lane=((method-0xB00)/4)%4;
+            program_dirty|=program.tokens[program_load][lane]!=data;program.tokens[program_load][lane]=data;if(lane==3) ++program_load;
         } else if(method>=0xB80 && method<=0xBFC) {
             if(constant_load>=constants.size()) throw std::runtime_error("NV097 constant upload outside context memory");
             const auto lane=((method-0xB80)/4)%4;constants[constant_load][lane]=real(data);if(lane==3) ++constant_load;
@@ -483,6 +553,7 @@ struct Gpu::Impl {
 };
 Gpu::Gpu(Renderer& renderer,Memory& memory,std::uint32_t semaphore_base):impl_(std::make_unique<Impl>(renderer,memory,*this,semaphore_base)) {}
 Gpu::~Gpu()=default;
+void Gpu::invalidate_memory(std::uint32_t address,std::uint32_t size) {impl_->invalidate_memory(address,size);}
 void Gpu::performance(Performance* profile) {impl_->profile=profile;}
 void Gpu::capture_frame(const std::filesystem::path& directory) {
     if(directory.empty() || !impl_->capture_requested.empty() || !impl_->capture_directory.empty())
@@ -507,6 +578,24 @@ void Gpu::submit(std::uint32_t begin,std::uint32_t end) {
             throw std::runtime_error("NV2A packet extends beyond its submission or method bank");
         if(count && subchannel==0) {
             const bool repeated=(header&0x40000000U)!=0;
+            if(g.objects[0]==0xD && !has_method_effect(first,repeated?1:count)) {
+                if(repeated) g.registers[0][first/4]=word_at(begin+(count-1)*4);
+                else if(count==1) g.registers[0][first/4]=word_at(begin);
+                else std::memcpy(g.registers[0].data()+first/4,commands+(begin-start),count*4);
+                g.statistics.methods+=count;begin+=count*4;continue;
+            }
+            if(g.objects[0]==0xD && repeated && (first==0x1800 || first==0x1808)) {
+                const auto elements=first==0x1800?count*2:count;
+                if(elements>32768-g.indices.size()) throw std::runtime_error("NV097 inline draw exceeds its bound");
+                const auto previous=g.indices.size();g.indices.resize(previous+elements);
+                if(first==0x1808) std::memcpy(g.indices.data()+previous,commands+(begin-start),count*4);
+                else for(unsigned i=0;i<count;++i) {
+                    const auto pair=word_at(begin+i*4);
+                    g.indices[previous+i*2]=pair&0xFFFF;g.indices[previous+i*2+1]=pair>>16;
+                }
+                g.registers[0][first/4]=word_at(begin+(count-1)*4);
+                g.statistics.methods+=count;begin+=count*4;continue;
+            }
             if(repeated && first==0x1818) {
                 if(count>2*1024*1024-g.inline_words.size()) throw std::runtime_error("NV097 inline draw exceeds its bound");
                 const auto previous=g.inline_words.size();g.inline_words.resize(previous+count);
@@ -520,7 +609,10 @@ void Gpu::submit(std::uint32_t begin,std::uint32_t end) {
                 const auto limit=tokens?g.program.tokens.size():g.constants.size();
                 if(index>limit || count/4>limit-index) throw std::runtime_error("NV097 shader upload outside its memory bank");
                 const auto* payload=commands+(begin-start);
-                if(tokens) {std::memcpy(g.program.tokens[index].data(),payload,count*4);g.program_load+=count/4;}
+                if(tokens) {
+                    g.program_dirty|=std::memcmp(g.program.tokens[index].data(),payload,count*4)!=0;
+                    std::memcpy(g.program.tokens[index].data(),payload,count*4);g.program_load+=count/4;
+                }
                 else {std::memcpy(g.constants[index].data(),payload,count*4);g.constant_load+=count/4;}
                 std::memcpy(g.registers[0].data()+first/4,payload,count*4);g.statistics.methods+=count;begin+=count*4;continue;
             }

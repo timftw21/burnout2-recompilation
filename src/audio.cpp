@@ -129,6 +129,19 @@ struct Audio::Packets {
     bool paused=false,started=false,discontinuous=false,envelope_complete=false;
     explicit Packets(unsigned capacity):slots(capacity) {}
 };
+struct Audio::ControlQueue {
+    enum Kind {frequency,pitch,spatial,volume,headroom};
+    struct Control {
+        std::uint32_t id=0,kind=0,hz=0;
+        double pitch=1;
+        float gain=1;
+        std::array<float,2> pan{1,1},front_back{1,0},environment_gain{1,0},environment_pole{};
+    };
+    static constexpr std::uint32_t capacity=4096,mask=capacity-1;
+    std::array<Control,capacity> values{};
+    alignas(64) std::atomic<std::uint32_t> head{0};
+    alignas(64) std::atomic<std::uint32_t> tail{0};
+};
 struct Audio::Live {
     struct Callback {std::uint64_t start=0,elapsed=0;std::uint32_t clock=0,requested=0,delivered=0;};
     std::vector<float> samples=std::vector<float>(48000*2*10);
@@ -150,6 +163,7 @@ std::unique_ptr<Audio::Capture> Audio::snapshot() {
     std::vector<std::pair<std::uintptr_t,std::uintptr_t>> ranges;ranges.reserve(256);
     {
         StreamLock lock(stream_);
+        apply_controls();
         for(unsigned i=0;i<voices_.size();++i) {
             capture->voices[i]=static_cast<const VoiceState&>(voices_[i]);sources[i]=voices_[i].source;
             if(const auto* packets=voices_[i].packets.get()) {
@@ -232,6 +246,7 @@ void Audio::restore(const Capture& capture) {
     bin_headroom_=capture.headroom;for(auto value:bin_headroom_) if(value>7) throw std::runtime_error("Invalid captured audio bin headroom");
     frames_processed_.store(capture.clock,std::memory_order_relaxed);
     effects_=capture.effects?std::make_unique<Effects>(*capture.effects):nullptr;
+    publish_statuses();
 }
 void Audio::capture(const std::filesystem::path& directory) {
     const auto saved=snapshot();std::filesystem::create_directories(directory);
@@ -360,7 +375,7 @@ std::vector<float> decode_audio(AudioFormat format,std::span<const std::byte> da
         decode_adpcm(format,data.data()+block*format.block_align,std::span(result).subspan(block*64*format.channels,64*format.channels));
     return result;
 }
-Audio::Audio(bool output,float gain) {
+Audio::Audio(bool output,float gain):voices_{},controls_(std::make_unique<ControlQueue>()) {
     if(!(gain>=0 && gain<=1)) throw std::runtime_error("Output volume must be between zero and one");
     if(!output) return;
     if(!SDL_InitSubSystem(SDL_INIT_AUDIO)) throw std::runtime_error(SDL_GetError());
@@ -378,11 +393,11 @@ Audio::Audio(bool output,float gain) {
                 const auto frames=std::min<std::size_t>((static_cast<unsigned>(additional)+7)/8,buffer.size()/2);
                 try {audio.mix_unlocked(std::span(buffer).first(frames*2));}
                 catch(const std::exception& error) {
-                    audio.failed_=true;std::snprintf(audio.failure_.data(),audio.failure_.size(),"%s",error.what());break;
+                    std::snprintf(audio.failure_.data(),audio.failure_.size(),"%s",error.what());audio.failed_.store(true,std::memory_order_release);break;
                 }
                 const int bytes=static_cast<int>(frames*2*sizeof(float));
-                if(!SDL_PutAudioStreamData(stream,buffer.data(),bytes)) {audio.failed_=true;
-                    std::snprintf(audio.failure_.data(),audio.failure_.size(),"%s",SDL_GetError());break;}
+                if(!SDL_PutAudioStreamData(stream,buffer.data(),bytes)) {
+                    std::snprintf(audio.failure_.data(),audio.failure_.size(),"%s",SDL_GetError());audio.failed_.store(true,std::memory_order_release);break;}
                 if(recorded) {
                     const auto count=std::min<std::size_t>(frames*2,live->samples.size()-live->sample_count);
                     std::copy_n(buffer.data(),count,live->samples.data()+live->sample_count);live->sample_count+=static_cast<unsigned>(count);
@@ -414,20 +429,64 @@ Audio::Voice& Audio::voice(std::uint32_t id) {
     if(!id || id>voices_.size() || !voices_[id-1].used) throw std::runtime_error("Invalid native audio voice");
     return voices_[id-1];
 }
+void Audio::publish_status(const Voice& value) {
+    static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
+    publish_position(value);
+    const auto status=value.used?8U|(value.playing?(value.loop?5U:1U):0U):0U;
+    auto& saved=statuses_[&value-voices_.data()];
+    if(saved.load(std::memory_order_relaxed)!=status) saved.store(status,std::memory_order_relaxed);
+}
+void Audio::publish_statuses() {for(const auto& value:voices_) publish_status(value);}
+void Audio::publish_position(const Voice& value) {
+    static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+    const auto position=current_position(value);
+    positions_[&value-voices_.data()].store(position.play|(std::uint64_t(position.write)<<32),std::memory_order_relaxed);
+}
+std::uint32_t Audio::reserve_controls(unsigned count) {
+    auto& queue=*controls_;
+    if(count>ControlQueue::capacity) throw std::runtime_error("Audio control group exceeds its capacity");
+    const auto tail=queue.tail.load(std::memory_order_relaxed);
+    if(count>ControlQueue::capacity-(tail-queue.head.load(std::memory_order_acquire))) {
+        // Rare backpressure retains every command; normal controls never wait
+        // for a mixer batch. The lock also serializes this temporary consumer.
+        StreamLock lock(stream_);apply_controls();
+    }
+    return tail;
+}
+void Audio::apply_controls() {
+    auto& queue=*controls_;
+    auto head=queue.head.load(std::memory_order_relaxed);
+    const auto tail=queue.tail.load(std::memory_order_acquire);
+    for(;head!=tail;++head) {
+        const auto& update=queue.values[head&ControlQueue::mask];
+        auto& value=voices_[update.id-1];
+        switch(update.kind) {
+        case ControlQueue::frequency:value.step=(update.hz?update.hz:value.format.rate)/48000.0;break;
+        case ControlQueue::pitch:value.step=update.pitch;break;
+        case ControlQueue::volume:value.gain=update.gain;break;
+        case ControlQueue::headroom:value.headroom=update.gain;break;
+        case ControlQueue::spatial:
+            value.spatial_gain=update.gain;value.spatial_pan=update.pan;value.spatial_pitch=update.pitch;
+            value.front_back=update.front_back;value.environment_gain=update.environment_gain;value.environment_pole=update.environment_pole;
+            break;
+        }
+    }
+    queue.head.store(head,std::memory_order_release);
+}
 std::uint32_t Audio::create(AudioFormat format,AudioBus bus,std::uint32_t input_bin) {
     if(bus==AudioBus::submix && input_bin==UINT32_MAX) input_bin=31;
     if((bus==AudioBus::none && input_bin!=UINT32_MAX) || (bus!=AudioBus::none && input_bin>=32))
         throw std::runtime_error("Invalid audio input mix bin");
-    validate(format,bus!=AudioBus::none);StreamLock lock(stream_);
+    validate(format,bus!=AudioBus::none);StreamLock lock(stream_);apply_controls();
     for(unsigned i=0;i<voices_.size();++i) if(!voices_[i].used) {
         auto& value=voices_[i];value=Voice{};value.format=format;value.step=format.rate/48000.0;
-        value.used=true;value.bus=bus;value.input_bin=input_bin;value.bin_gains.fill(1);return i+1;
+        value.used=true;value.bus=bus;value.input_bin=input_bin;value.bin_gains.fill(1);publish_status(value);return i+1;
     }
     throw std::runtime_error("Native audio voice capacity exhausted");
 }
 void Audio::release(std::uint32_t id) {
     Voice retired;
-    {StreamLock lock(stream_);retired=std::move(voice(id));voices_[id-1]=Voice{};
+    {StreamLock lock(stream_);apply_controls();retired=std::move(voice(id));voices_[id-1]=Voice{};publish_status(voices_[id-1]);
         for(auto& value:voices_) if(value.route==id) value.route=0;}
 }
 std::uint32_t Audio::frames(AudioFormat format,std::uint32_t bytes) {
@@ -444,7 +503,7 @@ void Audio::data(std::uint32_t id,std::span<const std::byte> bytes) {
     value.byte_count=static_cast<std::uint32_t>(bytes.size());
     value.cursor=0;value.play_start=0;value.play_frames=frames(value.format,value.byte_count);
     value.environment_history={};
-    value.loop_start=0;value.loop_frames=value.play_frames;value.playing=false;
+    value.loop_start=0;value.loop_frames=value.play_frames;value.playing=false;publish_status(value);
 }
 void Audio::bind(std::uint32_t id,std::span<const std::byte> bytes,std::uint32_t source_address) {
     std::vector<std::byte> retired;
@@ -454,10 +513,10 @@ void Audio::bind(std::uint32_t id,std::span<const std::byte> bytes,std::uint32_t
     value.byte_count=static_cast<std::uint32_t>(bytes.size());value.cursor=0;value.play_start=0;
     value.environment_history={};
     value.play_frames=value.byte_count/value.format.block_align*(value.format.tag==0x69?64:1);
-    value.loop_start=0;value.loop_frames=value.play_frames;value.playing=false;
+    value.loop_start=0;value.loop_frames=value.play_frames;value.playing=false;publish_status(value);
 }
 void Audio::format(std::uint32_t id,AudioFormat format) {
-    StreamLock lock(stream_);auto& value=voice(id);validate(format,value.bus!=AudioBus::none);
+    StreamLock lock(stream_);apply_controls();auto& value=voice(id);validate(format,value.bus!=AudioBus::none);
     if(value.format==format) {value.step=format.rate/48000.0;return;}
     if(value.packets && value.packets->count>value.packets->done) throw std::runtime_error("Cannot change the format of queued audio packets");
     const auto bytes=[&](std::uint32_t count){return count/(value.format.tag==0x69?64:1)*value.format.block_align;};
@@ -474,6 +533,7 @@ void Audio::format(std::uint32_t id,AudioFormat format) {
     value.environment_history={};
     value.play_start=play_start;value.play_frames=play_frames;value.loop_start=loop_start;value.loop_frames=loop_frames;
     value.cursor=std::min(cursor,play_frames);
+    publish_position(value);
 }
 std::array<float,2> Audio::sample(Voice& value,std::uint32_t frame) {
     const auto& format=value.format;std::array<float,2> result{};
@@ -505,12 +565,22 @@ void Audio::play(std::uint32_t id,bool loop) {
     if(!value.playing) value.gains_ready=false;
     if(value.bus==AudioBus::none && !value.play_frames) throw std::runtime_error("Cannot play an empty audio buffer");
     if(value.cursor>=value.play_frames) value.cursor=0;
-    value.loop=loop;value.playing=true;value.cached_block=UINT32_MAX;
+    value.loop=loop;value.playing=true;value.cached_block=UINT32_MAX;publish_status(value);
 }
-void Audio::stop(std::uint32_t id){StreamLock lock(stream_);auto& value=voice(id);value.playing=false;value.gains_ready=false;}
-std::uint32_t Audio::status(std::uint32_t id){StreamLock lock(stream_);const auto& value=voice(id);return value.playing?(value.loop?5:1):0;}
+void Audio::stop(std::uint32_t id){StreamLock lock(stream_);auto& value=voice(id);value.playing=false;value.gains_ready=false;publish_status(value);}
+std::uint32_t Audio::status(std::uint32_t id) {
+    if(failed_.load(std::memory_order_acquire)) throw std::runtime_error(failure());
+    if(!id || id>statuses_.size()) throw std::runtime_error("Invalid native audio voice");
+    const auto status=statuses_[id-1].load(std::memory_order_relaxed);
+    if(!(status&8)) throw std::runtime_error("Invalid native audio voice");
+    return status&7;
+}
 AudioPosition Audio::positions(std::uint32_t id) {
-    StreamLock lock(stream_);const auto& value=voice(id);
+    status(id);
+    const auto position=positions_[id-1].load(std::memory_order_relaxed);
+    return {static_cast<std::uint32_t>(position),static_cast<std::uint32_t>(position>>32)};
+}
+AudioPosition Audio::current_position(const Voice& value) {
     const auto frame=static_cast<std::uint32_t>(value.cursor);
     const auto samples=value.format.tag==0x69?64U:1U;
     const auto bytes=[&](std::uint32_t count){return count/samples*value.format.block_align;};
@@ -531,6 +601,7 @@ void Audio::position(std::uint32_t id,std::uint32_t bytes) {
     if(frame>value.play_frames) throw std::runtime_error("Audio position exceeds the play region");
     value.cursor=frame;value.cached_block=UINT32_MAX;
     value.environment_history={};value.gains_ready=false;
+    publish_position(value);
 }
 void Audio::region(std::uint32_t id,bool loop,std::uint32_t start,std::uint32_t bytes) {
     StreamLock lock(stream_);auto& value=voice(id);
@@ -539,14 +610,19 @@ void Audio::region(std::uint32_t id,bool loop,std::uint32_t start,std::uint32_t 
     if(first>total || count>total-first) throw std::runtime_error("Audio region exceeds its buffer");
     if(loop){value.loop_start=first;value.loop_frames=count?count:total-first;}
     else {value.play_start=first;value.play_frames=count?count:total-first;value.cursor=0;value.loop_start=0;value.loop_frames=value.play_frames;}
+    publish_position(value);
 }
 void Audio::volume(std::uint32_t id,std::int32_t db) {
     if(db>0 || db<-10000) throw std::runtime_error("Audio volume is outside -10000..0");
-    StreamLock lock(stream_);voice(id).gain=db==-10000?0:std::pow(10.0f,db/2000.0f);
+    status(id);const auto at=reserve_controls(1);
+    controls_->values[at&ControlQueue::mask]={.id=id,.kind=ControlQueue::volume,.gain=db==-10000?0:std::pow(10.0f,db/2000.0f)};
+    controls_->tail.store(at+1,std::memory_order_release);
 }
 void Audio::headroom(std::uint32_t id,std::uint32_t db) {
     if(db>10000) throw std::runtime_error("Audio headroom is outside 0..10000");
-    StreamLock lock(stream_);voice(id).headroom=std::pow(10.0f,-static_cast<float>(db)/2000.0f);
+    status(id);const auto at=reserve_controls(1);
+    controls_->values[at&ControlQueue::mask]={.id=id,.kind=ControlQueue::headroom,.gain=std::pow(10.0f,-static_cast<float>(db)/2000.0f)};
+    controls_->tail.store(at+1,std::memory_order_release);
 }
 void Audio::mixbin_headroom(std::uint32_t bin,std::uint32_t shift) {
     if(bin>=32 || shift>7) throw std::runtime_error("Invalid audio mix-bin headroom");
@@ -569,15 +645,18 @@ void Audio::mixbins(std::uint32_t id,std::span<const MixBin> bins,bool volumes_o
     }
 }
 void Audio::frequency(std::uint32_t id,std::uint32_t hz) {
-    StreamLock lock(stream_);auto& value=voice(id);
-    if(!hz) hz=value.format.rate;
-    if(hz<100 || hz>200000) throw std::runtime_error("Audio frequency is outside 100..200000");
-    value.step=hz/48000.0;
+    status(id);
+    if(hz && (hz<100 || hz>200000)) throw std::runtime_error("Audio frequency is outside 100..200000");
+    const auto at=reserve_controls(1);
+    controls_->values[at&ControlQueue::mask]={.id=id,.kind=ControlQueue::frequency,.hz=hz};
+    controls_->tail.store(at+1,std::memory_order_release);
 }
 void Audio::pitch(std::uint32_t id,std::int32_t pitch) {
     // Original 22C150/232635: 4096 * log2(frequency / 48000).
     if(pitch<-32767 || pitch>8191) throw std::runtime_error("Audio pitch is outside -32767..8191");
-    StreamLock lock(stream_);voice(id).step=std::exp2(pitch/4096.0);
+    status(id);const auto at=reserve_controls(1);
+    controls_->values[at&ControlQueue::mask]={.id=id,.kind=ControlQueue::pitch,.pitch=std::exp2(pitch/4096.0)};
+    controls_->tail.store(at+1,std::memory_order_release);
 }
 void Audio::route(std::uint32_t id,std::uint32_t destination) {
     StreamLock lock(stream_);auto& value=voice(id);
@@ -588,15 +667,27 @@ void Audio::route(std::uint32_t id,std::uint32_t destination) {
     value.gains_ready=false;
 }
 void Audio::spatial(std::uint32_t id,const SpatialResult& adjustment) {
+    spatial(std::span(&id,1),std::span(&adjustment,1));
+}
+void Audio::spatial(std::span<const std::uint32_t> ids,std::span<const SpatialResult> adjustments) {
+    if(ids.size()!=adjustments.size() || ids.size()>voices_.size()) throw std::runtime_error("Invalid spatial audio update count");
+    if(ids.empty()) return;
     const auto unit=[](float value){return !std::isfinite(value) || value<0 || value>1;};
+    for(const auto& adjustment:adjustments)
     if(unit(adjustment.gain) || !std::isfinite(adjustment.pitch) || adjustment.pitch<=0 ||
         std::ranges::any_of(adjustment.pan,unit) || std::ranges::any_of(adjustment.front_back,unit) ||
         std::ranges::any_of(adjustment.environment_pole,[](float value){return !std::isfinite(value) || value<0 || value>=1;}) ||
         std::ranges::any_of(adjustment.environment_gain,[](float value){return !std::isfinite(value) || value<0 || value>std::sqrt(10.0f);}))
         throw std::runtime_error("Invalid native 3D audio adjustment");
-    StreamLock lock(stream_);auto& value=voice(id);
-    value.spatial_gain=adjustment.gain;value.spatial_pan=adjustment.pan;value.spatial_pitch=adjustment.pitch;
-    value.front_back=adjustment.front_back;value.environment_gain=adjustment.environment_gain;value.environment_pole=adjustment.environment_pole;
+    for(const auto id:ids) status(id);
+    const auto at=reserve_controls(static_cast<unsigned>(ids.size()));
+    for(unsigned i=0;i<ids.size();++i) {
+        const auto& adjustment=adjustments[i];
+        controls_->values[(at+i)&ControlQueue::mask]={.id=ids[i],.kind=ControlQueue::spatial,.pitch=adjustment.pitch,
+            .gain=adjustment.gain,.pan=adjustment.pan,.front_back=adjustment.front_back,
+            .environment_gain=adjustment.environment_gain,.environment_pole=adjustment.environment_pole};
+    }
+    controls_->tail.store(at+static_cast<unsigned>(ids.size()),std::memory_order_release);
 }
 void Audio::packets(std::uint32_t id,unsigned capacity) {
     if(!capacity || capacity>256) throw std::runtime_error("Audio packet capacity is outside 1..256");
@@ -615,7 +706,7 @@ bool Audio::packet(std::uint32_t id,std::span<const std::byte> data,std::uint32_
         value.play_start=0;value.cursor=0;value.cached_block=UINT32_MAX;
     }
     packets.started=true;packets.discontinuous=false;
-    value.playing=!packets.paused && !packets.envelope_complete;return true;
+    value.playing=!packets.paused && !packets.envelope_complete;publish_status(value);return true;
 }
 unsigned Audio::completed(std::uint32_t id,std::span<AudioCompletion> output) {
     StreamLock lock(stream_);auto& packets=*voice(id).packets;
@@ -639,6 +730,7 @@ void Audio::pause(std::uint32_t id,unsigned mode) {
     if(mode!=0 && mode!=1 && mode!=3) throw std::runtime_error("Unsupported audio stream pause mode");
     packets.paused=mode==1 || (mode==3 && !packets.started);
     value.playing=!packets.paused && !packets.envelope_complete && packets.count>packets.done;
+    publish_status(value);
 }
 void Audio::flush(std::uint32_t id,unsigned flags) {
     if(flags&~7U) throw std::runtime_error("Unsupported audio stream flush flags");
@@ -657,6 +749,7 @@ void Audio::flush(std::uint32_t id,unsigned flags) {
     }
     packets.done=packets.count;packets.started=false;packets.discontinuous=false;packets.paused=false;
     value.playing=false;value.source={};value.cursor=0;value.play_frames=0;value.byte_count=0;value.cached_block=UINT32_MAX;
+    publish_status(value);
 }
 void Audio::discontinuity(std::uint32_t id) {
     StreamLock lock(stream_);voice(id).packets->discontinuous=true;
@@ -665,7 +758,7 @@ bool Audio::next_packet(Voice& value) {
     auto& packets=*value.packets;
     while(value.cursor>=value.play_frames) {
         value.cursor-=value.play_frames;++packets.done;value.cached_block=UINT32_MAX;
-        if(packets.done==packets.count) {value.source={};value.byte_count=0;value.play_frames=0;value.cursor=0;value.playing=false;return false;}
+        if(packets.done==packets.count) {value.source={};value.byte_count=0;value.play_frames=0;value.cursor=0;value.playing=false;publish_status(value);return false;}
         value.source=packets.slots[(packets.head+packets.done)%packets.slots.size()].data;
         value.byte_count=static_cast<std::uint32_t>(value.source.size());value.play_frames=frames(value.format,value.byte_count);
     }
@@ -745,7 +838,7 @@ void Audio::mix_bins(std::span<float> output,unsigned frame_count) {
         for(;count<frame_count;++count) {
             if(value.packets && !next_packet(value)) break;
             if(value.cursor>=value.play_frames) {
-                if(!value.loop || !value.loop_frames){value.playing=false;break;}
+                if(!value.loop || !value.loop_frames){value.playing=false;publish_status(value);break;}
                 value.cursor=value.loop_start+std::fmod(value.cursor-value.loop_start,static_cast<double>(value.loop_frames));
                 value.cached_block=UINT32_MAX;
             }
@@ -771,13 +864,14 @@ void Audio::mix_bins(std::span<float> output,unsigned frame_count) {
         }
         mix_voice(value,std::span(samples).first(count),output,frame_count);
         if(value.packets) {if(value.playing) next_packet(value);}
-        else if(!value.loop && value.cursor>=value.play_frames){value.cursor=value.play_frames;value.playing=false;}
+        else if(!value.loop && value.cursor>=value.play_frames){value.cursor=value.play_frames;value.playing=false;publish_status(value);}
+        publish_position(value);
     }
     for(unsigned id=0;id<voices_.size();++id) {
         auto& value=voices_[id];
         if(!value.used || (value.bus!=AudioBus::effects && value.bus!=AudioBus::effects_manual)) continue;
         const bool returning=value.playing || (value.bus==AudioBus::effects && active[id]);
-        if(value.bus==AudioBus::effects) value.playing=active[id];
+        if(value.bus==AudioBus::effects) {value.playing=active[id];publish_status(value);}
         if(!returning) continue;
         if(!effects_) throw std::runtime_error("Post-effects audio requires a compiled audio image");
         // The SDK's FXIN source is a 32-sample loop over its DSP output bin.
@@ -894,8 +988,9 @@ std::uint32_t Audio::effect_program(std::uint32_t offset,unsigned size) {
         throw std::runtime_error("Invalid compiled DSP program read");
     std::uint32_t value=0;std::memcpy(&value,effects_->program.data()+offset,size);return value;
 }
-std::string Audio::failure(){StreamLock lock(stream_);return failed_?failure_.data():std::string{};}
+std::string Audio::failure(){if(!failed_.load(std::memory_order_acquire)) return {};StreamLock lock(stream_);return failure_.data();}
 void Audio::mix_unlocked(std::span<float> output) {
+    apply_controls();
     const auto started=performance_enabled_.load(std::memory_order_relaxed) && !output.empty()?performance_clock():0;
     const auto measured=[&] {
         if(!started) return;const auto elapsed=performance_clock()-started;
@@ -1007,6 +1102,24 @@ std::string check_audio(const std::filesystem::path& effects_path,const std::fil
     distance.position(emitter,0);distance.spatial(emitter,{.pan={0,1}});distance.mix(mixed);require(mixed[0]==0 && mixed[1]==0.25f);
     distance.position(emitter,0);distance.spatial(emitter,{.pitch=0.5});distance.mix(mixed);require(mixed[0]==0.25f && mixed[2]==0);
     rejected=false;try{distance.spatial(emitter,{.gain=-1});}catch(const std::exception&){rejected=true;}require(rejected);
+    auto spatial_group=std::make_unique<Audio>(false);
+    const std::array spatial_ids{spatial_group->create(pcm),spatial_group->create(pcm)};
+    for(const auto id:spatial_ids) {spatial_group->data(id,bytes);spatial_group->play(id,false);}
+    std::array<SpatialResult,2> adjustments{{{.pan={1,0}},{.pan={0,1}}}};
+    spatial_group->spatial(spatial_ids,adjustments);spatial_group->mix(mixed);
+    require(mixed[0]==0.25f && mixed[1]==0.25f && !spatial_group->status(spatial_ids[0]) && !spatial_group->status(spatial_ids[1]));
+    adjustments[0].gain=0;const std::array invalid_ids{spatial_ids[0],0U};
+    rejected=false;try{spatial_group->spatial(invalid_ids,adjustments);}catch(const std::exception&){rejected=true;}
+    require(rejected && spatial_group->voices_[spatial_ids[0]-1].spatial_gain==1);
+    // Overflow, wrapping and lifecycle changes retain control ordering.
+    for(unsigned i=0;i<Audio::ControlQueue::capacity+32;++i) spatial_group->frequency(spatial_ids[0],i&1?48000:24000);
+    spatial_group->frequency(spatial_ids[0],24000);spatial_group->position(spatial_ids[0],0);spatial_group->play(spatial_ids[0],true);
+    spatial_group->mix(std::span(mixed).first(4));require(spatial_group->position(spatial_ids[0])==2);
+    spatial_group->frequency(spatial_ids[0],24000);spatial_group->format(spatial_ids[0],pcm);spatial_group->position(spatial_ids[0],0);
+    spatial_group->mix(std::span(mixed).first(4));require(spatial_group->position(spatial_ids[0])==4);
+    spatial_group->frequency(spatial_ids[0],24000);spatial_group->release(spatial_ids[0]);
+    const auto reused=spatial_group->create(pcm);spatial_group->data(reused,bytes);spatial_group->play(reused,true);
+    spatial_group->mix(std::span(mixed).first(4));require(reused==spatial_ids[0] && spatial_group->position(reused)==4);
     distance.position(emitter,0);distance.spatial(emitter,{.environment_gain={0.5f,0},.environment_pole={0.5f,0}});
     const std::array<MixBin,1> center_only{{{2,0}}};distance.mixbins(emitter,center_only);distance.mix(mixed);
     require(std::abs(mixed[0]-0.25f*0.5f*0.5f*0.70710678f)<0.000001f && mixed[0]==mixed[1]);

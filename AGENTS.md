@@ -3,9 +3,15 @@
 Build a small, fast Windows x64 static recompilation of the original Xbox game.
 Read DESIGN.txt and BUILDING.txt for design, commands and coverage.
 
-- Performance comes first. Target sustained 60 FPS at native resolution; measure
+- Performance comes first. Target sustained 240 FPS or higher at native resolution
+  with frame interpolation disabled; measure
   frame times, spikes, loading and memory on named hardware in menu/race/crash
   scenes. Component benchmarks do not establish game FPS.
+- Benchmark Airport Terminal 3 at 240 Hz, 1x native resolution, widescreen,
+  frame interpolation off and V-sync off. Use game automation for benchmarks;
+  every benchmark must last no longer than 30 seconds. F9 starts/stops the
+  performance diagnostic. Use computer use only when necessary, even when
+  permission has been granted.
 - Use C++23/CMake, with C/HLSL where useful. Require no Python in any workflow.
 - Compile game code ahead of time. Decode only in build tools; use native
   functions, direct calls and verified indirect tables. No JIT/interpreter fallback

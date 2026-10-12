@@ -3,14 +3,17 @@
   "configurePresets": [
     {
       "name": "windows",
-      "generator": "Visual Studio 18 2026",
-      "architecture": "x64",
-      "environment": { "MSBUILDDISABLENODEREUSE": "1" },
-      "binaryDir": "${sourceDir}/build/windows"
+      "generator": "Ninja Multi-Config",
+      "binaryDir": "${sourceDir}/build/windows",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang-cl",
+        "CMAKE_CXX_COMPILER": "clang-cl",
+        "CMAKE_LINKER_TYPE": "LLD"
+      }
     }
   ],
   "buildPresets": [
-    { "name": "release", "configurePreset": "windows", "configuration": "Release", "jobs": 2, "nativeToolOptions": ["/nodeReuse:false"] },
-    { "name": "debug", "configurePreset": "windows", "configuration": "Debug", "jobs": 2, "nativeToolOptions": ["/nodeReuse:false"] }
+    { "name": "release", "configurePreset": "windows", "configuration": "Release", "jobs": 6 },
+    { "name": "debug", "configurePreset": "windows", "configuration": "Debug", "jobs": 6 }
   ]
 }

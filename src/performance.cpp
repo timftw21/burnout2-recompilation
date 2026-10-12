@@ -63,7 +63,8 @@ double milliseconds(std::uint64_t ns) {return ns/1000000.0;}
 std::string summary(const Data& data) {
     const auto& h=data.header;std::vector<double> intervals,work,gpu;
     std::array<std::uint64_t,phase_names.size()> phases{};PerfCounters counters{};
-    unsigned spikes=0,diagnostic_frames=0,gpu_complete=0,gpu_partial=0;
+    const auto frame_budget=1000.0/(h.interpolation?60U:std::max(h.refresh,1U));
+    unsigned spikes=0,over_budget=0,diagnostic_frames=0,gpu_complete=0,gpu_partial=0;
     for(const auto& frame:std::span(data.frames).first(h.frames)) {
         if(frame.gpu_status==1) ++gpu_complete;
         else if(frame.gpu_status==2) ++gpu_partial;
@@ -72,6 +73,7 @@ std::string summary(const Data& data) {
         if(frame.partial) continue;
         if(frame.phases[unsigned(PerfPhase::capture)]) {++diagnostic_frames;continue;}
         intervals.push_back(milliseconds(frame.interval));
+        over_budget+=milliseconds(frame.interval)>frame_budget;
         const auto idle=frame.phases[unsigned(PerfPhase::pacing)]+frame.phases[unsigned(PerfPhase::scheduler)]+frame.phases[unsigned(PerfPhase::diagnostics)];
         work.push_back(milliseconds(frame.interval>idle?frame.interval-idle:0));
         spikes+=frame.interval>20000000;
@@ -83,8 +85,8 @@ std::string summary(const Data& data) {
         return std::format("{{\"samples\":{},\"median_ms\":{:.6f},\"p95_ms\":{:.6f},\"p99_ms\":{:.6f},\"max_ms\":{:.6f}}}",values.size(),percentile(.5),percentile(.95),percentile(.99),percentile(1));
     };
     std::ostringstream out;
-    out<<std::format("{{\"format\":\"b2-performance-summary-v1\",\"cpu\":{},\"gpu\":{},\"build\":{},\"logical_processors\":{},\"refresh_rate\":{},\"resolution_scale\":{},\"interpolation\":{},\"vsync\":{},\"duration_ms\":{:.3f},\"recorder_bytes\":{},\"source_intervals\":{},\"work_wall_time\":{},\"measured_gpu_spans\":{},\"frames_over_20_ms\":{},\"diagnostic_frames_excluded\":{},\"gpu_complete_frames\":{},\"gpu_partial_frames\":{},\"gpu_pending_frames\":{},\"limits\":{{\"frames_dropped\":{},\"samples_dropped\":{},\"costs_dropped\":{},\"resources_dropped\":{}}},\"phases\":[",
-        json(h.cpu.data()),json(h.gpu.data()),json(h.build.data()),h.processors,h.refresh,h.scale,bool(h.interpolation),bool(h.vsync),milliseconds(h.duration),h.recorder_bytes,distribution(intervals),distribution(work),distribution(gpu),spikes,diagnostic_frames,gpu_complete,gpu_partial,h.frames-gpu_complete-gpu_partial,h.frames_dropped,h.samples_dropped,h.costs_dropped,h.resources_dropped);
+    out<<std::format("{{\"format\":\"b2-performance-summary-v1\",\"cpu\":{},\"gpu\":{},\"build\":{},\"logical_processors\":{},\"refresh_rate\":{},\"resolution_scale\":{},\"interpolation\":{},\"vsync\":{},\"duration_ms\":{:.3f},\"recorder_bytes\":{},\"source_intervals\":{},\"work_wall_time\":{},\"measured_gpu_spans\":{},\"source_frame_budget_ms\":{:.6f},\"frames_over_budget\":{},\"frames_over_20_ms\":{},\"diagnostic_frames_excluded\":{},\"gpu_complete_frames\":{},\"gpu_partial_frames\":{},\"gpu_pending_frames\":{},\"limits\":{{\"frames_dropped\":{},\"samples_dropped\":{},\"costs_dropped\":{},\"resources_dropped\":{}}},\"phases\":[",
+        json(h.cpu.data()),json(h.gpu.data()),json(h.build.data()),h.processors,h.refresh,h.scale,bool(h.interpolation),bool(h.vsync),milliseconds(h.duration),h.recorder_bytes,distribution(intervals),distribution(work),distribution(gpu),frame_budget,over_budget,spikes,diagnostic_frames,gpu_complete,gpu_partial,h.frames-gpu_complete-gpu_partial,h.frames_dropped,h.samples_dropped,h.costs_dropped,h.resources_dropped);
     for(unsigned i=0;i<phases.size();++i) {if(i) out<<',';out<<std::format("{{\"name\":{},\"wall_ms\":{:.6f}}}",json(phase_names[i]),milliseconds(phases[i]));}
     out<<"],\"counters\":{";
     for(unsigned i=0;i<counters.size();++i) {if(i) out<<',';out<<json(metric_names[i])<<':'<<counters[i];}
@@ -128,17 +130,18 @@ void reports(const Data& data,const std::filesystem::path& directory) {
     std::ofstream text(directory/"performance.txt"),file(directory/"performance.json");
     if(!text || !file) throw std::runtime_error("Cannot create performance reports");
     const auto& h=data.header;
+    const auto frame_budget=1000.0/(h.interpolation?60U:std::max(h.refresh,1U));
     text<<"Burnout 2 performance capture\n"<<h.cpu.data()<<" / "<<h.gpu.data()<<"\n"<<h.refresh<<" Hz, "<<h.scale<<"x resolution, interpolation "<<(h.interpolation?"on":"off")<<", VSync "<<(h.vsync?"on":"off")<<"\n"
         <<h.frames<<" game-frame records, "<<h.samples<<" guest checkpoint samples, "<<milliseconds(h.duration)/1000<<" seconds\n"
         <<"Recorder storage: "<<h.recorder_bytes<<" bytes. Diagnostics are opt-in.\n"
         <<"See performance.json for frame percentiles, resource trends, hot operations and original code addresses.\n"
         <<"Work time excludes intentional frame pacing and scheduler idle. Present can include display/driver waits.\n"
-        <<"GPU timings sum measured command spans, excluding idle gaps and the settings overlay. Check coverage before comparing to 16.67 ms.\n"
+        <<"GPU timings sum measured command spans, excluding idle gaps and the settings overlay. Check coverage before comparing to the frame budget.\n"
         <<"Checkpoint sampling is cooperative; it does not measure exact function costs. Kernel IDs are ordinals, platform IDs are original addresses, draw IDs are prepared shader handles.\n\n";
     std::vector<double> intervals;
     for(const auto& frame:std::span(data.frames).first(h.frames)) if(!frame.partial && !frame.phases[unsigned(PerfPhase::capture)]) intervals.push_back(milliseconds(frame.interval));
     std::ranges::sort(intervals);
-    if(!intervals.empty()) text<<std::format("Game frames: median {:.3f} ms; 99th percentile {:.3f} ms; slowest {:.3f} ms. Target: 16.67 ms.\n",intervals[(intervals.size()-1)/2],intervals[std::min(intervals.size()-1,std::size_t(std::ceil(.99*intervals.size()))-1)],intervals.back());
+    if(!intervals.empty()) text<<std::format("Game frames: median {:.3f} ms; 99th percentile {:.3f} ms; slowest {:.3f} ms. Target: {:.3f} ms.\n",intervals[(intervals.size()-1)/2],intervals[std::min(intervals.size()-1,std::size_t(std::ceil(.99*intervals.size()))-1)],intervals.back(),frame_budget);
     std::uint64_t peak_working=0,peak_private=0;
     for(const auto& r:std::span(data.resources).first(h.resources)) {peak_working=std::max(peak_working,r.working_set);peak_private=std::max(peak_private,r.private_bytes);}
     text<<std::format("Peak process RAM: {:.1f} MiB working set, {:.1f} MiB private memory.\n\n",peak_working/1048576.0,peak_private/1048576.0);
@@ -187,9 +190,17 @@ struct Performance::State {
     }
 };
 std::uint64_t performance_clock() noexcept {
-    static const auto frequency=[] {LARGE_INTEGER value{};QueryPerformanceFrequency(&value);return std::uint64_t(value.QuadPart);}();
+    static const auto conversion=[] {
+        LARGE_INTEGER value{};QueryPerformanceFrequency(&value);
+        const auto frequency=std::uint64_t(value.QuadPart);
+        return std::array{frequency,1000000000ULL%frequency?0ULL:1000000000ULL/frequency};
+    }();
     LARGE_INTEGER value{};QueryPerformanceCounter(&value);
-    const auto ticks=std::uint64_t(value.QuadPart);return (ticks/frequency)*1000000000ULL+(ticks%frequency)*1000000000ULL/frequency;
+    const auto ticks=std::uint64_t(value.QuadPart);
+    // Windows' 10 MHz counter converts exactly with one multiplication. Keep
+    // the general integer conversion for counters that do not divide a second.
+    if(conversion[1]) return ticks*conversion[1];
+    return (ticks/conversion[0])*1000000000ULL+(ticks%conversion[0])*1000000000ULL/conversion[0];
 }
 Performance::Performance()=default;
 Performance::~Performance()=default;

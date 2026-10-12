@@ -488,24 +488,41 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
         red_pixel(image);if(relocated_handle!=gpu_program) throw std::runtime_error("Relocation changed the compiled program");
     },{},{},[&]{renderer.draw_program(colored(),relocated_handle,context,view,program_vertices);});
     ProgramVertex current{};for(auto& attribute:current.attributes) attribute={0,0,0,1};
-    // Queue enough small draws to wrap both upload buffers without a readback
-    // between them. Distinct positions/current colours expose overwritten data.
+    // Wrap vertex, index and constant buffers without an intervening readback.
+    // Distinct positions and colours expose overwritten queued draw data.
     if(total++) report+=',';
     std::string upload_error;double upload_submit_ms=0,upload_complete_ms=0;PerfCounters upload_counters{};
     const auto upload_image=directory/"stream-upload-order.png";
     try {
-        Renderer native(8,8,warp,debug);const auto program=native.prepare_program(vertex_program);
-        VertexLayout attributes{};attributes[0]={0,0,0x42};const auto layout=native.prepare_layout(program,attributes);
-        auto state=colored();native.prepare(state);
+        Renderer native(8,8,warp,debug);
+        auto queued_program=vertex_program;queued_program.tokens[1]=token(1,0,0,96,3,false,true,3);
+        const auto program=native.prepare_program(queued_program);
+        VertexLayout attributes{};attributes[0]={0,0,0x42};
+        const std::array layouts{native.prepare_layout(program,attributes),native.prepare_layout(native.prepare_program(vertex_program),attributes)};
+        auto queued_current=current;queued_current.attributes[3]={0,0,1,1};
+        std::array<RenderState,2> states{factors,factors};
+        for(auto& state:states) {state.color_inputs[0]=0x01040000;state.alpha_inputs[0]=0x11140000;native.prepare(state);}
+        states[0].factor0[0]=0xFFFF0000;states[1].factor0[0]=0xFFFFFFFF;
+        std::array<VertexConstants,2> uniforms{context,context};
+        uniforms[0][96]={1,1,1,1};uniforms[1][96]={0,0,1,1};
+        const std::array<std::array<Float4,4>,2> positions{{
+            {{{0,0,0.5f,1},{4,0,0.5f,1},{4,8,0.5f,1},{0,8,0.5f,1}}},
+            {{{4,0,0.5f,1},{8,0,0.5f,1},{8,8,0.5f,1},{4,8,0.5f,1}}}}};
+        const std::array<std::array<VertexStream,1>,2> streams{{
+            {{{std::as_bytes(std::span(positions[0])),sizeof(Float4)}}},
+            {{{std::as_bytes(std::span(positions[1])),sizeof(Float4)}}}}};
+        std::array<Renderer::StreamDraw,32> group{};
         Performance profile;profile.start(native.adapter(),60,1,false,false,{});native.performance(&profile);
         native.begin();const auto started=std::chrono::steady_clock::now();
         constexpr unsigned count=32770;
-        for(unsigned i=0;i<count;++i) {
-            const float x=i&1?4.0f:0.0f;
-            const std::array<Float4,4> positions{{{x,0,0.5f,1},{x+4,0,0.5f,1},{x+4,8,0.5f,1},{x,8,0.5f,1}}};
-            const std::array<VertexStream,1> streams{{{std::as_bytes(std::span(positions)),sizeof(Float4)}}};
-            auto values=current;values.attributes[3]=i&1?Float4{0,0,1,1}:Float4{1,0,0,1};
-            native.draw_streams(state,layout,context,view,streams,values,4);
+        for(unsigned first=0;first<count;first+=static_cast<unsigned>(group.size())) {
+            const auto size=std::min<unsigned>(static_cast<unsigned>(group.size()),count-first);
+            for(unsigned i=0;i<size;++i) {
+                const auto which=(first+i)&1;
+                const auto layout=layouts[((first+i)&2)?which:0];
+                group[i]={&states[which],&uniforms[which],&view,streams[which],&queued_current,{},nullptr,layout,4};
+            }
+            native.draw_streams(std::span(group).first(size));
         }
         native.end();upload_submit_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
         const auto image=native.readback();upload_complete_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
@@ -698,7 +715,7 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
     paired.tokens[1]=token(1,0,0,0,100,true,true,1); paired.tokens[1][2]|=1U<<28;
     launch_check("vertex-paired-register-ownership",paired,{0.5f,1,2,3});
 
-    const auto gpu_check=[&](std::string_view name,bool indexed,bool shifted,bool programmable,bool inlined=false,bool skinned=false,bool generated_texture=false,bool surface_clip=false,
+    const auto gpu_check=[&](std::string_view name,unsigned indexed,bool shifted,bool programmable,bool inlined=false,bool skinned=false,bool generated_texture=false,bool surface_clip=false,
                          bool target_sample=false,bool rgb565=false,bool unfinished=false,bool linear_sample=false,
                          TextureFormat feedback_format=TextureFormat::argb8_linear,bool layout_alias=false,bool upload_context=false,unsigned semaphore_burst=0) {
         if(total++) report+=',';
@@ -750,11 +767,16 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
                 auto uploaded=vertex_program;if(upload_context) uploaded.tokens[1]=token(1,0,0,96,3,false,true,3);
                 words.push_back(0xB00|(8U<<18));
                 for(unsigned instruction=0;instruction<2;++instruction) words.insert(words.end(),uploaded.tokens[instruction].begin(),uploaded.tokens[instruction].end());
+                packet(0x1E9C,{0});
+                packet(0xB04,{uploaded.tokens[0][1],uploaded.tokens[0][2],uploaded.tokens[0][3]});
+                packet(0xB00,{uploaded.tokens[1][0],uploaded.tokens[1][1],uploaded.tokens[1][2],uploaded.tokens[1][3]});
                 packet(0x1EA0,{0});
                 if(upload_context) {
                     packet(0x1EA4,{94});
                     packet(0xB80,{0,0,0x3F800000,0x3F800000,0,0x3F800000,0,0x3F800000,
                         0x3F800000,0x3F800000,0,0x3F800000,0x3F800000,0x3F800000,0x3F800000,0x3F800000});
+                    packet(0x1EA4,{94});packet(0xB84,{0,0x3F800000,0x3F800000,0,0x3F800000,0,0x3F800000});
+                    packet(0xB80,{0x3F800000,0x3F800000,0,0x3F800000});
                     // A partial upload must preserve its lane and load index.
                     packet(0x1EA4,{96});packet(0xB84,{0});
                 }
@@ -764,7 +786,8 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
                 const auto data=std::span(positions).subspan(1);
                 words.push_back(0x40001818|(16U<<18));
                 for(const auto& position:data) for(const auto component:position) words.push_back(std::bit_cast<std::uint32_t>(component));
-            } else if(indexed) packet(0x1800,{0x00010000,0x00030002},true);
+            } else if(indexed==32) packet(0x1808,{0,1,2,3},true);
+            else if(indexed) packet(0x1800,{0x00010000,0x00030002},true);
             else packet(0x1810,{0x03000000|first});
             packet(0x17FC,{0});
             packet(0x110,{0});
@@ -857,7 +880,8 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
     };
     gpu_check("gpu-packets-array-quad",false,false,false);
     gpu_check("gpu-capture-last-presented-frame",false,false,false,false,false,false,false,false,false,true);
-    gpu_check("gpu-packets-element16-quad",true,false,false);
+    gpu_check("gpu-packets-element16-quad",16,false,false);
+    gpu_check("gpu-packets-element32-quad",32,false,false);
     gpu_check("gpu-packets-first-vertex",false,true,false);
     gpu_check("gpu-packets-skin-matrix-aliases",false,false,false,false,true);
     gpu_check("gpu-packets-texgen-matrix-aliases",false,false,false,false,false,true);
@@ -1004,12 +1028,106 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
         sample_face(5);packet(0x200,{64U<<16,64U<<16});packet(0x12C,{0});submit();
         const auto updated=native.readback();save_png(updated,cubemap_image);
         expect(updated,55,32,{255,255,255,255});expect(updated,5,32,{255,0,0,255});
+        gpu.invalidate_memory(0x8002A000,8192);
+        if(native.resources().textures!=6) throw std::runtime_error("Released cubemap face retained its snapshot or surface");
+        packet(0x200,{64U<<16,64U<<16,0x06060213,0x00800080,0x2A000,0});
+        packet(0x1D90,{0xFFFF00FF});packet(0x1D94,{0xF0});
+        packet(0x200,{64U<<16,64U<<16,0x128,0x01000100,0x40000,0x50000});
+        sample_face(5);packet(0x200,{64U<<16,64U<<16});packet(0x12C,{0});submit();
+        expect(native.readback(),55,32,{255,0,255,255});
         if(!native.errors().empty()) throw std::runtime_error("Cubemap feedback produced D3D11 validation messages");
         ++passed;
     } catch(const std::exception& failure) {cubemap_error=failure.what();}
     report+=std::format("{{\"name\":\"gpu-packets-reflection-cubemap\",\"passed\":{},\"error\":{},\"image\":{}}}",
         cubemap_error.empty(),json(cubemap_error),json(utf8(cubemap_image.wstring())));
 
+    for(const bool recycling:{false,true}) {
+        if(total++) report+=',';
+        const auto name=recycling?"graphics-resource-recycling-5000":"gpu-storage-reuse";
+        const auto image_path=directory/(std::string(name)+".png");
+        std::string error;
+        try {
+            Renderer native(64,64,warp,debug);
+            const auto baseline=native.resources();
+            if(recycling) {
+                const auto pixels=solid(4,4,0xFF00FF00);
+                const auto retained=native.upload({4,4,TextureFormat::argb8,pixels});
+                for(unsigned cycle=0;cycle<5000;++cycle) {
+                    const auto texture=native.upload({4,4,TextureFormat::argb8,pixels});
+                    const auto target=native.create_target(4,4,SurfaceColor::rgb565,SurfaceDepth::z16);
+                    native.set_target(target);native.clear(0xFFFF0000);
+                    const std::array<std::uint32_t,6> faces{target,target,target,target,target,target};
+                    const auto cube=native.copy_cubemap(faces);
+                    native.release(cube);native.release(target);native.release(texture);
+                    const auto resources=native.resources();
+                    if(resources.textures!=1 || resources.targets!=baseline.targets ||
+                       resources.texture_bytes!=pixels.size() || resources.target_bytes!=baseline.target_bytes)
+                        throw std::runtime_error("Freed resources retained their views or memory budget");
+                }
+                const auto state=textured(retained);native.prepare(state);native.begin();native.draw(state,white);native.end();
+                const auto image=native.readback();expect(image,32,32,{0,255,0,255});save_png(image,image_path);
+                native.release(retained);
+            } else {
+                std::vector<std::byte> ram(512*1024);Memory memory(0,ram);Gpu gpu(native,memory,60000);
+                std::vector<std::uint32_t> words;
+                const auto packet=[&](std::uint32_t method,std::initializer_list<std::uint32_t> values) {
+                    words.push_back(method|(static_cast<std::uint32_t>(values.size())<<18));words.insert(words.end(),values);
+                };
+                const auto submit=[&] {
+                    const auto bytes=std::as_bytes(std::span(words));std::memcpy(memory.access(0,bytes.size()),bytes.data(),bytes.size());
+                    gpu.submit(0,static_cast<std::uint32_t>(bytes.size()));words.clear();
+                };
+                const auto paint=[&] {packet(0x17FC,{8});packet(0x1810,{0x03000000});packet(0x17FC,{0});};
+                const auto fill=[&](std::uint32_t address,std::uint32_t argb) {
+                    const auto pixels=solid(4,4,argb);std::memcpy(memory.access(address,pixels.size()),pixels.data(),pixels.size());
+                };
+                packet(0,{0xD});packet(0x200,{64U<<16,64U<<16,0x128,0x01000100,0x20000,0x30000});
+                packet(0x1D98,{63U<<16,63U<<16});packet(0x1D8C,{0xFFFFFF00,0xFF000000});packet(0x1D94,{0xF3});
+                packet(0x33C,{0x207,0,1,0});packet(0x350,{0x8006,0x203,0x01010101,0,255,0x207,0,255,0x1E00,0x1E00,0x1E00});
+                packet(0x288,{8,0x1800});packet(0x1E70,{1});
+                for(unsigned stage=0;stage<4;++stage) packet(0x1B08+stage*0x40,{0x030303});
+                packet(0x1B00,{0x8000,0x02210620,0x030303,0x40000000});packet(0x1B14,{0x01010000});
+                packet(0xAF0,{0x3F800000,0x3F800000,0x3F800000,0});packet(0xA20,{0x42000000,0x42000000,0,0});
+                packet(0x680,{0x42000000,0,0,0,0,0xC2000000,0,0,0,0,0x3F800000,0,0,0,0,0x3F800000});
+                constexpr std::array<Float4,4> positions{{{-1,1,0.25f,1},{1,1,0.25f,1},{1,-1,0.25f,1},{-1,-1,0.25f,1}}};
+                constexpr std::array<Float4,4> coordinates{{{0,0,0,1},{1,0,0,1},{1,1,0,1},{0,1,0,1}}};
+                std::memcpy(memory.access(4096,sizeof(positions)),positions.data(),sizeof(positions));
+                std::memcpy(memory.access(8192,sizeof(coordinates)),coordinates.data(),sizeof(coordinates));
+                packet(0x1720,{4096});packet(0x1760,{0x1042});packet(0x1744,{8192});packet(0x1784,{0x1042});
+                fill(0x8000,0xFFFF0000);fill(0x9000,0xFF0000FF);
+                // Keep an unrelated texture alive while replacing a subrange of
+                // the first allocation through its high-address alias.
+                packet(0x200,{(16U<<16)|48U,64U<<16});packet(0x1B00,{0x9000});paint();
+                packet(0x200,{32U<<16,64U<<16});packet(0x1B00,{0x8000});paint();
+                packet(0x1B10,{0x77770000});packet(0x1B1C,{0x12345678});packet(0x1B20,{0x76543210});paint();submit();
+                if(native.resources().textures!=3) throw std::runtime_error("Unused texture registers created duplicate cache entries");
+                gpu.invalidate_memory(0xF0008010,4);fill(0x8000,0xFF00FF00);
+                if(gpu.stats().draws!=3 || native.resources().textures!=2) throw std::runtime_error("Storage release dropped draws or unrelated resources");
+                packet(0x200,{(16U<<16)|32U,64U<<16});paint();
+                packet(0x200,{64U<<16,64U<<16});packet(0x12C,{0});submit();gpu.wait();
+                const auto image=native.readback();expect(image,8,32,{255,0,0,255});expect(image,40,32,{0,255,0,255});expect(image,56,32,{0,0,255,255});
+                save_png(image,image_path);
+                // A former GPU surface at this address must no longer override
+                // an ordinary texture loaded into the recycled guest allocation.
+                packet(0x200,{4U<<16,4U<<16,0x02020228,0x00100010,0xA000,0});
+                packet(0x1D98,{3U<<16,3U<<16});packet(0x1D90,{0xFFFF0000});packet(0x1D94,{0xF0});submit();
+                gpu.invalidate_memory(0x8000A000,64);fill(0xA000,0xFF0000FF);
+                packet(0x200,{64U<<16,64U<<16,0x128,0x01000100,0x20000,0x30000});packet(0x1B00,{0xA000});paint();
+                packet(0x12C,{0});submit();gpu.wait();expect(native.readback(),32,32,{0,0,255,255});
+                // Releasing only a depth allocation also retires its stale
+                // composite surface, including when it is the active target.
+                gpu.invalidate_memory(0x80030080,4);
+                if(native.resources().targets!=1) throw std::runtime_error("Released depth storage retained its cached surface");
+                gpu.invalidate_memory(0x8000,0x3000);
+            }
+            const auto resources=native.resources();
+            if(resources.textures || resources.targets!=baseline.targets || resources.texture_bytes || resources.target_bytes!=baseline.target_bytes)
+                throw std::runtime_error("Graphics storage did not return to its initial resource budget");
+            if(!native.errors().empty()) throw std::runtime_error("Resource recycling produced D3D11 validation messages");
+            ++passed;
+        } catch(const std::exception& failure) {error=failure.what();}
+        report+=std::format("{{\"name\":{},\"passed\":{},\"error\":{},\"image\":{}}}",json(name),error.empty(),json(error),json(utf8(image_path.wstring())));
+    }
     const auto messages = renderer.errors();
     report += std::format("],\"passed\":{},\"total\":{},\"shader_compilations\":{},\"debug_messages\":[",
                           passed == total && messages.empty(),total,renderer.stats().shader_compilations);

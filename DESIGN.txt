@@ -6,8 +6,9 @@ Use knowledge/ as research input, with discoveries tied to the verified executab
 
 1. Performance
 
-Initial target: sustained 60 FPS at native resolution, within a 16.67 ms frame
-budget. Name reference hardware and representative menu, racing and crash scenes
+Target: sustained 240 FPS or higher at 1x native resolution in widescreen, with
+interpolation and VSync disabled, within a 4.167 ms frame budget. Name reference hardware
+and representative menu, racing and crash scenes
 before acceptance. Measure CPU/GPU time, median and 99th-percentile frame times,
 loading time and peak memory; average FPS alone is insufficient.
 

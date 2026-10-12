@@ -16,7 +16,8 @@ struct Key {
     ShaderKind kind;VertexProgram program{};
     auto operator<=>(const Key&) const = default;
 };
-std::map<Key,std::vector<std::byte>> bytecode;
+struct Compiled {std::vector<std::byte> bytes;std::uint32_t first=0,count=192;};
+std::map<Key,Compiled> bytecode;
 std::string source(ShaderKind kind,const VertexProgram* program) {
     if(kind==ShaderKind::vertex || kind==ShaderKind::launch) {
         if(!program) throw std::runtime_error("A vertex shader requires its original program");
@@ -45,7 +46,12 @@ void program(std::ostringstream& output,const StaticVertex& value) {
 }
 ShaderBinary shader_binary(ShaderKind kind,const VertexProgram* program) {
     Key key{kind};if(program) key.program=normalize_vertex_program(*program);
-    if(const auto found=bytecode.find(key);found!=bytecode.end()) return {found->second,false};
+    if(const auto found=bytecode.find(key);found!=bytecode.end()) return {found->second.bytes,false,found->second.first,found->second.count};
+    std::uint32_t first=0,count=192;
+    if(kind==ShaderKind::vertex) {
+        const auto translated=translate_vertex_program(key.program);
+        first=translated.constant_first;count=translated.constant_count;
+    } else if(kind>=ShaderKind::fixed0 && kind<=ShaderKind::fixed6) count=96;
     const auto hlsl=source(kind,program?&key.program:nullptr);
     ComPtr<ID3DBlob> code,errors,compact;
     auto status=D3DCompile(hlsl.data(),hlsl.size(),"b2-offline",nullptr,nullptr,"main",shader_profile(kind),
@@ -56,8 +62,8 @@ ShaderBinary shader_binary(ShaderKind kind,const VertexProgram* program) {
         D3DCOMPILER_STRIP_DEBUG_INFO|D3DCOMPILER_STRIP_REFLECTION_DATA,&compact);
     if(FAILED(status)) throw std::runtime_error("Could not strip offline shader metadata");
     const auto* data=static_cast<const std::byte*>(compact->GetBufferPointer());
-    auto [stored,inserted]=bytecode.emplace(std::move(key),std::vector(data,data+compact->GetBufferSize()));
-    return {stored->second,inserted};
+    auto [stored,inserted]=bytecode.emplace(std::move(key),Compiled{std::vector(data,data+compact->GetBufferSize()),first,count});
+    return {stored->second.bytes,inserted,first,count};
 }
 std::span<const StaticVertex> static_vertex_shaders() {return {};}
 std::string compile_shaders(const std::filesystem::path& executable,const std::filesystem::path& destination,bool replace) {
@@ -107,12 +113,15 @@ std::string compile_shaders(const std::filesystem::path& executable,const std::f
     output<<"}};\n}\nstd::span<const StaticVertex> static_vertex_shaders(){return programs;}\nShaderBinary shader_binary(ShaderKind kind,const VertexProgram* program){\nswitch(kind){\n";
     for(unsigned i=0;i<unsigned(ShaderKind::count);++i) {
         if(i==unsigned(ShaderKind::vertex) || i==unsigned(ShaderKind::launch)) continue;
-        output<<std::format("case ShaderKind({}):return {{Bytes(reinterpret_cast<const std::byte*>(builtin_{}),sizeof(builtin_{})),false}};\n",i,i,i);
+        const auto binary=shader_binary(ShaderKind(i));
+        output<<std::format("case ShaderKind({}):return {{Bytes(reinterpret_cast<const std::byte*>(builtin_{}),sizeof(builtin_{})),false,{}, {}}};\n",i,i,i,binary.constant_first,binary.constant_count);
     }
     output<<"default:break;}\nif(!program) throw std::runtime_error(\"Missing static shader program\");\nconst auto key=normalize_vertex_program(*program);\n";
-    for(unsigned i=0;i<vertices.size();++i)
-        output<<std::format("if(kind==ShaderKind::{} && key==programs[{}].program) return {{Bytes(reinterpret_cast<const std::byte*>(vertex_{}),sizeof(vertex_{})),false}};\n",
-            vertices[i].launch?"launch":"vertex",i,i,i);
+    for(unsigned i=0;i<vertices.size();++i) {
+        const auto binary=shader_binary(vertices[i].launch?ShaderKind::launch:ShaderKind::vertex,&vertices[i].program);
+        output<<std::format("if(kind==ShaderKind::{} && key==programs[{}].program) return {{Bytes(reinterpret_cast<const std::byte*>(vertex_{}),sizeof(vertex_{})),false,{}, {}}};\n",
+            vertices[i].launch?"launch":"vertex",i,i,i,binary.constant_first,binary.constant_count);
+    }
     output<<"throw std::runtime_error(\"Vertex program is missing from the compiled shader bank\");}\n}\n";
     write_text(destination,output.str(),replace);
     return std::format("{{\"format\":\"b2-shaders-aot-v1\",\"sha256\":{},\"title_records\":{},\"sdk_programs\":3,\"vertex_programs\":{},\"builtin_shaders\":{},\"bytecode_bytes\":{},\"runtime_compiler\":false}}",

@@ -15,6 +15,7 @@ struct XboxHost {
     bool trace_io=false;
     std::filesystem::path storage_root;
     Performance* performance=nullptr;
+    bool widescreen=false;
 };
 struct BootIo {
     std::uint32_t ordinal=0,status=0,information=0,callsite=0;

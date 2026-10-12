@@ -30,8 +30,8 @@ public:
     static void validate(const EnvironmentParameters&);
 private:
     void call(std::uint32_t,std::initializer_list<std::uint32_t>);
-    Memory& memory_;
     std::array<std::byte,8192> scratch_{};
+    Memory memory_;
     std::array<std::uint32_t,12> environment_listener_{};
     SpatialListener previous_listener_;
     bool listener_valid_=false;

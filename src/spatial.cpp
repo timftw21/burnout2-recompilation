@@ -14,8 +14,7 @@ constexpr std::uint32_t base=0x70000000,listener=base+0x100,source=base+0x200,
 float real(std::uint32_t value){return std::bit_cast<float>(value);}
 float amplitude(std::int64_t db){return db<=-10000?0:std::pow(10.0f,static_cast<float>(db)/2000);}
 }
-Spatial::Spatial(Memory& memory):memory_(memory) {
-    memory_.map(base,scratch_);
+Spatial::Spatial(Memory& memory):memory_(base,scratch_,memory) {
     // The SDK constructor copies this exact environmental preset, rather than
     // the similarly named silent default found in later SDK headers.
     std::memcpy(environment_listener_.data(),memory_.access(0x00237BD8,48),48);
@@ -106,7 +105,10 @@ SpatialResult Spatial::calculate(const SpatialListener& value,const SpatialParam
     result.pitch=std::exp2(result.adjustments[2]/4096.0);
     result.distance=real(memory_.load<std::uint32_t>(source+0x68));
     for(unsigned i=0;i<2;++i) result.angles[i]=real(memory_.load<std::uint32_t>(source+0x74+i*4));
-    for(unsigned i=0;i<2;++i) result.front_back[i]=amplitude(std::bit_cast<std::int32_t>(memory_.load<std::uint32_t>(output+0x14+i*4)));
+    const auto level=[&](unsigned offset) {return std::bit_cast<std::int32_t>(memory_.load<std::uint32_t>(output+offset));};
+    // Original 232FED combines +0Ch/+14h for bins 6/7 and uses +10h for
+    // bins 8/9. +18h belongs to the centre speaker, not the rear pair.
+    result.front_back={amplitude(std::int64_t(level(0x0C))+level(0x14)),amplitude(level(0x10))};
     if(environment) for(unsigned i=0;i<2;++i) {
         result.environment_gain[i]=amplitude(std::bit_cast<std::int32_t>(memory_.load<std::uint32_t>(output+0x1C+i*4)));
         const auto coefficient=memory_.load<std::uint32_t>(output+0x30+i*4);
@@ -133,7 +135,8 @@ std::string check_spatial(const std::filesystem::path& executable,const std::fil
     set(11,1);set(13,5);set(14,100);set(16,1);set(17,1);set(18,1);
     SpatialListener listener_value;unsigned checks=0;
     const auto require=[&](bool condition){++checks;if(!condition) throw std::runtime_error("Original 3D audio check failed at case "+std::to_string(checks));};
-    auto result=spatial.calculate(listener_value,parameters,{});require(result.gain==1 && result.pitch==1 && result.distance==0 && result.pan==std::array<float,2>{std::sqrt(0.5f),std::sqrt(0.5f)});
+    auto result=spatial.calculate(listener_value,parameters,{});require(result.gain==1 && result.pitch==1 && result.distance==0 && result.pan==std::array<float,2>{std::sqrt(0.5f),std::sqrt(0.5f)} &&
+        std::abs(result.front_back[0]-0.5f)<0.0001f && result.front_back[1]==0);
     set(3,10);result=spatial.calculate(listener_value,parameters,{});require(result.distance==10 && result.gain<1 && result.gain>0);
     const std::array<float,1> unity{1};result=spatial.calculate(listener_value,parameters,std::as_bytes(std::span(unity)));require(result.gain==1);
     std::array<float,1> descending{0.5f};result=spatial.calculate(listener_value,parameters,std::as_bytes(std::span(descending)));

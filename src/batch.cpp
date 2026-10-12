@@ -1,5 +1,6 @@
 #include "batch.h"
 #include <algorithm>
+#include <bit>
 #include <deque>
 #include <format>
 #include <set>
@@ -215,7 +216,27 @@ Batch recompile_batch(Xbe& image, std::span<const std::uint32_t> seeds,
         for (const auto& [address, unit] : units) if (unit.emit)
             source << "    {" << std::format("0x{:08X}U", address) << ", \"" << image.sha256 << "\", "
                    << (unit.floating?std::format("entry_{:08X}",address):symbol(address)) << "},\n";
-        source << "}};\n}\nconst std::span<const CompiledFunction> compiled_batch{functions};\n}\n";
+        source << "}};\n";
+        const auto capacity=std::bit_ceil(static_cast<std::uint32_t>(emitted_count)*2);
+        const auto shift=32-std::countr_zero(capacity);
+        std::vector<std::uint32_t> dispatch(capacity);
+        std::uint32_t ordinal=0;
+        for(const auto& [address,unit]:units) if(unit.emit) {
+            auto slot=(address*2654435761U)>>shift;
+            while(dispatch[slot]) slot=(slot+1)&(capacity-1);
+            dispatch[slot]=++ordinal;
+        }
+        source << "const std::array<std::uint32_t," << capacity << "> dispatch{{\n";
+        for(std::size_t i=0;i<dispatch.size();++i)
+            source << dispatch[i] << 'U' << (i+1==dispatch.size()?"\n":i%32==31?",\n":",");
+        source << "}};\n}\nconst std::span<const CompiledFunction> compiled_batch{functions};\n"
+            "const CompiledFunction* lookup_native(std::uint32_t address) noexcept {\n"
+            "    auto slot=(address*2654435761U)>>" << shift << ";\n"
+            "    while(const auto index=dispatch[slot]) {\n"
+            "        const auto& function=functions[index-1];\n"
+            "        if(function.address==address) return &function;\n"
+            "        slot=(slot+1)&" << capacity-1 << "U;\n"
+            "    }\n    return nullptr;\n}\n}\n";
         result.source = source.str();
         result.assembly="; Native instruction helpers generated from verified XBE "+image.sha256+"\noption casemap:none\n.code\n";
         for(const auto& [name,assembly] : helpers) result.assembly+=assembly;

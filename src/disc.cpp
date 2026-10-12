@@ -22,7 +22,7 @@ Disc::Disc(const std::filesystem::path& path) : file_(path) {
         return std::string_view(reinterpret_cast<const char*>(header.data() + offset), magic.size()) == magic;
     };
     if (!is_magic(0) || !is_magic(sector_size - magic.size()))
-        throw std::runtime_error("Not a partition-only Xbox XISO image");
+        throw std::runtime_error("Not an Xbox XISO image");
     root_ = {"", u32(header, 0x14), u32(header, 0x18), 0x10};
     file_.check(root_.sector * sector_size, root_.size);
 }

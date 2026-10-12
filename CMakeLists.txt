@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.2)
-project(burnout2 VERSION 1.2.0 LANGUAGES C CXX)
+project(burnout2 VERSION 1.3.0 LANGUAGES C CXX)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "The initial target is Windows x64.")
@@ -8,6 +8,18 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
+option(B2_PROFILE_GENERATE "Collect LLVM profiles for native game optimization" OFF)
+option(B2_AVX2 "Build native code for an AVX2-capable CPU and operating system" OFF)
+set(B2_PROFILE_USE "" CACHE FILEPATH "LLVM indexed profile for native game optimization")
+if(B2_PROFILE_GENERATE AND B2_PROFILE_USE)
+    message(FATAL_ERROR "Choose profile collection or profile use, not both.")
+endif()
+if((B2_PROFILE_GENERATE OR B2_PROFILE_USE) AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    message(FATAL_ERROR "Native profiling requires the Clang toolchain.")
+endif()
+if(B2_PROFILE_USE AND NOT EXISTS "${B2_PROFILE_USE}")
+    message(FATAL_ERROR "B2_PROFILE_USE must name an existing llvm-profdata indexed profile.")
+endif()
 include(CheckIPOSupported)
 check_ipo_supported(RESULT b2_ipo_supported LANGUAGES CXX)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
@@ -67,11 +79,18 @@ if(B2_XBE)
         message(FATAL_ERROR "B2_XBE does not exist; extract default.xbe with b2-tool first.")
     endif()
     enable_language(ASM_MASM RC)
+    if(CMAKE_GENERATOR MATCHES "^Ninja")
+        # Use relative assembly inputs; MASM still uses legacy path encoding.
+        set(CMAKE_ASM_MASM_COMPILE_OBJECT "<CMAKE_ASM_MASM_COMPILER> <DEFINES> <INCLUDES> /c /Fo<OBJECT> <FLAGS>")
+    endif()
     # MASM uses legacy path encoding; relative inputs also work in Unicode folders.
     foreach(assembly IN ITEMS src/cpu_floating.asm src/cpu_reference.asm)
         file(RELATIVE_PATH assembly_input "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/${assembly}")
         set_source_files_properties("${assembly}" PROPERTIES VS_SETTINGS
             "CommandLineTemplate=ml64.exe /c [AllOptions] [AdditionalOptions] /Ta\"${assembly_input}\"")
+        if(CMAKE_GENERATOR MATCHES "^Ninja")
+            set_source_files_properties("${assembly}" PROPERTIES COMPILE_OPTIONS "/Ta${assembly_input}")
+        endif()
     endforeach()
     foreach(option IN ITEMS SDL_SHARED SDL_TEST_LIBRARY SDL_TESTS SDL_EXAMPLES SDL_INSTALL SDL_GPU SDL_RENDER SDL_OPENGL SDL_OPENGLES SDL_VULKAN)
         set(${option} OFF CACHE BOOL "" FORCE)
@@ -172,6 +191,10 @@ if(B2_XBE)
         set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/generated/${config}/native_cpu.cpp.asm"
             PROPERTIES OBJECT_NAME native_cpu_assembly VS_SETTINGS
             "CommandLineTemplate=ml64.exe /c [AllOptions] [AdditionalOptions] /Ta\"generated/${config}/native_cpu.cpp.asm\"")
+        if(CMAKE_GENERATOR MATCHES "^Ninja")
+            set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/generated/${config}/native_cpu.cpp.asm"
+                PROPERTIES COMPILE_OPTIONS "/Tagenerated/${config}/native_cpu.cpp.asm")
+        endif()
     endforeach()
     set(native_shards "")
     foreach(index RANGE 0 511)
@@ -194,14 +217,29 @@ if(B2_XBE)
     set(native_shaders "${CMAKE_CURRENT_BINARY_DIR}/generated/$<CONFIG>/native_shaders.cpp")
     # The generator preserves unchanged source timestamps; stamp completed work.
     set(native_shader_stamp "${native_shaders}.stamp")
+    # COMMAND orders the tool build. Only shader-generation inputs invalidate
+    # its output; changes to the shared renderer do not require recompiling HLSL.
     add_custom_command(OUTPUT "${native_shader_stamp}"
         BYPRODUCTS "${native_shaders}"
         COMMAND b2-tool compile-shaders "${B2_XBE}" "${native_shaders}" --replace
         COMMAND "${CMAKE_COMMAND}" -E touch "${native_shader_stamp}"
-        DEPENDS b2-tool "${B2_XBE}" "${CMAKE_CURRENT_BINARY_DIR}/generated/gui_shaders.h"
+        DEPENDS "${B2_XBE}" "${CMAKE_CURRENT_BINARY_DIR}/generated/gui_shaders.h"
+            "${CMAKE_CURRENT_BINARY_DIR}/generated/target.h"
+            "${CMAKE_CURRENT_BINARY_DIR}/generated/kernel_names.h"
+            src/file.h src/xbe.h src/shaders.h src/vertex_program.h
+            src/tool.cpp src/shader_compiler.cpp src/shaders.cpp src/vertex_program.cpp src/xbe.cpp src/file.cpp
         VERBATIM)
     add_custom_target(b2-shaders-generated DEPENDS "${native_shader_stamp}")
-    add_executable(b2 src/main.cpp src/cpu_checks.cpp src/cpu_reference.asm "${native_cpu}" "${native_cpu}.asm" ${native_shards} "${native_shaders}" resources/b2.rc)
+    add_executable(b2 src/main.cpp src/cpu_checks.cpp src/cpu_reference.asm "${native_cpu}" "${native_cpu}.asm" ${native_shards} "${native_shaders}" resources/b2.rc resources/b2.manifest)
+    # Share the CPU header across all shards without embedding installation paths.
+    target_precompile_headers(b2 PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:<cpu.h$<ANGLE-R>>")
+    # File-specific object paths split /MP batches; schedule them through two
+    # shared compiler workers instead of starting each compilation in sequence.
+    set_target_properties(b2 PROPERTIES
+        VS_GLOBAL_UseMultiToolTask true
+        VS_GLOBAL_EnableClServerMode true
+        VS_GLOBAL_EnforceProcessCountAcrossBuilds true
+        VS_GLOBAL_MultiProcMaxCount 2)
     target_include_directories(b2 PRIVATE "$<$<COMPILE_LANGUAGE:RC>:${CMAKE_CURRENT_SOURCE_DIR}/resources>")
     add_dependencies(b2 b2-native-generated b2-shaders-generated)
     target_link_libraries(b2 PRIVATE b2-core b2-graphics b2-cpu b2-app)
@@ -217,12 +255,47 @@ foreach(target IN ITEMS b2-core b2-cpu b2-input b2-graphics b2-app b2-tool b2)
     endif()
     if(MSVC)
         target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/W4;/permissive-;/Zc:__cplusplus;/utf-8>")
+        if(B2_AVX2)
+            target_compile_options(${target} PRIVATE "$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:/arch:AVX2>")
+        endif()
         if(target STREQUAL "b2")
-            target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/MP2>")
+            if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+                target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/MP2>")
+            endif()
             target_link_options(${target} PRIVATE "$<$<CONFIG:Release>:/DEBUG:FULL;/OPT:REF;/OPT:ICF>")
         endif()
     endif()
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_LINKER_TYPE STREQUAL "LLD" AND
+       target MATCHES "^b2(-tool)?$")
+        target_link_options(${target} PRIVATE
+            "$<$<CONFIG:Release>:/opt:lldlto=3>"
+            "$<$<CONFIG:Release>:/lldltocache:lto-cache/${target}/Release>"
+            "$<$<CONFIG:Release>:/lldltocachepolicy:cache_size_bytes=3g>")
+    endif()
 endforeach()
+
+if(B2_PROFILE_GENERATE OR B2_PROFILE_USE)
+    if(B2_PROFILE_GENERATE)
+        set(b2_profile_option "/clang:-fprofile-generate=${CMAKE_CURRENT_BINARY_DIR}/pgo")
+        execute_process(COMMAND "${CMAKE_CXX_COMPILER}" -print-resource-dir
+            OUTPUT_VARIABLE b2_clang_resources OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+        if(NOT EXISTS "${b2_clang_resources}/lib/windows/clang_rt.profile-x86_64.lib")
+            message(FATAL_ERROR "Clang's x64 profile runtime is missing.")
+        endif()
+        foreach(target IN ITEMS b2 b2-tool)
+            if(TARGET ${target})
+                target_link_directories(${target} PRIVATE "${b2_clang_resources}/lib/windows")
+            endif()
+        endforeach()
+    else()
+        set(b2_profile_option "/clang:-fprofile-use=${B2_PROFILE_USE}")
+    endif()
+    foreach(target IN ITEMS b2-core b2-cpu b2-input b2-graphics b2-app b2-tool b2)
+        if(TARGET ${target})
+            target_compile_options(${target} PRIVATE "$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:${b2_profile_option}>")
+        endif()
+    endforeach()
+endif()
 
 if(b2_ipo_supported)
     foreach(target IN ITEMS b2-core b2-cpu b2-input b2-graphics b2-app b2-tool b2)

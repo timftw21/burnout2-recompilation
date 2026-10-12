@@ -95,7 +95,7 @@ function Find-Program([string]$name, [string[]]$candidates, [version]$minimum) {
         if (!$candidate -or !(Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
         if ($minimum) {
             $versionLine = @(& $candidate --version)[0]
-            if ($LASTEXITCODE -ne 0 -or $versionLine -notmatch 'cmake version (\d+\.\d+\.\d+)' -or [version]$Matches[1] -lt $minimum) { continue }
+            if ($LASTEXITCODE -ne 0 -or $versionLine -notmatch '\bversion (\d+\.\d+\.\d+)' -or [version]$Matches[1] -lt $minimum) { continue }
         }
         return $candidate
     }
@@ -110,12 +110,13 @@ function Configure-Step([string]$message, [string]$directory, [string[]]$argumen
     if (Test-Path -LiteralPath $cachePath) {
         $cached = @{}
         foreach ($line in [IO.File]::ReadAllLines($cachePath)) {
-            if ($line -match '^(CMAKE_HOME_DIRECTORY|CMAKE_CACHEFILE_DIR|CMAKE_GENERATOR|CMAKE_GENERATOR_PLATFORM|CMAKE_GENERATOR_INSTANCE):[^=]+=(.*)$') {
+            if ($line -match '^(CMAKE_HOME_DIRECTORY|CMAKE_CACHEFILE_DIR|CMAKE_GENERATOR|CMAKE_GENERATOR_PLATFORM|CMAKE_GENERATOR_INSTANCE|CMAKE_C_COMPILER|CMAKE_CXX_COMPILER|CMAKE_LINKER_TYPE|CMAKE_MAKE_PROGRAM):[^=]+=(.*)$') {
                 $cached[$Matches[1]] = $Matches[2]
             }
         }
         $expected = @{ CMAKE_HOME_DIRECTORY=$projectRoot; CMAKE_CACHEFILE_DIR=$directory;
-            CMAKE_GENERATOR='Visual Studio 18 2026'; CMAKE_GENERATOR_PLATFORM='x64'; CMAKE_GENERATOR_INSTANCE=$visualStudio }
+            CMAKE_GENERATOR='Ninja Multi-Config'; CMAKE_GENERATOR_PLATFORM=''; CMAKE_GENERATOR_INSTANCE='';
+            CMAKE_C_COMPILER=$clang; CMAKE_CXX_COMPILER=$clang; CMAKE_LINKER_TYPE='LLD'; CMAKE_MAKE_PROGRAM=$ninja }
         foreach ($key in $expected.Keys) {
             if (!$cached.ContainsKey($key) -or $cached[$key].Replace('\', '/') -ne $expected[$key].Replace('\', '/')) {
                 # CMake clears only its own configuration metadata, preserving game files and saves.
@@ -184,8 +185,17 @@ try {
     if (!$visualStudio) { throw 'Install Visual Studio 2026 with Desktop development with C++, including the Windows SDK.' }
     $cmake = Find-Program 'cmake.exe' @("$env:ProgramFiles\CMake\bin\cmake.exe", "$visualStudio\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe") ([version]'4.2.0')
     $git = Find-Program 'git.exe' @("$env:ProgramFiles\Git\cmd\git.exe", "$visualStudio\Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\Git\cmd\git.exe")
-    $env:PATH = "$(Split-Path -Parent $cmake);$(Split-Path -Parent $git);$env:PATH"
-    $env:MSBUILDDISABLENODEREUSE = '1'
+    $clang = Find-Program 'clang-cl.exe' @("$env:ProgramFiles\LLVM\bin\clang-cl.exe", "$visualStudio\VC\Tools\Llvm\x64\bin\clang-cl.exe") ([version]'22.1.0')
+    $llvmDirectory = Split-Path -Parent $clang
+    foreach ($name in @('lld-link.exe', 'llvm-lib.exe')) {
+        if (!(Test-Path -LiteralPath (Join-Path $llvmDirectory $name) -PathType Leaf)) { throw 'Install the complete LLVM toolchain listed in README.md.' }
+    }
+    $developerShell = Join-Path $visualStudio 'Common7\Tools\Launch-VsDevShell.ps1'
+    if (!(Test-Path -LiteralPath $developerShell)) { throw 'Repair Visual Studio 2026 with Desktop development with C++ and the Windows SDK.' }
+    & $developerShell -Arch amd64 -HostArch amd64 -SkipAutomaticLocation -NoLogo
+    $ninja = Find-Program 'ninja.exe' @("$visualStudio\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe")
+    $env:PATH = "$(Split-Path -Parent $cmake);$(Split-Path -Parent $git);$llvmDirectory;$(Split-Path -Parent $ninja);$env:PATH"
+    $toolchain = @("-DCMAKE_C_COMPILER=$clang", "-DCMAKE_CXX_COMPILER=$clang", "-DCMAKE_MAKE_PROGRAM=$ninja")
     if (!$DiscImage) {
         if ($NoGui) { throw 'Specify -DiscImage for a build without the file picker.' }
         $picker = [Windows.Forms.OpenFileDialog]::new()
@@ -199,8 +209,8 @@ try {
     $DiscImage = (Resolve-Path -LiteralPath $DiscImage).Path
     if (!(Test-Path -LiteralPath $DiscImage -PathType Leaf)) { throw 'Select an Xbox XISO disc image file.' }
     $bootstrap = Join-Path $buildRoot 'bootstrap'
-    Configure-Step 'Preparing the build tools...' $bootstrap @('--preset', 'windows', '-B', $bootstrap, '-DB2_XBE=', "-DCMAKE_GENERATOR_INSTANCE=$visualStudio")
-    Run-Step 'Building the game-file reader...' $cmake @('--build', $bootstrap, '--config', 'Release', '--target', 'b2-tool', '--parallel', '2', '--', '/nodeReuse:false')
+    Configure-Step 'Preparing the build tools...' $bootstrap (@('--preset', 'windows', '-B', $bootstrap, '-DB2_XBE=') + $toolchain)
+    Run-Step 'Building the game-file reader...' $cmake @('--build', $bootstrap, '--config', 'Release', '--target', 'b2-tool', '--parallel', '6')
     $tool = Join-Path $bootstrap 'Release\b2-tool.exe'
     $importDirectory = Join-Path $logRoot ([Guid]::NewGuid().ToString())
     [IO.Directory]::CreateDirectory($importDirectory) | Out-Null
@@ -215,7 +225,7 @@ try {
     $localEffects = Join-Path $localDirectory 'b2distfx.bin'
     Copy-Changed $importXbe $localXbe
     Copy-Changed $importEffects $localEffects
-    Configure-Step 'Preparing the game build...' (Join-Path $buildRoot 'windows') @('--preset', 'windows', "-DB2_XBE=$localXbe", "-DB2_EFFECTS=$localEffects", "-DCMAKE_GENERATOR_INSTANCE=$visualStudio")
+    Configure-Step 'Preparing the game build...' (Join-Path $buildRoot 'windows') (@('--preset', 'windows', "-DB2_XBE=$localXbe", "-DB2_EFFECTS=$localEffects") + $toolchain)
     Run-Step 'Building the game. The first build can take a while...' $cmake @('--build', '--preset', 'release')
     $runtimeLocal = Join-Path $gameDirectory 'data\local'
     [IO.Directory]::CreateDirectory($runtimeLocal) | Out-Null

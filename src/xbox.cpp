@@ -362,6 +362,11 @@ struct Xbox::State {
         --found;
         return address-found->first<found->second.size?found:allocations.end();
     }
+    void release_allocation(std::map<std::uint32_t,Allocation>::iterator found) {
+        if(found==allocations.end()) return;
+        if(gpu) gpu->invalidate_memory(found->first,found->second.size);
+        allocations.erase(found);
+    }
     std::uint32_t argument(const Cpu& cpu,unsigned index) { return memory.load<std::uint32_t>(cpu.registers[esp]+4+index*4); }
     void set_last_error(Cpu& cpu,std::uint32_t error) {
         const auto stack_base=memory.load<std::uint32_t>(cpu.fs_base+4);
@@ -404,6 +409,7 @@ struct Xbox::State {
         memory.store<std::uint32_t>(thread->tib+0x28,thread->object);
         auto& cpu=thread->cpu;
         cpu.kernel=&services; cpu.clock=&clock; cpu.diagnostic=live && graphics_initialized?nullptr:&diagnostic;
+        cpu.profile=host.performance && host.performance->active()?host.performance:nullptr;
         cpu.preempt=[](Cpu& cpu) {
             auto& host=*static_cast<State*>(cpu.kernel->context);
             if(host.host.performance) host.host.performance->guest_sample(cpu.eip,host.current?host.current->id:0);
@@ -499,7 +505,7 @@ struct Xbox::State {
     void release_object(std::uint32_t address) {
         if(!objects.contains(address) || object_references[address]) return;
         if(std::ranges::any_of(handles,[&](const auto& pair) {return pair.second.address==address;})) return;
-        allocations.erase(address&0x0FFFFFFF); objects.erase(address); object_references.erase(address);
+        release_allocation(allocations.find(address&0x0FFFFFFF));objects.erase(address);object_references.erase(address);
     }
     std::uint32_t wait(std::span<const std::uint32_t> addresses,bool all,std::uint32_t timeout_pointer,bool alertable) {
         if(addresses.empty() || addresses.size()>64) return invalid_parameter;
@@ -807,12 +813,22 @@ struct Xbox::State {
         for(unsigned i=0;i<count;++i) bins[i]={memory.load<std::uint32_t>(pairs+i*8),std::bit_cast<std::int32_t>(memory.load<std::uint32_t>(pairs+i*8+4))};
         audio->mixbins(identifier,std::span(bins).first(count),volumes_only);
     }
-    void update_spatial(AudioBuffer& buffer) {
-        if(!buffer.has_spatial) return;
+    SpatialResult spatial_result(const AudioBuffer& buffer) {
         if(!audio_spatial) audio_spatial=std::make_unique<Spatial>(memory);
         const auto curve=buffer.curve_count?std::span(static_cast<const std::byte*>(memory.access(buffer.curve,buffer.curve_count*4)),buffer.curve_count*4):std::span<const std::byte>{};
-        const auto result=audio_spatial->calculate(audio_listener,buffer.spatial,curve,&buffer.environment,(buffer.flags&0x20000)!=0);
-        audio->spatial(buffer.identifier,result);
+        return audio_spatial->calculate(audio_listener,buffer.spatial,curve,&buffer.environment,(buffer.flags&0x20000)!=0);
+    }
+    void update_spatial(AudioBuffer& buffer) {
+        if(buffer.has_spatial) audio->spatial(buffer.identifier,spatial_result(buffer));
+    }
+    void update_spatial(std::span<AudioBuffer*> buffers) {
+        std::array<std::uint32_t,256> ids;std::array<SpatialResult,256> values;
+        unsigned count=0;
+        for(const auto* buffer:buffers) if(buffer->has_spatial) {
+            if(count==ids.size()) throw std::runtime_error("Spatial audio update exceeds voice capacity");
+            ids[count]=buffer->identifier;values[count++]=spatial_result(*buffer);
+        }
+        audio->spatial(std::span(ids).first(count),std::span(values).first(count));
     }
     static void copy_listener(SpatialListener& destination,const SpatialListener& source,unsigned fields) {
         if(fields&1) destination.position=source.position;
@@ -826,13 +842,15 @@ struct Xbox::State {
         const bool listener_changed=audio_pending_listener!=0;
         copy_listener(audio_listener,audio_deferred_listener,audio_pending_listener);
         audio_pending_listener=0;
+        std::array<AudioBuffer*,256> changed_buffers;unsigned count=0;
         for(auto& [object,buffer]:audio_buffers) {
             const bool changed=listener_changed || buffer.pending_spatial || buffer.pending_curve || buffer.pending_environment;
             if(buffer.pending_spatial) {buffer.spatial=buffer.deferred_spatial;buffer.has_spatial=true;buffer.pending_spatial=false;}
             if(buffer.pending_curve) {buffer.curve=buffer.deferred_curve;buffer.curve_count=buffer.deferred_curve_count;buffer.pending_curve=false;}
             if(buffer.pending_environment) {buffer.environment=buffer.deferred_environment;buffer.pending_environment=false;}
-            if(changed) update_spatial(buffer);
+            if(changed) changed_buffers[count++]=&buffer;
         }
+        update_spatial(std::span(changed_buffers).first(count));
     }
     void publish_audio_packets(Cpu& cpu,std::uint32_t object) {
         const auto found=audio_streams.find(object);if(found==audio_streams.end()) return;
@@ -901,7 +919,7 @@ struct Xbox::State {
             if(!references) {
                 const auto identifier=stream.identifier,raw=stream.raw;
                 audio->flush(identifier);publish_audio_packets(cpu,object);
-                audio->release(identifier);allocations.erase(raw);audio_streams.erase(object);
+                audio->release(identifier);release_allocation(allocations.find(raw));audio_streams.erase(object);
             }
             finish(cpu,4,references);return true;
         }
@@ -1132,7 +1150,9 @@ struct Xbox::State {
             else {
                 copy_listener(audio_deferred_listener,audio_listener,field);
                 audio_pending_listener&=~field;
-                for(auto& [buffer_object,buffer]:audio_buffers) update_spatial(buffer);
+                std::array<AudioBuffer*,256> buffers;unsigned count=0;
+                for(auto& [buffer_object,buffer]:audio_buffers) buffers[count++]=&buffer;
+                update_spatial(std::span(buffers).first(count));
             }
             finish(cpu,(count+2)*4,success);return;
         }
@@ -1184,7 +1204,7 @@ struct Xbox::State {
         switch(address) {
         case 0x0022C11B: {
             const auto references=--buffer.references;
-            if(!references){audio->release(buffer.identifier);allocations.erase(buffer.raw);audio_buffers.erase(found);}
+            if(!references){audio->release(buffer.identifier);release_allocation(allocations.find(buffer.raw));audio_buffers.erase(found);}
             finish(cpu,4,references);return;
         }
         case 0x0022EF4B: {
@@ -1711,7 +1731,7 @@ struct Xbox::State {
             const auto opcode=memory.load<std::uint8_t>(request+28);
             const auto mode=memory.load<std::uint8_t>(request+30)&0x3FU;
             // READ DVD STRUCTURE requests physical optical/security data absent
-            // from a partition-only XISO. Return the real unsupported status;
+            // from an XISO. Return the real unsupported status;
             // the original caller decides whether it can continue.
             if(opcode==0xAD) return 0xC00000BB;
             if(opcode!=0x5A || mode!=0x3E) throw NativeBoundary(cpu.eip,std::format("unsupported virtual disc SCSI command 0x{:02X}, page 0x{:02X}",opcode,mode));
@@ -1719,7 +1739,7 @@ struct Xbox::State {
             const auto capacity=memory.load<std::uint32_t>(request+12),buffer=memory.load<std::uint32_t>(request+20);
             const auto requested=(memory.load<std::uint8_t>(request+35)<<8)|memory.load<std::uint8_t>(request+36);
             const auto count=std::min({capacity,static_cast<unsigned>(requested),28U});
-            // A mounted partition-only XISO is an already readable virtual Xbox
+            // A mounted XISO is an already readable virtual Xbox
             // data partition. This reports that provider's state, not a physical
             // drive's authentication transcript or fabricated security sector.
             std::array<std::byte,28> mode_page{};
@@ -2081,11 +2101,12 @@ struct Xbox::State {
             const auto found=allocation(base);
             if(found==allocations.end() || (flags!=MEM_RELEASE && flags!=MEM_DECOMMIT) ||
                 (flags==MEM_RELEASE && (size || base!=found->first))) { finish(cpu,12,invalid_parameter); return; }
-            if(flags==MEM_RELEASE) { allocations.erase(found); memory.store<std::uint32_t>(pointer,0); memory.store<std::uint32_t>(size_pointer,0); }
+            if(flags==MEM_RELEASE) { release_allocation(found);memory.store<std::uint32_t>(pointer,0);memory.store<std::uint32_t>(size_pointer,0); }
             else {
                 const auto first=(base-found->first)/page;
                 const auto last=size?align_up(base-found->first+size,page)/page:found->second.size/page;
                 if(last>found->second.pages.size()) { finish(cpu,12,invalid_parameter); return; }
+                if(gpu) gpu->invalidate_memory(found->first+first*page,(last-first)*page);
                 std::fill(found->second.pages.begin()+first,found->second.pages.begin()+last,0);
                 std::memset(memory.access(found->first+first*page,(last-first)*page),0,(last-first)*page);
                 memory.store<std::uint32_t>(pointer,found->first+first*page); memory.store<std::uint32_t>(size_pointer,(last-first)*page);
@@ -2101,7 +2122,7 @@ struct Xbox::State {
         } else if constexpr(Ordinal==171 || Ordinal==17) {
             const auto found=allocation(argument(cpu,0));
             if(found==allocations.end()) throw NativeBoundary(cpu.eip,"free of an unknown native guest allocation");
-            allocations.erase(found); finish(cpu,4);
+            release_allocation(found);finish(cpu,4);
         } else if constexpr(Ordinal==180 || Ordinal==23 || Ordinal==179) {
             const auto found=allocation(argument(cpu,0));
             finish(cpu,4,found==allocations.end()?0:Ordinal==179?found->second.pages[((argument(cpu,0)&0x0FFFFFFF)-found->first)/page]:found->second.size);
@@ -2286,7 +2307,7 @@ struct Xbox::State {
         } else if constexpr(Ordinal==2) {
             const auto option=argument(cpu,1),parameter=argument(cpu,2);
             if(option==6) // AV_PACK_STANDARD | AV_STANDARD_NTSC_M | AV_FLAGS_60Hz.
-                memory.store<std::uint32_t>(argument(cpu,3),0x00400101);
+                memory.store<std::uint32_t>(argument(cpu,3),0x00400101|(host.widescreen?0x00010000U:0U));
             else if(option==11 && parameter<=5) flicker_filter=parameter;
             else if(option==14) luma_filter=parameter!=0;
             else throw NativeBoundary(cpu.eip,"native TV encoder option is unbound");
@@ -2299,7 +2320,8 @@ struct Xbox::State {
             // of the original machine's EEPROM or cryptographic keys.
             std::optional<std::uint32_t> value;
             if(index==7) value=1; // English.
-            else if(index==8 || index==9 || index==10 || index==17) value=0; // Native SD video, stereo, no parental restriction.
+            else if(index==8) value=host.widescreen?0x00010000U:0U; // XC_VIDEO_FLAGS: native anamorphic widescreen.
+            else if(index==9 || index==10 || index==17) value=0; // Stereo, no parental restriction.
             else if(index==0x103) value=0x00400100; // NTSC-M factory AV region.
             else if(index==0x104) value=1; // North American game region.
             if(!value) {finish(cpu,20,0xC0000034);return;}
@@ -2442,7 +2464,7 @@ struct Xbox::State {
             result.stack_word_count=static_cast<std::uint32_t>(std::min<std::size_t>(result.stack_words.size(),(ram.size()-stack)/4));
             for(unsigned i=0;i<result.stack_word_count;++i) result.stack_words[i]=memory.load<std::uint32_t>(stack+i*4);
         }
-        result.cpu.kernel=nullptr; result.cpu.diagnostic=nullptr; result.cpu.clock=nullptr; result.cpu.preempt=nullptr;
+        result.cpu.kernel=nullptr; result.cpu.diagnostic=nullptr; result.cpu.clock=nullptr; result.cpu.preempt=nullptr; result.cpu.profile=nullptr;
         diagnostic_guest(nullptr);
         // Resume sleeping native stacks with cancellation so their C++ and floating
         // scopes unwind before DeleteFiber releases host stacks.
@@ -2461,6 +2483,7 @@ void Xbox::output_gain(float gain) {
 void Xbox::performance_recording(bool enabled) {
     if(state_->gpu) state_->gpu->performance(enabled?state_->host.performance:nullptr);
     if(state_->audio) state_->audio->performance(enabled);
+    for(auto& thread:state_->threads) thread->cpu.profile=enabled?state_->host.performance:nullptr;
 }
 PerfCounters Xbox::performance_counters() const {
     PerfCounters counters=state_->graphics?state_->graphics->stats().counters:PerfCounters{};
@@ -2479,8 +2502,8 @@ void Xbox::capture_frame(const std::filesystem::path& directory) {
     state_->gpu->capture_frame(directory);
     const auto& memory=state_->memory;
     std::ostringstream snapshot;
-    snapshot<<std::format("{{\"format\":\"b2-game-state-v1\",\"phase\":\"capture_request\",\"source_sha256\":{},\"replay\":{{\"frames\":{},\"index\":{},\"loaded\":{},\"playback\":{},\"finished\":{},\"fade_state\":{},\"deadline_bits\":{},\"buffer\":{}}},\"memory\":[",
-        json(state_->image.sha256),memory.load<std::uint32_t>(0x002FFD68),memory.load<std::uint32_t>(0x002FFD6C),
+    snapshot<<std::format("{{\"format\":\"b2-game-state-v1\",\"phase\":\"capture_request\",\"source_sha256\":{},\"widescreen\":{},\"replay\":{{\"frames\":{},\"index\":{},\"loaded\":{},\"playback\":{},\"finished\":{},\"fade_state\":{},\"deadline_bits\":{},\"buffer\":{}}},\"memory\":[",
+        json(state_->image.sha256),state_->host.widescreen,memory.load<std::uint32_t>(0x002FFD68),memory.load<std::uint32_t>(0x002FFD6C),
         memory.load<std::uint32_t>(0x002FFD70),memory.load<std::uint32_t>(0x002FFD74),memory.load<std::uint32_t>(0x002FFD78),
         memory.load<std::uint32_t>(0x002FFD7C),memory.load<std::uint32_t>(0x002FFD80),json(hex32(memory.load<std::uint32_t>(0x00522358))));
     // Bounded original title state; collecting it requires an explicit capture.
@@ -2741,6 +2764,12 @@ std::string check_music(const std::filesystem::path& executable,const std::files
 std::string check_storage(const std::filesystem::path& executable,const std::filesystem::path& output) {
     Xbe image(executable);
     if(!image.supported() || std::filesystem::exists(output)) throw std::runtime_error("Storage checks require the verified XBE and a fresh output directory");
+    if(hex_bytes(image.data(0x00018390,17))!="E81A7D0C000FB6C083E001A3F8034D00C3" ||
+       hex_bytes(image.data(0x000183B0,17))!="A1F8034D0050B970853D00E840030A00C3" ||
+       hex_bytes(image.data(0x000B8713,6))!="C700ABAAAA3F" ||
+       hex_bytes(image.data(0x000B8739,6))!="C700398E633F" ||
+       hex_bytes(image.data(0x000B8741,6))!="C700398EE33F")
+        throw std::runtime_error("Original widescreen selection differs from its verified layout");
     std::filesystem::create_directories(output);
     unsigned checks=0;
     const auto require=[&](bool passed,std::string_view name) {
@@ -2770,7 +2799,7 @@ std::string check_storage(const std::filesystem::path& executable,const std::fil
     std::array<std::byte,32> saved_keys{};
     for(unsigned reload=0;reload<3;++reload) {
         std::vector<std::byte> ram(64*1024*1024);image.load(std::span(ram).subspan(image.base,image.image_size));Memory memory(0,ram);
-        XboxHost provider;provider.storage_root=output;
+        XboxHost provider;provider.storage_root=output;provider.widescreen=reload==1;
         Xbox xbox(image,memory,ram,{},std::move(provider));auto& state=*xbox.state_;
         auto& thread=state.create(0,0,0,image.stack_commit,0,false);state.current=&thread;
         auto& cpu=thread.cpu;cpu.preempt=nullptr;state.diagnostic.remaining=2000000;
@@ -2783,6 +2812,22 @@ std::string check_storage(const std::filesystem::path& executable,const std::fil
             return cpu.registers[eax];
         };
         constexpr std::uint32_t area=0xA000,profile=0x1000,profile_size=0x7C04,signed_size=0x7AB8,aligned_size=0x7E00;
+        const bool widescreen=reload==1;
+        require(invoke(0xFFF00000U+2*16,{0,6,0,area})==success &&
+            memory.load<std::uint32_t>(area)==(widescreen?0x00410101U:0x00400101U),"console video capabilities");
+        require(invoke(0x000E00AF,{})==unsigned(widescreen),"original SDK video flags");
+        invoke(0x00018390,{});
+        require(memory.load<std::uint32_t>(0x004D03F8)==unsigned(widescreen),"original game widescreen selection");
+        constexpr std::uint32_t view=0x003D8570,aspect=view+0x6AC84;
+        memory.store<std::uint32_t>(view+0x6AC7C,0);invoke(0x000183B0,{});
+        const auto expected_aspect=widescreen?0x3FE38E39U:0x3FAAAAABU;
+        require(memory.load<std::uint32_t>(aspect)==expected_aspect && memory.load<std::uint32_t>(aspect+0x660)==expected_aspect,
+            "original 16:9 and 4:3 camera aspect");
+        if(widescreen) {
+            memory.store<std::uint32_t>(view+0x6AC7C,2);invoke(0x000183B0,{});
+            require(memory.load<std::uint32_t>(aspect)==0x3F638E39U && memory.load<std::uint32_t>(aspect+0x660)==0x3F638E39U,
+                "original widescreen split-screen camera aspect");
+        }
         const auto text=[&](std::uint32_t address,std::string_view value) {
             std::memcpy(memory.access(address,value.size()),value.data(),value.size());memory.store<std::uint8_t>(address+static_cast<std::uint32_t>(value.size()),0);
         };
