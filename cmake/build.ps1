@@ -1,6 +1,8 @@
 param([string]$DiscImage, [switch]$NoGui)
 
 $ErrorActionPreference = 'Stop'
+# Use this shell's tools even when another PowerShell version launched it.
+Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1')
 $projectRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 Set-Location -LiteralPath $projectRoot
 $buildRoot = Join-Path $projectRoot 'build'
