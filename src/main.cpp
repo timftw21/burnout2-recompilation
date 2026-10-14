@@ -10,6 +10,7 @@
 #include "app.h"
 #include "input.h"
 #include "diagnostics.h"
+#include "custom_music.h"
 #include <algorithm>
 #include <charconv>
 #include <chrono>
@@ -285,20 +286,41 @@ int main(int argc, char** argv) {
             std::cout << "Burnout 2 native CPU diagnostics\n"
                          "  b2 --check-cpu [XBE]\n  b2 --check-input\n  b2 --bench-cpu [ITERATIONS]\n"
                          "  b2 --check-boot XBE [VISIT_BUDGET] [--disc ISO] [--frame PNG] [--memory ADDRESS:BYTES] [--break ADDRESS[:HIT]]\n"
-                         "  b2 --run-game XBE [--disc ISO] [--seconds N] [--frame PNG] [--controls SCRIPT] [--memory ADDRESS:BYTES] [--trace-io]\n"
+                         "  b2 --run-game XBE [--disc ISO] [--seconds N] [--frame PNG] [--controls SCRIPT] [--settings CFG] [--memory ADDRESS:BYTES] [--trace-io]\n"
                          "  b2 --check-window PNG [--warp]\n  b2 --check-audio [EFFECTS_IMAGE OUTPUT_DIRECTORY]\n"
                          "  b2 --check-effects IMAGE\n  b2 --check-spatial XBE [OUTPUT_DIRECTORY]\n"
                          "  b2 --inspect-effects XBE IMAGE OUTPUT_DIRECTORY\n"
                          "  b2 --check-storage XBE OUTPUT_DIRECTORY\n"
+                         "  b2 --check-memory-watch [--crash]\n"
+                         "  b2 --watch-semaphores HANDLE [HANDLE ...]\n"
+                         "  b2 --check-visibility XBE OUTPUT_DIRECTORY [--warp]\n"
                          "  b2 --check-replays XBE ISO OUTPUT_DIRECTORY\n"
                          "  b2 --check-music XBE ISO OUTPUT_DIRECTORY\n"
+                         "  b2 --import-music FOLDER CACHE_DIRECTORY\n"
+                         "  b2 --check-custom-music XBE OUTPUT_DIRECTORY [CACHE_DIRECTORY]\n"
                          "  b2 --inspect-audio CAPTURE.bin EFFECTS_IMAGE OUTPUT_DIRECTORY\n";
             return 0;
         }
         const auto command = std::string_view(argv[1]);
+        if(command=="--check-memory-watch" && (argc==2 || (argc==3 && std::string_view(argv[2])=="--crash"))) {
+            std::cout<<b2::check_memory_watch(argc==3)<<'\n';return 0;
+        }
+        if(command=="--watch-semaphores" && argc>=3 && argc<=6) {
+            std::array<std::uint32_t,4> handles{};
+            for(int i=2;i<argc;++i) handles[i-2]=diagnostic_number(argv[i]);
+            return b2::run_app({}, {},0,{}, {},{},false,"data/local/settings.cfg",handles);
+        }
         if(command=="--check-storage" && argc==4) {std::cout<<b2::check_storage(argv[2],argv[3])<<'\n';return 0;}
+        if(command=="--check-visibility" && (argc==4 || (argc==5 && std::string_view(argv[4])=="--warp"))) {
+            std::cout<<b2::check_visibility(argv[2],argv[3],argc==5)<<'\n';return 0;
+        }
         if(command=="--check-replays" && argc==5) {std::cout<<b2::check_replays(argv[2],argv[3],argv[4])<<'\n';return 0;}
         if(command=="--check-music" && argc==5) {std::cout<<b2::check_music(argv[2],argv[3],argv[4])<<'\n';return 0;}
+        if(command=="--check-custom-music" && (argc==4 || argc==5)) {std::cout<<b2::check_custom_music(argv[2],argv[3],argc==5?b2::utf8_path(argv[4]):std::filesystem::path{})<<'\n';return 0;}
+        if(command=="--import-music" && argc==4) {
+            const auto count=b2::import_custom_music(argv[2],argv[3]);
+            std::cout<<"{\"format\":\"b2-custom-music-import-v1\",\"passed\":true,\"songs\":"<<count<<"}\n";return 0;
+        }
         if(command=="--inspect-audio" && argc==5) {
             const auto report=b2::Audio::inspect_capture(argv[2],argv[3],argv[4]);std::cout<<report<<'\n';
             return report.find("\"passed\":true")!=std::string::npos?0:1;
@@ -314,7 +336,7 @@ int main(int argc, char** argv) {
             std::cout<<b2::check_window(argv[2],argc==4)<<'\n';return 0;
         }
         if(command=="--run-game" && argc>=3) {
-            std::filesystem::path disc,frame,controls;unsigned seconds=0;std::vector<MemorySlice> slices;bool trace_io=false;
+            std::filesystem::path disc,frame,controls,settings="data/local/settings.cfg";unsigned seconds=0;std::vector<MemorySlice> slices;bool trace_io=false;
             for(int index=3;index<argc;++index) {
                 const auto option=std::string_view(argv[index]);
                 if(option=="--trace-io") {trace_io=true;continue;}
@@ -323,13 +345,14 @@ int main(int argc, char** argv) {
                 else if(option=="--frame") frame=argv[++index];
                 else if(option=="--seconds") seconds=iterations(argv[++index]);
                 else if(option=="--controls") controls=argv[++index];
+                else if(option=="--settings") settings=argv[++index];
                 else if(option=="--memory") {
                     if(slices.size()==4) throw std::runtime_error("At most four memory slices are supported");
                     slices.push_back(memory_slice(argv[++index]));
                 }
                 else throw std::runtime_error("Unknown live-run option");
             }
-            return b2::run_app(argv[2],disc,seconds,frame,controls,slices,trace_io);
+            return b2::run_app(argv[2],disc,seconds,frame,controls,slices,trace_io,settings);
         }
         if(command=="--check-input" && argc==2) {std::cout<<b2::check_input()<<'\n';return 0;}
         if(command=="--check-boot" && argc>=3) {

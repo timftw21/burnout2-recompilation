@@ -7,7 +7,10 @@ enum class ShaderKind : unsigned {
     passthrough,clear_vertex,clear_pixel,display_vertex,display_pixel,gui_vertex,gui_pixel,
     combiner0,combiner1,combiner2,combiner3,combiner4,combiner5,combiner6,combiner7,combiner8,
     fixed0,fixed1,fixed2,fixed3,fixed4,fixed5,fixed6,vertex,launch,
-    color,modulate2d,modulate_cube,modulate3d,flow_colour,flow_estimate,flow_resolve,flow_cut,flow_interpolate,count
+    color,modulate2d,modulate_cube,modulate3d,flow_colour,flow_estimate,flow_resolve,flow_cut,flow_interpolate,fxaa,copy_multisample,copy_multisample_stencil,
+    passthrough_jitter,fixed_jitter0,fixed_jitter1,fixed_jitter2,fixed_jitter3,fixed_jitter4,fixed_jitter5,fixed_jitter6,vertex_jitter,
+    responsive_combiner0,responsive_combiner1,responsive_combiner2,responsive_combiner3,responsive_combiner4,responsive_combiner5,responsive_combiner6,responsive_combiner7,responsive_combiner8,
+    responsive_color,responsive_modulate2d,responsive_modulate_cube,responsive_modulate3d,upscale_inputs,flow_gradient,count
 };
 struct ShaderBinary {Bytes bytes;bool compiled=false;std::uint32_t constant_first=0,constant_count=192;};
 struct StaticVertex {VertexProgram program;bool launch=false;};

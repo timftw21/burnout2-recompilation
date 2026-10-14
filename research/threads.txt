@@ -33,3 +33,188 @@ the stored methods. These fixes compile 35607 discovered functions. Complete
 boot and race rendering have not been established.
 
 Fiber API: https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createfiberex
+
+Lesson-selection crash investigation (2026-10-13 local time)
+
+User log: build/windows/Release/logs/b2-20261014-001822-13252.log.
+The user clarified that the crash occurred while loading lesson selection.
+The target SHA256 matches knowledge/supported_target.json. The stopped executable
+was the high-address allocator build C90A9259D35D5275F551FBAEFE226F973C66544693AAC093943C7969D4D24BCA.
+
+Original E308A..E30CB implements the single-object Win32 wait. Its instruction
+E30A7 calls kernel ordinal 234 with handle 14C and an infinite timeout. The
+recorded return chain reaches 109240 through E3120; 109240 reads the shared
+resource semaphore handle from 5A6DE8. Initializer 109543..109548 creates that
+semaphore with initial count and maximum both 1, through 112910 and E3009.
+Bounded native disassembly of those addresses is under build/checks/sunlight.
+
+The native failure means the addressed dispatcher header has an unsupported
+first byte. The old log did not save the object address, header, handle kind,
+allocation ownership or pending reads. It does not establish a memory leak,
+the offending writer, or whether the preceding allocation policy caused it.
+Do not mark this crash fixed without further evidence.
+
+The existing storage diagnostic now keeps a real original SDK semaphore alive
+while the original process heap allocates/fills 48 mixed 0x180000, 0x30000 and
+0x1038-byte blocks and frees them in three passes. Its header survives and the
+original E3120/E3064 waits/releases work; the first run passed 1011 checks.
+All 18 original lesson/demo replay-load checks also passed without booting.
+These are bounded service diagnostics, not reproduction of the lesson menu.
+
+Dispatcher failures now record the exact header and matching native handle,
+three nearby allocation ranges with original allocation call sites, and at most
+32 pending reads with bounded file paths and their guest destinations. Allocation
+call sites cost one stored word per allocation; the snapshot runs only on failure,
+with no logging in successful waits. Invalid types still stop rather than report
+false success. A deliberately damaged header validates this diagnostic path;
+that synthetic case does not reproduce the unknown write in the user's crash.
+
+Next evidence needed: another manual lesson-selection attempt using the updated
+canonical b2.exe and its resulting log. No game was launched or automated here.
+
+Final diagnostic build verification (crash-sync-build3):
+All 1014 storage checks passed, including three deliberately damaged-header
+cases. Their actual JSON log snapshots were parsed and verified: exact E30A7
+callsite, semaphore kind, FF header and three nearby allocation records. CPU
+checks passed 52 original cases, 21976 instruction, 579 memory, 6744 floating and
+109 control cases across 36149 compiled functions. GPU and WARP sun diagnostics
+each passed all four scale/MSAA configurations and 384 original visibility
+reports, preserving the preceding rendering work. No gameplay was launched.
+All recorded owned workers exited. User settings SHA256 remained
+9E8A5F3EDD356FAA4B6658610B7BAE7B52F396098029DFF6630A725CC23B8193.
+These successful diagnostics do not establish a fix for the user's crash.
+Final canonical b2.exe SHA256: 83D42B8E164CBD56F8FB27EE22E2606A0A94B2B429304FDEDBA9248DC1407022.
+
+Second manual crash log (2026-10-13 local time)
+
+build/windows/Release/logs/b2-20261014-004624-4164.log reports an actual damaged
+semaphore: handle 13C, guest object 83894000, physical allocation 03894000,
+4096 bytes, created at original E3034. Adjacent 03893000 and 03895000 pages are
+also independent semaphore allocations from E3034. The header is
+BA0078F8247C16CA38C6CF7B4102499408BA2C1C instead of a dispatcher header. There
+are no pending reads at detection. This proves corruption, but does not identify
+the writer or exclude an already-completed read. Callsite 3F860 is the scheduler's
+last active guest continuation, not evidence that this function did the write.
+It was decoded in a bounded native range and contains animation calculations.
+
+The 20-byte signature was searched with bounded native rg over the verified XBE,
+frontend/global dictionaries, menu audio banks and both imported WMA files, with
+no match. These selected assets total roughly 16 MiB; no whole-disc or dump scan
+was used. The complete original decoder check passed for the first imported
+song: 169923 decoded ms, 169885 catalogue ms, 7493632 frames, two listed songs,
+29316 checks, no game or audio device. This does not reproduce the live mixer.
+
+The next manual run can use build/windows/Release/TraceCrash.cmd, which starts
+the same canonical b2.exe with --watch-semaphores 0x13C 0x14C. These are the two
+handles implicated by the real logs. Hardware slots monitor only each immutable
+first byte, after initialization. Legitimate dispatcher initialization temporarily
+removes watches; freed object memory is unwatched before reuse. File-read ranges
+are checked before issue, and pending reads are checked at watch setup, because
+an overlapped read may complete on an unwatched Windows thread. No game settings,
+allocation placement or rendering behavior is changed by selecting this mode.
+The diagnostic mode stops on an overwrite; it is not a root-cause repair.
+
+The native watch diagnostic caught two deliberate byte overwrites and verified
+removal. A separate deliberate fault produced exception 80000004 and a parsed
+JSON record with 16 native registers, four watch addresses and 16 stack words.
+Data watchpoints stop after the store: examine the preceding instructions at the
+reported native address and the captured stack when tracing the actual writer.
+No gameplay was launched for these checks.
+
+Windows API references used for the native diagnostic setup:
+https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getthreadcontext
+https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreadcontext
+A helper briefly suspends the owning native thread to update its debug registers,
+then resumes it and exits. It does not modify another process or automate input.
+
+Separate audit observation, not established as this crash's cause: the current
+NtAllocateVirtualMemory binding reserves on a 4 KiB boundary. Cxbx's independently
+implemented Xbox API reports 64 KiB reservation alignment with 4 KiB sizes; this
+must be tied to the offending original caller before claiming a crash fix.
+https://raw.githubusercontent.com/Cxbx-Reloaded/Cxbx-Reloaded/master/src/core/kernel/memory-manager/VMManager.cpp
+
+The ignored command runner now records the owned process immediately from its
+retained handle: rapid diagnostic faults can exit before the CIM tree snapshot.
+Worker records use Ticks, not CreationTicks. All previous crash command records
+were re-audited against their correct creation ticks; no owned workers survived.
+The deliberate-fault process and any descendants were also checked by exact PID.
+
+Final watch build (crash-watch-build2) passed native watch and deliberate-fault
+validation. The final fault's native RVA resolved through the matching PDB to
+b2::check_memory_watch(bool), as expected; the executable lacks source-line
+records, so the writer's function, captured stack and a bounded instruction range
+will be used when interpreting the real log. All 1014 storage checks, 52 CPU
+cases (21976 instruction / 579 memory / 6744 floating / 109 control), 18 replay
+loads and 29316 custom music checks passed. No gameplay was launched. Recorded
+workers were checked by exact PID and creation Ticks and had exited. Only b2.exe
+and b2-tool.exe remain as executables in Release; TraceCrash.cmd is an ignored,
+temporary manual diagnostic launcher. User settings remain byte-identical.
+Canonical watch-build b2.exe SHA256: 0ADADDDBD232EC4AF2EED3147801FC70C291ED48A2809C22BDAB80996F4CB6B7.
+
+Third manual log establishes the offending read (2026-10-13 local time)
+
+build/windows/Release/logs/b2-20261014-013134-19692.log stopped before issuing
+the asynchronous NtReadFile at original E0542. FWYL.PSS offset 60000 is being
+read for 20000 bytes into 8387C000; it spans the damaged semaphore at 83894000.
+A bounded 128-byte disc read at FWYL.PSS offset 78000 starts with the exact
+20 bytes BA0078F8247C16CA38C6CF7B4102499408BA2C1C from the previous crash.
+This identifies the actual writer, rather than a last-active animation routine.
+
+Original 13590..136FA claims fixed physical buffers through DFA30. The latter
+sets MmAllocateContiguousMemoryEx's minimum to the requested physical base and
+maximum to base+size-1. The original claims include 381C000/64000 (track master),
+3880000/640000 (track texture data) and 3EC0000/40000. It also reserves the
+sector, car, audio and replay buffers down to 2377000; the ranges are contiguous
+through 3F00000. Its sector/replay consumers use those fixed addresses, which
+also appear in the verified disc data. Bounded native analyses and byte reads
+are in build/checks/overnight-240/crash-fixed-layout, crash-fixed-physical and
+crash-track-catalogue outputs. No whole-disc or dump scan was used.
+
+The recent default descending placement of ordinary heaps, stacks and native
+objects competed with those physical claims before original initialization.
+For example, the preceding offline storage log already shows its original
+process heap at 03ECE000/100000, overlapping the 03EC0000/40000 claim. A failed
+physical claim cannot make the title stop using its fixed track addresses.
+That explains the real semaphore overwrite during FWYL.PSS loading.
+
+Ordinary allocations now prefer ascending free space above the 24-bit GPU
+report DMA window, falling back to remaining free space under real pressure.
+Contiguous physical allocations retain their descending, explicitly bounded
+search. Exact physical claims, alignment, protection and capacity are retained.
+No read truncation, semaphore substitution, extra RAM or track-address patch
+is used. The low DMA window remains available in the preceding sun diagnostics.
+
+The existing storage diagnostic now exercises all 73 original fixed buffer
+claims alongside native process-heap growth and semaphore waits. It demonstrates
+the former descending-placement conflict with the actual original DFA30 call,
+then checks successful claims under the correction. The existing replay check
+replays the real 128 KiB FWYL.PSS read across 83880000, compares every byte with
+the disc, and keeps a semaphore intact. Its replay buffer now uses the original
+fixed allocation instead of unallocated 01000000, where a native thread can live.
+The final build and offline checks passed; no gameplay was launched.
+
+Final fixed-layout build validation:
+crash-fixed-layout-build1 completed in 172.573 seconds, reusing generated CPU
+code. All 1455 storage cases passed, including 73 original fixed claims in each
+of three fresh runtimes and the deliberate previous-placement failure.
+crash-fixed-replays1 compared the complete real 128 KiB asynchronous read with
+the disc and preserved its semaphore header, then passed all 18 lesson/demo
+loads. crash-fixed-visibility-gpu1 and -warp1 each passed 11964 checks and 384
+reports in four resolution/MSAA configurations with zero debug messages and
+unchanged visible/half-visible/blocked counts (196/98/0). CPU validation passed
+52 original cases and the existing instruction/memory/floating/control matrix.
+crash-fixed-custom2 passed 29316 checks using the real data/local/custom-music
+catalogue, decoded all 7493632 frames of the first song, and opened no audio
+device. custom1 was an invocation with the wrong cache directory, corrected
+before this successful run; it did not expose a code regression.
+
+Every owned build/diagnostic worker was checked by exact PID and creation Ticks;
+none survived. Settings remain byte-identical with SHA256
+9E8A5F3EDD356FAA4B6658610B7BAE7B52F396098029DFF6630A725CC23B8193.
+Only b2.exe and b2-tool.exe remain as Release executables. The temporary
+TraceCrash.cmd launcher was removed. The user can now retry lesson selection
+by launching b2.exe normally. Manual gameplay confirmation remains pending;
+the exact offending read is fixed in the isolated original-code diagnostic.
+AGENTS.md remains ignored and untracked.
+Canonical fixed-layout b2.exe SHA256:
+4F781BDB06DD4E15989722D89DA6EB5FD4AF6C66F83B513EEAE87580CD7C9979.

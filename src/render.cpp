@@ -1,6 +1,7 @@
 #include "render.h"
 #include "shaders.h"
 #include "interpolation.h"
+#include "antialiasing.h"
 #include <Windows.h>
 #include <d3d11.h>
 #include <d3d11_1.h>
@@ -16,6 +17,7 @@
 #include <format>
 #include <map>
 #include <optional>
+#include <chrono>
 #include <stdexcept>
 
 using Microsoft::WRL::ComPtr;
@@ -147,8 +149,8 @@ D3D11_STENCIL_OP stencil_operation(std::uint32_t value) {
     default:throw std::runtime_error("Unsupported stencil operation");
     }
 }
-using PipelineKey = std::array<std::uint32_t, 22>;
-PipelineKey pipeline_key(const RenderState& state) {
+using PipelineKey = std::array<std::uint32_t, 23>;
+PipelineKey pipeline_key(const RenderState& state,bool multisample,bool responsive=false) {
     PipelineKey key{};
     std::size_t i = 0;
     for (auto value : {std::uint32_t(state.blend), std::uint32_t(state.depth_test), std::uint32_t(state.depth_write),
@@ -158,15 +160,24 @@ PipelineKey pipeline_key(const RenderState& state) {
     for(auto value : {std::uint32_t(state.stencil_test),state.stencil_function,state.stencil_read_mask,state.stencil_write_mask,
         state.stencil_fail,state.stencil_depth_fail,state.stencil_pass,std::uint32_t(state.polygon_offset),
         std::bit_cast<std::uint32_t>(state.polygon_offset_scale),std::bit_cast<std::uint32_t>(state.polygon_offset_bias),std::uint32_t(state.scissor_test)}) key[i++]=value;
-    return key;
+    key[i]=std::uint32_t(multisample)|(std::uint32_t(responsive)<<1);return key;
 }
-using SamplerKey=std::array<std::uint32_t,3>;
-SamplerKey sampler_key(const RenderState& state,unsigned stage) {
-    if(!state.textures[stage]) return {0x030303,0x01030000,0x0003FFC0};
-    auto filter=state.texture_filter[stage]&0x0F3F1FFF;
-    auto control=state.texture_control[stage]&0x3FFFFFF0;
-    if(((filter>>16)&63)<=2) {filter&=~0x1FFFU;control&=0x30;} // Level-zero filtering ignores LOD.
-    return {state.texture_address[stage],filter,control};
+using SamplerKey=std::array<std::uint32_t,6>;
+SamplerKey sampler_key(const RenderState& state,unsigned stage,unsigned anisotropy,bool highest_lod) {
+    const auto address=state.textures[stage]?state.texture_address[stage]:0x030303;
+    const auto filter=state.textures[stage]?state.texture_filter[stage]:0x01030000;
+    const auto control=state.textures[stage]?state.texture_control[stage]:0x0003FFC0;
+    const auto min=(filter>>16)&63,mag=(filter>>24)&15;
+    if(min<1 || min>6 || mag<1 || mag>2) throw std::runtime_error("Unsupported NV097 texture filter");
+    const bool min_linear=(min&1)==0,mip_linear=min>=5,mip_enabled=min>=3 && !highest_lod;
+    auto strength=anisotropy?anisotropy:1U<<((control>>4)&3);
+    auto native_filter=(min_linear?0x10U:0U)|(mag==2?4U:0U)|(mip_linear?1U:0U);
+    if(strength>1 && min_linear && mag==2) native_filter=D3D11_FILTER_ANISOTROPIC;
+    else strength=1;
+    auto bias=int(filter&0x1FFF);if(bias&0x1000) bias-=0x2000;
+    // Ignore register fields that do not affect the native descriptor.
+    return {address&0x0F0F0F,native_filter,mip_enabled?std::uint32_t(bias):0U,
+            mip_enabled?(control>>18)&0xFFF:0U,mip_enabled?(control>>6)&0xFFF:0U,strength};
 }
 struct alignas(16) Constants {
     std::array<Float4, 8> factor0, factor1;
@@ -427,10 +438,14 @@ struct Renderer::Impl {
         std::uint32_t width,height;
         SurfaceColor color_format=SurfaceColor::rgba8;
         SurfaceDepth depth_format=SurfaceDepth::z24s8;
-        ComPtr<ID3D11Texture2D> color,depth,staging;
+        ComPtr<ID3D11Texture2D> color,depth,image,staging;
         ComPtr<ID3D11RenderTargetView> color_view;
         ComPtr<ID3D11DepthStencilView> depth_view;
-        ComPtr<ID3D11ShaderResourceView> texture_view;
+        ComPtr<ID3D11ShaderResourceView> texture_view,multisample_view,depth_texture,stencil_texture;
+        ComPtr<ID3D11Texture2D> responsive;
+        ComPtr<ID3D11RenderTargetView> responsive_target;
+        ComPtr<ID3D11ShaderResourceView> responsive_view;
+        bool dirty=false;
     };
     std::map<std::uint32_t,FrameTarget> targets;
     std::uint32_t current_target=0;
@@ -446,6 +461,23 @@ struct Renderer::Impl {
     ComPtr<ID3D11RasterizerState> display_raster;
     ComPtr<ID3D11DepthStencilState> display_depth;
     std::unique_ptr<FrameInterpolation> interpolation;
+    std::unique_ptr<FrameAntialiasing> antialiasing;
+    std::unique_ptr<FrameUpscaling> upscaler;
+    UpscaleMethod upscale_method=UpscaleMethod::off;
+    unsigned upscale_output_scale=0;
+    UpscaleFrame upscale_frame;
+    std::uint32_t camera_identifier=0;
+    bool upscaled=false,camera_valid=false,camera_reset=true;
+    std::chrono::steady_clock::time_point upscale_time{};
+    std::array<float,2> jitter{};
+    std::array<float,2> applied_jitter{};
+    std::array<ComPtr<ID3D11PixelShader>,9> responsive_combiners;
+    std::array<ComPtr<ID3D11PixelShader>,4> responsive_simple;
+    ComPtr<ID3D11VertexShader> jitter_vertex;
+    ComPtr<ID3D11Buffer> temporal_constants;
+    std::unique_ptr<MultisampleCopy> multisample_copy;
+    unsigned antialiasing_quality=0,anisotropy=0,samples=1,msaa_supported=0;
+    bool highest_lod=false;
     ComPtr<ID3D11VertexShader> clear_vs;
     ComPtr<ID3D11PixelShader> clear_ps;
     ComPtr<ID3D11Buffer> clear_constants;
@@ -460,7 +492,12 @@ struct Renderer::Impl {
         ComPtr<ID3D11RasterizerState> raster;
     };
     std::map<PipelineKey, Pipeline> pipelines;
+    ComPtr<ID3D11SamplerState> default_sampler;
     std::map<SamplerKey,ComPtr<ID3D11SamplerState>> sampler_states;
+    // Leave room under D3D11's device limit for 256 queued four-stage draws
+    // retaining evicted samplers, plus display and postprocessing samplers.
+    std::array<SamplerKey,1024> sampler_order{};
+    unsigned sampler_next=0;
     PipelineKey prepared_pipeline_key{};
     const Pipeline* prepared_pipeline=nullptr;
     std::array<SamplerKey,4> prepared_sampler_keys{};
@@ -469,6 +506,7 @@ struct Renderer::Impl {
         VertexProgram key;
         bool launch;
         ComPtr<ID3D11VertexShader> vertex;
+        ComPtr<ID3D11VertexShader> jitter_vertex;
         ComPtr<ID3D11ComputeShader> compute;
         ComPtr<ID3D11InputLayout> layout;
         Bytes signature;
@@ -496,6 +534,7 @@ struct Renderer::Impl {
         ProgramUniforms uniforms;
         UINT factor_offset=0,program_offset=0;
         bool factor_changed=false,program_changed=false;
+        UINT reused_streams=0,reused_bytes=0;
         std::uint32_t program_id=0;
     };
     std::array<StreamBatchDraw,256> stream_uploads{};
@@ -524,9 +563,9 @@ struct Renderer::Impl {
         return upload;
     }
     static void fill_streams(std::byte* destination,const StreamUpload& upload,std::span<const VertexStream> streams,
-                             const ProgramVertex& current,std::uint32_t count) {
-        std::memcpy(destination+upload.offsets[16],&current,sizeof(current));
-        for(unsigned i=0;i<streams.size();++i) if(upload.sizes[i]) {
+                             const ProgramVertex& current,std::uint32_t count,UINT reused=0) {
+        if(!(reused&(1U<<16))) std::memcpy(destination+upload.offsets[16],&current,sizeof(current));
+        for(unsigned i=0;i<streams.size();++i) if(upload.sizes[i] && !(reused&(1U<<i))) {
             const auto& source=streams[i];auto* output=destination+upload.offsets[i];
             const auto stride=upload.strides[i],size=upload.sizes[i];
             const auto copied=std::min<std::size_t>(size,source.bytes.size());
@@ -554,7 +593,8 @@ struct Renderer::Impl {
     std::string adapter;
     std::uint32_t width, height, resolution_scale;
     static constexpr std::size_t target_limit=1024ULL*1024*1024;
-    std::size_t target_size(unsigned w,unsigned h) const {return std::size_t(w)*h*resolution_scale*resolution_scale*12;}
+    std::size_t target_size(unsigned w,unsigned h) const {return std::size_t(w)*h*resolution_scale*resolution_scale*(samples>1?8*samples+8:12);}
+    std::size_t target_usage() const {return target_bytes+(antialiasing?antialiasing->bytes():0);}
     Float4 program_viewport(const ProgramView& view,bool edge_aligned=false) const {
         // Guest screen coordinates already include a half-pixel origin. Scale
         // geometry around that origin, then add the host's half physical pixel.
@@ -650,6 +690,21 @@ struct Renderer::Impl {
         const UINT flags = D3D11_CREATE_DEVICE_SINGLETHREADED | (debug ? D3D11_CREATE_DEVICE_DEBUG : 0);
         checked(D3D11CreateDevice(nullptr, warp ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE,
                                   nullptr, flags, levels, 1, D3D11_SDK_VERSION, &device, &level, &context), "D3D11 device");
+        D3D11_SAMPLER_DESC sampler{};sampler.Filter=D3D11_FILTER_MIN_MAG_MIP_POINT;
+        sampler.AddressU=sampler.AddressV=sampler.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampler.MaxAnisotropy=1;sampler.MaxLOD=4095;sampler.ComparisonFunc=D3D11_COMPARISON_NEVER;
+        checked(device->CreateSamplerState(&sampler,&default_sampler),"Default texture sampler");
+        for(unsigned count:{2U,4U,8U}) {
+            bool supported=true;
+            for(auto format:{DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_B5G6R5_UNORM,DXGI_FORMAT_D16_UNORM,DXGI_FORMAT_D24_UNORM_S8_UINT}) {
+                UINT quality=0;supported&=SUCCEEDED(device->CheckMultisampleQualityLevels(format,count,&quality)) && quality!=0;
+            }
+            for(auto format:{DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_B5G6R5_UNORM,DXGI_FORMAT_R16_UNORM,DXGI_FORMAT_R24_UNORM_X8_TYPELESS,DXGI_FORMAT_X24_TYPELESS_G8_UINT}) {
+                UINT flags=0;supported&=SUCCEEDED(device->CheckFormatSupport(format,&flags)) && (flags&D3D11_FORMAT_SUPPORT_MULTISAMPLE_LOAD)!=0;
+                if(format==DXGI_FORMAT_R8G8B8A8_UNORM || format==DXGI_FORMAT_B5G6R5_UNORM) supported&=(flags&D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE)!=0;
+            }
+            if(supported) msaa_supported|=count;
+        }
         D3D11_FEATURE_DATA_D3D11_OPTIONS options{};
         if(SUCCEEDED(device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS,&options,sizeof(options))) &&
             options.ConstantBufferOffsetting && options.MapNoOverwriteOnDynamicConstantBuffer) context.As(&constant_context);
@@ -730,7 +785,7 @@ struct Renderer::Impl {
             checked(device->CreateDepthStencilState(&desc,&clear_depths[mask]),"Clear depth/stencil mask");
         }
         D3D11_RASTERIZER_DESC clear_desc{};clear_desc.FillMode=D3D11_FILL_SOLID;clear_desc.CullMode=D3D11_CULL_NONE;
-        clear_desc.DepthClipEnable=clear_desc.ScissorEnable=TRUE;
+        clear_desc.DepthClipEnable=clear_desc.ScissorEnable=clear_desc.MultisampleEnable=TRUE;
         checked(device->CreateRasterizerState(&clear_desc,&clear_raster),"Clear rectangle state");
     }
     ~Impl() {if(frame_ready) CloseHandle(frame_ready);}
@@ -764,16 +819,38 @@ struct Renderer::Impl {
         D3D11_TEXTURE2D_DESC texture{};
         texture.Width=w*resolution_scale; texture.Height=h*resolution_scale; texture.MipLevels=texture.ArraySize=1;
         extent(texture.Width,texture.Height);
-        texture.Format=native_color; texture.SampleDesc.Count=1;
+        texture.Format=native_color; texture.SampleDesc.Count=samples;
         texture.BindFlags=D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         checked(device->CreateTexture2D(&texture,nullptr,&output.color), "Offscreen target");
         checked(device->CreateRenderTargetView(output.color.Get(),nullptr,&output.color_view), "Offscreen view");
-        checked(device->CreateShaderResourceView(output.color.Get(),nullptr,&output.texture_view),"Target texture view");
-        texture.Format=depth_format==SurfaceDepth::z16?DXGI_FORMAT_D16_UNORM:DXGI_FORMAT_D24_UNORM_S8_UINT; texture.BindFlags=D3D11_BIND_DEPTH_STENCIL;
+        if(samples>1) {
+            checked(device->CreateShaderResourceView(output.color.Get(),nullptr,&output.multisample_view),"Multisample colour view");
+            texture.SampleDesc.Count=1;checked(device->CreateTexture2D(&texture,nullptr,&output.image),"Resolved target");texture.SampleDesc.Count=samples;
+            output.dirty=true;
+        } else output.image=output.color;
+        checked(device->CreateShaderResourceView(output.image.Get(),nullptr,&output.texture_view),"Target texture view");
+        const auto native_depth=depth_format==SurfaceDepth::z16?DXGI_FORMAT_D16_UNORM:DXGI_FORMAT_D24_UNORM_S8_UINT;
+        texture.Format=depth_format==SurfaceDepth::z16?DXGI_FORMAT_R16_TYPELESS:DXGI_FORMAT_R24G8_TYPELESS;
+        texture.BindFlags=D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE;
         checked(device->CreateTexture2D(&texture,nullptr,&output.depth), "Depth target");
-        checked(device->CreateDepthStencilView(output.depth.Get(),nullptr,&output.depth_view), "Depth view");
+        D3D11_DEPTH_STENCIL_VIEW_DESC depth_view{};depth_view.Format=native_depth;
+        depth_view.ViewDimension=samples>1?D3D11_DSV_DIMENSION_TEXTURE2DMS:D3D11_DSV_DIMENSION_TEXTURE2D;
+        checked(device->CreateDepthStencilView(output.depth.Get(),&depth_view,&output.depth_view), "Depth view");
+        {
+            D3D11_SHADER_RESOURCE_VIEW_DESC view{};view.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2DMS;
+            if(samples==1) {view.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D;view.Texture2D.MipLevels=1;}
+            view.Format=depth_format==SurfaceDepth::z16?DXGI_FORMAT_R16_UNORM:DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+            checked(device->CreateShaderResourceView(output.depth.Get(),&view,&output.depth_texture),"Multisample depth view");
+            if(samples>1 && depth_format!=SurfaceDepth::z16) {view.Format=DXGI_FORMAT_X24_TYPELESS_G8_UINT;checked(device->CreateShaderResourceView(output.depth.Get(),&view,&output.stencil_texture),"Multisample stencil view");}
+        }
         // Readback storage is created only for explicit diagnostics.
         return output;
+    }
+    void resolve(FrameTarget& output) {
+        if(samples==1 || !output.dirty) return;
+        unbind_textures();context->OMSetRenderTargets(0,nullptr,nullptr);
+        context->ResolveSubresource(output.image.Get(),0,output.color.Get(),0,output.color_format==SurfaceColor::rgb565?DXGI_FORMAT_B5G6R5_UNORM:DXGI_FORMAT_R8G8B8A8_UNORM);
+        output.dirty=false;auto color=rtv.Get();context->OMSetRenderTargets(1,&color,dsv.Get());
     }
     void unbind_textures() {
         bound.valid=false;
@@ -787,7 +864,8 @@ struct Renderer::Impl {
         const auto& output=found->second;
         width=output.width;height=output.height;current_target=id;
         target=output.color;depth=output.depth;staging=output.staging;rtv=output.color_view;dsv=output.depth_view;
-        auto color=rtv.Get();context->OMSetRenderTargets(1,&color,dsv.Get());
+        const std::array<ID3D11RenderTargetView*,2> colors{rtv.Get(),output.responsive_target.Get()};
+        context->OMSetRenderTargets(output.responsive_target?2:1,colors.data(),dsv.Get());
         const D3D11_VIEWPORT viewport{0,0,float(width*resolution_scale),float(height*resolution_scale),0,1};
         context->RSSetViewports(1,&viewport);
     }
@@ -797,7 +875,8 @@ struct Renderer::Impl {
         if (target && width==w && height==h) return;
         const auto required=target_size(w,h);
         const auto prior=target?target_size(width,height):0;
-        if(required>target_limit-(target_bytes-prior)) throw std::runtime_error("Render targets exceed 1 GiB");
+        const auto aa=antialiasing_quality && antialiasing_quality<=3?required/3:0;
+        if(required+aa>target_limit-(target_bytes-prior)) throw std::runtime_error("Render targets exceed 1 GiB");
         auto output=make_target(w,h);
         targets.insert_or_assign(0,std::move(output));target_bytes=target_bytes-prior+required;
         select_target(0);ended=false;
@@ -814,26 +893,36 @@ void Renderer::reset(unsigned scale) {
     const auto width=r.targets.at(0).width,height=r.targets.at(0).height,previous=r.resolution_scale;
     r.resolution_scale=scale;
     Impl::FrameTarget main;
-    try {main=r.make_target(width,height);} catch(...) {r.resolution_scale=previous;throw;}
-    r.interpolation.reset();r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
+    try {
+        if(r.target_size(width,height)>Impl::target_limit) throw std::runtime_error("Render targets exceed 1 GiB; reduce resolution or MSAA.");
+        main=r.make_target(width,height);
+    } catch(...) {r.resolution_scale=previous;throw;}
+    r.interpolation.reset();r.antialiasing.reset();r.upscaler.reset();r.upscale_method=UpscaleMethod::off;
+    r.upscaled=r.camera_valid=false;r.camera_reset=true;r.camera_identifier=0;r.upscale_time={};
+    r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
     r.targets.clear();r.textures.resize(1);r.free_textures.clear();r.texture_bytes=0;
     r.targets.emplace(0,std::move(main));r.target_bytes=r.target_size(width,height);r.select_target(0);r.ended=false;
     const auto compilations=r.stats.shader_compilations;r.stats={};r.stats.shader_compilations=compilations;
     r.vertex_cursor=r.index_cursor=0;r.factors_valid=r.program_valid=false;
     r.factor_cursor=r.program_cursor=r.factor_offset=r.program_offset=0;
+    enhancements(r.antialiasing_quality,r.anisotropy);
 }
 void Renderer::resize(std::uint32_t width, std::uint32_t height) {
     auto& r=*impl_;const auto& main=r.targets.at(0);
-    const bool reset=r.interpolation && (main.width!=width || main.height!=height);
+    const bool changed=main.width!=width || main.height!=height,interpolate=bool(r.interpolation);
     r.resize(width,height);
-    if(reset) {r.interpolation.reset();interpolation(true);}
+    if(changed) {
+        if(r.upscale_method!=UpscaleMethod::off) configure_upscaling(r.upscale_method);
+        else if(r.antialiasing_quality) enhancements(r.antialiasing_quality,r.anisotropy);
+        else if(interpolate) {r.interpolation.reset();interpolation(true);}
+    }
 }
 std::uint32_t Renderer::create_target(std::uint32_t width,std::uint32_t height,SurfaceColor color,SurfaceDepth depth) {
     auto& r=*impl_;extent(width,height);
     PerfScope timing(r.profile,PerfPhase::resources);r.count(PerfMetric::target_creations);
     if(r.recording) throw std::runtime_error("Create render targets before frame submission");
     const auto required=r.target_size(width,height);
-    if(!r.texture_capacity() || required>Impl::target_limit-r.target_bytes)
+    if(!r.texture_capacity() || required>Impl::target_limit-r.target_usage())
         throw std::runtime_error("Render target resource limit reached");
     auto output=r.make_target(width,height,color,depth);
     const auto id=r.retain_texture(output.texture_view,1,0);
@@ -854,12 +943,16 @@ void Renderer::grow_target(std::uint32_t target,std::uint32_t width,std::uint32_
     if(width<prior.width || height<prior.height) throw std::runtime_error("Target growth cannot shrink either dimension");
     if(width==prior.width && height==prior.height) return;
     const auto previous=r.target_size(prior.width,prior.height),required=r.target_size(width,height);
-    if(required>Impl::target_limit-(r.target_bytes-previous)) throw std::runtime_error("Render targets exceed 1 GiB");
+    if(required>Impl::target_limit-(r.target_usage()-previous)) throw std::runtime_error("Render targets exceed 1 GiB");
     auto output=r.make_target(width,height,prior.color_format,prior.depth_format);
     r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
     constexpr float black[4]{};
     r.context->ClearRenderTargetView(output.color_view.Get(),black);
     r.context->ClearDepthStencilView(output.depth_view.Get(),D3D11_CLEAR_DEPTH|(prior.depth_format==SurfaceDepth::z16?0:D3D11_CLEAR_STENCIL),1,0);
+    if(r.samples>1) {
+        r.multisample_copy->grow(prior.multisample_view.Get(),prior.depth_texture.Get(),prior.stencil_texture.Get(),
+            output.color_view.Get(),output.depth_view.Get(),prior.width*r.resolution_scale,prior.height*r.resolution_scale);
+    } else {
     r.context->CopySubresourceRegion(output.color.Get(),0,0,0,0,prior.color.Get(),0,nullptr);
     // Depth/stencil resources require whole copies with matching dimensions.
     // Migrate their packed bits through ordinary typeless textures, then copy
@@ -874,6 +967,7 @@ void Renderer::grow_target(std::uint32_t target,std::uint32_t width,std::uint32_
     r.context->CopyResource(grown_depth.Get(),output.depth.Get());
     r.context->CopySubresourceRegion(grown_depth.Get(),0,0,0,0,previous_depth.Get(),0,nullptr);
     r.context->CopyResource(output.depth.Get(),grown_depth.Get());
+    }
     found->second=std::move(output);r.textures[target].view=found->second.texture_view;
     r.target_bytes=r.target_bytes-previous+required;r.select_target(r.current_target);
 }
@@ -886,6 +980,8 @@ void Renderer::copy_target(std::uint32_t destination) {
         throw std::runtime_error("Target copy requires a distinct target with matching dimensions");
     r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
     r.context->CopyResource(found->second.color.Get(),r.target.Get());
+    found->second.dirty=true;
+    if(!destination && r.antialiasing) r.antialiasing->invalidate();
     auto view=r.rtv.Get();r.context->OMSetRenderTargets(1,&view,r.dsv.Get());
 }
 std::uint32_t Renderer::copy_cubemap(const std::array<std::uint32_t,6>& faces,std::uint32_t destination) {
@@ -897,7 +993,7 @@ std::uint32_t Renderer::copy_cubemap(const std::array<std::uint32_t,6>& faces,st
     for(unsigned face=0;face<faces.size();++face) {
         const auto found=r.targets.find(faces[face]);
         if(found==r.targets.end()) throw std::runtime_error("Cubemap face is not a render target");
-        sources[face]=found->second.color.Get();
+        r.resolve(found->second);sources[face]=found->second.image.Get();
         D3D11_TEXTURE2D_DESC source{};sources[face]->GetDesc(&source);
         if(!face) description=source;
         if(source.Width!=source.Height || source.Width!=description.Width || source.Format!=description.Format)
@@ -951,6 +1047,8 @@ void Renderer::copy_to_main() {
     }
     r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
     r.context->CopyResource(r.target.Get(),source.Get());
+    r.targets.at(0).dirty=true;
+    if(r.antialiasing) r.antialiasing->invalidate();
     r.ended=true;
 }
 ID3D11Device* Renderer::native_device() const {return impl_->device.Get();}
@@ -995,12 +1093,127 @@ void Renderer::attach_window(void* native_window) {
     r.window=window;
 }
 void Renderer::widescreen(bool enabled) {impl_->widescreen=enabled;}
+unsigned Renderer::raster_samples_per_pixel() const {return impl_->samples*impl_->resolution_scale*impl_->resolution_scale;}
+void Renderer::lod_override(bool enabled) {
+    auto& r=*impl_;
+    if(r.recording || r.targets.size()!=1 || r.texture_bytes) throw std::runtime_error("Change LOD override between game sessions.");
+    r.highest_lod=enabled;
+}
+bool Renderer::supports_msaa(unsigned samples) const {return samples>=2 && samples<=8 && std::has_single_bit(samples) && (impl_->msaa_supported&samples)!=0;}
+bool Renderer::supports_upscaling(UpscaleMethod method) const {
+    if(method==UpscaleMethod::off) return true;
+    if(method<UpscaleMethod::dlss || method>UpscaleMethod::xess) return false;
+    ComPtr<IDXGIDevice> device;ComPtr<IDXGIAdapter> adapter;DXGI_ADAPTER_DESC desc{};
+    if(FAILED(impl_->device.As(&device)) || FAILED(device->GetAdapter(&adapter)) || FAILED(adapter->GetDesc(&desc))) return false;
+    if(desc.VendorId==0x1414) return false;
+    return method!=UpscaleMethod::dlss || desc.VendorId==0x10DE;
+}
+void Renderer::upscaling(UpscaleMethod method,unsigned output_scale) {
+    auto& r=*impl_;
+    if(r.recording || r.targets.size()!=1 || r.texture_bytes) throw std::runtime_error("Change upscaling between game sessions.");
+    if(output_scale>8 || (output_scale && output_scale<r.resolution_scale)) throw std::runtime_error("Invalid upscaling output resolution");
+    r.upscale_output_scale=output_scale?output_scale:r.resolution_scale*2;
+    configure_upscaling(method);
+}
+void Renderer::configure_upscaling(UpscaleMethod method) {
+    auto& r=*impl_;
+    if(r.recording) throw std::runtime_error("Configure upscaling outside frame submission.");
+    if(!supports_upscaling(method)) throw std::runtime_error("This upscaling technique is unavailable on your graphics device.");
+    const bool interpolate=bool(r.interpolation);r.interpolation.reset();
+    r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
+    r.upscaler.reset();r.upscale_method=UpscaleMethod::off;r.upscaled=false;
+    auto& main=r.targets.at(0);main.responsive.Reset();main.responsive_target.Reset();main.responsive_view.Reset();
+    r.camera_valid=false;r.camera_identifier=0;r.camera_reset=true;r.upscale_time={};r.applied_jitter={};
+    try { if(method!=UpscaleMethod::off) {
+        if(r.samples!=1 || r.antialiasing) throw std::runtime_error("Upscaling supplies antialiasing; disable separate antialiasing before enabling it.");
+        const auto width=main.width*r.resolution_scale,height=main.height*r.resolution_scale;
+        auto next=std::make_unique<FrameUpscaling>(r.device.Get(),r.context.Get(),method,width,height,
+            main.width*r.upscale_output_scale,main.height*r.upscale_output_scale);
+        next->prepare_frames(r.stats.shader_compilations);
+        D3D11_TEXTURE2D_DESC mask{};mask.Width=width;mask.Height=height;mask.MipLevels=mask.ArraySize=1;
+        mask.Format=DXGI_FORMAT_R8_UNORM;mask.SampleDesc.Count=1;mask.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE;
+        checked(r.device->CreateTexture2D(&mask,nullptr,&main.responsive),"Upscaling responsive image");
+        checked(r.device->CreateRenderTargetView(main.responsive.Get(),nullptr,&main.responsive_target),"Upscaling responsive target");
+        checked(r.device->CreateShaderResourceView(main.responsive.Get(),nullptr,&main.responsive_view),"Upscaling responsive view");
+        const float zero[4]={};r.context->ClearRenderTargetView(main.responsive_target.Get(),zero);
+        if(!r.temporal_constants) {
+            D3D11_BUFFER_DESC buffer{32,D3D11_USAGE_DYNAMIC,D3D11_BIND_CONSTANT_BUFFER,D3D11_CPU_ACCESS_WRITE,0,0};
+            checked(r.device->CreateBuffer(&buffer,nullptr,&r.temporal_constants),"Temporal draw constants");
+            const auto vs=r.shader(ShaderKind::passthrough_jitter);
+            checked(r.device->CreateVertexShader(vs.data(),vs.size(),nullptr,&r.jitter_vertex),"Jittered vertex shader");
+            for(unsigned i=0;i<r.responsive_combiners.size();++i) {
+                const auto pixel=r.shader(ShaderKind(unsigned(ShaderKind::responsive_combiner0)+i));
+                checked(r.device->CreatePixelShader(pixel.data(),pixel.size(),nullptr,&r.responsive_combiners[i]),"Responsive combiner shader");
+            }
+            for(unsigned i=0;i<r.responsive_simple.size();++i) {
+                const auto pixel=r.shader(ShaderKind(unsigned(ShaderKind::responsive_color)+i));
+                checked(r.device->CreatePixelShader(pixel.data(),pixel.size(),nullptr,&r.responsive_simple[i]),"Responsive simple shader");
+            }
+        }
+        for(auto& program:r.programs) if(!program.launch && !program.screen_space && !program.jitter_vertex) {
+            const auto binary=program.fixed?shader_binary(ShaderKind(unsigned(ShaderKind::fixed_jitter0)+program.fixed_key.skin)):
+                shader_binary(ShaderKind::vertex_jitter,&program.key);
+            r.stats.shader_compilations+=binary.compiled;
+            checked(r.device->CreateVertexShader(binary.bytes.data(),binary.bytes.size(),nullptr,&program.jitter_vertex),"Jittered program shader");
+        }
+        r.upscaler=std::move(next);r.upscale_method=method;r.jitter={0,-1.0f/6};
+    } } catch(...) {
+        main.responsive.Reset();main.responsive_target.Reset();main.responsive_view.Reset();
+        r.temporal_constants.Reset();r.jitter_vertex.Reset();
+        for(auto& shader:r.responsive_combiners) shader.Reset();
+        for(auto& shader:r.responsive_simple) shader.Reset();
+        r.select_target(0);if(interpolate) interpolation(true);throw;
+    }
+    r.select_target(0);if(interpolate) interpolation(true);
+}
+void Renderer::camera(std::uint32_t identifier,float near_plane,float far_plane,float vertical_fov) {
+    auto& r=*impl_;if(!r.upscaler) return;
+    if(!(near_plane>0) || !(far_plane>near_plane) || !std::isfinite(far_plane) || !(vertical_fov>0 && vertical_fov<3.141593f)) return;
+    r.camera_reset|=r.camera_identifier!=identifier;
+    r.camera_identifier=identifier;r.camera_valid=true;
+    r.upscale_frame.camera_near=near_plane;r.upscale_frame.camera_far=far_plane;r.upscale_frame.vertical_fov=vertical_fov;
+}
+void Renderer::enhancements(unsigned quality,unsigned anisotropy) {
+    auto& r=*impl_;
+    if(r.recording || quality>6 || anisotropy>16 || (anisotropy && !std::has_single_bit(anisotropy)))
+        throw std::runtime_error("Configure valid graphics enhancements outside submission.");
+    const auto samples=quality>=4?1U<<(quality-3):1U;
+    if(samples>1 && !supports_msaa(samples)) throw std::runtime_error(std::format("MSAA {}x is unavailable on this graphics device.",samples));
+    if(samples>1 && !r.multisample_copy) r.multisample_copy=std::make_unique<MultisampleCopy>(r.device.Get(),r.context.Get(),r.stats.shader_compilations);
+    if(samples!=r.samples) {
+        if(r.targets.size()!=1 || r.texture_bytes) throw std::runtime_error("Change MSAA between game sessions.");
+        const auto previous_samples=r.samples,previous_quality=r.antialiasing_quality,previous_anisotropy=r.anisotropy;
+        const auto previous_target=r.targets.at(0).color.Get();
+        const bool interpolate=bool(r.interpolation);
+        r.samples=samples;r.antialiasing_quality=quality;r.anisotropy=anisotropy;
+        try {reset(r.resolution_scale);} catch(...) {
+            if(r.targets.at(0).color.Get()==previous_target) {
+                r.samples=previous_samples;r.antialiasing_quality=previous_quality;r.anisotropy=previous_anisotropy;
+                if(previous_samples==1) r.multisample_copy.reset();
+            }
+            throw;
+        }
+        if(interpolate) interpolation(true);return;
+    }
+    std::unique_ptr<FrameAntialiasing> next;
+    if(quality && quality<=3) {
+        const auto& main=r.targets.at(0);
+        const auto bytes=std::size_t(main.width)*main.height*r.resolution_scale*r.resolution_scale*4;
+        if(bytes>Impl::target_limit-r.target_bytes) throw std::runtime_error("Antialiasing exceeds the render-target budget.");
+        next=std::make_unique<FrameAntialiasing>(r.device.Get(),r.context.Get(),main.width*r.resolution_scale,main.height*r.resolution_scale,quality,r.stats.shader_compilations);
+        r.count(PerfMetric::target_creations);
+    }
+    if(samples==1) r.multisample_copy.reset();
+    r.unbind_textures();r.antialiasing=std::move(next);r.antialiasing_quality=quality;r.anisotropy=anisotropy;
+    const bool interpolate=bool(r.interpolation);
+    r.interpolation.reset();if(interpolate) interpolation(true);
+}
 void Renderer::interpolation(bool enabled) {
     auto& r=*impl_;
     if(!enabled) {r.interpolation.reset();return;}
     if(r.recording) throw std::runtime_error("Configure interpolation outside frame submission");
     if(!r.interpolation) {
-        D3D11_TEXTURE2D_DESC image{};r.targets.at(0).color->GetDesc(&image);
+        D3D11_TEXTURE2D_DESC image{};(r.upscaler?r.upscaler->image():r.targets.at(0).image.Get())->GetDesc(&image);
         r.interpolation=std::make_unique<FrameInterpolation>(r.device.Get(),r.context.Get(),image.Width,image.Height,r.stats.shader_compilations);
     }
 }
@@ -1008,9 +1221,37 @@ void Renderer::publish_frame(bool reset) {
     auto& r=*impl_;
     PerfScope timing(r.profile,PerfPhase::publish);
     if(r.recording || !r.ended) throw std::runtime_error("Publish a completed game frame");
-    {GpuSpan gpu(r.gpu_meter.get(),2);if(r.interpolation) r.interpolation->publish(r.targets.at(0).color.Get(),reset);}
+    {GpuSpan gpu(r.gpu_meter.get(),2);
+        auto& main=r.targets.at(0);r.resolve(main);
+        if(r.upscaler && r.camera_valid) {
+            const auto now=std::chrono::steady_clock::now();
+            r.upscale_frame.elapsed_ms=r.upscale_time.time_since_epoch().count()?std::chrono::duration<float,std::milli>(now-r.upscale_time).count():1000.0f/60;
+            r.upscale_frame.reset=reset || r.camera_reset || r.upscale_frame.elapsed_ms>250;
+            r.upscale_frame.jitter_x=r.applied_jitter[0];r.upscale_frame.jitter_y=r.applied_jitter[1];
+            r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
+            r.upscaler->publish_frame(main.image.Get(),main.depth_texture.Get(),main.responsive_view.Get(),r.upscale_frame);
+            r.upscaled=true;r.camera_reset=false;r.upscale_time=now;
+            const auto halton=[](unsigned index,unsigned base) {float result=0,factor=1;for(;index;index/=base){factor/=base;result+=factor*(index%base);}return result-0.5f;};
+            const auto phase=unsigned((r.stats.published_frames+1)%32)+1;
+            r.jitter={halton(phase,2),halton(phase,3)};r.applied_jitter={};
+            const float zero[4]={};r.context->ClearRenderTargetView(main.responsive_target.Get(),zero);r.select_target(r.current_target);
+        }
+        if(r.antialiasing) {r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);r.antialiasing->publish(main.texture_view.Get());r.select_target(r.current_target);}
+        if(r.interpolation) {
+            if(!r.upscaler || r.upscaled) r.interpolation->publish(r.upscaled?r.upscaler->image():r.antialiasing?r.antialiasing->image():main.image.Get(),reset);
+        }
+    }
     ++r.stats.published_frames;
     if(r.gpu_meter) r.gpu_meter->boundary(r.stats.published_frames+1);
+}
+bool Renderer::wait_frame(unsigned timeout_ms) {
+    auto& r=*impl_;if(r.frame_acquired) return true;
+    if(!r.frame_ready) throw std::runtime_error("A window is required for presentation pacing");
+    PerfScope availability(r.profile,PerfPhase::present);
+    const auto result=WaitForSingleObject(r.frame_ready,timeout_ms);
+    if(result==WAIT_TIMEOUT) return false;
+    if(result!=WAIT_OBJECT_0) throw std::runtime_error("Window frame availability wait failed");
+    r.frame_acquired=true;return true;
 }
 bool Renderer::display(float phase,bool wait) {
     auto& r=*impl_;
@@ -1021,13 +1262,7 @@ bool Renderer::display(float phase,bool wait) {
     const auto width=static_cast<std::uint32_t>(rectangle.right),height=static_cast<std::uint32_t>(rectangle.bottom);
     if(!width || !height) return false;
     extent(width,height);
-    if(!r.frame_acquired) {
-        PerfScope availability(r.profile,PerfPhase::present);
-        const auto result=WaitForSingleObject(r.frame_ready,wait?INFINITE:0);
-        if(result==WAIT_TIMEOUT) return false;
-        if(result!=WAIT_OBJECT_0) throw std::runtime_error("Window frame availability wait failed");
-        r.frame_acquired=true;
-    }
+    if(!wait_frame(wait?INFINITE:0)) return false;
     GpuSpan gpu(r.gpu_meter.get(),2);
     r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
     if(!r.window_view || r.window_width!=width || r.window_height!=height) {
@@ -1038,9 +1273,9 @@ bool Renderer::display(float phase,bool wait) {
         checked(r.device->CreateRenderTargetView(buffer.Get(),nullptr,&r.window_view),"Window render target");
         r.window_width=width;r.window_height=height;
     }
+    auto& main=r.targets.at(0);r.resolve(main);
     auto output=r.window_view.Get();r.context->OMSetRenderTargets(1,&output,nullptr);
     const float black[4]={0,0,0,1};r.context->ClearRenderTargetView(output,black);
-    const auto& main=r.targets.at(0);
     const auto display_width=r.widescreen?main.height*(16.0f/9.0f):float(main.width);
     const auto scale=std::min(float(width)/display_width,float(height)/main.height);
     const auto image_width=display_width*scale,image_height=main.height*scale;
@@ -1049,7 +1284,8 @@ bool Renderer::display(float phase,bool wait) {
     r.context->OMSetBlendState(nullptr,nullptr,UINT_MAX);
     r.context->IASetInputLayout(nullptr);r.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     r.context->VSSetShader(r.display_vs.Get(),nullptr,0);r.context->PSSetShader(r.display_ps.Get(),nullptr,0);
-    auto texture=r.interpolation && r.interpolation->published()?r.interpolation->current():main.texture_view.Get();
+    auto texture=r.interpolation && r.interpolation->published()?r.interpolation->current():
+        r.upscaled?r.upscaler->view():r.antialiasing && r.antialiasing->ready()?r.antialiasing->view():main.texture_view.Get();
     auto sampler=r.display_sampler.Get();
     if(r.interpolation && r.interpolation->ready() && phase<1) {
         if(phase==0) texture=r.interpolation->previous();
@@ -1077,7 +1313,8 @@ void Renderer::performance(Performance* profile) {
 }
 RenderResources Renderer::resources() const {
     const auto& r=*impl_;RenderResources result;
-    result.textures=r.textures.size()-1-r.free_textures.size();result.targets=r.targets.size();result.texture_bytes=r.texture_bytes;result.target_bytes=r.target_bytes;
+    result.textures=r.textures.size()-1-r.free_textures.size();result.targets=r.targets.size()+unsigned(bool(r.antialiasing));result.texture_bytes=r.texture_bytes;
+    result.target_bytes=r.target_bytes+(r.antialiasing?r.antialiasing->bytes():0);
     if(r.memory_adapter) {
         DXGI_QUERY_VIDEO_MEMORY_INFO local{},shared{};
         result.gpu_valid=SUCCEEDED(r.memory_adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_LOCAL,&local)) && SUCCEEDED(r.memory_adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,&shared));
@@ -1206,40 +1443,38 @@ Renderer::PreparedState Renderer::prepare(const RenderState& state) {
     // Sampling varies per texture, independently of blend/depth/raster state.
     // Sharing these objects avoids rebuilding whole pipelines for LOD changes.
     for(unsigned i=0;i<4;++i) {
-        const auto key=sampler_key(state,i);
+        const auto mode=state.texture_modes[i];
+        if(!mode || mode==4 || mode==5) continue;
+        const auto key=sampler_key(state,i,r.anisotropy,r.highest_lod);
         if(r.prepared_samplers[i] && !std::memcmp(&key,&r.prepared_sampler_keys[i],sizeof(key))) {
             prepared.samplers_[i]=r.prepared_samplers[i];continue;
         }
         if(const auto found=r.sampler_states.find(key);found!=r.sampler_states.end()) {
             prepared.samplers_[i]=found->second.Get();
-            r.prepared_sampler_keys[i]=key;r.prepared_samplers[i]=prepared.samplers_[i];continue;
+            r.prepared_sampler_keys[i]=key;r.prepared_samplers[i]=prepared.samplers_[i].Get();continue;
         }
-        if(r.sampler_states.size()>=4096) throw std::runtime_error("Sampler cache limit reached");
-        const auto filter=key[1],control=key[2];
-        const auto min=(filter>>16)&63,mag=(filter>>24)&15;
-        if(min<1 || min>6 || mag<1 || mag>2) throw std::runtime_error("Unsupported NV097 texture filter");
-        const bool min_linear=(min&1)==0,mip_linear=min>=5,mip_enabled=min>=3;
+        if(r.sampler_states.size()==r.sampler_order.size()) {
+            const auto oldest=r.sampler_states.find(r.sampler_order[r.sampler_next]);
+            for(auto& cached:r.prepared_samplers) if(cached==oldest->second.Get()) cached=nullptr;
+            r.sampler_states.erase(oldest);
+        }
         D3D11_SAMPLER_DESC sampler{};
-        sampler.Filter=D3D11_FILTER((min_linear?0x10:0)|(mag==2?4:0)|(mip_linear?1:0));
+        sampler.Filter=D3D11_FILTER(key[1]);
         sampler.AddressU=address_mode(key[0]&15);
         sampler.AddressV=address_mode((key[0]>>8)&15);
         sampler.AddressW=address_mode((key[0]>>16)&15);
-        sampler.MaxAnisotropy=1U<<((control>>4)&3);
-        if(sampler.MaxAnisotropy>1 && min_linear && mag==2) sampler.Filter=D3D11_FILTER_ANISOTROPIC;
+        sampler.MaxAnisotropy=key[5];
         sampler.ComparisonFunc=D3D11_COMPARISON_NEVER;
-        if(mip_enabled) {
-            // NV097 stores a signed 13-bit bias with eight fractional bits.
-            auto bias=int(filter&0x1FFF);if(bias&0x1000) bias-=0x2000;
-            sampler.MipLODBias=float(bias)/256;
-            sampler.MinLOD=float((control>>18)&0xFFF);sampler.MaxLOD=float((control>>6)&0xFFF);
-        }
+        sampler.MipLODBias=float(std::bit_cast<std::int32_t>(key[2]))/256;
+        sampler.MinLOD=float(key[3]);sampler.MaxLOD=float(key[4]);
         ComPtr<ID3D11SamplerState> native;
         checked(r.device->CreateSamplerState(&sampler,&native),"Sampler state");
         prepared.samplers_[i]=r.sampler_states.emplace(key,std::move(native)).first->second.Get();
-        r.prepared_sampler_keys[i]=key;r.prepared_samplers[i]=prepared.samplers_[i];
+        r.sampler_order[r.sampler_next]=key;r.sampler_next=(r.sampler_next+1)%r.sampler_order.size();
+        r.prepared_sampler_keys[i]=key;r.prepared_samplers[i]=prepared.samplers_[i].Get();
         r.count(PerfMetric::sampler_misses);
     }
-    const auto key = pipeline_key(state);
+    const auto key = pipeline_key(state,r.samples>1,bool(r.upscaler));
     if(r.prepared_pipeline && !std::memcmp(&key,&r.prepared_pipeline_key,sizeof(key))) {
         prepared.pipeline_=r.prepared_pipeline;return prepared;
     }
@@ -1250,6 +1485,7 @@ Renderer::PreparedState Renderer::prepare(const RenderState& state) {
     if (r.pipelines.size() >= 1024) throw std::runtime_error("Pipeline cache limit reached");
     Impl::Pipeline pipeline;
     D3D11_BLEND_DESC blend{};
+    if(r.upscaler) {blend.IndependentBlendEnable=TRUE;blend.RenderTarget[1].RenderTargetWriteMask=state.color_mask?D3D11_COLOR_WRITE_ENABLE_RED:0;}
     auto& output = blend.RenderTarget[0];
     output.BlendEnable = state.blend;
     output.SrcBlend = blend_factor(state.blend_source); output.DestBlend = blend_factor(state.blend_destination);
@@ -1280,6 +1516,7 @@ Renderer::PreparedState Renderer::prepare(const RenderState& state) {
     }
     raster.FrontCounterClockwise = state.front_ccw;
     raster.ScissorEnable=state.scissor_test;
+    raster.MultisampleEnable=r.samples>1;
     if(state.polygon_offset) {
         if(!std::isfinite(state.polygon_offset_scale) || !std::isfinite(state.polygon_offset_bias) ||
             std::abs(state.polygon_offset_bias)>=2147483648.0f) throw std::runtime_error("Invalid polygon offset");
@@ -1338,6 +1575,10 @@ std::uint32_t Renderer::prepare_program(const VertexProgram& program,bool launch
             inputs[i]={"TEXCOORD",i,DXGI_FORMAT_R32G32B32A32_FLOAT,0,i*static_cast<UINT>(sizeof(Float4)),D3D11_INPUT_PER_VERTEX_DATA,0};
         checked(r.device->CreateInputLayout(inputs.data(),static_cast<UINT>(inputs.size()),code.data(),code.size(),&prepared.layout),"Program vertex layout");
     }
+    if(r.upscaler && !prepared.launch && !prepared.screen_space) {
+        const auto jitter=shader_binary(ShaderKind::vertex_jitter,&key);r.stats.shader_compilations+=jitter.compiled;
+        checked(r.device->CreateVertexShader(jitter.bytes.data(),jitter.bytes.size(),nullptr,&prepared.jitter_vertex),"Jittered program shader");
+    }
     r.programs.push_back(std::move(prepared));
     r.count(PerfMetric::program_creations);
     return static_cast<std::uint32_t>(r.programs.size());
@@ -1354,6 +1595,10 @@ std::uint32_t Renderer::prepare_fixed(const FixedTransform& transform) {
     prepared.constant_first=metadata.constant_first;prepared.constant_count=metadata.constant_count;
     prepared.upload_first=metadata.constant_first;prepared.upload_count=metadata.constant_count;
     prepared.signature=r.fixed_signatures[transform.skin];prepared.vertex=r.fixed_vertices[transform.skin];prepared.layout=r.fixed_layouts[transform.skin];
+    if(r.upscaler) {
+        const auto jitter=shader_binary(ShaderKind(unsigned(ShaderKind::fixed_jitter0)+transform.skin));r.stats.shader_compilations+=jitter.compiled;
+        checked(r.device->CreateVertexShader(jitter.bytes.data(),jitter.bytes.size(),nullptr,&prepared.jitter_vertex),"Jittered fixed shader");
+    }
     r.programs.push_back(std::move(prepared));r.count(PerfMetric::program_creations);return static_cast<std::uint32_t>(r.programs.size());
 }
 void Renderer::snapshot_constants(std::uint32_t program,const VertexConstants& source,VertexConstants& destination,std::uint32_t& previous) {
@@ -1413,7 +1658,9 @@ void Renderer::clear(std::uint32_t argb, float depth) {
     auto& r = *impl_;
     PerfScope timing(r.profile,PerfPhase::render);GpuSpan gpu(r.gpu_meter.get(),0);
     if (!std::isfinite(depth) || depth < 0 || depth > 1) throw std::runtime_error("Invalid clear depth");
+    if(!r.current_target && r.antialiasing) r.antialiasing->invalidate();
     const auto rgba = color(argb);
+    if(r.samples>1) r.targets.at(r.current_target).dirty=true;
     r.context->ClearRenderTargetView(r.rtv.Get(), rgba.data());
     r.context->ClearDepthStencilView(r.dsv.Get(),D3D11_CLEAR_DEPTH|
         (r.targets.at(r.current_target).depth_format==SurfaceDepth::z16?0:D3D11_CLEAR_STENCIL),depth,0);
@@ -1423,6 +1670,8 @@ void Renderer::clear_buffers(std::uint32_t flags,std::uint32_t argb,float depth,
     auto& r=*impl_;
     PerfScope timing(r.profile,PerfPhase::render);GpuSpan gpu(r.gpu_meter.get(),0);
     if(flags&~0xF3U) throw std::runtime_error("Invalid clear channel flags");
+    if((flags&0xF0U) && !r.current_target && r.antialiasing) r.antialiasing->invalidate();
+    if(r.samples>1 && (flags&0xF0U)) r.targets.at(r.current_target).dirty=true;
     if(r.targets.at(r.current_target).depth_format==SurfaceDepth::z16) flags&=~2U;
     if(!std::isfinite(depth) || depth<0 || depth>1) throw std::runtime_error("Invalid clear depth");
     if(!rectangle.empty() && rectangle.size()!=4) throw std::runtime_error("A clear rectangle requires four coordinates");
@@ -1456,6 +1705,7 @@ void Renderer::clear_buffers(std::uint32_t flags,std::uint32_t argb,float depth,
 void Renderer::begin(std::uint32_t argb, float depth, bool clear_target) {
     auto& r = *impl_;
     if (r.recording) throw std::runtime_error("Frame already begun");
+    if(!r.current_target && r.antialiasing) r.antialiasing->invalidate();
     if(clear_target) clear(argb, depth);
     // Clear, presentation and native-context users may change bindings between
     // batches. Within a batch only changed state needs another driver call.
@@ -1468,8 +1718,9 @@ void Renderer::begin(std::uint32_t argb, float depth, bool clear_target) {
     }
     if(r.gpu_meter) r.gpu_meter->begin(0);
     r.recording = true; r.ended = false;
-    auto target = r.rtv.Get();
-    r.context->OMSetRenderTargets(1, &target, r.dsv.Get());
+    const auto& output=r.targets.at(r.current_target);
+    const std::array<ID3D11RenderTargetView*,2> targets{r.rtv.Get(),output.responsive_target.Get()};
+    r.context->OMSetRenderTargets(output.responsive_target?2:1,targets.data(),r.dsv.Get());
     const D3D11_VIEWPORT viewport{0, 0, float(r.width*r.resolution_scale), float(r.height*r.resolution_scale), 0, 1};
     r.context->RSSetViewports(1, &viewport);
 }
@@ -1515,8 +1766,22 @@ void Renderer::draw_streams(std::span<const StreamDraw> draws) {
             const auto& draw=draws[last];
             if(!draw.state || !draw.constants || !draw.view || !draw.current) throw std::runtime_error("Incomplete queued draw");
             auto upload=r.stream_storage(draw.layout,draw.streams,draw.count);
-            const auto aligned=(bytes+15)&~15U;
-            if(upload.bytes>Impl::max_vertices*sizeof(ProgramVertex)-aligned) break;
+            UINT next_bytes=bytes,reused=0,reused_bytes=0;
+            const auto* previous=last>first?&draws[last-1]:nullptr;
+            const auto* previous_upload=previous?&r.stream_uploads[last-1].vertices:nullptr;
+            if(previous && !std::memcmp(draw.current,previous->current,sizeof(ProgramVertex))) {
+                upload.offsets[16]=previous_upload->offsets[16];reused|=1U<<16;reused_bytes+=sizeof(ProgramVertex);
+            } else {next_bytes=(next_bytes+15)&~15U;upload.offsets[16]=next_bytes;next_bytes+=sizeof(ProgramVertex);}
+            for(unsigned stream=0;stream<draw.streams.size();++stream) if(upload.sizes[stream]) {
+                const auto& source=draw.streams[stream];
+                if(previous && stream<previous->streams.size() &&
+                   source.bytes.data()==previous->streams[stream].bytes.data() && source.bytes.size()==previous->streams[stream].bytes.size() &&
+                   source.stride==previous->streams[stream].stride && upload.strides[stream]==previous_upload->strides[stream] &&
+                   upload.sizes[stream]==previous_upload->sizes[stream]) {
+                    upload.offsets[stream]=previous_upload->offsets[stream];reused|=1U<<stream;reused_bytes+=upload.sizes[stream];
+                } else {next_bytes=(next_bytes+15)&~15U;upload.offsets[stream]=next_bytes;next_bytes+=upload.sizes[stream];}
+            }
+            if(next_bytes>Impl::max_vertices*sizeof(ProgramVertex)) break;
             auto indices=Impl::plan_indices(draw.state->primitive,draw.count,draw.indices);
             const auto index_size=indices.count*4;
             if(index_size>Impl::max_indices*4-index_bytes) break;
@@ -1538,8 +1803,8 @@ void Renderer::draw_streams(std::span<const StreamDraw> draws) {
                 if(staged.factor_changed) factor_bytes+=factor_size;
                 if(staged.program_changed) program_bytes+=program_size;
             }
-            for(auto& offset:upload.offsets) offset+=aligned;
-            bytes=aligned+upload.bytes;staged.vertices=upload;
+            upload.bytes=next_bytes-bytes;bytes=next_bytes;staged.vertices=upload;
+            staged.reused_streams=reused;staged.reused_bytes=reused_bytes;
             indices.offset=index_bytes;staged.indices=indices;index_bytes+=index_size;
         }
         UINT base=0;
@@ -1576,7 +1841,8 @@ void Renderer::draw_streams(std::span<const StreamDraw> draws) {
             auto* destination=r.append_buffer(r.vertices.Get(),Impl::max_vertices*sizeof(ProgramVertex),r.vertex_cursor,bytes,base);
             for(auto i=first;i<last;++i) {
                 const auto& draw=draws[i];auto& upload=r.stream_uploads[i].vertices;
-                Impl::fill_streams(destination,upload,draw.streams,*draw.current,draw.count);
+                Impl::fill_streams(destination,upload,draw.streams,*draw.current,draw.count,r.stream_uploads[i].reused_streams);
+                r.stats.reused_vertex_bytes+=r.stream_uploads[i].reused_bytes;
                 for(auto& offset:upload.offsets) offset+=base;
             }
             r.context->Unmap(r.vertices.Get(),0);
@@ -1661,7 +1927,7 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
         if(bindings->owner_!=&r || !bindings->pipeline_) throw std::runtime_error("Draw bindings belong to another renderer");
         selected=static_cast<const Pipeline*>(bindings->pipeline_);
     } else {
-        const auto found=r.pipelines.find(pipeline_key(state));
+            const auto found=r.pipelines.find(pipeline_key(state,r.samples>1,bool(r.upscaler)));
         if(found==r.pipelines.end()) throw std::runtime_error("Pipeline was not prepared before submission");
         selected=&found->second;
     }
@@ -1699,6 +1965,7 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
     const auto* constants=constant_batch?&constant_batch->factors:&local_factors.emplace(fragment_constants(state));
     std::array<ID3D11ShaderResourceView*, 12> views{};
     std::array<ID3D11SamplerState*, 4> samplers{};
+    samplers.fill(r.default_sampler.Get()); // Static shaders declare all four slots.
     for (unsigned i = 0; i < 4; ++i) {
         const auto mode=state.texture_modes[i];
         const bool sampled=mode && mode!=4 && mode!=5;
@@ -1708,10 +1975,13 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
             throw std::runtime_error("Copy the active render target before sampling its contents");
         if(sampled && r.textures[state.textures[i]].dimension!=(mode==3?3U:mode==2?2U:1U))
             throw std::runtime_error("Texture resource dimension does not match its shader mode");
-        if(sampled) views[i+(mode==3?4:mode==2?8:0)] = r.textures[state.textures[i]].view.Get();
-        if(bindings) samplers[i]=bindings->samplers_[i];
-        else {
-            const auto sampler=r.sampler_states.find(sampler_key(state,i));
+        if(sampled) {
+            if(r.samples>1) if(const auto target=r.targets.find(state.textures[i]);target!=r.targets.end()) r.resolve(target->second);
+            views[i+(mode==3?4:mode==2?8:0)] = r.textures[state.textures[i]].view.Get();
+        }
+        if(bindings && sampled) samplers[i]=bindings->samplers_[i].Get();
+        else if(sampled) {
+            const auto sampler=r.sampler_states.find(sampler_key(state,i,r.anisotropy,r.highest_lod));
             if(sampler==r.sampler_states.end()) throw std::runtime_error("Sampler was not prepared before submission");
             samplers[i]=sampler->second.Get();
         }
@@ -1768,8 +2038,19 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
     if(!bound.valid || bound.layout!=input_layout) r.context->IASetInputLayout(input_layout);
     if(!bound.valid || bound.topology!=topology) r.context->IASetPrimitiveTopology(topology);
     const auto simple=simple_combiner(state);
-    const auto vertex=program?program->vertex.Get():r.vs.Get();
-    const auto pixel=simple<r.simple_combiners.size()?r.simple_combiners[simple].Get():r.combiners[state.combiner_control&255].Get();
+    const bool responsive=bool(r.upscaler) && !r.current_target;
+    const bool jittered=responsive && r.camera_valid && state.depth_test && (!program || !program->screen_space);
+    auto vertex=program?program->vertex.Get():r.vs.Get();
+    auto pixel=simple<r.simple_combiners.size()?r.simple_combiners[simple].Get():r.combiners[state.combiner_control&255].Get();
+    if(responsive) {
+        const Float4 offset{jittered?r.jitter[0]*2/(r.width*r.resolution_scale):0,jittered?-r.jitter[1]*2/(r.height*r.resolution_scale):0,0,0};
+        const std::array<Float4,2> values{offset,Float4{float(state.blend || !jittered),0,0,0}};
+        D3D11_MAPPED_SUBRESOURCE mapped{};checked(r.context->Map(r.temporal_constants.Get(),0,D3D11_MAP_WRITE_DISCARD,0,&mapped),"Temporal draw map");
+        std::memcpy(mapped.pData,values.data(),sizeof(values));r.context->Unmap(r.temporal_constants.Get(),0);
+        auto buffer=r.temporal_constants.Get();r.context->VSSetConstantBuffers(3,1,&buffer);r.context->PSSetConstantBuffers(3,1,&buffer);
+        if(jittered) {vertex=program?program->jitter_vertex.Get():r.jitter_vertex.Get();r.applied_jitter=r.jitter;}
+        pixel=simple<r.responsive_simple.size()?r.responsive_simple[simple].Get():r.responsive_combiners[state.combiner_control&255].Get();
+    }
     if(!bound.valid || bound.vertex!=vertex) r.context->VSSetShader(vertex,nullptr,0);
     if(!bound.valid || bound.pixel!=pixel) r.context->PSSetShader(pixel,nullptr,0);
     auto program_buffer=r.program_constants.Get();
@@ -1815,6 +2096,7 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
         r.context->DrawIndexed(plan.count, 0, 0);
     }
     ++r.stats.draws; r.stats.vertices += count;r.count(PerfMetric::draws);r.count(PerfMetric::vertices,count);
+    if(r.samples>1 && state.color_mask) r.targets.at(r.current_target).dirty=true;
 }
 void Renderer::end() {
     auto& r = *impl_;
@@ -1831,10 +2113,26 @@ Image Renderer::read_target(std::uint32_t target) {
     try {auto image=readback();set_target(previous);return image;}
     catch(...) {set_target(previous);throw;}
 }
+Image Renderer::read_frame() {
+    if(impl_->upscaled) {
+        auto& r=*impl_;D3D11_TEXTURE2D_DESC desc{};r.upscaler->image()->GetDesc(&desc);
+        desc.Usage=D3D11_USAGE_STAGING;desc.BindFlags=desc.MiscFlags=0;desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+        ComPtr<ID3D11Texture2D> staging;checked(r.device->CreateTexture2D(&desc,nullptr,&staging),"Upscaled frame readback");
+        r.context->CopyResource(staging.Get(),r.upscaler->image());
+        D3D11_MAPPED_SUBRESOURCE mapped{};checked(r.context->Map(staging.Get(),0,D3D11_MAP_READ,0,&mapped),"Upscaled frame map");
+        Image image{desc.Width,desc.Height,std::vector<std::byte>(std::size_t(desc.Width)*desc.Height*4)};
+        for(unsigned y=0;y<desc.Height;++y) std::memcpy(image.rgba.data()+std::size_t(y)*desc.Width*4,
+            static_cast<const std::byte*>(mapped.pData)+std::size_t(y)*mapped.RowPitch,std::size_t(desc.Width)*4);
+        r.context->Unmap(staging.Get(),0);return image;
+    }
+    if(impl_->antialiasing && impl_->antialiasing->ready()) return impl_->antialiasing->readback();
+    return read_target(0);
+}
 Image Renderer::readback() {
     auto& r = *impl_;
     if (!r.ended || r.recording) throw std::runtime_error("End a frame before reading back");
-    D3D11_TEXTURE2D_DESC description{};r.target->GetDesc(&description);
+    auto& output=r.targets.at(r.current_target);r.resolve(output);
+    D3D11_TEXTURE2D_DESC description{};output.image->GetDesc(&description);
     auto& stored=r.targets.at(r.current_target).staging;
     if(!stored) {
         description.BindFlags=0;description.Usage=D3D11_USAGE_STAGING;description.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
@@ -1842,7 +2140,7 @@ Image Renderer::readback() {
     }
     r.staging=stored;
     Image image{description.Width,description.Height,std::vector<std::byte>(std::size_t(description.Width)*description.Height*4)};
-    r.context->CopyResource(r.staging.Get(), r.target.Get());
+    r.context->CopyResource(r.staging.Get(),output.image.Get());
     D3D11_MAPPED_SUBRESOURCE mapped{};
     checked(r.context->Map(r.staging.Get(), 0, D3D11_MAP_READ, 0, &mapped), "Frame readback");
     const bool rgb565=r.targets.at(r.current_target).color_format==SurfaceColor::rgb565;

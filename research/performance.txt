@@ -1188,3 +1188,463 @@ Release retains b2.exe and b2-tool.exe. Their hashes, the current symbols,
 settings, inputs and active direct-airport.profdata are unchanged; save/data
 files are intact. Benchmark captures, final validation output, reusable controls,
 timings and the initial source snapshot remain. CMake configuration still passes.
+
+2026-10-13: overnight 360 Hz optimization (active)
+
+User renewed authorization for game automation and necessary computer use.
+Settings: Airport Terminal 3, 360 Hz, 1x native, widescreen, interpolation off,
+V-sync off; each measured segment remains <=30 seconds. Existing user edits,
+saves, knowledge and private inputs are preserved. No subagents are used.
+Supported input verified by native check-image against supported_target.json:
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+Hardware remains Ryzen 5 5600X / RTX 5060 Ti. Baseline is the current local
+LLVM PGO executable, AVX2 off, PE 6ACEDF24 / 82341888-byte native image.
+
+Actual 15-second baseline: benchmark-49386549000, 226.550921 FPS, median
+4.3795 ms, p95 5.5258, p99 5.8387, maximum 7.9865 ms; 3398 intervals,
+no drops, settings unchanged. Native final image confirms active racing.
+Detailed baseline: performance-49382928200, 3200 source records over
+14.998763 seconds, full GPU timing coverage, no recorder limits or audio
+budget overruns. Guest 2.2675 ms/frame, commands 1.1048, platform 0.5406,
+uploads 0.3516, draws 0.2184, resources 0.1168; GPU spans median 1.4598,
+p99 1.9398 ms. Peak RAM: 216.3 MiB working set, 189.0 MiB private memory.
+The 2.777778 ms frame budget is not met. Sampling and recording overhead
+are not used as acceptance FPS. Baselines and source snapshot are retained
+under build/checks/overnight-360. All completed owned game workers exited.
+
+Native arithmetic-formula trial: 247.229 s build, existing CPU checks passed;
+arithmetic-race 224.068829 FPS, median 4.4598 ms, p99 5.7613 ms. No measured
+improvement over 226.550921; restored the native arithmetic flag path.
+
+Grouped x87 operand ranges: existing generated native blocks preflight shared
+base/index/segment ranges instead of individual operands. Original instruction
+order, provenance, unmasked exceptions and failed-memory fallback are retained.
+236.542 s build; all existing CPU cases passed. Grouped-float-race measured
+215.974669 FPS, median 4.7268 ms, p99 5.9011 ms. This is a regression in that
+run; no speedup is claimed. It requires assessment with matching compiler data
+before retention; removing it remains an option. Native image fell to 75796480
+bytes. No binary-wide analysis, runtime decoder or game-code binding was added.
+
+Native PC sampling: 15 seconds, 9728 samples, zero failures; bounded indexed
+PE unwind table and per-thread context reads, with no whole-image disassembly.
+Names with nonzero public-symbol displacement remain unresolved attribution;
+exact native instruction PCs are preserved. CPU sampling perturbs gameplay and
+native-sample's 209.631996 FPS is not an acceptance result. Both owned processes
+exited and were audited. The temporary sampler is not shipped or required.
+
+Audio batch: deferred DSP bytes remain producer-owned; commits publish owned
+partial-word snapshots through the existing bounded control queue. Full queues
+and oversized updates retain synchronous draining; reads, image replacement
+and capture drain queued changes. Continuous-coefficient state is recorded at
+publication. Identical listener values retain deferred-mask semantics while
+avoiding repeated calculator calls. CPU, 77 audio and 74 SDK binding cases pass;
+five additional effect cases cover partial writes, multiple commits, immediate
+overrides, queue wrapping/backpressure and oversized updates. Replayed scene
+samples still match uninterrupted mixing. Spatial calculations: 54 checks pass.
+Audio-batch-race: 234.676648 FPS, median 4.3233 ms, p95 5.0466, p99 5.5009,
+max 7.0065 ms; unchanged settings, no drops or audio error. Goal remains unmet.
+
+The native tool's check-render exceeded two 30-second launcher limits before
+creating its output directory. Offline tools compile diagnostic HLSL in their
+renderer constructor; the game uses build-compiled shader bytes and recorded
+zero gameplay compilations. This is not an in-game benchmark. Both timed-out
+worker groups were stopped by exact PID/creation time and checked. The launcher
+now waits for an exact owned console child to exit after terminating it, instead
+of mistaking asynchronous process shutdown for a surviving worker. Full render
+validation remains required and will use an appropriate offline-suite timeout.
+
+Next batch: reuse persistent queued-draw descriptors (avoids repeatedly zeroing
+256 slots), and generate integer arithmetic using the same native operation's
+result and flags instead of adding/subtracting twice. Result/flag diagnostics
+cover carry, narrow widths and upper-bit preservation. These changes are not
+built/accepted yet. Refresh LLVM profiling, then remeasure actual racing.
+Combined native arithmetic and refreshed profile: profiling build and use
+build both passed. Training produced combined-airport-19368.profraw (31823184
+bytes), merged into combined-airport.profdata. Training is not FPS acceptance.
+Counter-free combined-use-race: 252.316997 FPS, median 3.9977 ms, p95 4.6157,
+p99 5.1150, max 5.9938 ms, 3784 intervals / 14.997008 measured seconds.
+No drops, changed settings or audio error. PE 6ACEF8B2 / 77242368-byte image.
+CPU checks: 52 cases, 26026 integer, 579 memory, 6744 floating, 109 control.
+All 77 audio cases passed, including scene replay; 74 SDK binding cases passed.
+Hardware render validation: all 224 cases, zero debug messages, 55.748 s
+for the full offline suite. Offline constructor HLSL compilation explains the
+previous 30-second suite timeouts; game shader compilation remains zero.
+
+Graphics upload candidate: adjacent draws in one synchronous bounded group
+reuse identical source streams and current attributes. Stride, packed extent,
+pointer and source extent must all match; validation still runs for each draw.
+Reuse resets at every group/capacity split, and indices, constants, ordering
+and program state remain independent. A cumulative reused-byte counter is
+reported in live JSON. The existing queued wrapping check now draws repeated
+geometry through changing programs/constants and verifies that source bytes
+were actually reused. This candidate still requires render and race acceptance.
+
+Listener correction: unchanged settings cannot suppress refreshes of mutable
+rolloff curves. A pending/same-value setter with a live curve retains the native
+refresh. The native buffer constructor already applies initial spatial state.
+The added SDK-level check changes live curve bytes between identical listener
+settings and compares settled output levels. Its initial fixture errors were
+corrected: actual verified curve API is 22E8C4 (not 22E796), its offline voice
+needs stereo-only routing without a reverb image, and a zero curve endpoint
+attenuates progressively rather than muting at an intermediate distance.
+Original evidence: curve-binding-evidence.json, the existing native_api.h
+signature and existing independent rolloff checks in spatial.cpp. No new
+platform binding or callback was invented. Final fixture acceptance is pending.
+Shared-upload milestone: shared-vertices-render and -warp both pass 224/224
+cases without debug messages. All 207 comparable hardware PNGs match the
+combined baseline exactly. Queued-order submission: 867.472 ms versus 852.355
+ms earlier; 4100 maps in both, upload bytes 25167472 versus 51121328. Reduced
+bytes alone do not establish a component submission-time gain.
+
+shared-vertices-race: 255.305242 FPS, median 3.9289 ms, p95 4.5368,
+p99 5.0462, maximum 5.6579 ms; 3829 intervals over 14.997734 seconds.
+Settings unchanged, no drops/audio errors/runtime shader compilation.
+PE 6ACF03E3 / 77209600-byte image. About 12.7% above the fresh 226.550921
+baseline; still below 360 FPS. The whole 51-second run reports 5827631144
+reused vertex bytes; this is not a measured-segment average.
+
+Final curve fixture passes: 54 original spatial cases plus 83 SDK binding
+cases. It confirms attenuation after changing live curve bytes and repeating
+an identical listener setter, allowing the existing one-mix gain ramp to settle.
+The shared descriptor is cleared before the later stream fixture, so buffer
+format pointers cannot become stream callbacks. No production callback changed.
+
+shared-vertices-detailed: 9.997592 seconds, 2389 source records, full GPU
+coverage, no recorder/storage limits. GPU median 1.34736, p99 1.73536 ms.
+Approximate exclusive CPU wall cost per source record: guest 2.045 ms,
+GPU commands 1.064, platform 0.383, uploads 0.296, drawing 0.210, resources
+0.110. Recorder overhead makes this diagnostic slower than frame-only runs.
+All hidden-window/presentation/settings checks pass; no game boot for that suite.
+User settings stayed byte-identical: SHA256
+5FECB9F6BB39BC85F3B5BF528432A9CB4447AAA68B193CE7F661844AE1BF968C.
+
+Continuation checkpoint: goal is ACTIVE and UNMET. Canonical b2.exe is
+counter-free, AVX2 OFF, using combined-airport.profdata. The new draw-stream
+and listener functions have changed compiler control flow; refresh their profile
+before deciding whether to retain/reject the upload change. Keep user pre-existing
+edits (captured in start.diff and individual start-*.cpp/h snapshots), knowledge,
+saves and private inputs. All benchmarks remain <=30 seconds; 10-second F9
+scripts avoid recorder capacity limits when approaching 360 FPS. Do not claim
+menu/crash acceptance or 360 Hz: those are still outstanding.
+
+Next useful work: bounded original-byte analysis of sampled SDK paths 219750,
+21F9C0 and ED570; native compiler lowering improvements must retain flags,
+memory faults, callbacks and CPU checks. Consider graphics/CPU overlap only with
+verified ownership/fence behavior, not assumptions about borrowed RAM. No extra
+agent, computer-use session or permission request is needed for current authorized
+benchmarking. Current actual race result is 255.305242 FPS, not the target.
+2026-10-14: flag liveness trial (rejected)
+
+Verified small original ranges for 219750, 21F9C0 and ED570 with native
+analysis capped at 256 instructions each. Reports: sdk-00219750.json,
+sdk-0021F9C0.json, sdk-000ED570.json in overnight-360. No whole-file scan.
+A build-only control-flow pass tracked definitely overwritten CPU flag bits,
+with full state at calls, returns, loop checkpoints, trap/port operations,
+enhancement callbacks and jump-table error paths. Partial flag helpers retained
+incoming unmodified bits and existing undefined-flag policies. CPU references
+passed all 52 cases / 38176 instruction comparisons; audio/spatial checks passed.
+
+Training: flags-airport-4708.profraw (31809264 bytes), ten-second F9 segment,
+normal exit. Counter-free build: flags-airport.profdata, AVX2 OFF, profiling
+OFF. Actual 15-second flags-use-race: 253.337319 FPS, median 3.9781,
+p95 4.6032, p99 5.1273, max 5.7783 ms; 3799 intervals / 14.995817 seconds.
+No drops, setting changes or audio errors. It did not beat 255.305242 FPS.
+The added control-flow pass/helpers/tests are rejected rather than keeping
+unproven complexity. Restore uses the exact pre-flags snapshots, preserving
+all earlier user and optimization edits, plus combined-airport.profdata.
+Restoration build/check is in progress; the goal remains active and unmet.
+Flag-trial restoration completed: flags-restore-build 124.150 s and all
+52 / 26026 instruction / 579 memory / 6744 floating / 109 control checks pass.
+The exact pre-flags sources are restored. Canonical build is counter-free,
+AVX2 OFF, using combined-airport.profdata. No owned workers remain. The actual
+race target remains unmet; best verified build measured 255.305242 FPS.
+
+Next goal turn should target larger measured CPU/GPU-command costs, not retain
+flag-liveness complexity without a gain. Source snapshots and rejected trial
+profiles/reports are private in overnight-360. User edits/data are preserved.
+Consider improving the graphics command/state preparation or verified native
+integer/copy lowering; investigate actual ownership before any render worker.
+Do not invent callbacks, disable features to change the requested settings,
+claim component gains as game FPS, or mark this goal complete.
+2026-10-14: deferred D3D11 submission trial (rejected)
+An owned pending-query flag deferred explicit context Flush from each push-buffer
+submit to actual busy/fence/idle requests. All existing RAM upload boundaries
+were retained. The 15-second real race measured 252.054908 FPS, median 3.9884,
+p99 5.3098, max 8.4675 ms, with no drops or settings/audio changes. No FPS
+benefit was established against the 255.305242 build. The extra pending state
+and its diagnostic extension are removed using exact pre-trial snapshots.
+Microsoft documents that unnecessary Flush incurs overhead, but this game's
+actual 2.3 submissions/frame did not establish it as the remaining bottleneck.
+Reference: https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-flush
+Next controlled experiment uses existing B2_AVX2 with a matching new LLVM
+profile; prior AVX2 checks used mismatched architecture profiles and were
+inconclusive. Current hardware supports the existing native AVX2 runtime guard.
+2026-10-14: matched AVX2 trial (rejected)
+CPU checks pass all 52 groups, 26026 instruction, 579 memory, 6744 floating
+and 109 control cases. Training used avx2-shared-airport-18832.profraw,
+31937024 bytes, a ten-second F9 segment with no storage loss or audio error.
+The matched counter-free avx2-matched-race measured 251.244577 FPS, median
+4.0116, p99 5.2594, max 6.0132 ms, 3768 intervals / 14.997339 seconds.
+No FPS benefit over portable 255.305242 was established. Restore AVX2 OFF.
+Next: merge original MMX copies across harmless padding NOPs and retain
+validated native source/destination pointers in caller-saved registers.
+Original bytes 219890..2198D4 show 16 MOVQ/MOVNTQ split only by two NOPs.
+Keep original instruction order, MMX registers, NT stores, failed-range
+fallback and diagnostic checkpoints. No runtime decoding or new callback.
+2026-10-14: copy/curve and compiler import observations
+Portable copy-curves build: 253.815735 FPS, median 3.9666, p99 5.0072,
+max 5.6282 ms; 3806 intervals / 14.995130 seconds. CPU 52/26026/579/6744/109
+and spatial 54 plus 83 SDK binding checks pass. No drops/settings/audio errors.
+The simpler grouped MMX helper now uses two native pointers for the verified
+16-operation copy at 219898..2198D4 and ignores its two padding NOPs. Source
+order, MMX tags, non-temporal stores, alias and partial-fault checks pass.
+Curve snapshots preserve in-place edits on identical listener calls without
+allocating in gameplay. These changes have not established an FPS improvement.
+
+LLD import-instr-limit=1000 trial: 254.738063 FPS, median 3.9451, p99 4.9766,
+max 5.808 ms, 3820 intervals / 14.995796 seconds; CPU checks pass. Native image
+77410304 bytes versus 77242368 before. No clear gain: restore exact pre-trial
+CMakeLists.txt and keep the simpler compiler settings. No owned workers survived.
+LLVM option reference: https://www.llvm.org/doxygen/FunctionImport_8cpp_source.html
+
+Bounded original-byte analysis of six listener wrappers and their real callees
+confirms flags: position 1 at 22F730 (83483401), velocity 2 at 22F7A3
+(83483402), orientation 4 at 22F6BE (83493404), distance 8 at 22F573
+(83483408), rolloff 16 at 22F631 (83483410), doppler 32 at 22F5D2
+(83483420). Reports spatial-sdk-*.out.log each cap 128 instructions. The two
+math routines are intentionally partial analyses, not whole-function claims.
+22EC59 preserves computed listener flags at +4 and right-vector state at +44;
+new code marks only changed inputs, and retains those computed fields across
+unrelated listener changes. Math calls share one CPU/floating context, restoring
+host state before native C++ result conversion. All 54 spatial /83 binding checks
+pass; 1000-calculation training diagnostic 1.714 ms versus 1.9199 prior. This
+component result does not establish game FPS.
+
+New LLVM training uses ordinary frame-only gameplay with F9 OFF. The old F9
+training selected timing-only branches that are absent during acceptance runs.
+Profile audio-flags-airport-18540.profraw, 31824824 bytes, came from one normal
+15-second segment with unchanged 360/1x/widescreen/no interpolation/no V-sync.
+The instrumented 175.419634 FPS is training only, not an acceptance result.
+Counter-free audio-flags build and checks/actual benchmark are in progress.
+2026-10-14: diagnostic breakdown and restoration
+Counter-free normal-profile/audio-flags run: 253.693832 FPS, median 3.9596,
+p99 5.1399, max 7.361 ms; 3805 intervals /14.998394 seconds, no drops/settings
+or audio errors. CPU checks pass; spatial 54 + SDK bindings 83 pass. The
+counter-free 1000-calculation diagnostic was 2.1783 ms, so the instrumented
+component reduction was not a proven game performance improvement.
+
+Temporary fine GPU scopes, ten-second F9: 2274 source records, no limits.
+Exclusive wall cost/record: guest 2.041, platform 0.361, GPU 1.292 total,
+upload 0.295, drawing 0.213, resources 0.115. Within GPU: unclassified packet/
+submission code 0.506, per-draw preparation 0.270, queued upload planning
+0.260, textures 0.128, target selection 0.066, other state assembly 0.063 ms.
+Fine scopes add recorder overhead: these timings are diagnostic, not acceptance.
+GPU median 1.495744 / p99 1.958688 ms. Remaining guest hot paths per record:
+219750 0.221, 21F9C0 0.186, 90A50 0.164, ED570 0.114, 27BD9 0.097,
+90660 0.087; other guest 0.977 ms. All temporary scopes are removed.
+
+Fixed constant bank bulk-copy trial: 254.669448 FPS, median 3.9357,
+p99 5.0137, max 5.9803, 3819 intervals /14.995910 s, no drops/settings/audio
+errors. No gain over 255.305242 was established; remove the extra mapping table.
+All new continuation experiments are rejected as unproven: deferred Flush,
+matched AVX2, MMX padding/pointer cache, curve snapshot, precise listener flags,
+shared math floating scope, larger ThinLTO import limit, new profile and fixed
+constant bulk mapping. Exact pre-trial snapshots restore the previous verified
+sources and combined-airport.profdata. This retains earlier user work and the
+previous goal's accepted CPU/audio/vertex reuse changes. Restoration is running.
+
+Next useful investigation: build-only fusion of consecutive pure 32-bit GPR
+instructions into one compiler inline-assembly block. Preserve the project's
+undefined-flag policies (logic keeps AF; shifts keep AF and OF for count>1),
+all CPU flags, GPR values, diagnostic fallback, branch/loop checkpoints and
+special enhancement hooks. No runtime decode or invented CPU callback. Original
+2197FB..219803 is MOV ECX,EAX / SUB ECX,EDX / SHR ECX,1 / ADD ECX,EDX / SHR ECX,9:
+current lowering extracts flags separately after each arithmetic operation.
+Only consider this with meaningful comparisons against the original compiled
+sequence and original-byte verification. Prior flag-liveness trial failed and
+was removed; don't restore its complexity. GPU threading needs verified owned
+snapshots, fence ordering and main-thread SDL behavior; borrowed RAM cannot be
+used asynchronously without a proven ownership design. Goal remains unmet.
+Restoration completed: round-restore-build, CPU 52/26026/579/6744/109, spatial 54 +83 binding checks all pass. All six restored source snapshots match exactly; no owned workers remain. Canonical b2.exe is counter-free /AVX2 OFF/combined-airport.profdata. User settings hash is unchanged. Best verified actual race is still 255.305242 FPS; 360 Hz and menu/crash acceptance remain unmet. Goal ACTIVE.
+2026-10-14: pure integer block trial
+Previous goal turn classified as progress: bounded GPU timing split and rejected
+experiments changed the next action; target remains sustained 360 FPS/unmet.
+A build-only pass now groups up to 24 contiguous pure 32-bit GPR instructions
+with at least two flag writers, stopping at real branch/loop/noncontiguous
+boundaries and enhanced world sites. Original memory, port, control, floating
+and dynamic-shift operations remain individual native C++ instructions.
+The emitted compiler inline assembly retains original GPR/ALU order; captures
+final arithmetic flags once, plus AF/OF after their last defined writer when
+later logic/shifts preserve those bits by the project's undefined-flag policy.
+Early-clobber constraints prevent equal input values from accidentally sharing
+registers overwritten earlier in a block. Original C++ sequences remain compiled
+for diagnostics/non-Clang hosts. No decode or callback is added at runtime.
+
+Original bytes 2197FB..219803: 8BC8 / 2BCA / D1E9 /03CA /C1E909, verified
+from the bounded original SDK analysis. Private verifier extracts only bounded
+original function ranges for 219750, 21F9C0, ED570, 10CFE0, E61D0 and 211054,
+then compares generated blocks against the existing instruction-at-a-time C++.
+18 blocks /180000 random, boundary and equal-register comparisons pass, covering
+GPR values and all flag bits. Existing hardware-backed CPU helper comparisons
+also pass: 52 groups,26026 integer,579 memory,6744 floating,109 control.
+Spatial 54 plus 83 SDK binding checks pass. No new test files enter the repository.
+
+Training uses F9 OFF /ordinary 15-second frame recording at requested settings.
+integer-airport-5504.profraw:31839880 bytes. Instrumented169.959715 FPS is not
+acceptance. Native training build and all owned tool/check workers exited cleanly.
+Counter-free integer-airport.profdata build is compiling/linking; benchmark pending.
+Counter-free integer-race measured 252.568625 FPS, median 3.99, p99 5.0769, max 5.7277 ms;3787 intervals/14.993945 s. All CPU/spatial checks pass; no settings changes, drops or audio errors. No FPS benefit over255.305242 is established. Remove the pure-GPR fusion using exact pre-integer-runs snapshot; keep private generated verifier/180000-case evidence. Canonical restoration will use combined-airport.profdata. Current goal remains active/unmet.
+2026-10-14: direct primary RAM check (retained)
+The native cache now checks ordinary four-byte primary addresses before alias
+folding. Aliases, IO, other mappings and faults retain the previous path. The
+same unsigned underflow/end-range proof applies; no unchecked read is added.
+Existing near-UINT32_MAX, suffix alias, adjacent mapping and device checks pass.
+No new test is needed: existing 579 memory cases cover the reordered checks.
+Native source generation has the rejected integer pass removed exactly.
+The device already uses D3D11_CREATE_DEVICE_SINGLETHREADED; no flag change was
+made. No computer use or subagent was activated.
+
+Training: primary-direct-airport-12784.profraw,37666064 bytes, F9 OFF, ordinary
+15-second game profile. Its156.643866 instrumented FPS is not acceptance.
+Counter-free primary-direct-race:265.347045 FPS, median3.7603,p95 4.3672,
+p99 4.8022,max5.4642 ms,3980 intervals/14.999225 measured seconds. Requested
+360Hz/1x/widescreen/interpolation OFF/V-sync OFF remained unchanged. No dropped
+frames or audio errors. Native image83857408 bytes. This improves the prior
+255.305242 actual result; keep the four-line direct check.
+CPU52/26026/579/6744/109, spatial54 +83 SDK binding and audio77 checks pass.
+
+Ten-second F9 primary-direct-detailed:2396 source records, no limits, GPU median
+1.390336,p99 1.737792 ms, full timing coverage. Approximate exclusive cost per
+record: guest1.999, platform0.365,GPUcommands1.086,uploads0.308,drawing0.219,
+resources0.118 ms. Recorder overhead prevents using this as FPS acceptance.
+Peak working set230227968 bytes /private203436032. Hardware remains Ryzen5
+5600X /RTX5060 Ti. User settings hash unchanged. All owned workers exited.
+Canonical b2.exe: AVX2 OFF, profiling counters OFF, primary-direct-airport.profdata.
+Private comparison b2-360-primary.exe/pdb is retained alongside earlier exact
+owned comparison binaries for A/B work. Do not publish them. Clean only exact
+owned paths when no longer needed; preserve pre-existing user data.
+
+Goal remains ACTIVE and UNMET. Best actual race265.347045 FPS (2.777778 ms
+budget still not met); menu/crash/loading acceptance remains outstanding.
+Next possible investigation: analogous checked common-address handling for
+byte/halfword accesses, or larger guest/render overlap with proven ownership.
+No FPS claim from components. Avoid resurrecting rejected flag/ALU/AVX2/flush/
+constant-bank experiments without new evidence. Preserve earlier user edits.
+
+2026-10-14: final wrap-up requested by user
+The user accepted the measured 265.347045 FPS result and asked to stop pursuing
+360 Hz. The ACTIVE/UNMET continuation notes above are superseded by this request;
+360 FPS was not reached. Menu/crash/loading acceptance at 360 remains unproven.
+
+The two edits interrupted by the network error were a byte/halfword primary-RAM
+shortcut in cpu.h and its expanded boundary checks in cpu_checks.cpp. Only the
+instrumented training run completed; no counter-free FPS benefit was established.
+Both files were restored exactly to their pre-trial snapshots, retaining the
+verified four-byte shortcut and all earlier improvements and user changes.
+
+Canonical b2.exe was rebuilt with AVX2 OFF, profiling counters OFF, and
+primary-direct-airport.profdata. Final CPU checks pass: 52 groups, 26026 integer,
+579 memory, 6744 floating, 109 control, 36149 compiled functions. Supported input
+hash/size match knowledge/supported_target.json. The retained build's earlier
+audio/spatial/render checks and 15-second Airport Terminal 3 measurement remain
+the verification evidence; no further game benchmark was needed for wrap-up.
+
+User settings SHA256 remains
+5FECB9F6BB39BC85F3B5BF528432A9CB4447AAA68B193CE7F661844AE1BF968C.
+All tracked training/build/check workers have exited. Eleven owned comparison
+EXE/PDB files moved from Release into ignored overnight-360/comparison-binaries;
+Release contains only b2.exe and b2-tool.exe. Private evidence is preserved.
+
+2026-10-14: V-sync, upscaling and distance override corrections
+
+User explicitly authorized game automation for these three tasks. All live runs
+lasted at most 30 seconds; recorded segments lasted 5-6 seconds. No computer-use
+API, subagent, Python, commit, push or release publication was used. Hardware:
+Ryzen 5 5600X, 32 GiB, RTX 5060 Ti; native QueryDisplayConfig reports 144.001 Hz.
+Supported XBE SHA256: B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+Evidence is in build/checks/nap-performance-20261014. Scripted saves use a copy
+under automation-user; original save-file hashes were unchanged.
+
+V-sync previously combined an independent source/display timer with DXGI's
+waitable presentation queue. Visible windows now follow the queue at the monitor
+rate when the selected cap is at least that rate. Lower caps retain the software
+timer; hidden, minimized and occluded windows retain it too. Interpolation keeps
+60 Hz simulation and uses nonblocking extra presentations during guest work,
+with bounded availability waits only during the remaining source-frame wait.
+The first 144 Hz race recording measured 143.867 presented FPS. Fullscreen,
+3x, 4x MSAA, 16x anisotropy and interpolation measured 144.056 presented FPS
+with 16.634 ms median source intervals. 60/120 Hz title recordings measured
+59.862/119.897 FPS and 16.6667/8.3333 ms median intervals. Severe random drops
+were not reproduced in the old title baseline; these checks establish short-run
+behaviour, not an exhaustive long-session stability claim.
+
+Upscaling now treats the selected scale as output resolution. Input uses half
+that scale rounded up to a native integer scale; 1x uses native temporal AA.
+The former 3x setting rendered at 3x and reconstructed 6x; it now renders at 2x
+and reconstructs 3x. Vendor quality settings match the actual ratio. Optical
+flow caches exact FP32 finite differences and shared source patches, stops at
+an unchanged candidate and avoids repeated identical endpoint comparisons.
+Upscaling consumes measured endpoint motion, depth, confidence/rejection masks
+and scene-cut detection; it no longer runs the 21-neighbour occlusion-support
+pass needed for intermediate images. Actual interpolation retains that pass.
+All DLSS/FSR/XeSS dispatch, moving-geometry/HUD, resize, native AA and custom-ratio
+diagnostics passed with zero D3D11 messages. Image-estimated motion remains a
+quality/performance limitation; this does not claim exact engine motion vectors.
+
+Matching 1x-input/2x-output Airport Terminal 3 runs: original FSR GPU median
+4.865664 ms, p99 5.1168 ms; final fsr-motion 4.606656 ms, p99 4.983456 ms.
+Median source intervals changed 4.8429 -> 4.597 ms. Earlier gradient-only and
+shared-patch changes did not establish a race gain; their interpolation fixture
+improved while keeping identical hardware detail/edge/HUD results. Component
+timings are not game FPS. The fsr6-comparison run is excluded: settings accept
+only scales 1-4, so its invalid 6x request retained 1x and was not a valid former
+3x-input/6x-output comparison. No matched old 3x game benchmark is claimed.
+
+Distance override now extends camera clipping and prop fade by 50%. Original
+E84C0 writes camera+84; E8450 begins its update. Each camera retains its own
+original/applied values, avoiding compounding when 4431F0/443850 alternate.
+Original 90D30 stores the actual rendering camera at 5232C0 and the current
+visibility origin at manager+118. Its signed neighbour records at origin+218
+select resident sections at manager+D0; mesh choices belong to that origin.
+Horizontal coverage of those original resident bounds supplies the world range,
+extended by 50% within the extended camera limit. Distant sections are rejected
+before original 90740 frustum tests and material submissions. Matching resident
+sections preserve the original origin/record mesh choices unless highest LOD is
+enabled. Extra sections retain their verified nearby record. No per-frame I/O
+or allocation is added. Whole PSW/P2W storage is still preloaded during loading;
+preloading the file no longer implies submitting the entire track.
+
+Heartbreak Hills [R], verified live track ID 28: original radius 727.4073,
+extended 1091.111, camera far 1600 -> 2400, 36 of 72 sections rejected by distance,
+19 selected for rendering. Same input sequence before/after the visibility fix:
+173.027 -> 198.511 recorded FPS, median 5.7368 -> 5.1996 ms, p99 6.8599 -> 6.478 ms.
+Camera positions/workloads can differ as frame rates change; this is a short
+race comparison, not a fixed-view component benchmark or a sustained 360 FPS
+claim. Airport Terminal 3 also passed with a 564.7264 -> 847.0896 range and stable
+1600 -> 2400 camera clipping. Compact tracks can fit entirely within the extended
+radius. Heartbreak Hills [R] captures show green wall arrows after the earlier
+file-read/texture-cache coherence fix. The title capture shows Press START.
+
+Native window/flow checks pass on RTX 5060 Ti and WARP: moving detail, endpoints,
+stationary HUD, disocclusion, scene/colour cuts, reset, opt-out and backpressure.
+Hardware motion/detail/edge errors remained 0.000/0.032/0.427, HUD error 0.
+All 52 CPU cases and 244 hardware rendering checks passed. Shader compilation
+during game/window diagnostics remained zero. The last hardware window check
+also passed after hidden/minimized/occluded pacing guards: 144.170 generated Hz,
+59.977 source Hz under backpressure, unchanged detail/edge/HUD results. A 360 Hz
+selection with V-sync measured 143.886 FPS on the 144 Hz display. The final
+fullscreen race rerun measured 143.286 FPS; it did not hold exactly 144 at every
+instant under detailed diagnostics. All owned workers exited; final audit found
+no surviving game/tool/build workers and all six original save files unchanged.
+The canonical Release executables contain the validated changes.
+
+Final user-settings SHA256 is
+6EBC0CE42C2B1932A76CCE6E70D29E230E611C21DB98E691530804AEC18033C9;
+its last write was 12:31:08, before this goal started at 12:47:52. User preferences
+were therefore not written during the automated work. Final b2.exe is 83761152
+bytes, written 14:48:11; b2-tool.exe is 2723328 bytes, written 14:29:59.
+
+Primary API references used during investigation:
+https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-getframelatencywaitableobject
+https://learn.microsoft.com/en-us/windows/uwp/gaming/reduce-latency-with-dxgi-1-3-swap-chains
+https://raw.githubusercontent.com/NVIDIA/DLSS/main/doc/DLSS_Programming_Guide_Release.pdf

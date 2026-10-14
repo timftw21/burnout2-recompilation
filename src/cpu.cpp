@@ -1,6 +1,15 @@
 #include "cpu.h"
 
 namespace b2 {
+void skip_title_intro(Cpu& cpu,Memory& memory) {
+    if(!cpu.skip_intro || memory.load<std::uint32_t>(0x4CCAA8)!=19) return;
+    const auto intro=cpu.registers[ecx];
+    if(memory.load<std::uint32_t>(intro+8)>=5) return;
+    // Finish the last logo. The original update enters record 5 (PRESS START),
+    // clears the logo and enables the title controls without pressing Start.
+    memory.store<std::uint32_t>(intro+8,4);
+    memory.store<std::uint32_t>(intro+4,memory.load<std::uint32_t>(0x333FCC));
+}
 const CompiledFunction* lookup_native(std::uint32_t) noexcept;
 std::uint32_t read_port(Cpu& cpu,std::uint16_t port,unsigned width) {
     if(!cpu.kernel || !cpu.kernel->read_port) throw NativeBoundary(cpu.eip,std::format("unbound {}-bit input port 0x{:04X}",width,port));

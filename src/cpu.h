@@ -45,6 +45,10 @@ struct ExecutionDiagnostic {
     bool reached_watch=false;
 };
 enum Register : unsigned { eax, ecx, edx, ebx, esp, ebp, esi, edi };
+struct WorldView {
+    std::uint32_t manager=0,count=0,list=0;
+    std::array<std::uint32_t,256> sectors{};
+};
 struct Cpu {
     std::array<std::uint32_t, 8> registers{};
     std::uint32_t flags = 0x202;
@@ -60,6 +64,9 @@ struct Cpu {
     std::uint32_t gdt_base = 0;
     std::uint16_t gdt_limit = 0;
     Performance* profile = nullptr;
+    // Optional changes to verified title logic, separate from platform bindings.
+    bool skip_intro = false,highest_lod = false,unlimited_distance = false;
+    const WorldView* world_view = nullptr;
 };
 
 class NativeBoundary : public std::runtime_error {
@@ -89,6 +96,9 @@ inline void checkpoint(Cpu& cpu, std::uint32_t address) {
     }
 }
 void invoke_native(Cpu& cpu, Memory& memory, std::uint32_t address);
+void skip_title_intro(Cpu&,Memory&);
+void title_enhancement(Cpu&,Memory&,std::uint32_t address,std::uint32_t manager=0);
+bool override_world_material(Cpu&,Memory&);
 std::uint32_t read_port(Cpu&,std::uint16_t,unsigned);
 void write_port(Cpu&,std::uint16_t,unsigned,std::uint32_t);
 
@@ -129,6 +139,10 @@ public:
             return nullptr;
         }
         template<class T> __forceinline bool element(std::uint32_t address,std::byte*& output) const {
+            if constexpr(sizeof(T)==4) {
+                const auto offset=address-base_;
+                if(offset<word_limit_) {output=bytes_.data()+offset;return true;}
+            }
             const auto folded=address&alias_mask_,physical=folded>=alias_begin_?folded:address;
             if constexpr(sizeof(T)==4) {
                 // Memory rejects spans that wrap 32 bits. Underflow offsets
@@ -400,18 +414,19 @@ template<class MemoryType> inline void stream_vector(MemoryType& memory,std::uin
 inline constexpr std::uint32_t carry = 1, parity = 4, auxiliary = 16,
     zero = 64, sign = 128, direction = 1024, overflow = 2048;
 inline constexpr std::uint32_t arithmetic_flags = carry | parity | auxiliary | zero | sign | overflow;
+struct ArithmeticResult {std::uint32_t value,flags;};
 
 #if defined(__clang__) && defined(_M_X64)
-template<unsigned Bits,bool Subtract> __forceinline std::uint32_t native_arithmetic_flags(
+template<unsigned Bits,bool Subtract> __forceinline ArithmeticResult native_arithmetic(
     std::uint32_t flags,std::uint32_t a,std::uint32_t b,std::uint32_t input_carry) {
     std::uint32_t low;bool signed_overflow;
     // LAHF leaves OF intact; the flag output captures it without touching the
     // host stack or the guest's floating-point state.
 #define B2_ALU_FLAGS(Plain,WithCarry) \
     if(input_carry) __asm__("btl $0, %4; " WithCarry "; lahf" \
-        : "=a"(low), "=@cco"(signed_overflow), "+r"(a) : "r"(b), "r"(input_carry) : "cc"); \
+        : "=&a"(low), "=@cco"(signed_overflow), "+r"(a) : "r"(b), "r"(input_carry) : "cc"); \
     else __asm__(Plain "; lahf" \
-        : "=a"(low), "=@cco"(signed_overflow), "+r"(a) : "r"(b) : "cc")
+        : "=&a"(low), "=@cco"(signed_overflow), "+r"(a) : "r"(b) : "cc")
     if constexpr(Bits==8) {
         if constexpr(Subtract) {B2_ALU_FLAGS("subb %b3, %b2","sbbb %b3, %b2");}
         else {B2_ALU_FLAGS("addb %b3, %b2","adcb %b3, %b2");}
@@ -424,7 +439,8 @@ template<unsigned Bits,bool Subtract> __forceinline std::uint32_t native_arithme
         else {B2_ALU_FLAGS("addl %3, %2","adcl %3, %2");}
     }
 #undef B2_ALU_FLAGS
-    return (flags&~arithmetic_flags)|((low>>8)&0xD5U)|(signed_overflow?overflow:0);
+    return {a&static_cast<std::uint32_t>((1ULL<<Bits)-1),
+        (flags&~arithmetic_flags)|((low>>8)&0xD5U)|(signed_overflow?overflow:0)};
 }
 #endif
 
@@ -441,7 +457,7 @@ template<unsigned Bits> constexpr std::uint32_t logic_flags(std::uint32_t flags,
 template<unsigned Bits> constexpr std::uint32_t sub_flags(std::uint32_t flags, std::uint32_t a, std::uint32_t b,
                                                         std::uint32_t borrow = 0) {
 #if defined(__clang__) && defined(_M_X64)
-    if(!std::is_constant_evaluated() && borrow<=1) return native_arithmetic_flags<Bits,true>(flags,a,b,borrow);
+    if(!std::is_constant_evaluated() && borrow<=1) return native_arithmetic<Bits,true>(flags,a,b,borrow).flags;
 #endif
     a &= mask<Bits>; b &= mask<Bits>;
     const auto result = (a - b - borrow) & mask<Bits>;
@@ -453,7 +469,7 @@ template<unsigned Bits> constexpr std::uint32_t sub_flags(std::uint32_t flags, s
 template<unsigned Bits> constexpr std::uint32_t add_flags(std::uint32_t flags, std::uint32_t a, std::uint32_t b,
                                                         std::uint32_t input_carry = 0) {
 #if defined(__clang__) && defined(_M_X64)
-    if(!std::is_constant_evaluated() && input_carry<=1) return native_arithmetic_flags<Bits,false>(flags,a,b,input_carry);
+    if(!std::is_constant_evaluated() && input_carry<=1) return native_arithmetic<Bits,false>(flags,a,b,input_carry).flags;
 #endif
     a &= mask<Bits>; b &= mask<Bits>;
     const auto sum = static_cast<std::uint64_t>(a) + b + input_carry;
@@ -461,6 +477,14 @@ template<unsigned Bits> constexpr std::uint32_t add_flags(std::uint32_t flags, s
     return (flags & ~arithmetic_flags) | szp<Bits>(result) | (sum > mask<Bits> ? carry : 0) |
            (((a ^ b ^ result) & 16U) ? auxiliary : 0) |
            ((~(a ^ b) & (a ^ result) & (1U << (Bits - 1))) ? overflow : 0);
+}
+template<unsigned Bits,bool Subtract> constexpr ArithmeticResult arithmetic(
+    std::uint32_t flags,std::uint32_t a,std::uint32_t b,std::uint32_t input_carry=0) {
+#if defined(__clang__) && defined(_M_X64)
+    if(!std::is_constant_evaluated() && input_carry<=1) return native_arithmetic<Bits,Subtract>(flags,a,b,input_carry);
+#endif
+    if constexpr(Subtract) return {(a-b-input_carry)&mask<Bits>,sub_flags<Bits>(flags,a,b,input_carry)};
+    else return {(a+b+input_carry)&mask<Bits>,add_flags<Bits>(flags,a,b,input_carry)};
 }
 template<unsigned Bits> constexpr std::uint32_t sign_extend(std::uint32_t value) {
     constexpr auto high = 1U << (Bits - 1);

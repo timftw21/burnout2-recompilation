@@ -71,6 +71,7 @@ public:
     bool restores = false;
     bool returns = false;
     bool floating = false;
+    bool extended_world = false;
     std::set<std::uint32_t> labels;
     std::set<std::uint32_t> loop_headers;
     std::map<std::uint32_t,std::vector<const Instruction*>> floating_runs;
@@ -90,6 +91,10 @@ public:
         if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY) throw std::runtime_error("Expected a memory operand");
         if (operand.mem.type != ZYDIS_MEMOP_TYPE_MEM && !(lea && operand.mem.type == ZYDIS_MEMOP_TYPE_AGEN))
             throw std::runtime_error("Special memory operand is unsupported");
+        if(extended_world && lea && operand.mem.base==ZYDIS_REGISTER_ESI && operand.mem.index==ZYDIS_REGISTER_NONE && operand.mem.disp.value==0x2C8) {
+            const auto base=read_reg(operand.mem.base);
+            return "(cpu.world_view && cpu.world_view->manager=="+base+" ? cpu.world_view->list : std::uint32_t("+base+"+0x2C8U))";
+        }
         std::string value = constant(operand.mem.disp.has_displacement ? static_cast<std::uint32_t>(operand.mem.disp.value) : 0);
         if (operand.mem.base != ZYDIS_REGISTER_NONE) value += " + " + read_reg(operand.mem.base);
         if (operand.mem.index != ZYDIS_REGISTER_NONE)
@@ -102,7 +107,18 @@ public:
         switch (operand.type) {
         case ZYDIS_OPERAND_TYPE_REGISTER: return read_reg(operand.reg.value);
         case ZYDIS_OPERAND_TYPE_IMMEDIATE: return constant(static_cast<std::uint32_t>(operand.imm.value.u));
-        case ZYDIS_OPERAND_TYPE_MEMORY: return "ram.load<" + type(operand.size) + ">(" + address(operand) + ')';
+        case ZYDIS_OPERAND_TYPE_MEMORY: {
+            const auto original="ram.load<" + type(operand.size) + ">(" + address(operand) + ')';
+            if(extended_world && operand.size==32 && operand.mem.base==ZYDIS_REGISTER_ESI) {
+                const auto base=read_reg(operand.mem.base);
+                const auto guard="cpu.world_view && cpu.world_view->manager=="+base;
+                if(operand.mem.index==ZYDIS_REGISTER_NONE && operand.mem.disp.value==0x310)
+                    return "("+guard+" ? cpu.world_view->count : "+original+")";
+                if(operand.mem.index!=ZYDIS_REGISTER_NONE && operand.mem.scale==4 && operand.mem.disp.value==0xD0)
+                    return "("+guard+" ? cpu.world_view->sectors["+read_reg(operand.mem.index)+"] : "+original+")";
+            }
+            return original;
+        }
         default: throw std::runtime_error("Unsupported operand type");
         }
     }
@@ -268,12 +284,35 @@ public:
             body << "    cpu.floating.instruction=cpu.floating.data=0;\n    cpu.floating.opcode=cpu.floating.code_selector=cpu.floating.data_selector=0;\n";
     }
     void x87_run(const std::vector<const Instruction*>& run) {
+        struct Range {ZydisDecodedOperand operand;std::int64_t first,last;};
+        std::vector<Range> ranges;
+        std::map<std::string,unsigned> groups;
+        std::vector<unsigned> operand_groups;
+        for(const auto* instruction:run) for(unsigned i=0;i<instruction->decoded.operand_count_visible;++i) {
+            auto operand=instruction->operands[i];
+            if(operand.type!=ZYDIS_OPERAND_TYPE_MEMORY) continue;
+            const auto displacement=operand.mem.disp.has_displacement?operand.mem.disp.value:0;
+            operand.mem.disp.has_displacement=false;
+            const auto [group,inserted]=groups.try_emplace(address(operand),static_cast<unsigned>(ranges.size()));
+            if(inserted) ranges.push_back({operand,displacement,displacement+operand.size/8});
+            auto& range=ranges[group->second];
+            range.first=std::min(range.first,displacement);range.last=std::max(range.last,displacement+operand.size/8);
+            operand_groups.push_back(group->second);
+        }
         const auto helper=std::format("b2_x87_run_{:08X}_{:08X}",run.front()->address,run.back()->address);
         std::string precise,fast,last_data,last_instruction,ready;
         unsigned operands=0;
         body << "    if(!cpu.diagnostic) {\n"
              << "        struct Operand {void* pointer;std::uint32_t address;std::uint16_t selector;};\n"
              << "        static_assert(sizeof(Operand)==16);\n";
+        for(unsigned i=0;i<ranges.size();++i) {
+            auto operand=ranges[i].operand;operand.mem.disp.has_displacement=true;operand.mem.disp.value=ranges[i].first;
+            body << "        const auto fp_range_address_" << i << '=' << address(operand) << ";\n"
+                 << "        auto* fp_range_" << i << "=static_cast<std::byte*>(memory.try_access(fp_range_address_" << i << ','
+                 << ranges[i].last-ranges[i].first << "ULL));\n";
+            if(!ready.empty()) ready+=" && ";ready+=std::format("fp_range_{}",i);
+        }
+        body << "        if(" << (ranges.empty()?"true":ready) << ") {\n";
         std::ostringstream pointers;
         for(const auto* instruction:run) {
             const auto& ins=instruction->decoded;
@@ -282,13 +321,13 @@ public:
                 if(instruction->operands[i].type==ZYDIS_OPERAND_TYPE_MEMORY) memory=&instruction->operands[i];
             if(memory) {
                 const auto offset=operands*16;
-                body << "        const auto fp_address_" << operands << '=' << address(*memory) << ";\n";
-                pointers << "            {memory.try_access(fp_address_" << operands << ',' << memory->size/8
-                         << "),fp_address_" << operands << ",cpu."
+                const auto group=operand_groups[operands];
+                const auto displacement=(memory->mem.disp.has_displacement?memory->mem.disp.value:0)-ranges[group].first;
+                pointers << "            {fp_range_" << group << '+' << displacement << "ULL,std::uint32_t(fp_range_address_" << group << '+'
+                         << displacement << "ULL),cpu."
                          << (memory->mem.segment==ZYDIS_REGISTER_SS?"ss":memory->mem.segment==ZYDIS_REGISTER_FS?"fs":memory->mem.segment==ZYDIS_REGISTER_GS?"gs":"ds")
                          << "_selector},\n";
-                if(!ready.empty()) ready+=" && ";
-                ready+=std::format("fp_operands[{}].pointer",operands++);
+                ++operands;
                 const auto pointer=std::format("    mov rax,qword ptr [rcx+{}]\n",offset);
                 last_data=std::format("    mov r8d,dword ptr [rcx+{}]\n    mov dword ptr [rdx+{}],r8d\n"
                     "    mov r8w,word ptr [rcx+{}]\n    mov word ptr [rdx+{}],r8w\n",
@@ -313,8 +352,7 @@ public:
         if(operands) body << "        const std::array<Operand," << operands << "> fp_operands{{\n" << pointers.str() << "        }};\n";
         // Failed range checks fall through to the original compiled sequence:
         // earlier stores, floating state and the failing instruction stay exact.
-        body << "        if(" << (operands?ready:"true") << ") {\n"
-             << "            cpu.floating.code_selector=cpu.cs_selector;\n            " << helper
+        body << "            cpu.floating.code_selector=cpu.cs_selector;\n            " << helper
              << '(' << (operands?"fp_operands.data()":"nullptr") << ",&cpu.floating);\n"
              << "            goto " << label(run.back()->address+run.back()->decoded.length) << ";\n        }\n    }\n";
     }
@@ -367,6 +405,7 @@ public:
         floating=true;
     }
     void instruction(const Instruction& instruction, bool falls_through) {
+        extended_world=instruction.address>=0x90F68 && instruction.address<0x91595;
         const auto& ins = instruction.decoded;
         const auto& operands = instruction.operands;
         const auto next = instruction.address + ins.length;
@@ -385,6 +424,19 @@ public:
             throw std::runtime_error("Instruction prefixes need an implementation");
         if(labels.contains(instruction.address)) body << label(instruction.address) << ": ";
         body << "{ // " << instruction.text << '\n';
+        if(instruction.address==0x90F68 || instruction.address==0x90F7E || instruction.address==0x90FDC || instruction.address==0x914BF) {
+            calls=restores=true;(void)read_reg(ZYDIS_REGISTER_ESI);
+            body << "    if(cpu.highest_lod || cpu.unlimited_distance) { commit(); b2::title_enhancement(cpu,memory,"
+                 << constant(instruction.address) << ",esi); restore(); }\n";
+        }
+        if(instruction.address==0xC31C4) {
+            (void)read_reg(ZYDIS_REGISTER_ESP);
+            body << "    if(cpu.unlimited_distance) ram.store<std::uint32_t>(esp+0x10U,std::bit_cast<std::uint32_t>(std::bit_cast<float>(ram.load<std::uint32_t>(esp+0x10U))*(2.0f/3.0f)));\n";
+        }
+        if(instruction.address==0xC3A2E) {
+            (void)read_reg(ZYDIS_REGISTER_EBP);
+            body << "    if(cpu.unlimited_distance) ram.store<std::uint32_t>(ebp-4U,std::bit_cast<std::uint32_t>(std::bit_cast<float>(ram.load<std::uint32_t>(ebp-4U))*(2.0f/3.0f)));\n";
+        }
         if(loop_headers.contains(instruction.address))
             body << "    if(b2::checkpoint_due(cpu)) { commit(); b2::checkpoint(cpu," << constant(instruction.address) << "); }\n";
         if(const auto run=floating_runs.find(instruction.address);run!=floating_runs.end()) {
@@ -571,16 +623,14 @@ public:
                 m == ZYDIS_MNEMONIC_ADC || m == ZYDIS_MNEMONIC_SBB) {
                 const bool addition = m == ZYDIS_MNEMONIC_ADD || m == ZYDIS_MNEMONIC_ADC;
                 const bool with_carry = m == ZYDIS_MNEMONIC_ADC || m == ZYDIS_MNEMONIC_SBB;
-                if (with_carry) {
+                if(m==ZYDIS_MNEMONIC_CMP) flags("sub_flags",bits);
+                else {
                     type(bits);
                     uses_flags = writes_flags = true;
-                    body << "    const auto input_carry = flags & b2::carry;\n"
-                         << "    flags = b2::" << (addition ? "add_flags" : "sub_flags") << '<' << bits
-                         << ">(flags, a, b, input_carry);\n";
-                } else flags(addition ? "add_flags" : "sub_flags", bits);
-                if (m != ZYDIS_MNEMONIC_CMP)
-                    write(operands[0], std::string(addition ? "a + b" : "a - b") +
-                                      (with_carry ? (addition ? " + input_carry" : " - input_carry") : ""));
+                    body << "    const auto result=b2::arithmetic<" << bits << ',' << (addition?"false":"true") << ">(flags,a,b"
+                         << (with_carry?",flags&b2::carry":"") << ");\n    flags=result.flags;\n";
+                    write(operands[0],"result.value");
+                }
             } else {
                 const char operation = m == ZYDIS_MNEMONIC_OR ? '|' : m == ZYDIS_MNEMONIC_XOR ? '^' : '&';
                 body << "    const auto value = a " << operation << " b;\n";
@@ -709,19 +759,19 @@ public:
             const bool increment = ins.mnemonic == ZYDIS_MNEMONIC_INC;
             type(operands[0].size);
             uses_flags = writes_flags = true;
-            body << "    const auto a = " << read(operands[0]) << ";\n    flags = (b2::"
-                 << (increment ? "add_flags" : "sub_flags") << '<' << operands[0].size
-                 << ">(flags, a, 1U) & ~b2::carry) | (flags & b2::carry);\n";
-            write(operands[0], increment ? "a + 1U" : "a - 1U"); break;
+            body << "    const auto a = " << read(operands[0]) << ";\n"
+                 << "    const auto result=b2::arithmetic<" << operands[0].size << ',' << (increment?"false":"true") << ">(flags,a,1U);\n"
+                 << "    flags=(result.flags&~b2::carry)|(flags&b2::carry);\n";
+            write(operands[0],"result.value"); break;
         }
         case ZYDIS_MNEMONIC_NOT: case ZYDIS_MNEMONIC_NEG:
             body << "    const auto a = " << read(operands[0]) << ";\n";
             if (ins.mnemonic == ZYDIS_MNEMONIC_NEG) {
                 type(operands[0].size);
                 uses_flags = writes_flags = true;
-                body << "    flags = b2::sub_flags<" << operands[0].size << ">(flags, 0U, a);\n";
+                body << "    const auto result=b2::arithmetic<" << operands[0].size << ",true>(flags,0U,a);\n    flags=result.flags;\n";
             }
-            write(operands[0], ins.mnemonic == ZYDIS_MNEMONIC_NOT ? "~a" : "0U - a"); break;
+            write(operands[0], ins.mnemonic == ZYDIS_MNEMONIC_NOT ? "~a" : "result.value"); break;
         case ZYDIS_MNEMONIC_CDQ:
             used.insert(0); used.insert(2); dirty.insert(2);
             body << "    edx = 0U - (eax >> 31);\n"; break;
@@ -891,6 +941,16 @@ LoweredFunction lower(const Function& function,bool fuse_floating) {
     }
     Emitter emitter;
     emitter.labels.insert(function.entry);
+    // These edits apply only to the verified US title's camera, world visibility
+    // and scenery fading. They never change collision or streaming gameplay.
+    constexpr std::pair<std::uint32_t,std::string_view> enhancement_sites[]={
+        {0x90F68,"B9B0854B00"},{0x90F7E,"8B8618010000"},{0x90FDC,"8B8618010000"},
+        {0x914BF,"8B8618010000"},{0xC31C4,"D9442410"},{0xC3A2E,"D945FC"}};
+    for(const auto& [address,bytes]:enhancement_sites) if(const auto found=function.instructions.find(address);found!=function.instructions.end()) {
+        if(hex_bytes(Bytes(found->second.bytes).first(found->second.decoded.length))!=bytes)
+            throw std::runtime_error("World enhancement instruction signature changed");
+        emitter.labels.insert(address);
+    }
     for(const auto& edge : function.edges) {
         if(!edge.to) continue;
         emitter.labels.insert(*edge.to);
@@ -906,7 +966,7 @@ LoweredFunction lower(const Function& function,bool fuse_floating) {
     }
     emitter.calls=!emitter.loop_headers.empty();
     if(fuse_floating) {
-        std::set<std::uint32_t> targets{function.entry};
+        auto targets=emitter.labels;
         for(const auto& edge:function.edges) if(edge.to) targets.insert(*edge.to);
         for(auto current=function.instructions.begin();current!=function.instructions.end();) {
             std::vector<const Instruction*> run;
@@ -939,6 +999,29 @@ LoweredFunction lower(const Function& function,bool fuse_floating) {
     out << "void guest_" << std::format("{:08X}", function.entry) << "(Cpu& cpu, [[maybe_unused]] Memory& memory) {\n";
     out << "    [[maybe_unused]] const auto ram=memory.primary();\n";
     out << "    if(b2::checkpoint_due(cpu)) b2::checkpoint(cpu," << constant(function.entry) << ");\n";
+    if(function.entry==0x4C9F0) {
+        std::string prefix;auto pc=function.entry;
+        while(prefix.size()<30 && function.instructions.contains(pc)) {
+            const auto& instruction=function.instructions.at(pc);
+            prefix+=hex_bytes(Bytes(instruction.bytes).first(instruction.decoded.length));pc+=instruction.decoded.length;
+        }
+        if(prefix!="558BECD94508568BF18B4608D84604") throw std::runtime_error("Intro update signature changed");
+        out << "    b2::skip_title_intro(cpu,memory);\n";
+    }
+    constexpr std::pair<std::uint32_t,std::string_view> enhancement_entries[]={
+        {0x8EEB0,"8B5110568B7124"},{0x90D30,"558BEC83EC208B4508"},{0xE8450,"8B44240489442404"},
+        {0x90A50,"558BEC83EC4C8B8110030000"},{0x90BC0,"558BEC83EC4C8B8110030000"}};
+    for(const auto& [entry,bytes]:enhancement_entries) if(function.entry==entry) {
+        std::string prefix;auto pc=entry;
+        while(prefix.size()<bytes.size() && function.instructions.contains(pc)) {
+            const auto& instruction=function.instructions.at(pc);
+            prefix+=hex_bytes(Bytes(instruction.bytes).first(instruction.decoded.length));pc+=instruction.decoded.length;
+        }
+        if(prefix!=bytes) throw std::runtime_error("World enhancement entry signature changed");
+        if(entry==0x90A50 || entry==0x90BC0)
+            out << "    if((cpu.highest_lod || cpu.unlimited_distance) && b2::override_world_material(cpu,memory)) return;\n";
+        else out << "    if(cpu.highest_lod || cpu.unlimited_distance) b2::title_enhancement(cpu,memory," << constant(entry) << ");\n";
+    }
     constexpr std::uint32_t timed_functions[]={0x0021F9C0,0x00227BD9,0x00219750,0x000ED570,0x00109B40,
         0x00090420,0x00090660,0x00090A50,0x000BDEE0,0x0010DA90,0x00219370};
     if(std::ranges::find(timed_functions,function.entry)!=std::end(timed_functions))

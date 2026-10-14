@@ -3,6 +3,7 @@
 #include "recompiler.h"
 #include "batch.h"
 #include "render.h"
+#include "upscaling.h"
 #include "assets.h"
 #include "dsp_compiler.h"
 #include "shaders.h"
@@ -37,6 +38,7 @@ constexpr auto usage =
     "  b2-tool compile-shaders XBE OUTPUT.cpp [--replace]\n"
     "  b2-tool data XBE ADDRESS BYTE_COUNT\n"
     "  b2-tool check-render OUTPUT_DIRECTORY [--warp] [--debug]\n"
+    "  b2-tool check-upscaling OUTPUT_DIRECTORY\n"
     "  b2-tool check-performance OUTPUT_DIRECTORY\n"
     "  b2-tool inspect-performance CAPTURE.bin OUTPUT_DIRECTORY\n"
     "  b2-tool render-texture FILE NV097_FORMAT WIDTH HEIGHT OUTPUT.png [--warp]\n"
@@ -72,6 +74,9 @@ int wmain(int argc, wchar_t** argv) {
             output=b2::compile_shaders(argv[2],argv[3],argc==5);
         } else if (command == L"compile-effects" && (argc==4 || (argc==5 && std::wstring_view(argv[4])==L"--replace"))) {
             output=b2::compile_effects(argv[2],argv[3],argc==5);
+        } else if (command == L"check-upscaling" && argc == 3) {
+            output=b2::check_upscaling(argv[2]);
+            result=output.find("\"failed\":0")!=std::string::npos && output.find("\"debug_messages\":0")!=std::string::npos?0:1;
         } else if (command == L"check-render" && argc >= 3 && argc <= 5) {
             bool warp = false, debug = false;
             for (int i=3;i<argc;++i) {

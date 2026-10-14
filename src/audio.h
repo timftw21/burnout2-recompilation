@@ -138,6 +138,7 @@ private:
     std::array<std::atomic<std::uint64_t>,256> positions_{};
     struct ControlQueue;
     std::unique_ptr<ControlQueue> controls_; // Game-thread producer, audio-thread consumer.
+    void effect_parameter(std::uint32_t word,std::uint32_t value,unsigned mask);
     std::array<std::uint32_t,32> bin_headroom_{};
     std::atomic<std::uint32_t> frames_processed_{0};
     std::atomic<bool> performance_enabled_{false};

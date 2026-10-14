@@ -84,7 +84,12 @@ template<unsigned Bits> unsigned check_instructions(const References& host) {
                 const auto description = std::format("{}-bit carry arithmetic differs for {}, {}, carry {}", Bits, hex32(a), hex32(b), input_carry);
                 flags_match(add_flags<Bits>(original, a, b, input_carry), host.adc(a, b, input_carry), arithmetic_flags, original, description);
                 flags_match(sub_flags<Bits>(original, a, b, input_carry), host.sbb(a, b, input_carry), arithmetic_flags, original, description);
-                checked += 2;
+                const auto addition=arithmetic<Bits,false>(original,a,b,input_carry),subtraction=arithmetic<Bits,true>(original,a,b,input_carry);
+                flags_match(addition.flags,host.adc(a,b,input_carry),arithmetic_flags,original,description);
+                flags_match(subtraction.flags,host.sbb(a,b,input_carry),arithmetic_flags,original,description);
+                require(addition.value==((std::uint64_t(a)+b+input_carry)&mask<Bits>) &&
+                    subtraction.value==((std::uint64_t(a)-b-input_carry)&mask<Bits>),description);
+                checked += 5;
             }
             const auto description = std::format("{}-bit unary arithmetic differs for {}", Bits, hex32(a));
             flags_match((add_flags<Bits>(original, a, 1) & ~carry) | input_carry, host.inc(a, input_carry), arithmetic_flags, original, description);
@@ -788,6 +793,27 @@ unsigned check_cpu_image(const std::filesystem::path& path) {
     constexpr std::uint32_t stack=0x4000,begin=0x1800,size=0x1000;
     std::array<std::byte,size> expected{};
     unsigned cases=0;
+    // The PRESS START screen is intro record 5; component 17 is save/load.
+    require(memory.load<std::uint32_t>(0x333FCC)==std::bit_cast<std::uint32_t>(5.f) &&
+        memory.load<std::uint32_t>(0x333FD8)==std::bit_cast<std::uint32_t>(30.f) &&
+        memory.load<std::uint32_t>(0x333FDC)==1,"Original logo/title sequence changed");
+    for(bool enabled:{false,true}) for(unsigned screen:{17U,19U}) for(unsigned step:{0U,4U,5U}) {
+        memory.store<std::uint32_t>(0x4CCAA8,screen);memory.store<std::uint32_t>(0x4CCAB8,17);
+        memory.store<std::uint32_t>(0x4CCAAC,0xFFFFFFFF);memory.store<std::uint32_t>(0x4CCAB4,19);
+        memory.store<std::uint32_t>(0x4E2CBC,2);
+        constexpr std::uint32_t intro=0x2600;
+        memory.store<std::uint32_t>(intro+8,step);memory.store<std::uint32_t>(intro+4,std::bit_cast<std::uint32_t>(0.25f));
+        memory.store<std::uint32_t>(stack,0xABCDEF00);memory.store<std::uint32_t>(stack+4,0x3C888889);
+        Cpu cpu;cpu.skip_intro=enabled;cpu.registers[esp]=stack;cpu.registers[ecx]=intro;cpu.eip=0x4C9F0;
+        const auto registers=cpu.registers;skip_title_intro(cpu,memory);
+        const bool skipped=enabled && screen==19 && step<5;
+        require(cpu.registers==registers && cpu.eip==0x4C9F0 && memory.load<std::uint32_t>(stack)==0xABCDEF00 &&
+            memory.load<std::uint32_t>(stack+4)==0x3C888889 && memory.load<std::uint32_t>(0x4CCAAC)==0xFFFFFFFF &&
+            memory.load<std::uint32_t>(0x4E2CBC)==2 && memory.load<std::uint32_t>(intro+8)==(skipped?4:step) &&
+            memory.load<std::uint32_t>(intro+4)==std::bit_cast<std::uint32_t>(skipped?5.f:0.25f),
+            "Intro skip bypassed PRESS START, reset its timeout or changed a disabled update");
+        ++cases;
+    }
     for(unsigned alignment=0;alignment<4;++alignment) for(int displacement:{-7,0,1,7,128})
         for(unsigned length:{0U,1U,2U,3U,4U,5U,7U,8U,15U,16U,31U,32U,33U,64U,65U,127U}) {
             for(unsigned i=0;i<size;++i) bytes[begin+i]=static_cast<std::byte>((i*73)^0xA9);

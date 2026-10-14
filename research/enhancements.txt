@@ -1,0 +1,439 @@
+Graphics enhancements (2026-10-13)
+
+Target: supported US Xbox executable, SHA-256
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+Investigation used original executable bytes and existing private GPU captures;
+no new gameplay was launched or automated. The user checks gameplay manually.
+
+Original rendering
+
+The game's default RenderWare device initialization at 0x000F3ED0 clears its
+device globals, and the null-configuration branch at 0x000F3FB0 writes 0x11 to
+0x005ACDD4. Device creation at 0x000F3FF0 reads that value at 0x000F402E and
+stores it in the presentation parameters' sample-type field at 0x000F406C
+(0x005A6700, parameters +16), before the call to 0x002147E0 at 0x000F4087.
+These instructions were verified using the native tool's bounded analyse command,
+with budgets of 90 instructions per entry; no whole-binary scan was used.
+Existing captured surface-format values 0x00000128 and 0x08080124 have a zero
+NV097_SET_SURFACE_FORMAT_ANTI_ALIASING field (bits 12..15): single sampling.
+This establishes the original rendering used by the checked startup/capture;
+it does not assert coverage of every possible Xbox video mode.
+The default enhancement therefore remains antialiasing Off (original).
+
+Anisotropic filtering already exists in the original game and was already
+translated by the native renderer. Captured world draw 5 uses filter 0x02063DBB
+and control 0x4003FFD0: trilinear minification, linear magnification, signed
+LOD bias -581/256, and 2x anisotropy. This is a per-texture setting, not a claim
+that every texture uses 2x. See knowledge/evidence.txt for that world-draw example.
+The private frame-23252429800 capture independently has control 0x4003FFD0 (2x)
+on draws 0/6/7, with filters 0x02063E1A/0x02063E08/0x02063E7A. Those fields were
+read from their bounded register ranges at 0x1B0C/0x1B14. The same capture is the
+surface-format evidence above, at
+build/windows/Release/build/captures/frame-23252429800/draws.jsonl.
+
+Implementation
+
+The Enhancements tab follows Graphics. Settings save with existing preferences
+and apply on Start/Restart, preserving live game resources and prepared bindings.
+Old settings files default to antialiasing=0 and anisotropy=0 (original).
+
+Antialiasing uses one spatial FXAA pass, with Low/Medium/High quality presets.
+Luminance contrast rejects flat areas; edge orientation, gradient and endpoint
+search determine the perpendicular sampling offset. The quality presets use
+4/8/12 endpoint-search samples, contrast thresholds and subpixel blend strengths.
+RGB is filtered while original alpha is retained. It operates at the selected
+internal resolution, once per original completed frame, before interpolation.
+Original game targets, depth, texture feedback and reflection copies remain
+unfiltered. ImGui and the FPS overlay are drawn afterward. Game HUD and text are
+already composited into the source and can soften when FXAA is enabled.
+No temporal history, extra game draws, runtime shader compilation or gameplay
+readback is introduced. Shader bytecode is generated during the normal build.
+Only enabled AA allocates its additional RGBA8 image (4 bytes per internal pixel).
+Resizing/session reset recreates it; disabling AA releases it.
+
+Anisotropic filtering offers Original, Off (1x), 2x, 4x, 8x and 16x. Original
+preserves each draw's setting. Overrides select the native sampler's anisotropy
+for linearly filtered textures, including render-target sampling. Point-filtered
+textures retain point sampling. Original addressing, signed LOD bias and mip
+limits are retained. The existing bounded sampler cache includes the override
+in its key, so a strength change cannot reuse an incompatible prepared sampler.
+
+Primary references
+
+NV2A register definitions:
+https://raw.githubusercontent.com/xemu-project/xemu/master/hw/xbox/nv2a/nv2a_regs.h
+https://raw.githubusercontent.com/XboxDev/nxdk/master/lib/pbkit/nv_regs.h
+FXAA algorithm and image-space contrast/edge filtering:
+https://developer.download.nvidia.com/assets/gamedev/files/sdk/11/FXAA_WhitePaper.pdf
+Native sampler filtering and supported anisotropy range:
+https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ns-d3d11-d3d11_sampler_desc
+https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_filter
+
+Validation
+
+Existing native render checks now exercise all three AA strengths on a diagonal,
+unchanged original feedback/alpha/flat areas, AA resize with interpolation,
+resolution scaling/session reset, and storage release when disabled. They also
+inspect the actual bound D3D11 samplers for Original/1x/2x/4x/8x/16x, unchanged
+LOD settings and point sampling. The hidden settings check covers saved/invalid
+enhancement values and renders the new tab without booting the game.
+Release build passed. All 199 native render cases pass with the D3D11 debug layer
+on NVIDIA GeForce RTX 5060 Ti and Microsoft WARP, with zero validation messages.
+Reports: build/checks/enhancements/render-gpu-03/report.json and
+build/checks/enhancements/render-warp-01/report.json. These component checks do
+not establish game FPS or gameplay visual parity.
+The hidden settings check passed from the final b2.exe: all seven tabs render,
+saved settings survive reload and invalid values retain defaults. It also runs
+the built FXAA shader at 2x internal resolution; runtime shader compilations
+remain zero. The Enhancements screenshot was visually checked at
+build/checks/enhancements/settings-01-enhancements.png. The diagnostic never
+boots the game, and the user's settings.cfg hash was unchanged.
+The NVIDIA driver returns MaxAnisotropy=0 for the Off sampler, whose effective
+filter is MIN_MAG_MIP_LINEAR (0x15). That descriptor field is unused outside
+anisotropic filtering. The native check verifies the effective linear filter
+when disabled and checks the strength field only for active anisotropic filters.
+
+MSAA additions (2026-10-13)
+
+The same Antialiasing control now also offers MSAA 2x/4x/8x. Existing saved
+FXAA values 1..3 are unchanged; new values 4..6 select those sample counts.
+Off remains the default. Changes apply at the next session. Device capability
+checks cover RGBA8/RGB565 colour, D16/D24S8 depth, multisample loads and resolves.
+Unavailable levels are disabled. A saved unavailable choice resets to Off with
+an explicit Log message, keeping the settings window usable on another GPU.
+
+This is geometry MSAA, not postprocess smoothing. Colour/depth surfaces render
+with the selected sample count. Each surface also has a single-sample image,
+resolved only after colour changes and before texture sampling or publication.
+Feedback copies preserve the multisample colour data. Reflections/cubemaps,
+readback, ordinary texture sampling and interpolation use resolved images.
+Presentation resolves before binding the window's single-sample target.
+The resource budget reserves multisample colour/depth, resolve and diagnostic
+storage. Disabling MSAA releases its surfaces and transfer objects on reset.
+No runtime HLSL compilation or gameplay readback is used.
+
+A bounded native D3D11 probe verified 2/4/8 support in all four render formats
+on RTX 5060 Ti and WARP. It also confirmed that ordinary partial copies while
+growing multisample targets produce D3D11 validation errors. Growing MSAA targets
+therefore uses built sample-frequency shaders to load and preserve each colour
+and depth sample. Eight masked stencil passes preserve the full stencil byte
+per sample. New regions are cleared; existing scene depth and masks stay intact.
+Single-sample target growth retains its existing exact packed-depth transfer.
+
+Native checks cover partial geometric coverage at all three levels, pixel-exact
+fine texture detail, feedback, presentation, cubemap resolves, history resize,
+resource release, RGBA8/D24S8 and RGB565/D16 growth, and per-sample depth/stencil
+preservation against a scene rendered before growth. Stencil checks use 0xA5 to
+exercise upper and lower bits. The geometry coverage fixture crosses the sample
+positions; an exactly aligned diagonal can miss both 2x samples and legitimately
+retain aliasing. 4x and 8x cover more edge orientations, at greater GPU cost.
+The hidden window check also executes MSAA and transfer shaders from b2.exe's
+build-time bytecode bank, before returning to the default mode.
+
+Final validation: all 223 graphics cases pass on RTX 5060 Ti and WARP with the
+D3D11 debug layer and zero validation messages. Reports are
+build/checks/msaa/render-gpu-02/report.json and
+build/checks/msaa/render-warp-01/report.json. The final b2.exe hidden-window
+check passed with zero runtime shader compilations and no guest boot. It checks
+MSAA presentation, 2x resolution, transfer shaders and saved/invalid options.
+No gameplay was launched or automated, and the user's settings were unchanged.
+Temporary probe source/object/executable were removed; diagnostic reports remain.
+
+Primary API references:
+https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11device-checkmultisamplequalitylevels
+https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-resolvesubresource
+https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-copysubresourceregion
+https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ns-d3d11-d3d11_rasterizer_desc
+
+Release 1.4 enhancement work (2026-10-13; unfinished)
+
+The active request includes highest-LOD assets, removing the native render
+distance limit, skipping intro logos, and real DLSS/FSR/XeSS upscaling. The user
+renewed permission for game automation and necessary computer use for this work.
+No performance benchmark has been run. Existing MSAA and custom-music work must
+be preserved. In-game upscaling, geometry LOD and draw distance remain unfinished.
+
+The supported XBE SHA256 remains
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+Intro update 4C9F0 begins 558BECD94508568BF18B4608D84604. The frontend state at
+4CCAA8 is 19 during logos. Its component reads five 12-byte records at 333F98:
+legal (texture 4), Acclaim (1), Criterion (0), RenderWare (2), Dolby (3), with
+timings 5,5,5,3,5 seconds. The next record naturally calls 3F550, the original
+title/attract setup. The optional generated entry hook takes this same path and
+consumes the skipped float-delta argument. Disabled mode executes original code.
+The Enhancements checkbox and saved skip_intro setting are implemented.
+Automation with separate --settings CFG confirmed baseline Acclaim at 12 sec,
+and skip-enabled Press START at 20 sec after required scene loading. Frames:
+build/checks/enhancements14/startup12.png, intro-on.png, intro-title.png.
+All three runs had zero runtime shader compilation; owned workers exited.
+
+Intro and sampler corrections (2026-10-14)
+
+The first correction used the original splash Start-button branch at
+4CB73..4CB98: CB780 resets startup audio and 3EB70 schedules component 4CCAB8.
+The constructor sets that component to 17 at 3E599. User verification established
+that 17 is save/load, so this shortcut bypassed the requested PRESS START screen.
+3F550 schedules attract loading (20); neither branch is the correct skip target.
+3EB70 bytes are 8B4424048981E4170000C20400; its RET 4 consumes the skipped
+frame-delta argument. Disabled and non-logo updates remain untouched.
+
+b2-20261014-142727-13968.log records sampler-cache exhaustion at SDK boundaries
+21AE80 and 21B1C0 after several restarts. The renderer retained up to 4096 raw
+register keys, including fields whose effect was ignored or overridden. Keys
+now describe effective sampling, with a 1024-entry FIFO cache. Queued draws own
+their samplers so recycling an entry cannot change an older pending draw.
+Inactive stages use a permanent default sampler. This keeps all shader slots
+bound without repeated ownership work or unnecessary cache entries.
+
+Release built successfully. Native CPU checks pass, including four intro-hook
+cases checking the selected component, return stack and disabled/non-logo paths.
+All 225 offline render checks pass on RTX 5060 Ti and WARP with no D3D11 messages.
+The new sampler check prepares 8192 distinct native descriptors, then renders
+through an older queued binding and verifies its original level-zero sampling.
+Reports: build/checks/intro-sampler-20261014/{cpu,render-final,render-warp}.json.
+These checks did not boot gameplay or measure game FPS. Owned workers exited.
+
+PRESS START and capture rendering corrections (2026-10-14)
+
+Original intro update 4C9F0 reads 12-byte records at 333F98. Records 0..4 are
+logos; record 5 has type 1 and a 30-second timeout. The PRESS START title belongs
+to this record, within component 19. The skip helper finishes record 4 at its
+original 5-second duration (333FCC), then continues the original update. Its
+4CAB4..4CAEC transition clears the logo and 4CB00..4CB40 enables title controls.
+Actual Start input still opens save/load; the title's original attract timeout
+remains intact. The offline helper cases check disabled/other-screen paths,
+already-active title updates, and preservation of registers, stack and globals.
+
+Sky capture frame-2565967670400: draw 251 is the SDK XYZRHW sprite program
+at 223108, texture 829, rectangle (309.2055,100.514)..(369.2055,176.7044), RHW 0.
+It writes reciprocal RHW to the fog distance, giving infinity. Linear fog
+parameters 4002FCE5/B9F4C401 and final combiner 130C0300/00001C80 exposed the
+missing NV2A exceptional-distance handling. The new offline reproduction failed
+before the fix: pixel red channel 66 rather than 255, exactly fog colour 424B5B.
+The shared vertex footer now substitutes the hardware's mode-specific factors
+for infinite/NaN distances and bounds finite results before interpolation.
+Reference: https://raw.githubusercontent.com/xemu-project/xemu/master/hw/xbox/nv2a/pgraph/glsl/vsh.c
+Baseline report: build/checks/title-render-20261014/fog-before.json.
+
+Wall capture frame-2345076198100: user identified Heartbreak Hills [R], green
+trackside-wall arrows showing water. Captured track ID 28 and original 924C0
+path table select reverse P2P2. Original fixed course buffers persist while
+file reads replace their bytes. GPU texture views previously retired only on
+allocation release/decommit, so file reads could leave stale views. Sync reads
+now retire overlapping views before writing; async reads do so before issue
+and again before completion is published. An existing storage diagnostic now
+reads a real saved file over a resident texture through both native APIs and
+checks the resulting pixels. This establishes cache coherence; the specific
+wall-arrow result still requires manual verification.
+
+F8 previously saved no ordinary texture bytes. It now records the current guest
+bytes and original format/dimensions once per bound texture, bounded to 64 MiB
+per capture. The storage diagnostic also checks a texture replaced during a
+capture. Trial direct .PSS payload offsets were not established as live image
+sources; their decoded images must not be treated as evidence of game contents.
+
+Release build completed. CPU checks passed: 52 summary cases, 26026 instruction,
+591 memory, 6744 floating and 109 control cases; 36149 native functions compiled.
+The storage diagnostic passed all 1473 checks, including synchronous/asynchronous
+texture replacement, native bindings and the captured replacement bytes.
+All 244 rendering cases passed on RTX 5060 Ti and WARP with zero D3D11 messages,
+including the captured zero-RHW fog case and positive/negative infinity and NaN
+for all six fog modes. Reports: build/checks/title-render-20261014/{cpu,storage,
+render-gpu,render-warp}.json. No game boot, gameplay automation or benchmark was
+performed. Manual checks of the title, sky and Heartbreak Hills [R] wall arrows
+remain necessary; another F8 capture now contains the missing texture evidence.
+
+Real SDK bridge: src/upscaling.cpp uses shared D3D11/D3D12 textures and fences
+on the same adapter. It supplies colour, depth, current-to-previous motion and
+responsive-mask inputs to the actual vendor APIs. It has not been connected to
+the game renderer. Pinned, SHA256-checked dependencies are listed in
+cmake/upscalers.json and downloaded by cmake/upscalers.cmake. Game and tool copy
+the four signed runtime DLLs plus licenses. The project uses /MD, so NGX uses
+nvsdk_ngx_d.lib for Release and nvsdk_ngx_d_dbg.lib for Debug. /MT NGX is incorrect.
+DLSS v310.9.1, XeSS v3.0.2, FidelityFX SDK v2.3.0. XeSS's D3D12 path and FSR
+loader are used; no SDK name labels a substitute spatial filter.
+
+b2-tool check-upscaling OUTPUT runs a native moving-geometry case through all
+three SDKs and checks finite output and foreground/background colours. All 3
+passed on NVIDIA GeForce RTX 5060 Ti with 0 D3D11 debug messages, 49.807 seconds
+including SDK initialization (not a gameplay benchmark). Images and report:
+build/checks/enhancements14/sdk-native, and
+build/checks/overnight-240/enhancements14-sdk-native.out.log. Workers exited.
+Latest complete SDK build: enhancements14-sdk-md-build, 70.713 seconds.
+After this build, CLI help text and NGX cache location were edited; rebuild needed.
+
+Remaining renderer integration requires authentic frame motion/depth, jitter,
+camera values, reset handling and presentation/interpolation compatibility.
+Do not feed all-zero motion for moving gameplay or claim this integration done.
+Current original colour/depth targets are owned by Renderer::Impl::FrameTarget.
+Single-sample depth currently lacks an SRV; multisample depth already has one.
+Current ProgramUniforms are packed by constant_first/count plus viewport/fog/UV
+fields. No jitter or previous-position output exists yet. FrameInterpolation
+already computes bidirectional flow/confidence but has no public motion getter.
+
+Game research still needs verification before implementation:
+E84C0 is RwCameraSetFarClipPlane (camera +84); near +80, fog +88, view window
++68/+6C, frame +4. E8450 begins 8B44240489442404 and tail-calls [camera+18]
+(camera begin-update). Initial race cameras 4431F0/443850 request far 1600 at
+7FE0E/7FE1F. E7D90 builds frustum planes at +98 and corners +128. Raising far
+blindly affects the sky geometry in 8E880, which scales using far-clip distance.
+90D30 copies frustum planes, resolves loaded world sectors and calls 90740.
+90A50/90BC0 select [object + byte*4 + C4] from byte tables at sector +21C.
+It is NOT yet established whether these bytes identify LODs or material groups;
+do not assume index zero is the highest LOD. 90420 is a spatial-tree traversal,
+not evidence of a LOD selector. Racecar model paths are composed at 828D0; its
+82B8A block copies the string racecars/ from 2BFA94. Coupe has coupea.rws
+(359544 bytes), coupee.rws (897020), and RCF/RCX collision data (1073152 each).
+Their differing roles are not yet established. A sample Airport Terminal 3
+background asset was extracted to build/checks/enhancements14/aptl3_01.bgd
+(817828 bytes) for bounded metadata inspection; no whole binary disassembly.
+
+SDK references:
+https://github.com/NVIDIA/DLSS
+https://raw.githubusercontent.com/NVIDIA/DLSS/main/doc/DLSS_Programming_Guide_Release.pdf
+https://github.com/intel/xess
+https://raw.githubusercontent.com/intel/xess/main/doc/xess_sr_developer_guide_english.md
+https://gpuopen.com/manuals/fsr_sdk/
+
+Later update: upscaling is now connected to the game renderer (2026-10-13).
+Enhancements offers Off / DLSS / FSR / XeSS, rebuilding at session start. It
+reconstructs 2x the selected internal resolution. Independent AA is disabled in
+the active renderer while upscaling is selected; the user's saved AA choice is
+retained for Off mode. Built-in and original title vertex shaders have separate
+ahead-of-time jitter variants. Main-target pixel shaders write a responsive mask
+for UI/blended/non-jittered draws. Single-sample native depth is now typeless with
+an SRV. FrameInterpolation supplies measured current-to-previous optical flow
+and confidence; the input shader converts motion to input pixels and removes
+camera jitter, rejecting scene cuts/unreliable matches via the responsive mask.
+This uses image-estimated motion, NOT exact per-object engine motion. Quality
+and performance need further assessment in gameplay. Do not imply it has exact
+geometry motion vectors. Geometry LOD and draw-distance overrides remain undone.
+
+The Xbox GPU flip callback reads the main world camera via 443EB0 (holder then
+camera pointer, as 92030 does), or frontend camera 443EC0. The renderer receives
+actual near/far planes and 2*atan(viewWindow.y); camera changes reset history.
+It skips these reads when upscaling is off. Final float SDK output is converted
+to RGBA8 on the GPU for presentation, capture and existing interpolation.
+Renderer::read_frame and Xbox::save_frame now include reconstructed output.
+
+Native full renderer validation: all three methods passed basic vendor dispatch
+AND renderer jitter/depth/flow/UI-mask integration. Zero D3D11 debug messages.
+Report: build/checks/overnight-240/enhancements14-sdk-renderer.out.log; images
+build/checks/enhancements14/sdk-renderer/*-renderer.png. Initialization plus
+diagnostics took 96.753 seconds; this is not a gameplay benchmark. Owned workers
+exited. All 223 prior native graphics checks then passed on RTX 5060 Ti with
+zero debug messages: enhancements14-render-regression.out.log and
+build/checks/enhancements14/render-regression/report.json. WARP rerun is pending.
+
+DLSS game automation: enhancements14-game-dlss, 20 seconds of gameplay, total
+22.189 seconds. Reached Press START, 1111 flips, zero runtime shader compilation,
+reported source rate 59.103 at configured 60 Hz. This is behaviour verification,
+not a performance benchmark. Captured reconstructed 1280x960 image at
+build/checks/enhancements14/game-dlss.png. Native estimated motion has limitations
+visible around fine texture/detail; assess moving scene quality before calling
+the feature finished. Game settings used isolated dlss.cfg; no computer-use API
+was needed. Owned game worker exited.
+
+Latest binary includes full pipeline and capture changes; complete build was
+enhancements14-frame-check-build (176.567 seconds). Subsequently only this
+research update was made. No commits/pushes/releases were requested or made.
+
+Additional bounded world research: 8EEB0 relocates a loaded 3C000-byte sector;
+sector+BC is its mesh count and +C4 is a pointer array (not simply 4 LOD slots).
+D7A60 relocates each mesh's +4 and +C pointers. 90A50/90BC0 read each selected
+neighbor sector from world-manager+D0, then select its mesh via byte+21C. This
+does NOT establish that forcing mesh index zero is a valid LOD override.
+The sole direct caller of 90D30 is 92030 (world manager in ECX), called at 8070A
+from the render routine in generated/native_cpu.cpp.33.cpp. Need trace that
+manager's address and inspect actual loaded visibility/LOD records. An Airport
+master asset was extracted to build/checks/enhancements14/aptl.pss (5068800 bytes)
+for bounded metadata reads. First DWORD B2300008, next 95, then 2; many fields
+look like original 838xxxxx pointers. Guessed offsets 15800 and 25800 were zero
+and are NOT valid sector-location discoveries. Do not build on those guesses.
+
+World enhancement implementation (2026-10-13, validation pending)
+
+Original 921A0 returns camera+4 (frame) +10, whose translation is +30:
+camera world position is therefore frame+40. 8E880 independently uses frame+40
+for the sky. Camera E8450 calls its original begin-update callback; E84C0 changes
+far clipping, recomputes projection and marks the frame dirty. Fit far clipping
+to the loaded world's actual bounds instead of setting a guessed large constant.
+90740 tests four sector corners at +0/+10/+20/+30 and their copies raised by
+sector+0C. 90660 handles prop bounds. Outside is returned as 2.
+
+The rolling cache is 18 x 3C000-byte slots. FWYL PSW contains 92 x 3C000-byte
+sections (22609920 bytes), while its master PSS has count 92 at +5C. Original
+8EEB0 relocates world mesh, instance-matrix and instance-bound pointers. The
+new override calls this same compiled routine once per section during loading
+in separate 28-bit-addressable rendering storage, outside the Xbox heap.
+
+In-world metadata has a self visibility record (signed relative index 0), with
+per-material mesh choices at +21C and material IDs at +7B0. +214/+215/+7AC give
+three rendering phase boundaries. +BC counts meshes, not LODs; +C4 is their
+pointer array. The override renders each selected section's own nearby record
+through original 90A50/90BC0 helpers. It does not assume mesh zero is highest.
+The original main world function keeps its environment, sky, props and render
+state cleanup. Its later scenery loops use a bounded extended sector list;
+original collision and traffic cache state remains unchanged. All prop groups
+(+8F0, +8F4 and master-table instances using section+B8) follow the extended list.
+
+C3180 and C39F0 calculate camera distance, fade scenery and eventually suppress
+its draw. With unlimited distance their local fade input is zeroed at verified
+C31C4/C3A2E instructions, selecting the original full-opacity branch. All other
+matrix, shading and draw code remains original AOT code. Overrides default off.
+LOD override additionally forces actual D3D11 mip sampling to level zero, with
+its own sampler-cache key; Off retains original bias/limits/anisotropy settings.
+
+External format research helped locate RCX/RCF vehicle data and PSW geometry:
+https://gist.github.com/AcuteSyntax/536a2d62ab1b3fde5c14f70d268b14c0
+Correct the earlier assumption: coupea/e.rws are not the vehicle geometry files.
+Actual coupe.RCX begins B2CA2001 and is 106000 bytes. 85AC0 renders its fixed
+and moving submeshes through C4570/C4A70; their masks also control lighting and
+material variants. Do not blindly replace those masks or swap menu/race models.
+
+All enhancement hook sites and entries verify original instruction signatures
+at generation. No decoder, invented guest callback or runtime shader is added.
+Build enhancements14-world-build failed on a recompiler register-name typo;
+world-build2 failed on the Windows far macro. Both were fixed and owned workers
+exited. world-build3 is running; no gameplay validation of these changes yet.
+
+Final validation (2026-10-13)
+
+Release build enhancements14-world-build3 passed. Canonical b2.exe and b2-tool.exe
+contain all changes; no commit, push or release publication was performed.
+All 224 native graphics cases passed on RTX 5060 Ti and WARP, including forced
+highest mip detail and restoring original mip selection. Both debug layers
+reported zero messages. All 52 CPU cases passed (36149 compiled functions).
+The hidden SDL3/ImGui settings diagnostic passed save/load for all new options,
+all seven tabs, interpolation and pacing; zero runtime shader compilation.
+The Enhancements screenshot was inspected and all controls fit.
+
+Native upscaler diagnostic: DLSS, FSR and XeSS all passed vendor execution,
+renderer depth/jitter/motion/UI masking, resize and interpolation-history reset;
+zero debug messages. Output: build/checks/enhancements14/upscalers-final.
+This took 97.349 seconds including initialization, and is not a game benchmark.
+
+Game automation with isolated settings: highest LOD alone and both world
+options completed 20-second runs with zero runtime shader compilation. Whole
+FWYL geometry contains 92 sections; camera far clipping changed from 1600 to
+3535.92 based on actual whole-track bounds. Separate FSR and XeSS runs with the
+world overrides passed. Original controller timings then reached the Airport
+Terminal race flythrough, loaded 36 sections for the new track and displayed its
+scenery correctly. DLSS with both overrides also reached that flythrough and
+passed. The active driving portion was not reached before the 30-second limit;
+do not claim a race-driving or game-FPS benchmark. These are behaviour checks,
+with no F9/performance recording. SDK output is reconstructed 1280x960 at 1x.
+
+Reports are enhancements14-world-enabled, -lod-enabled, -game-fsr-world,
+-game-xess-world, -world-race, -game-dlss-world, -render-final-gpu,
+-render-final-warp, -window-final and -cpu-final in build/checks/overnight-240.
+Every owned worker was audited and exited. Release settings.cfg SHA-256 remained
+212F0F648CA6063C88C6A1812028A56E0229233EBA48DC5D37CD38509F0B3A52.
+AGENTS.md is untracked/ignored and was not staged. git diff --check passed.
+README, BUILDING, third-party notices and the packaging input list were updated.
+Correction to the prior size notation: coupe.RCX is 0x106000 bytes (1073152).
+
+Remaining practical limitation: temporal reconstruction uses measured optical
+flow rather than exact engine motion vectors; moving fine texture detail can
+soften or shimmer. This is documented. MSAA remains available for sharp edges.
+All four requested settings default off and apply at the next game session.

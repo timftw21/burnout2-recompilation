@@ -14,6 +14,7 @@ $inputs = @(
     'LICENSE', 'NOTICE.md', 'THIRD_PARTY_NOTICES.txt',
     'cmake/build.ps1', 'cmake/target.h.in', 'cmake/kernel_names.h.in',
     'cmake/cpu-seeds.txt.in', 'cmake/imgui-shaders.cmake',
+    'cmake/upscalers.cmake', 'cmake/upscalers.json',
     'knowledge/facts.json', 'knowledge/supported_target.json', 'src', 'resources'
 )
 $temporary = "$outputPath.$([Guid]::NewGuid()).tmp"

@@ -4,6 +4,7 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <deque>
 #include <map>
 #include <sstream>
@@ -28,7 +29,7 @@ constexpr auto method_effects=[] {
     std::array<std::uint16_t,2049> counts{};
     constexpr unsigned ranges[][2]={{0,0},{0x110,0x110},{0x12C,0x12C},{0x440,0x7BC},
         {0x840,0x93C},{0x9D0,0x9DC},{0xA20,0xA2C},{0xA50,0xA5C},{0xAF0,0xBFC},
-        {0x17FC,0x1800},{0x1808,0x1808},{0x1810,0x1810},{0x1818,0x1818},{0x1880,0x1AFC},
+        {0x17C8,0x17D0},{0x17FC,0x1800},{0x1808,0x1808},{0x1810,0x1810},{0x1818,0x1818},{0x1880,0x1AFC},
         {0x1D70,0x1D70},{0x1D94,0x1D94},{0x1E90,0x1E90},{0x1E9C,0x1EA4}};
     for(const auto& range:ranges) for(unsigned method=range[0];method<=range[1];method+=4) counts[method/4+1]=1;
     for(unsigned i=1;i<counts.size();++i) counts[i]+=counts[i-1];
@@ -60,48 +61,68 @@ struct Gpu::Impl {
         std::vector<std::uint32_t> packed;
     };
     std::vector<Draw> draws;
+    std::array<Renderer::StreamDraw,256> stream_draws{};
     unsigned draw_count=0;
     struct Surface {std::uint32_t identifier,width,height;std::uint64_t revision=0;bool color_cleared=false;};
     Surface* active_surface=nullptr;
     std::uint64_t surface_revision=0;
     std::map<std::array<std::uint32_t,4>,Surface> targets;
-    struct Texture {std::uint32_t identifier;std::uint64_t size;};
+    struct Texture {std::uint32_t identifier;std::uint64_t size,captured=0;};
     std::map<std::array<std::uint32_t,5>,Texture> textures;
     struct Cubemap {std::uint32_t identifier;std::array<std::uint64_t,6> revisions;std::uint64_t size;};
     std::map<std::array<std::uint32_t,5>,Cubemap> cubemaps;
     struct Fence {
-        ComPtr<ID3D11Query> query;
+        enum class Kind {semaphore,count,report};
+        ComPtr<ID3D11Query> query,occlusion;
+        Kind kind=Kind::semaphore;
         std::uint64_t work=0;
         std::uint32_t written=0;
         std::array<std::uint32_t,24> values{};
+        std::uint64_t epoch=0;
+        std::uint32_t address=0,divisor=1;
     };
     std::array<Fence,64> fences;
     unsigned fence_head=0,fence_count=0;
+    ComPtr<ID3D11Query> visibility_query;
+    bool visibility_enabled=false,visibility_active=false;
+    std::uint64_t visibility_epoch=0,completed_epoch=0;
+    double visibility_result=0;
+    const std::chrono::steady_clock::time_point started=std::chrono::steady_clock::now();
     std::uint64_t gpu_work=0;
     GpuStats statistics;
     Performance* profile=nullptr;
     std::filesystem::path capture_requested,capture_directory;
     std::ostringstream capture_trace;
     unsigned capture_draws=0;
+    std::uint64_t capture_serial=0,capture_texture_bytes=0;
+    unsigned capture_textures=0;
     bool capture_truncated=false;
     Impl(Renderer& r,Memory& m,Gpu& o,std::uint32_t base):renderer(r),memory(m),owner(o),semaphore_base(base) {
         for(auto& attribute:current.attributes) attribute={0,0,0,1};
         current.attributes[3]={1,1,1,1};draws.resize(256);indices.reserve(32768);inline_words.reserve(4096);
         const D3D11_QUERY_DESC description{D3D11_QUERY_EVENT,0};
-        for(auto& fence:fences) checked_gpu(renderer.native_device()->CreateQuery(&description,&fence.query));
+        const D3D11_QUERY_DESC occlusion{D3D11_QUERY_OCCLUSION,0};
+        for(auto& fence:fences) {
+            checked_gpu(renderer.native_device()->CreateQuery(&description,&fence.query));
+            checked_gpu(renderer.native_device()->CreateQuery(&occlusion,&fence.occlusion));
+        }
+        checked_gpu(renderer.native_device()->CreateQuery(&occlusion,&visibility_query));
     }
+    ~Impl() {if(visibility_active) renderer.native_context()->End(visibility_query.Get());}
     std::uint32_t reg(unsigned method) const {return registers[0][method/4];}
     void flush() {
         if(!draw_count) return;
+        if(visibility_enabled && !visibility_active) {
+            renderer.native_context()->Begin(visibility_query.Get());visibility_active=true;
+        }
         renderer.begin(0,1,false);
         try {
-            std::array<Renderer::StreamDraw,256> group{};
             for(unsigned i=0;i<draw_count;++i) {
                 const auto& draw=draws[i];
-                group[i]={&draw.state,&draw.constants,&draw.view,std::span(draw.streams).first(draw.stream_count),
+                stream_draws[i]={&draw.state,&draw.constants,&draw.view,std::span(draw.streams).first(draw.stream_count),
                     &draw.current,draw.indices,&draw.bindings,draw.layout,draw.count};
             }
-            renderer.draw_streams(std::span(group).first(draw_count));
+            renderer.draw_streams(std::span(stream_draws).first(draw_count));
             for(const auto& draw:std::span(draws).first(draw_count)) {
                 statistics.vertices+=draw.indices.empty()?draw.count:draw.indices.size();++statistics.draws;
             }
@@ -113,12 +134,16 @@ struct Gpu::Impl {
         address&=0x0FFFFFFF;
         const auto end=std::uint64_t(address)+size;
         if(end>0x10000000ULL) throw std::runtime_error("Invalid GPU storage invalidation range");
-        // Submit borrowed vertex RAM and texture references before the allocator
-        // can overwrite them. Already submitted D3D11 work retains its resources.
+        // Submit borrowed vertex RAM and texture references before their storage
+        // changes. Already submitted D3D11 work retains its resources.
         flush();
         const auto overlaps=[&](std::uint32_t base,std::uint64_t bytes) {
             base&=0x0FFFFFFF;return base<end && address<std::uint64_t(base)+bytes;
         };
+        for(unsigned i=0;i<fence_count;++i) {
+            auto& completion=fences[(fence_head+i)%fences.size()];
+            if(completion.kind==Fence::Kind::report && overlaps(completion.address,16)) completion.written=0;
+        }
         for(auto found=textures.begin();found!=textures.end();) {
             if(overlaps(found->first[0],found->second.size)) {renderer.release(found->second.identifier);found=textures.erase(found);}
             else ++found;
@@ -259,6 +284,19 @@ struct Gpu::Impl {
         if(found==textures.end()) found=textures.emplace(key,Texture{renderer.upload({width,height,static_cast<TextureFormat>(code),
             Bytes(static_cast<const std::byte*>(memory.access(address,static_cast<std::size_t>(size))),static_cast<std::size_t>(size)),
             mips,linear?pitch:0,cube,depth}),size}).first;
+        if(!capture_directory.empty() && found->second.captured!=capture_serial) {
+            found->second.captured=capture_serial;
+            if(size>64*1024*1024-capture_texture_bytes) capture_truncated=true;
+            else {
+                const auto name=std::format("texture-{:04}.bin",capture_textures++);
+                std::ofstream output(capture_directory/name,std::ios::binary);
+                output.write(static_cast<const char*>(memory.access(address,static_cast<std::size_t>(size))),static_cast<std::streamsize>(size));
+                if(!output) throw std::runtime_error("Cannot write captured texture bytes");
+                capture_texture_bytes+=size;
+                capture_trace<<std::format("{{\"type\":\"texture\",\"resource\":{},\"address\":{},\"format\":{},\"width\":{},\"height\":{},\"depth\":{},\"mip_levels\":{},\"pitch\":{},\"cubemap\":{},\"bytes\":{},\"data\":{}}}\n",
+                    found->second.identifier,json(hex32(address)),json(hex32(format)),width,height,depth,mips,linear?pitch:0,cube,size,json(name));
+            }
+        }
         return found->second.identifier;
     }
     RenderState state(ProgramView& view) {
@@ -395,9 +433,34 @@ struct Gpu::Impl {
         if(!capture_requested.empty()) {
             capture_directory=std::move(capture_requested);capture_requested.clear();
             std::filesystem::create_directories(capture_directory);
-            capture_draws=0;capture_truncated=false;
+            capture_draws=0;capture_truncated=false;capture_textures=0;capture_texture_bytes=0;++capture_serial;
             capture_trace<<"{\"type\":\"header\",\"format\":\"b2-gpu-frame-v1\",\"game_inputs_automated\":false}\n";
         }
+    }
+    Fence& completion() {
+        if(fence_count==fences.size()) {
+            poll();
+            if(fence_count==fences.size()) {
+                ++statistics.fence_queue_waits;
+                await([&]{return fence_count<fences.size();},PerfGpuWait::queue_space);
+            }
+        }
+        auto& result=fences[(fence_head+fence_count)%fences.size()];
+        result.work=gpu_work;result.written=0;result.address=0;result.epoch=visibility_epoch;++fence_count;
+        return result;
+    }
+    void finish_visibility() {
+        if(!visibility_active) return;
+        auto& result=completion();result.kind=Fence::Kind::count;
+        renderer.native_context()->End(visibility_query.Get());
+        result.occlusion.Swap(visibility_query);result.divisor=renderer.raster_samples_per_pixel();visibility_active=false;
+    }
+    void visibility_report(std::uint32_t data) {
+        if(reg(0x1A8)!=12 || (data>>24)!=1 || (data&15)) throw std::runtime_error("Unsupported NV097 visibility report DMA/type/offset");
+        const auto address=data&0xFFFFFF;memory.access(address,16);
+        flush();finish_visibility();
+        auto& result=completion();result.kind=Fence::Kind::report;result.address=address;result.written=1;
+        renderer.native_context()->End(result.query.Get());
     }
     void fence(std::uint32_t address,std::uint32_t value) {
         flush();
@@ -405,28 +468,36 @@ struct Gpu::Impl {
         // No guest thread runs between these host-side packet methods. Retain
         // the latest word per slot and publish it only when that query finishes.
         Fence* result=fence_count?&fences[(fence_head+fence_count-1)%fences.size()]:nullptr;
-        if(!result || result->work!=gpu_work) {
-            if(fence_count==fences.size()) {
-                poll();
-                if(fence_count==fences.size()) {
-                    ++statistics.fence_queue_waits;
-                    await([&]{return fence_count<fences.size();},PerfGpuWait::queue_space);
-                }
-            }
-            result=&fences[(fence_head+fence_count)%fences.size()];result->work=gpu_work;result->written=0;
-            renderer.native_context()->End(result->query.Get());++fence_count;++statistics.fence_queries;
+        if(!result || result->kind!=Fence::Kind::semaphore || result->work!=gpu_work) {
+            result=&completion();result->kind=Fence::Kind::semaphore;
+            renderer.native_context()->End(result->query.Get());++statistics.fence_queries;
         }
         if(address) {const auto slot=(address-semaphore_base)/4;result->values[slot]=value;result->written|=1U<<slot;}
         ++statistics.fences;
     }
     bool retire() {
-        BOOL finished=FALSE;
-        const auto status=renderer.native_context()->GetData(fences[fence_head].query.Get(),&finished,sizeof(finished),D3D11_ASYNC_GETDATA_DONOTFLUSH);
-        checked_gpu(status);
-        if(status!=S_OK || !finished) return false;
         const auto& completed=fences[fence_head];
-        for(auto slots=completed.written;slots;slots&=slots-1) {
-            const auto slot=std::countr_zero(slots);memory.store<std::uint32_t>(semaphore_base+slot*4,completed.values[slot]);
+        if(completed.kind==Fence::Kind::count) {
+            UINT64 samples=0;
+            const auto status=renderer.native_context()->GetData(completed.occlusion.Get(),&samples,sizeof(samples),D3D11_ASYNC_GETDATA_DONOTFLUSH);
+            checked_gpu(status);if(status!=S_OK) return false;
+            if(completed_epoch!=completed.epoch) {completed_epoch=completed.epoch;visibility_result=0;}
+            visibility_result+=double(samples)/completed.divisor;
+        } else {
+            BOOL finished=FALSE;
+            const auto status=renderer.native_context()->GetData(completed.query.Get(),&finished,sizeof(finished),D3D11_ASYNC_GETDATA_DONOTFLUSH);
+            checked_gpu(status);if(status!=S_OK || !finished) return false;
+            if(completed.kind==Fence::Kind::report) {
+                if(completed_epoch!=completed.epoch) {completed_epoch=completed.epoch;visibility_result=0;}
+                if(completed.written) {
+                    const auto timestamp=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count());
+                    memory.store<std::uint64_t>(completed.address,timestamp);
+                    memory.store<std::uint32_t>(completed.address+8,static_cast<std::uint32_t>(std::min(double(UINT32_MAX),std::round(visibility_result))));
+                    memory.store<std::uint32_t>(completed.address+12,0);
+                }
+            } else for(auto slots=completed.written;slots;slots&=slots-1) {
+                const auto slot=std::countr_zero(slots);memory.store<std::uint32_t>(semaphore_base+slot*4,completed.values[slot]);
+            }
         }
         fence_head=(fence_head+1)%static_cast<unsigned>(fences.size());--fence_count;
         return true;
@@ -461,7 +532,14 @@ struct Gpu::Impl {
         if(method==0x100 && !data) return;
         if(objects[0]!=0xD) throw std::runtime_error(std::format("NV097 object 0x{:X} is unbound at method 0x{:X}, value 0x{:X}",objects[0],method,data));
         if(!has_method_effect(method)) return;
-        if(method==0x17FC) {
+        if(method==0x17C8) {
+            if(data!=1) throw std::runtime_error("Unsupported NV097 report counter type");
+            flush();finish_visibility();++visibility_epoch;
+        } else if(method==0x17CC) {
+            if(data>1) throw std::runtime_error("Invalid NV097 visibility enable");
+            flush();finish_visibility();visibility_enabled=data!=0;
+        } else if(method==0x17D0) visibility_report(data);
+        else if(method==0x17FC) {
             if(data) {if(primitive) throw std::runtime_error("Nested NV097 begin/end");primitive=data;indices.clear();inline_words.clear();}
             else {
                 if(!inline_words.empty()) {
@@ -625,7 +703,7 @@ void Gpu::submit(std::uint32_t begin,std::uint32_t end) {
     g.flush();g.renderer.native_context()->Flush();g.poll();
 }
 bool Gpu::busy() {auto& g=*impl_;g.poll();return g.fence_count!=0;}
-void Gpu::wait() {auto& g=*impl_;g.flush();g.fence(0,0);g.await([&]{return !g.fence_count;},PerfGpuWait::idle);}
+void Gpu::wait() {auto& g=*impl_;g.flush();g.finish_visibility();g.fence(0,0);g.await([&]{return !g.fence_count;},PerfGpuWait::idle);}
 void Gpu::wait_fence(std::uint32_t value,std::uint32_t issued) {
     auto& g=*impl_;
     // Match the SDK's unsigned comparison, including counter wraparound.

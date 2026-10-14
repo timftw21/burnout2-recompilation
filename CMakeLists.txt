@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.2)
-project(burnout2 VERSION 1.3.0 LANGUAGES C CXX)
+project(burnout2 VERSION 1.4.0 LANGUAGES C CXX)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "The initial target is Windows x64.")
@@ -62,12 +62,14 @@ target_include_directories(b2-core PUBLIC src PRIVATE "${CMAKE_CURRENT_BINARY_DI
 target_link_libraries(b2-core PRIVATE bcrypt)
 target_compile_definitions(b2-core PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 
-add_library(b2-graphics STATIC src/render.cpp src/render_checks.cpp src/vertex_program.cpp src/shaders.cpp src/gpu.cpp src/interpolation.cpp)
+add_library(b2-graphics STATIC src/render.cpp src/render_checks.cpp src/vertex_program.cpp src/shaders.cpp src/gpu.cpp src/interpolation.cpp src/antialiasing.cpp)
 target_link_libraries(b2-graphics PUBLIC b2-core PRIVATE d3d11 dxgi windowscodecs ole32)
+include(cmake/upscalers.cmake)
 
 add_executable(b2-tool src/tool.cpp src/decoder.cpp src/recompiler.cpp src/batch.cpp src/dsp_compiler.cpp src/shader_compiler.cpp)
 target_include_directories(b2-tool PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(b2-tool PRIVATE b2-core b2-graphics Zydis d3dcompiler)
+b2_copy_upscalers(b2-tool)
 add_custom_command(TARGET b2-tool POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES.txt" "$<TARGET_FILE_DIR:b2-tool>/THIRD_PARTY_NOTICES.txt"
@@ -116,9 +118,10 @@ if(B2_XBE)
     target_include_directories(b2-ui PUBLIC "${imgui_SOURCE_DIR}" "${imgui_SOURCE_DIR}/backends")
     target_include_directories(b2-ui PRIVATE src)
     target_link_libraries(b2-ui PRIVATE SDL3::SDL3-static d3d11)
-    add_library(b2-input STATIC src/input.cpp src/audio.cpp)
+    add_library(b2-input STATIC src/input.cpp src/audio.cpp src/custom_music.cpp)
     target_include_directories(b2-input PUBLIC src)
-    target_link_libraries(b2-input PRIVATE SDL3::SDL3-static)
+    target_link_libraries(b2-input PRIVATE SDL3::SDL3-static mfplat mfreadwrite mf mfuuid ole32 delayimp)
+    target_link_options(b2-input INTERFACE /DELAYLOAD:mfplat.dll /DELAYLOAD:mfreadwrite.dll /DELAYLOAD:mf.dll)
     add_library(b2-cpu STATIC src/cpu.cpp src/xbox.cpp src/floating.cpp src/cpu_floating.asm)
     target_include_directories(b2-cpu PUBLIC src)
     target_link_libraries(b2-cpu PUBLIC b2-core PRIVATE b2-input b2-graphics iphlpapi)
@@ -243,6 +246,7 @@ if(B2_XBE)
     target_include_directories(b2 PRIVATE "$<$<COMPILE_LANGUAGE:RC>:${CMAKE_CURRENT_SOURCE_DIR}/resources>")
     add_dependencies(b2 b2-native-generated b2-shaders-generated)
     target_link_libraries(b2 PRIVATE b2-core b2-graphics b2-cpu b2-app)
+    b2_copy_upscalers(b2)
     target_compile_definitions(b2 PRIVATE B2_FINITE_ADDRESS=${finite_address} B2_COMPARE_ADDRESS=${compare_address})
 else()
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/gui_shaders.h"

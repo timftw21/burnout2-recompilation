@@ -1,0 +1,146 @@
+Custom soundtracks, 2026-10-12
+
+Supported original XBE SHA256:
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF
+
+Original code and storage contract
+
+The original soundtrack directory at 002C8D3C and database path at 002C8D78 are
+\Device\Harddisk0\Partition1\TDATA\FFFE0000\MUSIC\ and its ST.DB file.
+The counted ANSI database name is at 002C8D70. Original XapiOpenStDbAndReadHeader
+at 000E0B83 opens it with NtCreateFile and reads a 512-byte header through E0B45.
+
+XFindFirstSoundtrack at E0C86, XFindNextSoundtrack at E0C67 and the helper E0BE9
+read soundtrack records at (enumeration index + 1) * 512. Records have magic
+00021371, ID at +4, song count at +8, group IDs at +12, duration at +348 and
+UTF-16 name at +352. The original API copies 32 UTF-16 code units into its public
+name field, so imported display names use at most 31 units plus termination.
+The original game enumerates these APIs at C8D70 and caches that enumeration
+using 0057C204. A fresh game session therefore applies catalogue changes.
+
+XGetSoundtrackSongInfo at E0D35 indexes six-song groups and reads the group at
+(group ID + 101) * 512. It validates magic 00031073 and the soundtrack ID.
+Song IDs start at +16, durations at +40 and six UTF-16 names at +64, 64 bytes
+per name. XOpenSoundtrackSong at E0F5E formats the original %s%04x\%08x.WMA
+path, using song ID >> 16 for the folder and the full ID for the filename.
+XFindClose at E17F6 closes the original catalogue enumeration.
+
+The original XapiInitProcess creates its LocalAlloc heap at E609C and stores it
+at 005A8974. The isolated diagnostic must initialize that heap as well as the
+CRT heap at 005A619C; normal startup already does so. These are diagnostic setup
+requirements, not replacement soundtrack APIs or game-code patches.
+
+Implementation
+
+Audio settings select a folder and import up to 500 files as one soundtrack.
+The folder name supplies the collection name, and filenames supply song names.
+Windows Media Foundation reads supported local formats and writes stereo 44.1
+kHz WMA version 2, targeting about 128 kbps. Windows reports the relevant output
+formats as 16002 or 16005 bytes/second, rather than exactly 16000. Treat both as
+nominal 128 kbps and select the shortest encoded-block layout. The earlier
+nearest-byte-rate selection chose the larger layout and caused an early stop
+in the original decoder, as detailed below.
+
+Import runs on a cancellable worker while gameplay is stopped. Files are streamed
+in bounded PCM packets; complete songs are not held in memory. A completed
+catalogue replaces the previous generated cache after all files succeed.
+Cancellation leaves the previous library intact. Original music files are only
+read. Cache ownership and resolved paths are checked before generated-directory
+removal or replacement. Media Foundation is delay-loaded and needed only for
+importing, not normal game startup or cached-song playback.
+
+The native file provider mounts this private cache, read-only, at the original
+soundtrack path when custom music is enabled. The original compiled SDK and game
+perform discovery, menu construction, song selection and WMA playback. No menu
+availability flag, invented callback, runtime decoder or CPU fallback is added.
+
+References:
+https://xboxdevwiki.net/Soundtracks
+https://learn.microsoft.com/en-us/windows/win32/medfound/tutorial--decoding-audio
+https://learn.microsoft.com/en-us/windows/win32/medfound/tutorial--using-the-sink-writer-to-encode-video
+https://learn.microsoft.com/en-us/windows/win32/medfound/supported-media-formats-in-media-foundation
+
+Native verification logs and generated fixtures are private under
+build/checks/custom-music and build/checks/overnight-240/custom-music-*.
+
+Validation
+
+native-05/custom-music.json reports 114 passing checks with seven songs across
+the six-song group boundary, Unicode metadata, cancelled replacement preserving
+the existing catalogue, original soundtrack discovery/open/close and original
+WMA decoding. Eight packets decoded 16384 stereo frames at 44100 Hz; measured
+peak was 0.2020874 for a 0.2-amplitude source. No game boot or audio device was
+needed for these checks. Release build custom-music-build-07 and hidden settings
+check custom-music-window-01 passed, including the saved custom-music preferences.
+
+Isolated live startup reached the Load/Save menu with custom music enabled and
+no unexpected native boundary or audio error. It did not reach Music Selection.
+The user requested manual checking, so in-game menu selection and listening
+remain unverified. User saves and the existing settings file were unchanged.
+
+Follow-up, 2026-10-12
+
+The user confirmed imported music playback and Music Selection controls work.
+A roughly 3.5-minute song restarts after roughly two minutes while remaining on
+the same screen or driving. They also requested a volume audit against Burnout 1
+music and reserved all future in-game checking for manual verification.
+
+The original MP3 reports 210.200 seconds at stereo 48000 Hz. The imported WMA
+reports 210.279 seconds at stereo 44100 Hz; the catalogue stores 210253 ms.
+The cache therefore contains the whole song with a matching catalogue duration.
+Whole-song verification uses the original decoder and optional read-only cache,
+streaming packet statistics without retaining the entire decoded song in memory.
+
+Root cause and correction
+
+Windows reports two 44.1 kHz stereo formats at nominal 128 kbps: 16002 bytes/sec
+with 5945-byte encoded blocks, and 16005 bytes/sec with 2973-byte blocks. The
+first selection used the smaller bitrate error, picking the larger-block layout.
+The original decoder stops that imported file at 96502 ms, despite 210253 ms
+in the catalogue and 210279 ms in the ASF file. A bounded native debugger capture
+shows its reader reaching the 128 KiB input-buffer boundary at file offset
+0017FFFC. Original 24B50E clamps reads to that boundary; 24BDB9 supplies that
+reader to the ASF/WMA code. The modern larger-block layout encounters a partial
+read that the old reader/decoder cannot complete successfully.
+
+Changing only the ASF media-object numbering in a private copy did not change
+the stop. The unchanged original Burnout 1 file decodes past that point. Importing
+the same source with the 2973-byte layout instead produces 9273344 decoded
+stereo frames, or 210279 ms, through the same original decoder and file provider.
+No game-code patch, replacement decoder, timer change or padded fake song is used.
+The importer now groups the encoder's reported rates by nominal kbps and selects
+the smallest block at 128 kbps, rather than comparing byte-rate rounding errors.
+The existing local imported library was refreshed from its original source folder.
+
+The complete-song diagnostic also retains PCM from a final E_FAIL packet. Original
+24B44D writes both the produced size and E_FAIL when its reader reaches the end;
+a final packet can therefore contain valid tail samples. A complete-duration
+comparison still rejects a premature end. This changes diagnostic accounting,
+not gameplay's original WMA methods. Cancellation is reported as untested (null)
+when checking an existing read-only library instead of generated fixtures.
+
+Volume audit
+
+FFmpeg's streaming volumedetect measured the source MP3 at -9.7 dB mean and the
+first imported WMA at -9.6 dB. The corrected layout's original-decoder RMS is
+0.3308366 (about -9.6 dB). Import does not add gain or loudness normalization.
+The original Burnout 1 track music1/b1wma/01.wma measures -16.6 dB mean: about
+7 dB quieter in the recording itself. This comparison describes these two files,
+not every built-in or user-selected song. Shared original volume/headroom
+binding checks and native audio checks passed; the master gain remains shared.
+
+Relevant Windows format and container documentation:
+https://learn.microsoft.com/en-us/windows/win32/medfound/windowsmediaaudioencoder
+https://learn.microsoft.com/en-us/windows/win32/medfound/asf-file-structure
+
+Final verification
+
+The rebuilt canonical b2.exe passes the updated 252-case catalogue/import fixture,
+including Unicode, cancellation and complete final-packet accounting. The refreshed
+user library decodes all 9273344 stereo frames (210279 ms) through the original
+WMA methods. The known incompatible private copy still fails at 96502 ms, so
+accepting the decoder's final E_FAIL packet does not hide the premature stop.
+Native audio checks pass 70 cases; binding checks pass 74 cases, alongside
+54 spatial cases and 1000 original calculations. No game was booted or audio
+device opened during this follow-up. Existing settings remain byte-for-byte
+unchanged. Manual in-game verification of the correction remains with the user.

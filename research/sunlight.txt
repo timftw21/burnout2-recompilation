@@ -1,0 +1,124 @@
+Sun glow at building edges (2026-10-13)
+
+User reference: C:/Users/Timmy/Documents/ShareX/Screenshots/2026-10/ifamrWRvix.jpg.
+Original Xbox video screenshot, supplied by the user. Video source and timestamp
+were not supplied. The near-miss lesson shows the sun next to the upper edge of
+the dark building left of the road. This is a scaled/compressed widescreen image;
+viewpoint, elapsed lesson time and aspect differ from the recomp capture.
+The user confirmed the missing effect is the soft glow around the building edge.
+
+Recomp evidence: build/windows/Release/build/captures/frame-544341603100.
+640x480, widescreen false, no automated game inputs, 660 captured draws, no
+truncation. Draw 647 is a 14x14 untextured visibility probe at (378,54)-(392,68),
+depth 0.999, vertex alpha 4/255. Draw 648 draws the sun texture over a 256x256
+rectangle, but retains depth testing and cuts its glow sharply at the building.
+Both use the original XYZRHW SDK program at 00223108, with reciprocal W zero.
+The trace retains count-enable 17CC=1 and no GET_REPORT at 17D0 after the probe.
+
+Original executable SHA256:
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+Verified against knowledge/supported_target.json. Native bounded analysis of
+000BCB80 and SDK 00215810, 002168A0, 002168D0 and 00216940 is saved under
+build/checks/sunlight. No gameplay was launched for this investigation.
+
+000BD24F asks 00215810 for an older query's result. 000BD25C starts the new
+query; 000BD26C draws the probe and 000BD288 ends it. Successful older results
+take 000BD2DE: coverage is multiplied by 1/196 (002C4DC4, bytes 052FA73B) and
+255, then packed into the sun sprite's alpha. This path sets the original
+render-state cache at 005AD2BC to zero (disabling Z testing for the glow).
+ED570 reads dirty index 8F from 005ADA00, reads 005AD080+8F*4=005AD2BC,
+and calls 002175A0. Its 8F dispatch entry at 00223444 contains A0872100.
+002187CE emits 0004030C, writing the Boolean depth-enable value to NV097 030C.
+No completed result takes 000BD3C6 and enables Z testing. The sharp cutoff is
+the original game's fallback, not evidence that a new bloom pass is required.
+
+Two platform faults prevent a successful result:
+1. CLEAR_REPORT_VALUE 17C8, SET_ZPASS_PIXEL_COUNT_ENABLE 17CC and GET_REPORT 17D0
+   previously just retained register words. No coverage or completion was written.
+2. 002168D0 requests a 4096-byte contiguous page below physical 00FFFFFF through
+   kernel ordinal 166. All allocations previously searched upward from 005C6000;
+   early unrestricted framebuffer/texture allocations occupy this range. The
+   preserved startup allocation report shows no gap below 16 MiB even before
+   world loading. If allocation fails, 00216940 returns 8007000E without emitting
+   the disable/report packet. This agrees with the supplied capture's registers.
+
+The initial fix made contiguous allocations search downward within their requested bounds,
+keeping unrestricted graphics storage above narrower DMA ranges. Ordinary heap
+allocation and explicit guest addresses keep their existing behavior. No memory
+size increase, relocated game routine or special sun allocation is used.
+
+The GPU bridge uses preallocated native D3D11 occlusion queries, ordered with
+semaphores in the existing bounded completion queue. Report count and timestamp
+are written before the done word; pending reports remain pending until native
+completion. Reset generations preserve older pending results. Freeing report
+storage cancels its pending writes. Host resolution/sample coverage is converted
+to original Xbox pixel coverage; the game's own glare alpha and depth logic run.
+The optional timestamp reports host completion time in nanoseconds, rather than
+claiming to reproduce the Xbox GPU's timer clock.
+
+Offline diagnostic --check-visibility executes the original Begin/End/Get SDK
+functions, with unrestricted graphics and ordinary heap allocations preceding
+the constrained report-page request. It uses the exact captured sun-probe vertex
+program and zero reciprocal W, and batches full, half and blocked probes with
+following semaphores. Outputs are private under build/checks/sunlight.
+
+Validation: sunlight-build3, native-gpu3 and native-warp3 passed. Each backend
+completed 384 original SDK reports across 1x/off, 3x/off, 1x/MSAA 4x and 2x/MSAA
+8x. Counts were exactly 196 for fully visible, 98 for half visible and zero for
+blocked probes. The 24-bit report allocation, pending status, reset ordering,
+bounded completion-pool reuse and later semaphores all passed. Both backends
+reported zero D3D11 debug messages and zero runtime sun-shader compilations.
+The existing 224-case renderer suite passed on RTX 5060 Ti and WARP, with zero
+debug messages. CPU checks passed 21976 instruction, 579 memory, 6744 floating
+and 109 control cases, using 36149 compiled functions; all 117 storage checks
+passed. These are offline diagnostics, not a game FPS or screenshot-parity claim.
+The user will check the resulting glow in-game. All owned workers exited.
+
+Rebuilt build/windows/Release/b2.exe SHA256:
+46C9AD6DE36356A11A560376589342E6DECBD3AB092D9D4FF730FB7F5D97D5F9.
+
+Primary interface corroboration (behavior and register definitions only):
+https://raw.githubusercontent.com/XboxDev/nxdk/master/lib/pbkit/nv_regs.h
+https://raw.githubusercontent.com/xemu-project/xemu/master/hw/xbox/nv2a/pgraph/gl/reports.c
+https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_query
+https://github.com/XboxDev/OpenXDK/blob/master/include/xboxkrnl/mm.h
+https://raw.githubusercontent.com/Cxbx-Reloaded/Cxbx-Reloaded/master/src/core/hle/D3D8/XbD3D8Types.h
+
+Follow-up: rays still clipped (2026-10-13)
+
+The user confirmed an improvement, then supplied frame-235436048400 because the
+rays still stop at building edges. The executable SHA matches sunlight-build3.
+This capture has 698 draws, no truncation and no automated inputs. Draw 685 is
+the visibility probe; 686 is the sun sprite using texture 60. Both retain depth
+testing and 17CC=1, while 17D0 remains zero. Thus the original EndVisibilityTest
+still cannot allocate a report and emit its disable/report packet in this scene.
+
+The initial allocator correction covered contiguous graphics storage only.
+Ordinary virtual heaps, pools and internal objects still grew upward through
+the same flat physical arena. The earlier small-heap diagnostic missed that
+remaining competition. All unrestricted guest allocations now prefer higher
+addresses. Explicit requested addresses, lower/upper bounds, alignment and the
+64 MiB capacity are preserved. No special reservation, extra RAM or sun-specific
+render-state override was introduced.
+
+The strengthened native diagnostic first places a 20 MiB heap using the earlier
+policy and verifies that the original EndVisibilityTest returns 8007000E without
+emitting a report. It frees only that reproduced heap, then allocates 20 MiB
+through NtAllocateVirtualMemory and 4 MiB through ExAllocatePool under the new
+policy, alongside 8 MiB of unrestricted contiguous graphics storage. The real
+SDK report allocation and queries then succeed under that pressure.
+
+sunlight-rays-build1 and both rays-native-gpu1 / rays-native-warp1 passed. Each
+backend completed 384 reports in the same four resolution/MSAA configurations,
+with exact 196/98/0 coverage, zero runtime shader compilation and zero D3D11
+messages. CPU checks, 117 storage checks, 54 spatial cases / 1000 calculations
+and 74 original audio-binding checks passed. No gameplay was launched. Owned
+workers exited; user settings remained byte-identical.
+
+Opt-in captures now also save the last failed allocation and bounded original
+sun-query handles, indices and SDK report-table pointers, so a future capture
+can expose allocation failures directly. These additions run only on capture.
+
+Current build/windows/Release/b2.exe SHA256:
+C90A9259D35D5275F551FBAEFE226F973C66544693AAC093943C7969D4D24BCA.
+The remaining visual result requires the user's manual in-game check.

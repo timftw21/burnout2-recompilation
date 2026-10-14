@@ -19,7 +19,7 @@ public:
     void wait();
     void wait_fence(std::uint32_t value,std::uint32_t issued);
     void snapshot();
-    void invalidate_memory(std::uint32_t address,std::uint32_t size); // Guest storage was freed or decommitted.
+    void invalidate_memory(std::uint32_t address,std::uint32_t size); // Guest storage is being replaced or released.
     void capture_frame(const std::filesystem::path& directory);
     void performance(Performance*);
     GpuStats stats() const;

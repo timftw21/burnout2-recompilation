@@ -11,24 +11,26 @@ I'll try to respond in a timely manner.</i>
 Yes, AI was used in the development of this project. No, this project was not blindly thrown together.
 If you're skeptical, I implore you to try the recompilation for yourself. I take quality control quite seriously!😊
 
-## What's new in 1.3
+## What's new in 1.4
 
-- Faster gameplay and more consistent frame times, with improvements to game
-  code, graphics processing and audio.
-- Fixed missing engine sounds.
-- Fixed stale graphics resources that could cause incorrect textures and growing
-  memory use after extended play.
-- Sharper frame interpolation, with fewer distorted moving edges and steadier
-  text. Some artifacts remain on fine details and transparent overlays.
-- Native **Widescreen (16:9)** support.
-- Faster compilation and linking with the new LLVM/Clang compiler and LLD linker.
+- Faster game code and less repeated graphics work, with improved frame pacing.
+- Fixed competing frame-rate limits with **V-sync**, including when frame
+  interpolation is enabled. Lower selected frame rates still keep their cap.
+- Fixed the square in the sky, incorrect trackside wall textures on
+  **Heartbreak Hills [R]**, and a crash caused by graphics resource handling.
+- More efficient frame interpolation and upscaling. Upscaling now uses your
+  selected output resolution instead of doubling an already enlarged image.
+- **Custom music** imports your songs for the game's Music Selection menu.
+- Optional **MSAA/FXAA antialiasing**, **anisotropic filtering**, **LOD override**,
+  and a **Render distance override** that extends the original range by 50%.
+- Experimental **DLSS, FSR and XeSS**, with a visible warning about visual issues
+  and possible performance loss.
+- **Skip intro splash screens** now stops at the **PRESS START** title screen.
+- The mouse cursor hides after two idle seconds and returns on mouse input.
 
-**Keep V-sync disabled for now:** it has known issues in this release. New
-installations default to V-sync off; existing saved settings keep their value.
-
-**Reinstall when upgrading to 1.3.** Install LLVM 22.1 or newer, download and
-extract the new **Installation.zip**, and run **Build.cmd** again. See the
-upgrade instructions below to keep your saves and settings.
+Download the new **Installation.zip** and run **Build.cmd** again to update.
+See [Updating between releases](#updating-between-releases) to keep your saves,
+settings and imported music.
 
 ## Screenshots
 
@@ -57,13 +59,17 @@ focused on speed and simplicity. I couldn't bear to keep the slop version public
 - Custom keyboard bindings, 1×–4× internal resolution, and optional frame
   interpolation for higher display rates.
 - Native widescreen camera and screen layout, presented at 16:9.
+- Optional MSAA or FXAA antialiasing and anisotropic filtering up to 16×.
+- Imported custom music through the original Music Selection menu.
+- Optional intro skipping and increased track detail and draw distance.
+- Experimental DLSS, FSR and XeSS upscaling.
 
 ### What still needs work
 
 - Testing all modes, tracks and saved-game progression.
 - Checking sound balance and consistently smooth performance across the whole game.
-- Checking upscaled rendering and frame interpolation across all modes and PCs.
-- Fixing V-sync issues. Keep it disabled for now.
+- Experimental upscaling has visual issues and can reduce performance.
+- Frame interpolation can still distort fine details and transparent overlays.
 
 ## Getting started
 
@@ -96,35 +102,58 @@ the [official Ninja releases](https://github.com/ninja-build/ninja/releases/late
 extract it, and add the folder containing `ninja.exe` to your Windows **Path**
 environment variable. Close and reopen **Build.cmd** after installing it.
 
-### Upgrading to 1.3
+### Updating between releases
 
-Reinstall the recompilation to switch to the new compiler:
+Use these steps when updating from an earlier release to 1.4 or a later release:
 
-1. Back up `data/user` beside your current `b2.exe` to keep your saves.
-2. Install LLVM 22.1 or newer using the link above. Visual Studio and its Windows
-   SDK are still required.
-3. Download the new **Installation.zip** and extract it into your existing source
-   folder, replacing the previous source files.
-4. Run **Build.cmd** again and select your XISO. The builder switches compilers
-   and rebuilds while preserving your settings and saves.
+1. Close the game and builder.
+2. Back up `data/user` and `data/local/settings.cfg` beside your current `b2.exe`.
+   These contain your saves and settings. If you imported music, also back up
+   `data/local/custom-music`.
+3. Check the prerequisites above. Updates from releases before 1.3 require
+   LLVM 22.1 or newer; Visual Studio and its Windows SDK are still required.
+4. Download the latest **Installation.zip** and extract it into your existing
+   source folder—the folder containing **Build.cmd**—replacing the source files.
+   Keep the existing `build` and `data` folders.
+5. Run **Build.cmd** again and select your XISO. It rebuilds the game and updates
+   game-file locations while preserving your other settings, saves and imported
+   music. Open the game folder when the build finishes.
 
-If you install into a new folder instead, restore your backed-up `data/user`
-folder beside the new `b2.exe` after building, and choose your settings again.
-In **Graphics**, leave **V-sync** disabled even if your saved settings enabled it.
+For a new-folder installation, build it first, then restore your backups to the
+same locations beside the new `b2.exe`. Run **Build.cmd** once more to refresh
+game-file locations while keeping the restored settings.
 
 ### Game settings
 
 The builder updates the game-file locations after each successful build while
 keeping your other settings and saves. Click **Start game**
 in the settings window. Press **Esc** to open or close settings, with
-**Game Files**, **General**, **Audio**, **Graphics**, **Controls** and **Log** tabs. The game
+**Game Files**, **General**, **Audio**, **Graphics**, **Enhancements**, **Controls** and **Log** tabs. The game
 defaults to **60 Hz**; choose another rate in General. Changes save automatically
 when you finish editing. Hover over a setting to read its description.
 Startup, capture and error messages appear in Log, with the newest messages first.
+The mouse cursor hides after two seconds without mouse input. Moving, clicking
+or scrolling restores it; it stays visible while a mouse button is held.
 
 In **Controls**, click a key beside an action and press its replacement. **Clear**
 removes a binding; **Restore keyboard defaults** resets them. Esc cancels a key
 change. Esc, F1, F8 and F9 stay reserved for settings and captures.
+
+In **Audio**, click **Browse** beside **Music folder**, select a folder, then
+click **Import music**. Importing enables **Custom music** automatically. Start
+the game and choose the imported collection in its **Music Selection** menu.
+The folder name becomes the collection name; filenames become song names.
+Each import replaces the previous collection and accepts up to 500 songs directly
+inside the selected folder. Subfolders are not included.
+
+MP3, WAV, WMA, FLAC, M4A and AAC files use the audio codecs available in Windows.
+Imported copies are stored in `data/local/custom-music` beside `b2.exe`; your
+original files stay untouched. If Windows reports that its media components are
+missing, install the Media Feature Pack. Importing during play restarts the game
+from the beginning. Toggling **Custom music** applies when you start or restart
+the game. Cancelling an import keeps the previous collection.
+Importing preserves the recording's volume; different songs can be louder or
+quieter than the built-in music. Use the game's music volume controls to adjust it.
 
 In **Graphics**, choose **Internal resolution** from 1× (640 × 480) to
 4× (2560 × 1920). Higher values give sharper edges and use more graphics power.
@@ -137,7 +166,36 @@ Resolution changes apply when you start the game. If you change it while playing
 click **Restart game** in settings to apply them. Restart game reloads the game
 from the beginning while keeping the window open.
 Widescreen changes also apply when you start or restart the game.
-**Leave V-sync disabled for now; it has known issues.**
+**V-sync** prevents tearing and limits presentation to your display's refresh
+rate. Selecting a lower frame rate keeps that lower cap. It defaults to disabled.
+
+In **Enhancements**, choose **Antialiasing** from Off (original), MSAA 2×/4×/8×,
+or FXAA Low/Medium/High. MSAA smooths geometry edges while keeping texture detail
+sharp; higher sample counts use more GPU power and memory. Unsupported MSAA
+levels are disabled. FXAA smooths the whole image and can soften fine detail
+and in-game text. **Anisotropic filtering** offers Original, Off (1×), 2×, 4×, 8× and 16×;
+higher values keep textures sharper at an angle. Original preserves the game's
+per-texture filtering, including its 2× anisotropic filtering. Both options
+apply when you start or restart the game. They default to the original settings;
+increasing them uses more GPU power.
+
+**LOD override** keeps textures at their highest available detail and uses the
+track geometry selected for nearby viewing. **Render distance override** extends
+the original track visibility, camera clipping and scenery fade distances by
+50%. Extra scenery is loaded during startup and culled outside the extended
+range. These options increase GPU use; forcing texture detail can also cause
+shimmer. **Skip intro splash screens** goes to the **PRESS START** title screen
+after the required loading screen. All three default to disabled.
+
+**Upscaling technique** offers experimental DLSS, FSR and XeSS. All three have
+visual issues and can reduce performance. With upscaling enabled, **Graphics**
+shows **Output resolution**: choose the final image size from 1× to 4×.
+The game renders at half that scale, rounded up to a whole native scale, and
+reconstructs the chosen output size. At 1×, the technique provides antialiasing
+at native resolution. Separate MSAA/FXAA is disabled while upscaling is selected.
+DLSS requires an NVIDIA RTX card; FSR and XeSS support additional compatible
+cards. Upscaling defaults to Off. Enhancement changes apply on Start/Restart.
+
 The game buttons share a centered row. **Exit game** saves pending setting
 changes and closes the app.
 In **General**, selecting a rate above 60 Hz turns on **Frame interpolation**.

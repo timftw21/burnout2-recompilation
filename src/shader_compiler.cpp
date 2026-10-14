@@ -19,9 +19,9 @@ struct Key {
 struct Compiled {std::vector<std::byte> bytes;std::uint32_t first=0,count=192;};
 std::map<Key,Compiled> bytecode;
 std::string source(ShaderKind kind,const VertexProgram* program) {
-    if(kind==ShaderKind::vertex || kind==ShaderKind::launch) {
+    if(kind==ShaderKind::vertex || kind==ShaderKind::launch || kind==ShaderKind::vertex_jitter) {
         if(!program) throw std::runtime_error("A vertex shader requires its original program");
-        return translate_vertex_program(*program,kind==ShaderKind::launch).source;
+        return translate_vertex_program(*program,kind==ShaderKind::launch,kind==ShaderKind::vertex_jitter).source;
     }
     if(kind==ShaderKind::gui_vertex) return std::string(gui_vertex_source);
     if(kind==ShaderKind::gui_pixel) return std::string(gui_pixel_source);
@@ -48,10 +48,10 @@ ShaderBinary shader_binary(ShaderKind kind,const VertexProgram* program) {
     Key key{kind};if(program) key.program=normalize_vertex_program(*program);
     if(const auto found=bytecode.find(key);found!=bytecode.end()) return {found->second.bytes,false,found->second.first,found->second.count};
     std::uint32_t first=0,count=192;
-    if(kind==ShaderKind::vertex) {
+    if(kind==ShaderKind::vertex || kind==ShaderKind::vertex_jitter) {
         const auto translated=translate_vertex_program(key.program);
         first=translated.constant_first;count=translated.constant_count;
-    } else if(kind>=ShaderKind::fixed0 && kind<=ShaderKind::fixed6) count=96;
+    } else if((kind>=ShaderKind::fixed0 && kind<=ShaderKind::fixed6) || (kind>=ShaderKind::fixed_jitter0 && kind<=ShaderKind::fixed_jitter6)) count=96;
     const auto hlsl=source(kind,program?&key.program:nullptr);
     ComPtr<ID3DBlob> code,errors,compact;
     auto status=D3DCompile(hlsl.data(),hlsl.size(),"b2-offline",nullptr,nullptr,"main",shader_profile(kind),
@@ -88,6 +88,7 @@ std::string compile_shaders(const std::filesystem::path& executable,const std::f
         for(unsigned i=0;i<sdk_addresses.size();++i) if(address==sdk_addresses[i] && value.program!=screen_vertex_programs()[i])
             throw std::runtime_error("SDK screen-position metadata differs from original bytes at "+hex32(address));
         shader_binary(launch?ShaderKind::launch:ShaderKind::vertex,&value.program);
+        if(!launch) shader_binary(ShaderKind::vertex_jitter,&value.program);
         if(std::ranges::none_of(vertices,[&](const StaticVertex& prior){return prior.launch==launch && prior.program==value.program;}))
             vertices.push_back(value);
     };
@@ -101,18 +102,22 @@ std::string compile_shaders(const std::filesystem::path& executable,const std::f
     std::ostringstream output;output<<"// Generated ahead of time from the verified XBE and native HLSL.\n#include \"shaders.h\"\n#include <stdexcept>\nnamespace b2 {namespace {\n";
     std::size_t total=0;
     for(unsigned i=0;i<unsigned(ShaderKind::count);++i) {
-        if(i==unsigned(ShaderKind::vertex) || i==unsigned(ShaderKind::launch)) continue;
+        if(i==unsigned(ShaderKind::vertex) || i==unsigned(ShaderKind::launch) || i==unsigned(ShaderKind::vertex_jitter)) continue;
         const auto binary=shader_binary(ShaderKind(i));total+=binary.bytes.size();array(output,"builtin_"+std::to_string(i),binary.bytes);
     }
     for(unsigned i=0;i<vertices.size();++i) {
         const auto& value=vertices[i];const auto binary=shader_binary(value.launch?ShaderKind::launch:ShaderKind::vertex,&value.program);
         total+=binary.bytes.size();array(output,"vertex_"+std::to_string(i),binary.bytes);
+        if(!value.launch) {
+            const auto jitter=shader_binary(ShaderKind::vertex_jitter,&value.program);
+            total+=jitter.bytes.size();array(output,"jitter_"+std::to_string(i),jitter.bytes);
+        }
     }
     output<<std::format("const std::array<StaticVertex,{}> programs{{{{\n",vertices.size());
     for(const auto& value:vertices) program(output,value);
     output<<"}};\n}\nstd::span<const StaticVertex> static_vertex_shaders(){return programs;}\nShaderBinary shader_binary(ShaderKind kind,const VertexProgram* program){\nswitch(kind){\n";
     for(unsigned i=0;i<unsigned(ShaderKind::count);++i) {
-        if(i==unsigned(ShaderKind::vertex) || i==unsigned(ShaderKind::launch)) continue;
+        if(i==unsigned(ShaderKind::vertex) || i==unsigned(ShaderKind::launch) || i==unsigned(ShaderKind::vertex_jitter)) continue;
         const auto binary=shader_binary(ShaderKind(i));
         output<<std::format("case ShaderKind({}):return {{Bytes(reinterpret_cast<const std::byte*>(builtin_{}),sizeof(builtin_{})),false,{}, {}}};\n",i,i,i,binary.constant_first,binary.constant_count);
     }
@@ -121,10 +126,15 @@ std::string compile_shaders(const std::filesystem::path& executable,const std::f
         const auto binary=shader_binary(vertices[i].launch?ShaderKind::launch:ShaderKind::vertex,&vertices[i].program);
         output<<std::format("if(kind==ShaderKind::{} && key==programs[{}].program) return {{Bytes(reinterpret_cast<const std::byte*>(vertex_{}),sizeof(vertex_{})),false,{}, {}}};\n",
             vertices[i].launch?"launch":"vertex",i,i,i,binary.constant_first,binary.constant_count);
+        if(!vertices[i].launch) {
+            const auto jitter=shader_binary(ShaderKind::vertex_jitter,&vertices[i].program);
+            output<<std::format("if(kind==ShaderKind::vertex_jitter && key==programs[{}].program) return {{Bytes(reinterpret_cast<const std::byte*>(jitter_{}),sizeof(jitter_{})),false,{}, {}}};\n",
+                i,i,i,jitter.constant_first,jitter.constant_count);
+        }
     }
     output<<"throw std::runtime_error(\"Vertex program is missing from the compiled shader bank\");}\n}\n";
     write_text(destination,output.str(),replace);
     return std::format("{{\"format\":\"b2-shaders-aot-v1\",\"sha256\":{},\"title_records\":{},\"sdk_programs\":3,\"vertex_programs\":{},\"builtin_shaders\":{},\"bytecode_bytes\":{},\"runtime_compiler\":false}}",
-        json(image.sha256),title_programs.size(),vertices.size(),unsigned(ShaderKind::count)-2,total);
+        json(image.sha256),title_programs.size(),vertices.size(),unsigned(ShaderKind::count)-3,total);
 }
 }

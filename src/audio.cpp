@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cstdio>
 #include <format>
+#include <optional>
 #include <stdexcept>
 #include <tuple>
 
@@ -130,9 +131,9 @@ struct Audio::Packets {
     explicit Packets(unsigned capacity):slots(capacity) {}
 };
 struct Audio::ControlQueue {
-    enum Kind {frequency,pitch,spatial,volume,headroom};
+    enum Kind {frequency,pitch,spatial,volume,headroom,effect_parameter};
     struct Control {
-        std::uint32_t id=0,kind=0,hz=0;
+        std::uint32_t id=0,kind=0,hz=0,mask=0;
         double pitch=1;
         float gain=1;
         std::array<float,2> pan{1,1},front_back{1,0},environment_gain{1,0},environment_pole{};
@@ -459,6 +460,9 @@ void Audio::apply_controls() {
     const auto tail=queue.tail.load(std::memory_order_acquire);
     for(;head!=tail;++head) {
         const auto& update=queue.values[head&ControlQueue::mask];
+        if(update.kind==ControlQueue::effect_parameter) {
+            effect_parameter(update.id,update.hz,update.mask);continue;
+        }
         auto& value=voices_[update.id-1];
         switch(update.kind) {
         case ControlQueue::frequency:value.step=(update.hz?update.hz:value.format.rate)/48000.0;break;
@@ -906,10 +910,10 @@ void Audio::effects(const EffectsImage& image,std::uint32_t reverb_index) {
     auto replacement=std::make_unique<Effects>(image,reverb_index);
     // Validate initialization and its real delay transfers before publication.
     for(unsigned i=0;i<replacement->count;++i) run_effect(replacement->state,i);
-    StreamLock lock(stream_);effects_.swap(replacement);
+    StreamLock lock(stream_);apply_controls();effects_.swap(replacement);
 }
 void Audio::effect_data(std::uint32_t offset,std::span<std::byte> destination) {
-    StreamLock lock(stream_);
+    StreamLock lock(stream_);apply_controls();
     if(!effects_ || offset>effects_->state.x.size()*4 || destination.size()>effects_->state.x.size()*4-offset)
         throw std::runtime_error("Invalid native DSP effect read");
     while(!destination.empty()) {
@@ -920,11 +924,12 @@ void Audio::effect_data(std::uint32_t offset,std::span<std::byte> destination) {
     }
 }
 void Audio::effect_data(std::uint32_t offset,std::span<const std::byte> source,bool deferred) {
-    StreamLock lock(stream_);
     if(!effects_ || offset>effects_->state.x.size()*4 || source.size()>effects_->state.x.size()*4-offset)
         throw std::runtime_error("Invalid native DSP effect write");
-    auto& effect=*effects_;
     if(deferred) {
+        // Pending bytes belong to the game-thread producer. The mixer consumes
+        // only the owned word snapshots published by commit_effects().
+        auto& effect=*effects_;
         if(source.empty()) return;
         std::copy(source.begin(),source.end(),effect.pending.begin()+offset);
         for(std::size_t i=0;i<source.size();++i) effect.dirty.set(offset+i);
@@ -932,6 +937,7 @@ void Audio::effect_data(std::uint32_t offset,std::span<const std::byte> source,b
         effect.dirty_end=std::max(effect.dirty_end,(offset+static_cast<std::uint32_t>(source.size())+3)&~3U);
         return;
     }
+    StreamLock lock(stream_);apply_controls();auto& effect=*effects_;
     const bool continuous=std::ranges::any_of(voices_,[](const Voice& value){return value.used && value.playing;});
     while(!source.empty()) {
         const auto size=std::min<std::size_t>(4-offset%4,source.size());
@@ -943,26 +949,41 @@ void Audio::effect_data(std::uint32_t offset,std::span<const std::byte> source,b
     }
 }
 void Audio::commit_effects() {
-    StreamLock lock(stream_);if(!effects_) return;
+    if(!effects_) return;
     auto& effect=*effects_;
-    const bool continuous=std::ranges::any_of(voices_,[](const Voice& value){return value.used && value.playing;});
+    unsigned count=0;
+    for(auto offset=effect.dirty_first;offset<effect.dirty_end;offset+=4)
+        count+=effect.dirty[offset] || effect.dirty[offset+1] || effect.dirty[offset+2] || effect.dirty[offset+3];
+    if(!count) {effect.dirty_first=0x6000;effect.dirty_end=0;return;}
+    const bool continuous=std::ranges::any_of(statuses_,[](const auto& value){return (value.load(std::memory_order_relaxed)&1)!=0;});
+    const bool queued=count<=ControlQueue::capacity;
+    const auto at=queued?reserve_controls(count):0;
+    std::optional<StreamLock> lock;
+    if(!queued) {lock.emplace(stream_);apply_controls();}
+    unsigned index=0;
     for(auto offset=effect.dirty_first;offset<effect.dirty_end;offset+=4) {
-        auto value=effect.state.load(offset/4);bool changed=false;
-        for(unsigned i=0;i<4;++i) if(effect.dirty[offset+i]) {
-            reinterpret_cast<std::byte*>(&value)[i]=effect.pending[offset+i];changed=true;
-        }
-        if(changed) effect.state.parameter(offset/4,value,continuous);
+        unsigned mask=0;for(unsigned i=0;i<4;++i) if(effect.dirty[offset+i]) mask|=1U<<i;
+        if(!mask) continue;
+        std::uint32_t value;std::memcpy(&value,effect.pending.data()+offset,4);mask|=continuous?16U:0U;
+        if(queued) controls_->values[(at+index++)&ControlQueue::mask]={.id=offset/4,.kind=ControlQueue::effect_parameter,.hz=value,.mask=mask};
+        else effect_parameter(offset/4,value,mask);
     }
     effect.dirty.reset();effect.dirty_first=0x6000;effect.dirty_end=0;
+    if(queued) controls_->tail.store(at+count,std::memory_order_release);
+}
+void Audio::effect_parameter(std::uint32_t word,std::uint32_t value,unsigned mask) {
+    auto& state=effects_->state;auto merged=state.load(word);
+    for(unsigned i=0;i<4;++i) if(mask&(1U<<i)) reinterpret_cast<std::byte*>(&merged)[i]=reinterpret_cast<const std::byte*>(&value)[i];
+    state.parameter(word,merged,(mask&16)!=0);
 }
 std::uint32_t Audio::effect_x(std::uint32_t offset,unsigned size) {
-    StreamLock lock(stream_);
+    StreamLock lock(stream_);apply_controls();
     if(!effects_ || size>4 || !size || offset>=effects_->state.x.size()*4 || offset/4!=(offset+size-1)/4)
         throw std::runtime_error("Invalid native DSP X read");
     return (effects_->state.load(offset/4)>>(offset%4*8))&(size==4?0xFFFFFFFFU:(1U<<(size*8))-1);
 }
 void Audio::effect_x(std::uint32_t offset,unsigned size,std::uint32_t value) {
-    StreamLock lock(stream_);
+    StreamLock lock(stream_);apply_controls();
     if(!effects_ || size>4 || !size || offset>=effects_->state.x.size()*4 || offset/4!=(offset+size-1)/4)
         throw std::runtime_error("Invalid native DSP X write");
     const auto mask=size==4?0xFFFFFFFFU:(1U<<(size*8))-1,shift=offset%4*8;
@@ -971,19 +992,19 @@ void Audio::effect_x(std::uint32_t offset,unsigned size,std::uint32_t value) {
         std::ranges::any_of(voices_,[](const Voice& voice){return voice.used && voice.playing;}));
 }
 std::uint32_t Audio::effect_scratch(std::uint32_t offset,unsigned size) {
-    StreamLock lock(stream_);
+    StreamLock lock(stream_);apply_controls();
     if(!effects_ || !size || size>4 || offset>effects_->state.scratch.size() || size>effects_->state.scratch.size()-offset)
         throw std::runtime_error("Invalid native DSP scratch read");
     std::uint32_t value=0;std::memcpy(&value,effects_->state.scratch.data()+offset,size);return value;
 }
 void Audio::effect_scratch(std::uint32_t offset,unsigned size,std::uint32_t value) {
-    StreamLock lock(stream_);
+    StreamLock lock(stream_);apply_controls();
     if(!effects_ || !size || size>4 || offset>effects_->state.scratch.size() || size>effects_->state.scratch.size()-offset)
         throw std::runtime_error("Invalid native DSP scratch write");
     std::memcpy(effects_->state.scratch.data()+offset,&value,size);
 }
 std::uint32_t Audio::effect_program(std::uint32_t offset,unsigned size) {
-    StreamLock lock(stream_);
+    StreamLock lock(stream_);apply_controls();
     if(!effects_ || !size || size>4 || offset>effects_->program.size() || size>effects_->program.size()-offset)
         throw std::runtime_error("Invalid compiled DSP program read");
     std::uint32_t value=0;std::memcpy(&value,effects_->program.data()+offset,size);return value;
@@ -1163,6 +1184,26 @@ std::string check_audio(const std::filesystem::path& effects_path,const std::fil
         File file(effects_path);if(file.size()>65536) throw std::runtime_error("Effects image exceeds 64 KiB");
         const auto image=decode_effects(file.read(0,static_cast<std::size_t>(file.size())));
         auto fixture=std::make_unique<Audio>(false);auto& scene=*fixture;scene.effects(image,2);
+        constexpr auto parameter_offset=(0xAE+5)*4;
+        const std::array<std::uint32_t,1> initial_word{0x030201};
+        scene.effect_data(parameter_offset,std::as_bytes(std::span(initial_word)),false);
+        const std::array<std::byte,1> second_byte{std::byte{0x22}},third_byte{std::byte{0x33}};
+        scene.effect_data(parameter_offset+1,second_byte,true);
+        require(scene.effect_x(parameter_offset,4)==0x030201);
+        scene.commit_effects();scene.effect_data(parameter_offset+2,third_byte,true);scene.commit_effects();
+        require(scene.effect_x(parameter_offset,4)==0x332201);
+        const std::array<std::uint32_t,1> deferred_word{0x665544};
+        scene.effect_data(parameter_offset,std::as_bytes(std::span(deferred_word)),true);
+        scene.effect_data(parameter_offset+1,second_byte,false);scene.commit_effects();
+        require(scene.effect_x(parameter_offset,4)==0x662244);
+        for(unsigned i=0;i<Audio::ControlQueue::capacity+8;++i) {
+            scene.effect_data(parameter_offset+1,i&1?second_byte:third_byte,true);scene.commit_effects();
+        }
+        require(scene.effect_x(parameter_offset,4)==0x662244);
+        const std::vector<std::uint32_t> large_update(6144,0x030201);
+        scene.effect_data(0,std::as_bytes(std::span(large_update)),true);scene.commit_effects();
+        require(scene.effect_x(0,4)==0x030201 && scene.effect_x(6143*4,4)==0x030201);
+        scene.effects(image,2);
         // Known original distortion parameters also used by the effects checks.
         const std::array<std::uint32_t,11> parameters{0xDC0,0xDC0,0x1BC5B,0x3FFFFF,0x19A027,0x7FFFFF,0x1A7250,0,0x1FFFFF,0,0x7126E8};
         scene.effect_data((0xAE+5)*4,std::as_bytes(std::span(parameters)),false);

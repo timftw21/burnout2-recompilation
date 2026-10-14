@@ -63,12 +63,17 @@ Use C++23. Zydis is pinned and linked only into b2-tool, never the game executab
 Run PowerShell commands from the repository root. Private media and generated
 outputs remain ignored. No Python is required.
 
-Release 1.3 upgrades require reinstalling the source from Installation.zip and
-running Build.cmd again with LLVM 22.1 or newer installed. Extracting over the
-existing source folder and rebuilding preserves settings and saves; back up
-data/user beside b2.exe first. New-folder installations can restore that folder
-beside the new executable after building. Keep V-sync disabled for now because
-it has known issues; existing saved values are preserved.
+Updating between releases, including 1.4:
+Close the game and builder. Back up data/user and data/local/settings.cfg beside
+b2.exe, plus data/local/custom-music if you imported music. Install the required
+tools above; releases before 1.3 need LLVM 22.1 or newer. Extract the latest
+Installation.zip over the existing source folder containing Build.cmd, replacing
+source files while keeping build and data folders. Run Build.cmd again and select
+your XISO. The builder refreshes game-file locations and preserves other settings,
+saves and imported music. For a new-folder installation, build first, restore
+those backups beside the new b2.exe, then run Build.cmd once more to refresh
+game-file locations. With V-sync enabled, display rates are limited by the
+monitor's refresh rate; lower selected rates keep their cap.
 
 Release uses clang-cl, Ninja and parallel ThinLTO with a 3 GiB linker cache per
 executable. The generated CPU shards share a precompiled header and emit direct
@@ -129,6 +134,7 @@ CPU, loader and original startup
 & .\build\windows\Release\b2.exe --check-spatial data/local/default.xbe
 & .\build\windows\Release\b2.exe --check-spatial data/local/default.xbe build/checks/audio-bindings
 & .\build\windows\Release\b2.exe --check-music data/local/default.xbe 'Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso' build/checks/music
+& .\build\windows\Release\b2.exe --check-custom-music data/local/default.xbe build/checks/custom-music-check
 & .\build\windows\Release\b2.exe --check-effects data/local/b2distfx.bin
 & .\build\windows\Release\b2.exe --bench-cpu
 & .\build\windows\Release\b2-tool.exe check-image data/local/default.xbe
@@ -221,7 +227,9 @@ HIT defaults to 1. Breakpoints and memory snapshots remain diagnostic-only.
 Use a fresh output directory. This isolated check loads all 18 recorded menu and
 lesson demonstrations through the original file manager and replay loader. It
 compares headers, frame counts and complete input payloads with the disc files
-without booting, opening a window or using a graphics or audio device.
+without booting, opening a window or using a graphics or audio device. It also
+replays the real asynchronous FWYL.PSS read that damaged a loading semaphore,
+checking the full payload across the original fixed track-buffer boundary.
 
 Mounting an ISO verifies its default.xbe matches the compiled target. Disc files
 are read-only. Native saves and cache use data/user/UDATA, TDATA and CACHE beside
@@ -241,7 +249,21 @@ title mount, save-directory and player-profile signing routines without booting.
 It writes and reopens a full profile across fresh runtimes, checks signatures
 against Windows CNG, then overwrites through the game's asynchronous write path
 and reopens again. It also checks copied SHA contexts, padding boundaries and
-Xbox HMAC key truncation. Fixtures stay in the requested output directory.
+Xbox HMAC key truncation. It also checks the original shared semaphore wait
+while the process heap grows and frees mixed small and large allocations.
+The title's fixed physical buffer claims run through the original SDK too;
+ordinary heap growth must preserve those buffers and the loading semaphore.
+Fixtures stay in the requested output directory.
+The isolated --check-memory-watch diagnostic checks hardware write detection and
+removal without booting. Its optional --crash argument deliberately terminates
+that diagnostic to validate the native crash report; it is not a gameplay check.
+For a manual corruption investigation, --watch-semaphores accepts up to four
+guest handle numbers and opens the normal app. It watches the immutable type byte
+after object creation, skips legitimate initialization and removes watches before
+memory is released. Overlapping file reads are checked separately because Windows
+may complete them outside the guest thread. These watches are opt-in and are not
+saved in settings. Native crash logs include registers in RAX, RCX, RDX, RBX, RSP,
+RBP, RSI, RDI, R8..R15 order, four debug addresses and up to 16 stack words.
 The user confirmed creating a profile, saving, restarting and loading it in-game
 on 2026-10-09.
 
@@ -249,6 +271,8 @@ Offline D3D11 rendering
 
 & .\build\windows\Release\b2-tool.exe check-render build/checks/render --debug
 & .\build\windows\Release\b2-tool.exe check-render build/checks/render-warp --warp --debug
+& .\build\windows\Release\b2.exe --check-visibility data/local/default.xbe build/checks/visibility
+& .\build\windows\Release\b2.exe --check-visibility data/local/default.xbe build/checks/visibility-warp --warp
 
 Use fresh output directories. Runs save PNGs and structured adapter, failure and
 GPU timing reports. The renderer supports all ten NV097 primitives, indexed draws,
@@ -273,7 +297,8 @@ Full packed color clears preserve the same GPU image across linear/swizzled
 layout changes without a depth allocation; nonuniform reinterpretation is
 explicitly unsupported. Texture sampling respects separate minification/magnification,
 detail bias, mip-level limits and anisotropy. Samplers share a bounded cache
-independently of blend/depth/raster state.
+independently of blend/depth/raster state. Unused settings share native sampler
+descriptors, and queued draws retain their samplers when older entries are recycled.
 Surface clips retain their framebuffer storage; growth preserves color, depth
 and stencil on the GPU.
 Prepare resources before submission. Readback is an explicit offline operation.
@@ -293,6 +318,13 @@ fog sources. Matrix aliases share the original vertex-program constant bank.
 Original GPU packet submission is supported. GPU fences and timing queries avoid
 allocating queries or
 waiting for timing samples during normal rendering.
+Visibility queries return original pixel coverage through the SDK's report
+memory, with ordered asynchronous completion. Higher internal resolutions and
+MSAA retain the original pixel count. Unrestricted guest allocations search from
+higher addresses so graphics buffers, heaps, pools and stacks leave space for
+devices with limited DMA ranges. Explicit addresses and allocation bounds remain
+honored.
+The visibility diagnostic runs the original SDK without booting the game.
 
 & .\build\windows\Release\b2-tool.exe render-texture INPUT.bin 0x0F 256 128 OUTPUT.png
 & .\build\windows\Release\b2-tool.exe inspect-textures data/local/global.dic
@@ -306,7 +338,7 @@ timestamp and viewpoint. Asset rendering alone is not frame parity.
 SDL3 input supports Xbox gamepads and custom keyboard controls. Offline checks
 cover remapping, cleared bindings, stick directions and unchanged gamepad input.
 The executable opens an SDL3 window with persistent Dear ImGui settings in Game
-Files, General, Audio, Graphics, Controls and Log tabs. The full game name is in the
+Files, General, Audio, Graphics, Enhancements, Controls and Log tabs. The full game name is in the
 window title, and setting descriptions appear in hover tooltips.
 Log retains the latest 64 startup, capture and error messages, newest first,
 inside the scrolling tab content. Messages do not appear above the game buttons.
@@ -321,10 +353,37 @@ speed up movement. Absolute SDL3 deadlines avoid catch-up bursts after stalls
 or rate changes; the guest video callback stays at 60 Hz.
 The scheduler presents interpolated images while servicing events/input between
 original frames. V-sync can still limit presentation to the physical display.
-Audio controls master volume and mute through SDL3's output gain. Graphics has
-Widescreen (16:9), V-sync, fullscreen and internal resolution (1x-4x).
-V-sync defaults off for new installations and should remain disabled for now
-because of known issues. Existing saved preferences retain their selected value.
+Audio controls master volume and mute through SDL3's output gain. Browse a music
+folder and choose Import music to make its songs available in the original
+Music Selection menu. Each import replaces the collection with up to 500 files
+from that folder, without scanning subfolders. Folder and filenames provide
+the collection and song names. MP3, WAV, WMA, FLAC, M4A and AAC are supported
+through Windows Media Foundation; missing media components need the Media Feature
+Pack. The originals are read only, and cancellation preserves the previous cache.
+Import runs outside gameplay, with progress and cancellation; importing during
+play ends the session and restarts from the beginning after success. The Custom
+music checkbox applies when starting or restarting. Converted WMA files and the
+original-format catalogue are stored in data/local/custom-music beside b2.exe.
+The compiled Xbox code discovers and plays them through read-only native storage.
+Windows media libraries are delay-loaded and only needed for importing.
+
+Command-line import uses the same implementation:
+& .\build\windows\Release\b2.exe --import-music 'C:\Music\Driving' build/windows/Release/data/local/custom-music
+
+--check-custom-music requires a fresh output directory. It generates seven short
+tones and verifies import, Unicode names, catalogue group boundaries, cancelled
+replacement and playback through the original compiled soundtrack APIs and WMA
+decoder. It decodes the complete first song and compares the result with its
+catalogue duration, retaining only packet statistics. An optional final
+CACHE_DIRECTORY argument checks an existing imported library read-only instead
+of generating fixtures. Import preserves recording levels; built-in and imported
+music share the native volume and headroom controls. The user confirmed in-game
+selection and playback; all further in-game checking remains manual.
+
+Graphics has Widescreen (16:9), V-sync, fullscreen and internal resolution (1x-4x).
+V-sync defaults off for new installations. At the monitor's refresh rate it
+follows the display queue; lower selected rates retain their cap. Existing saved
+preferences retain their selected value.
 Widescreen reports the original video-settings bit to the compiled game and
 fits its anamorphic framebuffer to 16:9 at presentation. Native camera, HUD and
 split-screen calculations remain in the original code. The logical framebuffer
@@ -336,6 +395,52 @@ keeps the host half-pixel origin independent of scale. Targets are created at
 the selected scale when starting a game; changes during play require
 a new game session or app restart. Diagnostic readback storage is allocated only
 on request. The render-target budget accounts for scale and stays bounded.
+Enhancements follows Graphics and offers antialiasing Off/FXAA Low/Medium/High/MSAA 2x/4x/8x
+and anisotropic filtering Original/Off (1x)/2x/4x/8x/16x. Both save automatically
+and apply at the next session. Defaults preserve the original single-sample
+rendering and per-texture anisotropy, including the game's captured 2x road filter.
+FXAA runs once on each completed internal-resolution image, before interpolation,
+without changing original colour, depth or feedback targets. The settings and
+counter overlay remain sharp because they are drawn afterward. In-game HUD/text
+are part of the game image and may soften. One additional RGBA8 target is included
+in the resource budget only while FXAA is enabled; shaders compile during
+the build. Forced anisotropy preserves point sampling, address modes and signed
+LOD bias/limits. MSAA renders colour and depth with the selected sample count,
+then resolves to ordinary textures for feedback, reflections, display and
+interpolation. Growing targets copies individual colour/depth/stencil samples
+with built shaders; D3D11 forbids partial multisample copies. MSAA levels require
+support across the game's RGBA8/RGB565 and D16/D24S8 formats. Unsupported levels
+are disabled, and a saved unsupported choice resets to Off with a Log message.
+The target budget includes multisample colour/depth and resolved images. See
+research/enhancements.txt for evidence and native validation.
+LOD override clamps texture mip selection to level zero and draws each visible
+track section with its own nearby visibility record. Render distance override
+preloads the original PSW/P2W stream into separate mapped rendering storage during
+loading. The original world renderer then uses a bounded extended visibility list
+for scenery and props; collision and traffic streaming retain their original heap.
+Camera far clipping and original scenery fade distances extend by 50%. Track
+visibility extends the original visibility records' horizontal coverage by 50%,
+within the extended camera range. Sections outside it are rejected before the
+original frustum checks and draws; originally visible sections keep the game's
+mesh choices unless LOD override is enabled. Each camera retains its original
+range across camera switches. No extra reads or allocations occur during normal
+rendering. Both overrides default to disabled.
+Intro skip finishes the original logo sequence at the PRESS START title screen
+after required loading, preserving its normal controls and attract timeout.
+DLSS, FSR and XeSS are marked experimental in settings, with a visible warning
+about visual issues and possible performance loss. They use their pinned vendor
+SDKs, downloaded and verified by cmake/upscalers.cmake. D3D11 rendering shares
+images and GPU fences with a D3D12
+compute queue on the same adapter. Input includes native depth, camera parameters,
+vertex jitter, optical-flow motion and responsive UI/effect masks. Vertex variants
+and conversion shaders compile ahead of time. Motion is image-estimated rather
+than exact engine motion; quality around moving fine detail remains a limitation.
+Resolution selects the output size while upscaling is enabled. The game renders
+at half that scale, rounded up to a whole native scale; 1x applies the vendor's
+temporal antialiasing at native resolution. Reconstruction precedes interpolation.
+Separate MSAA/FXAA is inactive while upscaling is enabled; its saved choice remains.
+b2-tool check-upscaling OUTPUT runs native SDK and renderer diagnostics without
+booting. The build copies vendor libraries and license notices beside both tools.
 The FPS overlay measures display and original-game frames separately over half
 a second and is drawn at window resolution, after interpolation.
 Controls allows a key per action, clearing bindings and restoring defaults.
@@ -343,12 +448,16 @@ Esc cancels an active key change; Esc/F1/F8/F9 remain reserved for the interface
 Settings, including scancodes and game-file paths, save automatically in
 data/local/settings.cfg after editing. Closing settings or the app also saves
 pending edits. Continuous slider/text edits do not write on every frame.
+The cursor hides after two seconds without mouse input while the window has
+keyboard and mouse focus. Mouse movement, buttons and scrolling restore it;
+holding a mouse button keeps it visible. Settings preserve normal cursor shapes
+while it is visible.
 The game buttons share a centered row. Exit game saves pending setting changes
 and closes the app through the same path as closing the window.
 Restart game ends the current session
 through the native scheduler's cancellation path, releases its audio, pending
 reads and guest stacks, and starts a fresh session in the same window. Saved
-settings, including internal resolution, apply when the new session starts.
+settings, including internal resolution and enhancements, apply when the new session starts.
 
 Interpolation is a D3D11 image pass, inactive at the default 60 Hz. It stores two
 completed frames, estimates motion in both directions with four fixed-size
@@ -359,7 +468,7 @@ frame. This improves presentation smoothness without raising gameplay speed;
 occlusions/fast movement can still produce artifacts. All shaders compile during
 the build, and disabling the feature avoids history copies and motion passes.
 Hidden window diagnostics check saved/invalid bindings and settings, automatic
-interpolation selection and saved opt-outs, the counter, all four tabs, Esc,
+interpolation selection and saved opt-outs, the counter, all settings tabs, Esc,
 scaled targets, 60/120 Hz pacing, original frames at 120/144 Hz with interpolation
 off, 60 Hz source frames with interpolation on, live opt-outs, translated images,
 endpoints, stationary HUD, new occlusions,
@@ -370,6 +479,8 @@ F8, or Capture frame in Graphics, records the next complete GPU frame under
 build/captures. It exports target images and streaming draws.jsonl records with
 the original registers, shader tokens, constants and bounded vertex prefixes,
 plus clear events with their layout, color, channels and rectangle.
+Ordinary texture records include dimensions, formats and the current guest texture
+bytes in separate .bin files, bounded to 64 MiB per capture.
 game-state.json records replay state, relevant memory and recent file operations
 at the capture request; the GPU image records the next complete frame.
 audio.bin saves sample banks, voice controls, routing and DSP history at the

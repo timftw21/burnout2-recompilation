@@ -3,6 +3,7 @@
 #include "file.h"
 #include "xbox.h"
 #include "diagnostics.h"
+#include "custom_music.h"
 #include <SDL3/SDL.h>
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
@@ -12,6 +13,8 @@
 #include <d3d11.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <atomic>
+#include <bit>
 #include <charconv>
 #include <cfloat>
 #include <cmath>
@@ -75,9 +78,11 @@ struct ControlScript {
     }
 };
 struct Preferences {
-    std::array<char,4096> xbe{},disc{};
+    std::array<char,4096> xbe{},disc{},music_folder{};
     bool vsync=false,fullscreen=false,keyboard=true,muted=false,interpolation=false,show_fps=false,widescreen=false;
-    int refresh_rate=60,volume=100,resolution_scale=1;
+    int refresh_rate=60,volume=100,resolution_scale=1,antialiasing=0,anisotropy=0,upscaling=0;
+    bool custom_music=false;
+    bool skip_intro=false,highest_lod=false,unlimited_distance=false;
     KeyboardBindings bindings=default_keyboard_bindings();
     explicit Preferences(bool load=true,const std::filesystem::path& path="data/local/settings.cfg") {
         strcpy_s(xbe.data(),xbe.size(),"data/local/default.xbe");
@@ -92,18 +97,28 @@ struct Preferences {
                 int candidate=0;const auto result=std::from_chars(value.data(),value.data()+value.size(),candidate);
                 if(result.ec==std::errc{} && result.ptr==value.data()+value.size() && candidate>=minimum && candidate<=maximum) destination=candidate;
             };
-            if(key=="xbe" || key=="disc") {
-                auto& destination=key=="xbe"?xbe:disc;
+            if(key=="xbe" || key=="disc" || key=="music_folder") {
+                auto& destination=key=="xbe"?xbe:key=="disc"?disc:music_folder;
                 if(value.size()<destination.size()) strcpy_s(destination.data(),destination.size(),value.c_str());
             } else if(key=="vsync") vsync=value=="1";
             else if(key=="fullscreen") fullscreen=value=="1";
             else if(key=="widescreen") widescreen=value=="1";
             else if(key=="keyboard") keyboard=value=="1";
             else if(key=="muted") muted=value=="1";
+            else if(key=="custom_music") custom_music=value=="1";
+            else if(key=="skip_intro") skip_intro=value=="1";
+            else if(key=="highest_lod") highest_lod=value=="1";
+            else if(key=="unlimited_distance") unlimited_distance=value=="1";
             else if(key=="interpolation") interpolation=value=="1";
             else if(key=="show_fps") show_fps=value=="1";
             else if(key=="refresh_rate") number(refresh_rate,30,1000);
             else if(key=="resolution_scale") number(resolution_scale,1,4);
+            else if(key=="antialiasing") number(antialiasing,0,6);
+            else if(key=="upscaling") number(upscaling,0,3);
+            else if(key=="anisotropy") {
+                auto candidate=anisotropy;number(candidate,0,16);
+                if(!candidate || std::has_single_bit(unsigned(candidate))) anisotropy=candidate;
+            }
             else if(key=="volume") number(volume,0,100);
             else if(key.starts_with("key_")) {
                 for(unsigned i=0;i<keyboard_actions.size();++i) if(key.substr(4)==keyboard_actions[i].id) {
@@ -118,7 +133,11 @@ struct Preferences {
         std::ofstream file(path,std::ios::trunc);
         file<<"xbe="<<xbe.data()<<"\ndisc="<<disc.data()<<"\nvsync="<<vsync<<"\nfullscreen="<<fullscreen<<"\nkeyboard="<<keyboard
             <<"\nrefresh_rate="<<refresh_rate<<"\nvolume="<<volume<<"\nmuted="<<muted
-            <<"\nresolution_scale="<<resolution_scale<<"\ninterpolation="<<interpolation<<"\nshow_fps="<<show_fps<<"\nwidescreen="<<widescreen<<'\n';
+            <<"\nresolution_scale="<<resolution_scale<<"\ninterpolation="<<interpolation<<"\nshow_fps="<<show_fps<<"\nwidescreen="<<widescreen
+            <<"\nantialiasing="<<antialiasing<<"\nanisotropy="<<anisotropy
+            <<"\nupscaling="<<upscaling
+            <<"\nskip_intro="<<skip_intro<<"\nhighest_lod="<<highest_lod<<"\nunlimited_distance="<<unlimited_distance
+            <<"\ncustom_music="<<custom_music<<"\nmusic_folder="<<music_folder.data()<<'\n';
         for(unsigned i=0;i<keyboard_actions.size();++i) file<<"key_"<<keyboard_actions[i].id<<'='<<bindings[i]<<'\n';
         if(!file) throw std::runtime_error("Could not save settings");
     }
@@ -158,6 +177,10 @@ struct FramePacer {
         advance();
     }
 };
+struct MusicFolderSelection {
+    std::atomic<bool> finished{false};
+    std::string path,error;
+};
 struct App {
     SDL_Window* window=nullptr;
     std::unique_ptr<Renderer> renderer;
@@ -173,15 +196,24 @@ struct App {
     unsigned benchmark_dropped=0;
     std::string benchmark_properties,benchmark_cpu,benchmark_build;
     Xbox* game=nullptr;
+    std::array<std::uint32_t,4> watch_semaphores{};
+    MusicImport music_import;
+    std::shared_ptr<MusicFolderSelection> music_folder_selection;
+    unsigned music_songs=0;
+    bool music_importing=false,music_import_requested=false,music_restart=false;
     std::vector<int> refresh_rates;
+    float display_refresh=0;
     int category=0,select_category=-1,binding_action=-1,active_scale=1;
     bool running=true,playing=false,show_settings=true,launch=false,settings_dirty=false,active_widescreen=false;
     std::deque<std::string> log_messages;
     std::string memory_snapshot="[]";
     std::uint64_t stop_at=0,frames=0,first_frame=0,last_frame=0;
     std::uint64_t published_at=0,first_source=0,last_source=0,source_interval=1000000000ULL/60;
+    std::uint64_t mouse_activity=0;
+    bool cursor_hidden=false;
     App(bool hidden,bool warp,const std::filesystem::path& script={},const std::filesystem::path& preferences="data/local/settings.cfg"):
         settings(!hidden,preferences),settings_path(preferences) {
+        music_songs=custom_music_count(music_cache());
         // Explicit scripts must work while the user keeps another app focused.
         // This process reads only its own virtual controller in script mode.
         if(!script.empty() && !SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS,"1"))
@@ -190,10 +222,12 @@ struct App {
         try {
             window=SDL_CreateWindow("Burnout 2: Point of Impact",960,720,SDL_WINDOW_RESIZABLE|SDL_WINDOW_HIGH_PIXEL_DENSITY|(hidden?SDL_WINDOW_HIDDEN:0));
             if(!window) throw std::runtime_error(SDL_GetError());
+            mouse_activity=SDL_GetTicksNS();
             refresh_options();
             auto* handle=SDL_GetPointerProperty(SDL_GetWindowProperties(window),SDL_PROP_WINDOW_WIN32_HWND_POINTER,nullptr);
-            active_scale=settings.resolution_scale;
+            active_scale=settings.upscaling?std::max(1,(settings.resolution_scale+1)/2):settings.resolution_scale;
             renderer=std::make_unique<Renderer>(640,480,warp,hidden,active_scale);renderer->attach_window(handle);
+            configure_enhancements();
             active_widescreen=settings.widescreen;renderer->widescreen(active_widescreen);
             if(!script.empty()) controls=std::make_unique<ControlScript>(script);
             input=std::make_unique<Input>(controls?false:settings.keyboard,false,controls?controls->id:0);
@@ -215,7 +249,7 @@ struct App {
         }
         input.reset();controls.reset();renderer.reset();if(window) SDL_DestroyWindow(window);window=nullptr;SDL_Quit();
     }
-    ~App() {save_settings();cleanup();}
+    ~App() {music_import.cancel();save_settings();cleanup();}
     void log_message(std::string message) {
         if(message.empty()) return;
         if(log_messages.size()==64) log_messages.pop_front();
@@ -242,8 +276,8 @@ struct App {
         } catch(const std::exception& error) {performance.reset();log_message(error.what());}
     }
     std::string benchmark_settings() const {
-        return std::format("\"refresh_rate\":{},\"resolution_scale\":{},\"widescreen\":{},\"interpolation\":{},\"vsync\":{}",
-            settings.refresh_rate,active_scale,active_widescreen,settings.interpolate(),settings.vsync);
+        return std::format("\"refresh_rate\":{},\"resolution_scale\":{},\"output_resolution_scale\":{},\"upscaling\":{},\"distance_override\":{},\"widescreen\":{},\"interpolation\":{},\"vsync\":{}",
+            settings.refresh_rate,active_scale,settings.resolution_scale,settings.upscaling,settings.unlimited_distance,active_widescreen,settings.interpolate(),settings.vsync);
     }
     void stop_benchmark() {
         if(!benchmark_started) return;
@@ -301,6 +335,8 @@ struct App {
     }
     void refresh_options() {
         refresh_rates={30,60,75,90,120,144,165,180,240,360};
+        const auto* current=SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window));
+        display_refresh=current?current->refresh_rate:0;
         int count=0;auto** modes=SDL_GetFullscreenDisplayModes(SDL_GetDisplayForWindow(window),&count);
         if(modes) {
             for(int i=0;i<count;++i) {
@@ -315,6 +351,11 @@ struct App {
     }
     void event(const SDL_Event& event) {
         ImGui_ImplSDL3_ProcessEvent(&event);input->event(event);
+        if((event.type==SDL_EVENT_MOUSE_MOTION && (event.motion.xrel || event.motion.yrel)) ||
+           event.type==SDL_EVENT_MOUSE_BUTTON_DOWN || event.type==SDL_EVENT_MOUSE_BUTTON_UP ||
+           event.type==SDL_EVENT_MOUSE_WHEEL || event.type==SDL_EVENT_WINDOW_MOUSE_ENTER ||
+           event.type==SDL_EVENT_WINDOW_FOCUS_GAINED) mouse_activity=SDL_GetTicksNS();
+        if(event.type==SDL_EVENT_WINDOW_DISPLAY_CHANGED || event.type==SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED) refresh_options();
         if(event.type==SDL_EVENT_QUIT || event.type==SDL_EVENT_WINDOW_CLOSE_REQUESTED) exit_game();
         if(event.type==SDL_EVENT_KEY_DOWN && !event.key.repeat && binding_action>=0) {
             if(event.key.scancode==SDL_SCANCODE_ESCAPE) binding_action=-1;
@@ -330,11 +371,43 @@ struct App {
         }
         if(event.type==SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.scancode==SDL_SCANCODE_F8) capture_frame();
         if(event.type==SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.scancode==SDL_SCANCODE_F9) toggle_performance();
-        if(event.type==SDL_EVENT_WINDOW_DISPLAY_CHANGED) refresh_options();
+    }
+    void update_cursor() {
+        const auto flags=SDL_GetWindowFlags(window);
+        const bool hide=(flags&SDL_WINDOW_MOUSE_FOCUS) && (flags&SDL_WINDOW_INPUT_FOCUS) &&
+            SDL_GetTicksNS()-mouse_activity>=2000000000ULL && !SDL_GetMouseState(nullptr,nullptr);
+        if(hide==cursor_hidden) return;
+        cursor_hidden=hide;
+        auto& io=ImGui::GetIO();
+        // Keep the settings backend from showing the idle cursor every frame.
+        if(hide) {io.ConfigFlags|=ImGuiConfigFlags_NoMouseCursorChange;SDL_HideCursor();}
+        else {io.ConfigFlags&=~ImGuiConfigFlags_NoMouseCursorChange;SDL_ShowCursor();}
     }
     bool poll() {
         SDL_Event event;
         while(SDL_PollEvent(&event)) this->event(event);
+        update_cursor();
+        if(music_folder_selection && music_folder_selection->finished.load(std::memory_order_acquire)) {
+            const auto& selected=*music_folder_selection;
+            if(!selected.error.empty()) log_message(selected.error);
+            else if(!selected.path.empty()) {
+                if(selected.path.size()<settings.music_folder.size()) {
+                    strcpy_s(settings.music_folder.data(),settings.music_folder.size(),selected.path.c_str());settings_dirty=true;
+                } else log_message("The music folder path is too long.");
+            }
+            music_folder_selection.reset();
+        }
+        if(music_importing) {
+            const auto progress=music_import.status();
+            if(progress.finished) {
+                music_importing=false;log_message(progress.message);
+                if(progress.succeeded) {
+                    music_songs=progress.completed;settings.custom_music=true;settings_dirty=true;
+                    if(music_restart && running) launch=true;
+                }
+                music_restart=false;
+            }
+        }
         if(stop_at && SDL_GetTicksNS()>=stop_at) running=false;
         if(controls) {
             controls->advance();
@@ -360,6 +433,23 @@ struct App {
         return running;
     }
     bool poll_game() {return poll() && !launch;}
+    std::filesystem::path music_cache() const {return settings_path.parent_path()/"custom-music";}
+    void browse_music() {
+        music_folder_selection=std::make_shared<MusicFolderSelection>();
+        auto* request=new std::shared_ptr<MusicFolderSelection>(music_folder_selection);
+        SDL_ShowOpenFolderDialog([](void* userdata,const char* const* files,int) {
+            std::unique_ptr<std::shared_ptr<MusicFolderSelection>> request(static_cast<std::shared_ptr<MusicFolderSelection>*>(userdata));
+            auto& result=**request;
+            if(!files) result.error=SDL_GetError();
+            else if(files[0]) result.path=files[0];
+            result.finished.store(true,std::memory_order_release);
+        },request,window,settings.music_folder[0]?settings.music_folder.data():nullptr,false);
+    }
+    void begin_music_import() {
+        music_import_requested=false;music_importing=true;
+        music_import.start(utf8_path(settings.music_folder.data()),music_cache());
+        log_message("Importing custom music...");
+    }
     bool browse(std::array<char,4096>& path,bool iso) {
         std::array<wchar_t,32768> result{};
         OPENFILENAMEW dialog{};dialog.lStructSize=sizeof(dialog);
@@ -382,7 +472,7 @@ struct App {
             ImGui::Begin("Burnout 2: Point of Impact",nullptr,ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoResize);
             bool changed=false;
             if(ImGui::BeginTabBar("Settings")) {
-                constexpr const char* categories[]={"Game Files","General","Audio","Graphics","Controls","Log"};
+                constexpr const char* categories[]={"Game Files","General","Audio","Graphics","Enhancements","Controls","Log"};
                 for(int tab=0;tab<int(std::size(categories));++tab) if(ImGui::BeginTabItem(categories[tab],nullptr,select_category==tab?ImGuiTabItemFlags_SetSelected:0)) {
                     if(category!=tab) binding_action=-1;
                     category=tab;
@@ -424,13 +514,35 @@ struct App {
                         setting_help("Mutes all game audio without changing the master volume.");
                         changed|=audio_changed;
                         if(audio_changed && game) game->output_gain(settings.muted?0:settings.volume/100.0f);
+                        ImGui::Separator();
+                        ImGui::BeginDisabled(music_songs==0 || music_importing);
+                        changed|=ImGui::Checkbox("Custom music",&settings.custom_music);
+                        setting_help("Makes imported music available in the game's Music Selection menu. Applies when you start or restart the game.");
+                        ImGui::EndDisabled();
+                        ImGui::SameLine();ImGui::Text("%u songs imported",music_songs);
+                        ImGui::BeginDisabled(music_importing || music_folder_selection!=nullptr);
+                        ImGui::InputText("Music folder",settings.music_folder.data(),settings.music_folder.size(),ImGuiInputTextFlags_ReadOnly);
+                        ImGui::SameLine();if(ImGui::Button("Browse##music")) browse_music();
+                        ImGui::BeginDisabled(settings.music_folder[0]==0);
+                        if(ImGui::Button(playing?"Import music and restart":"Import music")) {
+                            music_import_requested=true;music_restart=playing;launch=true;
+                        }
+                        setting_help("Imports this folder for Music Selection. Importing while playing restarts the game from the beginning.");
+                        ImGui::EndDisabled();ImGui::EndDisabled();
+                        ImGui::TextWrapped("MP3, WAV, WMA, FLAC, M4A and AAC. Your original files stay in their folder.");
+                        const auto progress=music_import.status();
+                        if(music_importing) {
+                            ImGui::ProgressBar(progress.total?float(progress.completed)/progress.total:0);
+                            ImGui::TextWrapped("%s",progress.file.c_str());
+                            if(ImGui::Button("Cancel import")) {music_import.cancel();music_restart=false;}
+                        } else if(progress.finished) ImGui::TextWrapped("%s",progress.message.c_str());
                         break;
                     }
                     case 3: {
                         changed|=ImGui::Checkbox("Widescreen (16:9)",&settings.widescreen);
                         setting_help("Uses the game's native 16:9 camera and screen layout. Applies when you start or restart the game.");
                         changed|=ImGui::Checkbox("V-sync",&settings.vsync);
-                        setting_help("V-sync has known issues. Leave it disabled for now.");
+                        setting_help("Synchronizes presentation with the display to prevent tearing. The display's refresh rate limits the maximum frame rate.");
                         if(ImGui::Checkbox("Fullscreen",&settings.fullscreen)) {
                             if(!SDL_SetWindowFullscreen(window,settings.fullscreen)) {settings.fullscreen=!settings.fullscreen;log_message(SDL_GetError());}
                             else changed=true;
@@ -438,14 +550,14 @@ struct App {
                         setting_help("Switches between a window and fullscreen immediately.");
                         {
                             const auto label=std::format("{}x ({} x {})",settings.resolution_scale,640*settings.resolution_scale,480*settings.resolution_scale);
-                            if(ImGui::BeginCombo("Internal resolution",label.c_str())) {
+                            if(ImGui::BeginCombo(settings.upscaling?"Output resolution":"Internal resolution",label.c_str())) {
                                 for(int scale=1;scale<=4;++scale) {
                                     const auto option=std::format("{}x ({} x {})",scale,640*scale,480*scale);
                                     if(ImGui::Selectable(option.c_str(),settings.resolution_scale==scale)) {settings.resolution_scale=scale;changed=true;}
                                 }
                                 ImGui::EndCombo();
                             }
-                            setting_help(playing?"Higher resolutions sharpen geometry and use more GPU power. Original proportions are preserved. Use Restart game to apply changes.":
+                            setting_help(settings.upscaling?"Upscaling reconstructs this resolution from a smaller image. At 1x it provides antialiasing at native resolution. Use Restart game to apply changes.":playing?"Higher resolutions sharpen geometry and use more GPU power. Original proportions are preserved. Use Restart game to apply changes.":
                                 "Higher resolutions sharpen geometry and use more GPU power. Original proportions are preserved. Applies when you start the game.");
                         }
                         ImGui::Spacing();ImGui::BeginDisabled(!playing);
@@ -460,7 +572,50 @@ struct App {
                         ImGui::EndDisabled();
                         break;
                     }
-                    case 4:
+                    case 4: {
+                        changed|=ImGui::Checkbox("LOD override",&settings.highest_lod);
+                        setting_help("Keeps textures at their highest available detail and uses full nearby track geometry at every visible distance. Can increase shimmer and GPU load.");
+                        changed|=ImGui::Checkbox("Render distance override",&settings.unlimited_distance);
+                        setting_help("Increases the original draw distance by 50%. More distant track geometry is loaded at startup; scenery keeps its distance fade.");
+                        changed|=ImGui::Checkbox("Skip intro splash screens",&settings.skip_intro);
+                        setting_help("Starts at the title screen after the initial loading screen.");
+                        constexpr const char* upscalers[]={"Off (original)","DLSS (experimental)","FSR (experimental)","XeSS (experimental)"};
+                        if(ImGui::BeginCombo("Upscaling technique",upscalers[settings.upscaling])) {
+                            for(int i=0;i<int(std::size(upscalers));++i) {
+                                const bool supported=renderer->supports_upscaling(UpscaleMethod(i));
+                                ImGui::BeginDisabled(!supported);
+                                if(ImGui::Selectable(upscalers[i],settings.upscaling==i)) {settings.upscaling=i;changed=true;}
+                                if(!supported) setting_help("This technique is unavailable on your graphics device.");
+                                ImGui::EndDisabled();
+                            }
+                            ImGui::EndCombo();
+                        }
+                        setting_help("Reconstructs the output resolution selected in Graphics from a smaller image, or provides antialiasing at 1x. DLSS requires an NVIDIA RTX graphics card. FSR and XeSS also work on other supported cards.");
+                        ImGui::TextWrapped("Experimental: DLSS, FSR and XeSS have visual issues and may reduce performance.");
+                        ImGui::BeginDisabled(settings.upscaling!=0);
+                        constexpr const char* levels[]={"Off (original)","FXAA Low","FXAA Medium","FXAA High","MSAA 2x","MSAA 4x","MSAA 8x"};
+                        if(ImGui::BeginCombo("Antialiasing",levels[settings.antialiasing])) {
+                            for(int i=0;i<int(std::size(levels));++i) {
+                                const bool supported=i<4 || renderer->supports_msaa(1U<<(i-3));
+                                ImGui::BeginDisabled(!supported);
+                                if(ImGui::Selectable(levels[i],settings.antialiasing==i)) {settings.antialiasing=i;changed=true;}
+                                if(!supported) setting_help("This MSAA level is unavailable on your graphics device.");
+                                ImGui::EndDisabled();
+                            }
+                            ImGui::EndCombo();
+                        }
+                        setting_help("MSAA smooths geometry edges while keeping textures sharp. Higher sample counts use more GPU power and memory. FXAA smooths the whole image and can soften fine detail and in-game text.");
+                        ImGui::EndDisabled();
+                        constexpr int values[]={0,1,2,4,8,16};
+                        constexpr const char* filters[]={"Original (game setting)","Off (1x)","2x","4x","8x","16x"};
+                        int selected=0;for(int i=0;i<int(std::size(values));++i) if(settings.anisotropy==values[i]) selected=i;
+                        if(ImGui::Combo("Anisotropic filtering",&selected,filters,int(std::size(filters)))) {settings.anisotropy=values[selected];changed=true;}
+                        setting_help("Keeps road and other textures sharper at an angle. The original game uses anisotropic filtering. Original preserves each texture's settings; higher values use more GPU power.");
+                        ImGui::Spacing();
+                        ImGui::TextWrapped("Changes apply when you start or restart the game.");
+                        break;
+                    }
+                    case 5:
                         if(ImGui::Checkbox("Keyboard controller",&settings.keyboard)) {input->keyboard(settings.keyboard);changed=true;}
                         setting_help("Enables keyboard controls. Connected gamepads work automatically.");
                         ImGui::SeparatorText("Keyboard");
@@ -484,7 +639,7 @@ struct App {
                             ImGui::EndTable();
                         }
                         break;
-                    case 5:
+                    case 6:
                         if(log_messages.empty()) ImGui::TextUnformatted("No messages yet.");
                         for(auto message=log_messages.rbegin();message!=log_messages.rend();++message) {
                             ImGui::TextWrapped("%s",message->c_str());ImGui::Spacing();
@@ -503,9 +658,11 @@ struct App {
             const auto button_width=std::clamp((available-spacing*(count-1))/count,1.0f,160.0f);
             const auto row_width=button_width*count+spacing*(count-1);
             ImGui::SetCursorPosX(ImGui::GetCursorPosX()+std::max(0.0f,(available-row_width)/2));
+            ImGui::BeginDisabled(music_importing || music_import_requested);
             if(ImGui::Button(playing?"Restart game":"Start game",{button_width,0})) {launch=true;binding_action=-1;}
             setting_help(playing?"Restarts the game from the beginning with the saved settings. The window stays open.":
                 "Starts the game with these settings. Changes save automatically. Esc opens or closes settings.");
+            ImGui::EndDisabled();
             if(playing) {
                 ImGui::SameLine();
                 if(ImGui::Button("Return to game",{button_width,0})) {show_settings=false;binding_action=-1;}
@@ -539,10 +696,14 @@ struct App {
         last_frame=SDL_GetTicksNS();display_rate.sample(last_frame);
         if(!frames) first_frame=last_frame;++frames;
     }
+    bool display_paced() const {
+        return settings.vsync && !(SDL_GetWindowFlags(window)&(SDL_WINDOW_HIDDEN|SDL_WINDOW_MINIMIZED|SDL_WINDOW_OCCLUDED)) &&
+            display_refresh>=30 && settings.refresh_rate+0.5f>=display_refresh;
+    }
     void display(bool clear) {
         if(clear) {renderer->set_target(0);renderer->begin(0xFF16191D);renderer->end();}
         if(renderer->display()) {
-            settings_interface();{PerfScope wait(&performance,PerfPhase::pacing);pacer.wait(settings.refresh_rate);}renderer->present(settings.vsync);
+            settings_interface();if(!display_paced()) {PerfScope wait(&performance,PerfPhase::pacing);pacer.wait(settings.refresh_rate);}renderer->present(settings.vsync);
             if(playing) frame_presented();
         } else pacer.wait(settings.refresh_rate);
     }
@@ -550,7 +711,8 @@ struct App {
         const bool interpolate=settings.interpolate();
         if(!interpolate && !source_frame) return;
         const auto now=SDL_GetTicksNS();
-        if(interpolate && !pacer.due(settings.refresh_rate,now)) return;
+        const bool hardware=display_paced();
+        if(interpolate && !hardware && !pacer.due(settings.refresh_rate,now)) return;
         // Interpolate the two completed frames one source interval behind the
         // simulation. Menus/settings are drawn afterwards at the display rate.
         const auto phase=interpolate?std::clamp(float(double(now-published_at)/source_interval),0.0f,1.0f):1.0f;
@@ -560,18 +722,23 @@ struct App {
             settings_interface();
             if(renderer->present(settings.vsync,!interpolate)) frame_presented();
         }
-        if(interpolate) pacer.advance();
+        if(interpolate && !hardware) pacer.advance();
     }
     void game_flip() {
         // Interpolation presents extra images between 60 Hz original frames.
         // Without it, each original frame uses the selected refresh rate.
         auto now=SDL_GetTicksNS();source_pacer.due(settings.source_rate(),now);
-        while(running && now<source_pacer.next) {
+        while(running && !(display_paced() && !settings.interpolate()) && now<source_pacer.next) {
             if(!poll_game()) return;
             now=SDL_GetTicksNS();source_pacer.due(settings.source_rate(),now);
             auto deadline=source_pacer.next;
-            if(settings.interpolate() && published_at && pacer.next>now) deadline=std::min(deadline,pacer.next);
-            if(now<deadline) {PerfScope wait(&performance,PerfPhase::pacing);SDL_DelayPrecise(deadline-now);}
+            const bool hardware=display_paced() && settings.interpolate() && published_at;
+            if(settings.interpolate() && !hardware && published_at && pacer.next>now) deadline=std::min(deadline,pacer.next);
+            if(now<deadline) {
+                PerfScope wait(&performance,PerfPhase::pacing);
+                if(hardware && deadline-now>=1000000) renderer->wait_frame(unsigned((deadline-now)/1000000));
+                else SDL_DelayPrecise(deadline-now);
+            }
             now=SDL_GetTicksNS();
         }
         if(!running || launch) return;
@@ -589,10 +756,21 @@ struct App {
         if(controls && !controls->started) controls->started=now;
         display_due(true);
     }
+    void configure_enhancements() {
+        if(settings.antialiasing>=4 && !renderer->supports_msaa(1U<<(settings.antialiasing-3))) {
+            log_message(std::format("MSAA {}x is unavailable on this graphics device. Antialiasing has been set to Off.",1U<<(settings.antialiasing-3)));
+            settings.antialiasing=0;settings_dirty=true;
+        }
+        renderer->enhancements(settings.upscaling?0:settings.antialiasing,settings.anisotropy);
+        renderer->lod_override(settings.highest_lod);
+        renderer->upscaling(UpscaleMethod(settings.upscaling),unsigned(settings.resolution_scale));
+    }
     void configure_graphics() {
         // Preserve pipelines/UI while discarding the previous game's resources.
         // Mid-race recreation would lose feedback, depth and texture identities.
-        renderer->reset(settings.resolution_scale);active_scale=settings.resolution_scale;
+        active_scale=settings.upscaling?std::max(1,(settings.resolution_scale+1)/2):settings.resolution_scale;
+        renderer->reset(active_scale);
+        configure_enhancements();
         active_widescreen=settings.widescreen;renderer->widescreen(active_widescreen);
         renderer->interpolation(settings.interpolate());
     }
@@ -604,9 +782,14 @@ struct App {
             json(utf8(executable.wstring())),json(utf8(disc.wstring())),json(image.sha256)));
         std::vector<std::byte> ram(64*1024*1024);image.load(std::span(ram).subspan(image.base,image.image_size));Memory memory(0,ram);
         XboxHost host{renderer.get(),input.get(),[&]{return poll_game();},[&]{game_flip();}};
+        if(controls) host.storage_root=settings_path.parent_path()/"automation-user";
         host.widescreen=active_widescreen;
+        host.skip_intro=settings.skip_intro;host.highest_lod=settings.highest_lod;host.unlimited_distance=settings.unlimited_distance;
+        host.upscaling=settings.upscaling!=0;
+        if(settings.custom_music && music_songs) host.custom_music_root=music_cache();
         host.performance=&performance;
         host.trace_io=trace_io;
+        host.watch_semaphores=watch_semaphores;
         Xbox xbox(image,memory,ram,disc,std::move(host));
         xbox.output_gain(settings.muted?0:settings.volume/100.0f);
         struct Session {App& app;~Session(){app.stop_benchmark();app.stop_performance();app.game=nullptr;app.playing=false;app.show_settings=true;app.published_at=0;app.renderer->interpolation(false);}} session{*this};
@@ -661,21 +844,23 @@ struct App {
         }
         const auto fps=last_frame>first_frame?(frames-1)*1000000000.0/(last_frame-first_frame):0;
         const auto source_fps=last_source>first_source?(stats.published_frames-1)*1000000000.0/(last_source-first_source):0;
-        report<<std::format("],\"adapter\":{},\"shader_compilations\":{},\"uploaded_vertex_bytes\":{},\"vblank_callbacks\":{},\"refresh_rate\":{},\"resolution_scale\":{},\"widescreen\":{},\"interpolation\":{},\"interpolation_active\":{},\"source_fps\":{:.3f},\"interpolated_frames\":{},\"presented_fps\":{:.3f},\"memory\":{}}}",
-            json(result.graphics_adapter),stats.shader_compilations,stats.vertex_bytes,result.vblank_callbacks,settings.refresh_rate,active_scale,active_widescreen,settings.interpolation,settings.interpolate(),source_fps,stats.interpolated_frames,fps,memory_snapshot);
+        report<<std::format("],\"adapter\":{},\"shader_compilations\":{},\"uploaded_vertex_bytes\":{},\"reused_vertex_bytes\":{},\"vblank_callbacks\":{},\"refresh_rate\":{},\"resolution_scale\":{},\"widescreen\":{},\"interpolation\":{},\"interpolation_active\":{},\"source_fps\":{:.3f},\"interpolated_frames\":{},\"presented_fps\":{:.3f},\"extended_world_sectors\":{},\"visible_world_sectors\":{},\"detailed_world_batches\":{},\"original_camera_far\":{},\"camera_far\":{},\"original_render_distance\":{},\"render_distance\":{},\"distance_culled_sectors\":{},\"display_refresh\":{},\"output_resolution_scale\":{},\"upscaling\":{},\"memory\":{}}}",
+            json(result.graphics_adapter),stats.shader_compilations,stats.vertex_bytes,stats.reused_vertex_bytes,result.vblank_callbacks,settings.refresh_rate,active_scale,active_widescreen,settings.interpolation,settings.interpolate(),source_fps,stats.interpolated_frames,fps,result.extended_world_sectors,result.visible_world_sectors,result.detailed_world_batches,result.original_camera_far,result.camera_far,result.original_render_distance,result.render_distance,result.distance_culled_sectors,display_refresh,settings.resolution_scale,settings.upscaling,memory_snapshot);
         return report.str();
     }
 };
 }
 int run_app(const std::filesystem::path& xbe,const std::filesystem::path& disc,unsigned seconds,const std::filesystem::path& frame,
-            const std::filesystem::path& controls,std::span<const MemorySlice> slices,bool trace_io) {
+            const std::filesystem::path& controls,std::span<const MemorySlice> slices,bool trace_io,const std::filesystem::path& settings,std::span<const std::uint32_t> watch_semaphores) {
+    if(watch_semaphores.size()>4) throw std::runtime_error("At most four semaphore memory watches are supported");
     if(xbe.empty()) {
         std::array<wchar_t,32768> module{};
         const auto length=GetModuleFileNameW(nullptr,module.data(),static_cast<DWORD>(module.size()));
         if(!length || length==module.size()) throw std::runtime_error("Cannot locate the game folder");
         std::filesystem::current_path(std::filesystem::path(std::wstring_view(module.data(),length)).parent_path());
     }
-    App app(false,false,controls);
+    App app(false,false,controls,settings);
+    std::copy(watch_semaphores.begin(),watch_semaphores.end(),app.watch_semaphores.begin());
     if(seconds) app.stop_at=SDL_GetTicksNS()+std::uint64_t(seconds)*1000000000;
     if(!xbe.empty()) {
         for(;;) {
@@ -688,7 +873,9 @@ int run_app(const std::filesystem::path& xbe,const std::filesystem::path& disc,u
     while(app.poll()) {
         app.display(true);
         if(app.launch) {
-            app.launch=false;app.log_message("Starting game...");app.display(true);
+            app.launch=false;
+            if(app.music_import_requested) {app.begin_music_import();continue;}
+            app.log_message("Starting game...");app.display(true);
             try {
                 const auto result=app.play(utf8_path(app.settings.xbe.data()),utf8_path(app.settings.disc.data()),{});
                 app.log_message(app.launch?"Restarting game...":result.boundary.empty()?"Game exited.":result.boundary);
@@ -717,12 +904,17 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     for(unsigned frame=1;frame<=60;++frame) counter_rate.sample(1+frame*1000000000ULL/120);
     if(std::abs(counter_rate.value-120)>0.01) throw std::runtime_error("Frame rate counter did not measure 120 FPS");
     Preferences saved(false);saved.resolution_scale=3;saved.select_refresh_rate(144);saved.interpolation=false;saved.show_fps=true;saved.widescreen=true;saved.bindings[15]=SDL_SCANCODE_Z;
+    saved.custom_music=true;strcpy_s(saved.music_folder.data(),saved.music_folder.size(),"Music/Custom playlist");
+    saved.antialiasing=6;saved.anisotropy=16;
+    saved.skip_intro=true;saved.highest_lod=true;saved.unlimited_distance=true;saved.upscaling=3;
     saved.save(preferences);Preferences restored(true,preferences);
-    if(restored.bindings!=saved.bindings || restored.resolution_scale!=3 || restored.refresh_rate!=144 || restored.interpolation || !restored.show_fps || !restored.widescreen)
+    if(restored.bindings!=saved.bindings || restored.resolution_scale!=3 || restored.refresh_rate!=144 || restored.interpolation || !restored.show_fps || !restored.widescreen ||
+       !restored.custom_music || restored.music_folder!=saved.music_folder || restored.antialiasing!=6 || restored.anisotropy!=16 ||
+       !restored.skip_intro || !restored.highest_lod || !restored.unlimited_distance || restored.upscaling!=3)
         throw std::runtime_error("New settings did not survive save/load");
-    {std::ofstream file(preferences);file<<"key_accelerate="<<SDL_SCANCODE_ESCAPE<<"\nkey_brake=999999\nresolution_scale=99\n";}
+    {std::ofstream file(preferences);file<<"key_accelerate="<<SDL_SCANCODE_ESCAPE<<"\nkey_brake=999999\nresolution_scale=99\nantialiasing=7\nanisotropy=3\n";}
     Preferences invalid(true,preferences);std::filesystem::remove(preferences);
-    if(invalid.bindings!=default_keyboard_bindings() || invalid.resolution_scale!=1) throw std::runtime_error("Invalid settings replaced valid defaults");
+    if(invalid.bindings!=default_keyboard_bindings() || invalid.resolution_scale!=1 || invalid.antialiasing || invalid.anisotropy) throw std::runtime_error("Invalid settings replaced valid defaults");
     SDL_Event escape{};escape.type=SDL_EVENT_KEY_DOWN;escape.key.scancode=SDL_SCANCODE_ESCAPE;
     app.event(escape);if(app.show_settings) throw std::runtime_error("Esc did not hide settings");
     escape.key.repeat=true;app.event(escape);if(app.show_settings) throw std::runtime_error("Held Esc repeated the toggle");
@@ -737,7 +929,7 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     if(automatic.bindings[15]!=SDL_SCANCODE_Z || app.settings_dirty) throw std::runtime_error("Edited settings were not saved when closing settings");
     app.event(escape);
     app.log_message("Starting game...");
-    constexpr const char* names[]={"game-files","general","audio","graphics","controls","log"};
+    constexpr const char* names[]={"game-files","general","audio","graphics","enhancements","controls","log"};
     std::ostringstream images;images<<'[';
     for(int tab=0;tab<int(std::size(names));++tab) {
         app.select_category=tab;
@@ -821,11 +1013,29 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     }
     if(const auto messages=app.renderer->errors();!messages.empty()) throw std::runtime_error("Settings validation: "+messages.front());
     // Exercise resolution changes before a game starts, without guest execution.
-    app.settings.resolution_scale=2;app.configure_graphics();app.renderer->begin();app.renderer->end();
-    const auto scaled=app.renderer->readback();
+    app.settings.resolution_scale=2;app.settings.antialiasing=3;app.settings.anisotropy=16;
+    app.configure_graphics();app.renderer->begin(0xFF4080C0);app.renderer->end();app.renderer->publish_frame();
+    const auto scaled=app.renderer->read_frame();
     if(scaled.width!=1280 || scaled.height!=960) throw std::runtime_error("Selected internal resolution was not applied");
+    if(scaled.rgba[0]!=std::byte{64} || scaled.rgba[1]!=std::byte{128} || scaled.rgba[2]!=std::byte{192} || scaled.rgba[3]!=std::byte{255})
+        throw std::runtime_error("Built antialiasing shader changed a flat colour");
     if(const auto messages=app.renderer->errors();!messages.empty()) throw std::runtime_error("Resolution validation: "+messages.front());
-    app.settings.resolution_scale=1;app.configure_graphics();
+    if(app.renderer->supports_msaa(4)) {
+        app.settings.antialiasing=5;app.configure_graphics();
+        const auto target=app.renderer->create_target(32,32);app.renderer->set_target(target);
+        app.renderer->begin(0xFF0000FF,0.25f);app.renderer->clear_stencil(0xA5);app.renderer->end();
+        app.renderer->grow_target(target,64,64);
+        const auto copied=app.renderer->readback();
+        if(copied.rgba[0]!=std::byte{0} || copied.rgba[2]!=std::byte{255} || copied.rgba[3]!=std::byte{255})
+            throw std::runtime_error("Built MSAA transfer shader changed the source colour");
+        app.renderer->set_target();app.renderer->begin(0xFF4080C0);app.renderer->end();app.renderer->publish_frame();
+        if(!app.renderer->display()) throw std::runtime_error("MSAA image could not be displayed");
+        const auto displayed=app.renderer->read_display();const auto centre=(std::size_t(displayed.height/2)*displayed.width+displayed.width/2)*4;
+        if(displayed.rgba[centre]!=std::byte{64} || displayed.rgba[centre+1]!=std::byte{128} || displayed.rgba[centre+2]!=std::byte{192})
+            throw std::runtime_error("MSAA resolve was not presented to the window");
+        app.renderer->present(false);
+    }
+    app.settings.resolution_scale=1;app.settings.antialiasing=app.settings.anisotropy=0;app.configure_graphics();
     if(!SDL_SetWindowSize(app.window,640,480)) throw std::runtime_error(SDL_GetError());
     app.poll();
     auto& renderer=*app.renderer;

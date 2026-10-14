@@ -2,7 +2,10 @@
 #include "assets.h"
 #include "gpu.h"
 #include "cpu.h"
+#include <d3d11.h>
+#include <wrl/client.h>
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -65,7 +68,7 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
     const auto run = [&](std::string_view name, RenderState state, std::span<const Vertex> vertices,
                          const std::function<void(const Image&)>& validate,
                          const std::function<void()>& after = {}, std::span<const std::uint32_t> indices = {},
-                         const std::function<void()>& submit = {}) {
+                         const std::function<void()>& submit = {},bool publish=false) {
         if (total++) report += ',';
         const auto started = std::chrono::steady_clock::now();
         std::string error;
@@ -76,7 +79,8 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
             if(submit) submit(); else renderer.draw(state, vertices, indices);
             if (after) after();
             renderer.end(); begun = false;
-            const auto image = renderer.readback(); save_png(image, image_path);
+            if(publish) renderer.publish_frame();
+            const auto image = publish?renderer.read_frame():renderer.readback(); save_png(image, image_path);
             validate(image);
             ++passed;
         } catch (const std::exception& failure) {
@@ -93,6 +97,85 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
     const auto red_pixel = [](const Image& image) { expect(image, 32, 32, {255,0,0,255}); expect(image, 3, 3, {255,0,0,255}); };
     auto state = colored();
     run("colored-quads", state, red, red_pixel);
+    auto diagonal=white;diagonal[1].position={1,-1,0.5f,1};diagonal[2].position={-1,-1,0.5f,1};
+    auto edge_state=colored();edge_state.primitive=5;
+    Image original_edge;
+    run("antialiasing-off",edge_state,std::span(diagonal).first(3),[&](const Image& image) {original_edge=image;},{},{},{},true);
+    const auto target_budget=renderer.resources().target_bytes;
+    for(unsigned quality=1;quality<=3;++quality) {
+        renderer.enhancements(quality,0);
+        run(std::format("fxaa-quality-{}",quality),edge_state,std::span(diagonal).first(3),[&](const Image& image) {
+            if(renderer.readback().rgba!=original_edge.rgba) throw std::runtime_error("Antialiasing changed original game feedback");
+            unsigned changed=0;
+            for(std::size_t i=0;i<image.rgba.size();i+=4) {
+                changed+=image.rgba[i]!=original_edge.rgba[i];
+                if(image.rgba[i+3]!=original_edge.rgba[i+3]) throw std::runtime_error("Antialiasing changed alpha");
+            }
+            if(changed<32) throw std::runtime_error("Antialiasing did not smooth the diagonal");
+            expect(image,3,60,{255,255,255,255});expect(image,60,3,{0,0,0,255});
+        },{},{},{},true);
+    }
+    renderer.interpolation(true);renderer.resize(48,32);
+    run("fxaa-resize-with-interpolation",colored(),red,[](const Image& image) {
+        if(image.width!=48 || image.height!=32) throw std::runtime_error("Antialiasing retained old dimensions");
+        expect(image,24,16,{255,0,0,255});
+    },{},{},{},true);
+    renderer.reset(2);
+    run("fxaa-scaled-session-reset",colored(),red,[](const Image& image) {
+        if(image.width!=96 || image.height!=64) throw std::runtime_error("Antialiasing ignored internal resolution");
+        expect(image,48,32,{255,0,0,255});
+    },{},{},{},true);
+    renderer.enhancements(0,0);renderer.reset(1);renderer.resize(64,64);
+    if(renderer.resources().target_bytes!=target_budget) throw std::runtime_error("Disabled antialiasing retained render storage");
+    auto msaa_diagonal=white;msaa_diagonal[2].position={-1,-1,0.5f,1};
+    for(unsigned samples:{2U,4U,8U}) {
+        if(!renderer.supports_msaa(samples)) continue;
+        renderer.interpolation(false);
+        const auto mode=3U+unsigned(std::countr_zero(samples));renderer.enhancements(mode,0);
+        run(std::format("msaa-{}x-geometry",samples),edge_state,std::span(msaa_diagonal).first(3),[&](const Image& image) {
+            unsigned coverage=0;
+            for(unsigned y=0;y<64;++y) for(unsigned x=0;x<64;++x) {const auto value=pixel(image,x,y)[0];coverage+=value>0 && value<255;}
+            if(coverage<32) throw std::runtime_error("MSAA did not smooth geometry coverage");
+            expect(image,3,3,{255,255,255,255});expect(image,60,60,{0,0,0,255});
+            Microsoft::WRL::ComPtr<ID3D11RenderTargetView> target;renderer.native_context()->OMGetRenderTargets(1,&target,nullptr);
+            Microsoft::WRL::ComPtr<ID3D11Resource> resource;target->GetResource(&resource);Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;resource.As(&texture);
+            D3D11_TEXTURE2D_DESC description{};texture->GetDesc(&description);
+            if(description.SampleDesc.Count!=samples) throw std::runtime_error("MSAA sample count differs from the selected mode");
+        },{},{},{},true);
+        renderer.interpolation(true);renderer.resize(48,32);
+        run(std::format("msaa-{}x-resize-interpolation",samples),colored(),red,[](const Image& image) {
+            if(image.width!=48 || image.height!=32) throw std::runtime_error("MSAA history retained old dimensions");expect(image,24,16,{255,0,0,255});
+        },{},{},{},true);
+        renderer.enhancements(0,0);renderer.resize(64,64);
+    }
+    if(renderer.resources().target_bytes!=target_budget) throw std::runtime_error("Disabled MSAA retained render storage");
+    if(renderer.supports_msaa(4)) {
+        renderer.enhancements(5,0);
+        std::vector<std::byte> checker(64*64*4);
+        for(unsigned y=0;y<64;++y) for(unsigned x=0;x<64;++x) {
+            const auto value=std::byte(((x^y)&1)?255:0);const auto offset=(y*64+x)*4;
+            checker[offset]=checker[offset+1]=checker[offset+2]=value;checker[offset+3]=std::byte{255};
+        }
+        const auto texture=renderer.upload({64,64,TextureFormat::argb8_linear,checker});
+        run("msaa-preserves-fine-texture-detail",textured(texture),white,[](const Image& image) {
+            for(unsigned y=4;y<60;++y) for(unsigned x=4;x<60;++x) {
+                const auto value=((x^y)&1)?255U:0U;expect(image,x,y,{value,value,value,255},0);
+            }
+        },{},{},{},true);
+        renderer.reset(1);
+        const auto source=renderer.create_target(64,64),copy=renderer.create_target(64,64);
+        renderer.set_target(source);renderer.prepare(edge_state);renderer.begin();renderer.draw(edge_state,std::span(diagonal).first(3));renderer.end();
+        const auto scene=renderer.readback();renderer.copy_target(copy);renderer.copy_to_main();renderer.publish_frame();
+        if(renderer.read_frame().rgba!=scene.rgba) throw std::runtime_error("MSAA presentation lost sample coverage");
+        auto feedback=textured(copy);renderer.prepare(feedback);
+        run("msaa-render-target-feedback",feedback,white,[&](const Image& image) {
+            if(image.rgba!=scene.rgba) throw std::runtime_error("MSAA render-target sampling lost coverage");
+        },{},{},{},true);
+        const std::array<std::uint32_t,6> faces{copy,copy,copy,copy,copy,copy};const auto cube=renderer.copy_cubemap(faces);
+        auto cubed=textured(cube);cubed.texture_modes[0]=3;auto face=white;for(auto& vertex:face) vertex.uv[0]={-0.75f,-0.75f,1,1};
+        run("msaa-cubemap-resolve",cubed,face,[](const Image& image) {expect(image,32,32,{255,255,255,255});});
+        renderer.reset(1);renderer.enhancements(0,0);
+    }
     constexpr std::uint32_t triangles[] = {0,1,2,0,2,3};
     state.primitive = 5;
     run("indexed-triangles", state, red, red_pixel, {}, triangles);
@@ -161,12 +244,48 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
     run("mip-maximum-level",sampling,minified,[](const Image& image){expect(image,32,32,{0,255,0,255});});
     sampling.texture_control[0]=(1U<<18)|0x0003FFC0;
     run("mip-minimum-level",sampling,white,[](const Image& image){expect(image,32,32,{0,255,0,255});});
+    run("highest-lod-mipmap",colored(),red,[&](const Image&) {
+        Renderer detail(64,64,warp,debug);detail.lod_override(true);
+        auto state=textured(detail.upload({4,4,TextureFormat::argb8,mip_bytes,3}));
+        state.texture_filter[0]=0x02060100;state.texture_control[0]=(2U<<18)|0x0003FFC0;
+        detail.prepare(state);detail.begin();detail.draw(state,minified);detail.end();
+        const auto image=detail.readback();red_pixel(image);
+        save_png(image,directory/"highest-lod-mipmap-native.png");
+        if(!detail.errors().empty()) throw std::runtime_error("Highest texture LOD produced graphics validation errors");
+        detail.reset(1);detail.lod_override(false);
+        state.textures[0]=detail.upload({4,4,TextureFormat::argb8,mip_bytes,3});
+        detail.prepare(state);detail.begin();detail.draw(state,minified);detail.end();
+        expect(detail.readback(),32,32,{0,0,255,255});
+    });
     sampling.texture_control[0]=0x0003FFF0;
     auto grazing=white;for(auto& vertex:grazing) vertex.uv[0][0]*=64;
     run("mip-anisotropic-detail",sampling,grazing,[](const Image& image){
         const auto actual=pixel(image,32,32);
         if(actual[0]<200 || actual[2]>20) throw std::runtime_error("Grazing texture lost its base-level detail");
     });
+    sampling.texture_filter[0]=0x02063DBB;sampling.texture_control[0]=0x4003FFD0;
+    for(unsigned anisotropy:{0U,1U,2U,4U,8U,16U}) {
+        renderer.enhancements(0,anisotropy);
+        run(std::format("anisotropic-override-{}",anisotropy),sampling,grazing,[](const Image&){},[&] {
+            Microsoft::WRL::ComPtr<ID3D11SamplerState> native;renderer.native_context()->PSGetSamplers(0,1,&native);
+            D3D11_SAMPLER_DESC description{};native->GetDesc(&description);
+            const auto expected=anisotropy?anisotropy:2;
+            // MaxAnisotropy is inactive for linear filtering; the driver can
+            // canonicalize that unused descriptor field to zero.
+            if((expected>1 && description.MaxAnisotropy!=expected) ||
+               description.Filter!=(expected>1?D3D11_FILTER_ANISOTROPIC:D3D11_FILTER_MIN_MAG_MIP_LINEAR) ||
+               description.MipLODBias!=-581.0f/256 || description.MinLOD!=0 || description.MaxLOD!=4095)
+                throw std::runtime_error(std::format("Anisotropic sampler: filter 0x{:X}, strength {}, bias {}, mip range {}..{}; expected strength {}",
+                    unsigned(description.Filter),description.MaxAnisotropy,description.MipLODBias,description.MinLOD,description.MaxLOD,expected));
+        });
+    }
+    sampling.texture_filter[0]=0x01010000;
+    run("anisotropic-preserves-point-sampling",sampling,grazing,red_pixel,[&] {
+        Microsoft::WRL::ComPtr<ID3D11SamplerState> native;renderer.native_context()->PSGetSamplers(0,1,&native);
+        D3D11_SAMPLER_DESC description{};native->GetDesc(&description);
+        if(description.Filter!=D3D11_FILTER_MIN_MAG_MIP_POINT) throw std::runtime_error("Anisotropic override changed point sampling");
+    });
+    renderer.enhancements(0,0);
     std::vector<std::byte> pitched(24 * 4);
     const auto row = solid(4,1,0xFF00FF00);
     for (unsigned y=0;y<4;++y) std::copy(row.begin(),row.end(),pitched.begin()+y*24);
@@ -331,22 +450,37 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
         renderer.set_target();renderer.draw(opaque_feedback,white);
     });
 
-    const auto growth_check=[&](bool stencil,bool rgb565=false,unsigned scale=1) {
+    const auto growth_check=[&](bool stencil,bool rgb565=false,unsigned scale=1,unsigned msaa=1,bool per_sample=false) {
         std::string name=rgb565?"render-target-growth-rgb565-z16":stencil?"render-target-growth-stencil":"render-target-growth-depth-color";
         if(scale>1) name+=std::format("-{}x",scale);
+        if(msaa>1) name+=std::format("-msaa-{}x",msaa);
+        if(per_sample) name+="-individual-samples";
         if(total++) report+=',';
         std::string error;const auto image_path=directory/(name+".png");
         try {
-            Renderer native(64,64,warp,debug,scale);const auto target=native.create_target(32,32,
+            Renderer native(64,64,warp,debug,scale);
+            if(msaa>1) native.enhancements(3U+unsigned(std::countr_zero(msaa)),0);
+            const auto target=native.create_target(32,32,
                 rgb565?SurfaceColor::rgb565:SurfaceColor::rgba8,rgb565?SurfaceDepth::z16:SurfaceDepth::z24s8);
-            native.set_target(target);native.begin(0xFF0000FF,0.25f);native.clear_stencil(7);native.end();
-            native.grow_target(target,64,64);
+            native.set_target(target);
             auto state=colored();state.depth_test=!stencil;
-            state.stencil_test=stencil;state.stencil_function=0x202;state.stencil_reference=7;
+            state.stencil_test=stencil;state.stencil_function=0x202;state.stencil_reference=0xA5;
+            Image reference;
+            if(per_sample) {
+                auto source=colored();source.primitive=5;source.depth_test=true;
+                source.stencil_test=stencil;source.stencil_function=0x207;source.stencil_reference=0xA5;source.stencil_pass=0x1E01;
+                auto shape=msaa_diagonal;for(auto& vertex:shape) vertex.position[2]=0.25f;
+                const auto initialize=[&] {native.prepare(source);native.begin();native.draw(source,std::span(shape).first(3));native.end();};
+                initialize();native.prepare(state);native.begin(0,1,false);native.draw(state,red);native.end();reference=native.readback();
+                initialize();
+            } else {native.begin(0xFF0000FF,0.25f);native.clear_stencil(0xA5);native.end();}
+            native.grow_target(target,64,64);
             native.prepare(state);native.begin(0,1,false);native.draw(state,red);native.end();native.copy_to_main();
             const auto image=native.readback();save_png(image,image_path);
             if(image.width!=64*scale || image.height!=64*scale) throw std::runtime_error("Scaled target dimensions differ");
-            expect(image,16*scale,16*scale,stencil?std::array<unsigned,4>{255,0,0,255}:std::array<unsigned,4>{0,0,255,255});
+            if(per_sample) {
+                for(unsigned y=0;y<32;++y) for(unsigned x=0;x<32;++x) expect(image,x,y,pixel(reference,x,y),0);
+            } else expect(image,16*scale,16*scale,stencil?std::array<unsigned,4>{255,0,0,255}:std::array<unsigned,4>{0,0,255,255});
             expect(image,48*scale,48*scale,stencil?std::array<unsigned,4>{0,0,0,0}:std::array<unsigned,4>{255,0,0,255});
             if(const auto messages=native.errors();!messages.empty()) throw std::runtime_error("Target growth: "+messages.front());
             ++passed;
@@ -354,6 +488,10 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
         report+=std::format("{{\"name\":{},\"passed\":{},\"error\":{},\"image\":{}}}",json(name),error.empty(),json(error),json(utf8(image_path.wstring())));
     };
     growth_check(false);growth_check(true);growth_check(false,true);
+    for(unsigned samples:{2U,4U,8U}) if(renderer.supports_msaa(samples)) {
+        growth_check(false,false,1,samples);growth_check(true,false,1,samples);growth_check(false,true,1,samples);
+        growth_check(false,false,1,samples,true);growth_check(true,false,1,samples,true);
+    }
     for(unsigned scale=2;scale<=4;++scale) {growth_check(false,false,scale);growth_check(true,false,scale);growth_check(false,true,scale);}
 
     const auto token=[](unsigned mac,unsigned ilu,unsigned input,unsigned constant,unsigned out,bool context,bool final,
@@ -403,6 +541,60 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
     constexpr Float4 ui_positions[]={{16,16,0.5f,1},{48,16,0.5f,1},{48,48,0.5f,1},{16,48,0.5f,1}};
     for(unsigned i=0;i<4;++i) {ui_vertices[i].attributes[0]=ui_positions[i];ui_vertices[i].attributes[3]={1,0,0,1};ui_stream[i]={ui_positions[i],{},0xFF00FF00};}
     ProgramView ui_view;ui_view.depth_scale=16777215;
+    run("sdk-textured-zero-rhw",colored(),red,[&](const Image&) {
+        Renderer native(64,64,warp,debug);
+        auto pixels=solid(8,8,0xFFFF0000);
+        for(unsigned y=0;y<8;++y) for(unsigned x=0;x<8;++x) {
+            const auto color=y<4?(x<4?0xFFFF0000U:0xFF00FF00U):(x<4?0xFF0000FFU:0xFFFFFFFFU);
+            std::memcpy(pixels.data()+(y*8+x)*4,&color,4);
+        }
+        auto state=textured(native.upload({8,8,TextureFormat::argb8_linear,pixels}));
+        state.final_inputs={0x130C0300,0x00001C80};state.color_outputs[0]=state.alpha_outputs[0]=0xC00;
+        state.fog_enable=true;state.fog_color=0xFF424B5B;
+        state.fog_parameters={std::bit_cast<float>(0x4002FCE5U),std::bit_cast<float>(0xB9F4C401U)};
+        const auto program=native.prepare_program(ui_program);
+        VertexLayout attributes{};attributes[0]={0,0,0x42};attributes[9]={0,16,0x22};attributes[3]={0,24,0x40};
+        const auto layout=native.prepare_layout(program,attributes);
+        auto vertices=ui_stream;
+        constexpr std::array<float,2> coordinates[]={{0,0},{1,0},{1,1},{0,1}};
+        for(unsigned i=0;i<4;++i) {vertices[i].uv=coordinates[i];vertices[i].color=0xFFFFFFFF;}
+        const std::array<VertexStream,1> streams{{{std::as_bytes(std::span(vertices)),sizeof(UiVertex)}}};
+        for(float rhw:{1.0f,0.0f}) {
+            for(auto& vertex:vertices) vertex.position[3]=rhw;
+            native.prepare(state);native.begin();native.draw_streams(state,layout,ui_constants,ui_view,streams,{},4);native.end();
+            const auto image=native.readback();
+            save_png(image,directory/(rhw?"sdk-textured-rhw-one.png":"sdk-textured-rhw-zero.png"));
+            expect(image,24,24,{255,0,0,255});expect(image,40,24,{0,255,0,255});
+            expect(image,24,40,{0,0,255,255});expect(image,40,40,{255,255,255,255});
+        }
+        if(!native.errors().empty()) throw std::runtime_error("Textured zero RHW produced graphics validation errors");
+    });
+    run("sampler-cache-lifetime",colored(),red,[&](const Image&) {
+        Renderer native(64,64,warp,debug);
+        auto state=textured(native.upload({4,4,TextureFormat::argb8,mip_bytes,3}));
+        state.texture_filter[0]=0x02060000;state.texture_control[0]=0;
+        const auto queued=native.prepare(state);
+        // More distinct native descriptors than D3D11 permits simultaneously.
+        // An older queued draw must retain its original level-zero sampler.
+        for(unsigned i=0;i<8192;++i) {
+            auto varying=state;varying.texture_control[0]=(i&4095)<<6;
+            varying.texture_filter[0]|=(i>>12)<<8;
+            native.prepare(varying);
+        }
+        auto vertices=ui_stream;
+        constexpr std::array<float,2> coordinates[]={{0,0},{64,0},{64,64},{0,64}};
+        for(unsigned i=0;i<4;++i) {vertices[i].uv=coordinates[i];vertices[i].color=0xFFFFFFFF;}
+        const auto program=native.prepare_program(ui_program);
+        VertexLayout attributes{};attributes[0]={0,0,0x42};attributes[9]={0,16,0x22};attributes[3]={0,24,0x40};
+        const auto layout=native.prepare_layout(program,attributes);
+        const std::array<VertexStream,1> streams{{{std::as_bytes(std::span(vertices)),sizeof(UiVertex)}}};
+        native.begin();native.draw_streams(state,layout,ui_constants,ui_view,streams,{},4,{},&queued);native.end();
+        const auto image=native.readback();expect(image,32,32,{255,0,0,255});save_png(image,directory/"sampler-cache-lifetime-native.png");
+        Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler;native.native_context()->PSGetSamplers(0,1,&sampler);
+        D3D11_SAMPLER_DESC description{};sampler->GetDesc(&description);
+        if(description.MaxLOD!=0 || description.MipLODBias!=0 || !native.errors().empty())
+            throw std::runtime_error("Sampler eviction changed a queued draw or produced graphics validation errors");
+    });
     for(unsigned scale=1;scale<=4;++scale) {
         if(total++) report+=',';
         const auto name=std::format("ui-pixel-origin-{}x",scale);const auto image_path=directory/(name+".png");std::string error;
@@ -518,8 +710,8 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
         for(unsigned first=0;first<count;first+=static_cast<unsigned>(group.size())) {
             const auto size=std::min<unsigned>(static_cast<unsigned>(group.size()),count-first);
             for(unsigned i=0;i<size;++i) {
-                const auto which=(first+i)&1;
-                const auto layout=layouts[((first+i)&2)?which:0];
+                const auto which=((first+i)/2)&1;
+                const auto layout=layouts[((first+i)&1)?which:0];
                 group[i]={&states[which],&uniforms[which],&view,streams[which],&queued_current,{},nullptr,layout,4};
             }
             native.draw_streams(std::span(group).first(size));
@@ -527,6 +719,8 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
         native.end();upload_submit_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
         const auto image=native.readback();upload_complete_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
         upload_counters=native.stats().counters;native.performance(nullptr);profile.stop();
+        if(native.stats().reused_vertex_bytes<=(count-(count+31)/32)*sizeof(ProgramVertex))
+            throw std::runtime_error("Queued shared geometry was uploaded repeatedly");
         expect(image,1,4,{255,0,0,255});expect(image,6,4,{0,0,255,255});save_png(image,upload_image);
         if(const auto messages=native.errors();!messages.empty()) throw std::runtime_error("Queued uploads: "+messages.front());
         ++passed;
@@ -674,6 +868,19 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
         run(std::format("fixed-fog-source-{}",mode),fogged,white,[](const Image& image){expect(image,32,32,{128,0,128,255});},{},{},[&] {
             renderer.draw_program(fogged,shader,constants,view,fixed_vertices);
         });
+    }
+    FixedTransform explicit_fog{};explicit_fog.fog=true;explicit_fog.fog_source=6;
+    const auto explicit_shader=renderer.prepare_fixed(explicit_fog);
+    for(unsigned mode:{0x2601U,0x0804U,0x0800U,0x0802U,0x0801U,0x0803U}) {
+        auto state=fogged;state.fog_mode=mode;
+        const auto expected=mode==0x2601 || mode==0x0804 || mode==0x0800 ?
+            std::array<unsigned,4>{255,0,0,255}:std::array<unsigned,4>{0,0,255,255};
+        for(auto bits:{0x7F800000U,0xFF800000U,0x7FC00000U}) {
+            auto vertices=fixed_vertices;for(auto& vertex:vertices) vertex.attributes[5][0]=std::bit_cast<float>(bits);
+            run(std::format("fog-nonfinite-{:04x}-{:08x}",mode,bits),state,white,[&](const Image& image){expect(image,32,32,expected);},{},{},[&] {
+                renderer.draw_program(state,explicit_shader,fixed_context,view,vertices);
+            });
+        }
     }
     // Transform launches run the same decoded operations on a single GPU thread.
     // Results below are independent arithmetic expectations, not another decoder.

@@ -98,3 +98,27 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+Optional temporal upscaling libraries
+
+NVIDIA DLSS v310.9.1
+https://github.com/NVIDIA/DLSS
+The downloaded SDK and runtime are covered by NVIDIA's included LICENSE.txt.
+The build retains the complete notice in build/deps/upscalers/dlss/LICENSE.txt
+and copies it beside the executables as licenses/dlss.txt.
+
+Intel XeSS v3.0.2
+https://github.com/intel/xess
+The downloaded SDK and runtime are covered by Intel's included LICENSE.txt.
+The build retains the complete notice in build/deps/upscalers/xess/LICENSE.txt
+and copies it beside the executables as licenses/xess.txt.
+
+AMD FidelityFX SDK v2.3.0
+https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+The FidelityFX loader and upscaler are covered by the SDK's included license.
+The build retains Kits/FidelityFX/docs/license.md in the dependency cache and
+copies the complete notice beside the executables as licenses/fsr.txt.
+
+cmake/upscalers.json records immutable revisions, source URLs and SHA-256 hashes
+for all downloaded files. The installation archive contains these build inputs;
+the builder downloads the SDK files and preserves their original license notices.

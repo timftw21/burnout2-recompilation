@@ -9,17 +9,22 @@ namespace b2 {
 namespace {void checked_flow(HRESULT value,const char* operation) {
     if(FAILED(value)) throw std::runtime_error(std::format("{}: 0x{:08X}",operation,unsigned(value)));
 }}
-FrameInterpolation::FrameInterpolation(ID3D11Device* device,ID3D11DeviceContext* context,unsigned width,unsigned height,std::uint64_t& compilations):context_(context),
-    width_(std::clamp(width,16U,640U)),height_(std::clamp(height,16U,480U)) {
+FrameInterpolation::FrameInterpolation(ID3D11Device* device,ID3D11DeviceContext* context,unsigned width,unsigned height,std::uint64_t& compilations,bool interpolation_support):context_(context),
+    width_(std::clamp(width,16U,640U)),height_(std::clamp(height,16U,480U)),interpolation_support_(interpolation_support) {
     const auto shader=[&](ShaderKind kind) {const auto binary=shader_binary(kind);compilations+=binary.compiled;return binary.bytes;};
-    const auto vs=shader(ShaderKind::display_vertex),colour=shader(ShaderKind::flow_colour),pixel=shader(ShaderKind::flow_interpolate);
-    const auto estimate=shader(ShaderKind::flow_estimate),resolve=shader(ShaderKind::flow_resolve),cut=shader(ShaderKind::flow_cut);
+    const auto vs=shader(ShaderKind::display_vertex),colour=shader(ShaderKind::flow_colour);
+    const auto estimate=shader(ShaderKind::flow_estimate),cut=shader(ShaderKind::flow_cut);
     checked_flow(device->CreateVertexShader(vs.data(),vs.size(),nullptr,&vertex_),"Interpolation vertex shader");
     checked_flow(device->CreatePixelShader(colour.data(),colour.size(),nullptr,&downsample_),"Colour shader");
-    checked_flow(device->CreatePixelShader(pixel.data(),pixel.size(),nullptr,&interpolate_),"Interpolation shader");
     checked_flow(device->CreateComputeShader(estimate.data(),estimate.size(),nullptr,&estimate_),"Motion shader");
-    checked_flow(device->CreateComputeShader(resolve.data(),resolve.size(),nullptr,&resolve_),"Motion support shader");
+    if(interpolation_support_) {
+        const auto pixel=shader(ShaderKind::flow_interpolate),resolve=shader(ShaderKind::flow_resolve);
+        checked_flow(device->CreatePixelShader(pixel.data(),pixel.size(),nullptr,&interpolate_),"Interpolation shader");
+        checked_flow(device->CreateComputeShader(resolve.data(),resolve.size(),nullptr,&resolve_),"Motion support shader");
+    }
     checked_flow(device->CreateComputeShader(cut.data(),cut.size(),nullptr,&detect_cut_),"Scene-cut shader");
+    const auto gradient=shader(ShaderKind::flow_gradient);
+    checked_flow(device->CreateComputeShader(gradient.data(),gradient.size(),nullptr,&gradient_),"Motion gradient shader");
     D3D11_BUFFER_DESC buffer{32,D3D11_USAGE_DYNAMIC,D3D11_BIND_CONSTANT_BUFFER,D3D11_CPU_ACCESS_WRITE,0,0};
     checked_flow(device->CreateBuffer(&buffer,nullptr,&constants_),"Interpolation constants");
     D3D11_SAMPLER_DESC sampler{};sampler.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;sampler.AddressU=sampler.AddressV=sampler.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -50,7 +55,9 @@ FrameInterpolation::FrameInterpolation(ID3D11Device* device,ID3D11DeviceContext*
         checked_flow(device->CreateUnorderedAccessView(texture.Get(),nullptr,&flow.output),"Motion output");
     };
     for(auto& direction:flow_) for(unsigned level=0;level<levels;++level) output(direction[level],width_>>level,height_>>level,DXGI_FORMAT_R16G16B16A16_FLOAT);
-    for(auto& direction:resolved_) output(direction,width_,height_,DXGI_FORMAT_R16G16B16A16_FLOAT);
+    if(interpolation_support_) for(auto& direction:resolved_) output(direction,width_,height_,DXGI_FORMAT_R16G16B16A16_FLOAT);
+    for(auto& frame:frame_) for(unsigned level=0;level<levels;++level) for(auto& gradient:frame.gradients[level])
+        output(gradient,(width_>>level)+2,(height_>>level)+2,DXGI_FORMAT_R32G32B32A32_FLOAT);
     output(cut_,1,1,DXGI_FORMAT_R32_FLOAT);
 }
 void FrameInterpolation::constants(float phase,unsigned level,bool first) {
@@ -61,8 +68,8 @@ void FrameInterpolation::constants(float phase,unsigned level,bool first) {
     auto buffer=constants_.Get();context_->CSSetConstantBuffers(0,1,&buffer);context_->PSSetConstantBuffers(0,1,&buffer);
 }
 void FrameInterpolation::unbind() {
-    std::array<ID3D11ShaderResourceView*,5> empty{};ID3D11UnorderedAccessView* output=nullptr;
-    context_->CSSetUnorderedAccessViews(0,1,&output,nullptr);context_->CSSetShaderResources(0,5,empty.data());
+    std::array<ID3D11ShaderResourceView*,7> empty{};std::array<ID3D11UnorderedAccessView*,2> outputs{};
+    context_->CSSetUnorderedAccessViews(0,unsigned(outputs.size()),outputs.data(),nullptr);context_->CSSetShaderResources(0,unsigned(empty.size()),empty.data());
     context_->PSSetShaderResources(0,5,empty.data());context_->OMSetRenderTargets(0,nullptr,nullptr);
 }
 void FrameInterpolation::publish(ID3D11Texture2D* image,bool reset) {
@@ -74,18 +81,30 @@ void FrameInterpolation::publish(ID3D11Texture2D* image,bool reset) {
     context_->VSSetShader(vertex_.Get(),nullptr,0);context_->PSSetShader(downsample_.Get(),nullptr,0);
     auto view=frame_[1].image_view.Get();auto sampler=sampler_.Get();context_->PSSetShaderResources(0,1,&view);context_->PSSetSamplers(0,1,&sampler);
     constants(1);context_->Draw(3,0);unbind();context_->GenerateMips(frame_[1].pyramid_view.Get());
-    if(++frames_<2) return;
+    // Derivatives depend only on one source image, not the motion candidate.
+    // Cache them once and retain the previous frame's derivatives with its pyramid.
+    context_->CSSetShader(gradient_.Get(),nullptr,0);
+    for(unsigned level=0;level<levels;++level) {
+        auto source=frame_[1].pyramid_view.Get();constants(1,level);
+        std::array<ID3D11UnorderedAccessView*,2> outputs{frame_[1].gradients[level][0].output.Get(),frame_[1].gradients[level][1].output.Get()};
+        context_->CSSetShaderResources(0,1,&source);context_->CSSetUnorderedAccessViews(0,2,outputs.data(),nullptr);
+        context_->Dispatch(((width_>>level)+9)/8,((height_>>level)+9)/8,1);unbind();
+    }
+    if(++frames_<2) {context_->CSSetShader(nullptr,nullptr,0);return;}
     frames_=2;
     context_->CSSetSamplers(0,1,&sampler);context_->CSSetShader(estimate_.Get(),nullptr,0);
     for(unsigned direction=0;direction<2;++direction) for(int level=levels-1;level>=0;--level) {
         const auto coarse=level==levels-1?0:level+1;
-        std::array<ID3D11ShaderResourceView*,5> inputs{frame_[direction].pyramid_view.Get(),frame_[1-direction].pyramid_view.Get(),flow_[direction][coarse].view.Get(),
-            frame_[direction].image_view.Get(),frame_[1-direction].image_view.Get()};
+        std::array<ID3D11ShaderResourceView*,7> inputs{frame_[direction].pyramid_view.Get(),frame_[1-direction].pyramid_view.Get(),flow_[direction][coarse].view.Get(),
+            frame_[direction].image_view.Get(),frame_[1-direction].image_view.Get(),frame_[1-direction].gradients[level][0].view.Get(),frame_[1-direction].gradients[level][1].view.Get()};
         auto output=flow_[direction][level].output.Get();constants(1,unsigned(level),level==levels-1);
         context_->CSSetShaderResources(0,unsigned(inputs.size()),inputs.data());context_->CSSetUnorderedAccessViews(0,1,&output,nullptr);
         context_->Dispatch(((width_>>level)+7)/8,((height_>>level)+7)/8,1);unbind();
     }
-    context_->CSSetShader(resolve_.Get(),nullptr,0);
+    // Intermediate images need motion propagated into occluded surfaces.
+    // Vendor upscalers receive depth and a rejection mask and handle their
+    // own disocclusion; provide measured endpoint motion directly instead.
+    if(interpolation_support_) {context_->CSSetShader(resolve_.Get(),nullptr,0);
     for(unsigned direction=0;direction<2;++direction) {
         std::array<ID3D11ShaderResourceView*,4> inputs{frame_[direction].image_view.Get(),frame_[1-direction].image_view.Get(),
             flow_[direction][0].view.Get(),flow_[1-direction][0].view.Get()};
@@ -93,12 +112,15 @@ void FrameInterpolation::publish(ID3D11Texture2D* image,bool reset) {
         context_->CSSetShaderResources(0,unsigned(inputs.size()),inputs.data());context_->CSSetUnorderedAccessViews(0,1,&output,nullptr);
         context_->Dispatch((width_+7)/8,(height_+7)/8,1);unbind();
     }
+    }
     context_->CSSetShader(detect_cut_.Get(),nullptr,0);
-    std::array<ID3D11ShaderResourceView*,3> inputs{frame_[0].image_view.Get(),frame_[1].image_view.Get(),resolved_[0].view.Get()};
+    std::array<ID3D11ShaderResourceView*,3> inputs{frame_[0].image_view.Get(),frame_[1].image_view.Get(),
+        interpolation_support_?resolved_[0].view.Get():flow_[0][0].view.Get()};
     auto output=cut_.output.Get();context_->CSSetShaderResources(0,3,inputs.data());context_->CSSetUnorderedAccessViews(0,1,&output,nullptr);
     context_->Dispatch(1,1,1);unbind();context_->CSSetShader(nullptr,nullptr,0);
 }
 void FrameInterpolation::bind(float phase) {
+    if(!interpolation_support_) throw std::runtime_error("Intermediate images require interpolation support");
     constants(phase);
     std::array<ID3D11ShaderResourceView*,5> inputs{frame_[0].image_view.Get(),frame_[1].image_view.Get(),resolved_[0].view.Get(),resolved_[1].view.Get(),cut_.view.Get()};
     context_->PSSetShaderResources(0,5,inputs.data());context_->PSSetShader(interpolate_.Get(),nullptr,0);

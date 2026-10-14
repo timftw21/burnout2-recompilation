@@ -64,6 +64,16 @@ float4 nv_log(float x) {
 float4 nv_lit(float4 x) {
  return float4(1,max(x.x,0),x.x>0 && x.y>0 ? pow(x.y,clamp(x.w,-127.99609375,127.99609375)) : 0,1);
 }
+float nv_fog(float d,float4 params) {
+ if(params.w==0) return 1;
+ // NV2A substitutes mode-specific fog factors for infinite or NaN distances.
+ float exceptional=params.z==0 || (params.z==1 && params.w!=2) ? 1 : 0;
+ if((asuint(d)&0x7F800000)==0x7F800000) return exceptional;
+ float value=params.z==0 ? params.x+d*params.y-1 : params.z==1 ? params.x+exp2(d*params.y*16)-1.5 : params.x+exp2(-d*d*params.y*params.y*32)-1.5;
+ if(params.w==2) value=abs(value);
+ if(isnan(value)) return exceptional;
+ return clamp(value,-asfloat(0x7F7FFFFF),asfloat(0x7F7FFFFF));
+}
 )";
 std::string mac_operation(unsigned opcode) {
     switch(opcode) {
@@ -97,7 +107,7 @@ std::string ilu_operation(unsigned opcode) {
 }
 }
 namespace {
-std::string draw_source(const std::string& body,unsigned first=0,unsigned count=192) {
+std::string draw_source(const std::string& body,unsigned first=0,unsigned count=192,bool jitter=false) {
     std::string source(helpers);
     source+=std::format("\n#define B2_CONSTANT_FIRST {}\ncbuffer Program:register(b1) {{ ",first);
     if(count) source+=std::format("float4 k[{}]; ",count);
@@ -132,11 +142,15 @@ float2 screen=trunc(o[0].xy*16)/16-viewport.w;
 p.p=float4((screen.x*viewport.x-1)*w,(1-screen.y*viewport.y)*w,o[0].z*viewport.z*w,w);
 p.c=saturate(o[3]); p.s=saturate(o[4]);
 p.t0=o[9]*uv_scales[0]; p.t1=o[10]*uv_scales[1]; p.t2=o[11]*uv_scales[2]; p.t3=o[12]*uv_scales[3];
-float d=o[5].x,mode=fog_params.z;
-float fog=mode==0 ? fog_params.x+d*fog_params.y-1 : mode==1 ? fog_params.x+exp2(d*fog_params.y*16)-1.5 : fog_params.x+exp2(-d*d*fog_params.y*fog_params.y*32)-1.5;
-p.fog=fog_params.w==0 ? 1 : fog_params.w==2 ? abs(fog) : fog;
+p.fog=nv_fog(o[5].x,fog_params);
 return p; }
 )";
+    if(jitter) {
+        const auto main=source.find("P main(I input)");
+        source.insert(main,"cbuffer Temporal:register(b3){float4 jitter;float4 temporal;}\n");
+        const auto end=source.find("p.c=saturate(o[3]);");
+        source.insert(end,"p.p.xy+=jitter.xy*p.p.w;\n");
+    }
     return source;
 }
 }
@@ -152,7 +166,7 @@ void validate_fixed_transform(const FixedTransform& state) {
             throw std::runtime_error("Invalid NV097 texgen component");
     }
 }
-std::string fixed_transform_source(std::uint32_t skin) {
+std::string fixed_transform_source(std::uint32_t skin,bool jitter) {
     if(skin>6) throw std::runtime_error("Reserved NV097 skin mode");
     const auto matrix=[](std::string_view vector,unsigned row) {
         return std::format("float4(dot({},k[{}]),dot({},k[{}]),dot({},k[{}]),dot({},k[{}]))",
@@ -199,7 +213,7 @@ if(fixed_flags.y) {
  else if(fixed_flags.z==2) o[5].x=dot(eye.xyz,k[57].xyz)+k[57].w;
  else if(fixed_flags.z==3) o[5].x=abs(dot(eye.xyz,k[57].xyz)+k[57].w);
 })";
-    return draw_source(body,0,96);
+    return draw_source(body,0,96,jitter);
 }
 VertexProgram normalize_vertex_program(const VertexProgram& program) {
     if(program.start>=program.tokens.size()) throw std::runtime_error("NV2A vertex start exceeds 136 slots");
@@ -210,7 +224,7 @@ VertexProgram normalize_vertex_program(const VertexProgram& program) {
     }
     throw std::runtime_error("NV2A vertex program has no final instruction within 136 slots");
 }
-VertexTranslation translate_vertex_program(const VertexProgram& program,bool launch) {
+VertexTranslation translate_vertex_program(const VertexProgram& program,bool launch,bool jitter) {
     if(program.start>=program.tokens.size()) throw std::runtime_error("NV2A vertex start exceeds 136 slots");
     VertexTranslation result;
     std::string body="float4 r[12]; float4 o[13]; int a0=0;\n[unroll] for(int i=0;i<12;++i) r[i]=0;\n[unroll] for(int i=0;i<13;++i) o[i]=float4(0,0,0,1);\n";
@@ -283,7 +297,7 @@ VertexTranslation translate_vertex_program(const VertexProgram& program,bool lau
         result.source+="#define B2_CONSTANT_FIRST 0\nRWStructuredBuffer<float4> k:register(u0); StructuredBuffer<float4> inputs:register(t0);\n[numthreads(1,1,1)] void main(uint3 id:SV_DispatchThreadID) { float4 v[16]; [unroll] for(int i=0;i<16;++i) v[i]=inputs[i];\n"+body+"}\n";
     } else {
         if((result.output_masks[0]&14)!=14) throw std::runtime_error("NV2A vertex program does not write complete position XYZ");
-        result.source=draw_source(body,result.constant_first,result.constant_count);
+        result.source=draw_source(body,result.constant_first,result.constant_count,jitter);
     }
     return result;
 }
