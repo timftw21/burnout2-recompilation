@@ -437,3 +437,129 @@ Remaining practical limitation: temporal reconstruction uses measured optical
 flow rather than exact engine motion vectors; moving fine texture detail can
 soften or shimmer. This is documented. MSAA remains available for sharp edges.
 All four requested settings default off and apply at the next game session.
+
+Draw distance and settings refresh (2026-10-15)
+
+Draw distance now replaces highest_lod/unlimited_distance with Original, 2x and
+4x. Enabled legacy overrides migrate to 2x unless a valid new draw_distance key
+is present. Only the new key is saved. Original mesh selection and texture mip
+filtering are retained; forcing the highest mip and original-section mesh was
+removed. Extra PSW/P2W geometry still loads into separate bounded storage.
+Camera clipping, horizontal visibility coverage and scenery fading share the
+selected multiplier. Bounded decoding of the supported XBE confirms both fade
+sites C31C4/C3A2E use EA830's vector length, including sqrtss at EA871. Dividing
+their local input by the multiplier therefore scales linear fade distance.
+
+The game executable now uses the Windows GUI subsystem and mainCRTStartup.
+Normal startup does not create a terminal. Diagnostic commands retain redirected
+output and can attach to their invoking terminal. PE inspection confirmed game
+subsystem 2 and native tool subsystem 3; --help and CPU/storage output passed.
+Settings use Windows UI fonts loaded once, custom vector navigation icons,
+charcoal/orange styling, scrolling pages and a fixed action bar. No font assets
+are redistributed. Keyboard and gamepad navigation are enabled.
+
+Release validation: 52 CPU groups / 36149 compiled functions, 2061 storage cases,
+and 247 hardware render cases passed; zero D3D debug messages. The obsolete
+forced-highest-mip case was removed with its setting. Hidden settings captures
+and save/load/migration assertions passed, including 640x480 layouts. The full
+window diagnostic still fails its pre-existing interpolation line-orientation
+gate (diagonal 1.110, 1449/720; horizontal 1.180, 1406/960); no tolerance changed.
+Captures: build/checks/settings-refresh-20261015/final-ui.
+
+Authorized Airport Terminal 3 benchmarks used isolated saves, 360 Hz, 1x native,
+widescreen, interpolation/V-sync/upscaling off. Each invocation lasted 28 seconds,
+with F9 recording from 22 to 27 seconds. Track ID 2 was confirmed in all three.
+Ryzen 5 5600X / RTX 5060 Ti; recorded original-frame results:
+  setting   FPS      median ms   p99 ms   max ms   peak private MiB
+  Original  248.317  4.0236      5.0839    9.6312  190.98
+  2x        269.026  3.6446      4.6349    6.7273  258.89
+  4x        233.711  3.9063      8.4797   30.7344  256.00
+These short stationary runs have different traffic/timer progression and do not
+establish a performance improvement or sustained 360 FPS. All recorded zero
+runtime shader compilations. Captured scenery was inspected; no full visual
+parity claim is made. Both extended settings loaded 36 original world sections.
+Reported horizontal range was 773.743 -> 1547.486 (2x) and 773.744 -> 3094.975
+(4x). The camera present at each stop reported 1600 -> 3200 and 300 -> 1200;
+both exact factors passed the diagnostic assertions.
+Reports: build/checks/settings-refresh-20261015/distance-{1,2,4}.
+Final b2.exe SHA-256:
+7C28A68EEF6BE2B003321B74EC2B7632E05C854DC901F4F55740513DBEA6285A.
+All six personal save hashes and settings.cfg remained unchanged. Owned workers
+exited. No commit, push or release was performed.
+
+Draw-distance reflection, traffic and backdrop investigation (2026-10-15)
+
+User reference: build/windows/Release/build/captures/frame-1282500834100,
+Airport Terminal 3 start, 3x resolution. The side reflection images had missing
+road/building geometry and large white sky patches. All original instruction
+analyses below verify the supported B5207C40...ED7BF executable; reports and
+bounded asset audits are in build/checks/draw-distance-fixes-20261015.
+
+The global 90A50/90BC0 interception suppressed material draws after the main
+90D30 pass, including reflection renderer 91690 and later material pass 920F0.
+It has been removed. Original loaded sections retain their original material
+loops; only additional sections use the extended helpers. Verified 9158F clears
+the extended prop list at the end of the main world pass.
+
+A6E00 temporarily replaces *[443EB0] with its reflection camera at object+1C.
+Therefore checking that camera slot in E8450 did not distinguish reflection
+from scene cameras. The first repair restored reflection geometry but still
+enlarged its sky, leaving white patches. Verified A6E00/A7306 entry/sole-return
+hooks now scope this reflection pass and keep its camera range original. The
+4x reflection capture frame-27445755100 has complete road/building geometry
+and continuous sky, matching the original-distance cube sides. Main scene
+camera distance remains 1600 -> 6400; this is not a reduction of scene range.
+
+Traffic renderer 9B380 recomputes linear LOD thresholds at object+2E280/+2E284
+from 20 * camera scale and four times that value. EA830 computes vector length;
+9BFFC/9C01E select LOD and 9A330 chooses the corresponding model arrays. The
+verified 9B3DC instruction hook scales these freshly written thresholds once.
+Captured thresholds are 17.64706/70.58825 (1x), 35.29412/141.1765 (2x), and
+70.58825/282.353 (4x). Spawning, physics and vehicle positions are unchanged.
+
+The user localized building flicker to distant buildings near this start.
+The bounded audit reconstructs only captured PSW mesh triangles with their
+actual 20/24/28-byte strides. Across sections it found no coincident copies;
+within sections it found intentional layered surfaces. A separate audit of the
+original PSS background meshes found the actual conflict: backdrop mesh 5,
+material 107, overlaps detailed section 14/15/16 building meshes. The largest
+pair (section 15 mesh 22/material 53) has 48325.6 square units of coplanar overlap.
+This is competing near/far representations, not duplicate track streaming.
+
+8EA80 reads 24-byte background mesh records at master+40, count master+3C.
+C5550 binds these records as vertex buffers. Extended world loading registers
+those exact buffers with the GPU bridge. Only those draws receive positive
+polygon offset (one slope pixel plus one depth unit), giving detailed surfaces
+priority while retaining distant backdrops where detailed scenery is absent.
+No global depth bias, guessed building IDs, near-plane change or removed
+background geometry is used. Released/replaced storage removes its registrations.
+Registration allocates during loading only; drawing uses a bounded sorted lookup.
+F8 draw records include effective background_depth_bias for verification.
+
+Final validation: release build passed, all 52 native CPU groups passed
+(36149 compiled functions), and all 247 hardware render cases passed on RTX
+5060 Ti with zero D3D11 debug messages. Each final Airport Terminal 3 invocation
+was 28 seconds (28.65/28.63 seconds including startup/capture/exit), at 360 Hz,
+native 1x, widescreen, interpolation/V-sync off, using isolated saves/settings.
+F9 recorded 22-26 seconds; F8 captured at 27 seconds, outside the timed sample.
+Exact 2x/4x traffic thresholds, scene camera clipping and scenery range passed.
+Each captured frame tagged only the 12 draws of background meshes 0/5/11;
+sky, detailed world, cars and HUD retained their original depth state.
+Final capture directories: build/captures/frame-27441024500 (2x) and
+build/captures/frame-27448813400 (4x). Reflection sides retain complete scenery
+and sky. Native-resolution building captures were inspected; the user's 3x
+resolution/MSAA view and moving-camera appearance still need a manual check.
+
+Ryzen 5 5600X / RTX 5060 Ti, short stationary gameplay samples:
+  2x: 205.59 FPS, 4.83 ms median, 5.78 ms p99, 6.14 ms maximum.
+  4x: 201.11 FPS, 4.92 ms median, 6.02 ms p99, 6.51 ms maximum.
+These samples do not meet sustained 360 FPS or establish a performance gain.
+Zero runtime shader compilations. Peak private memory: 261.39/259.23 MiB.
+The prior 4x sample with restored reflections but without backdrop priority was
+202.34 FPS; the small difference is not a controlled performance conclusion.
+Reports: build/checks/draw-distance-fixes-20261015/final-distance-{2,4},
+verification.json and render/report.json; runner logs use draw-distance-final-*.
+Final b2.exe SHA-256:
+554F7FE9897033012740238368F591FE2DC652EB6FA7A7F9D4681455DE9A5B34.
+All six personal save hashes and settings.cfg remained unchanged. Owned workers
+exited. No commit, push or release was performed.

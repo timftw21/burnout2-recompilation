@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.2)
-project(burnout2 VERSION 1.4.0 LANGUAGES C CXX)
+project(burnout2 VERSION 1.5.0 LANGUAGES C CXX)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "The initial target is Windows x64.")
@@ -233,7 +233,9 @@ if(B2_XBE)
             src/tool.cpp src/shader_compiler.cpp src/shaders.cpp src/vertex_program.cpp src/xbe.cpp src/file.cpp
         VERBATIM)
     add_custom_target(b2-shaders-generated DEPENDS "${native_shader_stamp}")
-    add_executable(b2 src/main.cpp src/cpu_checks.cpp src/cpu_reference.asm "${native_cpu}" "${native_cpu}.asm" ${native_shards} "${native_shaders}" resources/b2.rc resources/b2.manifest)
+    add_executable(b2 WIN32 src/main.cpp src/cpu_checks.cpp src/cpu_reference.asm "${native_cpu}" "${native_cpu}.asm" ${native_shards} "${native_shaders}" resources/b2.rc resources/b2.manifest)
+    # Keep the same argc/argv diagnostics entry without allocating a console.
+    target_link_options(b2 PRIVATE /ENTRY:mainCRTStartup)
     # Share the CPU header across all shards without embedding installation paths.
     target_precompile_headers(b2 PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:<cpu.h$<ANGLE-R>>")
     # File-specific object paths split /MP batches; schedule them through two

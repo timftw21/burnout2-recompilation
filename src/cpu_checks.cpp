@@ -225,14 +225,17 @@ template<class T> unsigned check_strings() {
     constexpr std::uint32_t base=0x1000,source=80;
     for (const bool descending : {false, true}) {
         for (const std::uint32_t destination : {20U, 79U, 80U, 81U, 120U}) {
-            for (const std::uint32_t count : {0U, 1U, 7U, 16U}) {
+            for (const std::uint32_t count : {0U, 1U, 7U, 16U}) for(unsigned aliases=0;aliases<9;++aliases) {
                 std::array<std::byte, 256> model, reference;
                 for (std::size_t i = 0; i < model.size(); ++i) model[i] = std::byte((i * 17U) & 255U);
                 reference = model;
                 const auto offset = descending && count ? (count - 1U) * sizeof(T) : 0U;
                 Memory memory(base, model);
-                memory.move_elements<T>(static_cast<std::uint32_t>(base + destination + offset),
-                    static_cast<std::uint32_t>(base + source + offset), count, descending);
+                memory.map(base|0x80000000U,model);
+                memory.map(base|0xF0000000U,model);
+                constexpr std::array<std::uint32_t,3> address_views{0,0x80000000U,0xF0000000U};
+                memory.move_elements<T>(static_cast<std::uint32_t>(base + destination + offset)|address_views[aliases/3],
+                    static_cast<std::uint32_t>(base + source + offset)|address_views[aliases%3], count, descending);
                 b2_string_move(reference.data() + destination + offset, reference.data() + source + offset,
                     count, sizeof(T), descending);
                 require(model == reference, "Guest string copy differs from native REP MOVS");

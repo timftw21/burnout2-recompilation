@@ -294,7 +294,7 @@ std::string compile_effects(const std::filesystem::path& source,const std::files
                     if(instruction.target<=pc) code<<"d.guard("<<pc<<");";
                     code<<"goto "<<label(instruction.target)<<";}\n";break;
                 case Flow::call:code<<routine_name(effect,instruction.target)<<"(d);\n";break;
-                case Flow::loop:code<<"loop_"<<pc<<"="<<instruction.count<<"&0xFFFFU; if(!loop_"<<pc<<") goto "<<label(instruction.target)<<";\n";break;
+                case Flow::loop:code<<"loop_"<<pc<<"=d.loop_count("<<instruction.count<<"); if(!loop_"<<pc<<") goto "<<label(instruction.target)<<";\n";break;
                 default:break;
                 }
                 code<<"goto "<<label(pc+instruction.size)<<";\n";

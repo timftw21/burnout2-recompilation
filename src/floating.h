@@ -9,7 +9,9 @@ namespace b2 {
 struct FloatingState {
     std::array<std::byte,108> image = [] {
         std::array<std::byte,108> value{};
-        value[0]=std::byte{0x7F}; value[1]=std::byte{3};
+        // Xbox kernel thread default: masked exceptions, 53-bit precision.
+        // A translated FNINIT still performs the architectural 64-bit reset.
+        value[0]=std::byte{0x7F}; value[1]=std::byte{2};
         value[8]=value[9]=std::byte{0xFF};
         return value;
     }();

@@ -148,6 +148,7 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
         },{},{},{},true);
         renderer.enhancements(0,0);renderer.resize(64,64);
     }
+    renderer.interpolation(false);
     if(renderer.resources().target_bytes!=target_budget) throw std::runtime_error("Disabled MSAA retained render storage");
     if(renderer.supports_msaa(4)) {
         renderer.enhancements(5,0);
@@ -188,6 +189,49 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
     run("triangle-strip", state, strip, red_pixel);
     state.primitive = 9;
     run("quad-strip", state, strip, red_pixel);
+
+    {
+        const std::array<std::uint32_t,4> corners{0xFFFF0000,0xFF00FF00,0xFF0000FF,0xFFFFFFFF};
+        auto point=colored();point.primitive=1;point.point_size=16;point.point_sprite=true;point.cull=true;
+        point.textures[3]=renderer.upload({2,2,TextureFormat::argb8,std::as_bytes(std::span(corners))});
+        point.texture_modes[3]=1;point.texture_filter[3]=0x01010000;point.final_inputs={11,0x1B00};
+        const std::array<Vertex,1> center{};
+        auto lines=colored();lines.primitive=2;renderer.prepare(lines);
+        std::array<Vertex,2> rain{};
+        rain[0].position={-0.75f,-0.75f,0.5f,1};rain[1].position={0.75f,-0.75f,0.5f,1};
+        for(auto& vertex:rain) vertex.color={0,0,1,1};
+        run("point-sprite-texture-and-lines",point,center,[](const Image& image) {
+            expect(image,26,26,{255,0,0,255});expect(image,37,26,{0,255,0,255});
+            expect(image,26,37,{0,0,255,255});expect(image,37,37,{255,255,255,255});
+            expect(image,20,32,{0,0,0,255});
+            if(pixel(image,32,55)[2]!=255 && pixel(image,32,56)[2]!=255)
+                throw std::runtime_error("Point expansion leaked into subsequent line rendering");
+        },{},{},[&] {renderer.draw(point,center);renderer.draw(lines,rain);});
+        auto occluder=colored();occluder.depth_test=occluder.depth_write=true;renderer.prepare(occluder);
+        point.depth_test=true;
+        auto behind=center;behind[0].position[2]=0.75f;
+        run("point-sprite-depth",point,behind,[](const Image& image) {expect(image,32,32,{0,0,255,255});},
+            {},{},[&] {renderer.draw(occluder,blue);renderer.draw(point,behind);});
+
+        const auto fixed=renderer.prepare_fixed({});
+        VertexConstants constants{};
+        constants[0]={1,0,0,0};constants[1]={0,1,0,0};constants[2]={0,0,0,0.5f};constants[3]={0,0,0,1};
+        for(unsigned i=0;i<4;++i) constants[8+i][i]=1;
+        constants[59]={32.53125f,32.53125f,0,0};
+        auto scaled=colored();scaled.primitive=1;scaled.point_scale=true;
+        scaled.point_parameters={0,0,1,16,16,16,0,0};
+        for(unsigned distance:{2U,4U}) {
+            std::array<ProgramVertex,1> vertex{};
+            vertex[0].attributes[0]={0,0,std::sqrt(float(distance*distance-1)),1};
+            vertex[0].attributes[3]={1,0,0,1};
+            run(std::format("point-attenuation-{}",distance),scaled,center,[&](const Image& image) {
+                unsigned covered=0;
+                for(std::size_t offset=0;offset<image.rgba.size();offset+=4) covered+=image.rgba[offset]==std::byte{255};
+                const auto side=16/distance;
+                if(covered!=side*side) throw std::runtime_error("Point distance attenuation has incorrect coverage");
+            },{},{},[&] {renderer.draw_program(scaled,fixed,constants,{},vertex);},true);
+        }
+    }
 
     for (auto format : {TextureFormat::argb8, TextureFormat::xrgb8, TextureFormat::argb8_linear, TextureFormat::xrgb8_linear}) {
         const bool opaque = format == TextureFormat::xrgb8 || format == TextureFormat::xrgb8_linear;
@@ -244,19 +288,6 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
     run("mip-maximum-level",sampling,minified,[](const Image& image){expect(image,32,32,{0,255,0,255});});
     sampling.texture_control[0]=(1U<<18)|0x0003FFC0;
     run("mip-minimum-level",sampling,white,[](const Image& image){expect(image,32,32,{0,255,0,255});});
-    run("highest-lod-mipmap",colored(),red,[&](const Image&) {
-        Renderer detail(64,64,warp,debug);detail.lod_override(true);
-        auto state=textured(detail.upload({4,4,TextureFormat::argb8,mip_bytes,3}));
-        state.texture_filter[0]=0x02060100;state.texture_control[0]=(2U<<18)|0x0003FFC0;
-        detail.prepare(state);detail.begin();detail.draw(state,minified);detail.end();
-        const auto image=detail.readback();red_pixel(image);
-        save_png(image,directory/"highest-lod-mipmap-native.png");
-        if(!detail.errors().empty()) throw std::runtime_error("Highest texture LOD produced graphics validation errors");
-        detail.reset(1);detail.lod_override(false);
-        state.textures[0]=detail.upload({4,4,TextureFormat::argb8,mip_bytes,3});
-        detail.prepare(state);detail.begin();detail.draw(state,minified);detail.end();
-        expect(detail.readback(),32,32,{0,0,255,255});
-    });
     sampling.texture_control[0]=0x0003FFF0;
     auto grazing=white;for(auto& vertex:grazing) vertex.uv[0][0]*=64;
     run("mip-anisotropic-detail",sampling,grazing,[](const Image& image){

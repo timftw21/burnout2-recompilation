@@ -6,6 +6,7 @@
 
 namespace b2 {
 namespace {
+
 class ShaderBlob final : public ID3DBlob {
     Bytes bytes_;LONG references_=1;
 public:
@@ -144,16 +145,90 @@ float4 main(P p):SV_Target {
 }
 ID3DBlob* shader_blob(ShaderKind kind) {return new ShaderBlob(shader_binary(kind).bytes);}
 const char* shader_profile(ShaderKind kind) {
-    if(kind==ShaderKind::launch || kind==ShaderKind::flow_estimate || kind==ShaderKind::flow_resolve || kind==ShaderKind::flow_cut || kind==ShaderKind::flow_gradient) return "cs_5_0";
+    if(kind==ShaderKind::point_geometry) return "gs_5_0";
+    if(kind==ShaderKind::launch || kind==ShaderKind::flow_estimate || kind==ShaderKind::flow_resolve || kind==ShaderKind::flow_cut || kind==ShaderKind::flow_gradient ||
+       kind==ShaderKind::flow_depth || kind==ShaderKind::flow_depth_ms) return "cs_5_0";
     if(kind==ShaderKind::clear_pixel || kind==ShaderKind::display_pixel || kind==ShaderKind::gui_pixel ||
        (kind>=ShaderKind::combiner0 && kind<=ShaderKind::combiner8) ||
        kind==ShaderKind::flow_colour || kind==ShaderKind::flow_interpolate || kind==ShaderKind::fxaa ||
        kind==ShaderKind::copy_multisample || kind==ShaderKind::copy_multisample_stencil ||
        (kind>=ShaderKind::color && kind<=ShaderKind::modulate3d) ||
-       (kind>=ShaderKind::responsive_combiner0 && kind<=ShaderKind::upscale_inputs)) return "ps_5_0";
+       (kind>=ShaderKind::responsive_combiner0 && kind<=ShaderKind::upscale_inputs) ||
+       (kind>=ShaderKind::layer_combiner0 && kind<=ShaderKind::layer_modulate3d) ||
+       kind==ShaderKind::layer_begin || kind==ShaderKind::layer_begin_ms) return "ps_5_0";
     return "vs_5_0";
 }
 std::string shader_source(ShaderKind kind) {
+
+    if(kind==ShaderKind::layer_begin || kind==ShaderKind::layer_begin_ms) return
+        std::string(kind==ShaderKind::layer_begin_ms?"#define MULTISAMPLE\n":"")+R"(
+#ifdef MULTISAMPLE
+Texture2DMS<float4> scene:register(t0);
+#else
+Texture2D<float4> scene:register(t0);
+#endif
+struct O {float4 black:SV_Target0;float4 white:SV_Target1;float4 lower:SV_Target2;float4 upper:SV_Target3;};
+O main(float4 position:SV_Position,uint sample:SV_SampleIndex) {
+#ifdef MULTISAMPLE
+ float alpha=scene.Load(int2(position.xy),sample).a;
+#else
+ float alpha=scene.Load(int3(position.xy,0)).a;
+#endif
+ O o;o.black=o.lower=float4(0,0,0,alpha);o.white=o.upper=float4(1,1,1,alpha);return o;
+})";
+
+    if(kind==ShaderKind::flow_depth || kind==ShaderKind::flow_depth_ms) return
+        std::string(kind==ShaderKind::flow_depth_ms?"#define MULTISAMPLE 1\nTexture2DMS<float> source:register(t0);":"Texture2D<float> source:register(t0);")+R"(
+RWTexture2D<float> depth:register(u0);
+[numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID) {
+ uint width,height;depth.GetDimensions(width,height);if(id.x>=width || id.y>=height) return;
+ uint w,h,samples=1;
+#ifdef MULTISAMPLE
+ source.GetDimensions(w,h,samples);
+#else
+ source.GetDimensions(w,h);
+#endif
+ uint2 first=id.xy*uint2(w,h)/uint2(width,height),last=(id.xy+1)*uint2(w,h)/uint2(width,height);
+ float value=1;
+ [loop] for(uint y=first.y;y<max(first.y+1,last.y);++y) [loop] for(uint x=first.x;x<max(first.x+1,last.x);++x)
+ [loop] for(uint s=0;s<samples;++s) {
+#ifdef MULTISAMPLE
+  value=min(value,source.Load(int2(x,y),s));
+#else
+  value=min(value,source.Load(int3(x,y,0)));
+#endif
+ }
+ depth[id.xy]=value;
+})";
+    if(kind>=ShaderKind::layer_combiner0 && kind<=ShaderKind::layer_modulate3d) {
+        const auto original=kind<=ShaderKind::layer_combiner8?
+            ShaderKind(unsigned(ShaderKind::combiner0)+unsigned(kind)-unsigned(ShaderKind::layer_combiner0)):
+            ShaderKind(unsigned(ShaderKind::color)+unsigned(kind)-unsigned(ShaderKind::layer_color));
+        auto source=shader_source(original);
+        const auto position=source.find("float4 main(P p):SV_Target");
+        if(position==std::string::npos) throw std::runtime_error("Cannot add the presentation-layer shader outputs");
+        source.replace(position,std::string_view("float4 main(P p):SV_Target").size(),"float4 shade(P p)");
+        return source+R"(
+struct O {float4 black:SV_Target0;float4 white:SV_Target1;float4 lower:SV_Target2;float4 upper:SV_Target3;};
+O main(P p) {O o;o.black=o.white=o.lower=o.upper=saturate(shade(p));return o;})";
+    }
+    if(kind==ShaderKind::point_geometry) return R"(
+cbuffer Points:register(b4) {float4 point_info;}
+struct P {float4 p:SV_Position;float4 c:COLOR0;float4 s:COLOR1;
+ float4 t0:TEXCOORD0;float4 t1:TEXCOORD1;float4 t2:TEXCOORD2;float4 t3:TEXCOORD3;
+ float fog:TEXCOORD4;float size:TEXCOORD5;};
+[maxvertexcount(4)]
+void main(point P input[1],inout TriangleStream<P> output) {
+ P center=input[0];
+ if(center.p.w<=0 || any(abs(center.p.xy)>center.p.w) || center.p.z<0 || center.p.z>center.p.w) return;
+ float size=clamp(point_info.w<0?center.size:point_info.w,1,63.875);
+ [unroll] for(uint i=0;i<4;++i) {
+  float2 uv=float2(i>>1,i&1);P corner=center;
+  corner.p.xy+=(uv*2-1)*float2(point_info.x,-point_info.y)*size*center.p.w;
+  if(point_info.z) corner.t3=float4(uv,1,1);
+  output.Append(corner);
+ }
+})";
     if(kind==ShaderKind::passthrough_jitter) {
         auto source=shader_source(ShaderKind::passthrough);
         source.insert(0,"cbuffer Temporal:register(b3){float4 jitter;float4 temporal;}\n");
@@ -206,8 +281,8 @@ O main(float4 p:SV_Position,float2 uv:TEXCOORD0) {
 struct V {float4 p:POSITION;float4 c:COLOR0;float4 s:COLOR1;
  float4 t0:TEXCOORD0;float4 t1:TEXCOORD1;float4 t2:TEXCOORD2;float4 t3:TEXCOORD3;float fog:TEXCOORD4;};
 struct P {float4 p:SV_Position;float4 c:COLOR0;float4 s:COLOR1;
- float4 t0:TEXCOORD0;float4 t1:TEXCOORD1;float4 t2:TEXCOORD2;float4 t3:TEXCOORD3;float fog:TEXCOORD4;};
-P main(V v) {P p;p.p=v.p;p.c=v.c;p.s=v.s;p.t0=v.t0;p.t1=v.t1;p.t2=v.t2;p.t3=v.t3;p.fog=v.fog;return p;})";
+ float4 t0:TEXCOORD0;float4 t1:TEXCOORD1;float4 t2:TEXCOORD2;float4 t3:TEXCOORD3;float fog:TEXCOORD4;float size:TEXCOORD5;};
+P main(V v) {P p;p.p=v.p;p.c=v.c;p.s=v.s;p.t0=v.t0;p.t1=v.t1;p.t2=v.t2;p.t3=v.t3;p.fog=v.fog;p.size=1;return p;})";
     case ShaderKind::clear_vertex:return R"(
 cbuffer C:register(b0){float4 rgba;float4 parameters;}
 float4 main(uint id:SV_VertexID):SV_Position {float2 p=float2((id<<1)&2,id&2);return float4(p*float2(2,-2)+float2(-1,1),parameters.x,1);})";
@@ -410,7 +485,9 @@ RWTexture2D<float> cut:register(u0);SamplerState filter:register(s0);groupshared
     case ShaderKind::flow_interpolate:return R"(
 Texture2D previous:register(t0),current:register(t1);Texture2D<float4> forward:register(t2),backward:register(t3);
 Texture2D<float> cut:register(t4);SamplerState filter:register(s0);
-cbuffer C:register(b0){float phase;uint level;uint first;uint spare;}
+Texture2D previous_black:register(t5),previous_white:register(t6),current_black:register(t7),current_white:register(t8);
+Texture2D previous_lower:register(t15),previous_upper:register(t16),current_lower:register(t17),current_upper:register(t18);
+cbuffer C:register(b0){float phase;uint level;uint first;uint layers;}
 float match(Texture2D source,Texture2D destination,float2 uv,float2 v,float2 pixel) {
  float error=0;
  const float2 offsets[5]={float2(0,0),float2(1,0),float2(-1,0),float2(0,1),float2(0,-1)};
@@ -446,7 +523,7 @@ float4 motion_at(Texture2D<float4> field,Texture2D source,Texture2D destination,
  if(rounded_error+0.000001<error) {best.xy=rounded;error=rounded_error;}
  best.w=error;return best;
 }
-float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target {
+float4 interpolate(float2 uv) {
  float4 latest=current.SampleLevel(filter,uv,0);if(cut.Load(int3(0,0,0))>0.5) return latest;
  uint width,height;current.GetDimensions(width,height);float2 size=float2(width,height),pixel=1/size;
  if(match(previous,current,uv,float2(0,0),pixel)<0.0005) return latest;
@@ -491,6 +568,14 @@ float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target {
  // Average only aligned detail. Blending discrepant samples softens edges;
  // the nearer warped source retains detail and the intended display time.
  return difference<0.008&&length((a+f.xy-b)*size)<=0.75?lerp(old,next,phase):(phase<0.5?old:next);
+}float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target {
+ float4 scene=interpolate(uv);bool latest=phase>=0.5 || cut.Load(int3(0,0,0))>0.5;
+ if((layers&(latest?2:1))==0) return scene;
+ float4 black=latest?current_black.SampleLevel(filter,uv,0):previous_black.SampleLevel(filter,uv,0);
+ float4 white=latest?current_white.SampleLevel(filter,uv,0):previous_white.SampleLevel(filter,uv,0);
+ float4 lower=latest?current_lower.SampleLevel(filter,uv,0):previous_lower.SampleLevel(filter,uv,0);
+ float4 upper=latest?current_upper.SampleLevel(filter,uv,0):previous_upper.SampleLevel(filter,uv,0);
+ return clamp(black+scene*(white-black),lower,upper);
 })";
     case ShaderKind::copy_multisample:return R"(
 Texture2DMS<float4> source_colour:register(t0);Texture2DMS<float> source_depth:register(t1);

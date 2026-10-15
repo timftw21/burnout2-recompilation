@@ -12,6 +12,7 @@ struct ID3D11DeviceContext;
 struct ID3D11SamplerState;
 
 namespace b2 {
+struct MotionCamera;
 struct Image {
     std::uint32_t width, height;
     std::vector<std::byte> rgba;
@@ -48,6 +49,9 @@ struct Vertex {
 // Numeric primitive, comparison, blending and combiner fields retain NV097 values.
 struct RenderState {
     std::uint32_t primitive = 5;
+    float point_size = 1;
+    bool point_sprite = false, point_scale = false;
+    std::array<float,8> point_parameters{};
     bool blend = false, depth_test = false, depth_write = false;
     bool alpha_test = false, cull = false, front_ccw = false;
     std::uint32_t depth_function = 0x0203, alpha_function = 0x0207, alpha_reference = 0;
@@ -89,6 +93,7 @@ struct VertexStream { Bytes bytes;std::uint32_t stride; };
 struct RenderStats {
     std::uint64_t draws = 0, vertices = 0, shader_compilations = 0, vertex_bytes = 0;
     std::uint64_t published_frames = 0, interpolated_frames = 0;
+    std::uint64_t layered_frames = 0;
     std::uint64_t reused_vertex_bytes = 0;
     double gpu_ms = 0;
     bool gpu_timing_valid = false;
@@ -102,6 +107,7 @@ struct RenderResources {
 class Renderer {
     struct Impl;
 public:
+    struct Visibility {void* context;void (*scope)(void*,bool original_draw);};
     class PreparedState {
         friend class Renderer;
         friend struct Impl;
@@ -142,10 +148,12 @@ public:
     bool supports_msaa(unsigned samples) const;
     unsigned raster_samples_per_pixel() const; // Host samples representing one original Xbox pixel.
     void upscaling(UpscaleMethod,unsigned output_scale=0);
-    void lod_override(bool enabled);
-    void camera(std::uint32_t identifier,float near_plane,float far_plane,float vertical_fov);
+    void camera(std::uint32_t identifier,float near_plane,float far_plane,float vertical_fov,const MotionCamera* motion=nullptr);
     bool supports_upscaling(UpscaleMethod) const;
     void interpolation(bool enabled); // Allocate history only when explicitly enabled.
+    void motion_capture(bool enabled); // Retain diagnostic depth/camera only for an explicit capture.
+    bool needs_motion_camera() const;
+    void visibility(const Visibility*) noexcept; // Exclude presentation-only draws from original sample counts.
     void publish_frame(bool reset = false); // Snapshot a completed game frame.
     bool display(float phase = 1,bool wait = true); // Scale the main image when a window buffer is available.
     bool wait_frame(unsigned timeout_ms); // Acquire one presentation slot, with a bounded wait.
@@ -154,6 +162,7 @@ public:
     RenderResources resources() const;
     ID3D11Device* native_device() const;
     ID3D11DeviceContext* native_context() const;
+    ID3D11Texture2D* reconstruction_input(unsigned channel) const; // Explicit diagnostic readback only.
     PreparedState prepare(const RenderState&); // Borrowed bindings, valid for this renderer's lifetime.
     std::uint32_t prepare_program(const VertexProgram&, bool launch = false);
     std::uint32_t prepare_fixed(const FixedTransform& = {});
@@ -178,6 +187,7 @@ public:
     Image read_frame(); // Published presentation image, including optional antialiasing.
     Image read_target(std::uint32_t);
     Image read_display();
+    void save_motion_inputs(const std::filesystem::path& prefix); // Explicit diagnostic capture only.
     RenderStats stats() const;
     std::string adapter() const;
     std::vector<std::string> errors() const;

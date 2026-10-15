@@ -1,0 +1,69 @@
+Sunrise Valley Springs: open mountain backs (2026-10-15)
+
+User capture: build/windows/Release/build/captures/frame-562156488000.
+The defect is visible in frame.png, the original GPU frame. It is unrelated to
+frame interpolation. Captured camera position reconstructed from the original
+shader constants: (2145.499, 51.02387, 170.53622), looking toward decreasing X.
+Source XBE SHA-256: B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+
+Bounded offline replay reconstructed captured draws from tracks1/forward/dstl/
+dstl.psw and trackpss/forward/dstl.pss in the supported disc. Each vertex stream
+matches the capture's full 128-byte prefix; indices come from the original
+24-byte mesh records. Captured shaders, constants, textures and render state
+are replayed through the normal GPU bridge. Private inputs/programs/results:
+build/checks/sunrise-rendering-20261015.
+
+The floating peak is in additional sections 37-40, materials 90 and 107;
+draws 471/473/493/495/515/516/530. These are one-sided terrain surfaces viewed
+from the reverse side of the track after extending visibility. Replaying all
+nine meshes of those materials across all 52 sections gives the same missing
+slopes, ruling out an omitted section or alternate mesh. Back-face culling
+removes the slopes but leaves the protruding peak. The palm crowns in draws
+837-847 are correctly positioned behind these missing surfaces, so they show
+through the open mountain. The original crown mesh is at PSS offset 4C59D0,
+547 vertices with Y bounds -0.30 to 2.22; the capture uses resource 395.
+
+Removing the earlier distant-background depth bias produces a byte-identical
+replay. Globally reversing winding is not appropriate: authored vertex normals
+and triangle winding in draw 545 agree, with the visible normals facing the
+camera. Original scenery/material rendering remains unchanged.
+
+The GPU bridge now registers the separately loaded extra-world storage range
+and makes only its depth-tested polygon draws two-sided. This supplies the
+reverse view that the extended visibility requires, with original vertex data,
+textures and depth testing. It restores the mountain body and its occlusion of
+far-side trees; it does not remove the peak or trees. Original loaded sections,
+props, cars, reflections, sky and HUD are outside this registration. Replacing
+or releasing registered storage clears the range. Captures identify affected
+draws with extended_geometry_two_sided.
+
+The implementation adds a bounded address check, with no new draws, passes,
+vertex copies or gameplay allocation. Visible reverse faces naturally require
+rasterization. No gameplay frame-rate claim is made from the offline replay.
+
+Validation:
+- Release build passed. Its pre-existing PGO warnings discard stale profile
+  counts for changed functions; compilation and linking succeeded.
+- Expanded offline replay reconstructed 576 captured static draws, including
+  surrounding terrain, sky and palms. The baseline reproduces the user's scene
+  without cars/HUD. The fix restores the continuous mountain silhouette and
+  obscures the far-side crowns, with 576 draws both before and after. Replayed
+  at 1280x960 with antialiasing off and MSAA 4x; zero D3D debug errors.
+- The focused 19-draw replay matches the expected two-sided terrain image
+  exactly. Disabled, unrelated and invalidated registrations reproduce the
+  baseline exactly. Scope/lifetime, personal-file and rollback checks: 19 passed.
+- Native CPU checks: all 52 groups passed, 36149 compiled functions.
+- Native hardware rendering checks: all 247 passed on NVIDIA RTX 5060 Ti,
+  zero D3D11 debug messages. Report: render/report.json in the private directory.
+- Personal settings and saves are unchanged. Thin-object interpolation remains
+  reverted. All owned workers exited. Gameplay still requires the user's manual
+  visual check; no new gameplay capture or benchmark was run.
+
+Updated build/windows/Release/b2.exe SHA-256:
+B28D41506EACCF56358332284616D435DED8BA0DA7016BB50D486ADBEF9A3567.
+
+User review and release 1.5:
+The user confirmed that the rendering issue is not completely fixed and deferred
+further investigation to another release. The offline results above establish
+the specific improvement, not complete scene correctness. The draw-distance
+tooltip and release documentation now warn about possible rendering issues.

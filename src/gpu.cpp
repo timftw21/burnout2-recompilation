@@ -52,11 +52,14 @@ struct Gpu::Impl {
     ProgramVertex current{};
     std::uint32_t program_load=0,constant_load=0,primitive=0,target=0;
     std::vector<std::uint32_t> indices,inline_words;
+    std::vector<std::uint32_t> distant_buffers;
+    std::uint32_t extended_base=0,extended_size=0;
     struct Draw {
         RenderState state;VertexConstants constants;ProgramView view;ProgramVertex current;
         Renderer::PreparedState bindings;
         std::array<VertexStream,16> streams{};
         std::uint32_t layout=0,count=0,stream_count=0,constant_program=0;
+        bool distant_geometry=false,extended_geometry=false;
         std::vector<std::uint32_t> indices;
         std::vector<std::uint32_t> packed;
     };
@@ -96,7 +99,7 @@ struct Gpu::Impl {
     unsigned capture_draws=0;
     std::uint64_t capture_serial=0,capture_texture_bytes=0;
     unsigned capture_textures=0;
-    bool capture_truncated=false;
+    bool capture_truncated=false,capture_automated=false;
     Impl(Renderer& r,Memory& m,Gpu& o,std::uint32_t base):renderer(r),memory(m),owner(o),semaphore_base(base) {
         for(auto& attribute:current.attributes) attribute={0,0,0,1};
         current.attributes[3]={1,1,1,1};draws.resize(256);indices.reserve(32768);inline_words.reserve(4096);
@@ -112,9 +115,15 @@ struct Gpu::Impl {
     std::uint32_t reg(unsigned method) const {return registers[0][method/4];}
     void flush() {
         if(!draw_count) return;
-        if(visibility_enabled && !visibility_active) {
-            renderer.native_context()->Begin(visibility_query.Get());visibility_active=true;
-        }
+        const Renderer::Visibility visibility{this,[](void* context,bool original) {
+            auto& gpu=*static_cast<Impl*>(context);
+            if(!original) gpu.finish_visibility();
+            else if(gpu.visibility_enabled && !gpu.visibility_active) {
+                gpu.renderer.native_context()->Begin(gpu.visibility_query.Get());gpu.visibility_active=true;
+            }
+        }};
+        renderer.visibility(visibility_enabled?&visibility:nullptr);
+        struct ResetVisibility {Renderer& renderer;~ResetVisibility(){renderer.visibility(nullptr);}} reset{renderer};
         renderer.begin(0,1,false);
         try {
             for(unsigned i=0;i<draw_count;++i) {
@@ -126,6 +135,7 @@ struct Gpu::Impl {
             for(const auto& draw:std::span(draws).first(draw_count)) {
                 statistics.vertices+=draw.indices.empty()?draw.count:draw.indices.size();++statistics.draws;
             }
+            finish_visibility();
         } catch(...) {renderer.end();draw_count=0;throw;}
         renderer.end();draw_count=0;++gpu_work;
     }
@@ -140,6 +150,8 @@ struct Gpu::Impl {
         const auto overlaps=[&](std::uint32_t base,std::uint64_t bytes) {
             base&=0x0FFFFFFF;return base<end && address<std::uint64_t(base)+bytes;
         };
+        std::erase_if(distant_buffers,[&](auto base){return overlaps(base,1);});
+        if(extended_size && overlaps(extended_base,extended_size)) extended_size=0;
         for(unsigned i=0;i<fence_count;++i) {
             auto& completion=fences[(fence_head+i)%fences.size()];
             if(completion.kind==Fence::Kind::report && overlaps(completion.address,16)) completion.written=0;
@@ -305,13 +317,18 @@ struct Gpu::Impl {
         s.scissor_test=true;s.scissor={std::int32_t(horizontal&0xFFFF),std::int32_t(vertical&0xFFFF),
             std::int32_t((horizontal&0xFFFF)+(horizontal>>16)),std::int32_t((vertical&0xFFFF)+(vertical>>16))};
         s.primitive=primitive;s.blend=reg(0x304)!=0;s.depth_test=reg(0x30C)!=0;s.depth_write=reg(0x35C)!=0;
+        if(primitive==1) {
+            s.point_size=float(reg(0x43C)&0x1FF)/8;
+            s.point_sprite=reg(0x31C)!=0;s.point_scale=reg(0x318)!=0;
+            for(unsigned i=0;i<8;++i) s.point_parameters[i]=real(reg(0xA30+i*4));
+        }
         s.alpha_test=reg(0x300)!=0;s.cull=reg(0x308)!=0;s.front_ccw=reg(0x3A0)==0x901;
         s.depth_function=reg(0x354);s.alpha_function=reg(0x33C);s.alpha_reference=reg(0x340);
         s.blend_source=reg(0x344);s.blend_destination=reg(0x348);s.blend_equation=reg(0x350);
         s.cull_face=reg(0x39C);s.color_mask=reg(0x358);s.stencil_test=reg(0x32C)!=0;
         s.stencil_write_mask=reg(0x360)&255;s.stencil_function=reg(0x364);s.stencil_reference=reg(0x368)&255;s.stencil_read_mask=reg(0x36C)&255;
         s.stencil_fail=reg(0x370);s.stencil_depth_fail=reg(0x374);s.stencil_pass=reg(0x378);
-        s.polygon_offset=reg(0x338)!=0;s.polygon_offset_scale=real(reg(0x384));s.polygon_offset_bias=real(reg(0x388));
+        s.polygon_offset=reg(primitive==1?0x330:0x338)!=0;s.polygon_offset_scale=real(reg(0x384));s.polygon_offset_bias=real(reg(0x388));
         s.fog_enable=reg(0x2A4)!=0;const auto fog_color=reg(0x2A8);
         s.fog_color=(fog_color&0xFF00FF00U)|((fog_color&255)<<16)|((fog_color>>16)&255);s.fog_mode=reg(0x29C);
         s.fog_parameters={real(reg(0x9C0)),real(reg(0x9C4))};
@@ -344,6 +361,25 @@ struct Gpu::Impl {
         draw.view.depth_scale=constants[58][2];
         if(draw.view.depth_scale<=0) throw std::runtime_error("NV097 viewport depth scale was not initialized");
         draw.state=render_state;
+        const auto vertex_base=reg(0x1720)&0x0FFFFFFF;
+        draw.extended_geometry=!inlined && primitive>=4 && draw.state.depth_test &&
+            vertex_base-extended_base<extended_size;
+        if(draw.extended_geometry) {
+            // Extra sections can be viewed from outside their authored visibility
+            // set. Their one-sided terrain must also cover the reverse view, or
+            // peaks and props on the other side show through the missing slopes.
+            draw.state.cull=false;
+        }
+        draw.distant_geometry=!inlined && primitive>=4 && draw.state.depth_test &&
+            !distant_buffers.empty() && std::ranges::binary_search(distant_buffers,vertex_base);
+        if(draw.distant_geometry) {
+            // The original distant building proxies can coincide with the
+            // detailed scenery exposed by extended draw distance. Keep them
+            // as fallbacks, with a one-pixel slope/one-depth-unit separation.
+            auto& s=draw.state;
+            if(!s.polygon_offset) s.polygon_offset_scale=s.polygon_offset_bias=0;
+            s.polygon_offset=true;s.polygon_offset_scale+=1;s.polygon_offset_bias+=1;
+        }
         const auto mode=reg(0x1E94)&3;
         std::uint32_t shader;
         if(mode==2) {
@@ -415,7 +451,11 @@ struct Gpu::Impl {
             if(i) capture_trace<<',';const auto& stream=draw.streams[i];
             capture_trace<<std::format("{{\"stride\":{},\"size\":{},\"prefix\":{}}}",stream.stride,stream.bytes.size(),json(hex_bytes(stream.bytes.first(std::min<std::size_t>(128,stream.bytes.size())))));
         }
-        capture_trace<<"]}\n";
+        capture_trace<<']';
+        if(draw.distant_geometry)
+            capture_trace<<std::format(",\"background_depth_bias\":{{\"slope\":{},\"units\":{}}}",draw.state.polygon_offset_scale,draw.state.polygon_offset_bias);
+        if(draw.extended_geometry) capture_trace<<",\"extended_geometry_two_sided\":true";
+        capture_trace<<"}\n";
     }
     void capture_flip() {
         if(!capture_directory.empty()) {
@@ -434,7 +474,7 @@ struct Gpu::Impl {
             capture_directory=std::move(capture_requested);capture_requested.clear();
             std::filesystem::create_directories(capture_directory);
             capture_draws=0;capture_truncated=false;capture_textures=0;capture_texture_bytes=0;++capture_serial;
-            capture_trace<<"{\"type\":\"header\",\"format\":\"b2-gpu-frame-v1\",\"game_inputs_automated\":false}\n";
+            capture_trace<<std::format("{{\"type\":\"header\",\"format\":\"b2-gpu-frame-v1\",\"game_inputs_automated\":{}}}\n",capture_automated);
         }
     }
     Fence& completion() {
@@ -633,10 +673,10 @@ Gpu::Gpu(Renderer& renderer,Memory& memory,std::uint32_t semaphore_base):impl_(s
 Gpu::~Gpu()=default;
 void Gpu::invalidate_memory(std::uint32_t address,std::uint32_t size) {impl_->invalidate_memory(address,size);}
 void Gpu::performance(Performance* profile) {impl_->profile=profile;}
-void Gpu::capture_frame(const std::filesystem::path& directory) {
+void Gpu::capture_frame(const std::filesystem::path& directory,bool automated) {
     if(directory.empty() || !impl_->capture_requested.empty() || !impl_->capture_directory.empty())
         throw std::runtime_error("A frame capture is already pending");
-    impl_->capture_requested=directory;
+    impl_->capture_requested=directory;impl_->capture_automated=automated;
 }
 void Gpu::submit(std::uint32_t begin,std::uint32_t end) {
     auto& g=*impl_;
@@ -703,6 +743,18 @@ void Gpu::submit(std::uint32_t begin,std::uint32_t end) {
     g.flush();g.renderer.native_context()->Flush();g.poll();
 }
 bool Gpu::busy() {auto& g=*impl_;g.poll();return g.fence_count!=0;}
+void Gpu::extended_geometry(std::uint32_t address,std::uint32_t size) {
+    address&=0x0FFFFFFF;
+    if(std::uint64_t(address)+size>0x10000000ULL) throw std::runtime_error("Invalid extended geometry range");
+    auto& g=*impl_;g.flush();g.extended_base=address;g.extended_size=size;
+}
+void Gpu::distant_geometry(std::span<const std::uint32_t> vertex_buffers) {
+    if(vertex_buffers.size()>128) throw std::runtime_error("Distant geometry exceeds its bound");
+    auto& g=*impl_;g.flush();g.distant_buffers.assign(vertex_buffers.begin(),vertex_buffers.end());
+    for(auto& address:g.distant_buffers) address&=0x0FFFFFFF;
+    std::ranges::sort(g.distant_buffers);
+    g.distant_buffers.erase(std::unique(g.distant_buffers.begin(),g.distant_buffers.end()),g.distant_buffers.end());
+}
 void Gpu::wait() {auto& g=*impl_;g.flush();g.finish_visibility();g.fence(0,0);g.await([&]{return !g.fence_count;},PerfGpuWait::idle);}
 void Gpu::wait_fence(std::uint32_t value,std::uint32_t issued) {
     auto& g=*impl_;

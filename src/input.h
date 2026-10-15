@@ -50,6 +50,8 @@ private:
     KeyboardBindings bindings_=default_keyboard_bindings();
     std::array<SDL_Gamepad*,4> devices_{};
     std::array<GamepadState,4> states_{};
+    struct Rumble {std::uint16_t low=0,high=0;std::uint64_t renew=0;};
+    std::array<Rumble,4> rumble_{};
     std::uint64_t updated_=0;
     std::uint32_t device_id_=0;
 };

@@ -328,4 +328,8 @@ void FrameUpscaling::publish_frame(ID3D11Texture2D* colour,ID3D11ShaderResourceV
 }
 ID3D11Texture2D* FrameUpscaling::image() const {return impl_->frame_image?impl_->frame_image.Get():impl_->images[4].texture.Get();}
 ID3D11ShaderResourceView* FrameUpscaling::view() const {return impl_->frame_view?impl_->frame_view.Get():impl_->output_view.Get();}
+ID3D11Texture2D* FrameUpscaling::input(unsigned channel) const {
+    if(channel>=4) throw std::runtime_error("Invalid reconstruction input channel");
+    return impl_->images[channel].texture.Get();
+}
 }

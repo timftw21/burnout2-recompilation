@@ -424,18 +424,24 @@ public:
             throw std::runtime_error("Instruction prefixes need an implementation");
         if(labels.contains(instruction.address)) body << label(instruction.address) << ": ";
         body << "{ // " << instruction.text << '\n';
-        if(instruction.address==0x90F68 || instruction.address==0x90F7E || instruction.address==0x90FDC || instruction.address==0x914BF) {
+        if(instruction.address==0x90F68 || instruction.address==0x90F7E || instruction.address==0x90FDC || instruction.address==0x914BF || instruction.address==0x9158F || instruction.address==0xA7306) {
             calls=restores=true;(void)read_reg(ZYDIS_REGISTER_ESI);
-            body << "    if(cpu.highest_lod || cpu.unlimited_distance) { commit(); b2::title_enhancement(cpu,memory,"
+            body << "    if(cpu.draw_distance>1) { commit(); b2::title_enhancement(cpu,memory,"
                  << constant(instruction.address) << ",esi); restore(); }\n";
         }
         if(instruction.address==0xC31C4) {
             (void)read_reg(ZYDIS_REGISTER_ESP);
-            body << "    if(cpu.unlimited_distance) ram.store<std::uint32_t>(esp+0x10U,std::bit_cast<std::uint32_t>(std::bit_cast<float>(ram.load<std::uint32_t>(esp+0x10U))*(2.0f/3.0f)));\n";
+            body << "    if(cpu.draw_distance>1) ram.store<std::uint32_t>(esp+0x10U,std::bit_cast<std::uint32_t>(std::bit_cast<float>(ram.load<std::uint32_t>(esp+0x10U))/cpu.draw_distance));\n";
         }
         if(instruction.address==0xC3A2E) {
             (void)read_reg(ZYDIS_REGISTER_EBP);
-            body << "    if(cpu.unlimited_distance) ram.store<std::uint32_t>(ebp-4U,std::bit_cast<std::uint32_t>(std::bit_cast<float>(ram.load<std::uint32_t>(ebp-4U))*(2.0f/3.0f)));\n";
+            body << "    if(cpu.draw_distance>1) ram.store<std::uint32_t>(ebp-4U,std::bit_cast<std::uint32_t>(std::bit_cast<float>(ram.load<std::uint32_t>(ebp-4U))/cpu.draw_distance));\n";
+        }
+        if(instruction.address==0x9B3DC) {
+            (void)read_reg(ZYDIS_REGISTER_ECX);
+            // The traffic renderer recomputes both linear LOD thresholds from
+            // the camera each pass. Scale those, not the shared vehicle state.
+            body << "    if(cpu.draw_distance>1) for(const auto offset:{0x2E280U,0x2E284U}) ram.store<std::uint32_t>(ecx+offset,std::bit_cast<std::uint32_t>(std::bit_cast<float>(ram.load<std::uint32_t>(ecx+offset))*cpu.draw_distance));\n";
         }
         if(loop_headers.contains(instruction.address))
             body << "    if(b2::checkpoint_due(cpu)) { commit(); b2::checkpoint(cpu," << constant(instruction.address) << "); }\n";
@@ -942,10 +948,11 @@ LoweredFunction lower(const Function& function,bool fuse_floating) {
     Emitter emitter;
     emitter.labels.insert(function.entry);
     // These edits apply only to the verified US title's camera, world visibility
-    // and scenery fading. They never change collision or streaming gameplay.
+    // scenery fading and traffic LOD. Collision and spawning remain original.
     constexpr std::pair<std::uint32_t,std::string_view> enhancement_sites[]={
         {0x90F68,"B9B0854B00"},{0x90F7E,"8B8618010000"},{0x90FDC,"8B8618010000"},
-        {0x914BF,"8B8618010000"},{0xC31C4,"D9442410"},{0xC3A2E,"D945FC"}};
+        {0x914BF,"8B8618010000"},{0x9158F,"5F"},{0x9B3DC,"8D642400"},{0xA7306,"C20800"},
+        {0xC31C4,"D9442410"},{0xC3A2E,"D945FC"}};
     for(const auto& [address,bytes]:enhancement_sites) if(const auto found=function.instructions.find(address);found!=function.instructions.end()) {
         if(hex_bytes(Bytes(found->second.bytes).first(found->second.decoded.length))!=bytes)
             throw std::runtime_error("World enhancement instruction signature changed");
@@ -1010,7 +1017,7 @@ LoweredFunction lower(const Function& function,bool fuse_floating) {
     }
     constexpr std::pair<std::uint32_t,std::string_view> enhancement_entries[]={
         {0x8EEB0,"8B5110568B7124"},{0x90D30,"558BEC83EC208B4508"},{0xE8450,"8B44240489442404"},
-        {0x90A50,"558BEC83EC4C8B8110030000"},{0x90BC0,"558BEC83EC4C8B8110030000"}};
+        {0xA6E00,"558BEC51A1B03E4400"}};
     for(const auto& [entry,bytes]:enhancement_entries) if(function.entry==entry) {
         std::string prefix;auto pc=entry;
         while(prefix.size()<bytes.size() && function.instructions.contains(pc)) {
@@ -1018,9 +1025,7 @@ LoweredFunction lower(const Function& function,bool fuse_floating) {
             prefix+=hex_bytes(Bytes(instruction.bytes).first(instruction.decoded.length));pc+=instruction.decoded.length;
         }
         if(prefix!=bytes) throw std::runtime_error("World enhancement entry signature changed");
-        if(entry==0x90A50 || entry==0x90BC0)
-            out << "    if((cpu.highest_lod || cpu.unlimited_distance) && b2::override_world_material(cpu,memory)) return;\n";
-        else out << "    if(cpu.highest_lod || cpu.unlimited_distance) b2::title_enhancement(cpu,memory," << constant(entry) << ");\n";
+        out << "    if(cpu.draw_distance>1) b2::title_enhancement(cpu,memory," << constant(entry) << ");\n";
     }
     constexpr std::uint32_t timed_functions[]={0x0021F9C0,0x00227BD9,0x00219750,0x000ED570,0x00109B40,
         0x00090420,0x00090660,0x00090A50,0x000BDEE0,0x0010DA90,0x00219370};

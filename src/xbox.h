@@ -17,7 +17,8 @@ struct XboxHost {
     std::filesystem::path storage_root;
     Performance* performance=nullptr;
     bool widescreen=false;
-    bool skip_intro=false,highest_lod=false,unlimited_distance=false;
+    bool skip_intro=false;
+    unsigned draw_distance=1;
     bool upscaling=false;
     std::filesystem::path custom_music_root;
 };
@@ -72,13 +73,12 @@ public:
     BootResult run(std::uint32_t visit_budget,std::uint32_t break_address=0,std::uint32_t break_hit=1);
     bool save_frame(const std::filesystem::path&);
     void output_gain(float);
-    void capture_frame(const std::filesystem::path& directory);
+    void capture_frame(const std::filesystem::path& directory,bool automated=false);
     void performance_recording(bool);
     PerfCounters performance_counters() const;
 private:
     friend void native_platform(Cpu&,Memory&,std::uint32_t);
     friend void title_enhancement(Cpu&,Memory&,std::uint32_t,std::uint32_t);
-    friend bool override_world_material(Cpu&,Memory&);
     friend std::string check_storage(const std::filesystem::path&,const std::filesystem::path&);
     friend std::string check_visibility(const std::filesystem::path&,const std::filesystem::path&,bool);
     friend std::string check_replays(const std::filesystem::path&,const std::filesystem::path&,const std::filesystem::path&);

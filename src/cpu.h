@@ -65,7 +65,8 @@ struct Cpu {
     std::uint16_t gdt_limit = 0;
     Performance* profile = nullptr;
     // Optional changes to verified title logic, separate from platform bindings.
-    bool skip_intro = false,highest_lod = false,unlimited_distance = false;
+    bool skip_intro = false;
+    float draw_distance = 1;
     const WorldView* world_view = nullptr;
 };
 
@@ -98,7 +99,6 @@ inline void checkpoint(Cpu& cpu, std::uint32_t address) {
 void invoke_native(Cpu& cpu, Memory& memory, std::uint32_t address);
 void skip_title_intro(Cpu&,Memory&);
 void title_enhancement(Cpu&,Memory&,std::uint32_t address,std::uint32_t manager=0);
-bool override_world_material(Cpu&,Memory&);
 std::uint32_t read_port(Cpu&,std::uint16_t,unsigned);
 void write_port(Cpu&,std::uint16_t,unsigned,std::uint32_t);
 
@@ -277,8 +277,11 @@ public:
         }
         auto* to = pointer(static_cast<std::uint32_t>(destination - displacement), size);
         const auto* from = pointer(static_cast<std::uint32_t>(source - displacement), size);
-        const auto distance = destination > source ? destination - source : source - destination;
-        if (distance >= size || (descending ? destination >= source : destination <= source)) {
+        // Distinct cached/uncached guest addresses can name the same storage.
+        // Overlap and traversal order depend on that storage, not the aliases.
+        const auto destination_storage=reinterpret_cast<std::uintptr_t>(to),source_storage=reinterpret_cast<std::uintptr_t>(from);
+        const auto distance=destination_storage>source_storage?destination_storage-source_storage:source_storage-destination_storage;
+        if (distance >= size || (descending ? destination_storage >= source_storage : destination_storage <= source_storage)) {
             std::memmove(to, from, static_cast<std::size_t>(size));
         } else {
             // An overlapping REP MOVS can read data written by an earlier element.

@@ -32,6 +32,7 @@ public:
                        ID3D11ShaderResourceView* responsive,const UpscaleFrame&);
     ID3D11Texture2D* image() const;
     ID3D11ShaderResourceView* view() const;
+    ID3D11Texture2D* input(unsigned channel) const; // Read-only native diagnostic access, channels colour/depth/motion/mask.
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

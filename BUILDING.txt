@@ -63,7 +63,7 @@ Use C++23. Zydis is pinned and linked only into b2-tool, never the game executab
 Run PowerShell commands from the repository root. Private media and generated
 outputs remain ignored. No Python is required.
 
-Updating between releases, including 1.4:
+Updating between releases, including 1.5:
 Close the game and builder. Back up data/user and data/local/settings.cfg beside
 b2.exe, plus data/local/custom-music if you imported music. Install the required
 tools above; releases before 1.3 need LLVM 22.1 or newer. Extract the latest
@@ -253,6 +253,11 @@ Xbox HMAC key truncation. It also checks the original shared semaphore wait
 while the process heap grows and frees mixed small and large allocations.
 The title's fixed physical buffer claims run through the original SDK too;
 ordinary heap growth must preserve those buffers and the loading semaphore.
+The same check closes pending-I/O handles before completion, waits on retained
+file dispatchers, and exercises more than 64 lifetime workers without retaining
+their ended fibers/stacks. Handles and explicit object references keep terminated
+thread dispatchers valid. It checks Xbox ACPI/CPU clock domains and new-thread
+floating-point defaults through the original SDK calling conventions.
 Fixtures stay in the requested output directory.
 The isolated --check-memory-watch diagnostic checks hardware write detection and
 removal without booting. Its optional --crash argument deliberately terminates
@@ -277,8 +282,13 @@ Offline D3D11 rendering
 Use fresh output directories. Runs save PNGs and structured adapter, failure and
 GPU timing reports. The renderer supports all ten NV097 primitives, indexed draws,
 depth, stencil, culling, scissor, polygon offset, blending, alpha tests, four texture
-stages, register combiners and fog. The build translates the original vertex
-programs and compiles the renderer, fixed-transform and GUI shaders into the
+stages, register combiners and fog.
+Points retain their original size or distance attenuation. Point sprites use a
+built geometry shader to expand each flake and generate its texture coordinates.
+Depth, clipping, resolution scaling and MSAA remain active; line and triangle
+draws bypass that shader.
+The build translates the original vertex programs and compiles the renderer,
+fixed-transform and GUI shaders into the
 executable. The game has no shader compiler dependency. Shader constants and
 render state change normally during play; no HLSL is compiled during drawing.
 Successful shader generation is stamped so unchanged source files do not cause
@@ -337,11 +347,15 @@ timestamp and viewpoint. Asset rendering alone is not frame parity.
 
 SDL3 input supports Xbox gamepads and custom keyboard controls. Offline checks
 cover remapping, cleared bindings, stick directions and unchanged gamepad input.
-The executable opens an SDL3 window with persistent Dear ImGui settings in Game
-Files, General, Audio, Graphics, Enhancements, Controls and Log tabs. The full game name is in the
-window title, and setting descriptions appear in hover tooltips.
-Log retains the latest 64 startup, capture and error messages, newest first,
-inside the scrolling tab content. Messages do not appear above the game buttons.
+The executable opens an SDL3 window without creating a terminal. Command-line
+diagnostics retain redirected output and can attach to the caller's terminal.
+Persistent Dear ImGui settings use a sidebar for Game files, General, Audio,
+Graphics, Enhancements, Controls and Diagnostics. The charcoal/orange interface
+uses Windows UI fonts, custom vector icons, scrollable option panels and pinned
+game buttons. Fonts are loaded from Windows, not redistributed. Keyboard and
+gamepad navigation are enabled, and descriptions appear in hover tooltips.
+Diagnostics contains capture/performance controls and the latest 64 startup,
+capture and error messages, newest first.
 Esc toggles settings; F1 remains an alias.
 General selects the presentation limit, defaulting to 60 Hz independently of the
 monitor, and has interpolation and frame-rate counter toggles. Selecting a rate
@@ -413,18 +427,32 @@ support across the game's RGBA8/RGB565 and D16/D24S8 formats. Unsupported levels
 are disabled, and a saved unsupported choice resets to Off with a Log message.
 The target budget includes multisample colour/depth and resolved images. See
 research/enhancements.txt for evidence and native validation.
-LOD override clamps texture mip selection to level zero and draws each visible
-track section with its own nearby visibility record. Render distance override
-preloads the original PSW/P2W stream into separate mapped rendering storage during
-loading. The original world renderer then uses a bounded extended visibility list
-for scenery and props; collision and traffic streaming retain their original heap.
-Camera far clipping and original scenery fade distances extend by 50%. Track
-visibility extends the original visibility records' horizontal coverage by 50%,
-within the extended camera range. Sections outside it are rejected before the
-original frustum checks and draws; originally visible sections keep the game's
-mesh choices unless LOD override is enabled. Each camera retains its original
-range across camera switches. No extra reads or allocations occur during normal
-rendering. Both overrides default to disabled.
+Draw distance replaces the separate LOD and render-distance overrides. Choose
+Original (1x), 2x or 4x in Enhancements; Original is the default. Camera far
+clipping, scenery fade, traffic model-detail thresholds and the original
+visibility records' horizontal coverage scale together. Traffic retains its
+three detail levels, spawning and physics. Extended distances preload the
+original PSW/P2W stream into separate mapped rendering storage during loading.
+Collision and traffic retain
+their original heap. Sections outside the selected range are rejected before
+the original frustum checks and draws. Originally visible sections keep the
+game's material drawing order and layered surfaces; only additional sections
+use the extended drawing path. Reflection cameras, reflection scenery and
+later material passes remain original, and textures retain normal mipmap
+filtering. Each scene camera retains its original range across camera switches,
+so scaling never compounds.
+Additional sections render both sides of their surfaces: the expanded view can
+see behind one-sided mountains that the original visibility records hid. This
+restores reverse-facing mountain slopes and their occlusion of far-side scenery.
+Increased draw distance can still cause rendering issues, including incomplete
+terrain and incorrect scenery on Sunrise Valley Springs; the tooltip warns of
+this limitation. Original draw distance remains available.
+The original distant building proxies receive a small polygon depth offset so
+they remain visible beyond detailed scenery without fighting its overlapping
+surfaces. Other geometry retains its original depth state.
+No extra reads or allocations occur during normal rendering. Changes apply on
+start/restart. Existing enabled override settings migrate to 2x; an explicit
+draw_distance=1, 2 or 4 takes precedence. Only the new setting is saved.
 Intro skip finishes the original logo sequence at the PRESS START title screen
 after required loading, preserving its normal controls and attract timeout.
 DLSS, FSR and XeSS are marked experimental in settings, with a visible warning
@@ -460,19 +488,38 @@ reads and guest stacks, and starts a fresh session in the same window. Saved
 settings, including internal resolution and enhancements, apply when the new session starts.
 
 Interpolation is a D3D11 image pass, inactive at the default 60 Hz. It stores two
-completed frames, estimates motion in both directions with four fixed-size
-luminance levels, then warps them to the requested time. Weak/inconsistent motion and new
-occlusions retain current pixels; scene changes and long gaps reset continuity.
+completed frames and estimates scene motion in both directions with five bounded
+colour levels, then warps them to the requested time.
+The final supported screen-space draw suffix is separated from the scene,
+preserving opaque and translucent text over moving backgrounds. White alpha-mask
+atlases identify lettering after blended menu backgrounds. An immediate capture
+draw preserves the original shader and attachments, including MSAA boundaries.
+Floating black/white bases retain the colour transform; normalized lower/upper
+bounds retain clipping through additive highlights and later translucent layers.
+HUD history reuses completed images, and MSAA resolves directly into history.
+Full clears followed by RGB-only writes allow fast layer initialization; unknown
+alpha retains the per-sample path. Depth/camera capture runs only when requested
+by --frame, since the current scene interpolation does not consume those inputs.
+Depth/stencil-writing draws cannot be captured this way. Native rendering and
+MSAA support this separation; FXAA and vendor upscaling still use flattened images.
+Unsupported blends start a new suffix. Original game visibility queries count
+only original draws, excluding the additional presentation-layer work.
+Scene changes and long gaps reset continuity. Moving cars, shadows, thin surfaces
+and newly uncovered areas can still show interpolation artifacts. This is not a
+claim of perfect interpolation. Original frame endpoints remain unchanged.
 ImGui is drawn afterwards. The additional display delay is about one source
 frame. This improves presentation smoothness without raising gameplay speed;
 occlusions/fast movement can still produce artifacts. All shaders compile during
 the build, and disabling the feature avoids history copies and motion passes.
 Hidden window diagnostics check saved/invalid bindings and settings, automatic
-interpolation selection and saved opt-outs, the counter, all settings tabs, Esc,
+interpolation selection and saved opt-outs, the counter, all settings pages, Esc,
 scaled targets, 60/120 Hz pacing, original frames at 120/144 Hz with interpolation
 off, 60 Hz source frames with interpolation on, live opt-outs, translated images,
-endpoints, stationary HUD, new occlusions,
-scene cuts and history reset. They export images and component GPU timing without
+endpoints, stationary HUD, overlapping translucent text, clipped additive highlights,
+blended menu backgrounds, released history bindings, vertical/diagonal/horizontal
+thin surfaces, foreground depth, original camera reprojection, independent object
+motion, new occlusions, scene cuts and history reset. They
+export images and component GPU timing without
 booting. These measurements do not establish gameplay FPS or visual parity.
 Live logs report source FPS separately from presented FPS and generated frames.
 F8, or Capture frame in Graphics, records the next complete GPU frame under
@@ -607,10 +654,16 @@ Button values are 0/1; axes use -32768..32767. Events must be ordered, with at m
 The script owns a separate virtual gamepad and never changes physical controls.
 The name performance accepts 1 to start a recording and 0 to save it. Its times
 use the same first-flip clock, allowing repeatable race recordings without UI input.
+The command capture 1 requests the same complete frame/audio capture as F8.
+Schedule it after benchmark recording stops so capture I/O does not affect timing.
 Frame captures retain the last presented image, including when execution stops
 mid-frame or in a smaller offscreen pass. Captures and traces remain opt-in.
 With interpolation active, --frame also saves window images named -previous,
 -interpolated and -current for inspecting the final source pair and its midpoint.
+It also exports the exact pre-HUD -scene-previous/-scene-current PNGs and a
+-camera.json with the two original camera snapshots. Available depth inputs use
+-depth-previous.f32/-depth-current.f32: B2D1, little-endian uint32 width/height,
+then row-major float32 depth values on the bounded motion grid.
 --memory ADDRESS:BYTES captures up to four selected RAM ranges after a live run,
 with at most 4096 bytes per range. --trace-io includes the last 64 file operations
 with filenames, offsets, transfer sizes and destination addresses in the JSON

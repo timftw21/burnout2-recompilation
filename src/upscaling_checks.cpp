@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <format>
 #include <sstream>
 #include <stdexcept>
@@ -81,6 +82,7 @@ std::string check_upscaling(const std::filesystem::path& output) {
             if(!valid) throw std::runtime_error("Upscaling output is non-finite or does not preserve foreground/background colour");
             renderer.upscaling(UpscaleMethod(kind));
             renderer.camera(1,0.1f,100,1.047198f);
+            const auto framebuffer=renderer.create_target(width,height);
             RenderState solid;solid.primitive=8;solid.final_inputs={0x00000004,0x00001400};
             solid.depth_test=solid.depth_write=true;
             auto hud=solid;hud.depth_test=hud.depth_write=false;
@@ -90,17 +92,32 @@ std::string check_upscaling(const std::filesystem::path& output) {
                 std::array<Vertex,4> vertices{};
                 constexpr std::array<Float4,4> positions{{{-0.5f,0.5f,0.2f,1},{0.5f,0.5f,0.2f,1},{0.5f,-0.5f,0.2f,1},{-0.5f,-0.5f,0.2f,1}}};
                 for(unsigned i=0;i<4;++i) {vertices[i].position=positions[i];vertices[i].position[0]+=x+0.5f;vertices[i].color={0.9f,0.1f,0.1f,1};}
-                renderer.begin(0xFF2040E0,1,true);renderer.draw(solid,vertices);
+                renderer.set_target(framebuffer);renderer.begin(0xFF2040E0,1,true);renderer.draw(solid,vertices);
                 for(unsigned i=0;i<4;++i) {
                     vertices[i].position=positions[i];vertices[i].position[0]=positions[i][0]*0.25f;
                     vertices[i].position[1]=positions[i][1]*0.25f-0.7f;vertices[i].color={1,1,1,1};
                 }
-                renderer.draw(hud,vertices);renderer.end();renderer.publish_frame(frame==0);
+                renderer.draw(hud,vertices);renderer.end();renderer.copy_to_main();renderer.publish_frame(frame==0);
+            }
+            for(unsigned channel:{1U,3U}) {
+                auto* input=renderer.reconstruction_input(channel);D3D11_TEXTURE2D_DESC description{};input->GetDesc(&description);
+                description.BindFlags=description.MiscFlags=0;description.Usage=D3D11_USAGE_STAGING;description.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+                ComPtr<ID3D11Texture2D> staging;checked(device->CreateTexture2D(&description,nullptr,&staging),"Renderer temporal input readback");
+                context->CopyResource(staging.Get(),input);D3D11_MAPPED_SUBRESOURCE mapped{};
+                checked(context->Map(staging.Get(),0,D3D11_MAP_READ,0,&mapped),"Renderer temporal input map");
+                const auto* bytes=static_cast<const std::byte*>(mapped.pData);bool valid=false;
+                if(channel==1) {
+                    float centre=0,background=0;std::memcpy(&centre,bytes+48*mapped.RowPitch+64*4,4);std::memcpy(&background,bytes+8*mapped.RowPitch+8*4,4);
+                    valid=std::abs(centre-0.2f)<0.0001f && background==1;
+                } else valid=std::to_integer<unsigned>(bytes[82*mapped.RowPitch+64])==255;
+                context->Unmap(staging.Get(),0);
+                if(!valid) throw std::runtime_error("Original framebuffer depth or HUD mask was lost during presentation");
             }
             const auto game_image=renderer.read_frame();
             save_png(game_image,output/(std::string(name)+"-renderer.png"));
             if(game_image.width!=width*2 || game_image.height!=height*2)
                 throw std::runtime_error("Renderer did not publish the reconstructed resolution");
+            renderer.release(framebuffer);
             renderer.interpolation(true);renderer.resize(width+16,height+16);
             renderer.camera(2,0.1f,100,1.047198f);
             renderer.begin(0xFF2040E0,1,true);renderer.end();renderer.publish_frame(true);

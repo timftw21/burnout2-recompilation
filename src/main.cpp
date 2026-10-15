@@ -11,6 +11,8 @@
 #include "input.h"
 #include "diagnostics.h"
 #include "custom_music.h"
+#include <Windows.h>
+#include <cstdio>
 #include <algorithm>
 #include <charconv>
 #include <chrono>
@@ -279,6 +281,18 @@ bool check_boot(const std::filesystem::path& path,std::uint32_t budget,const std
 }
 
 int main(int argc, char** argv) {
+    // Command-line diagnostics can use an existing terminal; a normal launch
+    // never creates one. Preserve redirected output used by build/check tools.
+    if(argc>1 && !GetConsoleWindow()) {
+        const auto output=GetStdHandle(STD_OUTPUT_HANDLE),error=GetStdHandle(STD_ERROR_HANDLE);
+        if(AttachConsole(ATTACH_PARENT_PROCESS)) {
+            FILE* stream=nullptr;
+            if(!output || output==INVALID_HANDLE_VALUE) freopen_s(&stream,"CONOUT$","w",stdout);
+            else SetStdHandle(STD_OUTPUT_HANDLE,output);
+            if(!error || error==INVALID_HANDLE_VALUE) freopen_s(&stream,"CONOUT$","w",stderr);
+            else SetStdHandle(STD_ERROR_HANDLE,error);
+        }
+    }
     b2::initialize_diagnostics();
     try {
         if(argc==1) return b2::run_app();
@@ -427,6 +441,7 @@ int main(int argc, char** argv) {
                   << ",\"includes_input_setup\":true,\"game_booted\":false},\"compiled_functions\":" << b2::compiled_batch.size() << "}\n";
         return 0;
     } catch (const std::exception& error) {
+        if(argc==1) MessageBoxA(nullptr,error.what(),"Burnout 2 could not start",MB_OK|MB_ICONERROR);
         b2::diagnostic_record("{\"type\":\"error\",\"message\":"+b2::json(error.what())+'}');
         std::cout << "{\"error\":" << b2::json(error.what()) << "}\n";
         return 1;

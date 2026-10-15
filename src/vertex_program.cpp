@@ -113,7 +113,7 @@ std::string draw_source(const std::string& body,unsigned first=0,unsigned count=
     if(count) source+=std::format("float4 k[{}]; ",count);
     source+=R"(
 float4 viewport; float4 fog_params; float4 uv_scales[4]; uint4 input_formats[4];
- uint4 fixed_flags;uint4 fixed_texgen[4];uint4 fixed_matrices; };
+ uint4 fixed_flags;uint4 fixed_texgen[4];uint4 fixed_matrices;float4 point_params[2]; };
 float4 vertex_input(float4 v,uint format) {
  if(format==0) return v;
  if(format==0x40) return v.bgra;
@@ -133,7 +133,7 @@ float4 vertex_input(float4 v,uint format) {
 struct I {
 )";
     for(unsigned i=0;i<16;++i) source+=std::format("float4 v{}:TEXCOORD{};\n",i,i);
-    source+="};\nstruct P { float4 p:SV_Position; float4 c:COLOR0; float4 s:COLOR1; float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3; float fog:TEXCOORD4; };\nP main(I input) { float4 v[16];\n";
+    source+="};\nstruct P { float4 p:SV_Position; float4 c:COLOR0; float4 s:COLOR1; float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3; float fog:TEXCOORD4; float size:TEXCOORD5; };\nP main(I input) { float4 v[16];\n";
     for(unsigned i=0;i<16;++i) source+=std::format("v[{}]=vertex_input(input.v{},input_formats[{}][{}]);\n",i,i,i/4,i%4);
     source+=body+R"(
 P p; float w=o[0].w;
@@ -143,6 +143,7 @@ p.p=float4((screen.x*viewport.x-1)*w,(1-screen.y*viewport.y)*w,o[0].z*viewport.z
 p.c=saturate(o[3]); p.s=saturate(o[4]);
 p.t0=o[9]*uv_scales[0]; p.t1=o[10]*uv_scales[1]; p.t2=o[11]*uv_scales[2]; p.t3=o[12]*uv_scales[3];
 p.fog=nv_fog(o[5].x,fog_params);
+p.size=o[6].x;
 return p; }
 )";
     if(jitter) {
@@ -213,6 +214,14 @@ if(fixed_flags.y) {
  else if(fixed_flags.z==2) o[5].x=dot(eye.xyz,k[57].xyz)+k[57].w;
  else if(fixed_flags.z==3) o[5].x=abs(dot(eye.xyz,k[57].xyz)+k[57].w);
 })";
+    body+="if(fixed_flags.w) {\nfloat distance=length("+(skin?matrix("v[0]",8):std::string("eye"))+");\n";
+    body+=R"(
+ float minimum=min(point_params[1].w,63.875);
+ float maximum=min(minimum+point_params[0].w,63.875);
+ float attenuation=rsqrt(dot(point_params[0].xyz,float3(1,distance,distance*distance)));
+ o[6].x=clamp((attenuation+point_params[1].z)*point_params[0].w+point_params[1].w,minimum,maximum);
+}
+)";
     return draw_source(body,0,96,jitter);
 }
 VertexProgram normalize_vertex_program(const VertexProgram& program) {

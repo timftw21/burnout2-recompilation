@@ -13,22 +13,18 @@ I'll try to respond in a timely manner.</i>
 Yes, AI was used in the development of this project. No, this project was not blindly thrown together.
 If you're skeptical, I implore you to try the recompilation for yourself. I take quality control quite seriously!😊
 
-## What's new in 1.4
+## What's new in 1.5
 
-- Faster game code and less repeated graphics work, with improved frame pacing.
-- Fixed competing frame-rate limits with **V-sync**, including when frame
-  interpolation is enabled. Lower selected frame rates still keep their cap.
-- Fixed the square in the sky, incorrect trackside wall textures on
-  **Heartbreak Hills [R]**, and a crash caused by graphics resource handling.
-- More efficient frame interpolation and upscaling. Upscaling now uses your
-  selected output resolution instead of doubling an already enlarged image.
-- **Custom music** imports your songs for the game's Music Selection menu.
-- Optional **MSAA/FXAA antialiasing**, **anisotropic filtering**, **LOD override**,
-  and a **Render distance override** that extends the original range by 50%.
-- Experimental **DLSS, FSR and XeSS**, with a visible warning about visual issues
-  and possible performance loss.
-- **Skip intro splash screens** now stops at the **PRESS START** title screen.
-- The mouse cursor hides after two idle seconds and returns on mouse input.
+- Improved HUD/text interpolation with less repeated graphics work.
+- Correctness and efficiency fixes for game timing, memory, file loading,
+  thread cleanup, sound processing and controller rumble.
+- One **Draw distance** setting replaces the LOD and render-distance overrides:
+  choose Original, **2×** or **4×**, including traffic detail at greater distances.
+- Improved car reflections and reduced building flicker with extended draw
+  distance. Some scenery issues remain, including on **Sunrise Valley Springs**.
+- Fixed snow particle size and texturing, and improved upscaling inputs.
+- Refreshed settings with the recomp's logo, clearer categories and custom icons.
+  The game now opens without a separate terminal window.
 
 Download the new **Installation.zip** and run **Build.cmd** again to update.
 See [Updating between releases](#updating-between-releases) to keep your saves,
@@ -63,7 +59,7 @@ focused on speed and simplicity. I couldn't bear to keep the slop version public
 - Native widescreen camera and screen layout, presented at 16:9.
 - Optional MSAA or FXAA antialiasing and anisotropic filtering up to 16×.
 - Imported custom music through the original Music Selection menu.
-- Optional intro skipping and increased track detail and draw distance.
+- Optional intro skipping and 2×/4× draw distance, including traffic detail.
 - Experimental DLSS, FSR and XeSS upscaling.
 
 ### What still needs work
@@ -72,6 +68,8 @@ focused on speed and simplicity. I couldn't bear to keep the slop version public
 - Checking sound balance and consistently smooth performance across the whole game.
 - Experimental upscaling has visual issues and can reduce performance.
 - Frame interpolation can still distort fine details and transparent overlays.
+- Increased draw distance can cause missing or incorrect scenery; remaining
+  Sunrise Valley Springs rendering issues are deferred to a future release.
 
 ## Getting started
 
@@ -106,7 +104,7 @@ environment variable. Close and reopen **Build.cmd** after installing it.
 
 ### Updating between releases
 
-Use these steps when updating from an earlier release to 1.4 or a later release:
+Use these steps when updating from an earlier release:
 
 1. Close the game and builder.
 2. Back up `data/user` and `data/local/settings.cfg` beside your current `b2.exe`.
@@ -127,93 +125,32 @@ game-file locations while keeping the restored settings.
 
 ### Game settings
 
-The builder updates the game-file locations after each successful build while
-keeping your other settings and saves. Click **Start game**
-in the settings window. Press **Esc** to open or close settings, with
-**Game Files**, **General**, **Audio**, **Graphics**, **Enhancements**, **Controls** and **Log** tabs. The game
-defaults to **60 Hz**; choose another rate in General. Changes save automatically
-when you finish editing. Hover over a setting to read its description.
-Startup, capture and error messages appear in Log, with the newest messages first.
-The mouse cursor hides after two seconds without mouse input. Moving, clicking
-or scrolling restores it; it stays visible while a mouse button is held.
+Click **Start game** to play; press **Esc** to open or close settings. Changes
+save automatically. Hover over options for details, and use **Restart game**
+to apply graphics and enhancement changes during play.
 
-In **Controls**, click a key beside an action and press its replacement. **Clear**
-removes a binding; **Restore keyboard defaults** resets them. Esc cancels a key
-change. Esc, F1, F8 and F9 stay reserved for settings and captures.
+- **General:** Choose the refresh rate (60 Hz by default) and FPS overlay.
+  Rates above 60 Hz automatically enable **Frame interpolation** to keep gameplay
+  at its normal speed. Disabling it at higher rates speeds up gameplay.
+  Interpolation adds some display delay and can distort fine details.
+- **Graphics:** Select 1×–4× resolution, widescreen (16:9) and V-sync.
+  Higher resolutions use more graphics power.
+- **Enhancements:** Adjust MSAA/FXAA, anisotropic filtering and **Draw distance**
+  (Original, 2× or 4×). Increased distance uses more resources and may cause
+  rendering issues. Experimental DLSS, FSR and XeSS also have visual issues and
+  may reduce performance; they replace separate antialiasing and use the selected
+  output resolution. **Skip intro splash screens** is under **Miscellaneous**.
+- **Audio:** To use custom songs, **Browse** for a music folder, click
+  **Import music**, then select the collection in the game's **Music Selection**
+  menu. MP3, WAV, WMA, FLAC, M4A and AAC are supported through Windows codecs.
+  Importing replaces the previous collection and restarts an active game.
+- **Controls:** Click a binding and press its replacement; use **Clear** or
+  **Restore keyboard defaults** as needed. Esc cancels rebinding.
+- **Log:** View startup, capture and error messages.
 
-In **Audio**, click **Browse** beside **Music folder**, select a folder, then
-click **Import music**. Importing enables **Custom music** automatically. Start
-the game and choose the imported collection in its **Music Selection** menu.
-The folder name becomes the collection name; filenames become song names.
-Each import replaces the previous collection and accepts up to 500 songs directly
-inside the selected folder. Subfolders are not included.
-
-MP3, WAV, WMA, FLAC, M4A and AAC files use the audio codecs available in Windows.
-Imported copies are stored in `data/local/custom-music` beside `b2.exe`; your
-original files stay untouched. If Windows reports that its media components are
-missing, install the Media Feature Pack. Importing during play restarts the game
-from the beginning. Toggling **Custom music** applies when you start or restart
-the game. Cancelling an import keeps the previous collection.
-Importing preserves the recording's volume; different songs can be louder or
-quieter than the built-in music. Use the game's music volume controls to adjust it.
-
-In **Graphics**, choose **Internal resolution** from 1× (640 × 480) to
-4× (2560 × 1920). Higher values give sharper edges and use more graphics power.
-Enable **Widescreen (16:9)** for the game's native widescreen view. It uses the
-original camera and screen layout, with the image fitted to 16:9 within your
-window or display.
-Widescreen keeps the same internal resolution: it renders a wider view into the
-original 640 × 480 buffer, then stretches that image to 16:9 for display.
-Resolution changes apply when you start the game. If you change it while playing,
-click **Restart game** in settings to apply them. Restart game reloads the game
-from the beginning while keeping the window open.
-Widescreen changes also apply when you start or restart the game.
-**V-sync** prevents tearing and limits presentation to your display's refresh
-rate. Selecting a lower frame rate keeps that lower cap. It defaults to disabled.
-
-In **Enhancements**, choose **Antialiasing** from Off (original), MSAA 2×/4×/8×,
-or FXAA Low/Medium/High. MSAA smooths geometry edges while keeping texture detail
-sharp; higher sample counts use more GPU power and memory. Unsupported MSAA
-levels are disabled. FXAA smooths the whole image and can soften fine detail
-and in-game text. **Anisotropic filtering** offers Original, Off (1×), 2×, 4×, 8× and 16×;
-higher values keep textures sharper at an angle. Original preserves the game's
-per-texture filtering, including its 2× anisotropic filtering. Both options
-apply when you start or restart the game. They default to the original settings;
-increasing them uses more GPU power.
-
-**LOD override** keeps textures at their highest available detail and uses the
-track geometry selected for nearby viewing. **Render distance override** extends
-the original track visibility, camera clipping and scenery fade distances by
-50%. Extra scenery is loaded during startup and culled outside the extended
-range. These options increase GPU use; forcing texture detail can also cause
-shimmer. **Skip intro splash screens** goes to the **PRESS START** title screen
-after the required loading screen. All three default to disabled.
-
-**Upscaling technique** offers experimental DLSS, FSR and XeSS. All three have
-visual issues and can reduce performance. With upscaling enabled, **Graphics**
-shows **Output resolution**: choose the final image size from 1× to 4×.
-The game renders at half that scale, rounded up to a whole native scale, and
-reconstructs the chosen output size. At 1×, the technique provides antialiasing
-at native resolution. Separate MSAA/FXAA is disabled while upscaling is selected.
-DLSS requires an NVIDIA RTX card; FSR and XeSS support additional compatible
-cards. Upscaling defaults to Off. Enhancement changes apply on Start/Restart.
-
-The game buttons share a centered row. **Exit game** saves pending setting
-changes and closes the app.
-In **General**, selecting a rate above 60 Hz turns on **Frame interpolation**.
-Uncheck it if you prefer to keep it off. With interpolation
-on, gameplay stays at 60 Hz; with it off, higher rates speed up gameplay.
-Interpolation adds about one frame of display delay and may show
-artifacts around fast movement. **Show frame rate** displays the current game
-and display FPS in the upper-right corner.
-
-To record a slowdown, press **F9**, reproduce the problem, then press **F9**
-again to save the report. Recording stops after one minute. Reports save under
-`build/captures/performance-*`; send the whole folder when reporting performance
-issues. **F8** also includes performance data in a frame capture while recording.
-
-Profiles are stored in `data/user` beside `b2.exe`. Back up that whole folder to
-keep your saves.
+Press **F9** to start or stop a performance recording. Reports are saved under
+`build/captures/performance-*`; include the whole folder when reporting a slowdown.
+Saves are in `data/user` beside `b2.exe`; back up that folder to keep your profiles.
 
 ## Controls
 

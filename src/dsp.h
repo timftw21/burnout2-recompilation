@@ -32,6 +32,9 @@ struct Dsp {
     std::uint32_t coefficient(unsigned index) const;
     void advance_coefficients();
     std::uint32_t ea(unsigned index,unsigned mode);
+    unsigned loop_count(std::uint32_t count) const {
+        return registers[57]&(1U<<13)?((count-1)&0xFFFFU)+1:count&0xFFFFFFU;
+    }
     std::int64_t operand(unsigned);
     void add(unsigned,std::int64_t,bool subtract=false,bool save=true);
     void clear(unsigned);

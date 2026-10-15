@@ -1,0 +1,57 @@
+Snow point sprites, 2026-10-14
+
+User capture: build/windows/Release/build/captures/frame-3360468900400.
+The full frame is 1920x1440 and contains 811 draws without truncation.
+Draws 722-796 submit 18880 point vertices in 75 batches. They use fixed
+transforms, position and packed colour in a 16-byte stream, and an 8x8 DXT5
+texture in stage 3 (resource 128, texture-0089.bin). There are no automated
+game inputs in the capture.
+
+Supported executable SHA256, verified by the native CPU diagnostic:
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+No original game instructions were changed.
+
+The original GPU packets enable point attenuation at 0318 and sprite texture
+coordinates at 031C. The 043C size register is 1 (one eighth of a native pixel);
+distance coefficients at A30-A4C are [0, 10.371827, 0, 63, 63, 63,
+-0.015873017, 1]. The current stage-3 coordinates are [0,0,0,1], with no
+texture matrix or texgen. The previous renderer used ordinary D3D11 one-pixel
+points and discarded both size attenuation and generated sprite coordinates.
+Rain's line primitives follow a different path.
+
+The bridge now retains these point registers. Fixed shaders calculate size from
+the original model-view transform and encoded attenuation parameters; programmable
+shaders retain their point-size output. An ahead-of-time geometry shader expands
+each point with its original size and generates stage-3 coordinates when enabled.
+Point centres retain clipping; sprites retain blending, depth and scissor tests.
+Point sizes use native pixel units so internal scaling and MSAA work normally.
+Face culling does not apply to points, and point depth offset reads 0330 rather
+than the triangle-fill enable at 0338. The geometry stage is disabled for other
+primitives, clear operations and after each render pass.
+
+Native renderer checks cover all four texture corners, following line draws,
+depth rejection and independently known 8x8/4x4 distance-attenuated coverage.
+All 248 cases passed on RTX 5060 Ti and WARP with no debug messages.
+The rebuilt game's hidden settings/interpolation check and all 52 CPU groups
+also passed, with zero runtime shader compilation.
+
+Private replay evidence is under build/checks/snow. It submits the eight
+captured prefix vertices from each original batch: 600 vertices in 75 draws,
+using the original constants, states and captured texture. This is a particle
+replay on a clear background, not a full-frame replay or game FPS benchmark.
+With size and sprite handling disabled, coverage was 137 pixels at 1x. The
+corrected path covered 1351 pixels at 1x, 2003 with MSAA 4x, 12262 at 3x and
+14131 at 3x/MSAA 4x. Every variant had zero debug messages. This replays only
+the retained prefixes; the user will check complete moving snowfall in-game.
+The final replay also enabled a deliberately excessive triangle-fill depth bias
+while disabling point offset. Coverage stayed at 1351 pixels, confirming that
+unrelated fill state does not affect point sprites. The final game build and
+hidden settings check passed after that correction.
+
+Primary register/behaviour references, checked 2026-10-14:
+https://raw.githubusercontent.com/XboxDev/nxdk/master/lib/pbkit/nv_regs.h
+https://raw.githubusercontent.com/xemu-project/xemu/master/hw/xbox/nv2a/pgraph/glsl/vsh-ff.c
+https://raw.githubusercontent.com/xemu-project/xemu/master/hw/xbox/nv2a/pgraph/glsl/psh.c
+
+No computer use, subagents, game automation, commit, push or release publication
+was used for this fix. The local game build is intended for release 1.5 work.

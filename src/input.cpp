@@ -36,7 +36,9 @@ Input::~Input() {
     SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
 }
 void Input::refresh() {
-    for(auto& device:devices_) if(device && !SDL_GamepadConnected(device)) {SDL_CloseGamepad(device);device=nullptr;}
+    for(unsigned port=0;port<devices_.size();++port) if(auto& device=devices_[port];device && !SDL_GamepadConnected(device)) {
+        SDL_CloseGamepad(device);device=nullptr;rumble_[port]={};
+    }
     int count=0;auto* ids=SDL_GetGamepads(&count);
     if(!ids) throw std::runtime_error(SDL_GetError());
     for(int i=0;i<count;++i) {
@@ -62,6 +64,11 @@ void Input::update() {
     for(unsigned port=0;port<4;++port) {
         GamepadState next;next.packet=states_[port].packet;
         if(auto* device=devices_[port];device && SDL_GamepadConnected(device)) {
+            auto& feedback=rumble_[port];
+            if(feedback.renew && now>=feedback.renew) {
+                if(SDL_RumbleGamepad(device,feedback.low,feedback.high,65535)) feedback.renew=now+30000000000ULL;
+                else feedback={};
+            }
             constexpr SDL_GamepadButton digital[]={SDL_GAMEPAD_BUTTON_DPAD_UP,SDL_GAMEPAD_BUTTON_DPAD_DOWN,
                 SDL_GAMEPAD_BUTTON_DPAD_LEFT,SDL_GAMEPAD_BUTTON_DPAD_RIGHT,SDL_GAMEPAD_BUTTON_START,
                 SDL_GAMEPAD_BUTTON_BACK,SDL_GAMEPAD_BUTTON_LEFT_STICK,SDL_GAMEPAD_BUTTON_RIGHT_STICK};
@@ -97,7 +104,10 @@ bool Input::has_rumble(unsigned port) const {
 std::uint32_t Input::rumble(unsigned port,std::uint16_t low,std::uint16_t high) {
     if(port>=4 || !(connected()&(1U<<port))) return 1167;
     if(!has_rumble(port)) return 50;
-    return SDL_RumbleGamepad(devices_[port],low,high,1000)?0:31;
+    // Xbox feedback is a persistent motor state. SDL limits each effect to
+    // 65535 ms, so renew it until the title supplies a replacement or stop.
+    if(!SDL_RumbleGamepad(devices_[port],low,high,65535)) return 31;
+    rumble_[port]={low,high,(low || high)?SDL_GetTicksNS()+30000000000ULL:0};return 0;
 }
 std::string check_input() {
     struct VirtualDevice {
@@ -168,6 +178,8 @@ std::string check_input() {
     device.button(SDL_GAMEPAD_BUTTON_SOUTH,true);expect(sample().packet==packet+1,"changed packet number");
     expect(input.has_rumble(0),"rumble capability");
     expect(input.rumble(0,12345,54321)==0 && device.low==12345 && device.high==54321,"rumble delivery");
+    SDL_Delay(1100);sample();expect(device.low==12345 && device.high==54321,"motor state survives without repeated game requests");
+    expect(input.rumble(0,0,0)==0 && device.low==0 && device.high==0,"explicit motor stop");
     device.detach();sample();expect(input.connected()==0,"hot removal");
     expect(input.rumble(0,0,0)==1167,"disconnected rumble status");
     return std::format("{{\"format\":\"b2-input-check-v1\",\"backend\":\"SDL3\",\"passed_cases\":{}}}",cases);

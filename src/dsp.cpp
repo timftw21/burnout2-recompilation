@@ -216,6 +216,12 @@ std::string check_effects(const std::filesystem::path& source) {
     require(state.accumulators[0]==0x2000000,"convergent rounding up");
     state.accumulators[0]=0x2800000;state.multiply(0,0,0,true,true);
     require(state.accumulators[0]==0x2000000,"convergent rounding even");
+    require(state.loop_count(0)==0 && state.loop_count(0x10001)==0x10001 && state.loop_count(0xFFFFFF)==0xFFFFFF,
+        "normal DSP loop counts retain all 24 bits and skip zero");
+    state.write(57,1U<<13);
+    require(state.loop_count(0)==65536 && state.loop_count(0x10001)==1 && state.loop_count(0xFFFFFF)==65535,
+        "DSP compatibility loops use 16 bits and repeat 65536 times for zero");
+    state.write(57,0);
     state.write(16,400);state.write(24,2);require(state.ea(0,1)==400 && state.read(16)==402,"postincrement address");
     state.write(14,0);state.add(0,0x1000000,true,false);require(state.less() && !state.zero,"signed comparison");
     Dsp gain(image);const auto input=gain.x[0x80+5],output=gain.x[0x80+6];

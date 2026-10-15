@@ -1,0 +1,415 @@
+Correctness and interpolation audit, 2026-10-14/15
+Status: correctness and HUD/text fixes retained. The thin-feature candidate was rejected after the user's visual review and reverted in source and executable; see the rollback record at the end.
+
+Scope and evidence
+All 34 src C++ translation units were analysed sequentially with clang-tidy's
+clang-analyzer checks and their actual Release compilation commands. Manual
+review covered CPU translation, floating state, memory, kernel services, files,
+assets, graphics, audio, effects and input. Five analysis reports were checked:
+valid Windows flag-enum combinations, structure padding suggestions and a
+Zydis target() false positive. The pinned Zydis utility writes its result before
+every successful return; error paths are checked. No suppressions were added.
+This audit is an evidence record, not a certification of complete Xbox parity.
+
+Supported XBE SHA256:
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF
+Effects SHA256:
+4DA840E1EFADADE3FD7DDFE5DC0500157DEDC133F18748B738F8D00EE3746BE8
+Original-byte decoding used bounded native ranges. CPU generation still reports
+36149 compiled functions and 713245 instructions, with no unsupported translated
+instructions. Mutable indirect targets remain partial coverage. Platform bindings
+are separate from CPU coverage. Xbox Live encountered the explicitly unbound
+kernel export 181 (MmQueryStatistics); that run was excluded from race evidence.
+No replacement network behaviour was invented.
+
+Confirmed correctness fixes
+1. REP MOVS compared guest addresses when choosing overlap handling. Low,
+80000000 and F0000000 views can alias the same RAM. Copy decisions now compare
+resolved storage addresses, preserving x86 propagation through overlapping aliases.
+The native REP MOVSB reference disagreed before and agrees after the fix for
+1040 -> 80001041, eight bytes. Existing CPU checks cover all nine view pairs,
+8/16/32-bit elements and both traversal directions.
+
+2. Pending reads held host files but could lose their guest file/event objects
+when handles closed. Requests now retain those objects through completion.
+Waits also retain the owner of an embedded file dispatcher at +38h. Reference
+ownership is acquired before issuing the native read and released on completion.
+Existing storage checks close both handles early and verify payload, status,
+signalling and final release.
+
+3. The game draws into auxiliary framebuffers, then copies colour to main.
+Temporal reconstruction previously used unrelated main-target depth and only
+jittered/masked target zero. Depth, responsive masks and jitter now follow the
+full-size drawing target actually handed to presentation. Existing DLSS, FSR and
+XeSS diagnostics inspect the inputs delivered to each SDK.
+
+4. DSP DO counts were always truncated to 16 bits. Normal DSP56300 mode uses
+24 bits and zero skips; SR.SC compatibility mode uses 16 bits with zero meaning
+65536 iterations. Generation now uses a mode-aware helper. All 67 effects checks
+pass, with the work limit unchanged and no runtime instruction decoder.
+
+5. Kernel performance queries exposed host QPC units. Xbox ACPI time uses
+3375000 Hz; XAPI/RDTSC retains 733333333 Hz. Safe integer scaling now keeps those
+clock domains separate. Original wrappers 288214/288226 were decoded and the
+latter is exercised with one ACPI second, requiring 1000000 microseconds.
+The old assertion about the undefined EAX return of void AvSendTVEncoderOption
+was corrected to check its output buffer.
+
+6. Ended threads retained fibers, stacks and dispatcher storage indefinitely.
+Non-current ended fibers are now deleted; stacks are freed after pending I/O
+completes. Handles, waits and explicit references retain dispatcher storage.
+The current context remains available for diagnostics. The active-context limit
+now counts running/waiting/suspended threads, rather than retained completed
+metadata. The existing storage diagnostic runs 70 original XGetVideoFlags
+workers on real fibers, retains 68 completed handles simultaneously, then closes
+them and checks complete reclamation. No invented guest callback is used.
+
+7. Rumble expired after an arbitrary second. Xbox motor state persists until
+replaced. The binding now renews SDL's bounded effect every 30 seconds, honours
+replacement/stop and clears removed devices. SDL caps each effect at 65535 ms.
+Original XInputSetState at 28D1EC was decoded in a bounded 157-byte range; its
+51-byte function submits a report without a duration argument. The existing
+virtual-controller diagnostic checks persistence past a second and explicit stop.
+
+8. Default floating context used x87 037F. Xbox kernel threads begin with 027F
+(53-bit precision) and MXCSR 1F80. New threads and standalone original SDK calls
+now use those defaults. Actual translated FNINIT still performs the ISA's 037F
+reset. Original startup E682C, exception prologue 11FCD0, TLS dispatcher E6690
+and D3D initialization 21A400 contain no direct floating-control reset. Kernel
+context evidence comes from the pinned Cxbx implementation cited below.
+
+Reviewed behaviour preserved
+Audio's unusual loop write-cursor formula agrees with original 234D32. Xbox ADPCM
+uses its header predictor followed by 63 nibbles, matching xemu/vgmstream. The
+separate shift/add rounding was retained; FFmpeg's different rounding is not a
+reason to alter the Xbox rule. Timer DPC arguments are unspecified by the callback
+contract. No speculative timer change was made. The user's established uncapped
+behaviour with interpolation disabled is preserved.
+
+Interpolation changes
+The final supported SDK screen-space suffix is kept separate from the scene.
+An immutable white-RGB/variable-alpha atlas identifies fonts after blended menu
+backgrounds, using actual texture content rather than texture IDs or guessed
+instruction ranges. A real menu capture had 35 screen-space draws, alpha-blended
+backgrounds, a white BC3 font atlas and a DST_ALPHA + ONE highlight with RGB-only
+writes. The former classifier produced zero separated frames there.
+
+The original draw keeps its original shader and attachments. An immediate second
+draw records its positive affine colour operation. Floating black/white bases
+store the transform; normalized lower/upper bases preserve intermediate clipping
+through additive highlights and later translucent layers. All bases retain actual
+scene alpha, including individual MSAA samples. Depth/stencil-writing draws are
+excluded. Attaching all outputs to the original draw had changed two point-sampled
+MSAA boundary pixels by seven RGB levels. Explicit projective precision did not
+fix it and was discarded. The separate draw restores byte-exact original output.
+Disabling interpolation now clears all bound history views before releasing it.
+
+Motion uses five RGB levels, retained thin features, original framebuffer depth,
+forward projection and verified inverse warps. Surface samples identify lines at
+any angle. Fully measured endpoints provide motion along otherwise ambiguous
+straight edges. A median coarse prior disambiguates identical parallel endpoints.
+Weak/occluded matches retain source pixels. Reverse checks now reject poor
+photometric matches as well as low confidence; bad matches no longer retain a
+strong confidence value merely because the image has strong gradients.
+
+The wider endpoint search exposed a real airport performance regression. Useful
+correspondences must satisfy the existing 0.02 residual limit. Conservative
+partial-error bounds, cached shape signatures and outward-rounded tile colour
+bounds discard losing candidates without reducing resolution or search distance.
+Sparse endpoints are compacted on the GPU and searched by cooperating 64-thread
+groups. GPU-generated indirect arguments handle the full bounded queue without
+CPU count readback. Source patches are shared across candidates. Fine-level
+Newton updates stop below 0.01 pixel; fixed compute constants are immutable, and
+presentation constants use one packed upload when buffer offsets are supported.
+The existing native D3D11 binding remains available otherwise.
+
+Original camera reprojection
+The real scene/depth capture confirmed that the remaining airport speckles
+came from local image correspondences, particularly weak road shadows and
+partially covered masts. A local affine motion-fit trial improved some road
+pixels but was removed in favour of the original camera geometry.
+E82F0 selects E7C50 when camera+14 == 1 (perspective), otherwise E81B0 (parallel).
+Both bounded native disassemblies verify the matrix at camera+20; E7310 and
+E8490/E84C0 verify projection/near/far fields. Only matching perspective camera
+identifiers with finite, invertible matrices enable geometric reprojection.
+The normalized homogeneous screen transform is composed in double precision.
+The two depth images verify a matching original surface, allowing for the
+nearest covered raster sample on slopes. Image motion remains available for
+independent moving objects. Geometry-supported vectors retain their continuous
+motion during display sampling instead of being snapped to local RGB matches.
+Interpolation toggles query the renderer directly, avoiding stale startup flags.
+A coherent image-motion residual overrides the camera hypothesis for independent
+objects and moving decals. Failed endpoint warps require an actual depth occluder,
+with camera motion and raster uncertainty accounted for. Unmeasured depth retains
+the image-only fallback. Disabling interpolation clears image and constant-buffer
+bindings before releasing its resources.
+Two 64-byte camera buffers add 128 bytes to the fixed GPU allocation.
+
+Captured Airport source points provide a direct check: (460,420) reprojects by
+(28.3422,38.2936) native pixels with 0.737 RGB levels of 5x5 error; a bounded
+RGB search chose (28,38), 0.613 levels. The independent car point (340,310)
+produces 46.13 RGB levels and a 0.03218 depth mismatch under camera-only motion,
+so its image-derived motion is retained. Forcing camera motion on the car was
+explicitly rejected. A private tangential-foreground fixture also checks the
+case where depth alone cannot determine object velocity. Release camera and
+independent-object diagnostics pass on hardware and software.
+
+Private probes use original captured images and synthetic known midpoints.
+One probe initially selected the existing bank when an empty argument was passed;
+its switch was corrected before relying on candidate results. Candidate runs now
+explicitly select current shaders. Individual GPU timestamps isolate preparation,
+estimation, endpoint work, support, projection and pixel composition. Prototype
+compilations are confined to the private native tool; game shaders compile ahead
+of time. Intermediate records are preserved in audit-development.txt and logs.
+
+Validation and limits
+Build28 passed all 13 core groups: 52 CPU groups, 26026 instruction cases,
+1551 memory cases, 6744 floating cases and 109 control cases; storage 2061,
+input 57 and effects 67. These CPU/service fixes did not change afterwards.
+All 34 C++ translation units received the original sequential static analysis;
+the final app/interpolation/render/shaders/xbox units were scanned again without
+suppressions. App/interpolation/shaders report no findings. Render reports padding;
+Xbox reports padding and the same valid MSVC flag-enum false positive. No new
+correctness finding was reported. Final source hashes match the scanned files.
+
+Release33 passed all 248 hardware and 248 software rendering cases, both
+visibility checks, and DLSS/FSR/XeSS checks. D3D11 debug-message counts are zero.
+Release34 changes only the no-boot diagnostic's software timing assertion.
+The software renderer correctly selected 144 Hz original frames, produced one
+presentation per source and zero generated frames, but ran at about 119 Hz.
+The diagnostic now checks configured rate, cap and one-to-one semantics there;
+hardware still must meet its measured 144 Hz timing requirement. Both release34
+hardware/software window diagnostics pass. This does not establish software FPS.
+
+Hardware thin vertical/diagonal/horizontal mismatches are 3/720, 3/720, 3/960;
+software gives 3/720, 3/720, 6/960. Hardware mean errors are 0.075/0.113/0.127
+RGB levels, software 0.080/0.115/0.131. Static-camera midpoint error is zero.
+Independent-camera/foreground error is 0.451 hardware / 0.441 software with
+perimeter 688 (reference 480; existing limit 720). Detailed texture is 0.218.
+Layered HUD error is 0.001 native / 0.353 MSAA4; software 0 / 0.345. Blended
+menu error is 0.003 hardware / 0 software, on the 0..255 scale. Original endpoint
+images remain byte-exact. Game and diagnostic runtime shader-compilation counts
+are zero. The release bank has 80 builtins and 18 original vertex programs.
+
+Live Airport Terminal 3, release33, Ryzen 5 5600X / RTX 5060 Ti:
+All three paths were confirmed by images and track RAM 48A150 == 2. Physical
+display is 144 Hz; selected rates and settings are listed below. F9-equivalent
+recordings run after the intro and stop before optional frame/audio capture.
+All recorded benchmarks last less than 30 seconds. End-of-run averages include
+menus/loading and are not substituted for race measurements.
+
+1x, 144 Hz selected, widescreen, interpolation on, MSAA4/AF16, VSync off:
+14.997772 s, 899 intervals, median 16.6667 ms, p99 17.2491, maximum 17.4481;
+zero intervals above 20 ms. 1970 presentations (~131.35 Hz). Measured GPU median
+9.812256 ms, p99 11.386912, maximum 11.878912. Peak working set 407773184,
+private bytes 547696640, local GPU bytes 210452480. Thus source remains 60 Hz,
+but race presentation does not sustain the selected 144 Hz.
+
+User-style 3x, 144 Hz selected, widescreen, interpolation on, MSAA4/AF16,
+highest LOD and extended distance, VSync off: 14.997544 s, 899 intervals,
+median 16.6667 ms, p99 17.3492, maximum 17.636; zero above 20 ms. There are
+1275 presentations (~85.01 Hz). GPU median 14.889728 ms, p99 17.557408,
+maximum 19.141344. Peak working set 444854272, private 1395798016, local GPU
+1021579264 bytes. This is a clean race recording, unlike the older mixed-intro
+3x record. Source timing improved, but presentation remains below 144 Hz.
+
+Required baseline: 360 Hz selected, 1x, widescreen, interpolation off, VSync off,
+AA/AF off. The 4.9984 s recording has 1184 intervals (~236.88 original FPS),
+median 4.2094 ms, p99 5.515, maximum 6.0732; zero above 20 ms. GPU median
+1.45648 ms, p99 1.700928, maximum 1.963104. Peak working set 257966080,
+private 204820480, local GPU 33206272 bytes. Sustained 360 FPS is not achieved.
+These measurements establish the tested airport path only, not separate menu
+or crash-mode performance. Earlier no-disc/wrong-menu/intro runs are excluded.
+
+Native/MSAA text separation is supported. The real 3x airport capture has clear
+text and much more coherent scenery. Visible defects remain on some moving-car
+boundaries, damage highlights and shadows; local image matches cannot always
+separate material appearance from geometric motion. The two endpoint images are
+clean, confirming that these are generated-frame defects. FXAA/vendor-upscaled
+interpolation still uses flattened images. Unobservable motion, fast movement,
+newly uncovered surfaces and unsupported layer blends remain limits. Neither
+perfect interpolation nor complete Xbox technical parity has been established.
+
+Remaining interpolation investigation
+Generated car/paint/shadow defects are still visible at the user's 3x settings;
+this part of the goal is not complete. Do not call the current result perfect.
+The later bounded analysis in original-car-render-complete.json reaches all 550
+instructions of 85AC0. ECX is the original object identity. Calls 860C1/86191
+pass matrices/descriptors to C4570; 860D7/861A8 draw them through C4A70. ESI
+distinguishes reused moving parts. Secondary calls 8629F/862B3 pass a matrix to
+C3180 and a mesh to C33E0, with the original ESI instance. Their entry signatures
+and call return addresses are verified from the original bytes. Native scopes
+only associate original GPU commands with these identities; the original CPU
+instructions still execute ahead of time. No simulated object callback is used.
+
+Automated capture35 (frames 76583301200/77582707200) confirms 18 stable body/part
+keys and original matrices on the player object 004B9C50, plus four secondary
+draws. The old trace header incorrectly said automation=false; entity35.controls
+and audit35-entity-capture logs establish its automated provenance. That header
+bug is corrected in App -> Xbox -> GPU capture requests.
+
+The matched car vertex program is static bank record 6 (GPU handle 7). Original
+position rows are constants 96..99, with viewport scale/offset 58/59. Rather
+than assuming that convention for other shaders, the new motion variant runs
+the entire original position calculation with both frames' constants. It keeps
+NV2A subpixel rounding at each endpoint. Separate forward/backward motion draws
+preserve the original attachments/shader and pixel output. Source depth verifies
+visibility; covered destinations retain the known transform with a hidden flag.
+Only opaque supported surfaces qualify, and a bounded mesh-content signature
+rejects changed geometry. The 512-entry history allocates before gameplay.
+Motion targets are bounded to 640x480 and at most 2x MSAA; interpolation-off
+sessions do not allocate or submit this work. This is separate from CPU coverage.
+
+An isolated native probe exposed and fixed a vertex/pixel signature ordering
+mismatch. It then exposed a static-image shortcut that erased moving foreground
+at pixels where both endpoints showed background. Projected moving detail now
+guards that shortcut. Camera motion is retained when another surface covers its
+destination, so vacated foreground can reveal the correct background. With the
+original car shader, a 120x120 moving quad, moving textured background and changing
+paint colour, the private native probe now has zero silhouette mismatches and
+zero D3D11 messages. One UNORM colour level is the observed rounding allowance.
+These are component results; build40 game/window checks are still pending here.
+Actual car shadows, thin world geometry and unsupported translucent layers still
+require gameplay inspection. Do not infer perfect interpolation from this probe.
+
+Opt-in geometry exports use B2M1 + uint32 width/height + row-major RGBA float16:
+normalized UV displacement, confidence, covered-destination flag. Forward is
+previous -> current; backward is current -> previous. The existing scene/depth/
+camera exports remain available. Microsoft documents sample interpolation and
+SV_Position separately; both clip positions are sample-interpolated so MSAA
+motion is measured at a consistent sample location:
+https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-struct
+https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-semantics
+
+Preservation
+Existing snowfall changes are preserved; their original diff, executable and
+settings are backed up under build/checks/correctness-20261014/baseline. Original
+knowledge, private media and Git history are preserved. Automation uses separate
+settings and a copy of the diagnostic ABC profile. All six baseline personal save/
+identity file hashes and the original settings hash match. AGENTS.md stays local,
+untracked and ignored. No subagents, computer-use activation, commit, push or
+release publication were used. Captures, probes and generated output remain private.
+
+Primary references
+https://raw.githubusercontent.com/Cxbx-Reloaded/Cxbx-Reloaded/585c49a50af1255ab155099e06f24505f9c5a800/src/core/kernel/exports/EmuKrnlKe.cpp
+https://raw.githubusercontent.com/Cxbx-Reloaded/Cxbx-Reloaded/585c49a50af1255ab155099e06f24505f9c5a800/src/core/kernel/exports/EmuKrnlKi.cpp
+https://www.nxp.com/docs/en/reference-manual/DSP56300FM.pdf
+https://www.nxp.com/docs/en/reference-manual/DSP56303UM.pdf
+https://raw.githubusercontent.com/xemu-project/xemu/master/hw/xbox/mcpx/apu/vp/adpcm.h
+https://raw.githubusercontent.com/vgmstream/vgmstream/master/src/coding/ima_decoder.c
+https://raw.githubusercontent.com/XboxDev/nxdk/master/lib/pbkit/nv_regs.h
+https://raw.githubusercontent.com/xemu-project/xemu/master/hw/xbox/nv2a/pgraph/glsl/psh.c
+https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm
+https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-if
+https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/registering-and-queuing-a-customtimerdpc-routine
+https://raw.githubusercontent.com/aap/librw/master/src/camera.cpp
+
+Morning review, 2026-10-15
+Build42 passed the component/window, visibility, render, upscaling, CPU and storage
+checks, but failed the practical gameplay quality/performance goal. Both captured
+source images are clean; generated car edges/occlusions still show artifacts.
+At the recorded 3x windowed Airport settings, displayed rate fell from build33/34
+85.01 Hz to build42 64.14 and build43 63.80. Build43 restored complete GPU timing
+coverage after batching but did not recover performance. Its GPU median is
+16.053 ms, p99 19.899, with two source intervals above 20 ms. Build42's GPU
+statistics were incomplete (660 partial frames) and must not imply improvement.
+The exact remaining generated-pixel cause is not yet established.
+
+The user reported the regression and requested the last validated build. The
+normal b2.exe was restored from b2-before-entity.exe (validated34); SHA256 is
+20AFE6BE9412B83C483CA20995F073C099A3CA5F2CA1FDEE6352A0DE18F948A5.
+Experimental43 executable is preserved as b2-experimental43.exe; the source
+working tree still includes experimental geometry work and one unbuilt stream
+signature correction. It must not be rebuilt over the reviewed executable.
+A fresh 14.998-second fullscreen Airport review at the user's saved 3x/MSAA4/AF16/
+extended-distance/highest-LOD/interpolation-on/144-selected/Vsync-off settings
+measured 75.54 displayed Hz; 899 source intervals, median 16.6667 ms, p99 17.4399,
+maximum 18.5688, none above 20 ms. GPU median 15.9005 ms, p99 18.6606; all 899
+frames complete. This fullscreen review differs from the earlier windowed
+comparison. Report: review34-airport-performance.json. The game was then opened
+with normal controls and the user's settings/profile for hands-on review.
+No claim of perfect interpolation or 360 FPS is justified. The goal is unfinished.
+
+User-requested rollback, 2026-10-15 10:08 local: the quoted final message belongs to checkpoint34. Its binary was already the reviewed executable. The source and BUILDING.txt are now restored to that checkpoint too; all five recorded final34 source hashes match. Later work is preserved privately in experimental-after-checkpoint34.zip/diff. checkpoint34-source.zip freezes the restored source. The regression therefore predates the quoted message. Do not promote further candidates over this executable. The untouched pre-goal executable remains baseline/b2.exe. The original goal remains unfinished.
+
+Correctness/HUD recovery, 2026-10-15: installed SHA256 56A718BFD3631BB5691EB6A552E3B6B775D4F538FAB1DE02132DA52028496E4E. All eight CPU/service fixes remain, plus the original-only visibility-query guard and accurate capture-automation provenance. HUD capture, clipped bounds, alpha, menu fonts and MSAA are retained. Scene interpolation now uses the earlier algorithm; broad thin-edge searches, forward projection and camera hypotheses were removed. Identical captured-input replay measured roughly 3.7 ms preparation before versus 9.3 ms after that scene rework; swapping fields carried the added car-edge defects. Native/MSAA/menu HUD errors remain 0.001/0.353/0.003 on hardware, with exact endpoints; software passes too. The private HUD check logs/excludes four world gates so it can reach the existing HUD assertions. Shipping world assertions remain intact and fail on the earlier thin-line behavior. All 248 render cases on both backends, 3 upscalers, CPU/storage/input/effects and expanded visibility checks pass. Airport 3x/fullscreen/MSAA4/AF16/wide/144-selected/interpolation-on/Vsync-off measured 136.35 displayed Hz over 14.998 s versus untouched pre-goal 143.95. The earlier reviewed checkpoint34 Airport run was 75.54; a later checkpoint34 rerun entered attract mode (RAM track 7), so its 20 Hz result is excluded. Required 1x/360-selected/interpolation-off baseline measured 235.33 original FPS over 4.997 s; 360 remains unmet. Personal save hashes and settings match the pre-goal backup. Full report: thin-ab/recovery-validation.json. Source snapshot: thin-ab/correctness-hud-source.zip. Further experiments must stay separate from the installed executable. The original goal remains unfinished.
+
+Thin-feature candidate, 2026-10-15 (subsequently rejected and reverted)
+
+This supersedes the earlier recovery's failing thin-line gates. The baseline is
+this request's existing build, including the later HUD optimization, draw-distance
+and settings-design changes; those unrelated changes remain intact.
+Baseline executable SHA256:
+CA7E4DD0D449DA1D4C242390CA4390C6AE0A24148623FD281C5BF59F2559B2C6
+Final Release executable SHA256:
+C8EEF33DBA9F1D8FDCB4F14B8FDACEFC81CD1D68567AA32FBB4816966F430C48
+
+The bounded native probe identified two causes: narrow features inherited
+background motion after downsampling, and inverse warping from background could
+never discover a foreground line crossing that pixel. The resolver now detects
+high-contrast ridges and checks their colour and local shape in a bounded search.
+Nearby consistent motion supplies the unobservable direction along a line.
+Stationary candidates are checked first. Only verified features are projected
+forward, with deterministic nearest-sample selection and their own motion vector.
+Stationary strokes/intersections stay protected, including unseparated HUD text.
+Sharp endpoint matches skip reverse lookups that cannot change their validity.
+
+The two projection maps use 2.344 MiB at the maximum 640x480 motion grid. They
+allocate only with interpolation enabled. No new CPU readback, runtime shader
+compilation or per-frame allocation was added. Upscaling-only flow and original
+rendering do not submit these interpolation passes.
+
+An initial candidate reduced GPU time but lost presentation slots: display_due
+advanced its deadline even when the swapchain was briefly full. It now advances
+only after a successful presentation and waits for room only during source-frame
+idle time. The existing pressure check keeps source work at 59.993 Hz; ordinary
+interpolated pacing measures 60.000 source / 144.158 displayed Hz.
+
+The complete existing window/interpolation assertions pass on RTX 5060 Ti and
+WARP, including HUD, MSAA, layer reuse, exact endpoints, cuts, disocclusion and
+released bindings. A private copy disabled only PNG writes; no assertions or
+thresholds were weakened. On hardware, vertical/diagonal/horizontal midpoint
+silhouette disagreements fell from 1308/1449/1406 to 4/1/0 (720/720/960 reference
+pixels). Stationary HUD maximum error is zero. WARP disagreements are 3/4/0.
+The quarter-phase diagonal probe still has 18 disagreements: this image-based
+method does not establish perfect subpixel, occlusion or gameplay visual parity.
+Manual visual review remains with the user. No new images were saved.
+
+Gameplay comparisons: Ryzen 5 5600X / RTX 5060 Ti, Airport Terminal 3 (RAM track
+ID 2), widescreen, V-sync off, draw distance 2x. Each automated session lasted
+28 seconds, with F9 timing at seconds 22..27 and separate diagnostic saves.
+Interpolation-on used 3x resolution, MSAA4, AF16 and 144 Hz selected:
+  Baseline stationary repeats: 143.227 / 143.693 / 143.503 displayed FPS.
+  Final stationary repeats:    144.041 / 143.901 displayed FPS.
+  Baseline GPU median: 12.401..12.475 ms; p99: 15.983..16.060 ms.
+  Final GPU median:    12.017..12.283 ms; p99: 15.165..15.201 ms.
+  Extra right-trigger-held comparison: 142.511 -> 143.917 displayed FPS,
+  GPU median 13.148 -> 12.835 ms and p99 15.922 -> 15.187 ms.
+  These short runs establish the measured start-area workload, not a whole race.
+All source intervals stayed below 20 ms. No runtime shader compiles occurred.
+
+Required native comparison: 1x resolution, 360 Hz selected, interpolation and
+antialiasing off. Five baseline runs span 206.072..208.484 FPS; five candidate/final
+runs span 206.291..210.105 FPS. Two intermediate runs had higher p99 tails; a final
+quiet comparison measured 207.688 -> 210.105 FPS, source p99 5.790 -> 5.746 ms,
+and GPU p99 1.929 -> 1.903 ms. There is no repeatable native regression, and the
+360 FPS target remains unmet. Full per-run timings are preserved privately in
+build/checks/thin-objects-20261015/validation-benchmarks.json. Offline replay
+measurements are component costs, not game FPS.
+
+Release build and diff checks pass. All ten personal settings/save hashes match;
+all tracked worker processes exited. Research, original inputs and unrelated
+working changes were preserved. Probes/logs stay ignored; no permanent test,
+subagent, computer-use session, capture, commit or release publication was added.
+
+User-requested rollback, 2026-10-15: manual gameplay review found clear artifacts
+in the thin-feature candidate despite its passing numerical checks. The entire
+candidate, including its interpolation shader changes and presentation pacing
+change, is reverted. The three saved interpolation/shader source snapshots are
+restored byte-for-byte; the shader enum, app pacing and documentation are restored
+to the earlier behavior. Earlier correctness/HUD, draw-distance and UI work stays.
+The installed b2.exe exactly matches the pre-request baseline SHA256
+CA7E4DD0D449DA1D4C242390CA4390C6AE0A24148623FD281C5BF59F2559B2C6.
+Rejected source and executable are retained privately under
+build/checks/thin-objects-20261015/rejected. Numerical checks did not establish
+acceptable gameplay quality. The user's current settings and saves are unchanged.

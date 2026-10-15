@@ -1648,3 +1648,137 @@ Primary API references used during investigation:
 https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-getframelatencywaitableobject
 https://learn.microsoft.com/en-us/windows/uwp/gaming/reduce-latency-with-dxgi-1-3-swap-chains
 https://raw.githubusercontent.com/NVIDIA/DLSS/main/doc/DLSS_Programming_Guide_Release.pdf
+
+HUD interpolation overhead - 2026-10-15
+
+The correctness/HUD recovery build reproduced the reported regression on Airport
+Terminal 3. The final HUD suffix initialized four full-resolution bases with a
+sample-frequency fullscreen shader, then copied all five resolved images into
+history. Depth reduction also ran every source frame although the restored scene
+interpolation no longer reads it. No scene-motion algorithm or HUD blend changed.
+
+Completed single-sample images and their views/targets now rotate into history;
+MSAA bases resolve directly into their history destinations. This removes five
+full-image copies and four otherwise redundant resolved images. Known alpha from
+full clears is retained through RGB-only draws and matching framebuffer copies.
+Alpha-writing draws and incompatible partial clears invalidate that knowledge;
+unknown alpha retains the original per-sample initialization. Known alpha allows
+native clears instead of the fullscreen shader. Diagnostic depth/camera retention
+is opt-in through --frame. At 3x/MSAA4, these changes remove 65.625 MiB of explicit
+GPU image storage. No per-frame allocation, CPU readback or GPU wait was added.
+
+Renewed user permission covered these automated comparisons. Each recording was
+15 seconds with interpolation on, or 5 seconds with it off; menu/loading setup
+preceded the measured interval. Settings and saves used private copies. Track
+RAM remained 2, and the native final screenshot shows the Airport race.
+Hardware: AMD Ryzen 5 5600X / NVIDIA GeForce RTX 5060 Ti, local LLVM PGO build.
+
+3x, fullscreen, widescreen, MSAA4, AF16, highest LOD and extended distance,
+144 Hz selected, interpolation on, V-sync off:
+                           Before       After
+Displayed frames/second    136.950      143.025
+Source median (ms)           16.6667      16.6667
+Source p99 (ms)              17.3708      17.0875
+Source maximum (ms)          17.5153      17.3213
+GPU work median (ms)         12.3076      11.9463
+GPU work p99 (ms)            16.1276      15.5725
+GPU work maximum (ms)        16.2482      16.0916
+Peak local GPU bytes     1007267840    934064128
+
+Both runs have 899 complete source intervals, with no interval over 20 ms.
+This recovers most of the displayed-rate loss toward the 144 Hz cap; it does
+not eliminate the cost of correctly separating and compositing the HUD. Buffer
+rotation alone reduced memory but did not establish a speed improvement. The
+known-alpha clear path supplied the observed display-rate recovery.
+
+Required 1x, fullscreen, widescreen, 360 Hz selected, interpolation and V-sync
+off, other enhancements off: 232.494 FPS before, 239.810 FPS after. Median/p99
+source intervals were 4.3930/5.5689 ms before and 4.1575/5.1737 ms after. These
+short checks show no observed opt-out regression; the 360 FPS goal remains unmet.
+Do not attribute the small uncapped difference to a proven separate optimization.
+
+Validation: 248 render cases on each of hardware and WARP with zero D3D debug
+messages; 13116 visibility checks on each backend; all three vendor upscalers.
+Existing HUD diagnostics pass on both backends. The added focused case compares
+known-clear alpha against sampled alpha while repeatedly recycling both history
+slots. All 27 hardware HUD PNGs, including MSAA, menu, intermediate images and
+original endpoints, are byte-identical to a private build of the pre-fix renderer.
+Explicit capture still exports both 640x480 B2D1 depth images at the expected
+0.9 depth on native and MSAA rendering. Diagnostic shader compilation remains 0.
+
+The shipping window diagnostic still rejects the pre-existing thin-line quality
+failures. A private diagnostic logs/excludes the four existing world-quality
+gates to reach the HUD assertions; neither shipping gates nor tolerances were
+weakened. The actual logged line/detail failures match the pre-fix renderer.
+The normal Release executable was rebuilt. Six personal save hashes and the
+settings hash are unchanged. All owned game, diagnostic and build workers exited.
+Reports and source snapshots: build/checks/hud-performance-20261015.
+
+Correctness-fix optimization audit - 2026-10-15
+----------------------------------------------
+Reviewed the eight fixes recorded in research/correctness-audit.txt. Two
+avoidable costs were removed without changing their corrected behavior:
+
+* Ended-thread reclamation scanned the thread list after every scheduler yield,
+  including retained completed threads and their pending I/O/handle references.
+  It now runs after thread termination, dispatcher-owner release or I/O
+  completion. A deferred current context keeps collection pending until another
+  context runs. Fibers, stacks, handles, waits and explicit references retain
+  their existing lifetime rules.
+* Temporal reconstruction now covers the game's actual full-size auxiliary
+  framebuffer, exposing its per-draw constant upload to the main scene workload.
+  Consecutive draws now reuse identical jitter/mask constants and their shader
+  bindings. Value changes still upload; target/postprocessing changes invalidate
+  bindings, and reconstruction reconfiguration invalidates the cached value.
+
+The other fixes did not justify extra machinery: REP MOVS already uses memmove
+when resolved storage permits it; DSP count handling runs at loop setup; default
+floating state is initialization data. ACPI/CPU clock conversion and asynchronous
+file/event ownership remain unchanged. The pinned SDL3 implementation already
+coalesces identical motor strengths, so no second rumble cache was introduced.
+
+Release build and existing diagnostics passed: 52 CPU groups (26026 instruction,
+1551 memory, 6744 floating and 109 control cases), 2061 storage/thread cases,
+67 effects checks, 57 input cases, 248 hardware rendering cases, and DLSS/FSR/XeSS.
+Rendering and reconstruction reported no D3D11 debug messages. All 12 upscaling
+PNG outputs are byte-identical to the pre-audit executable's outputs, including
+the actual framebuffer depth/HUD-mask fixture and native/custom output sizes.
+No shipping tests or tolerances were added or weakened.
+
+Authorized paired Airport Terminal 3 recordings used Ryzen 5 5600X / RTX 5060 Ti,
+360 Hz selected, widescreen, 1x native resolution, interpolation off and V-sync
+off. Separate private saves/settings were copied from the same seed per run.
+The car stayed at the start so differing uncapped speeds could not move it into
+different scenery. Each recording lasted about five seconds, after menu/loading
+setup; each game invocation requested 28 seconds. Both native rendering and
+DLSS at native input/output resolution were measured. The track field remained
+2 in all four runs, and gameplay compiled no shaders during these recordings.
+
+                                before          after
+Native source FPS               259.018         258.705
+Native median frame ms            3.7988          3.8027
+Native p99 / maximum ms            4.6694/5.0451   4.6484/5.2330
+Native draw submission ms/frame    0.239163        0.241004
+DLSS source FPS                 208.720         211.269
+DLSS median frame ms              4.7710          4.7259
+DLSS p99 / maximum ms              5.7002/6.2739   5.7708/6.0725
+DLSS draw submission ms/frame      0.328576        0.261169
+DLSS mean draws/frame          1183.341        1179.163
+DLSS median measured GPU ms        4.776032        4.739008
+
+CPU draw-submission time with DLSS fell 20.5% per frame (20.2% per draw). This
+does not establish a comparable overall FPS gain: the native run was unchanged,
+and the short DLSS run improved only 1.2% while remaining GPU-limited. The 360 FPS
+target is still unmet. No separate gameplay speed claim is made for thread cleanup.
+Initial moving-car captures were excluded because scene progression changed the
+workload. An initial stationary capture hit an existing output filename; fresh
+paths were used for the four completed comparisons above.
+
+Baseline b2.exe SHA256:
+4A39AFEA10A978977C5FCF6F3BB47B2F6143E1BCF5D4F324F2E0D63CBDFC780F
+Optimized Release b2.exe SHA256:
+D4E37A595B86ACB781DB45635303B0CC63EF8285B641FF2B8734F25B95067F28
+All six personal save hashes and the settings hash remained unchanged. No owned
+game, diagnostic or build workers remained after validation.
+Reports, source snapshots, image hashes and isolated automation settings:
+build/checks/correctness-performance-20261015.

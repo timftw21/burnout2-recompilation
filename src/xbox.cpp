@@ -8,6 +8,7 @@
 #include "spatial.h"
 #include "effects.h"
 #include "render.h"
+#include "interpolation.h"
 #include "diagnostics.h"
 #include "crypto.h"
 #include <Windows.h>
@@ -107,7 +108,7 @@ struct Xbox::State {
         OVERLAPPED overlap{};
         std::shared_ptr<OpenFile> file;
         HANDLE native=INVALID_HANDLE_VALUE;
-        std::uint32_t file_object=0,event=0,status=0,ordinal=0,callsite=0,requested=0,buffer=0;
+        std::uint32_t file_object=0,event=0,status=0,ordinal=0,callsite=0,requested=0,buffer=0,thread=0;
         std::uint64_t offset=0;
         bool active=false;
         ~PendingIo() {if(overlap.hEvent) CloseHandle(overlap.hEvent);}
@@ -187,7 +188,7 @@ struct Xbox::State {
     std::vector<std::unique_ptr<Thread>> threads;
     Thread* current=nullptr;
     void* scheduler=nullptr;
-    bool converted=false,stopping=false,entry_returned=false;
+    bool converted=false,stopping=false,entry_returned=false,thread_cleanup_pending=false;
     std::string boundary;
     std::uint32_t next_handle=0x100,next_thread=4,heap_begin=0,gdt=0,kernel_cursor=0x1000,tick_address=0,shutdown_head=0;
     std::uint32_t thread_type=0,event_type=0,semaphore_type=0,file_type=0;
@@ -195,7 +196,6 @@ struct Xbox::State {
     bool luma_filter=false;
     std::vector<std::uint32_t> shutdown_registrations;
     std::size_t next_runnable=0;
-    LARGE_INTEGER performance_frequency{};
     std::chrono::steady_clock::time_point started=std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point quantum_due;
     std::chrono::steady_clock::time_point video_started;
@@ -216,16 +216,16 @@ struct Xbox::State {
     std::uint32_t world_camera=0,world_distance_culled=0;
     float world_original_far=0,world_applied_far=0;
     float world_original_range=0,world_range=0;
-    std::array<std::uint32_t,256> world_origins{},world_records{};
-    bool world_preparing=false,world_drawing=false,world_active=false;
+    std::array<std::uint32_t,256> world_records{};
+    bool world_preparing=false,world_active=false,world_reflecting=false;
 
     State(Xbe& image,Memory& memory,std::span<std::byte> ram,const std::filesystem::path& disc_path,XboxHost host):image(image),memory(memory),ram(ram),host(std::move(host)) {
         if(ram.size()!=64*1024*1024 || !image.supported()) throw std::runtime_error("Native Xbox requires the verified image and 64 MiB RAM");
-        if(this->host.highest_lod || this->host.unlimited_distance) {
-            const auto size=this->host.unlimited_distance?64U*1024*1024+4096:4096;
-            world_storage.resize(size);
-            const auto base=this->host.unlimited_distance?world_base:world_scratch;
-            memory.map(base&0x7FFFFFFF,world_storage);memory.map(base|0x80000000U,world_storage);
+        if(this->host.draw_distance!=1 && this->host.draw_distance!=2 && this->host.draw_distance!=4)
+            throw std::runtime_error("Draw distance must be 1x, 2x or 4x.");
+        if(this->host.draw_distance>1) {
+            world_storage.resize(64U*1024*1024+4096);
+            memory.map(world_base&0x7FFFFFFF,world_storage);memory.map(world_base,world_storage);
             world_view.list=world_scratch+0x400;
         }
         if(!disc_path.empty()) {
@@ -256,12 +256,8 @@ struct Xbox::State {
         memory.map(kernel_base,kernel_image);
         memory.map(0x80000000U+heap_begin,ram.subspan(heap_begin));
         memory.map(0xF0000000U+heap_begin,ram.subspan(heap_begin));
-        QueryPerformanceFrequency(&performance_frequency);
         clock={this,[](void* context) {
-            const auto& host=*static_cast<State*>(context);
-            const auto ns=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now()-host.started).count());
-            return (ns/1000000000)*733333333+(ns%1000000000)*733333333/1000000000;
+            return static_cast<State*>(context)->clock_ticks(733333333);
         }};
         services.context=this;
         bind<252>(); bind<253>(); bind<255>(); bind<258>(); bind<187>(); bind<184>(); bind<199>(); bind<217>();
@@ -449,9 +445,31 @@ struct Xbox::State {
         if(result) cpu.registers[eax]=static_cast<std::uint32_t>(*result);
         if(wide && result) cpu.registers[edx]=static_cast<std::uint32_t>(*result>>32);
     }
+    void collect_threads() {
+        if(!thread_cleanup_pending) return;
+        thread_cleanup_pending=false;
+        for(auto position=threads.begin();position!=threads.end();) {
+            auto& thread=**position;
+            // The current context also supplies the final diagnostic snapshot.
+            if(thread.state!=ThreadState::ended) {++position;continue;}
+            if(&thread==current) {thread_cleanup_pending=true;++position;continue;}
+            if(thread.fiber) {DeleteFiber(thread.fiber);thread.fiber=nullptr;}
+            // Pending I/O can still write into its guest stack after execution
+            // ends. Handles retain the dispatcher object, not an unused stack.
+            if(std::ranges::any_of(pending_io,[&](const auto& request){return request.active && request.thread==thread.id;})) {++position;continue;}
+            if(thread.stack) {release_allocation(allocation(thread.stack));thread.stack=0;}
+            const auto references=object_references.find(thread.object);
+            if((references!=object_references.end() && references->second) ||
+               std::ranges::any_of(handles,[&](const auto& value){return value.second.address==thread.object;})) {++position;continue;}
+            release_allocation(allocation(thread.object));object_references.erase(thread.object);
+            position=threads.erase(position);next_runnable=0;
+        }
+    }
     Thread& create(std::uint32_t routine,std::uint32_t context,std::uint32_t system,std::uint32_t stack_size,
                    std::uint32_t tls_size,bool suspended,bool entry=false) {
-        if(threads.size()>=64) throw NativeBoundary(current?current->cpu.eip:image.entry,"native thread limit exceeded");
+        collect_threads();
+        if(std::ranges::count_if(threads,[](const auto& thread){return thread->state!=ThreadState::ended;})>=64)
+            throw NativeBoundary(current?current->cpu.eip:image.entry,"native thread limit exceeded");
         auto thread=std::make_unique<Thread>();
         thread->host=this; thread->routine=routine; thread->context=context; thread->system=system;
         thread->id=next_thread; next_thread+=4;
@@ -478,8 +496,8 @@ struct Xbox::State {
         memory.store<std::uint32_t>(thread->tib+0x28,thread->object);
         auto& cpu=thread->cpu;
         cpu.kernel=&services; cpu.clock=&clock; cpu.diagnostic=live && graphics_initialized?nullptr:&diagnostic;
-        cpu.skip_intro=host.skip_intro;cpu.highest_lod=host.highest_lod;cpu.unlimited_distance=host.unlimited_distance;
-        if(host.unlimited_distance) cpu.world_view=&world_view;
+        cpu.skip_intro=host.skip_intro;cpu.draw_distance=float(host.draw_distance);
+        if(host.draw_distance>1) cpu.world_view=&world_view;
         cpu.profile=host.performance && host.performance->active()?host.performance:nullptr;
         cpu.preempt=[](Cpu& cpu) {
             auto& host=*static_cast<State*>(cpu.kernel->context);
@@ -515,7 +533,7 @@ struct Xbox::State {
             thread.exit_status=thread.cpu.registers[eax];
         } catch(const ThreadExit& exit) { thread.exit_status=exit.status; }
         catch(const std::exception& error) { if(!host.stopping) host.boundary=error.what(); }
-        thread.state=ThreadState::ended;
+        thread.state=ThreadState::ended;host.thread_cleanup_pending=true;
         host.memory.store<std::uint32_t>(thread.object+4,1);
         SwitchToFiber(host.scheduler);
         std::terminate();
@@ -611,9 +629,20 @@ struct Xbox::State {
         return all;
     }
     void release_object(std::uint32_t address) {
-        if(!objects.contains(address) || object_references[address]) return;
+        // Thread dispatcher storage is reclaimed by the scheduler, after its
+        // native fiber has yielded. Retry only when a retaining owner changes.
+        if(!objects.contains(address)) {thread_cleanup_pending=true;return;}
+        if(object_references[address]) return;
         if(std::ranges::any_of(handles,[&](const auto& pair) {return pair.second.address==address;})) return;
         release_allocation(allocations.find(address&0x0FFFFFFF));objects.erase(address);object_references.erase(address);
+    }
+    std::uint32_t dispatcher_owner(std::uint32_t address) const {
+        address=(address&0x0FFFFFFFU)|0x80000000U;
+        if(objects.contains(address)) return address;
+        if(std::ranges::any_of(threads,[&](const auto& thread){return thread->object==address;})) return address;
+        if(address>=0x38) if(const auto file=objects.find(address-0x38);file!=objects.end() && file->second.kind==Object::Kind::file)
+            return file->first;
+        return 0;
     }
     std::uint32_t wait(std::span<const std::uint32_t> addresses,bool all,std::uint32_t timeout_pointer,bool alertable) {
         if(addresses.empty() || addresses.size()>64) return invalid_parameter;
@@ -622,12 +651,14 @@ struct Xbox::State {
         const auto due=timeout_pointer?due_time(std::bit_cast<std::int64_t>(memory.load<std::uint64_t>(timeout_pointer))):
             std::chrono::steady_clock::time_point::max();
         struct References {
-            State& host; std::span<const std::uint32_t> addresses;
-            ~References() { for(auto address:addresses) if(host.objects.contains(address)) {
+            State& host;std::array<std::uint32_t,64> retained{};unsigned count=0;
+            ~References() { for(auto address:std::span(retained).first(count)) {
                 --host.object_references[address]; host.release_object(address);
             }}
-        } references{*this,addresses};
-        for(auto address:addresses) if(objects.contains(address)) ++object_references[address];
+        } references{*this};
+        for(auto address:addresses) if(const auto owner=dispatcher_owner(address)) {
+            ++object_references[owner];references.retained[references.count++]=owner;
+        }
         for(;;) {
             bool complete=true; std::optional<unsigned> selected;
             for(unsigned i=0;i<addresses.size();++i) {
@@ -708,6 +739,11 @@ struct Xbox::State {
             memory.store<std::uint8_t>(thread->tib+0x24,prior);
             ++vblank_callbacks;return;
         }
+    }
+    std::uint64_t clock_ticks(std::uint64_t frequency) const {
+        const auto ns=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-started).count());
+        return (ns/1000000000)*frequency+(ns%1000000000)*frequency/1000000000;
     }
     void clock_data() {
         const auto ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count();
@@ -1436,10 +1472,10 @@ struct Xbox::State {
         throw NativeBoundary(0x90D30,"world section has no original nearby visibility record");
     }
     void prepare_world(Cpu& cpu) {
-        if(!host.unlimited_distance || world_preparing) return;
+        if(host.draw_distance==1 || world_preparing) return;
         const auto manager=cpu.registers[ecx],master=memory.load<std::uint32_t>(0x4B85B8);
         const auto mode=unsigned(memory.load<std::uint32_t>(manager+0x14)!=0);
-        if(!master || !world_streams[mode] || !disc) throw NativeBoundary(0x8EEB0,"render distance override has no loaded world stream");
+        if(!master || !world_streams[mode] || !disc) throw NativeBoundary(0x8EEB0,"extended draw distance has no loaded world stream");
         const auto entry=*world_streams[mode];
         if(world_loaded && world_loaded->sector==entry.sector) return;
         const auto count=memory.load<std::uint32_t>(master+0x5C);
@@ -1474,10 +1510,22 @@ struct Xbox::State {
             memory.store<std::uint32_t>(world_scratch+0x24,i);
             world_call(cpu,0x8EEB0,world_scratch);
         }
+        // 8EA80 draws the master's original 24-byte background mesh records.
+        // They remain useful beyond the expanded scenery, but must yield to
+        // the detailed buildings wherever their coplanar surfaces overlap.
+        const auto backgrounds=memory.load<std::uint32_t>(master+0x3C),meshes=memory.load<std::uint32_t>(master+0x40);
+        std::array<std::uint32_t,128> buffers{};
+        if(backgrounds>buffers.size() || !gpu) throw NativeBoundary(0x8EEB0,"unsupported world background mesh table");
+        for(unsigned i=0;i<backgrounds;++i) buffers[i]=memory.load<std::uint32_t>(meshes+i*24+4);
+        gpu->distant_geometry(std::span(buffers).first(backgrounds));
+        gpu->extended_geometry(world_base,entry.size);
         world_count=count;world_loaded=entry;
     }
     void extend_camera(Cpu& cpu) {
-        if(!world_loaded || world_preparing) return;
+        // Reflection rendering uses its own visibility and sky geometry. Its
+        // camera temporarily occupies the main camera slot, but is not part
+        // of the extended scene pass.
+        if(!world_loaded || world_preparing || world_reflecting) return;
         const auto camera=argument(cpu,0),holder=memory.load<std::uint32_t>(0x443EB0);
         if(!holder || camera!=memory.load<std::uint32_t>(holder)) return;
         const auto far_plane=std::bit_cast<float>(memory.load<std::uint32_t>(camera+0x84));
@@ -1489,9 +1537,9 @@ struct Xbox::State {
             found->address=camera;
         }
         if(far_plane!=found->applied) found->original=far_plane;
-        // Extend the game's own distance by 50%, without compounding on each
+        // Scale the game's own distance without compounding on each
         // frame or fitting the camera to the entire track.
-        const auto extended=found->original*1.5f;
+        const auto extended=found->original*host.draw_distance;
         if(!std::isfinite(extended)) throw NativeBoundary(0xE8450,"extended camera distance exceeds its bound");
         if(extended!=far_plane) {
             const std::array arguments{camera,std::bit_cast<std::uint32_t>(extended)};
@@ -1501,7 +1549,7 @@ struct Xbox::State {
     }
     void select_world(Cpu& cpu,std::uint32_t manager) {
         world_view.manager=0;detailed_count=0;world_active=false;
-        if(host.unlimited_distance) {
+        if(host.draw_distance>1) {
             if(!world_loaded || world_preparing) throw NativeBoundary(0x90D30,"extra world geometry was not prepared during loading");
             if(!world_camera) throw NativeBoundary(0x90D30,"extended world camera was not initialized");
             const auto camera=memory.load<std::uint32_t>(0x5232C0);
@@ -1529,7 +1577,7 @@ struct Xbox::State {
             }
             if(!(original_squared>0) || !std::isfinite(original_squared)) throw NativeBoundary(0x90D30,"invalid original world rendering range");
             world_original_range=float(std::min(double(world_original_far),std::sqrt(original_squared)));
-            world_range=world_original_range*1.5f;
+            world_range=world_original_range*host.draw_distance;
             const auto limit=double(world_range)*world_range;world_distance_culled=0;
             for(unsigned i=0;i<world_count;++i) {
                 const auto sector=world_base+i*world_stride;
@@ -1543,33 +1591,26 @@ struct Xbox::State {
                 if(world_call(cpu,0x90740,0)==2) continue;
                 const auto index=detailed_count++;
                 world_view.sectors[index]=sector;memory.store<std::uint32_t>(world_view.list+index*4,index);
-                world_origins[index]=sector;world_records[index]=self_visibility(sector);
-                if(!host.highest_lod) for(unsigned record=0;record<records;++record) {
+                world_records[index]=self_visibility(sector);
+                for(unsigned record=0;record<records;++record) {
                     const auto loaded=original_sectors[record];
                     if(loaded && !std::memcmp(memory.access(loaded,64),memory.access(sector,64),64)) {
-                        world_origins[index]=origin;world_records[index]=record;break;
+                        // Keep the native material order and layered surfaces
+                        // for sections already covered by the original pass.
+                        world_records[index]=UINT32_MAX;break;
                     }
                 }
-            }
-        } else {
-            const auto count=memory.load<std::uint32_t>(manager+0x310);
-            if(count>18) throw NativeBoundary(0x90D30,"invalid original world visibility list");
-            for(unsigned i=0;i<count;++i) {
-                const auto index=memory.load<std::uint32_t>(manager+0x2C8+i*4);
-                if(index>=18) throw NativeBoundary(0x90D30,"invalid original world visibility index");
-                const auto sector=memory.load<std::uint32_t>(manager+0xD0+index*4);
-                world_origins[detailed_count]=sector;world_records[detailed_count]=self_visibility(sector);
-                world_view.sectors[detailed_count++]=sector;
             }
         }
         world_view.count=detailed_count;world_view.manager=manager;world_active=true;
     }
     void draw_detailed_world(Cpu& cpu,unsigned phase) {
-        if(!world_active || world_drawing) return;
-        world_drawing=true;struct Guard {bool& flag;~Guard(){flag=false;}} guard{world_drawing};
+        if(!world_active) return;
         std::memcpy(memory.access(world_scratch+0x11C,96),memory.access(world_view.manager+0x11C,96),96);
         for(unsigned i=0;i<detailed_count;++i) {
-            const auto sector=world_view.sectors[i],origin=world_origins[i],self=world_records[i];
+            const auto self=world_records[i];
+            if(self==UINT32_MAX) continue;
+            const auto sector=world_view.sectors[i],origin=sector;
             const auto opaque=memory.load<std::uint8_t>(origin+0x214),alpha=memory.load<std::uint8_t>(origin+0x215);
             const auto groups=memory.load<std::uint32_t>(origin+0x7AC),meshes=memory.load<std::uint32_t>(sector+0xBC);
             if(opaque>alpha || alpha>groups || groups>80 || meshes>80)
@@ -1593,12 +1634,16 @@ struct Xbox::State {
     void enhancement(Cpu& cpu,std::uint32_t address,std::uint32_t manager) {
         switch(address) {
         case 0x8EEB0:prepare_world(cpu);break;
-        case 0xE8450:if(host.unlimited_distance) extend_camera(cpu);break;
+        case 0xE8450:if(host.draw_distance>1) extend_camera(cpu);break;
+        case 0xA6E00:world_reflecting=true;break;
+        case 0xA7306:world_reflecting=false;break;
         case 0x90D30:world_active=false;world_view.manager=0;break;
         case 0x90F68:select_world(cpu,manager);break;
         case 0x90F7E:draw_detailed_world(cpu,0);break;
         case 0x90FDC:draw_detailed_world(cpu,1);break;
         case 0x914BF:draw_detailed_world(cpu,2);break;
+        // Only the main scene's prop loops use the extended visibility list.
+        case 0x9158F:world_active=false;world_view.manager=0;break;
         default:throw NativeBoundary(address,"unsupported title enhancement site");
         }
     }
@@ -1646,15 +1691,18 @@ struct Xbox::State {
         gpu_cursor=memory.load<std::uint32_t>(context+0x24);
         gpu=std::make_unique<Gpu>(*graphics,memory,notification);
         gpu->flip=[this] {
-            if(host.upscaling) {
+            if(host.upscaling || graphics->needs_motion_camera()) {
             // 92030 reads the main world camera through this original holder;
             // frontend drawing uses 443EC0. Read their real clip and view data.
                 const auto holder=memory.load<std::uint32_t>(0x443EB0);
                 const auto camera=holder?memory.load<std::uint32_t>(holder):memory.load<std::uint32_t>(0x443EC0);
                 if(camera) {
                     const auto value=[&](unsigned offset) {return std::bit_cast<float>(memory.load<std::uint32_t>(camera+offset));};
-                    graphics->camera(camera,value(0x80),value(0x84),2*std::atan(value(0x6C)));
-                }
+                    MotionCamera motion;motion.identifier=camera;motion.near_plane=value(0x80);motion.far_plane=value(0x84);
+                    motion.projection=memory.load<std::uint32_t>(camera+0x14);
+                    for(unsigned i=0;i<motion.view.size();++i) motion.view[i]=value(0x20+i*4);
+                    graphics->camera(camera,motion.near_plane,motion.far_plane,2*std::atan(value(0x6C)),&motion);
+                } else graphics->camera(0,0,0,0);
             }
             if(host.flip) host.flip();
         };
@@ -1925,7 +1973,7 @@ struct Xbox::State {
         request->file=object.file;request->file_object=object.address;
         request->event=event?handles.at(event).address:0;request->status=status;
         request->ordinal=write?236:219;request->callsite=memory.load<std::uint32_t>(cpu.registers[esp]);
-        request->offset=offset;request->requested=length;request->buffer=output;
+        request->offset=offset;request->requested=length;request->buffer=output;request->thread=current->id;
         request->native=file.native!=INVALID_HANDLE_VALUE?file.native:disc_io->native;
         const auto native_offset=offset+(file.native!=INVALID_HANDLE_VALUE || file.device?0:std::uint64_t(file.entry.sector)*2048);
         request->overlap.Offset=static_cast<DWORD>(native_offset);request->overlap.OffsetHigh=static_cast<DWORD>(native_offset>>32);
@@ -1934,11 +1982,14 @@ struct Xbox::State {
         // Course loads reuse fixed RAM buffers. Retire cached GPU views before
         // Windows starts replacing their bytes, and again at completion.
         if(!write && gpu) gpu->invalidate_memory(output,count);
+        auto& file_references=object_references[request->file_object];
+        auto* event_references=request->event?&object_references[request->event]:nullptr;
         const auto issued=write?WriteFile(request->native,buffer,count,nullptr,&request->overlap):
             ReadFile(request->native,buffer,count,nullptr,&request->overlap);
         if(!issued && GetLastError()!=ERROR_IO_PENDING) {
             const auto result=file_error(GetLastError());request->file.reset();return fail(result);
         }
+        ++file_references;if(event_references) ++*event_references;
         request->active=true;++pending_io_count;
         trace_io(cpu,request->ordinal,0x103,0,file.path,file.options,length,offset,output);
         return 0x103;
@@ -1960,7 +2011,9 @@ struct Xbox::State {
                 io_trace.push_back({request.ordinal,result,transferred,request.callsite,request.file->path,
                     request.file->options,request.requested,request.offset,request.buffer});
             }
-            request.file.reset();request.active=false;--pending_io_count;
+            request.file.reset();request.active=false;--pending_io_count;thread_cleanup_pending=true;
+            --object_references[request.file_object];release_object(request.file_object);
+            if(request.event) {--object_references[request.event];release_object(request.event);}
         }
     }
     std::uint32_t cancel_io(std::uint32_t handle) {
@@ -1985,7 +2038,7 @@ struct Xbox::State {
         if(!disc) return no_media;
         const auto entry=disc->lookup(*relative);
         if(!entry) return name_not_found;
-        if(host.unlimited_distance && !entry->directory()) {
+        if(host.draw_distance>1 && !entry->directory()) {
             const auto path=folded(*relative);
             if(path.ends_with(".PSW")) world_streams[0]=*entry;
             else if(path.ends_with(".P2W")) world_streams[1]=*entry;
@@ -2537,9 +2590,9 @@ struct Xbox::State {
             memory.store<std::uint8_t>(cpu.fs_base+0x24,static_cast<std::uint8_t>(Ordinal==129?2:cpu.registers[ecx]));
             finish(cpu,0,Ordinal==161?std::nullopt:std::optional<std::uint64_t>{prior});
         } else if constexpr(Ordinal==126 || Ordinal==127) {
-            LARGE_INTEGER value=performance_frequency;
-            if constexpr(Ordinal==126) QueryPerformanceCounter(&value);
-            finish(cpu,0,static_cast<std::uint64_t>(value.QuadPart),true);
+            // Kernel performance time uses the 3.375 MHz ACPI clock; the
+            // original XAPI/RDTSC timebase separately uses the CPU clock.
+            finish(cpu,0,Ordinal==126?clock_ticks(3375000):3375000,true);
         } else if constexpr(Ordinal==128) {
             FILETIME value; GetSystemTimeAsFileTime(&value);
             memory.store<std::uint64_t>(argument(cpu,0),(static_cast<std::uint64_t>(value.dwHighDateTime)<<32)|value.dwLowDateTime);
@@ -2799,6 +2852,7 @@ struct Xbox::State {
             current=selected; clock_data();
             quantum_due=std::chrono::steady_clock::now()+std::chrono::milliseconds(1);
             diagnostic_guest(&selected->cpu);{PerfScope guest(host.performance,PerfPhase::guest);SwitchToFiber(selected->fiber);}
+            diagnostic_guest(nullptr);collect_threads();
         }
         BootResult result;
         result.entry_returned=entry_returned; result.main_reached=diagnostic.reached_watch;
@@ -2814,7 +2868,7 @@ struct Xbox::State {
                 result.allocations.push_back({address,block.size,static_cast<std::uint32_t>(std::ranges::count_if(block.pages,[](auto protect){return protect!=0;})*page),block.protect});
             result.last_failed_allocation=last_failed_allocation;
         }
-        result.threads_created=static_cast<std::uint32_t>(threads.size());
+        result.threads_created=(next_thread-4)/4;
         result.vblank_callbacks=vblank_callbacks;
         result.extended_world_sectors=world_count;result.visible_world_sectors=detailed_count;result.detailed_world_batches=detailed_batches;
         result.original_camera_far=world_original_far;result.distance_culled_sectors=world_distance_culled;
@@ -2865,9 +2919,9 @@ PerfCounters Xbox::performance_counters() const {
     }
     return counters;
 }
-void Xbox::capture_frame(const std::filesystem::path& directory) {
+void Xbox::capture_frame(const std::filesystem::path& directory,bool automated) {
     if(!state_->gpu) throw std::runtime_error("The game has not initialized graphics yet");
-    state_->gpu->capture_frame(directory);
+    state_->gpu->capture_frame(directory,automated);
     const auto& memory=state_->memory;
     std::ostringstream snapshot;
     snapshot<<std::format("{{\"format\":\"b2-game-state-v1\",\"phase\":\"capture_request\",\"source_sha256\":{},\"widescreen\":{},\"replay\":{{\"frames\":{},\"index\":{},\"loaded\":{},\"playback\":{},\"finished\":{},\"fade_state\":{},\"deadline_bits\":{},\"buffer\":{}}},\"memory\":[",
@@ -3308,7 +3362,7 @@ std::string check_visibility(const std::filesystem::path& executable,const std::
     std::string results;
     for(const auto config:std::array<std::array<unsigned,2>,4>{{{1,0},{3,0},{1,5},{2,6}}}) {
         const auto scale=config[0],aa=config[1];
-        Renderer renderer(64,64,warp,true,scale);renderer.enhancements(aa,0);
+        Renderer renderer(64,64,warp,true,scale);renderer.enhancements(aa,0);renderer.interpolation(true);
         std::vector<std::byte> ram(64*1024*1024);image.load(std::span(ram).subspan(image.base,image.image_size));Memory memory(0,ram);
         XboxHost provider;provider.storage_root=output/std::format("storage-{}-{}",scale,aa);
         Xbox xbox(image,memory,ram,{},std::move(provider));auto& state=*xbox.state_;
@@ -3377,12 +3431,17 @@ std::string check_visibility(const std::filesystem::path& executable,const std::
         // full/partial occlusion and completion before a following semaphore.
         constexpr unsigned reports=96;
         for(unsigned i=0;i<reports;++i) {
+            packet(0x304,{0});
             packet(0x1E94,{0});packet(0x1760,{0x0C32});packet(0xAF8,{0x3F800000});
             packet(0x680,{0x42000000,0,0,0,0,0xC2000000,0,0,0,0,0x3F800000,0,0,0,0,0x3F800000});
             packet(0x35C,{1});packet(0x358,{0x01010101});packet(0x1D94,{0xF3});
             if(i%3) rectangle(2*i,-1,i%3==1?0.0f:1.0f,1,-1,0.25f);
             invoke(0x2168A0,{});
-            packet(0x35C,{0});packet(0x358,{0});packet(0x1E94,{2});packet(0x1760,{0x1042});packet(0xAF8,{0x4B7FFFFF});
+            // Alternate the original colourless sun probe with an equivalent
+            // colour-writing affine pass. Its extra layer draws must not
+            // enter the original SDK's pixel count.
+            packet(0x35C,{0});packet(0x358,{i&1?0x01010101U:0U});packet(0x304,{i&1});packet(0x344,{0x302,0x303});
+            packet(0x1E94,{2});packet(0x1760,{0x1042});packet(0xAF8,{0x4B7FFFFF});
             packet(0x1EA4,{0});packet(0xB80,{0x3F800000,0x3F800000,0x4B7FFFFF,0x3F800000,0x3F080000,0x3F080000,0,0});
             const std::array<Float4,4> probe{{{25,25,0.999f,0},{39,25,0.999f,0},{39,39,0.999f,0},{25,39,0.999f,0}}};
             const auto probe_address=0x8040+i*128;
@@ -3465,9 +3524,64 @@ std::string check_storage(const std::filesystem::path& executable,const std::fil
             return cpu.registers[eax];
         };
         constexpr std::uint32_t area=0xA000,profile=0x1000,profile_size=0x7C04,signed_size=0x7AB8,aligned_size=0x7E00;
+        if(!reload) {
+            memory.store<std::uint64_t>(area,3375000);
+            require(invoke(0x00288226,{area})==1000000 && cpu.registers[edx]==0,"original timer converts one ACPI second to one million microseconds");
+            const auto epoch=state.started;state.started=std::chrono::steady_clock::now()-std::chrono::seconds(1);
+            require(invoke(0xFFF00000U+127*16,{})==3375000 && cpu.registers[edx]==0,"original kernel ACPI performance frequency");
+            invoke(0x00288214,{area});const auto counter=memory.load<std::uint64_t>(area);
+            const auto timestamp=read_timestamp(cpu);state.started=epoch;
+            require(counter>=3375000 && counter<6750000 && timestamp>=733333333 && timestamp<1466666666,
+                "kernel ACPI counter and original CPU timestamp retain separate clock rates");
+            const bool convert=!IsThreadAFiber();
+            state.scheduler=convert?ConvertThreadToFiberEx(nullptr,FIBER_FLAG_FLOAT_SWITCH):GetCurrentFiber();
+            require(state.scheduler!=nullptr,"isolated native thread scheduler");
+            struct SchedulerScope {
+                Xbox::State& host;Xbox::State::Thread* previous;bool converted;
+                ~SchedulerScope(){host.current=previous;host.scheduler=nullptr;if(converted) ConvertFiberToThread();}
+            } scheduler_scope{state,&thread,convert};
+            const auto allocations=state.allocations.size();
+            std::array<std::uint32_t,68> completed_handles{};
+            for(unsigned cycle=0;cycle<70;++cycle) {
+                // Run the original XGetVideoFlags routine on real native fibers;
+                // no game boot or replacement guest callback is involved.
+                require(invoke(0xFFF00000U+255*16,{area,0,16384,0,0,0x000E00AF,0,0,0,0})==success,"native worker creation");
+                const auto handle=memory.load<std::uint32_t>(area);auto* worker=state.handles.at(handle).thread;
+                require(u16(worker->cpu.floating.image,0)==0x027F && worker->cpu.floating.mxcsr==0x1F80,
+                    "Xbox worker starts with the kernel's 53-bit x87 precision and masked SSE exceptions");
+                const auto object=worker->object,worker_stack=worker->stack;
+                if(cycle==1) require(invoke(0xFFF00000U+246*16,{handle,state.thread_type,area+8})==success,"worker object reference");
+                if(cycle==1) require(invoke(0xFFF00000U+187*16,{handle})==success,"close a running worker handle");
+                require(state.allocation(object)!=state.allocations.end() && memory.load<std::uint8_t>(object)==6,"running worker retains its dispatcher storage");
+                worker->cpu.preempt=nullptr;state.current=worker;SwitchToFiber(worker->fiber);state.current=&thread;
+                require(worker->state==Xbox::State::ThreadState::ended && state.boundary.empty(),"original worker routine exits");
+                state.collect_threads();
+                if(cycle==0) {
+                    require(state.allocation(object)!=state.allocations.end() && memory.load<std::uint32_t>(object+4)==1 &&
+                        !worker->fiber && state.allocation(worker_stack)==state.allocations.end(),"terminated worker retains its signalled object without retaining unused stacks");
+                    memory.store<std::uint64_t>(area+16,0);
+                    require(invoke(0xFFF00000U+233*16,{handle,0,area+16})==success,"wait for a terminated worker");
+                    require(invoke(0xFFF00000U+187*16,{handle})==success,"close the final worker handle");
+                } else if(cycle==1) {
+                    require(state.allocation(object)!=state.allocations.end(),"explicit reference retains a terminated worker");
+                    cpu.registers[ecx]=object;invoke(0xFFF00000U+250*16,{});
+                } else {
+                    completed_handles[cycle-2]=handle;
+                    require(state.allocation(object)!=state.allocations.end() && !worker->fiber && !worker->stack &&
+                        memory.load<std::uint32_t>(object+4)==1,"completed handles retain their signalled dispatcher without consuming active contexts");
+                }
+                state.collect_threads();
+                if(cycle<2) require(state.threads.size()==1 && state.allocations.size()==allocations && state.allocation(object)==state.allocations.end(),
+                    "terminated worker fibers, stacks and dispatcher storage are reclaimed");
+            }
+            require(state.threads.size()==completed_handles.size()+1,"more than 64 retained completed threads do not exhaust the live-context limit");
+            for(auto handle:completed_handles) require(invoke(0xFFF00000U+187*16,{handle})==success,"close a retained completed worker");
+            state.collect_threads();
+            require(state.threads.size()==1 && state.allocations.size()==allocations,"all retained completed workers are reclaimed after their handles close");
+        }
         const bool widescreen=reload==1;
-        require(invoke(0xFFF00000U+2*16,{0,6,0,area})==success &&
-            memory.load<std::uint32_t>(area)==(widescreen?0x00410101U:0x00400101U),"console video capabilities");
+        invoke(0xFFF00000U+2*16,{0,6,0,area});
+        require(memory.load<std::uint32_t>(area)==(widescreen?0x00410101U:0x00400101U),"console video capabilities");
         require(invoke(0x000E00AF,{})==unsigned(widescreen),"original SDK video flags");
         invoke(0x00018390,{});
         require(memory.load<std::uint32_t>(0x004D03F8)==unsigned(widescreen),"original game widescreen selection");
@@ -3646,6 +3760,22 @@ std::string check_storage(const std::filesystem::path& executable,const std::fil
             while(state.pending_io_count && std::chrono::steady_clock::now()<deadline) {state.dispatch_io();if(state.pending_io_count) Sleep(1);}
             require(!state.pending_io_count && memory.load<std::uint32_t>(area+0x710)==success && memory.load<std::uint32_t>(area+0x714)==aligned_size,"asynchronous save completes with the real byte count");
             require(invoke(0xFFF00000U+198*16,{overwrite,area+0x710})==success && invoke(0xFFF00000U+187*16,{overwrite})==success,"overwritten profile flush and close");
+            // An IRP retains its file and event objects after their handles
+            // close; completion must never signal reallocated guest storage.
+            const auto reader=invoke(0x000E09BA,{area+0x300,GENERIC_READ,3,0,3,0x40000000,0});
+            require(reader!=UINT32_MAX,"pending-close read handle");
+            require(invoke(0xFFF00000U+189*16,{area+0x720,0,0,0})==success,"pending-close completion event");
+            const auto event=memory.load<std::uint32_t>(area+0x720),file_object=state.handles.at(reader).address,event_object=state.handles.at(event).address;
+            const auto read_buffer=state.allocate(aligned_size,page,true,PAGE_READWRITE);require(read_buffer!=0,"pending-close read storage");
+            require(invoke(0xFFF00000U+219*16,{reader,event,0,0,area+0x710,read_buffer,aligned_size,area+0x700})==0x103,
+                "read remains pending until native completion publication");
+            require(invoke(0xFFF00000U+187*16,{reader})==success && invoke(0xFFF00000U+187*16,{event})==success &&
+                state.objects.contains(file_object) && state.objects.contains(event_object),"pending I/O retains closed file and event storage");
+            const auto close_deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+            while(state.pending_io_count && std::chrono::steady_clock::now()<close_deadline) {state.dispatch_io();if(state.pending_io_count) Sleep(1);}
+            require(!state.pending_io_count && memory.load<std::uint32_t>(area+0x710)==success && memory.load<std::uint32_t>(area+0x714)==aligned_size &&
+                !std::memcmp(memory.access(read_buffer,aligned_size),memory.access(profile,aligned_size),aligned_size),"closed-handle read completes with the original payload");
+            require(!state.objects.contains(file_object) && !state.objects.contains(event_object),"completion releases the final native object references");
         }
         if(reload==2) {
             require(memory.load<std::uint32_t>(profile+0x7AB4)==7,"overwritten profile persists in another fresh runtime");
@@ -3766,12 +3896,5 @@ void title_enhancement(Cpu& cpu,Memory& memory,std::uint32_t address,std::uint32
     HostFloatingScope floating(cpu.floating);
     host.enhancement(cpu,address,manager);
     cpu.registers=registers;cpu.flags=flags;cpu.eip=pc;
-}
-bool override_world_material(Cpu& cpu,Memory& memory) {
-    if(!cpu.kernel || !cpu.kernel->context || cpu.kernel->entries[255]!=Xbox::State::dispatch_kernel<255>)
-        throw NativeBoundary(cpu.eip,"world detail override requires the verified Xbox host provider");
-    auto& host=*static_cast<Xbox::State*>(cpu.kernel->context);
-    if(!host.world_active || host.world_drawing || cpu.registers[ecx]!=host.world_view.manager) return false;
-    const auto stack=cpu.registers[esp];cpu.eip=memory.load<std::uint32_t>(stack);cpu.registers[esp]=stack+8;return true;
 }
 }
