@@ -28,9 +28,8 @@ If you're skeptical, I implore you to try the recompilation for yourself. I take
 - Added optional **Ambient occlusion**, with three quality levels and adjustable
   strength; fixed shading lingering over car and track selection menus.
 - Updated the executable and settings icons with the new logo.
-- Temporarily disabled Sign In, New Account and Manage Account(s).
-  Imported **Interstate Burnout 1 (Coming Soon)** is also disabled, and leaving
-  its preview no longer causes a crash when selecting another mode.
+- Fixed a crash when switching game modes, and temporarily disabled Sign In,
+  New Account and Manage Account(s).
 
 Download the new **Installation.zip** and run **Build.cmd** again to update.
 See [Updating between releases](#updating-between-releases) to keep your saves,
@@ -78,10 +77,6 @@ focused on speed and simplicity. I couldn't bear to keep the slop version public
 
 You need a 64-bit Windows PC, a graphics card that supports DirectX 11, and <i>your
 own copy of the US Xbox release. Game files are not included</i>.
-
-**Only the Burnout 2 XISO is required.** Burnout 1 is used only by the separate,
-optional track importer. Its absence does not affect installation or normal play;
-the imported Interstate course remains disabled for now.
 
 1. Install [Visual Studio 2026 Community](https://visualstudio.microsoft.com/downloads/)
    with **Desktop development with C++**, **C++ CMake tools for Windows** and the included Windows SDK,

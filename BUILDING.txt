@@ -96,37 +96,6 @@ B2_XBE also requires the effects image; B2_EFFECTS can override its local path.
 The target is verified against knowledge/supported_target.json.
 Debug uses: cmake --build --preset debug
 
-Experimental Burnout 1 track import
-
-Burnout 1 is optional. Build.cmd requires only the supported Burnout 2 XISO;
-it does not invoke this importer or require any imported track assets.
-
-Interstate can be converted from the supported US Xbox Burnout disc. After
-building, run this from the source folder (the output directory must be new):
-& .\build\windows\Release\b2-tool.exe import-interstate 'D:\b1\Burnout (USA).xiso.iso' 'Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso' build/windows/Release/data/local/imported-tracks/interstate
-
-The imported Time Attack entry is temporarily disabled and labelled
-Interstate Burnout 1 (Coming Soon). The offline import tools remain available.
-The importer converts the world, textures, roadside objects,
-barriers, five checkpoints plus start/finish, collision and 8.04 km lap route.
-Checkpoint positions, directions, widths and lap time bonuses come from Burnout 1.
-Barrier arrows use all five original frames at their original speed and pause
-with the game. Interstate plays its Burnout 1 theme from Burnout 2's included
-music; choosing another track restores the previous music selection.
-The conversion includes the original sky and horizon, continuous traffic lanes,
-safe respawn positions, and opening/replay camera data. Replay cameras use
-Burnout 2's native camera modes; triggered traffic sequences and lane merging
-are not imported. Music currently uses the included song's full-file loop,
-rather than Burnout 1's lap-dependent crossfades. Experimental laps do not
-update the built-in track records. Gameplay and visual parity require checking.
-Imported assets remain private local files; the original disc images are unchanged.
-Back up the imported-tracks folder beside settings.cfg when moving installations.
-
-The offline check runs the original texture, route, collision, checkpoint, menu
-and draw selection routines, and renders transparent texture samples without
-booting the game:
-& .\build\windows\Release\b2.exe --check-track-import data/local/default.xbe 'Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso' build/windows/Release/data/local/imported-tracks/interstate build/checks/interstate
-
 Static CPU generation
 
 B2_XBE enables ahead-of-time generation from entry, main, verified startup roots
@@ -196,7 +165,7 @@ SDL3 processing. Sixty-five offline effects checks and sixty-five audio checks p
 including all 32 mix bins, headroom and replacement of the native effects image.
 Play and write positions follow the original codec-block lead and loop wrapping;
 play-region changes reset the loop region and normalize zero lengths.
-Music checks open all twelve Burnout 1 tracks through the original compiled WMA
+Music checks open twelve included soundtrack files through the original compiled WMA
 file decoder, feed its packets through the native sound stream and mix two seconds
 per track without booting or opening a sound device. They export WAV files and a
 JSON report, with bounded reads, timeouts and an execution budget. Each track also
