@@ -70,8 +70,7 @@ focused on speed and simplicity. I couldn't bear to keep the slop version public
 
 ### What works
 
-- Startup, menus and many levels, including driving, collisions and
-  tested lesson transitions.
+- Startup, menus, and all levels/modes.
 - Background music, menu sounds and in-game sound effects.
 - Creating, saving and loading profiles through the game's Load/Save menu.
 - Gamepad and keyboard input.
