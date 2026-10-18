@@ -1,4 +1,4 @@
-<div align="center"><img width="128" height="128" alt="55a1b42ef8b0ce4cff44d3db49b977fa" src="https://github.com/user-attachments/assets/e7e6d620-362c-45c4-85f9-5f4730074f9d" /></div>
+<div align="center"><img width="128" height="128" alt="Burnout2_Recomp_Logo_128_Corrected" src="https://github.com/user-attachments/assets/56cdde6c-ce6f-41a2-913c-63189fa3dbcf" /></div>
 
 # <div align="center">Burnout 2: Point of Impact — Static Recompilation</div>
 
