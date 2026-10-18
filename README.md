@@ -37,10 +37,28 @@ settings and imported music.
 
 ## Screenshots
 
-<p>
-  <img src="https://raw.githubusercontent.com/timftw21/burnout2-recompilation/main/screenshots/single-player.jpg" alt="Single Player menu" width="49%">
-  <img src="https://raw.githubusercontent.com/timftw21/burnout2-recompilation/main/screenshots/driving-lesson.jpg" alt="First driving lesson" width="49%">
-</p>
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <a href="https://raw.githubusercontent.com/timftw21/burnout2-recompilation/main/screenshots/single-player.jpg"><img src="https://raw.githubusercontent.com/timftw21/burnout2-recompilation/main/screenshots/single-player.jpg" alt="Single Player menu" width="360"></a><br>
+      <sub>Single Player menu</sub>
+    </td>
+    <td align="center" width="50%">
+      <a href="https://raw.githubusercontent.com/timftw21/burnout2-recompilation/main/screenshots/driving-lesson.jpg"><img src="https://raw.githubusercontent.com/timftw21/burnout2-recompilation/main/screenshots/driving-lesson.jpg" alt="Driving lesson" width="360"></a><br>
+      <sub>Driving lesson</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <a href="https://raw.githubusercontent.com/timftw21/burnout2-recompilation/main/screenshots/snowy-track.jpg"><img src="https://raw.githubusercontent.com/timftw21/burnout2-recompilation/main/screenshots/snowy-track.jpg" alt="Police car drifting on a snowy track" width="360"></a><br>
+      <sub>Snowy track</sub>
+    </td>
+    <td align="center" width="50%">
+      <a href="https://raw.githubusercontent.com/timftw21/burnout2-recompilation/main/screenshots/airport-terminal.jpg"><img src="https://raw.githubusercontent.com/timftw21/burnout2-recompilation/main/screenshots/airport-terminal.jpg" alt="Cars at Airport Terminal 1 and 2" width="360"></a><br>
+      <sub>Airport Terminal 1 &amp; 2</sub>
+    </td>
+  </tr>
+</table>
 
 ## What happened to the original release?
 
