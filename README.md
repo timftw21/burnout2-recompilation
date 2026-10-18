@@ -10,8 +10,8 @@ I'll try to respond in a timely manner. This is an independent fan project, unaf
 
 ## AI Disclosure
 
-Yes, AI was used in the development of this project. No, this project was not blindly thrown together.
-If you're skeptical, I implore you to try the recompilation for yourself. I take quality control quite seriously!😊
+Yes, AI (Codex) assisted in the development of this project. No, this project was not blindly thrown together.
+If you're skeptical, I implore you to try the recompilation for yourself. I take quality control quite seriously!👀
 
 ## What's new in 1.5
 
@@ -66,10 +66,7 @@ focused on speed and simplicity. I couldn't bear to keep the slop version public
 
 - Testing all modes, tracks and saved-game progression.
 - Checking sound balance and consistently smooth performance across the whole game.
-- Experimental upscaling has visual issues and can reduce performance.
-- Frame interpolation can still distort fine details and transparent overlays.
-- Increased draw distance can cause missing or incorrect scenery; remaining
-  Sunrise Valley Springs rendering issues are deferred to a future release.
+- Experimental upscaling has small visual issues and can reduce performance.
 
 ## Getting started
 
