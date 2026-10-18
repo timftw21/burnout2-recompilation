@@ -2,8 +2,8 @@
 
 # <div align="center">Burnout 2: Point of Impact — Static Recompilation</div>
 
-An unofficial Windows version of the original Xbox game, focused on fast gameplay
-and preserving its look and feel.
+An unofficial Windows version of the original Xbox game, focused on fast gameplay,
+preserving the original's look and feel, and a variety of enhancements.
 
 <i>Still in development: Slowdown, bugs, and crashes are possible. Open an issue if you experience a problem, and
 I'll try to respond in a timely manner. This is an independent fan project, unaffiliated with the game's owners.</i>
