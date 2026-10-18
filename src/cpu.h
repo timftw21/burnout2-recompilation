@@ -27,6 +27,7 @@ std::uint32_t b2_compare_exchange32(void*,std::uint32_t,std::uint32_t);
 }
 class Memory;
 struct Cpu;
+class Presentation;
 struct KernelServices {
     void* context = nullptr;
     std::array<void (*)(void*, Cpu&, Memory&), 512> entries{};
@@ -49,6 +50,39 @@ struct WorldView {
     std::uint32_t manager=0,count=0,list=0;
     std::array<std::uint32_t,256> sectors{};
 };
+struct HudLayout {
+    std::uint32_t list=0;
+    std::uint64_t active=0;
+    float scale=1,root_scale=1,root_x=0;
+    std::array<float,33> anchors{};
+    std::array<float,2> clip_transform{1,0};
+    std::array<float,2> transform(std::uint32_t queue) const {
+        const auto index=(queue-list)/16;
+        if(queue<list || (queue-list)%16 || index>=anchors.size() || !(active&(1ULL<<index))) return {1,0};
+        return {scale,(root_x+anchors[index]*root_scale)*(1-scale)};
+    }
+};
+struct WorldMaterials {
+    std::uint32_t begin=0;
+    std::span<const std::uint8_t> alpha_reference;
+    std::uint32_t alpha(std::uint32_t material,std::uint32_t fallback) const {
+        const auto index=(material-begin)/52;
+        return index<alpha_reference.size()?alpha_reference[index]:fallback;
+    }
+};
+struct GameTiming {
+    std::uint64_t last_cycles=0, remainder=0, pending=0;
+    std::uint64_t step=0, loading_cycles=0, loading_remainder=0;
+    std::uint32_t scene=0, loading=0;
+    std::uint32_t loading_steps=0;
+    float loading_delta=0;
+    double loading_fade_error=0;
+    double render_frames=1;
+    float render_delta=0;
+    bool scenery_animated=false;
+    bool loading_started=false;
+    bool started=false, update=true, render=true;
+};
 struct Cpu {
     std::array<std::uint32_t, 8> registers{};
     std::uint32_t flags = 0x202;
@@ -67,7 +101,11 @@ struct Cpu {
     // Optional changes to verified title logic, separate from platform bindings.
     bool skip_intro = false;
     float draw_distance = 1;
+    const WorldMaterials* world_materials = nullptr;
     const WorldView* world_view = nullptr;
+    HudLayout* hud_layout = nullptr;
+    GameTiming* game_timing = nullptr;
+    Presentation* presentation = nullptr;
 };
 
 class NativeBoundary : public std::runtime_error {
@@ -98,7 +136,15 @@ inline void checkpoint(Cpu& cpu, std::uint32_t address) {
 }
 void invoke_native(Cpu& cpu, Memory& memory, std::uint32_t address);
 void skip_title_intro(Cpu&,Memory&);
-void title_enhancement(Cpu&,Memory&,std::uint32_t address,std::uint32_t manager=0);
+void title_timing(Cpu&,Memory&);
+void title_loading(Cpu&,Memory&,bool update);
+std::uint32_t title_loading_fade(Cpu&,Memory&);
+void title_presentation(Cpu&,Memory&,std::uint32_t site,std::uint32_t object=0);
+void title_ui(Cpu&,Memory&,std::uint32_t node,std::uint32_t parameters);
+std::uint32_t title_blur_alpha(Cpu&,std::uint32_t alpha,std::uint32_t filter);
+std::uint32_t title_traffic_fade(Cpu&,Memory&,std::uint32_t vehicle);
+void title_enhancement(Cpu&,Memory&,std::uint32_t address);
+bool title_track(Cpu&,Memory&,std::uint32_t address,std::uint32_t object=0);
 std::uint32_t read_port(Cpu&,std::uint16_t,unsigned);
 void write_port(Cpu&,std::uint16_t,unsigned,std::uint32_t);
 

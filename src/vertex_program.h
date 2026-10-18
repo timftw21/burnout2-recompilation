@@ -25,6 +25,7 @@ struct VertexTranslation {
     std::array<std::uint32_t,13> output_masks{};
     std::uint32_t instructions=0;
     std::uint32_t constant_first=192,constant_count=0;
+    std::uint32_t input_mask=0;
     bool writes_context=false;
 };
 // Translation belongs to the native build tool. Gameplay selects bytecode.

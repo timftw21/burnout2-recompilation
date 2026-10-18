@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.2)
-project(burnout2 VERSION 1.5.0 LANGUAGES C CXX)
+project(burnout2 VERSION 1.6.0 LANGUAGES C CXX)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "The initial target is Windows x64.")
@@ -57,12 +57,12 @@ FetchContent_Declare(zydis
     GIT_PROGRESS FALSE)
 FetchContent_MakeAvailable(zydis)
 
-add_library(b2-core STATIC src/file.cpp src/disc.cpp src/xbe.cpp src/assets.cpp src/effects.cpp src/diagnostics.cpp src/crypto.cpp src/performance.cpp)
+add_library(b2-core STATIC src/file.cpp src/disc.cpp src/xbe.cpp src/assets.cpp src/tracks.cpp src/effects.cpp src/diagnostics.cpp src/crypto.cpp src/performance.cpp)
 target_include_directories(b2-core PUBLIC src PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(b2-core PRIVATE bcrypt)
 target_compile_definitions(b2-core PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 
-add_library(b2-graphics STATIC src/render.cpp src/render_checks.cpp src/vertex_program.cpp src/shaders.cpp src/gpu.cpp src/interpolation.cpp src/antialiasing.cpp)
+add_library(b2-graphics STATIC src/render.cpp src/render_checks.cpp src/vertex_program.cpp src/shaders.cpp src/gpu.cpp src/frame_processing.cpp src/antialiasing.cpp src/ambient_occlusion.cpp)
 target_link_libraries(b2-graphics PUBLIC b2-core PRIVATE d3d11 dxgi windowscodecs ole32)
 include(cmake/upscalers.cmake)
 
@@ -122,7 +122,7 @@ if(B2_XBE)
     target_include_directories(b2-input PUBLIC src)
     target_link_libraries(b2-input PRIVATE SDL3::SDL3-static mfplat mfreadwrite mf mfuuid ole32 delayimp)
     target_link_options(b2-input INTERFACE /DELAYLOAD:mfplat.dll /DELAYLOAD:mfreadwrite.dll /DELAYLOAD:mf.dll)
-    add_library(b2-cpu STATIC src/cpu.cpp src/xbox.cpp src/floating.cpp src/cpu_floating.asm)
+    add_library(b2-cpu STATIC src/cpu.cpp src/presentation.cpp src/xbox.cpp src/floating.cpp src/cpu_floating.asm)
     target_include_directories(b2-cpu PUBLIC src)
     target_link_libraries(b2-cpu PUBLIC b2-core PRIVATE b2-input b2-graphics iphlpapi)
     set(B2_EFFECTS "${CMAKE_CURRENT_SOURCE_DIR}/data/local/b2distfx.bin" CACHE FILEPATH "Local Xbox audio effects image")
@@ -229,8 +229,8 @@ if(B2_XBE)
         DEPENDS "${B2_XBE}" "${CMAKE_CURRENT_BINARY_DIR}/generated/gui_shaders.h"
             "${CMAKE_CURRENT_BINARY_DIR}/generated/target.h"
             "${CMAKE_CURRENT_BINARY_DIR}/generated/kernel_names.h"
-            src/file.h src/xbe.h src/shaders.h src/vertex_program.h
-            src/tool.cpp src/shader_compiler.cpp src/shaders.cpp src/vertex_program.cpp src/xbe.cpp src/file.cpp
+            src/file.h src/xbe.h src/shaders.h src/vertex_program.h src/ambient_occlusion.h
+            src/tool.cpp src/shader_compiler.cpp src/shaders.cpp src/ambient_occlusion.cpp src/vertex_program.cpp src/xbe.cpp src/file.cpp
         VERBATIM)
     add_custom_target(b2-shaders-generated DEPENDS "${native_shader_stamp}")
     add_executable(b2 WIN32 src/main.cpp src/cpu_checks.cpp src/cpu_reference.asm "${native_cpu}" "${native_cpu}.asm" ${native_shards} "${native_shaders}" resources/b2.rc resources/b2.manifest)

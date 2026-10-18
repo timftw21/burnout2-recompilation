@@ -39,3 +39,85 @@ Private outputs: build/checks/widescreen-20261011-205100.
 
 Primary SDK reference confirming encoder option 6 and VIDEO_WIDESCREEN=010000:
 https://github.com/XboxDev/nxdk/blob/master/lib/hal/video.h
+
+HUD proportions, 2026-10-17
+
+The original full-screen widescreen HUD retains its 640-wide coordinates. Final
+16:9 presentation stretches it by 4/3. Isolated standard/wide Airport captures
+confirm identical boost, lap-text and timer widths. The tachometer alone sets
+flag 4 at 1AC75/1AEE5: 26870..2688A multiplies its width by .9 and height by 1.2,
+preserving its shape after presentation but enlarging it relative to 4:3.
+
+The HUD owns the queue at [3D8570]. 1AA10 installs 32 widgets and assigns their
+queue ranges through object+8 (33 queue slots, with two belonging to widget 26).
+The virtual constructors in 1AC00..1CFE0 share x,y,scale,flags,player arguments.
+Record their actual layout anchors at setup. C1210 composes each queued primitive's
+position/size with its parent before calling node+50 at C1306. Apply the missing
+horizontal correction there, around the complete widget's original anchor.
+Its local geometry, text spacing and animated children therefore remain aligned;
+vertical dimensions, timing and game cameras are unchanged.
+C1160's clip bounds use the same transform; its pointer-based cache also checks
+the coordinate transform so a shared rectangle at another anchor is reapplied.
+Only this HUD queue is affected.
+
+1D0FB..1D121 sets the root canvas scales using width/640 and height/448.
+Wide split layouts already return a horizontal factor for an approximately
+854-wide canvas; compensate only the stretch that remains. The tachometer now
+uses ordinary dimensions before the shared correction. Projected world markers
+(constructor 1F790) and the split divider (24080) keep their original coordinates.
+This requires a fixed small anchor table and scalar coordinate arithmetic, with
+no additional rendering pass, texture, per-frame allocation or disk operation.
+
+Private source comparisons and verification: build/checks/hud-aspect-20261017.
+The user will check performance; no benchmarks were requested or run.
+
+Validation: Release build and all 52 CPU groups passed (3313 memory/title cases).
+The existing original Crash UI callback check now covers standard, corrected
+right-anchored and unrelated queues, including unchanged source records, colours,
+vertical positions and vertex counts. The final live Airport Time Attack run
+completed normally with all 20 control events, no audio errors and zero runtime
+shader compilations. Standard, original-wide and corrected-wide captures were
+inspected: boost/text widths now compensate the 4/3 presentation stretch, and
+the tachometer retains its standard dimensions before that compensation.
+Saved PNGs are the 640x480 anamorphic raster, before final 16:9 presentation.
+No full multiplayer/mode visual audit was performed. Personal settings matched
+their starting hash; all owned workers exited. Evidence: private verification.json.
+
+Text anchor follow-up, 2026-10-17
+
+User capture frame-1094951754200 exposes two composite-layout exceptions.
+Lesson constructor 21F50 ignores its x argument (zero in 1B312). All four target
+and score rows use the right-aligned column at [4D4884], via calls to 1E720 at
+220BE/22125, 221D5, 2223E and 222B4. Record that column as the queue's anchor.
+
+Driving-message constructor 1D830 creates a parent at x=40, then 1D980 places
+independent messages at local centre/right anchors (fields +7C/+80). A single
+queue transform also shrank those offsets: the centre moved from 320 to 250.
+At message creation, 1D5C0 now compensates its local x argument for the queue's
+horizontal scale before the original box alignment. Width, font spacing, fades
+and vertical animation retain the shared correction/original behavior. This
+also preserves the separate near-miss/traffic positions, instead of moving the
+entire queue to fix only its centred text. Standard and unrelated queues keep
+scale 1. Both corrections run at layout/message creation, adding no draw work.
+
+Boost-meter text follow-up, 2026-10-17
+
+User capture frame-270929492900 shows NEAR MISS shifted right of the boost
+meter. The preceding message correction preserved every local anchor, including
+ones which should scale with that meter. The centred messages use object+7C and
+alignment 0.5 at original calls 1DA13/1DAE1. Near-miss and traffic messages use
+object+80 and alignment 1.0 at 1DBBB/1DD2D. The original constructor at 1D5C0
+computes the box's left edge as x-alignment*width (1D5D6..1D5FB).
+
+Limit the position compensation to the centred alignment. Right-aligned messages
+retain their local positions relative to the boost meter, so their boxes and
+the gauge receive the same horizontal correction. The correction still runs
+only at message creation. Source bytes and the supported XBE hash were verified
+with bounded native decoding. Evidence: build/checks/boost-text-anchor-20261017.
+
+Release build and all 52 CPU groups passed (3,329 memory/presentation cases).
+Four cases run the original message allocator/constructor for both alignments
+in standard and widescreen layouts, checking the final box position, dimensions
+and calling convention. Personal settings stayed byte-identical; all owned
+build/check workers exited. No benchmark or game automation ran for this fix.
+Release SHA256: 98C5FFB256911C68CB0159F54251B75CA424FAD0A23E86363750ED2CCBFED919.

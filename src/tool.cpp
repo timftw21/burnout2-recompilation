@@ -5,6 +5,7 @@
 #include "render.h"
 #include "upscaling.h"
 #include "assets.h"
+#include "tracks.h"
 #include "dsp_compiler.h"
 #include "shaders.h"
 #include "performance.h"
@@ -31,6 +32,7 @@ constexpr auto usage =
     "Burnout 2 native tools (C++23)\n"
     "  b2-tool list ISO [DIRECTORY]\n"
     "  b2-tool extract ISO DISC_PATH OUTPUT\n"
+    "  b2-tool import-interstate BURNOUT_ISO BURNOUT2_ISO OUTPUT_DIRECTORY\n"
     "  b2-tool inspect XBE\n"
     "  b2-tool verify XBE\n"
     "  b2-tool check-image XBE\n"
@@ -66,7 +68,9 @@ int wmain(int argc, wchar_t** argv) {
         const auto started = std::chrono::steady_clock::now();
         int result = 0;
         std::string output;
-        if(command==L"check-performance" && argc==3) {
+        if(command==L"import-interstate" && argc==5) {
+            output=b2::import_interstate(argv[2],argv[3],argv[4]);
+        } else if(command==L"check-performance" && argc==3) {
             output=b2::check_performance(argv[2]);
         } else if(command==L"inspect-performance" && argc==4) {
             output=b2::inspect_performance(argv[2],argv[3]);

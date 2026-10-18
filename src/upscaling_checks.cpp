@@ -118,13 +118,13 @@ std::string check_upscaling(const std::filesystem::path& output) {
             if(game_image.width!=width*2 || game_image.height!=height*2)
                 throw std::runtime_error("Renderer did not publish the reconstructed resolution");
             renderer.release(framebuffer);
-            renderer.interpolation(true);renderer.resize(width+16,height+16);
+            renderer.resize(width+16,height+16);
             renderer.camera(2,0.1f,100,1.047198f);
             renderer.begin(0xFF2040E0,1,true);renderer.end();renderer.publish_frame(true);
             const auto resized=renderer.read_frame();
             if(resized.width!=(width+16)*2 || resized.height!=(height+16)*2)
-                throw std::runtime_error("Upscaling retained the old resolution or interpolation history after resize");
-            renderer.interpolation(false);
+                throw std::runtime_error("Upscaling retained the old resolution after resize");
+
             renderer.upscaling(UpscaleMethod::off);
             renderer.resize(width,height);
             // Native AA and a 3x output reconstructed from a 2x render must

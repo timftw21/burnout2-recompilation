@@ -3,12 +3,14 @@
 #include "xbox.h"
 #include "custom_music.h"
 #include "disc.h"
+#include "tracks.h"
 #include "input.h"
 #include "audio.h"
 #include "spatial.h"
 #include "effects.h"
 #include "render.h"
-#include "interpolation.h"
+#include "frame_processing.h"
+#include "presentation.h"
 #include "diagnostics.h"
 #include "crypto.h"
 #include <Windows.h>
@@ -92,7 +94,7 @@ struct Xbox::State {
         std::string path,link,pattern;
         std::uint64_t position=0;
         std::uint32_t access=0,share=0,options=0;
-        bool device=false,listing_loaded=false;
+        bool device=false,disc_file=false,listing_loaded=false;
         HANDLE native=INVALID_HANDLE_VALUE;
         std::filesystem::path host_path;
         ~OpenFile() {if(native!=INVALID_HANDLE_VALUE) CloseHandle(native);}
@@ -163,6 +165,7 @@ struct Xbox::State {
     XboxHost host;
     bool live=false;
     std::unique_ptr<Gpu> gpu;
+
     std::uint32_t gpu_cursor=0;
     bool graphics_initialized=false;
     struct InputHandle {std::uint32_t id=0,port=0;};
@@ -200,24 +203,56 @@ struct Xbox::State {
     std::chrono::steady_clock::time_point quantum_due;
     std::chrono::steady_clock::time_point video_started;
     std::uint64_t video_ticks=0,vblank_callbacks=0;
-    // Extra rendering storage is separate from the game's 64 MiB heap and its
-    // collision/traffic streaming window. NV2A vertex addresses remain 28-bit.
-    static constexpr std::uint32_t world_base=0x8A000000,world_scratch=0x0E000000,world_stride=0x3C000;
+    GameTiming game_timing;
+    Presentation presentation;
+    static constexpr std::uint32_t world_base=0x8A000000,world_stride=0x3C000,world_scratch=0x0E000000;
     std::vector<std::byte> world_storage;
     std::array<std::optional<DiscEntry>,2> world_streams;
+    std::array<std::filesystem::path,2> world_paths;
     std::optional<DiscEntry> world_loaded;
+    std::filesystem::path world_loaded_path;
+    struct WorldCone {
+        std::array<float,2> center{},left{},right{};
+        bool geometry=false,bounded=false;
+        bool contains(const std::array<float,2>& point) const {
+            const auto x=point[0]-center[0],z=point[1]-center[1];
+            return !bounded || (left[0]*z-left[1]*x>=0 && right[0]*z-right[1]*x<=0);
+        }
+    };
+    struct WorldRecord {unsigned section=0,origin=0,row=0;};
+    struct WorldSection {
+        std::array<float,3> low{},high{};
+        std::array<float,2> center{};
+        std::array<WorldCone,80> cones{};
+        std::array<std::uint64_t,2> backgrounds{};
+        std::vector<WorldRecord> additions;
+    };
+    std::vector<WorldSection> world_sections;
     WorldView world_view;
-    std::uint32_t world_count=0,detailed_count=0;
-    std::uint64_t detailed_batches=0;
-    struct WorldBounds {std::array<float,3> low,high;};
-    std::array<WorldBounds,256> world_bounds{};
+    HudLayout hud_layout;
+    std::array<WorldRecord,256> world_draws{};
+    unsigned world_draw_count=0,world_original_count=0,world_added_count=0;
+    unsigned world_origin=0;
+    std::uint64_t world_added_batches=0;
+    bool world_preparing=false;
     struct WorldCamera {std::uint32_t address=0;float original=0,applied=0;};
     std::array<WorldCamera,32> world_cameras{};
-    std::uint32_t world_camera=0,world_distance_culled=0;
-    float world_original_far=0,world_applied_far=0;
-    float world_original_range=0,world_range=0;
-    std::array<std::uint32_t,256> world_records{};
-    bool world_preparing=false,world_active=false,world_reflecting=false;
+    std::uint32_t world_camera=0;
+    float world_original_far=0;
+    bool world_ready=false,world_reflecting=false;
+    struct ImportedTrack {
+        bool selected=false;
+        WorldMaterials materials;
+        std::uint32_t storage=0,choices=0;
+        std::array<std::uint32_t,7> names{},welcomes{},tables{};
+        std::uint32_t barrier=0;
+        std::array<std::uint32_t,5> frames{};
+        double animation=0;
+        std::uint32_t playlist=0,songs=0;
+        std::array<std::uint32_t,3> music_selection{};
+        std::array<std::byte,68> music_playlist{};
+        std::array<std::byte,36> first_song{};
+    } imported;
 
     State(Xbe& image,Memory& memory,std::span<std::byte> ram,const std::filesystem::path& disc_path,XboxHost host):image(image),memory(memory),ram(ram),host(std::move(host)) {
         if(ram.size()!=64*1024*1024 || !image.supported()) throw std::runtime_error("Native Xbox requires the verified image and 64 MiB RAM");
@@ -251,6 +286,10 @@ struct Xbox::State {
         if(!this->host.custom_music_root.empty()) {
             auto& root=this->host.custom_music_root;root=std::filesystem::absolute(root).lexically_normal();
             if(std::filesystem::weakly_canonical(root)!=root) throw std::runtime_error("Custom music storage crosses a link or junction.");
+        }
+        if(!this->host.imported_tracks.empty()) {
+            auto& root=this->host.imported_tracks;root=std::filesystem::absolute(root).lexically_normal();
+            validate_interstate(root);
         }
         heap_begin=align_up(image.base+image.image_size,page);
         memory.map(kernel_base,kernel_image);
@@ -497,7 +536,11 @@ struct Xbox::State {
         auto& cpu=thread->cpu;
         cpu.kernel=&services; cpu.clock=&clock; cpu.diagnostic=live && graphics_initialized?nullptr:&diagnostic;
         cpu.skip_intro=host.skip_intro;cpu.draw_distance=float(host.draw_distance);
+        cpu.game_timing=host.renderer?&game_timing:nullptr;
+        cpu.presentation=host.renderer?&presentation:nullptr;
+        if(!host.imported_tracks.empty()) cpu.world_materials=&imported.materials;
         if(host.draw_distance>1) cpu.world_view=&world_view;
+        if(host.widescreen) cpu.hud_layout=&hud_layout;
         cpu.profile=host.performance && host.performance->active()?host.performance:nullptr;
         cpu.preempt=[](Cpu& cpu) {
             auto& host=*static_cast<State*>(cpu.kernel->context);
@@ -1465,67 +1508,399 @@ struct Xbox::State {
             throw NativeBoundary(entry,"world enhancement helper has an unexpected original ABI");
         const auto result=cpu.registers[eax];cpu.registers=registers;cpu.flags=flags;cpu.eip=pc;return result;
     }
-    unsigned self_visibility(std::uint32_t sector) {
-        const auto count=memory.load<std::uint32_t>(sector+0x204);
-        if(!count || count>18) throw NativeBoundary(0x90D30,"unsupported world visibility record count");
-        for(unsigned i=0;i<count;++i) if(!memory.load<std::uint32_t>(sector+0x218+i*0x54)) return i;
-        throw NativeBoundary(0x90D30,"world section has no original nearby visibility record");
+    void select_imported_track(bool selected) {
+        if(!selected && imported.playlist) {
+            std::memcpy(memory.access(imported.songs,36),imported.first_song.data(),36);
+            std::memcpy(memory.access(imported.playlist,68),imported.music_playlist.data(),68);
+            unsigned i=0;for(const auto address:{0x57C210U,0x57C1ECU,0x57C208U})
+                memory.store<std::uint32_t>(address,imported.music_selection[i++]);
+            imported.playlist=0;
+        }
+        if(!selected) {imported.barrier=0;imported.materials={};}
+        imported.selected=selected;
+        name_imported_track(selected);
+    }
+    void name_imported_track(bool selected) {
+        auto names=imported.names,welcomes=imported.welcomes;std::array<std::uint32_t,7> tables{};
+        for(unsigned language=0;language<tables.size();++language) {
+            const auto table=tables[language]=memory.load<std::uint32_t>(0x35272C+language*4);
+            if(!table) continue;
+            if(imported.tables[language]!=table) {
+                const auto previous=std::ranges::find(imported.tables,table);
+                names[language]=previous==imported.tables.end()?memory.load<std::uint32_t>(table+390*4):
+                    imported.names[previous-imported.tables.begin()];
+                welcomes[language]=previous==imported.tables.end()?memory.load<std::uint32_t>(table+728*4):
+                    imported.welcomes[previous-imported.tables.begin()];
+            }
+        }
+        imported.tables=tables;imported.names=names;imported.welcomes=welcomes;
+        for(unsigned language=0;language<tables.size();++language) if(tables[language]) {
+            memory.store<std::uint32_t>(tables[language]+390*4,selected?imported.storage+0x600:names[language]);
+            memory.store<std::uint32_t>(tables[language]+728*4,selected?imported.storage+0x640:welcomes[language]);
+        }
+    }
+    void imported_arrows(std::uint32_t site,std::uint32_t object) {
+        if(!imported.selected) return;
+        if(site==0x8BCD0) {
+            const auto master=memory.load<std::uint32_t>(object+8);
+            if(!master || memory.load<std::uint32_t>(master+16)!=232)
+                throw NativeBoundary(site,"imported barrier animation has no five-frame texture set");
+            const auto textures=memory.load<std::uint32_t>(master+20);
+            const auto materials=memory.load<std::uint32_t>(master+4);
+            if(materials>512) throw NativeBoundary(site,"imported material table exceeds its allocation");
+            if(materials<142) throw NativeBoundary(site,"imported material table has no source materials");
+            imported.materials={memory.load<std::uint32_t>(master+12)+142*52,
+                {static_cast<const std::uint8_t*>(memory.access(master+imported_alpha_offset+142,materials-142)),materials-142}};
+            imported.barrier=memory.load<std::uint32_t>(master+12)+216*52;
+            for(unsigned i=0;i<5;++i) imported.frames[i]=memory.load<std::uint32_t>(textures+(226+i)*4);
+            imported.animation=0;
+            memory.store<std::uint32_t>(imported.barrier+20,imported.frames[0]);
+        } else if(imported.barrier && object==0x4B95B0) {
+            const auto scene=memory.load<std::uint32_t>(0x34AB5C);
+            if(!scene || memory.load<std::uint32_t>(scene+8)) return;
+            const auto delta=game_timing.started?game_timing.render_delta:
+                std::bit_cast<float>(memory.load<std::uint32_t>(0x598188));
+            if(!std::isfinite(delta) || delta<0) throw NativeBoundary(site,"invalid game frame duration");
+            // B1 AEB36 advances every five 60 Hz frames. Use game time so
+            // uncapped rendering and pause keep the original animation speed.
+            imported.animation=std::fmod(imported.animation+double(delta)*12,5.0);
+            memory.store<std::uint32_t>(imported.barrier+20,imported.frames[static_cast<unsigned>(imported.animation)]);
+        }
+    }
+    void music_call(Cpu& cpu,std::uint32_t entry,std::uint32_t return_pc,std::uint32_t object,
+                    std::initializer_list<std::uint32_t> arguments={}) {
+        const auto registers=cpu.registers;const auto flags=cpu.flags,pc=cpu.eip;
+        const auto stack=registers[esp]-0x400;
+        cpu.registers[esp]=stack;cpu.registers[ecx]=object;
+        memory.store<std::uint32_t>(stack,return_pc);
+        unsigned i=0;for(const auto argument:arguments) memory.store<std::uint32_t>(stack+4+i++*4,argument);
+        invoke_native(cpu,memory,entry);
+        if(cpu.eip!=return_pc || cpu.registers[esp]!=stack+4+arguments.size()*4)
+            throw NativeBoundary(entry,"original music selection has an unexpected calling convention");
+        cpu.registers=registers;cpu.flags=flags;cpu.eip=pc;
+    }
+    void imported_music(Cpu& cpu,std::uint32_t object) {
+        if(!imported.selected || imported.playlist) return;
+        // Use the title's own lazy catalogue and WMA playlist, just as its
+        // Music Selection screen does. No audio files are imported or replaced.
+        if(!memory.load<std::uint32_t>(0x57C204)) music_call(cpu,0xC8D70,0xC91CA,object);
+        const auto table=memory.load<std::uint32_t>(object+4),count=memory.load<std::uint32_t>(object+0x10);
+        if(!table || !count || std::uint64_t(table)+std::uint64_t(count)*68!=memory.load<std::uint32_t>(object+8) ||
+            !memory.try_access(table,std::uint64_t(count)*68)) throw NativeBoundary(0xC93C0,"invalid original music catalogue");
+        unsigned index=0;
+        while(index<count && memory.load<std::uint32_t>(table+index*68+0x10)!=1) ++index;
+        if(index==count) throw NativeBoundary(0xC93C0,"original Burnout 1 playlist is missing");
+        const auto playlist=table+index*68,songs=memory.load<std::uint32_t>(playlist+4);
+        if(memory.load<std::uint32_t>(playlist+0x38)!=12 || !songs)
+            throw NativeBoundary(0xC93C0,"unexpected original Burnout 1 song list");
+        std::memcpy(imported.music_playlist.data(),memory.access(playlist,68),68);
+        std::memcpy(imported.first_song.data(),memory.access(songs,36),36);
+        unsigned i=0;for(const auto address:{0x57C210U,0x57C1ECU,0x57C208U})
+            imported.music_selection[i++]=memory.load<std::uint32_t>(address);
+        imported.playlist=playlist;imported.songs=songs;
+        // B1's usa2 course ID 0 selects music entry 0: track7.wav.
+        std::memmove(memory.access(songs,36),memory.access(songs+6*36,36),36);
+        memory.store<std::uint32_t>(playlist+8,songs+36);memory.store<std::uint32_t>(playlist+0x38,1);
+        memory.store<std::uint32_t>(0x57C210,1);memory.store<std::uint32_t>(0x57C1EC,index);memory.store<std::uint32_t>(0x57C208,0);
+        music_call(cpu,0xC91D0,0xC9AFB,object);
+    }
+    bool imported_camera_zoom(Cpu& cpu,std::uint32_t object) {
+        if(!imported.selected) return false;
+        const auto record=memory.load<std::uint32_t>(object+8);
+        if(!record) return false;
+        const auto id=memory.load<std::uint32_t>(record+0x10);
+        const auto source=memory.load<std::uint32_t>(0x4B8494);
+        if(!id || id>47 || !source || memory.load<std::uint32_t>(0x4B8498)!=47)
+            throw NativeBoundary(0xB5100,"invalid imported replay camera");
+        const auto authored=source+(id-1)*44;const auto zoom=memory.load<std::uint8_t>(authored+33);
+        if(!zoom) return false;
+        const auto car=memory.load<std::uint32_t>(object+0x1C),camera=memory.load<std::uint32_t>(object+0x18);
+        const auto transform=world_call(cpu,memory.load<std::uint32_t>(memory.load<std::uint32_t>(car)+0x18),car);
+        const auto value=[&](unsigned address){return std::bit_cast<float>(memory.load<std::uint32_t>(address));};
+        float squared=0;for(unsigned axis=0;axis<3;++axis) {
+            const auto delta=value(transform+0x30+axis*4)-value(object+0x140+axis*4);squared+=delta*delta;
+        }
+        const auto distance=std::sqrt(squared);const auto model=memory.load<std::uint32_t>(car+0xCEC);
+        const auto width=value(model+0xCC0)-value(model+0xCD0),length=value(model+0xCC8)-value(model+0xCD8);
+        // B1 8EC92: authored zoom, smoothing and per-camera FOV limits.
+        // B2 otherwise substitutes its global 3..120 degree limits.
+        const auto desired=std::atan(width*zoom/(distance-length))*229.1831180523293f;
+        const auto slot=memory.load<std::uint32_t>(camera+0x228),field=camera+slot*0xBC+0x18C;
+        const auto delta=game_timing.started?game_timing.render_delta:value(0x598188);
+        const auto weight=1.f-std::pow(0.95f,std::max(0.f,delta)*60.f);
+        const auto minimum=float(memory.load<std::uint8_t>(authored+34)),maximum=float(memory.load<std::uint8_t>(authored+35));
+        if(!std::isfinite(desired) || minimum>maximum) throw NativeBoundary(0xB5100,"invalid source camera zoom");
+        const auto fov=std::clamp(std::lerp(value(field),desired,weight),minimum,maximum);
+        const std::array arguments{std::bit_cast<std::uint32_t>(fov)};world_call(cpu,0xA04A0,camera,arguments);
+        memory.store<std::uint32_t>(field,std::bit_cast<std::uint32_t>(fov));
+        memory.store<std::uint32_t>(object+0xDC,std::bit_cast<std::uint32_t>(fov));
+        memory.store<std::uint32_t>(object+0xE0,std::bit_cast<std::uint32_t>(distance));
+        memory.store<std::uint32_t>(camera+(slot+2)*0xBC,std::bit_cast<std::uint32_t>(distance));return true;
+    }
+    void track_menu(std::uint32_t site,std::uint32_t object) {
+        if(host.imported_tracks.empty()) return;
+        if(site==0x4D2A9) {
+            // 4379F installs Time Attack as frontend mode 8; mode 5 is Free Run.
+            if(memory.load<std::uint32_t>(0x4CCABC)!=8) {select_imported_track(false);return;}
+            const auto count=memory.load<std::uint32_t>(object+12),table=memory.load<std::uint32_t>(object+20);
+            if(!count || count>30) throw NativeBoundary(site,"unexpected original track menu dimensions");
+            if(!imported.storage) {
+                imported.storage=allocate(4096,page,true,PAGE_READWRITE);
+                if(!imported.storage) throw NativeBoundary(site,"cannot allocate imported track menu");
+                constexpr char label[]="Interstate|Burnout 1 (Coming Soon)";
+                std::memcpy(memory.access(imported.storage+0x600,sizeof(label)),label,sizeof(label));
+                constexpr char welcome[]="Welcome to Interstate";
+                std::memcpy(memory.access(imported.storage+0x640,sizeof(welcome)),welcome,sizeof(welcome));
+            }
+            const auto storage=imported.storage;imported.choices=count;
+            std::memcpy(memory.access(storage,count*20),memory.access(table,count*20),count*20);
+            std::memcpy(memory.access(storage+0x400,32),memory.access(0x329820,32),32);
+            memory.store<std::uint32_t>(storage+0x408,std::bit_cast<std::uint32_t>(8.039576f));
+            // Use the original locked-track flag: display the upcoming course,
+            // but let the original confirmation handler reject activation.
+            memory.store<std::uint32_t>(storage+count*20,1);
+            memory.store<std::uint32_t>(storage+count*20+4,storage+0x400);
+            memory.store<std::uint32_t>(storage+count*20+8,3);
+            memory.store<std::uint32_t>(storage+count*20+12,7);
+            memory.store<std::uint32_t>(storage+count*20+16,0);
+            memory.store<std::uint32_t>(object+12,count+1);memory.store<std::uint32_t>(object+20,storage);
+            if(imported.selected) memory.store<std::uint32_t>(object+16,count);
+            // Browsing a course must not mount its files or enable its world
+            // hooks. Activation belongs to the original unlocked-confirm path.
+            select_imported_track(false);
+            site=0x4CCFD;
+        }
+        if(site==0x4CC40) {
+            // The original exit callback runs on both confirm and Back.
+            // Restore normal labels when leaving an uncommitted preview.
+            name_imported_track(imported.selected);
+        } else if(site==0x4CCFD || site==0x4CEE0) {
+            const auto count=memory.load<std::uint32_t>(object+12),table=memory.load<std::uint32_t>(object+20);
+            bool selected=false;
+            if(table==imported.storage && count && memory.load<std::uint32_t>(0x4CCABC)==8) {
+                const auto index=static_cast<std::int32_t>(memory.load<std::uint32_t>(object+16));
+                selected=(index%static_cast<int>(count)+count)%count==imported.choices;
+            }
+            if(site==0x4CEE0) select_imported_track(selected);
+            else name_imported_track(selected);
+        } else throw NativeBoundary(site,"unsupported imported track menu site");
+    }
+    std::filesystem::path imported_file(std::string_view relative) {
+        if(!imported.selected || host.imported_tracks.empty() || memory.load<std::uint32_t>(0x4CCABC)!=8) return {};
+        const auto path=folded(relative);
+        if(path=="TRACKPSS\\FORWARD\\FWYL.PSS") return host.imported_tracks/"interstate.pss";
+        if(path=="TRACKS1\\FORWARD\\FWYL\\FWYL.PSW" || path=="TRACKS1\\FORWARD\\FWYL\\FWYL.P2W") return host.imported_tracks/"interstate.psw";
+        if(path.starts_with("TRACKS\\FORWARD\\FWYL\\") && path.ends_with(".BGD")) return host.imported_tracks/"interstate.bgd";
+        if(path=="TRACKS\\FORWARD\\FWYL\\FWYL_0.BCD") return host.imported_tracks/"interstate.bcd";
+        return {};
+    }
+    unsigned world_target(unsigned origin,unsigned row) const {
+        const auto relative=std::bit_cast<std::int32_t>(memory.load<std::uint32_t>(world_base+origin*world_stride+0x218+row*0x54));
+        const auto count=static_cast<int>(world_sections.size());
+        return static_cast<unsigned>((static_cast<int>(origin)+relative%count+count)%count);
+    }
+    bool world_faces(const WorldRecord& record,const std::array<float,2>& position) const {
+        const auto source=world_base+record.origin*world_stride;
+        const auto groups=memory.load<std::uint32_t>(source+0x7AC);
+        for(unsigned group=0;group<groups;++group) {
+            const auto mesh=memory.load<std::uint8_t>(source+0x21C+record.row*0x54+group);
+            if(mesh!=255 && !world_sections[record.section].cones[mesh].contains(position)) return false;
+        }
+        return true;
     }
     void prepare_world(Cpu& cpu) {
-        if(host.draw_distance==1 || world_preparing) return;
+        if(world_preparing) return;
         const auto manager=cpu.registers[ecx],master=memory.load<std::uint32_t>(0x4B85B8);
         const auto mode=unsigned(memory.load<std::uint32_t>(manager+0x14)!=0);
-        if(!master || !world_streams[mode] || !disc) throw NativeBoundary(0x8EEB0,"extended draw distance has no loaded world stream");
+        if(!master || !world_streams[mode] || !disc) throw NativeBoundary(0x8EEB0,"extended scenery has no world stream");
         const auto entry=*world_streams[mode];
-        if(world_loaded && world_loaded->sector==entry.sector) return;
+        if(world_loaded && world_loaded->sector==entry.sector && world_loaded_path==world_paths[mode]) return;
         const auto count=memory.load<std::uint32_t>(master+0x5C);
-        if(!count || count>world_view.sectors.size() || std::uint64_t(count)*world_stride!=entry.size)
-            throw NativeBoundary(0x8EEB0,"world stream dimensions exceed the verified rendering format");
-        world_active=false;world_view.manager=0;world_loaded.reset();world_preparing=true;
+        if(!count || count>256 || std::uint64_t(count)*world_stride!=entry.size)
+            throw NativeBoundary(0x8EEB0,"unsupported extended scenery dimensions");
+        world_view.manager=0;world_loaded.reset();world_preparing=true;
         struct Guard {bool& flag;~Guard(){flag=false;}} guard{world_preparing};
-        // Read once during original world loading; steady gameplay performs no
-        // file I/O, allocation or relocation for the additional track sections.
+        if(gpu) gpu->invalidate_memory(world_base,64U*1024*1024);
+        std::optional<File> replacement;
+        if(!world_paths[mode].empty()) replacement.emplace(world_paths[mode]);
         for(std::uint32_t offset=0;offset<entry.size;) {
-            const auto bytes=std::min(1024U*1024,entry.size-offset);
-            disc->read(entry,offset,std::span(world_storage).subspan(offset,bytes));offset+=bytes;
+            const auto size=std::min(1024U*1024,entry.size-offset);
+            const auto bytes=std::span(world_storage).subspan(offset,size);
+            if(replacement) replacement->read(offset,bytes);else disc->read(entry,offset,bytes);
+            offset+=size;
         }
+        world_sections.clear();world_sections.resize(count);
         std::memset(memory.access(world_scratch,0x318),0,0x318);
         memory.store<std::uint32_t>(world_scratch+0x10,world_base);
-        for(unsigned i=0;i<count;++i) {
-            const auto sector=world_base+i*world_stride;
-            self_visibility(sector);
-            auto& bounds=world_bounds[i];
-            bounds.low.fill(std::numeric_limits<float>::infinity());bounds.high.fill(-std::numeric_limits<float>::infinity());
-            // 90740 tests four base corners and their copies lifted by +0x0C.
-            // Retain conservative section bounds for distance rejection before
-            // the original frustum and material routines submit any geometry.
-            const auto height=std::bit_cast<float>(memory.load<std::uint32_t>(sector+0x0C));
-            if(!std::isfinite(height) || height<0) throw NativeBoundary(0x8EEB0,"invalid world section height");
+        const auto real=[&](std::uint32_t address) {return std::bit_cast<float>(memory.load<std::uint32_t>(address));};
+        for(unsigned s=0;s<count;++s) {
+            const auto sector=world_base+s*world_stride;
+            memory.store<std::uint32_t>(world_scratch+0x24,s);world_call(cpu,0x8EEB0,world_scratch);
+            auto& section=world_sections[s];
+            const auto rows=memory.load<std::uint32_t>(sector+0x204),groups=memory.load<std::uint32_t>(sector+0x7AC);
+            const auto meshes=memory.load<std::uint32_t>(sector+0xBC);
+            if(!rows || rows>18 || groups>80 || meshes>80 ||
+               memory.load<std::uint8_t>(sector+0x214)>memory.load<std::uint8_t>(sector+0x215) ||
+               memory.load<std::uint8_t>(sector+0x215)>groups)
+                throw NativeBoundary(0x8EEB0,"unsupported scenery visibility/material table");
+            section.low.fill(INFINITY);section.high.fill(-INFINITY);
+            const auto height=real(sector+0x0C);
+            if(!std::isfinite(height) || height<0) throw NativeBoundary(0x8EEB0,"invalid scenery bounds");
             for(unsigned corner=0;corner<4;++corner) for(unsigned axis=0;axis<3;++axis) {
-                const auto value=std::bit_cast<float>(memory.load<std::uint32_t>(sector+corner*16+axis*4));
-                if(!std::isfinite(value)) throw NativeBoundary(0x8EEB0,"invalid world section bounds");
-                bounds.low[axis]=std::min(bounds.low[axis],value);
-                bounds.high[axis]=std::max(bounds.high[axis],value+(axis==1?height:0));
+                const auto value=real(sector+corner*16+axis*4);
+                if(!std::isfinite(value)) throw NativeBoundary(0x8EEB0,"invalid scenery corner");
+                section.low[axis]=std::min(section.low[axis],value);
+                section.high[axis]=std::max(section.high[axis],value+(axis==1?height:0));
+                if(axis!=1) section.center[axis/2]+=value*.25f;
             }
-            memory.store<std::uint32_t>(world_scratch+0x24,i);
-            world_call(cpu,0x8EEB0,world_scratch);
+            for(unsigned b=0;b<4;++b) {
+                const auto background=memory.load<std::uint8_t>(sector+0x208+b);
+                if(background==255) continue;
+                if(background>=128 || background>=memory.load<std::uint32_t>(master+0x3C))
+                    throw NativeBoundary(0x8EEB0,"invalid scenery backdrop");
+                section.backgrounds[background/64]|=1ULL<<(background%64);
+            }
+            for(unsigned m=0;m<meshes;++m) {
+                const auto mesh=memory.load<std::uint32_t>(sector+0xC4+m*4),material=memory.load<std::uint32_t>(mesh+20);
+                if(material>=memory.load<std::uint32_t>(master+4)) throw NativeBoundary(0x8EEB0,"invalid scenery material");
+                const auto flags=memory.load<std::uint32_t>(memory.load<std::uint32_t>(master+12)+material*52+16);
+                // Same pipeline order as original 90A50/90BC0; C5550 and
+                // C3C70 take the vertex stride from that pipeline's +8.
+                const auto pipeline=flags&0x8000200?0x4B86B0U:flags&0xFC004A00?0x4B8690U:
+                    flags&0x3E00000?0x4B8660U:flags&0x100000?0x4B8670U:flags&0x80000?0x4B8650U:flags&0x8000?0x4B8640U:0;
+                if(!pipeline) continue;
+                const auto stride=memory.load<std::uint32_t>(pipeline+8),vertices=memory.load<std::uint32_t>(mesh+4);
+                const auto indices=memory.load<std::uint32_t>(mesh+12),n=memory.load<std::uint32_t>(mesh+16);
+                if(stride<12 || stride>64 || n>32768) throw NativeBoundary(0x8EEB0,"unsupported scenery vertex layout");
+                std::array<float,2> low{INFINITY,INFINITY},high{-INFINITY,-INFINITY};
+                for(unsigned j=0;j<n;++j) {
+                    const auto vertex=vertices+memory.load<std::uint16_t>(indices+j*2)*stride;
+                    // D7A60 clears the Xbox CPU alias bit on vertex buffers.
+                    if(vertex-(sector&0x7FFFFFFF)>world_stride-stride)
+                        throw NativeBoundary(0x8EEB0,std::format("scenery vertex leaves section {} mesh {} (stride {})",s,m,stride));
+                    for(unsigned a=0;a<2;++a) {const auto v=real(vertex+a*8);if(!std::isfinite(v)) throw NativeBoundary(0x8EEB0,"invalid scenery vertex");low[a]=std::min(low[a],v);high[a]=std::max(high[a],v);}
+                }
+                if(n) {
+                    section.cones[m].geometry=true;
+                    for(unsigned a=0;a<2;++a) section.cones[m].center[a]=(low[a]+high[a])*.5f;
+                }
+            }
         }
-        // 8EA80 draws the master's original 24-byte background mesh records.
-        // They remain useful beyond the expanded scenery, but must yield to
-        // the detailed buildings wherever their coplanar surfaces overlap.
-        const auto backgrounds=memory.load<std::uint32_t>(master+0x3C),meshes=memory.load<std::uint32_t>(master+0x40);
-        std::array<std::uint32_t,128> buffers{};
-        if(backgrounds>buffers.size() || !gpu) throw NativeBoundary(0x8EEB0,"unsupported world background mesh table");
-        for(unsigned i=0;i<backgrounds;++i) buffers[i]=memory.load<std::uint32_t>(meshes+i*24+4);
-        gpu->distant_geometry(std::span(buffers).first(backgrounds));
-        gpu->extended_geometry(world_base,entry.size);
-        world_count=count;world_loaded=entry;
+        // A distant view may extend an authored viewing direction, but must
+        // not reveal the unbuilt reverse side of a terrain patch. Derive the
+        // angular envelope from every original section that selects its mesh.
+        std::vector<std::vector<float>> angles(count*80);
+        for(unsigned s=0;s<count;++s) {
+            const auto source=world_base+s*world_stride;
+            const auto rows=memory.load<std::uint32_t>(source+0x204),groups=memory.load<std::uint32_t>(source+0x7AC);
+            for(unsigned r=0;r<rows;++r) {
+                const auto target=world_target(s,r),sector=world_base+target*world_stride;
+                for(unsigned g=0;g<groups;++g) {
+                    const auto mesh=memory.load<std::uint8_t>(source+0x21C+r*0x54+g);
+                    if(mesh==255) continue;
+                    if(mesh>=memory.load<std::uint32_t>(sector+0xBC)) throw NativeBoundary(0x8EEB0,"invalid distant scenery mesh");
+                    if(!world_sections[target].cones[mesh].geometry) continue;
+                    const auto& center=world_sections[target].cones[mesh].center;
+                    angles[target*80+mesh].push_back(std::atan2(world_sections[s].center[1]-center[1],world_sections[s].center[0]-center[0]));
+                }
+            }
+        }
+        constexpr float pi=3.14159265358979323846f;
+        for(unsigned s=0;s<count;++s) for(unsigned m=0;m<80;++m) {
+            auto& views=angles[s*80+m];if(views.size()<2) continue;
+            std::ranges::sort(views);float gap=0,left=0,right=0;
+            for(unsigned i=0;i<views.size();++i) {
+                const auto next=i+1<views.size()?views[i+1]:views[0]+2*pi;
+                if(next-views[i]>gap) {gap=next-views[i];left=next;right=views[i]+2*pi;}
+            }
+            if(gap<=pi) continue;
+            auto& cone=world_sections[s].cones[m];cone.bounded=true;
+            cone.left={std::cos(left),std::sin(left)};cone.right={std::cos(right),std::sin(right)};
+        }
+        // Precompute extra rows during loading. Each row must coexist with all
+        // active backdrops; this preserves the game's near/far model ownership.
+        // Keep its actual per-material choices instead of using a self row.
+        for(unsigned s=0;s<count;++s) {
+            auto& current=world_sections[s];const auto source=world_base+s*world_stride;
+            std::array<bool,256> original{};std::array<float,256> best;best.fill(INFINITY);
+            std::array<WorldRecord,256> chosen{};
+            for(unsigned r=0;r<memory.load<std::uint32_t>(source+0x204);++r) original[world_target(s,r)]=true;
+            for(unsigned from=0;from<count;++from) {
+                const auto& candidate=world_sections[from];
+                if((candidate.backgrounds[0]&current.backgrounds[0])!=current.backgrounds[0] ||
+                   (candidate.backgrounds[1]&current.backgrounds[1])!=current.backgrounds[1]) continue;
+                const auto dx=current.center[0]-candidate.center[0],dz=current.center[1]-candidate.center[1];
+                const auto distance=dx*dx+dz*dz;const auto origin=world_base+from*world_stride;
+                for(unsigned r=0;r<memory.load<std::uint32_t>(origin+0x204);++r) {
+                    const auto target=world_target(from,r);const WorldRecord record{target,from,r};
+                    if(original[target] || distance>=best[target] || !world_faces(record,current.center)) continue;
+                    chosen[target]=record;best[target]=distance;
+                }
+            }
+            for(unsigned target=0;target<count;++target) if(std::isfinite(best[target])) current.additions.push_back(chosen[target]);
+        }
+        world_loaded=entry;world_loaded_path=world_paths[mode];world_ready=true;
+    }
+    void select_world(Cpu& cpu) {
+        world_view.manager=0;world_view.count=0;world_draw_count=0;
+        world_added_count=0;world_original_count=0;
+        if(!world_loaded || world_preparing || world_reflecting) return;
+        const auto manager=cpu.registers[esi],origin=memory.load<std::uint32_t>(manager+0x118);
+        unsigned index=0;
+        for(;index<world_sections.size();++index)
+            if(!std::memcmp(memory.access(origin,64),memory.access(world_base+index*world_stride,64),64)) break;
+        if(index==world_sections.size()) throw NativeBoundary(0x90F68,"unknown scenery visibility origin");
+        world_origin=index;
+        const auto camera=memory.load<std::uint32_t>(0x5232C0),frame=memory.load<std::uint32_t>(camera+4);
+        const std::array position{std::bit_cast<float>(memory.load<std::uint32_t>(frame+0x40)),std::bit_cast<float>(memory.load<std::uint32_t>(frame+0x48))};
+        const auto append=[&](std::uint32_t sector) {
+            const auto slot=world_view.count++;world_view.sectors[slot]=sector;
+            memory.store<std::uint32_t>(world_view.list+slot*4,slot);
+        };
+        const auto original=memory.load<std::uint32_t>(manager+0x310);
+        if(original>18) throw NativeBoundary(0x90F68,"invalid original scenery list");
+        for(unsigned i=0;i<original;++i) append(memory.load<std::uint32_t>(manager+0xD0+memory.load<std::uint32_t>(manager+0x2C8+i*4)*4));
+        world_original_count=original;
+        const auto range=world_original_far*host.draw_distance;
+        for(const auto record:world_sections[index].additions) {
+            const auto& section=world_sections[record.section];float squared=0;
+            for(unsigned a=0;a<2;++a) {const auto d=position[a]-std::clamp(position[a],section.low[a*2],section.high[a*2]);squared+=d*d;}
+            if(squared>range*range || !world_faces(record,position)) continue;
+            const auto sector=world_base+record.section*world_stride;
+            const auto saved_eax=cpu.registers[eax],saved_edx=cpu.registers[edx];
+            cpu.registers[eax]=sector;cpu.registers[edx]=manager+0x11C;
+            const auto visible=world_call(cpu,0x90740,0);
+            cpu.registers[eax]=saved_eax;cpu.registers[edx]=saved_edx;
+            if(visible==2) continue;
+            append(sector);world_draws[world_draw_count++]=record;
+        }
+        world_added_count=world_draw_count;world_view.manager=manager;
+    }
+    void draw_world(Cpu& cpu,unsigned phase) {
+        if(!world_view.manager) return;
+        std::memcpy(memory.access(world_scratch+0x11C,96),memory.access(world_view.manager+0x11C,96),96);
+        for(unsigned i=0;i<world_draw_count;++i) {
+            const auto record=world_draws[i];const auto origin=world_base+record.origin*world_stride;
+            const auto opaque=memory.load<std::uint8_t>(origin+0x214),alpha=memory.load<std::uint8_t>(origin+0x215);
+            const auto groups=memory.load<std::uint32_t>(origin+0x7AC);
+            memory.store<std::uint32_t>(world_scratch+0x118,origin);
+            memory.store<std::uint32_t>(world_scratch+0x310,1);
+            memory.store<std::uint32_t>(world_scratch+0x2C8,record.row);
+            memory.store<std::uint32_t>(world_scratch+0xD0+record.row*4,world_base+record.section*world_stride);
+            memory.store<std::uint32_t>(world_scratch+0x88+record.row*4,4);
+            const auto begin=phase==0?0U:phase==1?unsigned(opaque):unsigned(alpha);
+            const auto end=phase==0?unsigned(opaque):phase==1?unsigned(alpha):groups;
+            for(unsigned group=begin;group<end;++group) {
+                if(memory.load<std::uint8_t>(origin+0x21C+record.row*0x54+group)==255) continue;
+                const std::array arguments{group};world_call(cpu,phase==1?0x90BC0:0x90A50,world_scratch,arguments);++world_added_batches;
+            }
+        }
     }
     void extend_camera(Cpu& cpu) {
         // Reflection rendering uses its own visibility and sky geometry. Its
         // camera temporarily occupies the main camera slot, but is not part
         // of the extended scene pass.
-        if(!world_loaded || world_preparing || world_reflecting) return;
+        if(!world_ready || world_preparing || world_reflecting) return;
         const auto camera=argument(cpu,0),holder=memory.load<std::uint32_t>(0x443EB0);
         if(!holder || camera!=memory.load<std::uint32_t>(holder)) return;
         const auto far_plane=std::bit_cast<float>(memory.load<std::uint32_t>(camera+0x84));
@@ -1545,105 +1920,63 @@ struct Xbox::State {
             const std::array arguments{camera,std::bit_cast<std::uint32_t>(extended)};
             world_call(cpu,0xE84C0,0,arguments,0);
         }
-        found->applied=extended;world_camera=camera;world_original_far=found->original;world_applied_far=extended;
+        found->applied=extended;world_camera=camera;world_original_far=found->original;
     }
-    void select_world(Cpu& cpu,std::uint32_t manager) {
-        world_view.manager=0;detailed_count=0;world_active=false;
-        if(host.draw_distance>1) {
-            if(!world_loaded || world_preparing) throw NativeBoundary(0x90D30,"extra world geometry was not prepared during loading");
-            if(!world_camera) throw NativeBoundary(0x90D30,"extended world camera was not initialized");
-            const auto camera=memory.load<std::uint32_t>(0x5232C0);
-            const auto frame=memory.load<std::uint32_t>(camera+4);
-            std::array<float,3> position{};
-            for(unsigned axis=0;axis<3;++axis) {
-                position[axis]=std::bit_cast<float>(memory.load<std::uint32_t>(frame+0x40+axis*4));
-                if(!std::isfinite(position[axis])) throw NativeBoundary(0x90D30,"invalid world camera position");
-            }
-            const auto origin=memory.load<std::uint32_t>(manager+0x118);
-            const auto records=memory.load<std::uint32_t>(origin+0x204);
-            if(!records || records>18) throw NativeBoundary(0x90D30,"invalid original world visibility records");
-            std::array<std::uint32_t,18> original_sectors{};double original_squared=0;
-            for(unsigned record=0;record<records;++record) {
-                const auto loaded=original_sectors[record]=memory.load<std::uint32_t>(manager+0xD0+record*4);
-                if(!loaded) continue;
-                // The original visibility records limit the scenery before
-                // camera clipping does. Extend their horizontal coverage,
-                // keeping tall section bounds from inflating the road range.
-                for(unsigned corner=0;corner<4;++corner) {
-                    const auto x=double(std::bit_cast<float>(memory.load<std::uint32_t>(loaded+corner*16)))-position[0];
-                    const auto z=double(std::bit_cast<float>(memory.load<std::uint32_t>(loaded+corner*16+8)))-position[2];
-                    original_squared=std::max(original_squared,x*x+z*z);
-                }
-            }
-            if(!(original_squared>0) || !std::isfinite(original_squared)) throw NativeBoundary(0x90D30,"invalid original world rendering range");
-            world_original_range=float(std::min(double(world_original_far),std::sqrt(original_squared)));
-            world_range=world_original_range*host.draw_distance;
-            const auto limit=double(world_range)*world_range;world_distance_culled=0;
-            for(unsigned i=0;i<world_count;++i) {
-                const auto sector=world_base+i*world_stride;
-                double squared=0;
-                for(unsigned axis:{0U,2U}) {
-                    const auto distance=double(position[axis])-std::clamp(position[axis],world_bounds[i].low[axis],world_bounds[i].high[axis]);
-                    squared+=distance*distance;
-                }
-                if(squared>limit) {++world_distance_culled;continue;}
-                cpu.registers[eax]=sector;cpu.registers[edx]=manager+0x11C;
-                if(world_call(cpu,0x90740,0)==2) continue;
-                const auto index=detailed_count++;
-                world_view.sectors[index]=sector;memory.store<std::uint32_t>(world_view.list+index*4,index);
-                world_records[index]=self_visibility(sector);
-                for(unsigned record=0;record<records;++record) {
-                    const auto loaded=original_sectors[record];
-                    if(loaded && !std::memcmp(memory.access(loaded,64),memory.access(sector,64),64)) {
-                        // Keep the native material order and layered surfaces
-                        // for sections already covered by the original pass.
-                        world_records[index]=UINT32_MAX;break;
-                    }
-                }
-            }
-        }
-        world_view.count=detailed_count;world_view.manager=manager;world_active=true;
-    }
-    void draw_detailed_world(Cpu& cpu,unsigned phase) {
-        if(!world_active) return;
-        std::memcpy(memory.access(world_scratch+0x11C,96),memory.access(world_view.manager+0x11C,96),96);
-        for(unsigned i=0;i<detailed_count;++i) {
-            const auto self=world_records[i];
-            if(self==UINT32_MAX) continue;
-            const auto sector=world_view.sectors[i],origin=sector;
-            const auto opaque=memory.load<std::uint8_t>(origin+0x214),alpha=memory.load<std::uint8_t>(origin+0x215);
-            const auto groups=memory.load<std::uint32_t>(origin+0x7AC),meshes=memory.load<std::uint32_t>(sector+0xBC);
-            if(opaque>alpha || alpha>groups || groups>80 || meshes>80)
-                throw NativeBoundary(0x90D30,"unsupported original world material groups");
-            memory.store<std::uint32_t>(world_scratch+0x118,origin);
-            memory.store<std::uint32_t>(world_scratch+0x310,1);
-            memory.store<std::uint32_t>(world_scratch+0x2C8,self);
-            memory.store<std::uint32_t>(world_scratch+0xD0+self*4,sector);
-            memory.store<std::uint32_t>(world_scratch+0x88+self*4,4);
-            const auto begin=phase==0?0U:phase==1?unsigned(opaque):unsigned(alpha);
-            const auto end=phase==0?unsigned(opaque):phase==1?unsigned(alpha):groups;
-            for(unsigned group=begin;group<end;++group) {
-                const auto mesh=memory.load<std::uint8_t>(origin+0x21C+self*0x54+group);
-                if(mesh==255) continue;
-                if(mesh>=meshes || mesh>=128) throw NativeBoundary(0x90D30,"invalid nearby world mesh index");
-                const std::array arguments{group};
-                world_call(cpu,phase==1?0x90BC0:0x90A50,world_scratch,arguments);++detailed_batches;
-            }
-        }
-    }
-    void enhancement(Cpu& cpu,std::uint32_t address,std::uint32_t manager) {
+    void enhancement(Cpu& cpu,std::uint32_t address) {
         switch(address) {
+        case 0x1AC27: {
+            // The original widget constructors share (x,y,scale,flags,player).
+            // Keep each complete widget about its authored anchor, including
+            // text spacing, gauge needles and animated children.
+            const auto object=cpu.registers[ecx];
+            for(unsigned i=0;i<32;++i) {
+                if(memory.load<std::uint32_t>(0x3D8580+i*4)!=object) continue;
+                const auto first=memory.load<std::uint32_t>(object+8);
+                const auto next=i==31?33U:memory.load<std::uint32_t>(memory.load<std::uint32_t>(0x3D8584+i*4)+8);
+                if(first>=next || next>hud_layout.anchors.size()) throw NativeBoundary(address,"invalid HUD widget range");
+                const auto method=memory.load<std::uint32_t>(memory.load<std::uint32_t>(object)+4);
+                // Projected world markers and the split-screen divider use
+                // scene/screen coordinates rather than a HUD widget anchor.
+                if(method==0x1F790 || method==0x24080) break;
+                // Lesson targets/scores ignore the constructor's x and use
+                // their own right-aligned column for all four text rows.
+                const auto anchor=std::bit_cast<float>(memory.load<std::uint32_t>(method==0x21F50?0x4D4884:cpu.registers[esp]));
+                for(auto index=first;index<next;++index) {
+                    hud_layout.anchors[index]=anchor;hud_layout.active|=1ULL<<index;
+                }
+                break;
+            }
+            break;
+        }
+        case 0x1D121: {
+            const auto queue=memory.load<std::uint32_t>(0x3D8570),root=memory.load<std::uint32_t>(queue);
+            hud_layout.list=memory.load<std::uint32_t>(queue+0x3C);
+            hud_layout.root_x=std::bit_cast<float>(memory.load<std::uint32_t>(root+0x20));
+            hud_layout.root_scale=std::bit_cast<float>(memory.load<std::uint32_t>(root+0x28));
+            const auto native_scale=hud_layout.root_scale*640/memory.load<std::uint32_t>(0x443EC4);
+            // Native wide split-screen already uses an approximately 854-wide
+            // canvas. Compensate only the horizontal stretch still remaining.
+            if(!(native_scale>0) || !std::isfinite(native_scale)) throw NativeBoundary(address,"invalid HUD canvas scale");
+            hud_layout.scale=std::min(1.0f,0.75f/native_scale);
+            break;
+        }
+        case 0x81158:case 0x81369:case 0x817F7:
+            submit_graphics(false);gpu->begin_overlay();break;
+        case 0x215CE0:
+            if(gpu) {submit_graphics(false);gpu->restore_feedback();}break;
+        // Preserve the original visibility/material records. Detailed sections
+        // outside that set contain open terrain backs and overlap the distant
+        // models. Extend clipping, scenery fades and traffic LOD within those
+        // authored views instead of submitting incompatible geometry twice.
         case 0x8EEB0:prepare_world(cpu);break;
         case 0xE8450:if(host.draw_distance>1) extend_camera(cpu);break;
         case 0xA6E00:world_reflecting=true;break;
         case 0xA7306:world_reflecting=false;break;
-        case 0x90D30:world_active=false;world_view.manager=0;break;
-        case 0x90F68:select_world(cpu,manager);break;
-        case 0x90F7E:draw_detailed_world(cpu,0);break;
-        case 0x90FDC:draw_detailed_world(cpu,1);break;
-        case 0x914BF:draw_detailed_world(cpu,2);break;
-        // Only the main scene's prop loops use the extended visibility list.
-        case 0x9158F:world_active=false;world_view.manager=0;break;
+        case 0x90F68:select_world(cpu);break;
+        case 0x90F7E:draw_world(cpu,0);break;
+        case 0x90FDC:draw_world(cpu,1);break;
+        case 0x914BF:draw_world(cpu,2);break;
+        case 0x9158F:world_view.manager=0;break;
         default:throw NativeBoundary(address,"unsupported title enhancement site");
         }
     }
@@ -1701,7 +2034,7 @@ struct Xbox::State {
                     MotionCamera motion;motion.identifier=camera;motion.near_plane=value(0x80);motion.far_plane=value(0x84);
                     motion.projection=memory.load<std::uint32_t>(camera+0x14);
                     for(unsigned i=0;i<motion.view.size();++i) motion.view[i]=value(0x20+i*4);
-                    graphics->camera(camera,motion.near_plane,motion.far_plane,2*std::atan(value(0x6C)),&motion);
+                    graphics->camera(camera,motion.near_plane,motion.far_plane,2*std::atan(value(0x6C)),&motion,value(0x68)/value(0x6C));
                 } else graphics->camera(0,0,0,0);
             }
             if(host.flip) host.flip();
@@ -1730,15 +2063,15 @@ struct Xbox::State {
         if(live) for(auto& thread:threads) thread->cpu.diagnostic=nullptr;
         finish(cpu,4,0);
     }
-    void submit_graphics() {
+    void submit_graphics(bool flush=true) {
         constexpr std::uint32_t context=0x002256C0;
         if(!gpu) throw std::runtime_error("Native GPU submission precedes device initialization");
         const auto flags=memory.load<std::uint32_t>(context+8);
         const auto end=memory.load<std::uint32_t>(context+((flags&4)?0x358:0));
         const auto ring_begin=memory.load<std::uint32_t>(context+0x24),ring_end=memory.load<std::uint32_t>(context+0x28);
         if(gpu_cursor<ring_begin || end<gpu_cursor || end>ring_end) throw std::runtime_error("Original GPU submission left its push-buffer ring");
-        if(end!=gpu_cursor) {gpu->submit(gpu_cursor,end);gpu_cursor=end;}
-        if(memory.load<std::uint32_t>(0x00225210)) {gpu->wait();memory.store<std::uint32_t>(context+8,flags|0x2000);}
+        if(end!=gpu_cursor) {gpu->submit(gpu_cursor,end,flush);gpu_cursor=end;}
+        if(flush && memory.load<std::uint32_t>(0x00225210)) {gpu->wait();memory.store<std::uint32_t>(context+8,flags|0x2000);}
     }
     void platform(Cpu& cpu,std::uint32_t address) {
         if(address==0x00128CF8) {
@@ -1951,7 +2284,7 @@ struct Xbox::State {
         if(file.entry.directory() && !file.device) return fail(0xC00000BA);
         if(write && file.native==INVALID_HANDLE_VALUE) return fail(write_protected);
         if(!write && !(file.access&(0x80000000U|1U))) return fail(access_denied);
-        const auto sector=file.native!=INVALID_HANDLE_VALUE?512U:2048U;
+        const auto sector=file.native!=INVALID_HANDLE_VALUE && !file.disc_file?512U:2048U;
         // Original sample.xsb/b2distfx.bin callers use ordinary heap buffers.
         // Enforce sector transfers without imposing Windows DMA alignment on
         // the guest's pointer; our mounted-image handle is buffered.
@@ -2036,12 +2369,12 @@ struct Xbox::State {
         const auto relative=disc_path(*name);
         if(!relative) return open_writable(cpu,*name,options_index,share_index,disposition,information);
         if(!disc) return no_media;
-        const auto entry=disc->lookup(*relative);
+        auto entry=disc->lookup(*relative);
         if(!entry) return name_not_found;
-        if(host.draw_distance>1 && !entry->directory()) {
-            const auto path=folded(*relative);
-            if(path.ends_with(".PSW")) world_streams[0]=*entry;
-            else if(path.ends_with(".P2W")) world_streams[1]=*entry;
+        const auto replacement=imported_file(*relative);
+        if(!replacement.empty()) {
+            const auto size=std::filesystem::file_size(replacement);
+            if(size>UINT32_MAX) return invalid_parameter;entry->size=static_cast<std::uint32_t>(size);
         }
         const auto access=argument(cpu,1),options=argument(cpu,options_index),share=argument(cpu,share_index);
         if(disposition>5 || share>7) return invalid_parameter;
@@ -2058,7 +2391,19 @@ struct Xbox::State {
         const auto base=allocate(72,page,true,PAGE_READWRITE);
         if(!base) return no_memory;
         const auto address=base|0x80000000U,handle=next_handle; next_handle+=4;
-        auto file=std::make_shared<OpenFile>();file->entry=*entry;file->path=*name;
+        auto file=std::make_shared<OpenFile>();file->entry=*entry;file->path=*name;file->disc_file=true;
+        if(host.draw_distance>1) {
+            const auto path=folded(*relative);
+            if(path.ends_with(".PSW") || path.ends_with(".P2W")) {
+                const auto mode=unsigned(path.ends_with(".P2W"));world_streams[mode]=*entry;world_paths[mode]=replacement;
+            }
+        }
+        if(!replacement.empty()) {
+            file->host_path=replacement;
+            file->native=CreateFileW(replacement.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,
+                (options&0x30)?FILE_ATTRIBUTE_NORMAL:FILE_FLAG_OVERLAPPED|FILE_FLAG_RANDOM_ACCESS,nullptr);
+            if(file->native==INVALID_HANDLE_VALUE) {const auto error=GetLastError();release_allocation(allocations.find(base));return file_error(error);}
+        }
         file->access=access;file->share=share;file->options=options;file->device=relative->empty();
         memory.store<std::uint16_t>(address,5);
         memory.store<std::uint8_t>(address+2,static_cast<std::uint8_t>(((access&(0x80000000U|1U))?2:0)|((share&7)<<4)));
@@ -2072,7 +2417,7 @@ struct Xbox::State {
         return success;
     }
     std::uint32_t file_attributes(const OpenFile& file) const {
-        if(file.native!=INVALID_HANDLE_VALUE) return file.entry.directory()?0x10U:0x20U;
+        if(!file.disc_file && file.native!=INVALID_HANDLE_VALUE) return file.entry.directory()?0x10U:0x20U;
         return file.entry.directory()?0x11U:0x21U;
     }
     std::uint64_t file_size(const OpenFile& file) const {
@@ -2092,8 +2437,9 @@ struct Xbox::State {
         if(length<required) return buffer_too_small;
         auto data=static_cast<std::byte*>(memory.access(output,required));std::memset(data,0,required);
         const auto size=file_size(file);
-        const auto unit=file.native!=INVALID_HANDLE_VALUE?16384ULL:2048ULL,allocated=(size+unit-1)&~(unit-1);
-        if(file.native!=INVALID_HANDLE_VALUE && (type==4 || type==34)) {
+        const bool native_disk=!file.disc_file && file.native!=INVALID_HANDLE_VALUE;
+        const auto unit=native_disk?16384ULL:2048ULL,allocated=(size+unit-1)&~(unit-1);
+        if(native_disk && (type==4 || type==34)) {
             BY_HANDLE_FILE_INFORMATION native{};
             if(!GetFileInformationByHandle(file.native,&native)) return file_error(GetLastError());
             const FILETIME times[]={native.ftCreationTime,native.ftLastAccessTime,native.ftLastWriteTime,native.ftLastWriteTime};
@@ -2104,7 +2450,7 @@ struct Xbox::State {
         case 5:memory.store<std::uint64_t>(output,allocated);memory.store<std::uint64_t>(output+8,size);
             memory.store<std::uint32_t>(output+16,1);memory.store<std::uint8_t>(output+21,file.entry.directory());break;
         case 6:
-            if(file.native!=INVALID_HANDLE_VALUE) {
+            if(native_disk) {
                 BY_HANDLE_FILE_INFORMATION native{};
                 if(!GetFileInformationByHandle(file.native,&native)) return file_error(GetLastError());
                 memory.store<std::uint64_t>(output,(static_cast<std::uint64_t>(native.nFileIndexHigh)<<32)|native.nFileIndexLow);
@@ -2115,7 +2461,7 @@ struct Xbox::State {
             std::memcpy(data+4,file.path.data(),file.path.size());break;
         case 14:memory.store<std::uint64_t>(output,file.position);break;
         case 16:memory.store<std::uint32_t>(output,file.options);break;
-        case 17:memory.store<std::uint32_t>(output,file.native!=INVALID_HANDLE_VALUE?511:2047);break;
+        case 17:memory.store<std::uint32_t>(output,native_disk?511:2047);break;
         case 19:memory.store<std::uint64_t>(output,allocated);break;
         case 20:memory.store<std::uint64_t>(output,size);break;
         case 34:memory.store<std::uint64_t>(output+32,allocated);memory.store<std::uint64_t>(output+40,size);
@@ -2284,6 +2630,10 @@ struct Xbox::State {
                             const auto relative=disc_path(file.path);
                             if(!relative) throw NativeBoundary(cpu.eip,"directory left its mounted disc");
                             file.listing=disc->list(*relative);
+                            if(imported.selected) for(auto& entry:file.listing) if(!entry.directory()) {
+                                const auto replacement=imported_file(*relative+"/"+entry.name);
+                                if(!replacement.empty()) entry.size=static_cast<std::uint32_t>(std::filesystem::file_size(replacement));
+                            }
                         }
                         file.listing_position=0;file.listing_loaded=true;
                     }
@@ -2330,7 +2680,7 @@ struct Xbox::State {
                         if(offset>INT64_MAX) result=invalid_parameter;
                         else {file.position=offset;memory.store<std::uint64_t>(found->second.address+0x14,offset);}
                     }
-                } else if(file.native==INVALID_HANDLE_VALUE) result=write_protected;
+                } else if(file.disc_file || file.native==INVALID_HANDLE_VALUE) result=write_protected;
                 else if(type==19 || type==20) {
                     if(argument(cpu,3)<8) result=buffer_too_small;
                     else {
@@ -2365,10 +2715,11 @@ struct Xbox::State {
                 else throw NativeBoundary(cpu.eip,std::format("unsupported set-file information class {}",type));
             } else if constexpr(Ordinal==218) {
                 const auto output=argument(cpu,2),length=argument(cpu,3),type=argument(cpu,4);
+                const bool native_disk=!file.disc_file && file.native!=INVALID_HANDLE_VALUE;
                 if(type==3) {
                     if(length<24) result=buffer_too_small;
                     else {
-                        if(file.native!=INVALID_HANDLE_VALUE) {
+                        if(native_disk) {
                             ULARGE_INTEGER free{},total{};
                             if(!GetDiskFreeSpaceExW(user_root.c_str(),&free,&total,nullptr)) result=file_error(GetLastError());
                             else {
@@ -2383,17 +2734,17 @@ struct Xbox::State {
                     }
                 } else if(type==4) {
                     if(length<8) result=buffer_too_small;
-                    else {memory.store<std::uint32_t>(output,file.native!=INVALID_HANDLE_VALUE?7:2);memory.store<std::uint32_t>(output+4,file.native!=INVALID_HANDLE_VALUE?0:0x24);written=8;}
+                    else {memory.store<std::uint32_t>(output,native_disk?7:2);memory.store<std::uint32_t>(output+4,native_disk?0:0x24);written=8;}
                 } else if(type==5) {
-                    const std::string_view name=file.native!=INVALID_HANDLE_VALUE?"FATX":"XDVDFS";
+                    const std::string_view name=native_disk?"FATX":"XDVDFS";
                     if(length<12+name.size()) result=buffer_too_small;
                     else {
-                        memory.store<std::uint32_t>(output,file.native!=INVALID_HANDLE_VALUE?2:0x00080000);memory.store<std::uint32_t>(output+4,file.native!=INVALID_HANDLE_VALUE?42:255);
+                        memory.store<std::uint32_t>(output,native_disk?2:0x00080000);memory.store<std::uint32_t>(output+4,native_disk?42:255);
                         memory.store<std::uint32_t>(output+8,static_cast<std::uint32_t>(name.size()));
                         std::memcpy(memory.access(output+12,name.size()),name.data(),name.size());written=12+static_cast<unsigned>(name.size());
                     }
                 } else throw NativeBoundary(cpu.eip,std::format("unsupported volume information class {}",type));
-            } else if constexpr(Ordinal==198) {if(file.native!=INVALID_HANDLE_VALUE && !FlushFileBuffers(file.native)) result=file_error(GetLastError());}
+            } else if constexpr(Ordinal==198) {if(!file.disc_file && file.native!=INVALID_HANDLE_VALUE && !FlushFileBuffers(file.native)) result=file_error(GetLastError());}
             io_status(argument(cpu,1),result,written);finish(cpu,cleanup,result);
         } else if constexpr(Ordinal==210) {
             const auto name=object_name(argument(cpu,0));const auto relative=name?disc_path(*name):std::nullopt;
@@ -2409,9 +2760,11 @@ struct Xbox::State {
                 memory.store<std::uint64_t>(output+32,(size+16383)&~16383ULL);memory.store<std::uint64_t>(output+40,size);
                 memory.store<std::uint32_t>(output+48,data.dwFileAttributes);finish(cpu,8,success);return;
             }
-            const auto entry=disc && relative?disc->lookup(*relative):std::nullopt;
+            auto entry=disc && relative?disc->lookup(*relative):std::nullopt;
             if(!entry) {finish(cpu,8,disc?name_not_found:no_media);return;}
-            OpenFile file;file.entry=*entry;file.path=*name;
+            const auto replacement=imported_file(*relative);
+            if(!replacement.empty()) entry->size=static_cast<std::uint32_t>(std::filesystem::file_size(replacement));
+            OpenFile file;file.entry=*entry;file.path=*name;file.disc_file=true;
             std::uint32_t written=0;finish(cpu,8,file_information(file,argument(cpu,1),52,34,written));
         } else if constexpr(Ordinal==67 || Ordinal==69) {
             const auto name=folded(counted_string(argument(cpu,0)));
@@ -2870,9 +3223,9 @@ struct Xbox::State {
         }
         result.threads_created=(next_thread-4)/4;
         result.vblank_callbacks=vblank_callbacks;
-        result.extended_world_sectors=world_count;result.visible_world_sectors=detailed_count;result.detailed_world_batches=detailed_batches;
-        result.original_camera_far=world_original_far;result.distance_culled_sectors=world_distance_culled;
-        result.original_render_distance=world_original_range;result.render_distance=world_range;
+        result.original_camera_far=world_original_far;
+        result.original_world_sections=world_original_count;result.extra_world_sections=world_added_count;
+        result.extra_world_batches=world_added_batches;
         if(world_camera) result.camera_far=std::bit_cast<float>(memory.load<std::uint32_t>(world_camera+0x84));
         for(const auto& thread:threads) {
             const auto state=std::array{"ready","running","waiting","ended"}[static_cast<unsigned>(thread->state)];
@@ -2886,7 +3239,7 @@ struct Xbox::State {
             result.stack_word_count=static_cast<std::uint32_t>(std::min<std::size_t>(result.stack_words.size(),(ram.size()-stack)/4));
             for(unsigned i=0;i<result.stack_word_count;++i) result.stack_words[i]=memory.load<std::uint32_t>(stack+i*4);
         }
-        result.cpu.kernel=nullptr; result.cpu.diagnostic=nullptr; result.cpu.clock=nullptr; result.cpu.preempt=nullptr; result.cpu.profile=nullptr;result.cpu.world_view=nullptr;
+        result.cpu.kernel=nullptr; result.cpu.diagnostic=nullptr; result.cpu.clock=nullptr; result.cpu.preempt=nullptr; result.cpu.profile=nullptr;result.cpu.world_view=nullptr;result.cpu.hud_layout=nullptr;
         diagnostic_guest(nullptr);
         // Resume sleeping native stacks with cancellation so their C++ and floating
         // scopes unwind before DeleteFiber releases host stacks.
@@ -2932,16 +3285,31 @@ void Xbox::capture_frame(const std::filesystem::path& directory,bool automated) 
     constexpr std::pair<std::uint32_t,unsigned> slices[]={{0x002FFD68,0xA0},{0x002FE370,16},{0x00300080,0x60},
         {0x0034AB40,0x40},{0x003525E0,0x144},{0x0048A150,16},{0x004CD800,32},{0x00522358,12},{0x00489F70,5*0x50},
         {0x0057C190,0x100},{0x002145A4,4},{0x0024A630,8},
-        {0x0033DEE4,24},{0x00559E78,24},{0x00225A7C,16}};
+        {0x0033DEE4,24},{0x00559E78,24},{0x00225A7C,16},{0x004CCAA8,12}};
     for(unsigned i=0;i<std::size(slices);++i) {
         if(i) snapshot<<',';const auto [address,size]=slices[i];
         snapshot<<std::format("{{\"address\":{},\"bytes\":{}}}",json(hex32(address)),json(hex_bytes({static_cast<const std::byte*>(memory.access(address,size)),size})));
     }
-    snapshot<<"],\"last_failed_allocation\":[";
+    snapshot<<std::format("],\"presentation\":{{\"simulation_step\":{},\"fraction\":{},\"smoothed_poses\":{},\"loading_delta\":{},\"ui\":",
+        state_->game_timing.step,double(state_->game_timing.remainder)/733333333.0,
+        state_->presentation.active_poses(),state_->game_timing.loading_delta);
+    state_->presentation.capture_ui(snapshot,memory,state_->game_timing.step);
+    snapshot<<"},\"last_failed_allocation\":[";
     for(unsigned i=0;i<state_->last_failed_allocation.size();++i) {
         if(i) snapshot<<',';snapshot<<state_->last_failed_allocation[i];
     }
-    snapshot<<"],\"io\":[";
+    snapshot<<std::format("],\"scenery\":{{\"origin\":{},\"original_visible\":{},\"extra_visible\":{},\"added\":[",
+        state_->world_origin,state_->world_original_count,state_->world_added_count);
+    const auto record=[&](const State::WorldRecord& view) {snapshot<<std::format("[{}, {}, {}]",view.section,view.origin,view.row);};
+    for(unsigned i=0;i<state_->world_draw_count;++i) {if(i) snapshot<<',';record(state_->world_draws[i]);}
+    snapshot<<"],\"plans\":[";
+    for(unsigned s=0;s<state_->world_sections.size();++s) {
+        if(s) snapshot<<',';snapshot<<'[';
+        const auto& additions=state_->world_sections[s].additions;
+        for(unsigned i=0;i<additions.size();++i) {if(i) snapshot<<',';record(additions[i]);}
+        snapshot<<']';
+    }
+    snapshot<<"]},\"io\":[";
     for(unsigned i=0;i<state_->io_trace.size();++i) {
         if(i) snapshot<<',';const auto& io=state_->io_trace[i];
         snapshot<<std::format("{{\"ordinal\":{},\"status\":{},\"information\":{},\"callsite\":{},\"path\":{},\"options\":{},\"requested\":{},\"offset\":{},\"buffer\":{}}}",
@@ -3362,7 +3730,7 @@ std::string check_visibility(const std::filesystem::path& executable,const std::
     std::string results;
     for(const auto config:std::array<std::array<unsigned,2>,4>{{{1,0},{3,0},{1,5},{2,6}}}) {
         const auto scale=config[0],aa=config[1];
-        Renderer renderer(64,64,warp,true,scale);renderer.enhancements(aa,0);renderer.interpolation(true);
+        Renderer renderer(64,64,warp,true,scale);renderer.enhancements(aa,0);
         std::vector<std::byte> ram(64*1024*1024);image.load(std::span(ram).subspan(image.base,image.image_size));Memory memory(0,ram);
         XboxHost provider;provider.storage_root=output/std::format("storage-{}-{}",scale,aa);
         Xbox xbox(image,memory,ram,{},std::move(provider));auto& state=*xbox.state_;
@@ -3887,14 +4255,731 @@ void native_platform(Cpu& cpu,Memory& memory,std::uint32_t address) {
     PerfScope timing(host.host.performance,PerfPhase::platform,address);
     host.platform(cpu,address);
 }
-void title_enhancement(Cpu& cpu,Memory& memory,std::uint32_t address,std::uint32_t manager) {
+std::string check_track_import(const std::filesystem::path& executable,const std::filesystem::path& disc_path,
+                               const std::filesystem::path& assets,const std::filesystem::path& output) {
+    using State=Xbox::State;
+    Xbe image(executable);if(!image.supported()) throw std::runtime_error("Track import checks require the verified XBE");
+    std::filesystem::create_directories(output);
+    std::vector<std::byte> ram(64*1024*1024);image.load(std::span(ram).subspan(image.base,image.image_size));Memory memory(0,ram);
+    XboxHost provider;provider.storage_root=output/"storage";provider.imported_tracks=assets;
+    Xbox xbox(image,memory,ram,disc_path,std::move(provider));auto& state=*xbox.state_;
+    auto& thread=state.create(0,0,0,image.stack_commit,0,false);state.current=&thread;
+    auto& cpu=thread.cpu;cpu.preempt=nullptr;state.diagnostic.remaining=2000000;
+    const auto stack=cpu.registers[esp]-8192;
+    unsigned checks=0;
+    const auto require=[&](bool condition,std::string_view name) {if(!condition) throw std::runtime_error("Track import check: "+std::string(name));++checks;};
+    const auto invoke=[&](unsigned address,unsigned object,std::initializer_list<unsigned> arguments={}) {
+        state.diagnostic.remaining=2000000;cpu.registers[ecx]=object;cpu.registers[esp]=stack;
+        memory.store<std::uint32_t>(stack,return_sentinel);unsigned index=0;
+        for(auto value:arguments) memory.store<std::uint32_t>(stack+4+index++*4,value);
+        try {invoke_native(cpu,memory,address);} catch(const std::exception& error) {
+            throw std::runtime_error(std::format("Track call {} stopped at {}: {}",hex32(address),hex32(cpu.eip),error.what()));
+        }
+        require(cpu.eip==return_sentinel,"original call returns to its caller");return cpu.registers[eax];
+    };
+    memory.store<std::uint32_t>(0xA000,0x30);
+    const auto heap=invoke(0xE435A,0,{2,0,image.heap_reserve,image.heap_commit,0,0xA000});
+    require(heap!=0,"original SDK heap initialization");memory.store<std::uint32_t>(0x5A8974,heap);
+    memory.store<std::uint32_t>(0x5A619C,heap);require(invoke(0x123801,0)==1,"original CRT lock initialization");
+    constexpr unsigned master=0x8381C000,manager=0x0E000000;
+    const auto race=state.allocate(2*1024*1024,page,true,PAGE_READWRITE);
+    require(race!=0,"race diagnostic allocation does not overlap the original heap");
+    File master_file(assets/"interstate.pss");require(master_file.size()<=0x6A4000,"fixed master allocation");
+    master_file.read(0,{static_cast<std::byte*>(memory.access(master,master_file.size())),static_cast<std::size_t>(master_file.size())});
+    memory.store<std::uint32_t>(0x4B85B8,master);
+    memory.store<std::uint32_t>(0x5ACE74,0x34);
+    const auto texture_table=memory.load<std::uint32_t>(master+20);
+    require(memory.load<std::uint32_t>(master+16)==232,"all original, imported, barrier and environment texture headers are present");
+    state.imported.selected=true;invoke(0x8BCD0,0x4B85B0);
+    for(unsigned i=146;i<231;++i) {
+        const auto texture=memory.load<std::uint32_t>(texture_table+i*4);
+        const auto raster=memory.load<std::uint32_t>(texture),resource=memory.load<std::uint32_t>(raster+0x34);
+        require(memory.load<std::uint32_t>(resource+4)>=(master&0x7FFFFFFF),"original texture registration retains imported pixels");
+        require(memory.load<std::uint32_t>(resource+12)!=0,"original texture registration creates an Xbox texture header");
+    }
+    File race_file(assets/"interstate.bgd");require(race_file.size()<=2*1024*1024,"fixed race allocation");
+    race_file.read(0,{static_cast<std::byte*>(memory.access(race,race_file.size())),static_cast<std::size_t>(race_file.size())});
+    memory.store<std::uint32_t>(0x2FFFF8,1);memory.store<std::uint32_t>(0x2FFFFC,race);
+    require(invoke(0x79C70,0x2FFFF8)==1,"original race loader accepts imported arrays");
+    require(memory.load<std::uint32_t>(0x4B8498)==47,"original loader retains all authored replay cameras");
+    const auto authored_cameras=memory.load<std::uint32_t>(0x4B8494);
+    require(memory.load<std::uint16_t>(authored_cameras+24)==0 && memory.load<std::uint8_t>(authored_cameras+26)==0x87 &&
+        memory.load<std::uint8_t>(authored_cameras+27)==5,"original starting camera and mode are retained");
+    File camera_file(assets/"interstate.bcd");require(camera_file.size()<0x20000,"native camera allocation bounds");
+    const auto camera_data=state.allocate(0x20000,page,true,PAGE_READWRITE);
+    require(camera_data!=0,"camera diagnostic allocation");
+    camera_file.read(0,{static_cast<std::byte*>(memory.access(camera_data,camera_file.size())),static_cast<std::size_t>(camera_file.size())});
+    memory.store<std::uint32_t>(0x34AB50,camera_data);memory.store<std::uint32_t>(0x300050,1);
+    require(invoke(0x891A0,0x300000)==1,"native cinematic loader accepts the imported camera file");
+    require(memory.load<std::uint32_t>(0x300020)==1 && memory.load<std::uint32_t>(0x300024)==722 &&
+        memory.load<std::uint32_t>(0x300040)==1,"opening keeps the native duration and uses the authored starting view");
+    const auto replay_records=memory.load<std::uint32_t>(0x300018),replay_positions=memory.load<std::uint32_t>(0x30001C);
+    const auto replay_count=memory.load<std::uint32_t>(0x300038),replay_points=memory.load<std::uint32_t>(0x30003C);
+    require(replay_count==57 && replay_points>47 && memory.load<std::uint32_t>(0x30004C)==1,"all replay cameras and spline end markers are loaded");
+    unsigned source_cameras=0,spline_cameras=0;
+    for(unsigned i=0;i<replay_count;++i) {
+        const auto record=replay_records+i*104,flags=memory.load<std::uint32_t>(record+0x34),mode=flags&0x7E0;
+        const auto id=memory.load<std::uint32_t>(record+0x10);
+        require(id>=1 && id<=47 && memory.load<std::uint32_t>(record+0x38)<437,"camera identity and source road index");
+        require(memory.load<std::uint32_t>(record+0x3C)<=memory.load<std::uint32_t>(record+0x40) &&
+            memory.load<std::uint32_t>(record+0x40)<replay_points,"camera path bounds");
+        if(mode==0x400) continue;
+        ++source_cameras;const auto original=authored_cameras+(id-1)*44;
+        if(mode==0x200) {++spline_cameras;require((memory.load<std::uint32_t>(record+104+0x34)&0x7E0)==0x400,"spline has its own end gate");}
+        else {
+            const auto position=replay_positions+memory.load<std::uint32_t>(record+0x3C)*12;
+            require(!std::memcmp(memory.access(position,12),memory.access(original,12),12),"static camera retains its source position");
+        }
+        require(memory.load<std::uint32_t>(record+0x14)==std::bit_cast<std::uint32_t>(float(memory.load<std::uint8_t>(original+32))),
+            "camera retains its authored field of view");
+    }
+    require(source_cameras==47 && spline_cameras==10,"all five authored camera modes are represented");
+    require(invoke(0x89400,0x300054)==1,"native replay controller accepts converted gates and paths");
+    const auto road=memory.load<std::uint32_t>(0x4B8450),curve=memory.load<std::uint32_t>(road);
+    const auto route_points=memory.load<std::uint32_t>(curve);
+    require(route_points==437,"original loader finds Interstate's closed lap route without a duplicate segment");
+    require(memory.load<std::uint32_t>(curve+0x1C)==race+0x160,"route vertices refer to imported positions");
+    const auto distances=memory.load<std::uint32_t>(curve+12);
+    const auto metres=std::bit_cast<float>(memory.load<std::uint32_t>(distances+(route_points-1)*8));
+    require(std::isfinite(metres) && metres>8039 && metres<8040,"original lap length is 8.04 km");
+    invoke(0x7D750,road,{0,0xA100});float direction=0;
+    for(unsigned axis=0;axis<3;++axis) direction+=std::bit_cast<float>(memory.load<std::uint32_t>(0xA100+axis*4))*
+        std::bit_cast<float>(memory.load<std::uint32_t>(race+0x60+axis*4));
+    require(direction>0,"original road direction agrees with the starting grid");
+    invoke(0x1F4950,0);
+    const auto checkpoints=memory.load<std::uint32_t>(0x4B8464),checkpoint_count=memory.load<std::uint32_t>(0x4B8468);
+    require(checkpoint_count==6 && memory.load<std::uint32_t>(0x4B8470)==48,"original loader finds six checkpoint planes and their per-lap events");
+    constexpr unsigned checkpoint_car=0xC000;
+    memory.fill_elements<std::uint32_t>(checkpoint_car,0,1024,false);
+    constexpr unsigned bonuses[6][3]={{55000,42000,0},{30000,25000,25000},{27000,22000,22000},
+        {24000,22000,22000},{38000,32000,30000},{22000,20000,25000}};
+    unsigned checkpoint_crossings=0;
+    for(unsigned lap=0;lap<3;++lap) {
+        unsigned previous=0;
+        memory.store<std::uint32_t>(checkpoint_car+0x644,lap);
+        for(unsigned gate=0;gate<checkpoint_count;++gate) {
+            const auto object=checkpoints+gate*28,plane=memory.load<std::uint32_t>(object+4);
+            require(memory.load<std::uint32_t>(plane+0x20)==8,"checkpoint retains eight per-lap event slots");
+            const auto event=memory.load<std::uint32_t>(plane+0x24+lap*4),event_data=memory.load<std::uint32_t>(event+4);
+            require(memory.load<std::uint32_t>(event_data)==bonuses[gate][lap],"checkpoint retains the original Burnout 1 time bonus");
+            invoke(0x9F610,object);bool crossed=false;
+            for(unsigned point=0;point<route_points && !crossed;++point) {
+                memory.store<std::uint32_t>(checkpoint_car+0xD4C,point+1);
+                memory.store<std::uint32_t>(0xA140,UINT32_MAX);
+                state.diagnostic.break_address=0x9F660;state.diagnostic.break_hit=1;
+                try {require(invoke(0x79B00,object,{checkpoint_car,point,0xA140})==0,"checkpoint does not trigger before its crossing");}
+                catch(const std::runtime_error&) {
+                    if(cpu.eip!=0x9F660) throw;
+                    crossed=true;require(memory.load<std::uint32_t>(0xA140)==bonuses[gate][lap],"original crossing code awards the imported checkpoint time");
+                    require(!gate || point>previous,"original route crosses the imported gates in order");previous=point;++checkpoint_crossings;
+                }
+                state.diagnostic.break_address=0;
+            }
+            require(crossed,"original game code recognizes the checkpoint crossing");
+        }
+    }
+    File world_file(assets/"interstate.psw");const auto sections=memory.load<std::uint32_t>(master+0x5C);
+    require(sections==59 && world_file.size()==sections*State::world_stride,"world stream dimensions");
+    std::vector<std::byte> world(static_cast<std::size_t>(world_file.size())),scratch(4096);
+    world_file.read(0,world);memory.map(State::world_base,world);memory.map(State::world_base&0x7FFFFFFF,world);memory.map(manager,scratch);
+    memory.store<std::uint32_t>(manager+0x10,State::world_base);
+    std::uint64_t triangles=0;unsigned instances=0;
+    for(unsigned i=0;i<sections;++i) {
+        const auto sector=State::world_base+i*State::world_stride;
+        memory.store<std::uint32_t>(manager+0x24,i);invoke(0x8EEB0,manager);
+        const auto tree=memory.load<std::uint32_t>(sector+0xB0),vertices=memory.load<std::uint32_t>(sector+0x84);
+        require(tree>=sector && tree<sector+State::world_stride,"original collision tree relocation");
+        require(memory.load<std::uint32_t>(tree+4)==tree+16,"original collision branch relocation");
+        require(vertices>=sector && vertices<sector+State::world_stride,"original collision vertex relocation");
+        for(unsigned j=0;j<memory.load<std::uint32_t>(sector+0xBC);++j) {
+            const auto mesh=memory.load<std::uint32_t>(sector+0xC4+j*4);
+            require(mesh>=sector && mesh<sector+State::world_stride,"original mesh relocation");
+            require(memory.load<std::uint32_t>(mesh+4)>=(sector&0x7FFFFFFF),"original vertex buffer relocation");
+        }
+        const auto groups=memory.load<std::uint32_t>(sector+0x8F0);
+        for(unsigned prop=0;prop<memory.load<std::uint32_t>(master+0x18);++prop) {
+            const auto group=groups+prop*12,count=memory.load<std::uint32_t>(group);
+            if(!count) continue;
+            instances+=count;
+            const auto matrices=memory.load<std::uint32_t>(group+4),bounds=memory.load<std::uint32_t>(group+8);
+            require(matrices>=sector && matrices+count*64<=sector+State::world_stride,"original instance matrix relocation");
+            require(bounds>=sector && bounds+count*60<=sector+State::world_stride,"original instance bounds relocation");
+        }
+        memory.store<std::uint32_t>(sector+0xB4,2);
+        triangles+=memory.load<std::uint32_t>(sector+0x90);
+    }
+    require(instances==894,"all original roadside instances are present");
+    memory.store<std::uint32_t>(manager+4,18);memory.store<std::uint32_t>(manager+0x34,8);
+    require(invoke(0x8F240,manager,{race+0x20})==8,"original streamer finds the starting grid in its initial contact window");
+    constexpr unsigned collision_manager=0x48A150+0x2F460;
+    std::memcpy(memory.access(collision_manager,0x318),memory.access(manager,0x318),0x318);
+    const auto ray_contact=[&](const std::array<float,3>& from,const std::array<float,3>& to) {
+        for(unsigned axis=0;axis<3;++axis) {
+            memory.store<std::uint32_t>(0xA160+axis*4,std::bit_cast<std::uint32_t>(from[axis]));
+            memory.store<std::uint32_t>(0xA180+axis*4,std::bit_cast<std::uint32_t>(to[axis]));
+        }
+        return invoke(0x92F20,0x48A150,{0,0,0xA160,0xA180,0xA1A0,0})!=0;
+    };
+    const auto road_contact=[&](std::array<float,3> point) {
+        auto from=point;from[1]+=20;point[1]-=20;return ray_contact(from,point);
+    };
+    std::array<float,3> grid;
+    for(unsigned axis=0;axis<3;++axis) grid[axis]=std::bit_cast<float>(memory.load<std::uint32_t>(race+0x20+axis*4));
+    require(road_contact(grid),"original collision code finds road beneath the starting grid");
+    memory.store<std::uint32_t>(collision_manager+4,sections);
+    const auto positions=memory.load<std::uint32_t>(curve+0x1C),pairs=memory.load<std::uint32_t>(curve+8);
+    const auto contact_section=[&](const std::array<float,3>& point) {
+        for(unsigned section=0;section<sections;++section) {
+            bool inside=true;const auto sector=State::world_base+section*State::world_stride;
+            for(unsigned plane=0;plane<4;++plane) {
+                const auto at=sector+64+plane*16;float distance=-std::bit_cast<float>(memory.load<std::uint32_t>(at+12));
+                for(unsigned axis=0;axis<3;++axis) distance+=std::bit_cast<float>(memory.load<std::uint32_t>(at+axis*4))*point[axis];
+                inside&=distance>=0;
+            }
+            if(inside) return section;
+        }
+        return UINT32_MAX;
+    };
+    unsigned contacts=0;std::string missed;
+    for(unsigned i=0;i<route_points;++i) {
+        const auto left=positions+memory.load<std::uint16_t>(pairs+i*4)*16,right=positions+memory.load<std::uint16_t>(pairs+i*4+2)*16;
+        std::array<float,3> point;
+        for(unsigned axis=0;axis<3;++axis) point[axis]=(std::bit_cast<float>(memory.load<std::uint32_t>(left+axis*4))+
+            std::bit_cast<float>(memory.load<std::uint32_t>(right+axis*4)))*0.5f;
+        const auto containing=contact_section(point);
+        require(containing!=UINT32_MAX,"lap route remains inside the streamed world");
+        memory.store<std::uint32_t>(collision_manager+0x34,containing);
+        bool hit=false;
+        // A freeway cross-section can span a median. Check the carriageways,
+        // rather than requiring the exact midpoint to contain a road triangle.
+        for(const float fraction:{0.5f,0.1f,0.3f,0.7f,0.9f}) {
+            for(unsigned axis=0;axis<3;++axis) point[axis]=
+                std::bit_cast<float>(memory.load<std::uint32_t>(left+axis*4))*(1-fraction)+
+                std::bit_cast<float>(memory.load<std::uint32_t>(right+axis*4))*fraction;
+            if(road_contact(point)) {hit=true;break;}
+        }
+        contacts+=hit;
+        if(!hit && missed.size()<200) missed+=std::format(" {}:[{},{},{}]@{}",i,point[0],point[1],point[2],containing);
+    }
+    require(contacts==route_points,std::format("original collision code finds road across every lap cross-section ({}/{}; missing{})",contacts,route_points,missed));
+    require(memory.load<std::uint32_t>(0x4B8458)==1,"imported respawn route is registered");
+    const auto ai=memory.load<std::uint32_t>(memory.load<std::uint32_t>(0x4B8454));
+    const auto ai_pairs=memory.load<std::uint32_t>(ai+8),ai_attrs=memory.load<std::uint32_t>(ai+20);
+    require(memory.load<std::uint32_t>(ai)==route_points,"respawn route follows the complete lap");
+    unsigned respawns=0;
+    for(unsigned i=0;i<route_points;++i) {
+        if(!memory.load<std::uint8_t>(ai_attrs+i*32+4)) continue;
+        require(memory.load<std::uint8_t>(ai_attrs+i*32+4)==2,"respawn uses the authored carriageway edge");
+        const auto vertex=positions+memory.load<std::uint16_t>(ai_pairs+i*4+2)*16;
+        std::array<float,3> from,to;
+        for(unsigned axis=0;axis<3;++axis) from[axis]=to[axis]=std::bit_cast<float>(memory.load<std::uint32_t>(vertex+axis*4));
+        const auto containing=contact_section(from);require(containing!=UINT32_MAX,"respawn remains inside the streamed world");
+        memory.store<std::uint32_t>(collision_manager+0x34,containing);
+        from[1]+=1;to[1]-=1;
+        require(ray_contact(from,to),std::format("native collision beneath respawn point {}",i));++respawns;
+    }
+    require(respawns==378,"original prohibited respawn sections are retained");
+    // The longest B1 exclusion needs four skips; B2's three-skip fallback
+    // would put the car back in a prohibited section. Exercise the real search.
+    constexpr unsigned respawn_car=0xC000,respawn_body=0xB000,respawn_matrix=0xB100;
+    for(const bool imported:{false,true}) {
+        state.imported.selected=imported;
+        memory.fill_elements<std::uint32_t>(respawn_car,0,1024,false);
+        memory.fill_elements<std::uint32_t>(respawn_body,0,128,false);
+        memory.store<std::uint32_t>(respawn_car+8,respawn_body);
+        memory.store<std::uint32_t>(respawn_body+16,respawn_matrix);
+        for(unsigned axis=0;axis<3;++axis) memory.store<std::uint32_t>(respawn_matrix+axis*20,std::bit_cast<std::uint32_t>(1.0f));
+        const auto vertex=positions+memory.load<std::uint16_t>(ai_pairs+139*4+2)*16;
+        std::memcpy(memory.access(respawn_matrix+48,12),memory.access(vertex,12),12);
+        memory.store<std::uint32_t>(respawn_car+0xD4C,139);
+        memory.store<std::uint32_t>(respawn_car+0xD54,memory.load<std::uint32_t>(0x4B8454));
+        memory.store<std::uint32_t>(respawn_car+0xD58,139);
+        // Checkpoints are at function entries: the stock fallback logs before
+        // placement, while the extended search reaches the body reset.
+        const auto boundary=imported?0x5F360U:0x11E2EEU;
+        state.diagnostic.break_address=boundary;state.diagnostic.break_hit=1;
+        try {invoke(0x84510,respawn_car,{0});throw std::runtime_error("Respawn search boundary was not reached");}
+        catch(const std::runtime_error&) {if(cpu.eip!=boundary) throw;}
+        state.diagnostic.break_address=0;
+        if(!imported) require(cpu.registers[edi]==155,"native B2 respawn retains its original three-skip limit");
+        else {
+            const auto expected=positions+memory.load<std::uint16_t>(ai_pairs+159*4+2)*16;
+            require(std::memcmp(memory.access(respawn_matrix+48,12),memory.access(expected,12),12)==0,
+                "native respawn clears B1's longer exclusion and uses the next permitted point");
+        }
+    }
+    require(memory.load<std::uint32_t>(0x4B8460)==32 && memory.load<std::uint32_t>(0x4B84A0)>1,
+        "native traffic lanes and spatial activation are registered");
+    // Check individual upward-facing surfaces too: one hit across the whole
+    // freeway width cannot detect a missing lane or a bad section boundary.
+    unsigned road_faces=0,missing_faces=0;std::string collision_misses="section,triangle,x,y,z,selected,direct\n";
+    unsigned wheel_faces=0;
+    for(unsigned section=0;section<sections;++section) {
+        const auto sector=State::world_base+section*State::world_stride;
+        const auto vertex_data=memory.load<std::uint32_t>(sector+0x84),triangle_data=memory.load<std::uint32_t>(sector+0x94);
+        memory.store<std::uint32_t>(collision_manager+0x34,section);
+        for(unsigned face=0;face<memory.load<std::uint32_t>(sector+0x90);++face) {
+            std::array<std::array<float,3>,3> points;std::array<float,3> center{},normal{};
+            for(unsigned corner=0;corner<3;++corner) for(unsigned axis=0;axis<3;++axis) {
+                const auto vertex=memory.load<std::uint32_t>(triangle_data+face*16+corner*4);
+                points[corner][axis]=std::bit_cast<float>(memory.load<std::uint32_t>(vertex_data+vertex*16+axis*4));
+                center[axis]+=points[corner][axis]/3;
+            }
+            for(unsigned axis=0;axis<3;++axis) {
+                const auto a=(axis+1)%3,b=(axis+2)%3;
+                normal[axis]=(points[1][a]-points[0][a])*(points[2][b]-points[0][b])-
+                    (points[1][b]-points[0][b])*(points[2][a]-points[0][a]);
+            }
+            const auto magnitude=std::hypot(normal[0],normal[1],normal[2]);
+            if(magnitude<0.001f || normal[1]/magnitude<0.5f) continue;
+            ++road_faces;auto from=center,to=center;from[1]+=0.1f;to[1]-=0.1f;
+            for(unsigned axis=0;axis<3;++axis)
+                memory.store<std::uint32_t>(0xA250+axis*4,std::bit_cast<std::uint32_t>(from[axis]));
+            memory.store<std::uint32_t>(0xA25C,std::bit_cast<std::uint32_t>(0.25f));
+            memory.store<std::uint32_t>(0x4F08E0,0);
+            invoke(0x90420,collision_manager,{section,0xA250,0x56EA0,0});
+            const auto hit=ray_contact(from,to);
+            const auto surface=memory.load<std::uint32_t>(triangle_data+face*16+12)&0xFFFF;
+            if(hit && surface<=13) {
+                cpu.registers[ebx]=0xA260;
+                require(invoke(0x64DA0,0,{0xA400,0xA160,0xA180,0xA270})!=0,
+                    std::format("wheel contact on road face {}:{} (surface {})",section,face,surface));
+                ++wheel_faces;
+            }
+            if(hit) continue;
+            const auto selected=invoke(0x8F240,collision_manager,{0xA160});
+            for(unsigned axis=0;axis<3;++axis) {
+                memory.store<std::uint32_t>(0xA200+axis*4,std::bit_cast<std::uint32_t>(from[axis]));
+                memory.store<std::uint32_t>(0xA210+axis*4,std::bit_cast<std::uint32_t>(to[axis]));
+            }
+            memory.store<std::uint32_t>(0xA22C,std::bit_cast<std::uint32_t>(1.1f));
+            invoke(0x8F3D0,collision_manager,{section,0xA200,0x92EE0,0xA220});
+            const auto direct=std::bit_cast<float>(memory.load<std::uint32_t>(0xA22C))<1;
+            collision_misses+=std::format("{},{},{},{},{},{},{}\n",section,face,center[0],center[1],center[2],selected,direct);
+            // Original HIT files include scenery beyond every source section's
+            // contact bounds. Preserve those faces without treating them as road.
+            bool in_world=false;
+            for(unsigned candidate=0;candidate<sections && !in_world;++candidate) {
+                bool inside=true;
+                for(unsigned plane=0;plane<4;++plane) {
+                    const auto at=State::world_base+candidate*State::world_stride+64+plane*16;
+                    float distance=-std::bit_cast<float>(memory.load<std::uint32_t>(at+12));
+                    for(unsigned axis=0;axis<3;++axis)
+                        distance+=std::bit_cast<float>(memory.load<std::uint32_t>(at+axis*4))*center[axis];
+                    inside&=distance>=0;
+                }
+                in_world=inside;
+            }
+            missing_faces+=in_world || !direct;
+        }
+    }
+    write_text(output/"collision-misses.csv",collision_misses,true);
+    require(wheel_faces!=0,"native wheels accept the imported road surfaces");
+    require(!missing_faces,std::format("individual road surfaces retain native collision ({}/{} missed)",missing_faces,road_faces));
+    // Exercise the original material dispatcher and vertex binding, stopping
+    // at the draw wrapper so no game window or gameplay session is needed.
+    constexpr unsigned context=0x2256C0,commands=0x02000000;
+    memory.store<std::uint32_t>(0x2256B8,context);
+    memory.store<std::uint32_t>(context,commands);memory.store<std::uint32_t>(context+4,commands+65536);
+    memory.store<std::uint32_t>(context+0x2C,1);
+    const auto stride=invoke(0xD8410,0,{0x2C51D4});
+    require(stride==24,"original textured world declaration matches imported vertices");
+    memory.store<std::uint32_t>(0x4B8698,stride);
+    const auto material_table=memory.load<std::uint32_t>(master+12);
+    const auto world_materials=memory.load<std::uint32_t>(State::world_base+0x7AC);
+    for(unsigned material=142;material<142+world_materials;++material) {
+        const auto flags=memory.load<std::uint32_t>(material_table+material*52+16);
+        require(flags==0x80000000U || flags==0x20000000U,"imported material selects the original opaque or cutout triangle-strip renderer");
+    }
+    unsigned world_draws=0,odd_draws=0,barrier_triangles=0,barrier_contacts=0;
+    memory.store<std::uint32_t>(manager+0x310,1);memory.store<std::uint32_t>(manager+0x2C8,8);
+    for(unsigned i=0;i<sections;++i) {
+        const auto sector=State::world_base+i*State::world_stride;
+        memory.store<std::uint32_t>(manager+0x118,sector);memory.store<std::uint32_t>(manager+0xD0+8*4,sector);
+        for(unsigned j=0;j<memory.load<std::uint32_t>(sector+0xBC);++j) {
+            const auto mesh=memory.load<std::uint32_t>(sector+0xC4+j*4),material=memory.load<std::uint32_t>(mesh+20);
+            memory.store<std::uint32_t>(context,commands);
+            state.diagnostic.break_address=0xEE140;state.diagnostic.break_hit=1;
+            try {invoke(0x90BC0,manager,{material-142});throw std::runtime_error("World draw boundary was not reached");}
+            catch(const std::runtime_error&) {if(cpu.eip!=0xEE140) throw;}
+            state.diagnostic.break_address=0;
+            const auto arguments=cpu.registers[esp],count=memory.load<std::uint32_t>(mesh+16);
+            require(memory.load<std::uint32_t>(arguments)==0xC5570 && memory.load<std::uint32_t>(arguments+4)==6,
+                "original world dispatcher submits a triangle strip");
+            require(memory.load<std::uint32_t>(arguments+8)==count && memory.load<std::uint32_t>(arguments+12)==memory.load<std::uint32_t>(mesh+12),
+                "original draw retains imported index count and storage");
+            require(memory.load<std::uint32_t>(0x2242F0)==stride && memory.load<std::uint32_t>(0x2242F8)==mesh,
+                "original SDK binds the imported vertex buffer with its correct stride");
+            const auto texture=memory.load<std::uint32_t>(material_table+material*52+20),raster=memory.load<std::uint32_t>(texture);
+            require(memory.load<std::uint32_t>(context+0xB78)==memory.load<std::uint32_t>(raster+0x38),
+                "original material dispatcher binds the imported texture");
+            const auto cutout=memory.load<std::uint32_t>(material_table+material*52+16)==0x20000000U;
+            require(memory.load<std::uint32_t>(0x5AD170)==unsigned(cutout) && (!cutout ||
+                (memory.load<std::uint32_t>(0x5AD168)==0x204 && memory.load<std::uint32_t>(0x5AD174)==
+                    memory.load<std::uint8_t>(master+imported_alpha_offset+material))),
+                "original material dispatcher preserves transparent cutouts");
+            ++world_draws;odd_draws+=count&1;
+            if(material!=142+world_materials-1) continue;
+            memory.store<std::uint32_t>(collision_manager+0x34,i);
+            const auto indices=memory.load<std::uint32_t>(mesh+12),vertices=memory.load<std::uint32_t>(mesh+4);
+            for(unsigned k=2;k<count;++k) {
+                std::array<unsigned,3> index;
+                for(unsigned corner=0;corner<3;++corner) index[corner]=memory.load<std::uint16_t>(indices+(k-2+corner)*2);
+                if(index[0]==index[1] || index[1]==index[2] || index[0]==index[2]) continue;
+                std::array<std::array<float,3>,3> points;
+                for(unsigned corner=0;corner<3;++corner) for(unsigned axis=0;axis<3;++axis)
+                    points[corner][axis]=std::bit_cast<float>(memory.load<std::uint32_t>(vertices+index[corner]*24+axis*4));
+                std::array<float,3> center{},normal{};
+                for(unsigned axis=0;axis<3;++axis) {
+                    center[axis]=(points[0][axis]+points[1][axis]+points[2][axis])/3;
+                    const auto a=(axis+1)%3,b=(axis+2)%3;
+                    normal[axis]=(points[1][a]-points[0][a])*(points[2][b]-points[0][b])-
+                        (points[1][b]-points[0][b])*(points[2][a]-points[0][a]);
+                }
+                const auto length=std::hypot(normal[0],normal[2]);require(length>0,"barrier face has a horizontal collision direction");
+                center[1]=std::min({points[0][1],points[1][1],points[2][1]})+0.5f;
+                auto from=center,to=center;
+                for(unsigned axis:{0U,2U}) {from[axis]-=normal[axis]/length;to[axis]+=normal[axis]/length;}
+                ++barrier_triangles;barrier_contacts+=ray_contact(from,to) || ray_contact(to,from);
+            }
+        }
+    }
+    require(world_draws && odd_draws,"native draw checks include strips that previously failed as incomplete line lists");
+    require(invoke(0xD8410,0,{0x2C51D4})==24,"environment declaration matches imported positions, UVs and colour");
+    require(memory.load<std::uint32_t>(master+0x3C)==3,"all original horizon materials are present");
+    unsigned environment_triangles=0;
+    for(unsigned part=0;part<4;++part) {
+        const auto mesh=part?memory.load<std::uint32_t>(master+0x40)+(part-1)*24:memory.load<std::uint32_t>(master+0x38);
+        const auto count=memory.load<std::uint32_t>(mesh+16),indices=memory.load<std::uint32_t>(mesh+12);
+        unsigned faces=0;
+        for(unsigned i=2;i<count;++i) {
+            const auto a=memory.load<std::uint16_t>(indices+(i-2)*2),b=memory.load<std::uint16_t>(indices+(i-1)*2),c=memory.load<std::uint16_t>(indices+i*2);
+            faces+=a!=b && b!=c && a!=c;
+        }
+        constexpr unsigned expected[]={528,146,4,331};
+        require(faces==expected[part],"environment strips retain every original triangle");environment_triangles+=faces;
+        memory.store<std::uint32_t>(context,commands);
+        state.diagnostic.break_address=0xEE140;state.diagnostic.break_hit=1;
+        try {invoke(0xC5550,0x4B8690,{mesh});throw std::runtime_error("Environment draw boundary was not reached");}
+        catch(const std::runtime_error&) {if(cpu.eip!=0xEE140) throw;}
+        state.diagnostic.break_address=0;
+        const auto arguments=cpu.registers[esp];
+        require(memory.load<std::uint32_t>(arguments+4)==6 && memory.load<std::uint32_t>(arguments+8)==count &&
+            memory.load<std::uint32_t>(arguments+12)==indices,"native sky and horizon rendering uses the converted strips");
+    }
+    require(environment_triangles==1009,"complete sky and skyline geometry");
+    require(barrier_triangles==712 && barrier_contacts==barrier_triangles,"every imported barrier face has its original wall collision at car height");
+    const auto scene=memory.load<std::uint32_t>(0x34AB5C);
+    memory.store<std::uint32_t>(0x34AB5C,0xAB80);memory.store<std::uint32_t>(0xAB88,0);
+    for(const unsigned rate:{60,144,360}) {
+        state.imported_arrows(0x8BCD0,0x4B85B0);
+        memory.store<std::uint32_t>(0x598188,std::bit_cast<std::uint32_t>(1.0f/rate));
+        const auto frame=[&](unsigned viewport) {
+            state.diagnostic.break_address=0x8E500;state.diagnostic.break_hit=1;
+            try {invoke(0x90D30,viewport,{0xAA00,0});throw std::runtime_error("World animation boundary was not reached");}
+            catch(const std::runtime_error&) {if(cpu.eip!=0x8E500) throw;}
+            state.diagnostic.break_address=0;
+        };
+        for(unsigned tick=1;tick<=rate*2;++tick) {
+            frame(0x4B95B0);
+            const auto expected=(tick*12/rate)%5;
+            require(memory.load<std::uint32_t>(state.imported.barrier+20)==state.imported.frames[expected],
+                "native world rendering advances the five arrow frames at the original speed");
+        }
+        const auto texture=memory.load<std::uint32_t>(state.imported.barrier+20);
+        memory.store<std::uint32_t>(0xAB88,1);frame(0x4B95B0);
+        require(memory.load<std::uint32_t>(state.imported.barrier+20)==texture,"paused arrows retain their current frame");
+        memory.store<std::uint32_t>(0xAB88,0);frame(0x4B98C8);
+        require(memory.load<std::uint32_t>(state.imported.barrier+20)==texture,"additional viewports do not advance the arrows");
+    }
+    state.imported_arrows(0x8BCD0,0x4B85B0);
+    for(unsigned i=0;i<5;++i) {
+        const auto texture=state.imported.frames[i];const auto name=std::format("d_arrws{}",i+1);
+        require(!std::strcmp(static_cast<const char*>(memory.access(texture+16,32)),name.c_str()),"arrow frames retain their original sequence");
+        memory.store<std::uint32_t>(state.imported.barrier+20,texture);memory.store<std::uint32_t>(context,commands);
+        invoke(0x8D1A0,0x4B85B0,{216,1});
+        const auto raster=memory.load<std::uint32_t>(texture);
+        require(memory.load<std::uint32_t>(context+0xB78)==memory.load<std::uint32_t>(raster+0x38),"native material binding uses the selected arrow frame");
+    }
+    memory.store<std::uint32_t>(state.imported.barrier+20,state.imported.frames[0]);
+    memory.store<std::uint32_t>(0x34AB5C,scene);state.imported.selected=false;state.imported.barrier=0;
+    Renderer cutout_renderer(128,128,false,true);
+    std::array<Vertex,4> quad;
+    for(unsigned i=0;i<4;++i) {
+        quad[i].position={i&1?1.0f:-1.0f,i&2?-1.0f:1.0f,0.5f,1};
+        for(auto& uv:quad[i].uv) uv={i&1?1.0f:0.0f,i&2?1.0f:0.0f,0,1};
+    }
+    for(const auto name:{"ftrees","telepole","farrw"}) {
+        unsigned material=142;
+        for(;material<142+world_materials;++material) {
+            const auto texture=memory.load<std::uint32_t>(material_table+material*52+20);
+            if(!std::strcmp(static_cast<const char*>(memory.access(texture+16,32)),name)) break;
+        }
+        require(material<142+world_materials,"captured cutout material is present");
+        memory.store<std::uint32_t>(context,commands);invoke(0x8D1A0,0x4B85B0,{material,1});
+        const auto texture=memory.load<std::uint32_t>(material_table+material*52+20);
+        const auto width=memory.load<std::uint32_t>(texture+0x6C),height=memory.load<std::uint32_t>(texture+0x70);
+        const auto format=(memory.load<std::uint32_t>(texture+0xA4)>>8)&255;
+        const auto pixels=memory.load<std::uint32_t>(texture+0xB4),size=((width+3)/4)*((height+3)/4)*(format==12?8:16);
+        RenderState draw;draw.primitive=6;draw.texture_modes[0]=1;draw.combiner_control=1;
+        draw.color_inputs[0]=0x04080000;draw.alpha_inputs[0]=0x14180000;draw.color_outputs[0]=draw.alpha_outputs[0]=0xC0;
+        draw.alpha_test=memory.load<std::uint32_t>(0x5AD170)!=0;
+        draw.alpha_function=memory.load<std::uint32_t>(0x5AD168);draw.alpha_reference=memory.load<std::uint32_t>(0x5AD174);
+        require(draw.alpha_test,"original game enables alpha testing for the captured artifact");
+        require(draw.alpha_reference==240,"first-pass B1 cutouts retain their original alpha reference");
+        draw.textures[0]=cutout_renderer.upload({width,height,static_cast<TextureFormat>(format),
+            {static_cast<const std::byte*>(memory.access(pixels,size)),size}});
+        const auto render=[&](bool alpha) {
+            draw.alpha_test=alpha;cutout_renderer.prepare(draw);cutout_renderer.begin(0xFF204080);
+            cutout_renderer.draw(draw,quad);cutout_renderer.end();return cutout_renderer.readback();
+        };
+        const auto opaque=render(false),cutout=render(true);
+        unsigned preserved=0,opaque_background=0;
+        for(unsigned y=4;y<124;++y) for(unsigned x=4;x<124;++x) {
+            const auto at=(y*128+x)*4;
+            const auto background=[&](const Image& image) {return image.rgba[at]==std::byte{32} && image.rgba[at+1]==std::byte{64} && image.rgba[at+2]==std::byte{128};};
+            preserved+=background(cutout);opaque_background+=background(opaque);
+        }
+        require(preserved && preserved<120*120 && !opaque_background,"transparent pixels retain the scene and opaque pixels remain visible");
+        save_png(cutout,output/(std::string(name)+"-cutout.png"));cutout_renderer.release(draw.textures[0]);
+    }
+    require(cutout_renderer.errors().empty(),"imported cutouts pass D3D11 debug validation");
+    const auto prop_stride=invoke(0xD8410,0,{0x2C5034});
+    require(prop_stride==20,"original instance declaration matches imported vertices");
+    memory.store<std::uint32_t>(0x4B8620,prop_stride);memory.store<std::uint32_t>(0x4B863C,1);
+    const auto props=memory.load<std::uint32_t>(master+0x1C),prop_count=memory.load<std::uint32_t>(master+0x18);
+    for(unsigned i=0;i<prop_count;++i) {
+        const auto mesh=props+i*120,material=memory.load<std::uint32_t>(mesh+20);
+        require(material>=142+world_materials && material<memory.load<std::uint32_t>(master+4) &&
+            memory.load<std::uint32_t>(material_table+material*52+16)==0x40000U,"instance material uses its own vertex pipeline");
+        memory.store<std::uint32_t>(context,commands);
+        state.diagnostic.break_address=0xC39A0;state.diagnostic.break_hit=1;
+        try {invoke(0x8D1A0,0x4B85B0,{material,1});throw std::runtime_error("Instance material boundary was not reached");}
+        catch(const std::runtime_error&) {if(cpu.eip!=0xC39A0) throw;}
+        state.diagnostic.break_address=0;
+        require(cpu.registers[ecx]==0x4B8618,"original material dispatcher selects the instance pipeline");
+        invoke(0xC3160,0x4B8618,{mesh});
+        state.diagnostic.break_address=0xEE140;state.diagnostic.break_hit=1;
+        try {invoke(0xC3C30,0x4B8618,{mesh});throw std::runtime_error("Instance draw boundary was not reached");}
+        catch(const std::runtime_error&) {if(cpu.eip!=0xEE140) throw;}
+        state.diagnostic.break_address=0;
+        const auto arguments=cpu.registers[esp];
+        require(memory.load<std::uint32_t>(arguments)==0xC3C4A && memory.load<std::uint32_t>(arguments+4)==6 &&
+            memory.load<std::uint32_t>(arguments+8)==memory.load<std::uint32_t>(mesh+16) &&
+            memory.load<std::uint32_t>(arguments+12)==memory.load<std::uint32_t>(mesh+12),"original instance draw submits the imported triangle strip");
+        require(memory.load<std::uint32_t>(0x2242F0)==prop_stride && memory.load<std::uint32_t>(0x2242F8)==mesh,
+            "original SDK binds the imported instance with its correct stride");
+    }
+    require(invoke(0x184C0,0x352728)==1,"original language initialization");
+    // Read the original main-menu row's mode and label operands, then pass
+    // them through its original row builder. This catches mode-ID mix-ups.
+    const auto attack_mode=std::to_integer<unsigned char>(image.data(0x437A2,1)[0]);
+    const auto attack_label=std::to_integer<unsigned char>(image.data(0x43786,1)[0])/4U;
+    memory.store<std::uint32_t>(0xA800,0);memory.store<std::uint32_t>(0xA804,0xA820);
+    invoke(0x43220,0xA800,{attack_label,0,attack_mode});
+    const auto label=memory.load<std::uint32_t>(0xA820);
+    require(!std::memcmp(memory.access(label,12),"Time Attack",12) && attack_mode==8,
+        "original main-menu label identifies Time Attack mode 8");
+    require(u32(image.data(0x16529,4),0)==attack_mode,"original Time Attack initializer uses the same gameplay mode");
+    std::array<unsigned,7> tables{},names{},welcomes{};
+    for(unsigned language=0;language<tables.size();++language) {
+        tables[language]=memory.load<std::uint32_t>(0x35272C+language*4);
+        names[language]=memory.load<std::uint32_t>(tables[language]+390*4);
+        welcomes[language]=memory.load<std::uint32_t>(tables[language]+728*4);
+    }
+    // Original frontend bindings from 2A5C0. Replay the real menu rather than
+    // manufacturing its records and calling the extension directly.
+    constexpr std::pair<unsigned,unsigned> widgets[]={
+        {0x4CB330,0x328D28},{0x4CB354,0x326508},{0x4CB35C,0x320BE0},
+        {0x4CB360,0x320690},{0x4CB364,0x31E8D8},{0x4CB368,0x322C80},
+        {0x4CB374,0x31CEA0},{0x4CB370,0x324B70},{0x4CB358,0x31C958},{0x4CB380,0x31DD7C}};
+    for(const auto& [destination,source]:widgets) memory.store<std::uint32_t>(destination,memory.load<std::uint32_t>(source));
+    const auto menu_fixture=[&] {
+        // Stop after original list construction and extension, before the
+        // original buttons allocate draw queues for the on-screen frontend.
+        state.diagnostic.break_address=0x2AB40;state.diagnostic.break_hit=1;
+        try {invoke(0x4D290,0x3344D8);throw std::runtime_error("Track menu boundary was not reached");}
+        catch(const std::runtime_error&) {
+            if(cpu.eip!=0x2AB40) throw;
+        }
+        state.diagnostic.break_address=0;
+    };
+    memory.store<std::uint32_t>(0x4CCABC,attack_mode);menu_fixture();
+    require(memory.load<std::uint32_t>(0x3344E4)==31,"native Time Attack menu appends one track");
+    memory.store<std::uint32_t>(0x3344E8,29);
+    memory.store<std::uint16_t>(0x3D810C,1);
+    state.diagnostic.break_address=0x36E30;state.diagnostic.break_hit=1;
+    try {invoke(0x4CC70,0x3344D8,{0});throw std::runtime_error("Track details boundary was not reached");}
+    catch(const std::runtime_error&) {if(cpu.eip!=0x36E30) throw;}
+    state.diagnostic.break_address=0;memory.store<std::uint16_t>(0x3D810C,0);
+    require(memory.load<std::uint32_t>(0x3344E8)==30 && !state.imported.selected &&
+        state.imported_file("trackpss/forward/fwyl.pss").empty(),
+        "original scroll previews the appended track without activating imported assets");
+    for(const auto table:tables) require(memory.load<std::uint32_t>(table+390*4)==state.imported.storage+0x600,
+        "original menu lookup displays the imported track name in every language");
+    for(const auto table:tables) require(memory.load<std::uint32_t>(table+728*4)==state.imported.storage+0x640,
+        "opening caption names Interstate instead of the original B2 track");
+    constexpr char upcoming_label[]="Interstate|Burnout 1 (Coming Soon)";
+    require(!std::memcmp(memory.access(state.imported.storage+0x600,sizeof(upcoming_label)),upcoming_label,sizeof(upcoming_label)) &&
+        memory.load<std::uint32_t>(state.imported.storage+30*20)==1,"upcoming track is labelled and locked");
+    memory.store<std::uint16_t>(0x3D8130,1);
+    state.diagnostic.break_address=0xCA5E0;state.diagnostic.break_hit=1;
+    try {invoke(0x4CC70,0x3344D8,{0});throw std::runtime_error("Locked track input boundary was not reached");}
+    catch(const std::runtime_error&) {if(cpu.eip!=0xCA5E0) throw;}
+    require(memory.load<std::uint32_t>(cpu.registers[esp])==0x4CEDB &&
+        memory.load<std::uint32_t>(cpu.registers[esp]+4)==5 && !state.imported.selected,
+        "original confirm input rejects the upcoming track without activating imported assets");
+    state.diagnostic.break_address=0;memory.store<std::uint16_t>(0x3D8130,0);
+    invoke(0x4CC40,0x3344D8);
+    require(!state.imported.selected && state.imported_file("trackpss/forward/fwyl.pss").empty(),
+        "leaving the locked preview keeps original track loading active");
+    for(unsigned language=0;language<tables.size();++language) {
+        require(memory.load<std::uint32_t>(tables[language]+390*4)==names[language],"leaving a preview restores original track names");
+        require(memory.load<std::uint32_t>(tables[language]+728*4)==welcomes[language],"leaving a preview restores original opening captions");
+    }
+    // Exercise imported assets offline through the real accepted-confirm path.
+    // The live menu remains locked; only this diagnostic's row is unlocked.
+    menu_fixture();memory.store<std::uint32_t>(0x3344E8,30);
+    memory.store<std::uint32_t>(state.imported.storage+30*20,0);
+    memory.store<std::uint16_t>(0x3D8130,1);
+    state.diagnostic.break_address=0x8BC80;state.diagnostic.break_hit=1;
+    try {invoke(0x4CC70,0x3344D8,{0});throw std::runtime_error("Confirmed track boundary was not reached");}
+    catch(const std::runtime_error&) {if(cpu.eip!=0x8BC80) throw;}
+    require(memory.load<std::uint32_t>(cpu.registers[esp])==0x4CEEA && state.imported.selected,
+        "only the original unlocked-confirm path activates imported assets");
+    state.diagnostic.break_address=0;memory.store<std::uint16_t>(0x3D8130,0);
+    invoke(0x4CC40,0x3344D8);
+    require(state.imported.selected && memory.load<std::uint32_t>(0x4CCAE0)==3,"native imported track selection");
+    memory.store<std::uint32_t>(0x34AB58,attack_mode);
+    require(title_track(cpu,memory,0x18030),"imported laps cannot enter built-in track records");
+    std::vector<std::byte> records(0x6AA0);std::memcpy(records.data(),memory.access(0x34ABC8,records.size()),records.size());
+    invoke(0x18030,0x34ABC8,{0});
+    require(cpu.registers[esp]==stack+8 && !std::memcmp(records.data(),memory.access(0x34ABC8,records.size()),records.size()),
+        "native record update preserves built-in records for imported laps");
+    require(state.imported_file("trackpss/forward/fwyl.pss")==std::filesystem::absolute(assets)/"interstate.pss","selected master mount");
+    require(state.imported_file("tracks/forward/fwyl/fwyl1_01.bgd")==std::filesystem::absolute(assets)/"interstate.bgd","selected race mount");
+    require(state.imported_file("tracks/forward/fwyl/fwyl_0.bcd")==std::filesystem::absolute(assets)/"interstate.bcd","selected cinematic camera mount");
+    constexpr unsigned music_object=0xAD00;
+    const std::array<unsigned,3> music_before{0,0,5};
+    unsigned music_value=0;for(const auto address:{0x57C210U,0x57C1ECU,0x57C208U})
+        memory.store<std::uint32_t>(address,music_before[music_value++]);
+    state.diagnostic.break_address=0xC91D0;state.diagnostic.break_hit=1;
+    try {invoke(0xC93C0,music_object);throw std::runtime_error("Music selection boundary was not reached");}
+    catch(const std::runtime_error&) {if(cpu.eip!=0xC91D0) throw;}
+    state.diagnostic.break_address=0;
+    const auto music_playlist=state.imported.playlist,music_songs=state.imported.songs;
+    const auto saved_playlist=state.imported.music_playlist;const auto saved_song=state.imported.first_song;
+    require(music_playlist && memory.load<std::uint32_t>(music_playlist+0x38)==1 &&
+        memory.load<std::uint32_t>(music_songs)==6,"original catalogue selects Interstate's seventh Burnout 1 song");
+    require(memory.load<std::uint32_t>(0x57C210)==1 && memory.load<std::uint32_t>(0x57C208)==0,
+        "Interstate enables its native music playlist automatically");
+    const auto music_course=memory.load<std::uint32_t>(0x48A150);
+    for(const unsigned file_table:{0x3401D8,0x3402D8}) {
+        unsigned course=0;
+        for(;course<32;++course) {
+            const auto directory=memory.load<std::uint32_t>(0x33FDD8+course*4);
+            if(memory.load<std::uint8_t>(directory+5)==(file_table==0x3401D8?'0':'1')) break;
+        }
+        require(course<32,"original track music metadata supplies both included WMA banks");
+        memory.store<std::uint32_t>(0x48A150,course);
+        state.diagnostic.break_address=0x1091D0;state.diagnostic.break_hit=1;
+        try {invoke(0xC91D0,music_object);throw std::runtime_error("Music stream boundary was not reached");}
+        catch(const std::runtime_error&) {if(cpu.eip!=0x1091D0) throw;}
+        state.diagnostic.break_address=0;
+        require(cpu.registers[edi]==file_table+24,"native music routing selects the included seventh song in either disc bank");
+        const auto filename=memory.load<std::uint32_t>(cpu.registers[edi]);
+        const auto name=std::format("d:\\music{}\\b1wma\\07.wma",file_table==0x3401D8?0:1);
+        require(!std::strcmp(static_cast<const char*>(memory.access(filename,name.size()+1)),name.c_str()) &&
+            title_track(cpu,memory,0xC92D3),"native one-song policy uses Interstate's included WMA file");
+    }
+    memory.store<std::uint32_t>(0x48A150,music_course);
+    constexpr std::pair<const char*,const char*> mounted[]={
+        {"D:\\trackpss\\forward\\fwyl.pss","interstate.pss"},
+        {"D:\\tracks1\\forward\\fwyl\\fwyl.psw","interstate.psw"},
+        {"D:\\tracks\\forward\\fwyl\\fwyl1_01.bgd","interstate.bgd"}};
+    for(const auto& [name,asset]:mounted) {
+        std::memcpy(memory.access(0xA300,std::strlen(name)+1),name,std::strlen(name)+1);
+        const auto handle=invoke(0xE09BA,0,{0xA300,GENERIC_READ,FILE_SHARE_READ,0,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,0});
+        require(handle!=UINT32_MAX,"original SDK opens the imported asset mount");
+        memory.store<std::uint64_t>(0xA240,0);
+        require(invoke(0xFFF00000U+219*16,0,{handle,0,0,0,0xA250,0xA400,256,0xA240})==success &&
+            memory.load<std::uint32_t>(0xA254)==256,"original file service reads imported asset bytes");
+        File file(assets/asset);const auto expected=file.read(0,256);
+        require(!std::memcmp(memory.access(0xA400,256),expected.data(),256),"mounted bytes match the converted file");
+        require(invoke(0xFFF00000U+211*16,0,{handle,0xA250,0xA600,52,34})==success &&
+            memory.load<std::uint64_t>(0xA628)==file.size() && memory.load<std::uint32_t>(0xA630)==0x21,
+            "mounted files report converted sizes and read-only disc attributes");
+        require(invoke(0xFFF00000U+218*16,0,{handle,0xA250,0xA600,32,5})==success &&
+            memory.load<std::uint32_t>(0xA600)==0x00080000,"mounted files retain the original disc filesystem");
+        memory.store<std::uint32_t>(0xA200,0xFFFFFFFD);memory.store<std::uint32_t>(0xA204,0xA210);
+        memory.store<std::uint16_t>(0xA210,static_cast<std::uint16_t>(std::strlen(name)));
+        memory.store<std::uint16_t>(0xA212,static_cast<std::uint16_t>(std::strlen(name)));
+        memory.store<std::uint32_t>(0xA214,0xA300);
+        require(invoke(0xFFF00000U+210*16,0,{0xA200,0xA600})==success &&
+            memory.load<std::uint64_t>(0xA628)==file.size() && memory.load<std::uint32_t>(0xA630)==0x21,
+            "path metadata matches the imported file handle");
+        require(invoke(0xFFF00000U+187*16,0,{handle})==success,"imported asset handle closes");
+    }
+    // Retain another owner to exercise the original playlist Release without
+    // constructing an audio device in this asset/menu diagnostic.
+    memory.store<std::uint32_t>(0xAF00,2);memory.store<std::uint32_t>(0x57C1F4,0xAF00);
+    menu_fixture();
+    require(!state.imported.selected,"returning to track browsing ends the previous imported selection");
+    memory.store<std::uint32_t>(0x3344E8,3);invoke(0x4CC40,0x3344D8);
+    require(!state.imported.selected && state.imported_file("trackpss/forward/fwyl.pss").empty(),"original Interstate Loop remains selectable");
+    require(!state.imported.playlist && !std::memcmp(memory.access(music_playlist,68),saved_playlist.data(),68) &&
+        !std::memcmp(memory.access(music_songs,36),saved_song.data(),36),"leaving Interstate restores the original Burnout 1 catalogue");
+    music_value=0;for(const auto address:{0x57C210U,0x57C1ECU,0x57C208U})
+        require(memory.load<std::uint32_t>(address)==music_before[music_value++],"leaving Interstate restores the user's music selection");
+    require(!memory.load<std::uint32_t>(0x57C1F4) && memory.load<std::uint32_t>(0xAF00)==1,
+        "leaving Interstate releases its native music playlist");
+    require(!title_track(cpu,memory,0x18030),"original track record updates remain enabled");
+    for(unsigned language=0;language<tables.size();++language) {
+        require(memory.load<std::uint32_t>(tables[language]+390*4)==names[language],"original track names are restored");
+        require(memory.load<std::uint32_t>(tables[language]+728*4)==welcomes[language],"original opening captions are restored");
+    }
+    memory.store<std::uint32_t>(0x352730,tables[0]);
+    state.select_imported_track(true);state.select_imported_track(false);
+    require(memory.load<std::uint32_t>(tables[0]+390*4)==names[0],"shared language tables retain their original track name");
+    require(memory.load<std::uint32_t>(tables[0]+728*4)==welcomes[0],"shared language tables retain their original opening caption");
+    for(const unsigned mode:{2,5}) {
+        memory.store<std::uint32_t>(0x4CCABC,mode);menu_fixture();
+        require(memory.load<std::uint32_t>(0x3344E4)==30,"other modes keep their original track list");
+    }
+    const auto report=std::format("{{\"format\":\"b2-track-import-check-v1\",\"passed\":true,\"game_booted\":false,\"checks\":{},\"sections\":{},\"collision_triangles\":{},\"road_contacts\":{},\"instances\":{},\"lap_metres\":{},\"native_world_draws\":{},\"native_prop_draws\":{},\"odd_index_draws\":{},\"checkpoints\":{},\"native_checkpoint_crossings\":{},\"barrier_triangles\":{},\"barrier_contacts\":{},\"barrier_frames\":5,\"arrow_rates\":[60,144,360],\"music_track\":7,\"native_music_selection\":true,\"cutout_images\":3,\"native_time_attack_menu\":true,\"native_time_attack_selection\":true,\"time_attack_mode\":{}}}",checks,sections,triangles,contacts,instances,metres,world_draws,prop_count,odd_draws,checkpoint_count,checkpoint_crossings,barrier_triangles,barrier_contacts,attack_mode);
+    write_text(output/"report.json",report+'\n',true);return report;
+}
+bool title_track(Cpu& cpu,Memory& memory,std::uint32_t address,std::uint32_t object) {
+    if(!cpu.kernel || !cpu.kernel->context) return false;
+    if(cpu.kernel->entries[255]!=Xbox::State::dispatch_kernel<255>) throw NativeBoundary(address,"imported track requires the verified Xbox host provider");
+    auto& host=*static_cast<Xbox::State*>(cpu.kernel->context);
+    if(&host.memory!=&memory) throw NativeBoundary(address,"imported track received another guest memory");
+    if(host.host.imported_tracks.empty()) return false;
+    HostFloatingScope floating(cpu.floating);
+    if(address==0x18030) return host.imported.selected && memory.load<std::uint32_t>(0x34AB58)==8;
+    if(address==0x84850) return host.imported.selected;
+    if(address==0xB5100) return host.imported_camera_zoom(cpu,object);
+    if(address==0x8BCD0 || address==0x90D30) {host.imported_arrows(address,object);return false;}
+    if(address==0xC93C0) {host.imported_music(cpu,object);return false;}
+    if(address==0xC91F7) {if(host.imported.playlist) cpu.registers[edi]+=24;return false;}
+    if(address==0xC92D3) return host.imported.playlist!=0;
+    const bool music_active=host.imported.playlist!=0;
+    host.track_menu(address,object);
+    if(music_active && !host.imported.playlist) {
+        const auto playlist=memory.load<std::uint32_t>(0x57C1F4);
+        if(playlist) host.music_call(cpu,0x20DDB3,0xC925C,0,{playlist});
+        memory.store<std::uint32_t>(0x57C1F4,0);
+    }
+    return false;
+}
+void title_enhancement(Cpu& cpu,Memory& memory,std::uint32_t address) {
     if(!cpu.kernel || !cpu.kernel->context || cpu.kernel->entries[255]!=Xbox::State::dispatch_kernel<255>)
         throw NativeBoundary(address,"title enhancement requires the verified Xbox host provider");
     auto& host=*static_cast<Xbox::State*>(cpu.kernel->context);
     if(&host.memory!=&memory) throw NativeBoundary(address,"title enhancement received another guest memory");
     const auto registers=cpu.registers;const auto flags=cpu.flags,pc=cpu.eip;
     HostFloatingScope floating(cpu.floating);
-    host.enhancement(cpu,address,manager);
+    host.enhancement(cpu,address);
     cpu.registers=registers;cpu.flags=flags;cpu.eip=pc;
 }
 }

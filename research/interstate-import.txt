@@ -1,0 +1,450 @@
+Burnout 1 Interstate import experiment (2026-10-16)
+
+Inputs are private Xbox XISOs. No game bytes are committed or packaged.
+Burnout: D:\b1\Burnout (USA).xiso.iso
+Supported default.xbe SHA-256:
+42BD7D38FEB39C17783197C4433435BFC06D8F5872D6F4B45048D9DAAC82013B
+Burnout 2 is the existing supported_target.json US version 3 target.
+
+The original game rules identify WestCoastFreeway; its disc directory is usa2.
+Relevant source file SHA-256 values:
+usa2.xbw 5AF5B1761565B4BDC41D4987051317D6B6F1615367D07F5E79385D8A1D4ED6AA
+usa2.hit B83A650A7E32D263E0367FE975663B3496BC748B640373B083DF2243D4C27FAE
+usa2.dic 9D808ABB445AF4C3DC0C8B4D4A5BBDBEF2DD101C4A1C95FCAE7DB08C5AE1DC89
+usa21.sgd 2996B866F73E1E8717E43DCA4B12728B4618C940AD8586686B75CEE02A5C6B86
+
+Original-byte findings used by src/tracks.cpp:
+- XBW has 59 sections, 1,077 meshes, 74 material names and 894 instances.
+  Section records are 300 bytes. Direct and secondary mesh counts are at
+  +118/+11C; their shared list is +124. Instances use +120/+128 and 88 bytes.
+  Six meshes serve the instances. Secondary meshes account for the other 57
+  meshes and must also be imported. Strip vertices use 24 or 36 source bytes.
+- The RW 3.1 Xbox texture dictionary has 80 DXT1/3/5 textures. Each mip has its
+  own size word. Converted mip payloads retain the original compressed blocks.
+- HIT contains 43,089 triangles in 59 sections. Convert its separate BSP leaf
+  table to B2's inline leaf counts and triangle offsets. Preserve vertex data.
+- SGDVER 7 provides a 438-frame closed lap, approximately 8,039.576 metres.
+  Frames match the type-3 path points. Preserve source grid positions/headings;
+  convert cross-sections, strip indices, cumulative distances and closed curve.
+- The lap starts in source section 1 and proceeds in increasing section order.
+  B2's initial contact search is around streaming slot 8. Start the converted
+  stream at source section 52 so source section 1 occupies slot 8.
+
+Verified B2 routines and integration:
+- 79C70 loads BGD arrays; 7D750 computes forward direction from cross-sections.
+  Pair ordering must be right then left for B1's positive forward direction.
+- D7960 registers textures; D7A60 relocates mesh vertices and indices.
+- 8EEB0 relocates 0x3C000-byte world slots and per-model instance groups.
+  Native instances keep shared 20-byte XYZ/UV meshes in PSS. PSW stores 64-byte
+  matrices and 60-byte bounds. C39F0 reads RGB from matrix +1C/+2C/+3C;
+  C3020 ignores those packed fields when reconstructing the transform.
+- 8F240 locates the loaded section; 92F20/8F3D0/92EE0 cast road-contact rays.
+  Freeway cross-sections can span medians. Independent triangle searches find
+  ground across all 438 sections; checking only their midpoints misses medians.
+- FEMode 8 is Time Attack; mode 5 is Free Run. The original main-menu builder
+  at 43784 reads language entry 10 ("Time Attack"), then 4379F stores mode 8
+  in that row. Its 3004E0 game object uses 16520, which also sets gameplay
+  mode 8. 4CF20 builds the original list; append after it at
+  4D2A9. 4CC40 commits selection. 4CCFD must use the list pointer instead of
+  an inline-array address when browsing the appended item. Existing tracks
+  retain their table entries; only the selected imported item mounts converted
+  FWYL PSS/PSW/BGD files. Language entry 390 is restored on deselection.
+  The original 184C0 language initializer installs seven language slots,
+  including aliased English tables; preserve and restore all seven.
+- 18030 builds built-in race records. Skip it for the selected imported Time
+  Attack track so its results cannot become built-in track records.
+
+Assets are published by renaming a completed staging directory. At game startup,
+the import version and three output SHA-256 values are checked. The game and
+tool require no runtime decoder, new guest callback, or additional dependency.
+
+Limits: this is a Time Attack experiment. It retains B2's sky/environment and
+does not import B1 traffic or race-event scripts. It requires manual gameplay
+and visual verification; component diagnostics do not establish FPS or parity.
+Private native-check outputs are in build/checks/interstate-import-20261016.
+
+The initial menu check incorrectly supplied mode 5 and called the host extension
+directly. That hid the wrong mode gate and put the entry in Free Run instead of
+Time Attack. The corrected diagnostic initializes the original languages, derives
+the Time Attack mode from the original main-menu operands, and runs 43220,
+4D290/4CF20, a right-scroll input through 4CC70, and selection through 4CC40.
+Diagnostic breakpoints stop before visual button/detail queues are allocated.
+It verifies the extra row, every language lookup, record protection, and that
+Free Run and Championship keep their original lists.
+
+Final Release validation: 3,917 import checks passed, including all 80 imported
+texture registrations, the starting grid, 438 road cross-sections, 894 instances,
+native selection, original-track restoration, record protection and mounted file
+reads/metadata. All 52 CPU groups and 2,061 existing storage checks passed.
+The converted files are installed in
+build/windows/Release/data/local/imported-tracks/interstate.
+No gameplay, computer use or game benchmark was run.
+
+Load-crash correction (log b2-20261016-212155-16892.log):
+The pending world draws reached the renderer through the SDK fence flush at
+21AE80 and failed with "Incomplete line list". The importer had assigned all
+materials flag 8000. Original 90A50/90BC0 dispatch that flag to C3C70, whose
+EE140 calls specify primitive 2 (line list). These meshes are triangle strips;
+615 of the 1,071 terrain draws have odd index counts, invalid for line lists.
+
+Use the original textured terrain class 80000000 (FWYL material 2), dispatched
+to C5550, which passes primitive 6 (triangle strip) to EE140. Its declaration
+at 2C51D4 has 24-byte XYZ/UV/colour vertices. Shared instances need separate
+materials with flag 40000 (FWYL material 117): 8D1A0 selects C39A0, and the
+instance loop uses C3160/C3C30 with 20-byte XYZ/UV vertices and matrix colour.
+Both native draw paths are verified against the original XBE bytes. Format v2
+rejects older converted caches; regenerate the assets rather than weakening
+the renderer's primitive validation.
+
+The offline import diagnostic now runs the original material dispatch, texture
+binding and vertex-buffer binding for every terrain mesh, then stops at EE140
+to inspect the primitive, index count and pointer. It also checks all six shared
+instance meshes through their own material and draw path. It does not boot the
+game or claim gameplay or visual verification.
+
+Installed v2 validation: all 8,310 import checks passed from the rebuilt Release
+executable, including 1,071 terrain draws through the original middle-pass
+dispatcher 90BC0 and six shared instance draw paths. All 52 CPU groups passed.
+The installed master SHA-256 is
+C80D29E3BCF0C241043670FCBAF0B4A30A2E8DBCA45BA229A7FB4EDE3E74CDF3.
+PSW and BGD hashes are unchanged from v1. The earlier converted assets are
+preserved privately in the native-check directory under pre-material-fix.
+Release b2.exe SHA-256:
+673EF9807538A1675748CED8B6D0B9749080B736E31FD1B042CDBF1EC173E845.
+All 253 offscreen graphics cases also passed on the RTX 5060 Ti with the
+D3D11 debug layer enabled and no debug messages. No game session or benchmark
+was run for this correction.
+
+Format references consulted, with layouts checked against original local bytes:
+https://raw.githubusercontent.com/EdnessP/scripts/main/burnout/tex_Burnout1.py
+https://gist.github.com/AcuteSyntax/536a2d62ab1b3fde5c14f70d268b14c0
+
+Transparency, checkpoints and barriers (format v3):
+User capture: build/windows/Release/build/captures/frame-1037590474100.
+Its rear-car view shows solid backgrounds on tree billboards, telepole wires
+and farrw road arrows. The source native texture dictionary explicitly stores
+an alpha flag at its texture header +4C. Preserve that flag when selecting B2
+materials: 80000000 is opaque, 20000000 is the original cutout class used by
+FWY_CrucPine and FWY_BridgeGrid. 8D1A0 enables alpha test, GREATER, reference 4
+for the latter. The SDK state-method table maps states 3C/3A/3D to methods
+300/33C/340. Instance class 40000 already enables the original cutout path.
+
+The source SGD has 32 920-byte triggers after its 88 path records and 12,224
+position/attribute pairs. Type 0 occurs at indices 0,4,11,17,22,28: start/finish
+and five checkpoints, matching the source SID's labels at 60400..60780.
+Copy position +10, forward +1C and width +28 into B2's 68-byte planes. Split
+each trigger's eight time slots at +2C into B2's 272-byte checkpoint events.
+Preserve all times; leave unrelated traffic/event scripts absent. B2's 79C70
+loader relocates these arrays into 4B8464 (planes) and 4B846C (events).
+The offline diagnostic uses original initializer 1F4950 and crossing code
+79B00, stopping at the actual 9F660 checkpoint action boundary. All six gates
+are encountered in lap order, with all 18 first-three-lap time values verified.
+
+tracks/usa2/chev.dff contains one world-coordinate geometry with 776 vertices
+and 712 triangles. Both frames are identity transforms. Convert its original
+triangles and texture coordinates into the same streamed world strips. B1's
+AED5C loads this separate clump; its AEB36 renderer uses the d_arrws animation
+textures from misc/texture.dic. The conversion uses original d_arrws1; the
+five-frame arrow animation is not imported. All 712 faces already have solid
+collision in the original HIT at car height. Preserve that collision rather
+than adding duplicate surfaces or replacement physics.
+
+The updated offline check passes 18,515 checks: 1,102 native terrain/barrier
+draw submissions, six shared instance paths, 438 road cross-sections, all 712
+barrier collision probes and 18 checkpoint crossings. Offscreen ftrees,
+telepole and farrw images verify that native alpha-test settings preserve the
+background while retaining opaque pixels, with no D3D11 debug messages.
+No game session, computer use or benchmark was run for these changes.
+
+Final installed v3 Release validation also passes all 18,515 import checks and
+52 CPU groups. Both the research helper and rebuilt b2-tool produce identical
+converted files. Prior v2 files are preserved in the private pre-v3 directory.
+Source chev.dff SHA-256:
+824F5E5BC2E1F97FFB06C0024E81B70C8EFA011F0FD48D3D986624BB0494750C.
+Source misc/texture.dic SHA-256:
+BE68A66365F076510DEB3E312457FE540DF049A5450C6CA3017D55CDFC5FC3FC.
+Installed v3 hashes:
+PSS 443E79CE415C0505A5419B2191592B546CE2BEBDC15F6BB245CCE813BDFC1BC0
+PSW 30086E5EF7C1C842F5FC5B2629406F44F03DF132F2EEE5473F01200B9B949F83
+BGD 0C4296D18599A5421E1D0F1CE172F9EA300CFE04EC462852C38F6795C62F67A8
+b2.exe C7A57A5BA7501092DDB5AC035A4351B70F996099A203244B858F10AB7A9602B7
+
+Animated barriers and Interstate music (format v4):
+B1 AEEA5..AEF50 loads d_arrws1..5 and clears frame/tick counters. Its AEB36
+renderer, called at A25DA, advances the tick counter only when the current
+state's +8 pause flag is zero. AEB5B compares against 5, clears the counter,
+advances the frame modulo 5, then installs that texture through AE8FF.
+Import all five compressed textures without changing their order. B2's 8BCD0
+master initializer resets the animation; its main world renderer 90D30 binds
+the selected frame before drawing. Use the original frame duration at 598188
+and state pause flag at [34AB5C]+8, at 12 texture changes per second. Only the
+first viewport advances the clock. Rendering more frames does not speed it up.
+
+Correction (2026-10-17): 9B417..9B42B was previously read across a row
+boundary. The usa2 row's course ID is ZERO (9B399, [ebp-100]); ID 2 at
+[ebp-F0] belongs to the NEXT row. A2AD4..A2AE2 doubles the course ID for
+79A62. Entry zero of the 64-byte filename table at 1A8880 is track7.wav.
+The six floats at 1A8130 are 12.074, 60.08, 60.08, 108.075, 108.075,
+128.17 seconds. 79BB6..79ECB uses the first pair on the first lap and
+the second pair on subsequent laps; it starts the alternate stream one second
+before the loop end, seeking to one second before the next loop's start,
+and crossfades. The last pair describes the outro. 7C5710 and 7D8770 are
+zero-based player lap counters: A5A90 adds one for the displayed lap number.
+The original PCM file is six-channel, 48 kHz, 16-bit, 128.17 seconds.
+The v4 track-3 selection described below is historical and incorrect.
+
+B2 C8D70 lazily builds the original music catalogue. Playlist records are
+68 bytes: vector begin/end/capacity +4/+8/+C, included-B1 flag +10, soundtrack
+ID +14, inline name +18, and song count +38. Song records are 36 bytes: original
+song ID followed by a 32-byte name. C79F0/C6160 establish these layouts.
+The historical v4 implementation preserved the original playlist and user
+selection, then used its third song as a one-song playlist. C93C0 prepares
+this through original C8D70/C91D0, with original return sites and checked ABI.
+C91F7 redirects the included-file table to its third entry; C92D3 bounds this
+playlist to one file. All other selections retain the original twelve-file
+loop. Native XACT queues, WMA decoding, volume and playback remain unchanged.
+On deselection restore the catalogue and user selection, and release the
+imported playlist through original 20DDB3 (210752), as C91D0 itself does.
+
+The extended offline import diagnostic runs the actual 8BCD0 registration,
+90D30 world entry, material binding, catalogue initializer and original
+C91D0 music routing. It checks two seconds at each of 60/144/360 Hz, pause,
+additional viewports, original texture order, both WMA banks, the one-song
+queue, and restoration. Music selection checks stop at original audio-service
+boundaries; the separate existing music check validates real WMA decoding and
+mixing without opening an audio device. No gameplay or benchmark is automated.
+Both included 03.wma files have 2,722,683 bytes and SHA-256:
+F1B073EB51A84A5EFAB7EDFE22F258320ACD4CAC360AB2C023F453C6C227FA15.
+The reduced diagnostic also executes the original C92AF/C92D2 queue segments,
+verifying the exact XACT file descriptor and single-entry loop exit. Those
+internal locations are diagnostic-only entries in that helper. The installed
+check enters the real C91D0 function instead; no extra game callbacks or
+internal diagnostic entries are added to the release's fixed native table.
+Installed v4 Release validation: 19,605 import checks, all 52 CPU groups, and
+all twelve original WMA decoding/mixing cases pass. Track 3 produces finite,
+nonzero 44.1 kHz stereo audio (96,000 mixed output frames). The actual release
+checks run from music-arrows-release-check-2/report.json and
+music-arrows-release-music/music.json. No game session or audio device opened.
+The converted assets from the rebuilt native tool match the research converter.
+Installed master SHA-256:
+CE2C3B38B6E2567A95C22694CF37241E8244FCAFA9BB48D889981D395D60D3A5.
+World and race hashes are unchanged from v3. Prior v3 files are in pre-v4.
+Installed b2.exe SHA-256:
+9049FB9F7C7BD40AC17D2B2A64178A0631467D61F95CD63C62356046A9A3152E
+
+Early v5 audit (2026-10-17; before installation):
+Original 9E2D7 sets alpha reference 240 before 9DC22's first mesh list
+(section +118). 9E3DC changes it to 160 for the second list (+11C).
+All 39 ftrees and 39 treeus1 world meshes belong to the first list. The v4
+cutout reference 4 therefore retained the white fringe. Preserve the source
+reference in an import-owned byte table at master +63E00, outside all original
+resources; feed it into B2's existing material state cache at 8D40C/8D734.
+No extra draw pass or texture resampling is needed. Original B2 materials stay
+outside the override range. Source mesh lists never assign conflicting alpha
+references to one material. All source visibility indices lie within eight
+cyclic sections; the existing 17-sector import window covers every source PVS.
+
+Native 90420 sphere traversal with the actual vehicle collector 56EA0 accepts
+all upward-facing imported faces except 176 category-28 faces in sections
+45..47. B2 explicitly skips categories 26..29; source categories still need
+semantic conversion. The 41 ray-centroid misses lie outside every original
+section's contact bounds and all hit when their own BSP is queried directly.
+They are source exterior scenery, not lost imported faces.
+
+An isolated scripted Time Attack run reproduces a separate fall-through near
+(185.596, -362.758) in X/Z. The car's height reaches -11.499 while the source
+road triangle is at -5.55139, category 15, in converted section 9. Before
+starting, the car sits correctly on the road at (176, -449) with two contact
+triangles. Adding missing section +B8 IDs alone does not fix the fall-through.
+Private evidence is under build/checks/interstate-import-20261016/live and
+v5-wheel-check. No benchmark or performance acceptance has been performed.
+
+Collision follow-up (2026-10-17): B2 wheel routine 64DA0 rejects surface IDs
+above 13. B1 road IDs 14/15 must therefore be translated, not copied. B1
+B9EB8 and B2 5FB90 establish the matching rolling-resistance groups: source
+7..11 become 6..10; 12..15 become 11; 26..30 become 25..29. Preserve flag bits.
+The expanded existing diagnostic passes 99,098 checks, including original
+wheel queries on all upward-facing road faces. An isolated scripted drive
+passes the reproduced failure at 64 mph, y=-5.093 at z=-332.892. No FPS claim.
+
+Road/respawn investigation: B1 road frames repeat the first point at the end.
+Import 437 unique cross-sections and close B2's index array, rather than adding
+a zero-length 438th segment. B1 12B61..12BD9 uses frame +1C/+2C as left/right
+scalars and center - right-vector * scalar; +48 is not the left boundary.
+Use the source cumulative distances, including the final 8039.576 m value.
+B1 B1A18 skips frame flag 4000 and respawns beside the road edge, inset by
+the car's local maximum X (model bounds from A16D0 -> 81992 -> 812D3 -> 734EC).
+There are 59 prohibited frames. Midpoint respawns are unsafe: 26 otherwise
+allowed points lie over freeway dividers. B2 84510 requires an AI curve at
+car+D54; without one, 84B53 merely uprights the car where it fell.
+
+Traffic format: B1 9807E reads point-attribute byte 0 as metres/second.
+9A8BD and 9ACB9 select cumulative vehicle groups and add per-group spacing
+to record +A. Type 1 records are continuous generators (32 on Interstate);
+type 0 records are triggered sequences and must not become continuous lanes.
+B2 79C70 relocates traffic index pairs, cumulative distances, 48-byte point
+attributes and 32-byte curves. 93B20 reads density +23 divided by 500 and
+speed +2A in mph; 93BD0/93E13 schedule native spawning. 94A30 changes active
+lane ranges using 32-byte spatial blocks, 8-byte spawn records and 8-byte
+enable/disable transitions. Retain this bounded native activation, rather
+than keeping the entire imported track's traffic active. Conversion and
+game verification remain in progress; these changes are not yet installed.
+
+Traffic/respawn conversion follow-up: the native loader accepts 32 continuous
+traffic lanes, 51 spatial blocks, 467 spawn ranges and 689 transitions. Speeds
+come from the source point attributes; density translates the source mean gap
+to B2's native occupancy convention. B2 vehicle groups replace the source
+normal/heavy groups. Triggered traffic sequences are still not converted.
+No runtime lane search or custom spawning logic was introduced.
+
+For the B2 respawn strip, intersect the original traffic centre lines with
+each source road cross-section and select the outermost lane inside its right
+boundary. This retains a drivable carriageway without guessing vehicle width
+or placing cars on the freeway median. All 378 permitted positions pass the
+original collision query within one metre; all 59 prohibited frames retain
+their prohibition. Original B2 AI route registration and lap tracking work.
+The complete existing diagnostic passes 100,574 checks (v5-ai-check-2).
+Its race buffer now uses a real guest allocation: the old fixed address
+01000000 overlapped the diagnostic heap once race data grew beyond 32 KiB.
+
+An isolated 80-second functional drive loads the converted data in the existing
+release. Native traffic lists grow from two occupied lanes to nine, with an
+observed actor advancing from path point 239.777 to 240.014 in 110 ms. The
+player's AI pointer is 505388 and its road/AI indices both advance to 24.
+Capture and observer data: live/traffic-drive-2.png, live/traffic-observe.csv.
+This was not a benchmark. The installed import and user's settings are unchanged.
+
+Sky, respawn and camera completion (2026-10-17):
+The source sky.dff supplies 312 vertices and 528 triangles. Normalize its
+radius to B2's unit dome; preserve the source texture coordinates and colours.
+skys.dff supplies 651 vertices and 481 horizon triangles in three materials,
+including its four untextured red triangles. The native sky/horizon renderers
+draw these records. All 1,077 original world meshes, 894 instances and 233,548
+indices remain present. The imported tree materials retain alpha reference
+240, removing the white fringe without another drawing pass.
+
+B2's 84510 respawn search originally considers only three following points.
+That is insufficient for B1's longer prohibited sections. For the selected
+import, the verified 84850 comparison now permits one complete route search;
+original tracks retain their original limit. The native diagnostic confirms
+the unsafe original fallback and selection of permitted source point 159.
+
+usa2rpc.sgd contains 47 authored 44-byte cameras. Preserve those records in
+BGD and convert their positions, directions, FOV and road activation gates
+into a native BCD. Its 47 cameras plus ten disabled spline-end markers load
+through 891A0 and initialize through 89400. The source starting view is
+stationary; it replaces the unrelated B2 opening path while retaining B2's
+opening duration. Static, look-at, in-car and road-following cameras use the
+corresponding native B2 modes. Source zoom limits and 0.05-per-60-Hz-frame
+smoothing are applied only to imported cameras, using elapsed game time.
+This is a data conversion: B2's spline movement and camera transitions do
+not reproduce every detail of B1's dynamic following, roll and fades.
+
+The expanded existing native diagnostic passes 100,808 checks, including all
+47 camera records, native camera loading, road/wheel contact, barriers,
+checkpoint crossings, traffic registration and safe respawns. A functional
+80-second drive on the camera build reaches Interstate and drives over the
+previous fall-through location without an unsupported stop. The capture at
+frame-56601785500 and live/camera-drive.png retain the original sky/horizon
+and clean tree edges. This functional run is not a benchmark.
+
+The music selection is now included Burnout 1 track 7, from both native WMA
+banks. Burnout 1's lap-dependent two-stream crossfades described above are
+research findings; playback currently uses B2's full-file playlist loop.
+Triggered traffic sequences and source lane-merging behaviour also remain
+outside the current conversion.
+
+Installed v5 validation:
+The rebuilt Release executable passes 100,823 import checks and all 52 CPU
+groups (26,026 instruction, 3,301 memory, 6,744 floating and 109 control cases).
+All four installed data files match the validated v5-cameras output. Previous
+installed assets are preserved in the private pre-v5 folder. Settings and user
+saves were not changed. The native opening was visually checked in
+live/camera-intro.png; its leftover 88 Interchange caption is now replaced via
+original language entry 728 and restored on deselection, including shared
+language tables. Those caption changes are covered by the native diagnostic.
+
+Airport Terminal 3 functional/performance validation used an isolated control
+script and private profile, 360 Hz selected, 1x native resolution, widescreen,
+V-sync off and frame interpolation off on Ryzen 5 5600X / RTX 5060 Ti.
+Each recording lasted ten seconds. F9 capture performance-76565986300 reports
+3.734 ms median, 5.216 ms p99, 7.108 ms maximum, and 216.1 MiB peak working set.
+The following low-overhead benchmark-86667293300 records 290.317 FPS,
+3.3582 ms median, 4.5402 ms p99 and 5.2146 ms maximum, with no dropped samples.
+The final frame and native course ID 2 verify the actual Airport race. An
+earlier attempt stayed in Load/Save and is excluded from race measurements.
+These figures do not establish the 360 FPS target or a controlled before/after
+comparison; the older 226.55 FPS baseline used a different race segment.
+
+Installed data SHA-256:
+PSS 9DF3733E924B7AFA91A25E4DD60BBAA38E13A78CA030CC58D3B7763AE912F38D
+PSW 68D9945B03726317C1AB307F9FC0798DDFBF610AA901D772462D378564045753
+BGD F2D980C1D85758133A06662C9C241AE3F800C032ED99665CAA831CB348A593A5
+BCD EABF5607CF006F1D8C8851381F715FACC87DD0BD6B277E015CEE1CC25566146C
+
+Temporary menu availability, 2026-10-17
+
+The imported Time Attack row now reads Interstate|Burnout 1 (Coming Soon) and
+sets the original locked-track bit in its first word. Original confirm input at
+4CEC5 checks that bit and takes the refusal branch at 4CECB rather than starting
+a race. The longer label needs more than the previous 32-byte gap; its separate
+welcome string moved from extension storage+620 to +640. Existing offline asset
+and course checks remain available, including an original confirm-input check.
+
+The main-menu Sign In, New Account and Manage Account(s) rows use language tokens
+824, 826 and 827. Their final row+4 stores at 43CD9, 43D2C and 43D79 now write the
+original disabled bit instead of zero. All three original signatures are
+895C0204, checked during native generation. Original input at 443EE..44408 tests
+this bit and refuses activation before the account action dispatch. Labels and
+rows remain in place, and this adds no runtime scan or rendering work. Discovery
+used bounded native decoding against the supported XBE; private evidence is in
+build/checks/menu-availability-20261017.
+
+Validation: Release build, all 52 CPU groups and the 100,825 existing import
+checks passed. A 27-second functional run confirmed all three account rows are
+greyed out and reject A without leaving the main menu. A 39-second functional
+run confirmed the full Interstate label fits and A leaves the track menu open.
+A separate original-track selection still launched Airport Terminal 3 normally.
+No game benchmarks ran. Personal settings stayed byte-identical; all owned
+build/check/game workers exited. Release SHA256:
+D0F00847EC2CC1E5CAC373908AB8AB4BF5AB2275E5B706F2682CDB32C69FE3F5.
+
+Track preview state leak, 2026-10-17
+
+The reported 03:18:34 session stopped at 8BCD0 because the imported barrier
+initializer was applied to a master without Interstate's 232 textures. The
+preview hook at 4CCFD previously used the same state change as 4CC40, mounting
+imported assets simply by highlighting the row. 4CC40 is the page's exit
+callback (vtable 2BB778+8), called by 3F7D2 on page changes, including Back.
+Consequently backing out of the locked row could leave imported world, camera,
+music and record handling active in a different mode. V-sync only changes
+presentation pacing and is not involved in these selection conditions.
+
+Preview now updates labels only. Accepted input activates imported handling at
+4CEE0, after the original locked-row check at 4CEC5/4CEC9; ESI there is the menu
+object+4. The 4CEE0 signature B9B0854B00 is checked during native generation.
+Entering the track menu ends the previous active selection, while its exit
+restores normal names unless a course was actually confirmed. The barrier
+format validation remains intact. No per-frame work was added.
+
+The existing import diagnostic now covers browsing, refused confirmation,
+leaving the locked preview, all language-label restoration, accepted input
+(with only the offline diagnostic row unlocked) and re-entering the menu.
+Private evidence: build/checks/import-state-crash-20261017. Original bytes were
+checked against supported target SHA256
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+
+Before-fix functional reproduction with V-sync enabled: scroll to the locked
+Interstate entry, press A (refused), return through car select to the main menu,
+move from Time Attack to Crash, and select a car/junction. The original build
+exited with the identical 8BCD0 five-frame-texture-set boundary; frontend mode
+was 15 (Crash). The same route into Championship completed normally, which
+explains why the fault did not occur on every mode change. The automatic stop
+in these navigation runs is not a performance recording.
+
+Validation: Release build completed; all 52 CPU groups and 100,843 import
+checks passed, including the preview/confirmation regression cases. A second
+live run of the corrected sequence was skipped at the user's request. No game
+benchmarks ran. Personal settings remained byte-identical and all owned
+build/check/game workers exited. Release SHA256:
+D7B52514F97CDDF7E4A3422856FE8780644140F8BB5173EE2677ADBAF2978653

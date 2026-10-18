@@ -563,3 +563,91 @@ Final b2.exe SHA-256:
 554F7FE9897033012740238368F591FE2DC652EB6FA7A7F9D4681455DE9A5B34.
 All six personal save hashes and settings.cfg remained unchanged. Owned workers
 exited. No commit, push or release was performed.
+
+Authored draw-distance replacement (2026-10-17)
+
+The earlier expanded-sector approach is removed. Each section's self visibility
+record is valid from that section, not from an arbitrary distant viewpoint.
+The Sunrise capture's added sections expose incomplete backs of mountains;
+two-sided drawing cannot create their missing surfaces. Airport's detailed
+sections also overlap PSS background buildings (bounded overlap evidence above).
+Polygon bias only hides some of that conflicting geometry and is not a valid
+replacement/visibility rule.
+
+Keep the original visibility records, material selections and distant models.
+Scale far clipping, scenery fades, traffic model detail and traffic body fade.
+The latter previously kept its original 225..250 range even when wheels/LOD
+were extended. Its camera-relative range now scales with the same setting,
+without changing simulation distance caches or vehicle state. Reflection range
+remains original and camera scaling does not compound.
+
+Remove the 64 MiB extra world copy, PSW/P2W preloads, additional section draws,
+extended prop-list rewrites, global extra-geometry two-sided override and
+background depth bias. This reduces memory, loading and submitted work; no new
+GPU pass is introduced. Whole-track high-detail visibility remains bounded by
+the original authored data; the settings help now states this explicitly.
+Validation results follow after the Release build and diagnostics.
+
+Validation: Release, 52 CPU groups, 258 hardware renderer cases (zero D3D debug
+messages) and the window/settings diagnostic passed. Private Airport and Sunrise
+Valley Springs start-area smoke runs verified 1600 -> 6400 camera far range,
+zero runtime shader compilations and no audio errors. The corrected camera
+control run verified first-person, rear view, release and return to third person.
+Details and limits: research/game-timing.txt and
+build/checks/camera-distance-20261017/verification.json. No FPS benchmark or
+full-track visual audit was performed. Personal settings unchanged; workers exited.
+
+Actual scenery extension after user review (2026-10-17)
+
+The authored-only replacement above did NOT satisfy increased scenery distance:
+it restored the original section visibility limit. Camera/fade scaling alone
+was insufficient. The new implementation adds sections beyond that original
+list, while retaining the original sections and their material choices.
+
+Original 90F9E..90FC9 reads four signed background indices at origin+208..20B
+and passes them to 8EA80. That routine binds 24-byte PSS mesh records. Extra
+PSW sections must use visibility rows authored to coexist with these models,
+not indiscriminately use their own self rows. During loading, choose additional
+rows from source sections whose background set includes the active set. Keep
+the row's actual material/mesh choices and rendering phase. This preserves the
+near/far building ownership that the earlier self-row approach lost.
+
+Also derive horizontal viewing cones for individual meshes from all original
+visibility records that select them. Mesh centers come from indexed vertices;
+observer positions are the original section centers. A cone is restrictive only
+when those directions occupy less than a half-circle. Reject a candidate row
+if it exposes a mesh from outside that envelope. Choose the closest compatible
+source section, prepare candidates once during loading, and recheck cones,
+distance and the original frustum at rendering time. This is a conservative
+extension of authored views, not reconstructed missing terrain or unrestricted
+whole-track detail. Distant model coverage and permitted viewpoints still limit
+which additional sections are appropriate.
+
+Bounded asset analysis at the reported Sunrise camera (2145.499,170.53622 in XZ)
+excludes both mountain meshes of sections 37, 38 and 39 using these envelopes.
+Their spans are 92.64..148.41 degrees. The ordinary mountain in section 25
+remains permitted. Native D7A60 explicitly clears bit 31 on vertex buffers;
+section-relative validation must compare the physical aliases, while index
+and mesh-record pointers retain the CPU alias.
+
+Extra world storage and preprocessing are enabled only above Original distance.
+The main world pass appends extra props and uses original 90A50/90BC0 for extra
+materials. Reflection passes, simulation, authored depth state and face culling
+are unchanged. F8 game-state captures include original/extra section counts,
+selected [target,source,row] records and the prepared plans. End reports include
+extra material-batch counts. These establish actual extra draws independently
+of camera far clipping. No gameplay FPS claim follows from those counts.
+
+Private implementation checks and captures: build/checks/scenery-distance-20261017.
+Validation: final Release build and all 52 CPU diagnostic groups passed.
+Functional Sunrise Valley Springs and Airport Terminal 3 runs completed normally
+with no audio errors or runtime shader compilation. Their final views contained
+6 original + 1 extra and 8 original + 3 extra sections respectively; actual extra
+material draws were recorded. Airport camera controls covered first person,
+rear view, release and return to third person. Private settings/saves were used.
+The native Sunrise section-31 plan excludes the defective mountain sections
+37..39; Airport plans preserve the compatible distant building rows. These are
+metadata checks at the reported problem locations, not a full-track visual audit.
+The exact old Sunrise viewpoint was not revisited in the live runs. All owned
+workers exited. The user declined benchmarks and will check performance; no
+performance-regression claim is made. Detailed evidence: private verification.json.

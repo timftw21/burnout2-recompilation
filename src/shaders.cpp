@@ -1,4 +1,5 @@
 #include "shaders.h"
+#include "ambient_occlusion.h"
 #include <d3dcommon.h>
 #include <Windows.h>
 #include <format>
@@ -146,19 +147,22 @@ float4 main(P p):SV_Target {
 ID3DBlob* shader_blob(ShaderKind kind) {return new ShaderBlob(shader_binary(kind).bytes);}
 const char* shader_profile(ShaderKind kind) {
     if(kind==ShaderKind::point_geometry) return "gs_5_0";
-    if(kind==ShaderKind::launch || kind==ShaderKind::flow_estimate || kind==ShaderKind::flow_resolve || kind==ShaderKind::flow_cut || kind==ShaderKind::flow_gradient ||
-       kind==ShaderKind::flow_depth || kind==ShaderKind::flow_depth_ms) return "cs_5_0";
+    if(kind==ShaderKind::launch || kind==ShaderKind::flow_estimate || kind==ShaderKind::flow_cut || kind==ShaderKind::flow_gradient ||
+       kind==ShaderKind::flow_depth || kind==ShaderKind::flow_depth_ms ||
+       (kind>=ShaderKind::ao_low && kind<=ShaderKind::ao_high)) return "cs_5_0";
     if(kind==ShaderKind::clear_pixel || kind==ShaderKind::display_pixel || kind==ShaderKind::gui_pixel ||
        (kind>=ShaderKind::combiner0 && kind<=ShaderKind::combiner8) ||
-       kind==ShaderKind::flow_colour || kind==ShaderKind::flow_interpolate || kind==ShaderKind::fxaa ||
+       kind==ShaderKind::flow_colour || kind==ShaderKind::fxaa ||
        kind==ShaderKind::copy_multisample || kind==ShaderKind::copy_multisample_stencil ||
        (kind>=ShaderKind::color && kind<=ShaderKind::modulate3d) ||
        (kind>=ShaderKind::responsive_combiner0 && kind<=ShaderKind::upscale_inputs) ||
        (kind>=ShaderKind::layer_combiner0 && kind<=ShaderKind::layer_modulate3d) ||
-       kind==ShaderKind::layer_begin || kind==ShaderKind::layer_begin_ms) return "ps_5_0";
+       kind==ShaderKind::layer_begin || kind==ShaderKind::layer_begin_ms || kind==ShaderKind::ao_composite) return "ps_5_0";
     return "vs_5_0";
 }
 std::string shader_source(ShaderKind kind) {
+    if(kind>=ShaderKind::ao_low && kind<=ShaderKind::ao_composite)
+        return ambient_occlusion_shader(unsigned(kind)-unsigned(ShaderKind::ao_low)+1,kind==ShaderKind::ao_composite);
 
     if(kind==ShaderKind::layer_begin || kind==ShaderKind::layer_begin_ms) return
         std::string(kind==ShaderKind::layer_begin_ms?"#define MULTISAMPLE\n":"")+R"(
@@ -179,7 +183,7 @@ O main(float4 position:SV_Position,uint sample:SV_SampleIndex) {
 
     if(kind==ShaderKind::flow_depth || kind==ShaderKind::flow_depth_ms) return
         std::string(kind==ShaderKind::flow_depth_ms?"#define MULTISAMPLE 1\nTexture2DMS<float> source:register(t0);":"Texture2D<float> source:register(t0);")+R"(
-RWTexture2D<float> depth:register(u0);
+RWTexture2D<float2> depth:register(u0);
 [numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID) {
  uint width,height;depth.GetDimensions(width,height);if(id.x>=width || id.y>=height) return;
  uint w,h,samples=1;
@@ -188,15 +192,17 @@ RWTexture2D<float> depth:register(u0);
 #else
  source.GetDimensions(w,h);
 #endif
- uint2 first=id.xy*uint2(w,h)/uint2(width,height),last=(id.xy+1)*uint2(w,h)/uint2(width,height);
- float value=1;
- [loop] for(uint y=first.y;y<max(first.y+1,last.y);++y) [loop] for(uint x=first.x;x<max(first.x+1,last.x);++x)
+ int2 first=id.xy*uint2(w,h)/uint2(width,height),last=(id.xy+1)*uint2(w,h)/uint2(width,height);
+ float2 value=float2(1,0);
+ [loop] for(int y=first.y;y<max(first.y+1,last.y);++y) [loop] for(int x=first.x;x<max(first.x+1,last.x);++x)
  [loop] for(uint s=0;s<samples;++s) {
+  int2 at=clamp(int2(x,y),0,int2(w,h)-1);
 #ifdef MULTISAMPLE
-  value=min(value,source.Load(int2(x,y),s));
+  float sample_depth=source.Load(at,s);
 #else
-  value=min(value,source.Load(int3(x,y,0)));
+  float sample_depth=source.Load(int3(at,0));
 #endif
+  value=float2(min(value.x,sample_depth),max(value.y,sample_depth));
  }
  depth[id.xy]=value;
 })";
@@ -413,64 +419,6 @@ float full_error(float2 uv,float2 v,float2 pixel) {
  if(any(uv+v<0) || any(uv+v>1)) confidence=0;
  motion[id.xy]=float4(v,confidence,bestResidual/25);
 })";
-    case ShaderKind::flow_resolve:return R"(
-Texture2D source:register(t0),destination:register(t1);
-Texture2D<float4> field:register(t2),opposite:register(t3);
-RWTexture2D<float4> resolved:register(u0);SamplerState filter:register(s0);
-float photo_error(float2 uv,float2 v,float2 pixel) {
- float error=0;const float2 offsets[5]={float2(0,0),float2(2,0),float2(-2,0),float2(0,2),float2(0,-2)};
- [unroll] for(uint i=0;i<5;i++) {
-  float2 p=uv+offsets[i]*pixel;
-  error+=dot(abs(source.SampleLevel(filter,p,0).rgb-destination.SampleLevel(filter,p+v,0).rgb),
-   float3(0.299,0.587,0.114))*(i==0?0.5:0.125);
- }
- return error;
-}
-[numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID) {
- uint width,height;resolved.GetDimensions(width,height);if(id.x>=width || id.y>=height) return;
- uint full_width,full_height;source.GetDimensions(full_width,full_height);
- float2 size=float2(width,height),full_size=float2(full_width,full_height),pixel=1/full_size,uv=(float2(id.xy)+0.5)/size;
- float3 colour=source.SampleLevel(filter,uv,0).rgb;
- float4 own=field.Load(int3(id.xy,0)),best=own,hidden=own;best.z=hidden.z=0;
- float best_error=0.12;float4 consensus=0;float total=0;
- float2 last_motion=0;float last_error=0;bool have_error=false;
- const int2 offsets[21]={int2(0,0),int2(2,0),int2(-2,0),int2(0,2),int2(0,-2),
-  int2(2,2),int2(-2,2),int2(2,-2),int2(-2,-2),int2(4,0),int2(-4,0),int2(0,4),int2(0,-4),
-  int2(8,0),int2(-8,0),int2(0,8),int2(0,-8),int2(8,8),int2(-8,8),int2(8,-8),int2(-8,-8)};
- // Transfer only verified motion from the same surface. A covered pixel has
- // no endpoint match of its own; colour and distance choose nearby support.
- [unroll] for(uint i=0;i<21;i++) {
-  int2 cell=clamp(int2(id.xy)+offsets[i]*2,int2(0,0),int2(width-1,height-1));
-  float4 candidate=field.Load(int3(cell,0));if(candidate.z<0.2 || candidate.w>=0.02) continue;
-  float2 location=(float2(cell)+0.5)/size;
-  float4 reverse=opposite.SampleLevel(filter,location+candidate.xy,0);
-  if(reverse.z<0.2 || length((candidate.xy+reverse.xy)*full_size)>1.5) continue;
-  float3 difference=source.SampleLevel(filter,location,0).rgb-colour;
-  float separation=length(difference-dot(difference,float3(0.299,0.587,0.114)));
-  if(separation>=0.12) continue;
-  // Adjacent support cells often carry the same half-precision vector.
-  // Their weights still differ; the endpoint comparison does not.
-  if(!have_error || any(candidate.xy!=last_motion)) {
-   last_motion=candidate.xy;last_error=photo_error(uv,last_motion,pixel);have_error=true;
-  }
-  float error=last_error;
-  float distance=dot(float2(offsets[i]),float2(offsets[i]));
-  float weight=min(candidate.z,reverse.z)/(1+distance*0.0625+separation*separation*400);
-  consensus+=candidate*weight;total+=weight;
-  if(error+0.000001<best_error) {best=candidate;best_error=error;best.w=error;}
- }
- if(total>0) {
-  consensus/=total;float error=photo_error(uv,consensus.xy,pixel);
-  float2 rounded=round(consensus.xy/pixel)*pixel;float rounded_error=photo_error(uv,rounded,pixel);
-  if(rounded_error+0.000001<error) {consensus.xy=rounded;error=rounded_error;}
-  consensus.w=error;
-  // Equal local matches are ambiguous on smooth detail. Prefer motion
-  // supported across the surface, while retaining a better individual fit.
-  if(error<=best_error+0.00001) best=consensus;
-  hidden=consensus;
- }
- resolved[id.xy]=best.z>=0.2?best:hidden.z>=0.2?hidden:best;
-})";
     case ShaderKind::flow_cut:return R"(
 Texture2D previous:register(t0),current:register(t1);Texture2D<float4> motion:register(t2);
 RWTexture2D<float> cut:register(u0);SamplerState filter:register(s0);groupshared float2 differences[256];
@@ -481,101 +429,6 @@ RWTexture2D<float> cut:register(u0);SamplerState filter:register(s0);groupshared
  differences[index]=float2(raw,warped);GroupMemoryBarrierWithGroupSync();
  [unroll] for(uint stride=128;stride>0;stride>>=1) {if(index<stride) differences[index]+=differences[index+stride];GroupMemoryBarrierWithGroupSync();}
  if(index==0) cut[uint2(0,0)]=(differences[0].x>256*0.20 && differences[0].y>256*0.15)?1:0;
-})";
-    case ShaderKind::flow_interpolate:return R"(
-Texture2D previous:register(t0),current:register(t1);Texture2D<float4> forward:register(t2),backward:register(t3);
-Texture2D<float> cut:register(t4);SamplerState filter:register(s0);
-Texture2D previous_black:register(t5),previous_white:register(t6),current_black:register(t7),current_white:register(t8);
-Texture2D previous_lower:register(t15),previous_upper:register(t16),current_lower:register(t17),current_upper:register(t18);
-cbuffer C:register(b0){float phase;uint level;uint first;uint layers;}
-float match(Texture2D source,Texture2D destination,float2 uv,float2 v,float2 pixel) {
- float error=0;
- const float2 offsets[5]={float2(0,0),float2(1,0),float2(-1,0),float2(0,1),float2(0,-1)};
- [unroll] for(uint i=0;i<5;i++) {
-  float2 p=uv+offsets[i]*pixel;
-  float3 difference=abs(source.SampleLevel(filter,p,0).rgb-destination.SampleLevel(filter,p+v,0).rgb);
-  error+=dot(difference,float3(0.299,0.587,0.114))*(i==0?0.5:0.125);
- }
- return error;
-}
-float4 motion_at(Texture2D<float4> field,Texture2D source,Texture2D destination,float2 uv,float2 pixel) {
- uint width,height;field.GetDimensions(width,height);
- float2 position=uv*float2(width,height)-0.5,fraction=frac(position);int2 base=int2(floor(position));
- float3 colour=source.SampleLevel(filter,uv,0).rgb;float4 best=0;float total=0;
- [unroll] for(uint i=0;i<4;i++) {
-  int2 cell=clamp(base+int2(i&1,i>>1),int2(0,0),int2(width-1,height-1));
-  float2 location=(float2(cell)+0.5)/float2(width,height);
-  float difference=dot(abs(source.SampleLevel(filter,location,0).rgb-colour),float3(0.299,0.587,0.114));
-  float agreement=1/(1+difference*difference*400);
-  float weight=(i&1?fraction.x:1-fraction.x)*(i&2?fraction.y:1-fraction.y)*agreement*agreement;
-  best+=field.Load(int3(cell,0))*weight;total+=weight;
- }
- if(total<0.001) return float4(0,0,0,0);
- best/=total;float error=match(source,destination,uv,best.xy,pixel);
- best.w=error;
- if(error<0.00002 || error>=0.12) return best;
- [unroll] for(uint i=0;i<4;i++) {
-  float4 candidate=field.Load(int3(clamp(base+int2(i&1,i>>1),int2(0,0),int2(width-1,height-1)),0));
-  float candidate_error=match(source,destination,uv,candidate.xy,pixel);
-  if(candidate.z>=0.2 && candidate_error+0.000001<error) {best=candidate;error=candidate_error;}
- }
- float2 rounded=round(best.xy/pixel)*pixel;float rounded_error=match(source,destination,uv,rounded,pixel);
- if(rounded_error+0.000001<error) {best.xy=rounded;error=rounded_error;}
- best.w=error;return best;
-}
-float4 interpolate(float2 uv) {
- float4 latest=current.SampleLevel(filter,uv,0);if(cut.Load(int3(0,0,0))>0.5) return latest;
- uint width,height;current.GetDimensions(width,height);float2 size=float2(width,height),pixel=1/size;
- if(match(previous,current,uv,float2(0,0),pixel)<0.0005) return latest;
- if(dot(abs(previous.SampleLevel(filter,uv,0).rgb-latest.rgb),float3(0.299,0.587,0.114))<0.0005) {
-  uint neighbours=0;bool edge=false;
-  const float2 offsets[4]={float2(1,0),float2(-1,0),float2(0,1),float2(0,-1)};
-  [unroll] for(uint i=0;i<4;i++) {
-   float3 old=previous.SampleLevel(filter,uv+offsets[i]*pixel,0).rgb;
-   float3 next=current.SampleLevel(filter,uv+offsets[i]*pixel,0).rgb;
-   neighbours+=dot(abs(old-next),float3(0.299,0.587,0.114))<0.0005;
-   edge=edge||(min(dot(abs(old-latest.rgb),float3(0.299,0.587,0.114)),dot(abs(next-latest.rgb),float3(0.299,0.587,0.114)))>0.12);
-  }
-  if(neighbours>=2&&edge) return latest;
- }
- float4 fallback=phase<0.5?previous.SampleLevel(filter,uv,0):latest;
- float2 a=uv,b=uv;
- [unroll] for(uint i=0;i<3;i++) {
-  a=uv-phase*motion_at(forward,previous,current,a,pixel).xy;
-  b=uv-(1-phase)*motion_at(backward,current,previous,b,pixel).xy;
- }
- float4 f=motion_at(forward,previous,current,a,pixel),r=motion_at(backward,current,previous,b,pixel);
- // Validate each warp at its matching endpoint. Testing only f(a)+r(b)
- // can accept unrelated foreground/background correspondences at an overlap.
- float4 reverse=motion_at(backward,current,previous,a+f.xy,pixel);
- float4 opposite=motion_at(forward,previous,current,b+r.xy,pixel);
- bool stable_old=all(a>=0)&&all(a<=1)&&f.z>=0.2&&length((a+phase*f.xy-uv)*size)<=0.75;
- bool stable_next=all(b>=0)&&all(b<=1)&&r.z>=0.2&&length((b+(1-phase)*r.xy-uv)*size)<=0.75;
- // Resolved motion already has bidirectional support from its source surface.
- // A sharp endpoint match can remain valid when the reverse lookup lands at
- // a boundary with no usable local gradient.
- bool valid_old=stable_old&&(f.w<0.01||(f.w<0.12&&reverse.z>=0.2&&length((f.xy+reverse.xy)*size)<=1.5));
- bool valid_next=stable_next&&(r.w<0.01||(r.w<0.12&&opposite.z>=0.2&&length((r.xy+opposite.xy)*size)<=1.5));
- float4 old=previous.SampleLevel(filter,a,0),next=current.SampleLevel(filter,b,0);
- if(!valid_old&&!valid_next) {
-  if(phase<0.5?f.z<0.2:r.z<0.2) return fallback;
-  if(stable_old&&f.w>=0.12) return old;
-  if(stable_next&&r.w>=0.12) return next;
-  return fallback;
- }
- if(!valid_old) return next;if(!valid_next) return old;
- float difference=dot(abs(old.rgb-next.rgb),float3(0.299,0.587,0.114));
- // Average only aligned detail. Blending discrepant samples softens edges;
- // the nearer warped source retains detail and the intended display time.
- return difference<0.008&&length((a+f.xy-b)*size)<=0.75?lerp(old,next,phase):(phase<0.5?old:next);
-}float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target {
- float4 scene=interpolate(uv);bool latest=phase>=0.5 || cut.Load(int3(0,0,0))>0.5;
- if((layers&(latest?2:1))==0) return scene;
- float4 black=latest?current_black.SampleLevel(filter,uv,0):previous_black.SampleLevel(filter,uv,0);
- float4 white=latest?current_white.SampleLevel(filter,uv,0):previous_white.SampleLevel(filter,uv,0);
- float4 lower=latest?current_lower.SampleLevel(filter,uv,0):previous_lower.SampleLevel(filter,uv,0);
- float4 upper=latest?current_upper.SampleLevel(filter,uv,0):previous_upper.SampleLevel(filter,uv,0);
- return clamp(black+scene*(white-black),lower,upper);
 })";
     case ShaderKind::copy_multisample:return R"(
 Texture2DMS<float4> source_colour:register(t0);Texture2DMS<float> source_depth:register(t1);

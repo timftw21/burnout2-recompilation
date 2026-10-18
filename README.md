@@ -1,4 +1,4 @@
-<div align="center"><img width="128" height="128" alt="Burnout2_Recomp_Logo_128_Corrected" src="https://github.com/user-attachments/assets/56cdde6c-ce6f-41a2-913c-63189fa3dbcf" /></div>
+<div align="center"><img width="128" alt="Burnout2_Recomp_Logo_128_Corrected" src="https://github.com/user-attachments/assets/56cdde6c-ce6f-41a2-913c-63189fa3dbcf" /></div>
 
 # <div align="center">Burnout 2: Point of Impact — Static Recompilation</div>
 
@@ -13,18 +13,24 @@ I'll try to respond in a timely manner. This is an independent fan project, unaf
 Yes, AI (Codex) assisted in the development of this project. No, this project was not blindly thrown together.
 If you're skeptical, I implore you to try the recompilation for yourself. I take quality control quite seriously!👀
 
-## What's new in 1.5
+## What's new in 1.6
 
-- Improved HUD/text interpolation with less repeated graphics work.
-- Correctness and efficiency fixes for game timing, memory, file loading,
-  thread cleanup, sound processing and controller rumble.
-- One **Draw distance** setting replaces the LOD and render-distance overrides:
-  choose Original, **2×** or **4×**, including traffic detail at greater distances.
-- Improved car reflections and reduced building flicker with extended draw
-  distance. Some scenery issues remain, including on **Sunrise Valley Springs**.
-- Fixed snow particle size and texturing, and improved upscaling inputs.
-- Refreshed settings with the recomp's logo, clearer categories and custom icons.
-  The game now opens without a separate terminal window.
+- Reworked high-refresh motion for cars, cameras, menus and HUD animations,
+  with an **Unlimited** refresh-rate option.
+- Corrected timing for handling, opponents, replays, How to Play, loading screens,
+  sound effects, spinning scenery, fades and the boost filter.
+- Fixed jittery Time Attack ghosts and car shadows, transparent wheels and
+  Crash-mode cars, taillight trails, MSAA artifacts and menu transition flashes.
+- Corrected widescreen HUD proportions and text placement while keeping the
+  HUD at the screen edges. Boosting no longer darkens the speedometer or boost meter.
+- Fixed extended-distance scenery and building overlap, including
+  **Sunrise Valley Springs**, while retaining the extra draw distance.
+- Added optional **Ambient occlusion**, with three quality levels and adjustable
+  strength; fixed shading lingering over car and track selection menus.
+- Updated the executable and settings icons with the new logo.
+- Temporarily disabled Sign In, New Account and Manage Account(s).
+  Imported **Interstate Burnout 1 (Coming Soon)** is also disabled, and leaving
+  its preview no longer causes a crash when selecting another mode.
 
 Download the new **Installation.zip** and run **Build.cmd** again to update.
 See [Updating between releases](#updating-between-releases) to keep your saves,
@@ -52,12 +58,12 @@ focused on speed and simplicity. I couldn't bear to keep the slop version public
 - Background music, menu sounds and in-game sound effects.
 - Creating, saving and loading profiles through the game's Load/Save menu.
 - Gamepad and keyboard input.
-- Saved settings for display, audio and controls, with a selectable refresh rate
-  that defaults to 60 Hz.
-- Custom keyboard bindings, 1×–4× internal resolution, and optional frame
-  interpolation for higher display rates.
-- Native widescreen camera and screen layout, presented at 16:9.
+- Saved settings for display, audio and controls, with refresh rates from 60 Hz
+  through **Unlimited**. High-refresh gameplay and menus keep normal game speed.
+- Custom keyboard bindings and 1×–4× internal resolution.
+- Native 16:9 camera with the HUD's original proportions and edge placement.
 - Optional MSAA or FXAA antialiasing and anisotropic filtering up to 16×.
+- Optional ambient occlusion with adjustable quality and strength.
 - Imported custom music through the original Music Selection menu.
 - Optional intro skipping and 2×/4× draw distance, including traffic detail.
 - Experimental DLSS, FSR and XeSS upscaling.
@@ -72,6 +78,10 @@ focused on speed and simplicity. I couldn't bear to keep the slop version public
 
 You need a 64-bit Windows PC, a graphics card that supports DirectX 11, and <i>your
 own copy of the US Xbox release. Game files are not included</i>.
+
+**Only the Burnout 2 XISO is required.** Burnout 1 is used only by the separate,
+optional track importer. Its absence does not affect installation or normal play;
+the imported Interstate course remains disabled for now.
 
 1. Install [Visual Studio 2026 Community](https://visualstudio.microsoft.com/downloads/)
    with **Desktop development with C++**, **C++ CMake tools for Windows** and the included Windows SDK,
@@ -126,17 +136,18 @@ Click **Start game** to play; press **Esc** to open or close settings. Changes
 save automatically. Hover over options for details, and use **Restart game**
 to apply graphics and enhancement changes during play.
 
-- **General:** Choose the refresh rate (60 Hz by default) and FPS overlay.
-  Rates above 60 Hz automatically enable **Frame interpolation** to keep gameplay
-  at its normal speed. Disabling it at higher rates speeds up gameplay.
-  Interpolation adds some display delay and can distort fine details.
+- **General:** Choose the refresh rate (60 Hz by default) or **Unlimited**, and
+  enable the FPS overlay. Higher rates smooth gameplay and menus without changing
+  game speed. Unlimited removes the frame cap; V-sync still follows your display.
 - **Graphics:** Select 1×–4× resolution, widescreen (16:9) and V-sync.
   Higher resolutions use more graphics power.
 - **Enhancements:** Adjust MSAA/FXAA, anisotropic filtering and **Draw distance**
-  (Original, 2× or 4×). Increased distance uses more resources and may cause
-  rendering issues. Experimental DLSS, FSR and XeSS also have visual issues and
-  may reduce performance; they replace separate antialiasing and use the selected
-  output resolution. **Skip intro splash screens** is under **Miscellaneous**.
+  (Original, 2× or 4×). **Ambient occlusion** adds contact shading, with three
+  quality levels and a strength slider; Off preserves the original appearance.
+  Increased distance and shading quality use more resources. Experimental DLSS,
+  FSR and XeSS have visual issues and may reduce performance; they replace
+  separate antialiasing and use the selected output resolution.
+  **Skip intro splash screens** is under **Miscellaneous**.
 - **Audio:** To use custom songs, **Browse** for a music folder, click
   **Import music**, then select the collection in the game's **Music Selection**
   menu. MP3, WAV, WMA, FLAC, M4A and AAC are supported through Windows codecs.
@@ -187,8 +198,7 @@ provide the visual reference.
 - [Microsoft's Direct3D 11 documentation](https://learn.microsoft.com/en-us/windows/win32/direct3d11/atoc-dx-graphics-direct3d-11)
   and [Windows API documentation](https://learn.microsoft.com/en-us/windows/win32/api/):
   the Windows graphics and system backend.
-- [Lucas and Kanade's image-registration paper](https://publications.ri.cmu.edu/storage/publications/pub_files/pub3/lucas_bruce_d_1981_1/lucas_bruce_d_1981_1.pdf):
-  the motion-estimation method used for optional frame interpolation.
+- [XeGTAO](https://github.com/GameTechDev/XeGTAO): reference for ambient occlusion.
 
 See [third-party notices](THIRD_PARTY_NOTICES.txt) for dependency licenses and
 [research notes](https://github.com/timftw21/burnout2-recompilation/tree/main/research)

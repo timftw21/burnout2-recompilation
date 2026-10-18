@@ -1,0 +1,464 @@
+Frame-independent game timing, 2026-10-17
+
+Verified default.xbe SHA-256:
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF
+
+Original byte evidence: bounded native decode of 11000..1116D and
+D7210..D73FF. Private output: build/checks/frame-timing/original-*.json.
+
+11036 starts each main-loop iteration. Slots +20/+24/+28 handle scene lifecycle
+changes; they are not the physics update. Slot +10 runs a combined update/draw
+function, followed by D73B0 at 1115C.
+D7240 resets the global timer and selects fixed 1/60 (NTSC) or 1/50 (PAL)
+seconds at 598188. D72C0 selects quarter speed; D7300 restores normal speed.
+598190 holds that mode, 598194 requests a mode change, and 352720 selects PAL.
+D73B0 advances 59818C by four normal ticks or one slow-motion tick per render.
+D7340 accumulates tick differences in each timer, respecting its running flag,
+then converts them to seconds using 598188 and a normal-mode factor of 0.25.
+D7390 returns rounded milliseconds through the original float-to-integer code.
+
+The first variable-step change was incorrect. Although clock arithmetic passed,
+replay 88890 consumes one six-byte input record per update and checks the low
+bytes of player position (88C7B). Different physics steps invalidate recordings.
+Ghost routines 7AC10, 7BB20, 7BD80 and 7BE10 use 598188 to convert fixed sample
+spacing to frame counts. Handling and per-update sound events also ran at the
+display rate. Changing timer arithmetic did not make those systems variable-step.
+
+The replacement schedules original 60 Hz NTSC / 50 Hz PAL updates from the
+existing 733333333 Hz clock, carrying integer cycle remainders. All original
+movement deltas, clock increments, conversions and slow-motion code are restored.
+Scene/loading changes discard loading time. Catch-up runs complete updates with
+one final draw. The first version drew unchanged poses between updates; the user
+confirmed that it fixed gameplay, playback and sound but looked like 60 Hz.
+
+Verified update/draw boundaries:
+  Main: 11036 starts scheduling; 1115C advances time only after an update.
+  Menu: 133B3..13428 updates; 13428..13482 draws.
+  Race variants: 14DF1..150BB, 15423..15491, 163C3..163C8,
+                 16843..1684B update before their drawing portion.
+  Crash: 1A823..1A828 updates before drawing.
+The AOT emitter verifies original bytes and destinations at these boundaries.
+157E0 contains shared race/replay/vehicle updates; 19B00 contains crash updates.
+Ghost 7BB20 advances samples during updates; 7BE60 draws them without advancing.
+
+Existing CPU checks exercise
+fixed update counts, original timer/pause/slow-motion behavior, native replay
+record/playback round trips and ghost initialization at 30, 60, 144, 360, 1000 Hz
+and varying intervals, for both video modes. All passed, including original ghost
+spline playback. The user subsequently confirmed the earlier regressions fixed.
+
+Display-pose interpolation and loading playback, 2026-10-17
+
+The fixed simulation remains unchanged. The scene drawing boundaries now retain
+consecutive original poses and temporarily apply an intermediate pose for each
+display frame. Rotations use normalized quaternions, preserving solid wheel/car
+geometry; translation and scale are interpolated separately. Current simulation
+poses are restored before the next update. Scene/loading changes clear history.
+No pixel warping, image blending, extra GPU pass or per-frame allocation is used.
+
+Verified original sources, decoded in bounded native instruction ranges:
+  E90D0 marks a RenderWare frame dirty. Local matrix is frame+10, derived world
+  matrix +50. F2570/F2620 rebuild the hierarchy and attached camera callbacks.
+  E9040 destroys a frame recursively; E8F60 initializes it. Both invalidate its
+  history. Only frames changed during simulation are tracked, not temporary
+  reflection transforms created while drawing.
+  E82F0 rebuilds the camera view and frustum from its frame. After rendering,
+  original hierarchy synchronization rebuilds these from restored poses, so
+  physics never reads an interpolated camera cache.
+  85AC0 reads car+CEC -> model, model+D00 -> body matrix, model+EC0..1080 ->
+  eight possible part matrices, and car+8 -> body with wheel pointers at +BB8.
+  Body+10 points to the physical matrix. B2530 uses the same model+D00 for the
+  projected shadow. These poses are applied before the entire race draw.
+  9B380 reads each view's 26 traffic groups, up to 30 pointers per group from
+  manager+2AEBC, counts at +2DF7C. Each traffic object begins with its matrix.
+  7BE60 calls original ghost pose construction 7B280, then at 7BEDE EDI points
+  to the generated ghost matrix. Only that rendered pose is interpolated; the
+  ghost sample index, fraction, input and simulation deltas are untouched.
+  2E280 draws the car-selection model. Its second argument points to persistent
+  UI parameters (C1210 passes node+28): two angles, view-window dimensions,
+  model reference and camera offset. Interpolating those visual parameters
+  before drawing keeps the original reflection and real car synchronized.
+
+ADE20 is the loading draw/update function. It also runs in blocking scene
+constructors, without 11036. ADE38 called UI update 3F6F0 once per display frame,
+and ADFE6/AE18F decremented the fade using the fixed gameplay delta each time.
+It now has its own elapsed clock: UI callbacks consume original 50/60 Hz steps;
+the three loading-only delta operands use real elapsed display time. The global
+gameplay delta at 598188 is never changed. Normal scene drawing ends a loading
+sequence, so the next loading sequence starts without an unrelated time backlog.
+
+Native verification additionally covers loading at every tested display cadence,
+intermediate translations and non-collapsing half-turn wheel rotations, exact
+pose restoration, original camera/hierarchy/view/frustum restoration, and
+car-selection angle wrapping without modifying its model pointer.
+
+The live capture exposed a separate catch-up boundary error in the earlier fixed
+scheduler: menu 13485 discarded 12 bytes of E8520 arguments even when rendering
+had been skipped. Only that draw-owned cleanup is now skipped on catch-up steps;
+the original status return and saved-register epilogue still execute. A native
+133B0 calling-convention check covers this case without a graphics device.
+
+Final validation: Release build smooth-presentation-build4 passed. All 52 native
+CPU groups passed (26,026 instruction, 3,165 memory, 6,744 floating-point and
+109 control cases; 36,149 compiled functions). The final functional run completed
+car selection, track selection, loading and the start of an Airport Terminal 3
+race, including capture-induced stalls, with no unexpected boundary or audio
+error. Private artifacts: build/checks/fixed-simulation/build/captures/
+frame-17401365200 (car select), frame-20403155500 (track select), and
+frame-45400782200 (race, 38 mph). Captures confirm an intermediate car-select pose
+and 53 intermediate race poses at fractions 0.50 and 0.47 respectively.
+These were functional checks, not a performance comparison; no FPS-regression
+claim is inferred from their whole-run frame counts. No GPU pass was added.
+
+Draw-owned scenery and blur timing, 2026-10-17
+
+8C8D0 is the original rotating-scenery loop. For each track definition of type 7
+(definition+68), 8C932 reads 598188 and multiplies by angular speed at +64.
+The loop rotates each 64-byte instance matrix with EA0E0 around the original
+axis at 2C04F4 (0,0,1), preserving the three translation components. The master
+lists are +28/+2C (definitions), +34 (per-definition sector lists), and +5C
+(sector count). Scene+8 pauses rotation. Original bytes: 8C8D0 83EC24,
+8C932 D90588815900, 8C9FF C3.
+
+8CA00 calls it at 8CEF0 whenever its animation argument is enabled. 80610 calls
+91EC0 with that argument during drawing; split-screen can call it for both
+views even though both share the master at 4B85B0. Drawing now supplies elapsed
+presentation time multiplied by the original fixed delta's slow-motion scale,
+and advances that shared scenery once per displayed frame. Physics, recordings,
+ghosts and timers retain their original fixed delta. Imported barrier texture
+animation, also advanced from drawing, uses the same elapsed time.
+
+A97C0 is the original framebuffer feedback filter. It reads active strength at
+object+8, applies the original PAL factor (2C2F78 ABF9553F) and converts strength
+to an alpha byte at A97F9. A99F4 calls 215CE0 with -1: the original SDK selects
+device+15F8, the previous displayed surface. The quad uses SRCALPHA / INVSRCALPHA
+and writes that byte at +24/+40/+5C/+78. It then restores default strength from
+object+4. A97FF's original bytes are 89442410.
+
+Keeping the same history weight per display shortened the blur at high refresh.
+Only its emitted alpha now changes: alpha(display) = alpha(original) raised to
+elapsed_original_frames. Byte rounding carries forward to prevent quantization
+from changing decay at very high rates. Disabled/full strength and the original
+cadence remain exact. The filter's original pass, input surface, state transitions
+and original PAL adjustment remain intact; no GPU passes or frame allocations
+were added. Scene changes reset the visual clock and rounding residue.
+
+Validation: effects-timing-build3 rebuilt the release executable successfully.
+All 52 native groups passed: 26,026 instruction, 3,221 memory, 6,744 floating
+and 109 control cases, with 36,149 compiled functions. Added checks execute the
+original 8C8D0/EA0E0 rotation path at 30/50/60/144/360/1000 FPS and changing
+cadence, in PAL/NTSC, normal/slow motion, paused/running, and duplicate views.
+They compare with original fixed-cadence rotations, including the original
+approximate RSQRTSS axis normalization. Blur retention over equal elapsed time,
+byte-rounding carry, original cadence and zero/full-strength cases pass.
+
+The 48-second functional launch-to-race run completed normally, with no audio
+error or runtime shader compilation. Its final frame shows Airport Terminal 3
+at 74 mph. Private output: build/checks/fixed-simulation/effects.png; capture:
+build/checks/fixed-simulation/build/captures/frame-45435487100. The run was a
+functional check, not a performance comparison; it did not activate boost.
+Original fixed NTSC delta remains 3C888889 in the final memory capture. All
+owned build/check/game workers exited. No new GPU passes or per-frame allocations.
+
+Fade timing and CPU audit, 2026-10-17
+
+Bounded native decoding confirms B9230 initializes a viewport fade: elapsed +4,
+fade-in +8, fade-out +C, alpha scale +10, camera holder +14. B9270 draws its
+original coloured quad and advances elapsed with 598188 at B9748 (D90588815900).
+The race/crash drawing paths call it once per viewport, with separate paused and
+running branches. It was therefore advancing 360 original ticks per second at
+360 Hz. Only that operand now uses the existing elapsed rendering delta,
+including the original slow-motion scale. Original alpha calculations, fade
+completion, rendering and the simulation delta are unchanged.
+
+ADE20's first loading phase copies the previous display and subtracts RGB.
+ADED5..ADEE7 converts delta * 255 / 0.5 to a whole number, then ADEEC (8BD8)
+copies it to EBX. Truncating every short display loses colour steps (and at
+1000 Hz loses all of them). Preserve the original quantized amount per fixed
+frame, scaled by elapsed time, with fractional carry and saturation at 255.
+ADEB4 (D91F), which initializes a new fade, clears the carry. The second phase
+already calculates absolute alpha from its elapsed countdown. No new draw pass.
+
+Opponent/traffic update chain verified from original bytes: race scene 3002D0
+has vtable 295BE8; constructor 198F0 sets controller 303BC4, vtable 295CF0.
+157E0 calls its +10 slot at 15824 only while unpaused; 17310 -> 13950 -> 822B0.
+822B0 dispatches vehicle updates using the original 598188 at 82608, 82636 and
+82719, and calls traffic routines 9F500/9F9B0. This entire chain remains inside
+the fixed update boundary. Presentation restores physical and derived camera
+matrices before it runs; the new fade delta never enters these calls.
+
+Temporary original calls from presentation/loading now retain the scheduling
+budget they consume instead of restoring an older quantum_remaining alongside
+the saved guest registers. Loading clock arithmetic also runs inside the host
+floating-point guard. Existing native checks cover live x87 values, non-default
+MXCSR, registers/flags, scheduling consumption and loading fade conservation.
+
+Validation: fade-cpu-final-build and all 52 native check groups passed (26,026
+instruction, 3,221 memory, 6,744 floating and 109 control cases). The generated
+B9748 uses render_delta while recording the original guest operand address;
+ADEEC uses the carried RGB amount. The 48-second launch-to-race smoke check
+ended normally with no audio error or runtime shader compilation. Airport
+Terminal 3 shows all four racers, player speed 74 mph and timer 2.316 seconds.
+The original fixed delta remains 3C888889; the completed viewport fade elapsed
+is approximately 0.254 seconds for its 0.25-second duration. Capture
+build/checks/fixed-simulation/build/captures/frame-45427470900 records 73 smoothed
+poses at fraction 0.5028. This does not constitute a visual comparison of every
+transition or an FPS benchmark. All owned workers exited.
+
+Boost filter transitions, 2026-10-17
+
+Original A9750 changes enable/default strength only when the enable flag changes.
+A976B (C7410800000000) clears active strength at object+8. A9790 also clears that
+field for camera cuts. A97C0 draws with active strength, then A9C60/A9C65
+(8B4804 / 894808) restores it from object+4. Consequently, extra display draws
+were shortening the initial clear from one original simulation frame to one
+display frame. The original enable/disable and camera/FOV transition code still
+runs inside the fixed update boundary; no new fade curve should replace it.
+
+The emitted-alpha adjustment now retains that clear through the same simulation
+step. The next step resumes the original feedback strength and its existing
+elapsed-time decay adjustment. Original filter state is never changed by this
+adjustment. Rounding residue and clear step are separate for the two original
+viewport filters at 4431F8 and 443858, preventing one view's clear from resetting
+the other's blur decay. No additional GPU passes, per-frame allocations, or
+transcendental calculations were added.
+
+The existing native presentation check now invokes A9750, A9790 and the original
+A97C0 alpha path. A diagnostic breakpoint at the first surface request, 215CE0,
+allows checking its emitted alpha without a GPU. The verified A9C65 strength
+copy completes the fixture. Cases cover enable, sustained blur, camera cut,
+disable and re-enable with 1/2/6/17 displays per simulation tick in PAL and NTSC;
+they verify equal-time history retention and unchanged original filter state.
+Existing changing-cadence checks also exercise independent viewport rounding.
+
+Validation: boost-transition-build rebuilt the release executable successfully;
+boost-transition-check passed all 52 native groups (26,026 instruction, 3,285
+memory, 6,744 floating and 109 control cases; 36,149 compiled functions).
+The 64 added transition cases use the compiled original instructions, including
+the emitted-alpha hook. No gameplay comparison or FPS benchmark was run.
+
+Boost feedback and HUD shading, 2026-10-17
+
+The speedometer and boost meter contain translucent shading. A97C0 samples the
+previous displayed surface (A99F2 6AFF; A99F4 E8E7C21600 calls 215CE0 with -1).
+Rendering the HUD into that feedback repeatedly compounds its shading. For a
+constant scene, black HUD opacity p and history weight w, displayed brightness
+is (1-p)*(1-w)/(1-(1-p)*w). Preserving boost duration at higher display rates
+raises w, so retaining the HUD in that history makes the gauges much darker.
+
+Verified race draw boundaries 81158 (E8F3720600), 81369 (E8E2700600), and
+817F7 (E8546C0600) begin the UI camera after scene/filter drawing. The last is
+after both split-screen world views. When a filter is enabled, submit the queued
+scene without a driver flush or wait, and move the existing presentation copy
+to this boundary. Swap color resource handles so UI draws use the copied color
+with the original scene depth/stencil/responsive mask. Swap back at flip: the
+guest surface retains clean scene feedback and main receives the complete HUD.
+This uses the existing targets, one color copy, and the original draw count.
+MSAA color/resolved views and texture bindings move with their color resources.
+
+Other users of GetBackBuffer(-1), including A9D69's loading transition, still
+need the complete displayed image. Its verified 215CE0 entry (8B442404 83F8FF)
+restores that image by swapping handles before returning it, except for boost's
+A99F9 return site. This requires no additional image copy. Normal presentation,
+main-target writes, resource release and reset retire the retained history marker.
+
+The existing render diagnostic now exercises transparent/opaque HUD content,
+equal-time scene feedback at 60/360 Hz, retained depth, ordinary and 4x MSAA
+rendering, loading-image restoration, and GPU flip/snapshot completion. It checks
+unchanged draw/copy/resource counts. Existing AO cases also exercise HUD separation
+with depth clears, and the combined FSR case uses the separated path.
+
+Validation: boost-hud-render-final passed all 258 render cases with the D3D11
+debug layer on the NVIDIA GeForce RTX 5060 Ti, with no graphics validation
+messages. The HUD cases retain equal-time boost history, constant gauge opacity,
+the original depth, one copy and five fixture draws per frame, and unchanged
+render-target memory. All 52 native CPU groups also passed. Release b2.exe is
+rebuilt; all owned build/check workers exited. No game automation, comparison,
+or FPS benchmark was run for this change.
+
+Time Attack ghost presentation and uncapped display (2026-10-17)
+
+Original XBE SHA-256 B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF was reverified against knowledge/supported_target.json.
+The existing 7BEDE hook receives EDI = ghost+5F0, the complete output record
+from 7B280. It had treated that record's header as a matrix. Verified original
+instructions 7B294/7B2AE locate the body matrix at record+10, 7B460/7B478
+locate part matrices at +1B0 (0x40-byte stride), and 7B7B8/7B7CF locate
+wheel matrices at +70. Counts come from [4BA93C]+2C and [4B9C58]+B88.
+Presentation now smooths all these transforms and restores their original bytes
+after drawing. Ghost sample indices, sample fractions and update cadence stay
+original. The native presentation diagnostic checks the full 8-part/4-wheel
+layout, intermediate display positions, untouched fields and exact restoration.
+Bounded original decode: build/checks/unlimited-ghost-ao-20261017/ghost-pose.txt.
+
+Refresh rate 0 means Unlimited. It clears the application pacing deadline and
+still respects V-sync; returning to a numbered rate starts a fresh schedule.
+The fixed simulation clock is unchanged. Preferences and performance exports
+accept the sentinel; uncapped reports have no synthetic frame deadline.
+Validation: Release build, all 52 CPU groups (26,026 instruction, 3,304 memory,
+6,744 floating, 109 control cases), all 258 D3D11 render cases, --check-window
+and check-performance passed. Render checks reported no D3D11 messages.
+Automated car-select (23 seconds) and Airport Terminal 3 Time Attack
+(63 seconds) smoke runs used Unlimited, 3x resolution, 4x MSAA and GTAO High;
+both exited cleanly with no audio errors or runtime shader compilations.
+These functional runs are not performance benchmarks or a visual motion
+comparison. All owned workers exited. Private reports and captures are in
+build/checks/unlimited-ghost-ao-20261017 and the matching overnight-360 logs.
+Release b2.exe SHA-256: A0CCFD9BEE19BA450B82D9134AF639446D9598D57E01A8BA2CE56488E7A0CA9D.
+
+Camera cuts and authored draw distance (2026-10-17)
+
+Original bytes rechecked against supported_target.json SHA-256
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+Bounded native decodes establish ADCA0/A6130's second stack argument as the
+camera wrapper. Wrapper+228 selects one of three BC-byte mode records, with
+mode at +170+slot*BC. A0660 pushes a mode and A0CB0 restores it. 1294F pushes
+rear view (mode 2); 129D4 releases it. 12A2B switches ordinary modes 0/1.
+A04A0 updates view window through E85C0 and near clipping through E8490.
+
+Presentation now records active camera wrappers during original updates.
+A mode, camera, frame or projection change discards that camera's pose/lens
+history. Ordinary motion remains interpolated; intentional view changes cannot
+blend into a sideways intermediate view. Window width/height and near clipping
+use the pose's interpolation fraction. Original E8490 rebuilds projection and
+E90D0/F2620 rebuild view/frustum; original lens values are restored before the
+next simulation update. All storage is fixed-size, with no per-frame allocation.
+Validation results follow after the Release build and diagnostics.
+
+2026-10-17 validation: Release build passed. All 52 CPU groups passed,
+including 3307 memory/presentation cases and the new real-camera mode/zoom
+restoration cases. All 258 hardware renderer cases passed on RTX 5060 Ti with
+zero D3D debug messages. The window/settings check passed.
+
+Airport Terminal 3 and Sunrise Valley Springs (menu index 7) completed private
+63-second functional runs with 360 Hz selected, 1x native, MSAA 4x, GTAO High,
+4x distance and V-sync off. Both retained 1600 original / 6400 extended far
+planes, compiled zero shaders and had no audio errors. These are functional
+runs, not FPS benchmarks; no new performance comparison was authorized/run.
+The original problem location was diagnosed from the earlier capture/assets;
+the new Sunrise run is a start-area smoke check, not a full-track visual audit.
+
+A separate 72-second Airport run used the verified original controls (white /
+left shoulder for camera mode, X for rear view). Captures at
+build/captures/frame-61921212800 and frame-65421126200 show forward first-person
+and rear view respectively. Releasing rear view and switching back restored
+mode 1 / third person; camera-final.png records the final view. All 28 events
+applied, zero shader compilations and no audio error. Earlier smoke scripts used
+Y/right shoulder and did not establish the view transitions; this corrected run
+is the live camera evidence. CPU diagnostics establish interpolation and exact
+simulation-state restoration between the captured endpoints.
+
+Private results: build/checks/camera-distance-20261017/verification.json.
+Release b2.exe SHA256:
+C551C6CF82C6CB3F8915872A58A31AC291D0B728D3C4AC2D28F7EA7AEE7EB7F8.
+All owned workers exited. Personal settings remained byte-identical; game runs
+used a private automation-user copy of the profile.
+
+Menu and HUD presentation, 2026-10-17
+
+133B3..13428 still runs the original frontend update at 50/60 Hz. Its 3F6F0
+calls 2A8D0 and component updates before drawing 3EB60 -> 2AA30 -> C1410.
+Only the 3D preview parameters had presentation history; queued UI movement,
+size and colour therefore still stepped at the simulation rate.
+
+C1210 composes each node's eight float position/size/colour values at
+C1230..C1299 and calls its original drawing callback at C1306. Retain consecutive
+values by node and sample them at the presentation fraction, before widescreen
+anchoring. Original queue records, text and texture contents remain unchanged.
+Original cadence and catch-up gaps use exact current values. Changed callback,
+parent or payload identity, allocation at C14C7 and scene resets discard history.
+Values changed within the same simulation tick also bypass interpolation, so
+already draw-driven animation is not sampled a second time.
+
+The Burnout message uses callback 22A60, installed at 23580. Its integer texture
+phase (+14 in callback data) and float wipe amount (+18) advance in 235C6..235DE,
+inside the original HUD update. The callback reads but does not advance them.
+Its float wipe amount follows the same display fraction; C1309 restores the
+exact original value immediately after drawing. The texture sequence and event
+counter keep their original timing. No framebuffer blending, new render pass
+or per-frame allocation is involved. The fixed UI history uses scalar/SSE work
+without saving the live x87 stack per node; stationary values skip interpolation.
+
+The supplied Burnout2_Recomp_Logo_128_Corrected.png replaces resources/b2.png
+byte-for-byte (SHA256 24B19485488F260AB6962FF6892D613EF63C4DFA9E367863859FE885AB310863).
+resources/b2.ico contains its 128/64/48/32/24/16-pixel variants. The executable's
+existing icon resource and SETTINGS_LOGO both embed the replacements; SDL3 uses
+the first executable icon for the native window. Private evidence is in
+build/checks/ui-motion-icon-20261017. Benchmarks remain declined by the user.
+
+Final validation: ui-motion-icon-final-build and all 52 native CPU groups passed
+(26,026 instruction, 3,316 memory/presentation, 6,744 floating, 109 control cases).
+The existing real C1210/34C20 callback check now verifies an intermediate moving
+UI element combined with widescreen anchoring, unchanged colours, source records
+and vertex counts. Font layout changes at payload+8 reset history; intentional
+camera cuts also clear UI history so projected labels cannot sweep across cuts.
+
+The settings/window check passed and its new logo was visually inspected.
+The icon extracted from the built executable exactly matched the supplied
+artwork's 32-pixel ICO entry (zero differing pixels). A 32-second functional
+frontend run at the 144 Hz setting reached track selection, applied all 17
+scripted events, compiled zero shaders and reported no audio errors. No in-game
+performance recording was started, and this does not establish game FPS or
+visual parity of every HUD transition. Personal settings stayed byte-identical;
+all owned build/check/game workers exited. Final hashes and results are in the
+private verification.json.
+
+Menu page transitions, 2026-10-17
+
+3F6F0 changes frontend pages through 3F7E2 -> 3E2D0, which hides all 30
+components through their existing visibility setters. Their draw nodes remain
+allocated and can retain the same parent/callback/payload identity. Interpolating
+that discontinuity briefly restores the previous page's position and opacity.
+Clear UI history at 3E2D0 and the frontend-exit branch 3F815 before drawing the
+new state. Subsequent animation still uses consecutive original updates, with
+no changes to menu clocks, game simulation or drawing passes. Both original
+instruction signatures are verified during ahead-of-time generation.
+
+Release build and all 52 CPU groups passed, including three additional cases
+in the existing original queued-draw check: a hidden, repositioned persistent
+node stays invisible at an intermediate display fraction after a page reset.
+A 33-second functional 144 Hz run entered and backed out of car/track menus,
+applied all 18 inputs, compiled zero shaders and reported no audio errors.
+Private evidence: build/checks/menu-transition-20261017. No benchmarks ran;
+personal settings stayed byte-identical and all owned workers exited.
+
+Direct extraction of the rebuilt EXE's 32-pixel icon exactly matches b2.ico.
+Windows' shell icon entry was refreshed for that executable; system image-list
+lookups show the supplied 2 logo. Release SHA256:
+82B566CEF7957566DD90FA17722338E90D307341AC99F3F51CE7E356B1CB10BD.
+
+Menu panel mirroring, 2026-10-17
+
+The page reset alone did not resolve the reported panel/text flash. The user's
+frame-19866382000 and frame-22370790600 captures showed surrounding transitions;
+the car/logo overlap was unrelated. A bounded functional navigation trace found
+the discontinuity inside the following page's animation, after the page reset.
+At simulation step 1096, panel node 005C6E68 changed from x=-513.84, width=1984
+to x=1496.98, width=-1984, with unchanged y, height and opacity. Eight other panel
+and border nodes mirrored on the same tick. Back navigation at step 1276 reversed
+the signs, and re-entry at step 1456 repeated the first change.
+
+Original callback BFBF0 loads the signed width at BFBF7 and adds x at BFBFC;
+BFC10..BFC13 similarly computes y+height before drawing through C2280. Mirroring
+therefore changes rectangle orientation immediately. Interpolating positive and
+negative widths instead collapses these panels through the screen and briefly
+reveals or covers text. Discard the UI pair when either dimension changes sign,
+then resume normal interpolation on subsequent samples. This preserves smooth
+movement without changing the game's animation clocks, fades or draw passes.
+The hot-path addition is two scalar sign comparisons; temporary tracing was
+removed. F8 captures now include the existing UI histories and frontend state
+so future captures retain the needed transition evidence without runtime logging.
+
+Release build and all 52 CPU groups passed: 26,026 instruction, 3,325 memory/
+presentation, 6,744 floating and 109 control cases. The existing original queued
+draw check now exercises width and height mirroring in all three bar variants,
+alongside its normal smooth movement and page-reset cases. Private evidence:
+build/checks/menu-flash-captures-20261017. Benchmarks remain declined.
+
+A final 28-second functional run at the 144 Hz setting entered, left and
+re-entered car selection. All 23 scripted events applied; nine transition
+captures contained no paired rectangles with opposite orientations. Captures
+just after each mirror were inspected, and ordinary interpolation resumed on
+subsequent samples. No shaders compiled and no audio errors were reported.
+Personal settings remained byte-identical; all owned build/check/game workers
+exited. This functional run was not a performance benchmark. Release SHA256:
+677B0DC5C5219C9328F44ECAB384CEBD9BEBA361D58BA36D26F30A2D27A8D1D1.

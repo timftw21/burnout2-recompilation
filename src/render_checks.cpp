@@ -97,6 +97,78 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
     const auto red_pixel = [](const Image& image) { expect(image, 32, 32, {255,0,0,255}); expect(image, 3, 3, {255,0,0,255}); };
     auto state = colored();
     run("colored-quads", state, red, red_pixel);
+    for(unsigned samples:{1U,4U}) for(unsigned displays:{1U,6U}) {
+        if(samples>1 && !renderer.supports_msaa(samples)) continue;
+        run(std::format("boost-hud-history-{}x-{}hz",samples,displays*60),state,white,[&](const Image&) {
+            Performance counters;
+            Renderer native(64,64,warp,debug);
+            if(samples>1) native.enhancements(5,0);
+            const std::array targets{native.create_target(64,64),native.create_target(64,64)};
+            auto world=colored();world.depth_test=world.depth_write=true;
+            auto hud=colored();hud.blend=true;hud.blend_source=0x302;hud.blend_destination=0x303;
+            hud.color_mask=0x00010101;hud.scissor_test=true;hud.scissor={8,8,24,24};
+            auto text=colored();text.scissor_test=true;text.scissor={40,8,56,24};
+            auto hidden=world;hidden.depth_write=false;
+            native.prepare(world);native.prepare(hud);native.prepare(text);native.prepare(hidden);
+            for(auto target:targets) {native.set_target(target);native.begin(0xFFFFFFFF);native.end();}
+            native.performance(&counters);
+            const auto resources=native.resources();
+            const auto frames=displays*4;
+            for(unsigned frame=0;frame<frames;++frame) {
+                const auto target=targets[frame&1];
+                auto feedback=textured(targets[(frame+1)&1]);feedback.blend=true;
+                feedback.blend_source=0x302;feedback.blend_destination=0x303;feedback.color_mask=0x00010101;
+                native.prepare(feedback);native.set_target(target);native.begin();
+                native.draw(world,frame<displays*3?white:blue);
+                native.draw(feedback,quad({1,1,1,float(std::pow(0.7,1.0/displays))}));native.end();
+                native.begin_overlay();native.begin(0,1,false);
+                native.draw(hud,quad({0,0,0,0.3f}));native.draw(text,red);
+                // The presentation copy must still use the scene's depth.
+                native.draw(hidden,quad({0,1,0,1},0.75f));native.end();native.end_overlay();
+                native.publish_frame();
+                const auto image=native.readback();
+                expect(image,48,16,{255,0,0,255});
+                const auto scene=pixel(image,32,32);
+                expect(image,16,16,{unsigned(std::lround(scene[0]*0.7)),unsigned(std::lround(scene[1]*0.7)),179,255},2);
+                if(frame<displays*3) expect(image,32,32,{255,255,255,255});
+                if(frame+1==frames) {
+                    expect(image,32,32,{179,179,255,255},3);
+                    save_png(image,directory/std::format("boost-hud-{}x-{}hz.png",samples,displays*60));
+                    native.set_target(target);const auto history=native.readback();
+                    expect(history,16,16,scene);expect(history,48,16,scene);native.set_target();
+                    native.restore_feedback();const auto transition=native.read_target(target);
+                    if(transition.rgba!=image.rgba) throw std::runtime_error("Loading transition lost the completed HUD");
+                }
+            }
+            const auto after=native.resources();const auto counts=native.stats().counters;
+            if(after.targets!=resources.targets || after.target_bytes!=resources.target_bytes ||
+               counts[unsigned(PerfMetric::target_creations)] || counts[unsigned(PerfMetric::target_copies)]!=frames ||
+               counts[unsigned(PerfMetric::draws)]!=frames*5)
+                throw std::runtime_error("Boost HUD separation added render resources, copies or draws");
+            if(!native.errors().empty()) throw std::runtime_error("Boost HUD feedback produced graphics validation errors");
+        });
+    }
+    run("gpu-boost-overlay-flip-and-snapshot",state,white,[&](const Image&) {
+        Renderer native(64,64,warp,debug);
+        std::vector<std::byte> ram(65536);Memory memory(0,ram);Gpu gpu(native,memory,60000);
+        std::vector<std::uint32_t> words;
+        const auto packet=[&](std::uint32_t method,std::initializer_list<std::uint32_t> values) {
+            words.push_back(method|(static_cast<std::uint32_t>(values.size())<<18));words.insert(words.end(),values);
+        };
+        const auto submit=[&] {
+            const auto bytes=std::as_bytes(std::span(words));std::memcpy(memory.access(0,bytes.size()),bytes.data(),bytes.size());
+            gpu.submit(0,static_cast<std::uint32_t>(bytes.size()),false);words.clear();
+        };
+        packet(0,{0xD});packet(0x200,{64U<<16,64U<<16,0x128,0x01000100,0x20000,0x30000});
+        for(bool flip:{true,false}) {
+            packet(0x1D98,{63U<<16,63U<<16});packet(0x1D90,{0xFFFFFFFF});packet(0x1D94,{0xF0});submit();
+            gpu.begin_overlay();
+            packet(0x1D98,{(23U<<16)|8U,(23U<<16)|8U});packet(0x1D90,{0xFF000000});packet(0x1D94,{0xF0});
+            if(flip) packet(0x12C,{0});submit();gpu.snapshot();
+            const auto image=native.readback();expect(image,16,16,{0,0,0,255});expect(image,32,32,{255,255,255,255});
+        }
+        if(gpu.stats().flips!=1 || !native.errors().empty()) throw std::runtime_error("GPU overlay completion lost its frame or produced graphics errors");
+    });
     auto diagonal=white;diagonal[1].position={1,-1,0.5f,1};diagonal[2].position={-1,-1,0.5f,1};
     auto edge_state=colored();edge_state.primitive=5;
     Image original_edge;
@@ -115,8 +187,8 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
             expect(image,3,60,{255,255,255,255});expect(image,60,3,{0,0,0,255});
         },{},{},{},true);
     }
-    renderer.interpolation(true);renderer.resize(48,32);
-    run("fxaa-resize-with-interpolation",colored(),red,[](const Image& image) {
+    renderer.resize(48,32);
+    run("fxaa-resize",colored(),red,[](const Image& image) {
         if(image.width!=48 || image.height!=32) throw std::runtime_error("Antialiasing retained old dimensions");
         expect(image,24,16,{255,0,0,255});
     },{},{},{},true);
@@ -130,7 +202,7 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
     auto msaa_diagonal=white;msaa_diagonal[2].position={-1,-1,0.5f,1};
     for(unsigned samples:{2U,4U,8U}) {
         if(!renderer.supports_msaa(samples)) continue;
-        renderer.interpolation(false);
+
         const auto mode=3U+unsigned(std::countr_zero(samples));renderer.enhancements(mode,0);
         run(std::format("msaa-{}x-geometry",samples),edge_state,std::span(msaa_diagonal).first(3),[&](const Image& image) {
             unsigned coverage=0;
@@ -142,13 +214,13 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
             D3D11_TEXTURE2D_DESC description{};texture->GetDesc(&description);
             if(description.SampleDesc.Count!=samples) throw std::runtime_error("MSAA sample count differs from the selected mode");
         },{},{},{},true);
-        renderer.interpolation(true);renderer.resize(48,32);
-        run(std::format("msaa-{}x-resize-interpolation",samples),colored(),red,[](const Image& image) {
+        renderer.resize(48,32);
+        run(std::format("msaa-{}x-resize",samples),colored(),red,[](const Image& image) {
             if(image.width!=48 || image.height!=32) throw std::runtime_error("MSAA history retained old dimensions");expect(image,24,16,{255,0,0,255});
         },{},{},{},true);
         renderer.enhancements(0,0);renderer.resize(64,64);
     }
-    renderer.interpolation(false);
+
     if(renderer.resources().target_bytes!=target_budget) throw std::runtime_error("Disabled MSAA retained render storage");
     if(renderer.supports_msaa(4)) {
         renderer.enhancements(5,0);
@@ -735,7 +807,7 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
             {{{std::as_bytes(std::span(positions[0])),sizeof(Float4)}}},
             {{{std::as_bytes(std::span(positions[1])),sizeof(Float4)}}}}};
         std::array<Renderer::StreamDraw,32> group{};
-        Performance profile;profile.start(native.adapter(),60,1,false,false,{});native.performance(&profile);
+        Performance profile;profile.start(native.adapter(),60,1,false,{});native.performance(&profile);
         native.begin();const auto started=std::chrono::steady_clock::now();
         constexpr unsigned count=32770;
         for(unsigned first=0;first<count;first+=static_cast<unsigned>(group.size())) {
@@ -1365,6 +1437,97 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
             ++passed;
         } catch(const std::exception& failure) {error=failure.what();}
         report+=std::format("{{\"name\":{},\"passed\":{},\"error\":{},\"image\":{}}}",json(name),error.empty(),json(error),json(utf8(image_path.wstring())));
+    }
+    for(unsigned quality=1;quality<=3;++quality) for(const auto sample_count:{1U,4U}) {
+        if(sample_count>1 && !renderer.supports_msaa(sample_count)) continue;
+        if(total++) report+=',';
+        const auto name=std::format("gtao-{}-{}x",quality,sample_count);const auto image_path=directory/(name+".png");
+        std::string error;const auto started=std::chrono::steady_clock::now();
+        try {
+            Renderer native(128,96,warp,debug);native.enhancements(sample_count==4?5:0,0);
+            const auto baseline_bytes=native.resources().target_bytes;
+            auto surface=colored();surface.depth_test=surface.depth_write=true;native.prepare(surface);
+            const auto ui=native.prepare_program(screen_vertex_programs()[0]);
+            VertexConstants constants{};constants[0]={1,1,16777215,1};constants[1]={0.53125f,0.53125f,0,0};
+            ProgramView view;view.depth_scale=16777215;
+            auto hud=colored();hud.blend=true;hud.blend_source=0x302;hud.blend_destination=0x303;native.prepare(hud);
+            std::array<ProgramVertex,4> text{};
+            constexpr std::array<Float4,4> positions{{{48,36,0,1},{80,36,0,1},{80,60,0,1},{48,60,0,1}}};
+            for(unsigned i=0;i<4;++i){text[i].attributes[0]=positions[i];text[i].attributes[3]={1,0,0,1};}
+            auto alpha=colored();alpha.color_mask=0x01000000;native.prepare(alpha);
+            auto shadow=hud;shadow.color_mask=0x10101;shadow.blend_source=0x304;shadow.blend_destination=1;shadow.blend_equation=0x800B;native.prepare(shadow);
+            auto unsupported=shadow;unsupported.blend_source=1;unsupported.blend_equation=0x800A;native.prepare(unsupported);
+            std::array<ProgramVertex,4> panel{};
+            constexpr std::array<Float4,4> full{{{0,0,0,1},{128,0,0,1},{128,96,0,1},{0,96,0,1}}};
+            for(unsigned i=0;i<4;++i){panel[i].attributes[0]=full[i];panel[i].attributes[3]={0.25f,0.25f,0.25f,0.5f};}
+            const auto depth_at=[](float z){return (100.0f/(100.0f-0.1f))*(1-0.1f/z);};
+            const auto draw=[&](bool corner,bool overlay,bool clear_depth=false,bool isolate=false,unsigned menu_shadow=0) {
+                native.prepare(surface);native.prepare(hud);
+                native.camera(1,0.1f,100,1.047197551f);
+                native.begin(0xFF808080);
+                auto plane=quad({0.8f,0.8f,0.8f,1},depth_at(4));
+                if(corner) {
+                    auto wall=plane;wall[1].position[0]=wall[2].position[0]=0;
+                    wall[0].position[2]=wall[3].position[2]=depth_at(4/(1+0.577350269f*(128.0f/96)));
+                    native.draw(surface,wall);plane[0].position[0]=plane[3].position[0]=0;
+                }
+                native.draw(surface,plane);
+                if(isolate) {native.end();native.begin_overlay();native.begin(0,1,false);}
+                if(overlay) native.draw_program(hud,ui,constants,view,text);
+                if(menu_shadow) {
+                    native.draw_program(alpha,ui,constants,view,panel);
+                    native.draw_program(menu_shadow==1?shadow:unsupported,ui,constants,view,panel);
+                    auto transparent=text;for(auto& vertex:transparent) vertex.attributes[3][3]=0;
+                    native.draw_program(hud,ui,constants,view,transparent);
+                }
+                if(clear_depth) native.clear_buffers(3,0,1,0);
+                native.end();if(isolate) native.end_overlay();native.publish_frame();return native.read_frame();
+            };
+            const auto original=draw(true,false);
+            native.ambient_occlusion(quality,1);
+            const auto flat=draw(false,false);expect(flat,64,48,{204,204,204,255},2);
+            const auto shaded=draw(true,false);
+            const auto dark=pixel(shaded,65,48)[0];
+            if(dark>=198 || dark<20) throw std::runtime_error(std::format("GTAO corner shading is missing or excessive: {}",dark));
+            expect(native.readback(),65,48,pixel(original,65,48),0);
+            const auto overlaid=draw(true,true,true);expect(overlaid,64,48,{255,0,0,255},1);
+            if(pixel(overlaid,65,28)[0]>=198) throw std::runtime_error("HUD depth clear lost the scene depth snapshot");
+            save_png(overlaid,image_path);
+            const auto menu=draw(true,true,false,false,1);
+            expect(menu,64,48,{223,0,0,128},2);
+            expect(menu,65,28,{unsigned(std::max(0,int(pixel(shaded,65,28)[0])-32)),unsigned(std::max(0,int(pixel(shaded,65,28)[1])-32)),unsigned(std::max(0,int(pixel(shaded,65,28)[2])-32)),128},2);
+            const auto unseparated=draw(true,true,false,false,2);
+            if(unseparated.rgba!=native.readback().rgba) throw std::runtime_error("AO reused scene depth after an unsupported menu blend");
+            // A later 2D screen can reuse the surface without clearing depth.
+            auto background=colored();native.prepare(background);native.begin(0,1,false);
+            native.draw_program(background,ui,constants,view,panel);native.draw_program(hud,ui,constants,view,text);
+            native.end();native.publish_frame();
+            if(native.read_frame().rgba!=native.readback().rgba) throw std::runtime_error("AO shaded a new menu with leftover scene depth");
+            native.ambient_occlusion(quality,0);const auto zero=draw(true,false);
+            if(zero.rgba!=original.rgba) throw std::runtime_error("Zero-strength AO changed the original image");
+            native.ambient_occlusion(quality,0.35f);
+            draw(true,true);const auto repeated=draw(true,true);expect(repeated,64,48,{255,0,0,255},1);
+            const auto scene=native.create_target(128,96);
+            native.set_target(scene);const auto isolated=draw(true,true,true,true);
+            expect(isolated,64,48,{255,0,0,255},1);expect(native.read_target(scene),64,48,{204,204,204,255},1);
+            expect(isolated,65,28,pixel(repeated,65,28),1);
+            native.release(scene);
+
+            if(sample_count==1) {native.enhancements(2,0);expect(draw(true,true),64,48,{255,0,0,255},1);native.enhancements(0,0);}
+            if(quality==2 && sample_count==1 && native.supports_upscaling(UpscaleMethod::fsr)) {
+                native.upscaling(UpscaleMethod::fsr,1);draw(true,true);expect(draw(true,true),64,48,{255,0,0,255},1);
+                const auto reconstructed=native.create_target(128,96);
+                native.set_target(reconstructed);expect(draw(true,true,false,true),64,48,{255,0,0,255},1);
+                native.release(reconstructed);
+                native.upscaling(UpscaleMethod::off);
+            }
+            native.ambient_occlusion(0);const auto disabled=draw(true,false);
+            if(disabled.rgba!=original.rgba || native.resources().target_bytes!=baseline_bytes)
+                throw std::runtime_error("Disabling AO did not restore original pixels/resource usage");
+            if(!native.errors().empty()) throw std::runtime_error(native.errors().front());
+            ++passed;
+        } catch(const std::exception& failure){error=failure.what();}
+        report+=std::format("{{\"name\":{},\"passed\":{},\"error\":{},\"image\":{},\"elapsed_ms\":{:.3f}}}",json(name),error.empty(),json(error),json(utf8(image_path.wstring())),std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count());
     }
     const auto messages = renderer.errors();
     report += std::format("],\"passed\":{},\"total\":{},\"shader_compilations\":{},\"debug_messages\":[",

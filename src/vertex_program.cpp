@@ -251,7 +251,7 @@ VertexTranslation translate_vertex_program(const VertexProgram& program,bool lau
             if(type==1) {
                 if(index>12) throw std::runtime_error(std::format("NV2A slot {} reads reserved R{}",slot,index));
                 value=index==12?"o[0]":std::format("r[{}]",index);
-            } else if(type==2) value=std::format("v[{}]",input);
+            } else if(type==2) {result.input_mask|=1U<<input;value=std::format("v[{}]",input);}
             else if(type==3) {
                 if(!relative && constant>=192) throw std::runtime_error(std::format("NV2A slot {} reads invalid constant {}",slot,constant));
                 if(relative) {result.constant_first=0;result.constant_count=192;}

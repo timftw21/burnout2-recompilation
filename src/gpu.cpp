@@ -50,16 +50,13 @@ struct Gpu::Impl {
     FixedTransform prepared_fixed{};VertexLayout prepared_attributes{};
     VertexConstants constants{};
     ProgramVertex current{};
-    std::uint32_t program_load=0,constant_load=0,primitive=0,target=0;
+    std::uint32_t program_load=0,constant_load=0,primitive=0,target=0,overlay_target=0;
     std::vector<std::uint32_t> indices,inline_words;
-    std::vector<std::uint32_t> distant_buffers;
-    std::uint32_t extended_base=0,extended_size=0;
     struct Draw {
         RenderState state;VertexConstants constants;ProgramView view;ProgramVertex current;
         Renderer::PreparedState bindings;
         std::array<VertexStream,16> streams{};
         std::uint32_t layout=0,count=0,stream_count=0,constant_program=0;
-        bool distant_geometry=false,extended_geometry=false;
         std::vector<std::uint32_t> indices;
         std::vector<std::uint32_t> packed;
     };
@@ -150,8 +147,6 @@ struct Gpu::Impl {
         const auto overlaps=[&](std::uint32_t base,std::uint64_t bytes) {
             base&=0x0FFFFFFF;return base<end && address<std::uint64_t(base)+bytes;
         };
-        std::erase_if(distant_buffers,[&](auto base){return overlaps(base,1);});
-        if(extended_size && overlaps(extended_base,extended_size)) extended_size=0;
         for(unsigned i=0;i<fence_count;++i) {
             auto& completion=fences[(fence_head+i)%fences.size()];
             if(completion.kind==Fence::Kind::report && overlaps(completion.address,16)) completion.written=0;
@@ -361,25 +356,6 @@ struct Gpu::Impl {
         draw.view.depth_scale=constants[58][2];
         if(draw.view.depth_scale<=0) throw std::runtime_error("NV097 viewport depth scale was not initialized");
         draw.state=render_state;
-        const auto vertex_base=reg(0x1720)&0x0FFFFFFF;
-        draw.extended_geometry=!inlined && primitive>=4 && draw.state.depth_test &&
-            vertex_base-extended_base<extended_size;
-        if(draw.extended_geometry) {
-            // Extra sections can be viewed from outside their authored visibility
-            // set. Their one-sided terrain must also cover the reverse view, or
-            // peaks and props on the other side show through the missing slopes.
-            draw.state.cull=false;
-        }
-        draw.distant_geometry=!inlined && primitive>=4 && draw.state.depth_test &&
-            !distant_buffers.empty() && std::ranges::binary_search(distant_buffers,vertex_base);
-        if(draw.distant_geometry) {
-            // The original distant building proxies can coincide with the
-            // detailed scenery exposed by extended draw distance. Keep them
-            // as fallbacks, with a one-pixel slope/one-depth-unit separation.
-            auto& s=draw.state;
-            if(!s.polygon_offset) s.polygon_offset_scale=s.polygon_offset_bias=0;
-            s.polygon_offset=true;s.polygon_offset_scale+=1;s.polygon_offset_bias+=1;
-        }
         const auto mode=reg(0x1E94)&3;
         std::uint32_t shader;
         if(mode==2) {
@@ -437,7 +413,7 @@ struct Gpu::Impl {
         if(++draw_count==draws.size()) flush();
     }
     void capture_draw(std::uint32_t first,const Draw& draw,std::uint32_t shader) {
-        if(capture_trace.tellp()>32*1024*1024 || capture_draws==1024) {capture_truncated=true;return;}
+        if(capture_trace.tellp()>48*1024*1024 || capture_draws==2048) {capture_truncated=true;return;}
         capture_trace<<std::format("{{\"type\":\"draw\",\"draw\":{},\"first\":{},\"count\":{},\"target\":{},\"shader\":{},\"program_start\":{},\"registers\":{},\"program\":{},\"constants\":{},\"current\":{},\"textures\":[",
             capture_draws++,first,draw.count,target,shader,program.start,json(hex_bytes(std::as_bytes(std::span(registers[0])))),
             json(hex_bytes(std::as_bytes(std::span(program.tokens)))),json(hex_bytes(std::as_bytes(std::span(constants)))),
@@ -452,9 +428,6 @@ struct Gpu::Impl {
             capture_trace<<std::format("{{\"stride\":{},\"size\":{},\"prefix\":{}}}",stream.stride,stream.bytes.size(),json(hex_bytes(stream.bytes.first(std::min<std::size_t>(128,stream.bytes.size())))));
         }
         capture_trace<<']';
-        if(draw.distant_geometry)
-            capture_trace<<std::format(",\"background_depth_bias\":{{\"slope\":{},\"units\":{}}}",draw.state.polygon_offset_scale,draw.state.polygon_offset_bias);
-        if(draw.extended_geometry) capture_trace<<",\"extended_geometry_two_sided\":true";
         capture_trace<<"}\n";
     }
     void capture_flip() {
@@ -665,7 +638,14 @@ struct Gpu::Impl {
             // CPU-visible completion still uses semaphore queries and wait().
             flush();
         }
-        else if(method==0x12C) {flush();select_target();renderer.copy_to_main();target=0;active_surface=nullptr;++statistics.flips;++gpu_work;capture_flip();if(owner.flip) owner.flip();}
+        else if(method==0x12C) {
+            flush();select_target();
+            if(overlay_target) {
+                if(target!=overlay_target) throw std::runtime_error("Overlay presentation changed its scene target");
+                renderer.end_overlay();overlay_target=0;
+            } else renderer.copy_to_main();
+            target=0;active_surface=nullptr;++statistics.flips;++gpu_work;capture_flip();if(owner.flip) owner.flip();
+        }
         if(indices.size()>32768 || inline_words.size()>2*1024*1024) throw std::runtime_error("NV097 inline draw exceeds its bound");
     }
 };
@@ -678,7 +658,7 @@ void Gpu::capture_frame(const std::filesystem::path& directory,bool automated) {
         throw std::runtime_error("A frame capture is already pending");
     impl_->capture_requested=directory;impl_->capture_automated=automated;
 }
-void Gpu::submit(std::uint32_t begin,std::uint32_t end) {
+void Gpu::submit(std::uint32_t begin,std::uint32_t end,bool flush) {
     auto& g=*impl_;
     PerfScope timing(g.profile,PerfPhase::gpu_commands);
     if(end<begin || ((end-begin)&3) || end-begin>4*1024*1024) throw std::runtime_error("Invalid native GPU submission range");
@@ -740,21 +720,15 @@ void Gpu::submit(std::uint32_t begin,std::uint32_t end) {
             g.method(subchannel,method,word_at(begin));begin+=4;
         }
     }
-    g.flush();g.renderer.native_context()->Flush();g.poll();
+    g.flush();if(flush) {g.renderer.native_context()->Flush();g.poll();}
 }
+void Gpu::begin_overlay() {
+    auto& g=*impl_;
+    if(g.overlay_target) throw std::runtime_error("Scene overlays already begun");
+    g.flush();g.select_target();g.renderer.begin_overlay();g.overlay_target=g.target;++g.gpu_work;
+}
+void Gpu::restore_feedback() {auto& g=*impl_;g.flush();g.renderer.restore_feedback();}
 bool Gpu::busy() {auto& g=*impl_;g.poll();return g.fence_count!=0;}
-void Gpu::extended_geometry(std::uint32_t address,std::uint32_t size) {
-    address&=0x0FFFFFFF;
-    if(std::uint64_t(address)+size>0x10000000ULL) throw std::runtime_error("Invalid extended geometry range");
-    auto& g=*impl_;g.flush();g.extended_base=address;g.extended_size=size;
-}
-void Gpu::distant_geometry(std::span<const std::uint32_t> vertex_buffers) {
-    if(vertex_buffers.size()>128) throw std::runtime_error("Distant geometry exceeds its bound");
-    auto& g=*impl_;g.flush();g.distant_buffers.assign(vertex_buffers.begin(),vertex_buffers.end());
-    for(auto& address:g.distant_buffers) address&=0x0FFFFFFF;
-    std::ranges::sort(g.distant_buffers);
-    g.distant_buffers.erase(std::unique(g.distant_buffers.begin(),g.distant_buffers.end()),g.distant_buffers.end());
-}
 void Gpu::wait() {auto& g=*impl_;g.flush();g.finish_visibility();g.fence(0,0);g.await([&]{return !g.fence_count;},PerfGpuWait::idle);}
 void Gpu::wait_fence(std::uint32_t value,std::uint32_t issued) {
     auto& g=*impl_;
@@ -763,6 +737,9 @@ void Gpu::wait_fence(std::uint32_t value,std::uint32_t issued) {
 }
 void Gpu::snapshot() {
     auto& g=*impl_;g.flush();
+    if(g.overlay_target) {
+        g.renderer.set_target(g.overlay_target);g.renderer.end_overlay();g.overlay_target=g.target=0;return;
+    }
     // Main holds the last presented frame. The bound surface may belong to an
     // unfinished frame or an offscreen pass when execution stops.
     if(g.statistics.flips) g.renderer.set_target(0);

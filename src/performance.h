@@ -25,7 +25,7 @@ class Performance {
 public:
     Performance();
     ~Performance();
-    void start(std::string_view gpu,unsigned refresh,unsigned scale,bool interpolation,bool vsync,const PerfCounters&);
+    void start(std::string_view gpu,unsigned refresh,unsigned scale,bool vsync,const PerfCounters&);
     void stop();
     void reset();
     bool active() const {return active_;}

@@ -63,7 +63,7 @@ Use C++23. Zydis is pinned and linked only into b2-tool, never the game executab
 Run PowerShell commands from the repository root. Private media and generated
 outputs remain ignored. No Python is required.
 
-Updating between releases, including 1.5:
+Updating between releases, including 1.6:
 Close the game and builder. Back up data/user and data/local/settings.cfg beside
 b2.exe, plus data/local/custom-music if you imported music. Install the required
 tools above; releases before 1.3 need LLVM 22.1 or newer. Extract the latest
@@ -95,6 +95,37 @@ Skip extraction for existing files: extraction refuses overwrites. Enabling
 B2_XBE also requires the effects image; B2_EFFECTS can override its local path.
 The target is verified against knowledge/supported_target.json.
 Debug uses: cmake --build --preset debug
+
+Experimental Burnout 1 track import
+
+Burnout 1 is optional. Build.cmd requires only the supported Burnout 2 XISO;
+it does not invoke this importer or require any imported track assets.
+
+Interstate can be converted from the supported US Xbox Burnout disc. After
+building, run this from the source folder (the output directory must be new):
+& .\build\windows\Release\b2-tool.exe import-interstate 'D:\b1\Burnout (USA).xiso.iso' 'Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso' build/windows/Release/data/local/imported-tracks/interstate
+
+The imported Time Attack entry is temporarily disabled and labelled
+Interstate Burnout 1 (Coming Soon). The offline import tools remain available.
+The importer converts the world, textures, roadside objects,
+barriers, five checkpoints plus start/finish, collision and 8.04 km lap route.
+Checkpoint positions, directions, widths and lap time bonuses come from Burnout 1.
+Barrier arrows use all five original frames at their original speed and pause
+with the game. Interstate plays its Burnout 1 theme from Burnout 2's included
+music; choosing another track restores the previous music selection.
+The conversion includes the original sky and horizon, continuous traffic lanes,
+safe respawn positions, and opening/replay camera data. Replay cameras use
+Burnout 2's native camera modes; triggered traffic sequences and lane merging
+are not imported. Music currently uses the included song's full-file loop,
+rather than Burnout 1's lap-dependent crossfades. Experimental laps do not
+update the built-in track records. Gameplay and visual parity require checking.
+Imported assets remain private local files; the original disc images are unchanged.
+Back up the imported-tracks folder beside settings.cfg when moving installations.
+
+The offline check runs the original texture, route, collision, checkpoint, menu
+and draw selection routines, and renders transparent texture samples without
+booting the game:
+& .\build\windows\Release\b2.exe --check-track-import data/local/default.xbe 'Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso' build/windows/Release/data/local/imported-tracks/interstate build/checks/interstate
 
 Static CPU generation
 
@@ -358,15 +389,17 @@ Diagnostics contains capture/performance controls and the latest 64 startup,
 capture and error messages, newest first.
 Esc toggles settings; F1 remains an alias.
 General selects the presentation limit, defaulting to 60 Hz independently of the
-monitor, and has interpolation and frame-rate counter toggles. Selecting a rate
-above 60 Hz enables interpolation; selecting 60 Hz or lower disables it. Manual
-opt-outs survive save/load until another rate is selected. Interpolation keeps
-original frames at 60 Hz and adds display images. With interpolation off, original
-frames run at the selected rate and are presented once each; higher rates can
-speed up movement. Absolute SDL3 deadlines avoid catch-up bursts after stalls
-or rate changes; the guest video callback stays at 60 Hz.
-The scheduler presents interpolated images while servicing events/input between
-original frames. V-sync can still limit presentation to the physical display.
+monitor, and has a frame-rate counter toggle. Each completed game frame is
+presented once. Absolute SDL3 deadlines avoid catch-up bursts after stalls or
+rate changes; the guest video callback stays at 60 Hz. V-sync can still limit
+presentation to the physical display. Frame generation has been removed.
+Gameplay uses the original fixed simulation steps. Vehicle and camera poses
+are smoothed between those steps for drawing at the selected display rate.
+Menu and HUD movement, sizing and fades also use intermediate visual values;
+the original text blur keeps its duration and follows the same display timing.
+Loading animations follow elapsed time, including during blocking loads.
+Track animations, screen fades and boost blur retain their original timing at
+higher refresh rates, including pause and slow motion.
 Audio controls master volume and mute through SDL3's output gain. Browse a music
 folder and choose Import music to make its songs available in the original
 Music Selection menu. Each import replaces the collection with up to 500 files
@@ -399,9 +432,11 @@ V-sync defaults off for new installations. At the monitor's refresh rate it
 follows the display queue; lower selected rates retain their cap. Existing saved
 preferences retain their selected value.
 Widescreen reports the original video-settings bit to the compiled game and
-fits its anamorphic framebuffer to 16:9 at presentation. Native camera, HUD and
-split-screen calculations remain in the original code. The logical framebuffer
-stays 640x480; internal scaling and interpolation are unchanged. The option saves
+fits its anamorphic framebuffer to 16:9 at presentation. HUD widgets retain their
+4:3 proportions and original edge/centre anchors. The correction includes text,
+gauges and their animated parts, and accounts for existing native split-screen
+scaling. Native camera calculations remain unchanged. The logical framebuffer
+stays 640x480; internal scaling is unchanged. The option saves
 automatically and applies when starting or restarting a session. It defaults off.
 Resolution scales colour/depth/feedback targets and raster/scissor rectangles;
 guest coordinates, texture addresses and gameplay are unchanged. Vertex mapping
@@ -413,15 +448,23 @@ Enhancements follows Graphics and offers antialiasing Off/FXAA Low/Medium/High/M
 and anisotropic filtering Original/Off (1x)/2x/4x/8x/16x. Both save automatically
 and apply at the next session. Defaults preserve the original single-sample
 rendering and per-texture anisotropy, including the game's captured 2x road filter.
-FXAA runs once on each completed internal-resolution image, before interpolation,
+Ambient occlusion offers Off/GTAO Low/Medium/High and a strength control. It
+defaults Off; the initial strength is 35%. It adds contact shading using the
+original perspective camera and a depth snapshot, without changing original
+colour/depth/feedback targets. Supported HUD layers are composed afterward.
+The added image feeds FXAA and upscaling. Shaders compile during
+the build, and AO resources are allocated only while enabled. Settings apply
+at the next start/restart. Original baked shading remains; lower strength keeps
+the added effect subtle. Screen-space AO cannot account for hidden geometry.
+FXAA runs once on each completed internal-resolution image,
 without changing original colour, depth or feedback targets. The settings and
 counter overlay remain sharp because they are drawn afterward. In-game HUD/text
 are part of the game image and may soften. One additional RGBA8 target is included
 in the resource budget only while FXAA is enabled; shaders compile during
 the build. Forced anisotropy preserves point sampling, address modes and signed
 LOD bias/limits. MSAA renders colour and depth with the selected sample count,
-then resolves to ordinary textures for feedback, reflections, display and
-interpolation. Growing targets copies individual colour/depth/stencil samples
+then resolves to ordinary textures for feedback, reflections and display.
+Growing targets copies individual colour/depth/stencil samples
 with built shaders; D3D11 forbids partial multisample copies. MSAA levels require
 support across the game's RGBA8/RGB565 and D16/D24S8 formats. Unsupported levels
 are disabled, and a saved unsupported choice resets to Off with a Log message.
@@ -429,27 +472,17 @@ The target budget includes multisample colour/depth and resolved images. See
 research/enhancements.txt for evidence and native validation.
 Draw distance replaces the separate LOD and render-distance overrides. Choose
 Original (1x), 2x or 4x in Enhancements; Original is the default. Camera far
-clipping, scenery fade, traffic model-detail thresholds and the original
-visibility records' horizontal coverage scale together. Traffic retains its
-three detail levels, spawning and physics. Extended distances preload the
-original PSW/P2W stream into separate mapped rendering storage during loading.
-Collision and traffic retain
-their original heap. Sections outside the selected range are rejected before
-the original frustum checks and draws. Originally visible sections keep the
-game's material drawing order and layered surfaces; only additional sections
-use the extended drawing path. Reflection cameras, reflection scenery and
-later material passes remain original, and textures retain normal mipmap
-filtering. Each scene camera retains its original range across camera switches,
-so scaling never compounds.
-Additional sections render both sides of their surfaces: the expanded view can
-see behind one-sided mountains that the original visibility records hid. This
-restores reverse-facing mountain slopes and their occlusion of far-side scenery.
-Increased draw distance can still cause rendering issues, including incomplete
-terrain and incorrect scenery on Sunrise Valley Springs; the tooltip warns of
-this limitation. Original draw distance remains available.
-The original distant building proxies receive a small polygon depth offset so
-they remain visible beyond detailed scenery without fighting its overlapping
-surfaces. Other geometry retains its original depth state.
+clipping, scenery fade, traffic opacity and model-detail thresholds scale
+together. Additional track sections are drawn beyond the original visibility
+list, using original material records compatible with the active distant models.
+Viewing directions are derived from the original mesh visibility records to
+avoid exposing unfinished terrain backs. Scenery already represented by an
+incompatible distant model keeps that model; extension depends on the track
+and viewpoint. Reflection views and depth/culling states remain original.
+Extended modes preload world data into separate 64 MiB rendering storage and
+prepare the extra visibility lists during loading; Original does neither. Each scene
+camera retains its original range across camera switches, so scaling never
+compounds. Traffic spawning, physics and the original three detail levels remain.
 No extra reads or allocations occur during normal rendering. Changes apply on
 start/restart. Existing enabled override settings migrate to 2x; an explicit
 draw_distance=1, 2 or 4 takes precedence. Only the new setting is saved.
@@ -465,12 +498,12 @@ and conversion shaders compile ahead of time. Motion is image-estimated rather
 than exact engine motion; quality around moving fine detail remains a limitation.
 Resolution selects the output size while upscaling is enabled. The game renders
 at half that scale, rounded up to a whole native scale; 1x applies the vendor's
-temporal antialiasing at native resolution. Reconstruction precedes interpolation.
+temporal antialiasing at native resolution.
 Separate MSAA/FXAA is inactive while upscaling is enabled; its saved choice remains.
 b2-tool check-upscaling OUTPUT runs native SDK and renderer diagnostics without
 booting. The build copies vendor libraries and license notices beside both tools.
 The FPS overlay measures display and original-game frames separately over half
-a second and is drawn at window resolution, after interpolation.
+a second and is drawn at window resolution.
 Controls allows a key per action, clearing bindings and restoring defaults.
 Esc cancels an active key change; Esc/F1/F8/F9 remain reserved for the interface.
 Settings, including scancodes and game-file paths, save automatically in
@@ -487,41 +520,11 @@ through the native scheduler's cancellation path, releases its audio, pending
 reads and guest stacks, and starts a fresh session in the same window. Saved
 settings, including internal resolution and enhancements, apply when the new session starts.
 
-Interpolation is a D3D11 image pass, inactive at the default 60 Hz. It stores two
-completed frames and estimates scene motion in both directions with five bounded
-colour levels, then warps them to the requested time.
-The final supported screen-space draw suffix is separated from the scene,
-preserving opaque and translucent text over moving backgrounds. White alpha-mask
-atlases identify lettering after blended menu backgrounds. An immediate capture
-draw preserves the original shader and attachments, including MSAA boundaries.
-Floating black/white bases retain the colour transform; normalized lower/upper
-bounds retain clipping through additive highlights and later translucent layers.
-HUD history reuses completed images, and MSAA resolves directly into history.
-Full clears followed by RGB-only writes allow fast layer initialization; unknown
-alpha retains the per-sample path. Depth/camera capture runs only when requested
-by --frame, since the current scene interpolation does not consume those inputs.
-Depth/stencil-writing draws cannot be captured this way. Native rendering and
-MSAA support this separation; FXAA and vendor upscaling still use flattened images.
-Unsupported blends start a new suffix. Original game visibility queries count
-only original draws, excluding the additional presentation-layer work.
-Scene changes and long gaps reset continuity. Moving cars, shadows, thin surfaces
-and newly uncovered areas can still show interpolation artifacts. This is not a
-claim of perfect interpolation. Original frame endpoints remain unchanged.
-ImGui is drawn afterwards. The additional display delay is about one source
-frame. This improves presentation smoothness without raising gameplay speed;
-occlusions/fast movement can still produce artifacts. All shaders compile during
-the build, and disabling the feature avoids history copies and motion passes.
-Hidden window diagnostics check saved/invalid bindings and settings, automatic
-interpolation selection and saved opt-outs, the counter, all settings pages, Esc,
-scaled targets, 60/120 Hz pacing, original frames at 120/144 Hz with interpolation
-off, 60 Hz source frames with interpolation on, live opt-outs, translated images,
-endpoints, stationary HUD, overlapping translucent text, clipped additive highlights,
-blended menu backgrounds, released history bindings, vertical/diagonal/horizontal
-thin surfaces, foreground depth, original camera reprojection, independent object
-motion, new occlusions, scene cuts and history reset. They
-export images and component GPU timing without
-booting. These measurements do not establish gameplay FPS or visual parity.
-Live logs report source FPS separately from presented FPS and generated frames.
+Hidden window diagnostics check saved/invalid bindings and settings, the counter,
+all settings pages, Esc, scaled targets, 60/120 Hz pacing, original frames at
+120/144 Hz, antialiasing and performance capture. They export images and timing
+without booting. These measurements do not establish gameplay FPS or visual parity.
+Live logs report game FPS separately from presented FPS.
 F8, or Capture frame in Graphics, records the next complete GPU frame under
 build/captures. It exports target images and streaming draws.jsonl records with
 the original registers, shader tokens, constants and bounded vertex prefixes,
@@ -563,7 +566,7 @@ performance.json and a short performance.txt, under the usual build/captures pat
 
 Recording measures exclusive main-thread wall time for guest code, kernel and
 platform services, GPU command processing, drawing, buffer/texture uploads,
-resource preparation, GPU waits, publication, display/interpolation, Present,
+resource preparation, GPU waits, publication, display, Present,
 UI, pacing and scheduler idle. It records source-frame intervals and counters
 for draw/vertex volume, uploads, cache misses, copies, packets, fences and
 presented/generated frames. Intentional pacing, scheduler idle and recorder
@@ -579,7 +582,7 @@ I/O totals, resource counts and the process's local/shared GPU memory usage and
 budget. Validity flags preserve unavailable measurements. Audio mix batches have
 separate atomic elapsed-time and budget-overrun counters.
 
-GPU timestamps sum nonoverlapping render, copy/resource and display/interpolation
+GPU timestamps sum nonoverlapping render, copy/resource and display
 spans, excluding idle gaps and the ImGui overlay. An opt-in pool of eight frames
 with 64 spans each avoids waits/flushes for timing; missing spans, invalid clocks
 and results still pending at save are explicit. Normal play allocates no recorder
@@ -658,8 +661,6 @@ The command capture 1 requests the same complete frame/audio capture as F8.
 Schedule it after benchmark recording stops so capture I/O does not affect timing.
 Frame captures retain the last presented image, including when execution stops
 mid-frame or in a smaller offscreen pass. Captures and traces remain opt-in.
-With interpolation active, --frame also saves window images named -previous,
--interpolated and -current for inspecting the final source pair and its midpoint.
 It also exports the exact pre-HUD -scene-previous/-scene-current PNGs and a
 -camera.json with the two original camera snapshots. Available depth inputs use
 -depth-previous.f32/-depth-current.f32: B2D1, little-endian uint32 width/height,

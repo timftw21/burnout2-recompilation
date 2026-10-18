@@ -1,0 +1,101 @@
+GTAO enhancement (2026-10-16)
+
+Enhancements now offers Off / GTAO Low / Medium / High and strength 0..100%.
+The default is Off, with an initial strength of 35%. Preferences save both
+values, reject out-of-range values, and apply them at the next game session.
+
+Implementation:
+- Four additional shaders compile ahead of time: three GTAO quality variants
+  and one depth-aware filter/composite. The existing depth extraction shaders
+  snapshot normalized depth, including the closest MSAA sample.
+- Camera clips/FOV/view-window aspect come from the original camera. The
+  existing +80/+84 and +68/+6C contracts are preserved. A fresh bounded decode
+  confirms E82F5 bytes 83 7E 14 01: camera+14 == 1 selects the perspective
+  implementation E7C50; the other branch calls E81B0.
+- Normals are reconstructed from depth with the nearer adjacent surface at
+  discontinuities. Horizon integration adapts the MIT-licensed XeGTAO equations;
+  THIRD_PARTY_NOTICES.txt carries Intel's notice. No external library was added.
+  Each result is normalized by its unoccluded slice energy, preserving an
+  unobstructed plane. Fixed spatial rotations avoid temporal noise without TAA.
+- The near-field radius is 1.5 original world units. Low uses 8 depth taps,
+  Medium 12, High 24. A 5x5 depth-aware spatial filter accompanies composition.
+- AO shades a presentation copy. Original game colour/depth/feedback resources
+  remain untouched. Existing HUD layer capture supplies the scene before the
+  supported final UI suffix; its depth snapshot survives subsequent HUD clears.
+  The separately shaded scene also feeds layered interpolation. FXAA and the
+  native upscaling input consume the composed image.
+- Combining HUD capture with upscaling preserves the upscaler's second render
+  attachment. Capture uses the original colour blend for every HUD basis;
+  ordinary draws retain the upscaler's independent responsive-mask blend.
+- A valid matching perspective camera and scene/layer capture are required.
+  Incompatible or missing captures preserve original presentation for that frame.
+  Split-screen, every effect sequence and gameplay scene parity remain unverified.
+  Hidden geometry is unavailable to screen-space AO. The original image combines
+  baked lighting/materials, so this enhancement darkens scene colour rather than
+  a separately exposed ambient-light contribution.
+- AO allocations are absent while Off. At 640x480 single sampling, AO and its
+  HUD capture add 14,745,600 target bytes. MSAA, scaling and interpolation are
+  included in the existing bounded target accounting. Gameplay adds no shader
+  compilation, asset reads, diagnostic logging or CPU/GPU readback.
+
+Validation on Ryzen 5 5600X / NVIDIA RTX 5060 Ti:
+- Release build passed; game shaders report runtime_compiler=false.
+- All 52 CPU check groups passed with the supported original XBE: 26,026
+  instruction, 1,551 memory, 6,744 floating and 109 control cases; 36,149 compiled
+  functions. This does not establish all gameplay-path coverage.
+- All 253 render cases passed on RTX 5060 Ti and all 253 on Microsoft Basic
+  Render Driver (WARP), with zero D3D11 validation messages on both. Added cases
+  cover flat/corner shading, unchanged original target pixels, HUD/depth clears,
+  zero strength, disabling/resource restoration, MSAA 4x, interpolation, FXAA
+  and supported FSR integration. No diagnostic thresholds were weakened.
+- Replayed 576 static draws from the existing Sunrise Valley Springs capture
+  frame-562156488000, using previously verified original PSS/PSW mesh/texture
+  bytes. Zero runtime shader compilations and zero D3D11 messages. FSR with AO
+  on/off also replayed all 576 draws with zero validation messages.
+- One first-publish GPU interval at native 640x480, 35% strength, AA/upscaling/
+  interpolation off: Off 0.0008 ms, Low 0.0581 ms, Medium 0.0677 ms, High 0.0853 ms.
+  These are component measurements, not sustained gameplay FPS or frame spikes.
+  No game boot, gameplay benchmark, new gameplay capture or computer use ran.
+- Settings roundtrips, invalid-value handling and UI images were verified.
+  The broader --check-window diagnostic still stops at the existing thin-line
+  interpolation check: diagonal 1.110 / 1449 of 720, horizontal 1.180 / 1406 of
+  960. The previous executable reproduces that exact error (SHA-256 CA7E4DD0
+  D449DA1D4C242390CA4390C6AE0A24148623FD281C5BF59F2559B2C6, joined without spaces).
+  Personal settings hashes are unchanged. All owned workers exited.
+
+Private reports, source replay, projection decode, timings and comparison image:
+build/checks/ambient-occlusion-20261016/ (summary.json, validation/, comparison.png).
+Supported original XBE SHA-256:
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+Built b2.exe SHA-256:
+0B7050827FD377EFAAD98ABE2572ABA5C1BE0943F9F505D5973C82E72CD88BF4.
+
+Primary method / implementation references:
+https://github.com/GameTechDev/XeGTAO
+https://www.activision.com/cdn/research/Practical_Real_Time_Strategies_for_Accurate_Indirect_Occlusion_NEW%20VERSION_COLOR.pdf
+
+Menu overlay correction (2026-10-17)
+
+Capture frame-3000811426200 contains 3D car draws behind the track menu.
+Draw 47 writes destination alpha; draw 48 subtracts source colour times that
+alpha (source 304, destination ONE, equation 800B, RGB-only mask). The old
+layer classifier rejected reverse subtraction, then captured a new UI suffix
+starting at draw 49. That snapshot already included the menu image while its
+depth still described the car, allowing car-shaped shading over the menu.
+Reverse subtraction with fixed destination alpha is an affine offset and uses
+the existing signed bases and clamped endpoints without new shaders/resources.
+Keep this operation in the overlay suffix, avoiding its extra snapshot restart.
+Also require matching 3D depth provenance for AO: clears, target/frame changes,
+new 2D backgrounds and unseparated overlays retire that provenance. A later UI
+suffix alone cannot make stale depth valid again. HUD-only depth clears retain
+an already captured scene snapshot. Existing render checks cover these cases,
+including unchanged menu pixels, retained 3D shading, and single/4x MSAA.
+Validation: all 258 hardware render cases passed, with no D3D11 messages,
+including the menu reverse-subtraction and stale-depth cases at all three AO
+qualities and single/4x MSAA. Existing HUD clear, FXAA, FSR and resource-release
+checks also passed. The first run exceeded its 120-second wrapper limit; its
+owned process exited during cleanup. The completed run took 165.75 seconds
+under a 300-second limit. These diagnostic timings do not measure game FPS.
+The car-select smoke capture uses Unlimited, 3x resolution and 4x MSAA:
+build/checks/unlimited-ghost-ao-20261017/car-after.png. Note that F8 frame.png
+captures the original target before AO; --frame saves the presented AO image.

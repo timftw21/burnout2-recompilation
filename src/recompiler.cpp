@@ -33,6 +33,8 @@ std::string type(unsigned bits) {
     return std::format("std::uint{}_t", bits);
 }
 bool batchable_x87(const Instruction& instruction) {
+    if(instruction.address==0xADED5 || instruction.address==0xADFE6 || instruction.address==0xAE18F ||
+       instruction.address==0x8C932 || instruction.address==0xB9748) return false;
     const auto& ins=instruction.decoded;
     if(ins.opcode_map!=ZYDIS_OPCODE_MAP_DEFAULT || ins.opcode<0xD8 || ins.opcode>0xDF || ins.address_width!=32 ||
        (ins.attributes&(ZYDIS_ATTRIB_HAS_LOCK|ZYDIS_ATTRIB_HAS_REP|ZYDIS_ATTRIB_HAS_REPE|ZYDIS_ATTRIB_HAS_REPNE))) return false;
@@ -63,6 +65,30 @@ bool batchable_mmx_copy(const Instruction& instruction) {
     return true;
 }
 
+// Verified scene-frame boundaries: update original state at 50/60 Hz, draw at
+// the selected display rate. Catch-up steps omit only the drawing portion.
+struct TimingGate {std::uint32_t address,target;std::string_view bytes;bool render;};
+constexpr TimingGate timing_gates[]={
+    {0x1115C,0x11161,"E84F620C00",false},
+    {0x133B3,0x13428,"E8080C0000",false},{0x13428,0x13482,"8B0DC03E4400",true},
+    {0x14DF1,0x150BB,"8B3D4CA04B00",false},{0x150BB,0x150C9,"8B4610",true},
+    {0x15423,0x15491,"E8B8030000",false},{0x15491,0x1549F,"8B4610",true},
+    {0x163C3,0x163C8,"E818F4FFFF",false},{0x163C8,0x163D6,"8B4610",true},
+    {0x16843,0x1684B,"E898EFFFFF",false},{0x1684B,0x16859,"8B4610",true},
+    {0x1A823,0x1A828,"E8D8F2FFFF",false},{0x1A828,0x1A836,"8B4610",true}
+};
+constexpr std::pair<std::uint32_t,std::string_view> presentation_sites[]={
+    {0xE90D0,"8B442404"},{0xE9040,"57"},{0xE8F60,"8B442404"},
+    {0x9B380,"55"},{0x7BEDE,"A1B03E4400"},{0x2E280,"55"},
+    {0xADCA0,"56"},{0xA6130,"55"},
+    {0x3E2D0,"56"},{0x3F815,"8B8EDC170000"},
+    {0xADE20,"83EC3C"},{0xADE38,"E8B318F9FF"},{0xADE3D,"A1A8CA4C00"},
+    {0xADED5,"D90588815900"},{0xADFE6,"D82588815900"},{0xAE18F,"D82588815900"},
+    {0x13485,"83C40C"},{0x13488,"5E"},
+    {0x8C8D0,"83EC24"},{0x8C932,"D90588815900"},{0x8C9FF,"C3"},
+    {0xA97FF,"89442410"},{0xB9748,"D90588815900"},
+    {0xADEB4,"D91F"},{0xADEEC,"8BD8"}
+};
 class Emitter {
 public:
     std::set<unsigned> used, dirty;
@@ -110,8 +136,7 @@ public:
         case ZYDIS_OPERAND_TYPE_MEMORY: {
             const auto original="ram.load<" + type(operand.size) + ">(" + address(operand) + ')';
             if(extended_world && operand.size==32 && operand.mem.base==ZYDIS_REGISTER_ESI) {
-                const auto base=read_reg(operand.mem.base);
-                const auto guard="cpu.world_view && cpu.world_view->manager=="+base;
+                const auto base=read_reg(operand.mem.base),guard="cpu.world_view && cpu.world_view->manager=="+base;
                 if(operand.mem.index==ZYDIS_REGISTER_NONE && operand.mem.disp.value==0x310)
                     return "("+guard+" ? cpu.world_view->count : "+original+")";
                 if(operand.mem.index!=ZYDIS_REGISTER_NONE && operand.mem.scale==4 && operand.mem.disp.value==0xD0)
@@ -257,7 +282,12 @@ public:
         if (memory) {
             if (!memory->size || memory->size%8) throw std::runtime_error("Unsupported x87 memory width");
             body << "    const auto fp_address=" << address(*memory) << ";\n"
-                 << "    auto* fp_memory=ram.access(fp_address," << memory->size/8 << ");\n";
+                 << "    auto* fp_memory=";
+            if(instruction.address==0xADED5 || instruction.address==0xADFE6 || instruction.address==0xAE18F)
+                body << "cpu.game_timing ? static_cast<void*>(&cpu.game_timing->loading_delta) : ";
+            if(instruction.address==0x8C932 || instruction.address==0xB9748)
+                body << "cpu.presentation && cpu.game_timing && cpu.game_timing->started ? static_cast<void*>(&cpu.game_timing->render_delta) : ";
+            body << "ram.access(fp_address," << memory->size/8 << ");\n";
         }
         if (!control) {
             body << "    cpu.floating.instruction=" << constant(instruction.address) << ";\n"
@@ -405,7 +435,7 @@ public:
         floating=true;
     }
     void instruction(const Instruction& instruction, bool falls_through) {
-        extended_world=instruction.address>=0x90F68 && instruction.address<0x91595;
+        extended_world=instruction.address>=0x91001 && instruction.address<0x9158F;
         const auto& ins = instruction.decoded;
         const auto& operands = instruction.operands;
         const auto next = instruction.address + ins.length;
@@ -424,10 +454,146 @@ public:
             throw std::runtime_error("Instruction prefixes need an implementation");
         if(labels.contains(instruction.address)) body << label(instruction.address) << ": ";
         body << "{ // " << instruction.text << '\n';
-        if(instruction.address==0x90F68 || instruction.address==0x90F7E || instruction.address==0x90FDC || instruction.address==0x914BF || instruction.address==0x9158F || instruction.address==0xA7306) {
+        if(instruction.address>=0x1AC00 && instruction.address<0x1CFE0 && ins.mnemonic==ZYDIS_MNEMONIC_CALL &&
+           operands[0].type==ZYDIS_OPERAND_TYPE_MEMORY && operands[0].mem.disp.value==4) {
+            const auto bytes=hex_bytes(Bytes(instruction.bytes).first(ins.length));
+            if(bytes!="FF5004" && bytes!="FF5204") throw std::runtime_error("HUD constructor call signature changed");
+            calls=restores=true;(void)read_reg(ZYDIS_REGISTER_ECX);(void)read_reg(ZYDIS_REGISTER_ESP);
+            body << "    if(cpu.hud_layout) {commit(); b2::title_enhancement(cpu,memory,0x1AC27U); restore();}\n";
+        }
+        if(instruction.address==0x1D121) {
+            calls=restores=true;
+            body << "    if(cpu.hud_layout) {commit(); b2::title_enhancement(cpu,memory,0x1D121U); restore();}\n";
+        }
+        if(instruction.address==0x26870) {
+            dirty.insert(2);used.insert(2);
+            // Use the ordinary tachometer dimensions before the common HUD
+            // correction; the native wide variant scales width/height .9/1.2.
+            body << "    if(cpu.hud_layout) edx&=~4U;\n";
+        }
+        // Reset presentation at the original page-wide hide and frontend exit.
+        // These reuse existing UI nodes, so allocation hooks cannot detect them.
+        if(instruction.address==0x3E2D0 || instruction.address==0x3F815)
+            body << "    if(cpu.presentation) b2::title_ui(cpu,memory,0,0);\n";
+        if(instruction.address==0xC14C7) {
+            const auto node=read_reg(ZYDIS_REGISTER_EAX);
+            body << "    if(cpu.presentation) b2::title_ui(cpu,memory," << node << "-8U,0);\n";
+        }
+        if(instruction.address==0xC1309) {
+            const auto node=read_reg(ZYDIS_REGISTER_ESI);
+            body << "    if(ui_blur) ram.store<std::uint32_t>(" << node << "+0x40U,ui_blur_value);\n";
+        }
+        if(instruction.address==0xC1306 || instruction.address==0xC11ED) {
+            (void)read_reg(ZYDIS_REGISTER_ESP);
+            if(instruction.address==0xC1306) {
+                const auto node=read_reg(ZYDIS_REGISTER_ESI);
+                body << "    ui_blur=cpu.presentation && ram.load<std::uint32_t>(" << node << "+0x50U)==0x22A60U;\n"
+                     << "    if(ui_blur) ui_blur_value=ram.load<std::uint32_t>(" << node << "+0x40U);\n";
+                body << "    if(cpu.presentation) b2::title_ui(cpu,memory," << node << ",ram.load<std::uint32_t>(esp));\n";
+            }
+            body << "    if(hud_transform[0]!=1) {\n";
+            if(instruction.address==0xC1306) {
+                body << "    const auto p=ram.load<std::uint32_t>(esp);\n"
+                     << "    ram.store<std::uint32_t>(p,std::bit_cast<std::uint32_t>(std::bit_cast<float>(ram.load<std::uint32_t>(p))*hud_transform[0]+hud_transform[1]));\n"
+                     << "    ram.store<std::uint32_t>(p+8U,std::bit_cast<std::uint32_t>(std::bit_cast<float>(ram.load<std::uint32_t>(p+8U))*hud_transform[0]));\n";
+            } else {
+                body << "    for(const auto p:{esp,esp+8U}) ram.store<std::uint32_t>(p,std::bit_cast<std::uint32_t>(std::bit_cast<float>(ram.load<std::uint32_t>(p))*hud_transform[0]+hud_transform[1]));\n";
+            }
+            body << "    }\n";
+        }
+        if(instruction.address==0x11036) {
+            if(hex_bytes(Bytes(instruction.bytes).first(ins.length))!="B970683D00")
+                throw std::runtime_error("Original main-loop boundary changed");
+            dirty.insert(1);used.insert(1);
+            body << "    if(cpu.game_timing) {\n    b2::title_timing(cpu,memory);\n"
+                 << "    if(!cpu.game_timing->update) {ecx=ram.load<std::uint32_t>(0x34AB5CU);goto i_00011144;}\n    }\n";
+        }
+        for(const auto& gate:timing_gates) {
+            if(gate.render && (instruction.address==gate.address || instruction.address==gate.target)) {
+                calls=restores=true;
+                body << "    if(cpu.presentation) {commit(); b2::title_presentation(cpu,memory,"
+                     << (instruction.address==gate.address?1:2) << "); restore();}\n";
+            }
+            if(instruction.address==gate.address)
+                body << "    if(cpu.game_timing && !cpu.game_timing->" << (gate.render?"render":"update")
+                     << ") goto " << label(gate.target) << ";\n";
+        }
+        // The menu keeps E8520's three cdecl arguments until its epilogue.
+        // A catch-up iteration skipped that call and has no arguments to pop.
+        if(instruction.address==0x13485)
+            body << "    if(cpu.game_timing && !cpu.game_timing->render) goto i_00013488;\n";
+        if(instruction.address==0x8C8D0)
+            body << "    if(cpu.presentation && cpu.game_timing && cpu.game_timing->started) {\n"
+                 << "    if(cpu.game_timing->scenery_animated) goto i_0008C9FF;\n"
+                 << "    cpu.game_timing->scenery_animated=true;\n    }\n";
+        if(instruction.address==0xA97FF) {
+            dirty.insert(0);used.insert(0);used.insert(1);
+            body << "    eax=b2::title_blur_alpha(cpu,eax,ecx);\n";
+        }
+        if(instruction.address==0x215CE0) {
+            if(hex_bytes(Bytes(instruction.bytes).first(ins.length))!="8B442404") throw std::runtime_error("Framebuffer request signature changed");
+            calls=restores=true;(void)read_reg(ZYDIS_REGISTER_ESP);
+            // A97C0 requests scene history; loading fades and other users of
+            // GetBackBuffer(-1) need the complete previous display, with HUD.
+            body << "    if(cpu.presentation && ram.load<std::uint32_t>(esp+4U)==0xFFFFFFFFU && ram.load<std::uint32_t>(esp)!=0xA99F9U) {\n"
+                 << "    commit(); b2::title_enhancement(cpu,memory,0x215CE0U); restore();}\n";
+        }
+        if(instruction.address==0x81158 || instruction.address==0x81369 || instruction.address==0x817F7) {
+            const auto bytes=instruction.address==0x81158?"E8F3720600":instruction.address==0x81369?"E8E2700600":"E8546C0600";
+            if(hex_bytes(Bytes(instruction.bytes).first(ins.length))!=bytes) throw std::runtime_error("Race HUD boundary signature changed");
+            calls=restores=true;
+            body << "    if(cpu.presentation && (ram.load<std::uint32_t>(0x4431F8U) || ram.load<std::uint32_t>(0x443858U))) {\n"
+                 << "    commit(); b2::title_enhancement(cpu,memory," << constant(instruction.address) << "); restore();}\n";
+        }
+        if(instruction.address==0xADEB4)
+            body << "    if(cpu.game_timing) cpu.game_timing->loading_fade_error=0;\n";
+        if(instruction.address==0xADEEC) {
+            dirty.insert(0);used.insert(0);
+            body << "    if(cpu.game_timing) eax=b2::title_loading_fade(cpu,memory);\n";
+        }
+        if(instruction.address==0xE90D0 || instruction.address==0xE9040 || instruction.address==0xE8F60 ||
+           instruction.address==0x9B380 || instruction.address==0x7BEDE || instruction.address==0x2E280 ||
+           instruction.address==0xADCA0 || instruction.address==0xA6130) {
+            calls=restores=true;
+            const auto object=instruction.address==0x9B380?read_reg(ZYDIS_REGISTER_ECX):
+                instruction.address==0x7BEDE?read_reg(ZYDIS_REGISTER_EDI):
+                "ram.load<std::uint32_t>("+read_reg(ZYDIS_REGISTER_ESP)+
+                (instruction.address==0x2E280 || instruction.address==0xADCA0 || instruction.address==0xA6130?"+8U)":"+4U)");
+            body << "    if(cpu.presentation) {commit(); b2::title_presentation(cpu,memory,"
+                 << constant(instruction.address) << ',' << object << "); restore();}\n";
+        }
+        if(instruction.address==0xADE20 || instruction.address==0xADE38) {
+            calls=restores=true;
+            body << "    if(cpu.game_timing) {commit(); b2::title_loading(cpu,memory,"
+                 << (instruction.address==0xADE38?"true":"false") << "); restore();";
+            if(instruction.address==0xADE38) body << " goto i_000ADE3D;";
+            body << "}\n";
+        }
+        if(instruction.address==0x4D2A9) {
+            if(hex_bytes(Bytes(instruction.bytes).first(ins.length))!="F60500B34C0004") throw std::runtime_error("Track menu signature changed");
             calls=restores=true;(void)read_reg(ZYDIS_REGISTER_ESI);
+            body << "    commit(); b2::title_track(cpu,memory,0x0004D2A9U,esi); restore();\n";
+        }
+        if(instruction.address==0x4CCFD) {
+            if(hex_bytes(Bytes(instruction.bytes).first(ins.length))!="8B7C8630") throw std::runtime_error("Track menu row signature changed");
+            calls=restores=true;(void)read_reg(ZYDIS_REGISTER_ESI);
+            body << "    commit(); b2::title_track(cpu,memory,0x0004CCFDU,esi); restore();\n";
+        }
+        if(instruction.address==0x4CEE0) {
+            if(hex_bytes(Bytes(instruction.bytes).first(ins.length))!="B9B0854B00") throw std::runtime_error("Track confirmation signature changed");
+            calls=restores=true;(void)read_reg(ZYDIS_REGISTER_ESI);
+            body << "    commit(); b2::title_track(cpu,memory,0x0004CEE0U,esi-4U); restore();\n";
+        }
+        if(instruction.address==0xC91F7) {
+            if(hex_bytes(Bytes(instruction.bytes).first(ins.length))!="A110C25700") throw std::runtime_error("Music file table signature changed");
+            calls=restores=true;dirty.insert(7);used.insert(7);
+            body << "    commit(); b2::title_track(cpu,memory,0x000C91F7U); restore();\n";
+        }
+        if(instruction.address==0x90F68 || instruction.address==0x90F7E || instruction.address==0x90FDC ||
+           instruction.address==0x914BF || instruction.address==0x9158F || instruction.address==0xA7306) {
+            calls=restores=true;
             body << "    if(cpu.draw_distance>1) { commit(); b2::title_enhancement(cpu,memory,"
-                 << constant(instruction.address) << ",esi); restore(); }\n";
+                 << constant(instruction.address) << "); restore(); }\n";
         }
         if(instruction.address==0xC31C4) {
             (void)read_reg(ZYDIS_REGISTER_ESP);
@@ -442,6 +608,13 @@ public:
             // The traffic renderer recomputes both linear LOD thresholds from
             // the camera each pass. Scale those, not the shared vehicle state.
             body << "    if(cpu.draw_distance>1) for(const auto offset:{0x2E280U,0x2E284U}) ram.store<std::uint32_t>(ecx+offset,std::bit_cast<std::uint32_t>(std::bit_cast<float>(ram.load<std::uint32_t>(ecx+offset))*cpu.draw_distance));\n";
+        }
+        if(instruction.address==0x9BA2C) {
+            (void)read_reg(ZYDIS_REGISTER_ECX);
+            // Keep the original damaged/scripted-vehicle exemptions, material
+            // alpha and fade curve. Only visual range follows the viewing camera.
+            body << "    ram.store<std::uint32_t>(ecx+0x1E4U,b2::title_traffic_fade(cpu,memory,ecx));\n"
+                 << "    goto i_0009BA8D;\n";
         }
         if(loop_headers.contains(instruction.address))
             body << "    if(b2::checkpoint_due(cpu)) { commit(); b2::checkpoint(cpu," << constant(instruction.address) << "); }\n";
@@ -610,7 +783,24 @@ public:
             vector_write(operands[0],value); break;
         }
         case ZYDIS_MNEMONIC_MOV: case ZYDIS_MNEMONIC_MOVZX:
-            body << "    const auto value = " << read(operands[1]) << ";\n";
+            if(instruction.address==0x8D40C || instruction.address==0x8D734) {
+                const auto expected=instruction.address==0x8D40C?"B804000000":"B8C0000000";
+                if(hex_bytes(Bytes(instruction.bytes).first(ins.length))!=expected)
+                    throw std::runtime_error("World alpha reference signature changed");
+                // Converted B1 materials retain their source alpha cutoff.
+                // Keep the title's state cache and draw submission unchanged.
+                body << "    const auto value = cpu.world_materials?cpu.world_materials->alpha(ram.load<std::uint32_t>("
+                     << read_reg(ZYDIS_REGISTER_EBP) << "-4U)," << read(operands[1]) << "):" << read(operands[1]) << ";\n";
+            } else if(instruction.address==0x43CD9 || instruction.address==0x43D2C || instruction.address==0x43D79) {
+                if(hex_bytes(Bytes(instruction.bytes).first(ins.length))!="895C0204")
+                    throw std::runtime_error("Online account menu availability signature changed");
+                // Keep Sign In, New Account and Manage Account(s) visible with
+                // the title's disabled flag, including its normal input guard.
+                body << "    const auto value = 1U;\n";
+            } else if(instruction.address==0x4CCFD)
+                body << "    const auto value = ram.load<std::uint32_t>(ram.load<std::uint32_t>(" << read_reg(ZYDIS_REGISTER_ESI)
+                     << "+0x14U)+" << read_reg(ZYDIS_REGISTER_EAX) << "*4U+4U);\n";
+            else body << "    const auto value = " << read(operands[1]) << ";\n";
             write(operands[0], "value"); break;
         case ZYDIS_MNEMONIC_MOVSX:
             body << "    const auto value = b2::sign_extend<" << operands[1].size << ">(" << read(operands[1]) << ");\n";
@@ -621,8 +811,20 @@ public:
         case ZYDIS_MNEMONIC_ADD: case ZYDIS_MNEMONIC_SUB: case ZYDIS_MNEMONIC_CMP:
         case ZYDIS_MNEMONIC_ADC: case ZYDIS_MNEMONIC_SBB:
         case ZYDIS_MNEMONIC_AND: case ZYDIS_MNEMONIC_OR: case ZYDIS_MNEMONIC_XOR: case ZYDIS_MNEMONIC_TEST: {
+            if(instruction.address==0xC92D3) {
+                if(hex_bytes(Bytes(instruction.bytes).first(ins.length))!="83FE0C") throw std::runtime_error("Burnout 1 playlist length signature changed");
+                calls=restores=true;
+                body << "    commit(); const auto music_count=b2::title_track(cpu,memory,0x000C92D3U)?1U:12U; restore();\n";
+            }
+            if(instruction.address==0x84850) {
+                if(hex_bytes(Bytes(instruction.bytes).first(ins.length))!="837D0803") throw std::runtime_error("Respawn search limit signature changed");
+                calls=restores=true;(void)read_reg(ZYDIS_REGISTER_EDX);
+                // B1 can prohibit more than three consecutive respawn slots.
+                body << "    commit(); const auto imported_respawn=b2::title_track(cpu,memory,0x00084850U); restore();\n";
+            }
             body << "    const std::uint32_t a = " << read(operands[0]) << ";\n"
-                 << "    const std::uint32_t b = " << read(operands[1]) << ";\n";
+                 << "    const std::uint32_t b = " << (instruction.address==0xC92D3?"music_count":
+                    instruction.address==0x84850?"(imported_respawn?edx:3U)":read(operands[1])) << ";\n";
             const auto bits = operands[0].size;
             const auto m = ins.mnemonic;
             if (m == ZYDIS_MNEMONIC_ADD || m == ZYDIS_MNEMONIC_SUB || m == ZYDIS_MNEMONIC_CMP ||
@@ -947,12 +1149,30 @@ LoweredFunction lower(const Function& function,bool fuse_floating) {
     }
     Emitter emitter;
     emitter.labels.insert(function.entry);
+    for(const auto& gate:timing_gates) if(const auto found=function.instructions.find(gate.address);found!=function.instructions.end()) {
+        if(hex_bytes(Bytes(found->second.bytes).first(found->second.decoded.length))!=gate.bytes ||
+           !function.instructions.contains(gate.target))
+            throw std::runtime_error("Original scene update/render boundary changed");
+        emitter.labels.insert(gate.address);emitter.labels.insert(gate.target);
+    }
+    if(function.instructions.contains(0x11036)) emitter.labels.insert(0x11144);
+    for(const auto& [address,bytes]:presentation_sites) if(const auto found=function.instructions.find(address);found!=function.instructions.end()) {
+        if(hex_bytes(Bytes(found->second.bytes).first(found->second.decoded.length))!=bytes)
+            throw std::runtime_error("Original presentation/loading instruction signature changed");
+        emitter.labels.insert(address);
+    }
     // These edits apply only to the verified US title's camera, world visibility
     // scenery fading and traffic LOD. Collision and spawning remain original.
     constexpr std::pair<std::uint32_t,std::string_view> enhancement_sites[]={
+        {0x1D121,"DDD8"},{0x26870,"F6C204"},{0xC1306,"FF5650"},{0xC1309,"8B36"},{0xC11ED,"E87E1B0000"},{0xC14C7,"C20800"},
         {0x90F68,"B9B0854B00"},{0x90F7E,"8B8618010000"},{0x90FDC,"8B8618010000"},
-        {0x914BF,"8B8618010000"},{0x9158F,"5F"},{0x9B3DC,"8D642400"},{0xA7306,"C20800"},
-        {0xC31C4,"D9442410"},{0xC3A2E,"D945FC"}};
+        {0x914BF,"8B8618010000"},{0x9158F,"5F"},
+        {0x9B3DC,"8D642400"},{0xA7306,"C20800"},
+        {0xC31C4,"D9442410"},{0xC3A2E,"D945FC"},
+        {0x9BA15,"8B4E0C"},{0x9BA18,"8B81E8010000"},{0x9BA24,"3991A0010000"},
+        {0x9BA2C,"8B4508"},{0x9BA42,"8D9C98E08E0200"},{0x9BA49,"D903"},
+        {0x9BA6D,"D835D01A2C00"},{0x9BA73,"D999E4010000"},{0x9BA8D,"D981E0010000"},
+        {0x9BEBC,"8B15B03E4400"},{0x9BEC4,"8B4804"},{0x9BEC7,"83C140"}};
     for(const auto& [address,bytes]:enhancement_sites) if(const auto found=function.instructions.find(address);found!=function.instructions.end()) {
         if(hex_bytes(Bytes(found->second.bytes).first(found->second.decoded.length))!=bytes)
             throw std::runtime_error("World enhancement instruction signature changed");
@@ -1015,8 +1235,38 @@ LoweredFunction lower(const Function& function,bool fuse_floating) {
         if(prefix!="558BECD94508568BF18B4608D84604") throw std::runtime_error("Intro update signature changed");
         out << "    b2::skip_title_intro(cpu,memory);\n";
     }
+    if(function.entry==0x4CC40) {
+        if(hex_bytes(Bytes(function.instructions.at(function.entry).bytes).first(3))!="8B4110")
+            throw std::runtime_error("Track selection signature changed");
+        out << "    b2::title_track(cpu,memory,0x0004CC40U,cpu.registers[b2::ecx]);\n";
+    }
+    if(function.entry==0x18030) {
+        std::string prefix;auto pc=function.entry;
+        while(prefix.size()<22 && function.instructions.contains(pc)) {
+            const auto& instruction=function.instructions.at(pc);
+            prefix+=hex_bytes(Bytes(instruction.bytes).first(instruction.decoded.length));pc+=instruction.decoded.length;
+        }
+        if(prefix!="558BEC51833D48BB2F0001") throw std::runtime_error("Race record signature changed");
+        out << "    if(b2::title_track(cpu,memory,0x00018030U)) { cpu.eip=ram.load<std::uint32_t>(cpu.registers[b2::esp]); cpu.registers[b2::esp]+=8; return; }\n";
+    }
+    if(function.entry==0xB5100) {
+        if(hex_bytes(Bytes(function.instructions.at(function.entry).bytes).first(3))!="83EC10")
+            throw std::runtime_error("Replay camera zoom signature changed");
+        out << "    if(b2::title_track(cpu,memory,0x000B5100U,cpu.registers[b2::ecx])) { cpu.eip=ram.load<std::uint32_t>(cpu.registers[b2::esp]); cpu.registers[b2::esp]+=8; return; }\n";
+    }
+    constexpr std::pair<std::uint32_t,std::string_view> track_entries[]={
+        {0x8BCD0,"568BF18B4608"},{0x90D30,"558BEC83EC208B4508"},{0xC93C0,"83EC24B808000000"}};
+    for(const auto& [entry,bytes]:track_entries) if(function.entry==entry) {
+        std::string prefix;auto pc=entry;
+        while(prefix.size()<bytes.size() && function.instructions.contains(pc)) {
+            const auto& instruction=function.instructions.at(pc);
+            prefix+=hex_bytes(Bytes(instruction.bytes).first(instruction.decoded.length));pc+=instruction.decoded.length;
+        }
+        if(prefix!=bytes) throw std::runtime_error("Imported track entry signature changed");
+        out << "    b2::title_track(cpu,memory," << constant(entry) << ",cpu.registers[b2::ecx]);\n";
+    }
     constexpr std::pair<std::uint32_t,std::string_view> enhancement_entries[]={
-        {0x8EEB0,"8B5110568B7124"},{0x90D30,"558BEC83EC208B4508"},{0xE8450,"8B44240489442404"},
+        {0x8EEB0,"8B5110568B7124"},{0xE8450,"8B44240489442404"},
         {0xA6E00,"558BEC51A1B03E4400"}};
     for(const auto& [entry,bytes]:enhancement_entries) if(function.entry==entry) {
         std::string prefix;auto pc=entry;
@@ -1031,6 +1281,33 @@ LoweredFunction lower(const Function& function,bool fuse_floating) {
         0x00090420,0x00090660,0x00090A50,0x000BDEE0,0x0010DA90,0x00219370};
     if(std::ranges::find(timed_functions,function.entry)!=std::end(timed_functions))
         out << "    std::optional<b2::PerfScope> timing;\n    if(cpu.profile) timing.emplace(cpu.profile,b2::PerfPhase::guest," << constant(function.entry) << ");\n";
+    if(function.entry==0x1CFE0) {
+        if(hex_bytes(Bytes(function.instructions.at(function.entry).bytes).first(1))!="55")
+            throw std::runtime_error("HUD layout entry signature changed");
+        out << "    if(cpu.hud_layout) cpu.hud_layout->active=0;\n";
+    }
+    if(function.entry==0x1D5C0) {
+        if(hex_bytes(Bytes(function.instructions.at(function.entry).bytes).first(4))!="8B44240C")
+            throw std::runtime_error("HUD driving-message entry signature changed");
+        // Centred driving messages keep their screen position. Right-aligned
+        // near-miss/traffic messages belong to the boost meter and must retain
+        // its local scale; the original constructor still aligns each box.
+        out << "    if(cpu.hud_layout) {\n"
+            << "    const auto sp=cpu.registers[b2::esp],manager=ram.load<std::uint32_t>(sp+4U);\n"
+            << "    const auto queue=ram.load<std::uint32_t>(manager+60U)+ram.load<std::uint32_t>(sp+8U)*16U;\n"
+            << "    const auto scale=cpu.hud_layout->transform(queue)[0];\n"
+            << "    if(scale!=1 && ram.load<std::uint32_t>(sp+24U)==0x3F000000U) ram.store<std::uint32_t>(sp+16U,std::bit_cast<std::uint32_t>(std::bit_cast<float>(ram.load<std::uint32_t>(sp+16U))/scale));\n    }\n";
+    }
+    if(function.entry==0xC1210 || function.entry==0xC1160)
+        out << "    const auto hud_transform=cpu.hud_layout?cpu.hud_layout->transform(cpu.registers[b2::ecx]):std::array<float,2>{1,0};\n";
+    if(function.entry==0xC1210)
+        out << "    std::uint32_t ui_blur_value=0;bool ui_blur=false;\n";
+    if(function.entry==0xC1160)
+        // The original clip cache compares only the rectangle pointer. The
+        // same rectangle at another widget anchor also needs a state update.
+        out << "    if(cpu.hud_layout) {\n"
+            << "    if(hud_transform!=cpu.hud_layout->clip_transform && ram.load<std::uint32_t>(cpu.registers[b2::ecx]+12U)) ram.store<std::uint32_t>(cpu.registers[b2::esp]+4U,0);\n"
+            << "    cpu.hud_layout->clip_transform=hud_transform;\n    }\n";
     for (const auto index : emitter.used)
         out << "    auto " << registers[index] << " = cpu.registers[" << index << "];\n";
     if (emitter.uses_flags) out << "    auto flags = cpu.flags;\n";

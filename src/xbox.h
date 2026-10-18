@@ -21,6 +21,7 @@ struct XboxHost {
     unsigned draw_distance=1;
     bool upscaling=false;
     std::filesystem::path custom_music_root;
+    std::filesystem::path imported_tracks;
 };
 struct BootIo {
     std::uint32_t ordinal=0,status=0,information=0,callsite=0;
@@ -52,11 +53,9 @@ struct BootResult {
     std::array<std::uint32_t,5> last_failed_allocation{};
     std::uint32_t active_thread=0,threads_created=0;
     std::uint64_t vblank_callbacks=0;
-    std::uint32_t extended_world_sectors=0,visible_world_sectors=0;
-    std::uint64_t detailed_world_batches=0;
     float original_camera_far=0,camera_far=0;
-    float original_render_distance=0,render_distance=0;
-    std::uint32_t distance_culled_sectors=0;
+    unsigned original_world_sections=0,extra_world_sections=0;
+    std::uint64_t extra_world_batches=0;
     std::string boundary;
     Cpu cpu;
     ExecutionDiagnostic diagnostic;
@@ -78,7 +77,9 @@ public:
     PerfCounters performance_counters() const;
 private:
     friend void native_platform(Cpu&,Memory&,std::uint32_t);
-    friend void title_enhancement(Cpu&,Memory&,std::uint32_t,std::uint32_t);
+    friend void title_enhancement(Cpu&,Memory&,std::uint32_t);
+    friend bool title_track(Cpu&,Memory&,std::uint32_t,std::uint32_t);
+    friend std::string check_track_import(const std::filesystem::path&,const std::filesystem::path&,const std::filesystem::path&,const std::filesystem::path&);
     friend std::string check_storage(const std::filesystem::path&,const std::filesystem::path&);
     friend std::string check_visibility(const std::filesystem::path&,const std::filesystem::path&,bool);
     friend std::string check_replays(const std::filesystem::path&,const std::filesystem::path&,const std::filesystem::path&);
@@ -91,6 +92,7 @@ private:
 std::string check_storage(const std::filesystem::path& xbe,const std::filesystem::path& output);
 std::string check_visibility(const std::filesystem::path& xbe,const std::filesystem::path& output,bool warp=false);
 std::string check_replays(const std::filesystem::path& xbe,const std::filesystem::path& disc,const std::filesystem::path& output);
+std::string check_track_import(const std::filesystem::path& xbe,const std::filesystem::path& disc,const std::filesystem::path& assets,const std::filesystem::path& output);
 std::string check_audio_listener(const std::filesystem::path& xbe,const std::filesystem::path& output);
 std::string check_music(const std::filesystem::path& xbe,const std::filesystem::path& disc,const std::filesystem::path& output);
 std::string check_custom_music(const std::filesystem::path& xbe,const std::filesystem::path& output,const std::filesystem::path& cache={});

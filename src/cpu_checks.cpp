@@ -1,10 +1,12 @@
 #include "cpu_checks.h"
 #include "cpu.h"
+#include "presentation.h"
 #include "file.h"
 #include "xbe.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <memory>
 
 extern "C" {
 #define B2_REFERENCES(bits) \
@@ -340,7 +342,7 @@ unsigned check_call_chain() {
 unsigned check_matrix() {
     constexpr std::uint32_t base=0x1000,stack=0x1380;
     const auto& matrix=function(0x00227BD9);
-    Performance profile;profile.start("CPU diagnostic",144,1,false,false,{});
+    Performance profile;profile.start("CPU diagnostic",144,1,false,{});
     unsigned checked=0;
     for(unsigned masks:{0x3FU,0x37U}) for(unsigned precision:{0U,2U,3U}) for(unsigned rounding=0;rounding<4;++rounding)
         for(unsigned alias=0;alias<4;++alias) for(unsigned sample=0;sample<5;++sample) {
@@ -787,6 +789,406 @@ CpuChecks check_cpu_batch() {
     result.control_cases=check_control_boundaries()+check_compact_jump_table()+check_segment_setup()+check_flags_stack();
     return result;
 }
+unsigned check_game_timing(Memory& memory) {
+    constexpr std::uint64_t frequency=733333333;
+    constexpr std::uint32_t timer=0x2600,ghost=0x8000,input=0x2900,stack=0x4000,buffer=0x6000,ghost_frames=0xA000;
+    constexpr std::uint32_t controller=0x2FFD68,returned=0xABCDEF00;
+    unsigned cases=0;
+    for(bool pal:{false,true}) for(unsigned rate:{30U,60U,144U,360U,1000U,0U}) {
+        GameTiming timing;std::uint64_t cycles=0;
+        GuestClock clock{&cycles,[](void* value){return *static_cast<std::uint64_t*>(value);}};
+        Cpu cpu;cpu.game_timing=&timing;cpu.clock=&clock;
+        const auto call=[&](std::uint32_t address,std::uint32_t object=timer,std::initializer_list<std::uint32_t> arguments={}) {
+            cpu.registers[esp]=stack;cpu.registers[ecx]=object;memory.store(stack,returned);
+            unsigned index=0;for(const auto value:arguments) memory.store(stack+4+index++*4,value);
+            invoke_native(cpu,memory,address);
+            require(cpu.eip==returned && cpu.registers[esp]==stack+4+arguments.size()*4,"Original timing/replay calling convention changed");
+            return cpu.registers[eax];
+        };
+        const unsigned simulation_rate=pal?50:60,total=simulation_rate*10;
+        memory.store<std::uint32_t>(0x352720,pal);
+        memory.store<std::uint32_t>(0x34AB5C,0x2500);memory.store<std::uint32_t>(0x2510,0);
+        memory.store<std::uint32_t>(0x598190,0);memory.store<std::uint32_t>(0x598194,0);
+        call(0xD7240);
+        std::memset(memory.access(ghost,64),0,64);
+        std::array<std::uint32_t,2> ghost_intervals{};
+        for(unsigned slow=0;slow<2;++slow) {
+            call(slow?0xD72C0:0xD7300);call(0x7BE10,ghost);
+            ghost_intervals[slow]=memory.load<std::uint32_t>(ghost+0x24);
+        }
+        call(0xD7300);
+        memory.store(0x3D686C,buffer);
+        for(unsigned player=0;player<4;++player) memory.store<std::uint32_t>(0x2FE370+player*4,0);
+        std::memset(memory.access(timer,28),0,28);std::memset(memory.access(0x2FFD88,28),0,28);
+        call(0x88850,controller,{0});
+        std::memset(memory.access(0x2800,64),0,64);
+        // Original ghost playback: 22 half-second samples on a straight path,
+        // with no traffic/body subparts. Its real spline and frame-advance code
+        // must progress identically when presentation cadence changes.
+        std::memset(memory.access(ghost,0x660),0,0x660);
+        std::memset(memory.access(ghost_frames,22*0x130),0,22*0x130);
+        memory.store<std::uint32_t>(ghost+8,ghost_frames);memory.store<std::uint32_t>(ghost+12,22);
+        memory.store<std::uint32_t>(0x4BA93C,0x2700);memory.store<std::uint32_t>(0x272C,0);
+        memory.store<std::uint32_t>(0x4B9C58,0x2B00);memory.store<std::uint32_t>(0x3688,0);
+        memory.store<std::uint32_t>(0x4B9C70,0);
+        for(unsigned sample=0;sample<22;++sample) {
+            memory.store<std::uint32_t>(ghost_frames+sample*0x130,0x3F800000);
+            memory.store<std::uint32_t>(ghost_frames+sample*0x130+4,std::bit_cast<std::uint32_t>(float(sample)));
+        }
+        std::array<std::array<std::uint32_t,5>,600> recorded{};
+        unsigned steps=0,expected_ticks=0;bool was_slow=false;
+        const auto run=[&](const auto& update) {
+            cycles=0;timing={};title_timing(cpu,memory);
+            for(unsigned frame=1;cycles<10*frequency;++frame) {
+                constexpr unsigned varying[]{30,144,60,360};
+                cycles=std::min(10*frequency,rate?std::uint64_t(frame)*frequency/rate:cycles+frequency/varying[frame%4]);
+                unsigned rendered=0;
+                do {
+                    title_timing(cpu,memory);
+                    if(timing.update) update();
+                    rendered+=timing.render;
+                } while(timing.pending);
+                require(rendered==1,"Catch-up steps rendered extra frames");
+            }
+        };
+        run([&] {
+            ++steps;
+            const bool slow=steps>=5*simulation_rate && steps<7*simulation_rate;
+            const bool paused=steps>=3*simulation_rate && steps<4*simulation_rate;
+            if(slow!=was_slow) {call(slow?0xD72C0:0xD7300);was_slow=slow;}
+            const auto fixed=(pal?0x3CA3D70AU:0x3C888889U)-(slow?0x01000000U:0);
+            require(memory.load<std::uint32_t>(0x598188)==fixed,"Original physics step changed with display rate");
+            // Check the initializer on a separate empty object, preserving the
+            // active ghost's playback state across updates.
+            call(0x7BE10,0x2800);
+            require(memory.load<std::uint32_t>(0x2824)==ghost_intervals[slow],"Ghost sample interval changed with display rate");
+            memory.store<std::uint32_t>(0x2508,paused);call(0x7BB20,ghost);
+            memory.store<std::uint32_t>(timer+0x18,!paused);call(0xD73B0);
+            if(!paused) expected_ticks+=slow?1:4;
+            const double ghost_progress=memory.load<std::uint32_t>(ghost+0x10)+std::bit_cast<float>(memory.load<std::uint32_t>(ghost+0x14));
+            require(std::abs(ghost_progress-double(expected_ticks)/(simulation_rate*2))<0.0001,"Ghost playback speed changed with display rate");
+            const auto milliseconds=call(0xD7390);
+            require(std::abs(double(milliseconds)-double(expected_ticks)*1000/(simulation_rate*4))<1,"Original timer drifted");
+            memory.store<std::uint32_t>(input,steps%2);
+            memory.store<std::uint32_t>(input+8,std::bit_cast<std::uint32_t>(float(steps%5)*0.2f));
+            memory.store<std::uint32_t>(input+12,std::bit_cast<std::uint32_t>(float(int(steps%9)-4)*0.25f));
+            memory.store<std::uint32_t>(input+16,std::bit_cast<std::uint32_t>(float(steps%3)*0.5f));
+            call(0x88890,controller,{input});
+            require(steps<=total && memory.load<std::uint32_t>(controller+4)==steps,"Replay recording consumed extra inputs");
+            std::memcpy(recorded[steps-1].data(),memory.access(input,20),20);
+        });
+        require(steps==total,"Simulation rate followed display rate");
+        call(0x88850,controller,{1});steps=0;
+        run([&] {
+            call(0x88890,controller,{input});
+            require(!std::memcmp(recorded[steps].data(),memory.access(input,20),20),"Replay input round trip changed");
+            ++steps;
+            require(memory.load<std::uint32_t>(controller+4)==steps,"Replay playback consumed extra inputs");
+            if(steps<total-16) require(memory.load<std::uint32_t>(controller+0x14)==0,"Replay restarted before its recorded end");
+        });
+        require(steps==total,"Replay duration followed display rate");
+        // Loading can run inside a blocking constructor, with no main-loop
+        // scheduler calls. Its clock must still follow real time at every rate.
+        timing.loading_started=false;cycles=0;title_loading(cpu,memory,false);
+        unsigned loading_steps=0,fade_units=0;double fade_seconds=0;
+        for(unsigned frame=1;cycles<10*frequency;++frame) {
+            constexpr unsigned varying[]{30,144,60,360};
+            cycles=std::min(10*frequency,rate?std::uint64_t(frame)*frequency/rate:cycles+frequency/varying[frame%4]);
+            title_loading(cpu,memory,false);
+            loading_steps+=timing.loading_steps;fade_seconds+=timing.loading_delta;
+            fade_units+=title_loading_fade(cpu,memory);
+        }
+        require(loading_steps==total && std::abs(fade_seconds-10)<0.00001,"Loading playback followed the display rate");
+        require(std::abs(double(fade_units)-total*(pal?10:8))<=1,"Loading fade lost fractional colour steps at high refresh rates");
+        // Time spent changing scenes/loading is not a backlog of racing steps.
+        cycles+=20*frequency;memory.store<std::uint32_t>(0x2510,1);title_timing(cpu,memory);
+        require(timing.update && timing.render && !timing.pending,"Loading accumulated unwanted simulation steps");
+        ++cases;
+    }
+    return cases;
+}
+unsigned check_presentation(Memory& memory) {
+    auto presentation=std::make_unique<Presentation>();
+    GameTiming timing;Cpu cpu;cpu.game_timing=&timing;cpu.presentation=presentation.get();
+    constexpr std::uint32_t matrix=0xD000;
+    for(unsigned i=0;i<4;++i) memory.store<std::uint32_t>(0x2FE370+i*4,0);
+    std::array<float,16> start{};start[0]=start[5]=start[10]=1;
+    start[3]=std::bit_cast<float>(0x20003U);
+    auto finish=start;finish[0]=-1;finish[10]=-1;finish[12]=6;finish[3]=std::bit_cast<float>(3U);
+    unsigned checks=0;
+    for(unsigned rate:{30U,60U,144U,360U,1000U}) {
+        presentation->reset();timing.step=1;timing.render=true;timing.remainder=0;
+        std::memcpy(memory.access(matrix,64),start.data(),64);
+        presentation->begin(cpu,memory);presentation->matrix(cpu,memory,matrix);presentation->end(cpu,memory);
+        ++timing.step;
+        std::memcpy(memory.access(matrix,64),finish.data(),64);
+        for(unsigned frame=0;frame<=rate;++frame) {
+            timing.remainder=std::uint64_t(frame)*733333332/rate;
+            presentation->begin(cpu,memory);presentation->matrix(cpu,memory,matrix);
+            std::array<float,16> pose;std::memcpy(pose.data(),memory.access(matrix,64),64);
+            require(std::abs(pose[12]-6.f*frame/rate)<0.00001f,"Visual movement did not follow the display fraction");
+            for(unsigned row=0;row<3;++row) {
+                float length=0;for(unsigned column=0;column<3;++column) length+=pose[row*4+column]*pose[row*4+column];
+                require(std::abs(length-1)<0.00001f,"Interpolated wheel/body rotation collapsed its geometry");
+            }
+            presentation->end(cpu,memory);
+            require(!std::memcmp(memory.access(matrix,64),finish.data(),64),"Rendered pose leaked into simulation state");
+            ++checks;
+        }
+    }
+    // The ghost draw hook receives 7B280's complete render record. Its header
+    // and playback state are not transforms; body, wheels and parts all are.
+    presentation->reset();timing.step=1;timing.remainder=0;
+    constexpr std::uint32_t ghost_pose=0xE800,ghost_model=0xE000,ghost_body=0xF000;
+    const auto old_model=memory.load<std::uint32_t>(0x4BA93C),old_body=memory.load<std::uint32_t>(0x4B9C58);
+    memory.store(0x4BA93C,ghost_model);memory.store(0x4B9C58,ghost_body);
+    memory.store<std::uint32_t>(ghost_model+0x2C,8);memory.store<std::uint32_t>(ghost_body+0xB88,4);
+    constexpr std::array<unsigned,13> ghost_offsets{0x10,0x70,0xB0,0xF0,0x130,0x1B0,0x1F0,0x230,0x270,0x2B0,0x2F0,0x330,0x370};
+    std::memset(memory.access(ghost_pose,0x3B4),0x5A,0x3B4);
+    for(auto offset:ghost_offsets) std::memcpy(memory.access(ghost_pose+offset,64),start.data(),64);
+    presentation->begin(cpu,memory);title_presentation(cpu,memory,0x7BEDE,ghost_pose);presentation->end(cpu,memory);
+    ++timing.step;
+    for(auto offset:ghost_offsets) std::memcpy(memory.access(ghost_pose+offset,64),finish.data(),64);
+    std::array<std::byte,0x3B4> ghost_original;std::memcpy(ghost_original.data(),memory.access(ghost_pose,ghost_original.size()),ghost_original.size());
+    for(unsigned fraction:{0U,1U,3U}) {
+        timing.remainder=733333333ULL*fraction/4;
+        presentation->begin(cpu,memory);title_presentation(cpu,memory,0x7BEDE,ghost_pose);
+        for(auto offset:ghost_offsets) require(std::abs(std::bit_cast<float>(memory.load<std::uint32_t>(ghost_pose+offset+48))-1.5f*fraction)<0.00001f,
+            "Ghost body, wheels and parts did not follow the display fraction");
+        require(memory.load<std::uint32_t>(ghost_pose)==0x5A5A5A5A && memory.load<std::uint32_t>(ghost_pose+0x180)==0x5A5A5A5A,
+            "Ghost playback fields were treated as a transform");
+        presentation->end(cpu,memory);
+        require(!std::memcmp(ghost_original.data(),memory.access(ghost_pose,ghost_original.size()),ghost_original.size()),
+            "Ghost display smoothing changed the original playback state");
+        ++checks;
+    }
+    memory.store(0x4BA93C,old_model);memory.store(0x4B9C58,old_body);
+    // Exercise the original RenderWare hierarchy and camera callback. Restoring
+    // only the camera's local pose would leave interpolated view/frustum data
+    // visible to the next simulation update.
+    presentation->reset();timing={};timing.started=true;timing.step=1;
+    constexpr std::uint32_t frame=0xD200,camera=0xD400,stack=0xC000;
+    std::memset(memory.access(frame,0x500),0,0x500);
+    memory.store<std::uint32_t>(frame+0x90,camera+8);memory.store<std::uint32_t>(frame+0x94,camera+8);
+    memory.store<std::uint32_t>(frame+0xA0,frame);
+    memory.store<std::uint32_t>(camera+4,frame);
+    memory.store<std::uint32_t>(camera+8,frame+0x90);memory.store<std::uint32_t>(camera+12,frame+0x90);
+    memory.store<std::uint32_t>(camera+0x10,0xE82F0);memory.store<std::uint32_t>(camera+0x14,1);
+    for(unsigned offset:{0x68U,0x6CU,0x70U,0x74U}) memory.store<std::uint32_t>(camera+offset,std::bit_cast<std::uint32_t>(1.f));
+    memory.store<std::uint32_t>(camera+0x80,std::bit_cast<std::uint32_t>(0.1f));
+    memory.store<std::uint32_t>(camera+0x84,std::bit_cast<std::uint32_t>(1000.f));
+    memory.store<std::uint32_t>(0x5ADD5C,0x5ADD5C);memory.store<std::uint32_t>(0x5ADD60,0x5ADD5C);
+    const auto synchronize=[&] {
+        cpu.registers[esp]=stack;memory.store<std::uint32_t>(stack,0xABCDEF00);memory.store(stack+4,frame);
+        invoke_native(cpu,memory,0xE90D0);
+        cpu.registers[esp]=stack;invoke_native(cpu,memory,0xF2620);
+    };
+    std::memcpy(memory.access(frame+0x10,64),start.data(),64);synchronize();
+    title_presentation(cpu,memory,1);title_presentation(cpu,memory,2);
+    ++timing.step;timing.remainder=733333333/2;
+    std::memcpy(memory.access(frame+0x10,64),finish.data(),64);synchronize();
+    std::array<std::byte,0x500> original;std::memcpy(original.data(),memory.access(frame,original.size()),original.size());
+    // Presentation re-enters real guest frame/camera code. Preserve live x87,
+    // SIMD, flags and registers while still charging that work to scheduling.
+    memory.store<std::uint32_t>(0x5ADCB8,0x3FA00000);
+    cpu.registers[esp]=stack;memory.store<std::uint32_t>(stack,0xABCDEF00);
+    invoke_native(cpu,memory,0xEE6D0);
+    cpu.floating.mxcsr=0x3F80;
+    cpu.preempt=[](Cpu&) {};cpu.quantum_remaining=1024;
+    std::uint64_t loading_cycles=733333333;
+    GuestClock clock{&loading_cycles,[](void* value){return *static_cast<std::uint64_t*>(value);}};
+    cpu.clock=&clock;
+    const auto before=cpu;
+    {
+    FloatingScope guest(cpu.floating);
+    title_loading(cpu,memory,false);(void)title_loading_fade(cpu,memory);
+    title_presentation(cpu,memory,1);
+    require(cpu.registers==before.registers && cpu.flags==before.flags && cpu.eip==before.eip &&
+        cpu.quantum_remaining<before.quantum_remaining,"Presentation changed CPU state or rewound its scheduling budget");
+    }
+    require(cpu.floating.image==before.floating.image && cpu.floating.xmm==before.floating.xmm &&
+        cpu.floating.mxcsr==before.floating.mxcsr,"Presentation damaged the guest floating-point context");
+    cpu.floating={};
+    cpu.registers[esp]=stack;invoke_native(cpu,memory,0xF2620);
+    require(std::abs(std::bit_cast<float>(memory.load<std::uint32_t>(frame+0x80))-3.f)<0.00001f,"Original camera hierarchy did not receive the intermediate pose");
+    title_presentation(cpu,memory,2);
+    cpu.preempt=nullptr;
+    require(!std::memcmp(original.data(),memory.access(frame,original.size()),original.size()),"Camera view/frustum changed simulation state after presentation");
+    ++checks;
+    // Mode changes are cuts even when both views share the same RwFrame and
+    // are only a few metres apart. Zoom and near clipping must follow the pose.
+    constexpr std::uint32_t wrapper=0xE800;
+    std::memset(memory.access(wrapper,0x400),0,0x400);
+    memory.store(wrapper,camera);memory.store<std::uint32_t>(wrapper+0x228,1);
+    const auto lens=[&](float width,float near) {
+        for(unsigned i=0;i<2;++i) {
+            memory.store<std::uint32_t>(camera+0x68+i*4,std::bit_cast<std::uint32_t>(width));
+            memory.store<std::uint32_t>(camera+0x70+i*4,std::bit_cast<std::uint32_t>(1.f/width));
+        }
+        cpu.registers[esp]=stack;memory.store<std::uint32_t>(stack,0xABCDEF00);
+        memory.store(stack+4,camera);memory.store<std::uint32_t>(stack+8,std::bit_cast<std::uint32_t>(near));
+        invoke_native(cpu,memory,0xE8490);synchronize();
+    };
+    presentation->reset();timing.step=1;timing.update=true;timing.render=true;
+    lens(1.f,0.1f);title_presentation(cpu,memory,0xADCA0,wrapper);
+    title_presentation(cpu,memory,1);title_presentation(cpu,memory,2);
+    for(unsigned mode:{1U,2U,0U}) {
+        ++timing.step;memory.store(wrapper+0x22C,mode);
+        std::memcpy(memory.access(frame+0x10,64),start.data(),64);lens(1.f,0.1f);
+        title_presentation(cpu,memory,0xADCA0,wrapper);title_presentation(cpu,memory,1);
+        require(!std::memcmp(memory.access(frame+0x10,64),start.data(),64),"Camera mode switch swept through the previous view");
+        title_presentation(cpu,memory,2);
+        ++timing.step;
+        std::memcpy(memory.access(frame+0x10,64),finish.data(),64);lens(2.f,0.2f);
+        title_presentation(cpu,memory,0xADCA0,wrapper);
+        std::memcpy(original.data(),memory.access(frame,original.size()),original.size());
+        title_presentation(cpu,memory,1);
+        require(std::abs(std::bit_cast<float>(memory.load<std::uint32_t>(frame+0x40))-3.f)<0.00001f &&
+            std::abs(std::bit_cast<float>(memory.load<std::uint32_t>(camera+0x68))-1.5f)<0.00001f &&
+            std::abs(std::bit_cast<float>(memory.load<std::uint32_t>(camera+0x80))-0.15f)<0.00001f,
+            "Camera pose, zoom and near clipping used different presentation times");
+        title_presentation(cpu,memory,2);
+        require(!std::memcmp(original.data(),memory.access(frame,original.size()),original.size()),"Camera zoom restoration changed simulation state");
+        ++checks;
+    }
+    presentation->reset();timing.step=1;
+    constexpr std::uint32_t parameters=0xD800,asset=0xD900;
+    std::array<float,6> preview{359,5,1,1,std::bit_cast<float>(asset),0};
+    memory.store<std::uint32_t>(asset+0x8C,0xE000);
+    std::memcpy(memory.access(parameters,24),preview.data(),24);
+    presentation->begin(cpu,memory);presentation->preview(cpu,memory,parameters);presentation->end(cpu,memory);
+    ++timing.step;preview[0]=1;preview[1]=7;
+    std::memcpy(memory.access(parameters,24),preview.data(),24);
+    presentation->begin(cpu,memory);presentation->preview(cpu,memory,parameters);
+    require(std::abs(std::bit_cast<float>(memory.load<std::uint32_t>(parameters))-360)<0.00001f &&
+        std::abs(std::bit_cast<float>(memory.load<std::uint32_t>(parameters+4))-6)<0.00001f,
+        "Car-select angle wrap changed the direction of rotation");
+    require(memory.load<std::uint32_t>(parameters+16)==asset,"Car-select asset pointer was treated as animation data");
+    presentation->end(cpu,memory);
+    require(!std::memcmp(memory.access(parameters,24),preview.data(),24),"Car-select animation state was not restored");
+    ++checks;
+    // A skipped menu draw must also skip cleanup of its absent cdecl args.
+    timing.update=timing.render=false;
+    cpu.registers[esp]=stack;cpu.registers[ecx]=0x2500;
+    memory.store<std::uint32_t>(stack,0xABCDEF00);memory.store<std::uint32_t>(0x2504,0x2500);
+    invoke_native(cpu,memory,0x133B0);
+    require(cpu.eip==0xABCDEF00 && cpu.registers[esp]==stack+4 && cpu.registers[eax]==0x2500,
+        "Skipped menu drawing unbalanced the original scene stack");
+    ++checks;
+    // Run the title's real rotating-scenery loop, including its pause check
+    // and matrix rotation, at different display rates. Two views share the
+    // same world and must not advance it twice.
+    constexpr std::uint64_t frequency=733333333;
+    constexpr std::uint32_t manager=0xE000,master=0xE100,definition=0xE300,table=0xE400,instances=0xE500;
+    std::memset(memory.access(manager,0x600),0,0x600);
+    memory.store(manager+8,master);memory.store<std::uint32_t>(master+0x28,1);
+    memory.store(master+0x2C,definition);memory.store(master+0x34,table);
+    memory.store<std::uint32_t>(master+0x5C,1);memory.store<std::uint32_t>(definition+0x68,7);
+    memory.store<std::uint32_t>(definition+0x64,std::bit_cast<std::uint32_t>(90.f));
+    memory.store(table,instances);memory.store<std::uint32_t>(instances,1);memory.store(instances+4,matrix);
+    const auto rotate=[&] {
+        cpu.registers[esp]=stack;cpu.registers[ecx]=manager;memory.store<std::uint32_t>(stack,0xABCDEF00);
+        invoke_native(cpu,memory,0x8C8D0);
+        require(cpu.eip==0xABCDEF00 && cpu.registers[esp]==stack+4,"Scenery animation changed the original calling convention");
+    };
+    for(bool pal:{false,true}) for(bool slow:{false,true}) for(bool paused:{false,true})
+    for(unsigned rate:{30U,50U,60U,144U,360U,1000U,0U}) {
+        presentation->reset();timing={};timing.started=true;
+        memory.store<std::uint32_t>(0x352720,pal);
+        memory.store<std::uint32_t>(0x598188,(pal?0x3CA3D70AU:0x3C888889U)-(slow?0x01000000U:0));
+        memory.store<std::uint32_t>(0x34AB5C,0x2500);memory.store<std::uint32_t>(0x2508,paused);
+        std::memcpy(memory.access(matrix,64),start.data(),64);
+        // EA0E0 normalizes its axis with the Xbox's approximate RSQRTSS.
+        // Compare against its actual original-cadence result, not ideal trig.
+        cpu.presentation=nullptr;
+        for(unsigned update=0;update<(pal?50U:60U);++update) rotate();
+        std::array<float,16> reference;std::memcpy(reference.data(),memory.access(matrix,64),64);
+        cpu.presentation=presentation.get();
+        std::memcpy(memory.access(matrix,64),start.data(),64);
+        presentation->begin(cpu,memory);presentation->end(cpu,memory);
+        double retention=1;
+        for(unsigned display=1;timing.last_cycles<frequency;++display) {
+            constexpr unsigned varying[]{30,144,60,360};
+            timing.last_cycles=std::min(frequency,rate?std::uint64_t(display)*frequency/rate:
+                timing.last_cycles+frequency/varying[display%4]);
+            presentation->begin(cpu,memory);
+            rotate();
+            std::array<std::byte,64> once;std::memcpy(once.data(),memory.access(matrix,64),64);
+            rotate();require(!std::memcmp(once.data(),memory.access(matrix,64),64),"A second view advanced the same scenery twice");
+            retention*=double(title_blur_alpha(cpu,178,0x4431F8))/255;
+            (void)title_blur_alpha(cpu,0,0x443858);
+            presentation->end(cpu,memory);
+        }
+        require(std::abs(std::bit_cast<float>(memory.load<std::uint32_t>(matrix))-reference[0])<0.0002 &&
+            std::abs(std::bit_cast<float>(memory.load<std::uint32_t>(matrix+4))-reference[1])<0.0002,
+            std::format("Scenery rotation timing: PAL {}, slow {}, paused {}, rate {}, matrix [{},{}], expected [{},{}]",
+                pal,slow,paused,rate,std::bit_cast<float>(memory.load<std::uint32_t>(matrix)),
+                std::bit_cast<float>(memory.load<std::uint32_t>(matrix+4)),reference[0],reference[1]));
+        require(std::abs(std::log(retention)/std::log(178.0/255)-(pal?50:60))<0.1,
+            "Original blur history decayed at a different rate per second");
+        require(title_blur_alpha(cpu,0,0x4431F8)==0,"Disabled blur changed strength");
+        ++timing.step;
+        require(title_blur_alpha(cpu,255,0x4431F8)==255,"Full blur changed strength");
+        timing.render_frames=1;
+        require(title_blur_alpha(cpu,178,0x4431F8)==178,"Original-cadence blur changed strength");
+        ++checks;
+    }
+    // Exercise the original boost enable/disable and camera-cut routines,
+    // comparing one original draw with several displays in the same tick.
+    // Stop A97C0 before it requests a GPU surface: the emitted alpha is already
+    // on its stack. Completing its verified A9C65 strength copy needs no GPU.
+    constexpr std::uint32_t filter=0x4431F8,reference_filter=0x443858;
+    const auto set_blur=[&](std::uint32_t object,unsigned enabled) {
+        cpu.registers[esp]=stack;cpu.registers[ecx]=object;
+        memory.store<std::uint32_t>(stack,0xABCDEF00);memory.store(stack+4,enabled);
+        memory.store<std::uint32_t>(stack+8,enabled?0x3F333333U:0U);
+        invoke_native(cpu,memory,0xA9750);
+        require(cpu.eip==0xABCDEF00 && cpu.registers[esp]==stack+12,"Boost transition changed the original calling convention");
+    };
+    const auto draw_blur=[&](std::uint32_t object) {
+        cpu.registers[esp]=stack;cpu.registers[ecx]=object;
+        memory.store<std::uint32_t>(stack,0xABCDEF00);
+        ExecutionDiagnostic diagnostic;diagnostic.break_address=0x215CE0;
+        cpu.diagnostic=&diagnostic;bool drew=false;
+        try {invoke_native(cpu,memory,0xA97C0);}
+        catch(const NativeBoundary& boundary) {require(boundary.address==0x215CE0,"Boost draw failed before producing alpha");drew=true;}
+        cpu.diagnostic=nullptr;
+        require(drew==bool(memory.load<std::uint32_t>(object)),"Disabled boost retained a framebuffer pass");
+        if(!drew) return 0U;
+        const auto alpha=memory.load<std::uint32_t>(stack-4);
+        memory.store(object+8,memory.load<std::uint32_t>(object+4));
+        return alpha;
+    };
+    for(bool pal:{false,true}) for(unsigned displays:{1U,2U,6U,17U}) {
+        presentation->reset();timing={};timing.started=true;timing.render_frames=1.0/displays;
+        memory.store<std::uint32_t>(0x352720,pal);
+        std::memset(memory.access(filter,12),0,12);std::memset(memory.access(reference_filter,12),0,12);
+        for(unsigned step=1;step<=8;++step) {
+            timing.step=step;
+            for(const auto object:{reference_filter,filter}) {
+                if(step==1 || step==6) set_blur(object,1);
+                if(step==5 || step==8) set_blur(object,0);
+                if(step==3) {
+                    cpu.registers[esp]=stack;cpu.registers[ecx]=object;
+                    memory.store<std::uint32_t>(stack,0xABCDEF00);invoke_native(cpu,memory,0xA9790);
+                }
+            }
+            cpu.presentation=nullptr;const auto reference_alpha=draw_blur(reference_filter);
+            cpu.presentation=presentation.get();double retention=1;
+            for(unsigned display=0;display<displays;++display) {
+                const auto alpha=draw_blur(filter);
+                if(!reference_alpha) require(!alpha,"Extra displays shortened the original boost transition/history clear");
+                retention*=double(alpha)/255;
+            }
+            require(std::abs(retention-double(reference_alpha)/255)<0.004,
+                "Boost transition retained a different amount of history over one original frame");
+            require(!std::memcmp(memory.access(filter,12),memory.access(reference_filter,12),12),
+                "Boost presentation changed the original filter state");
+            ++checks;
+        }
+    }
+    return checks;
+}
 unsigned check_cpu_image(const std::filesystem::path& path) {
     Xbe image(path);
     require(image.supported(),"CPU image checks require the verified target");
@@ -856,7 +1258,7 @@ unsigned check_cpu_image(const std::filesystem::path& path) {
     constexpr DrawCase draws[]={{0,0,0,110,60,10},{0.1f,0,1,100,60,10},{0.1f,0.125f,0.5f,100,55,16}};
     const auto store_float=[&](std::uint32_t address,float value) {memory.store<std::uint32_t>(address,std::bit_cast<std::uint32_t>(value));};
     const auto load_float=[&](std::uint32_t address) {return std::bit_cast<float>(memory.load<std::uint32_t>(address));};
-    for(const auto& sample:draws) {
+    for(unsigned aspect=0;aspect<7;++aspect) for(const auto& sample:draws) {
         std::fill_n(bytes.begin()+record,0x500,std::byte{});
         constexpr float position[]={10,20,100,40,8,16,24,128},identity[]={0,0,1,1,1,1,1,1};
         for(unsigned i=0;i<8;++i) {
@@ -873,21 +1275,130 @@ unsigned check_cpu_image(const std::filesystem::path& path) {
         memory.store<std::uint32_t>(stack,0xABCDEF00);
         ExecutionDiagnostic diagnostic;diagnostic.remaining=10000;diagnostic.watch_address=0x00034C20;
         Cpu cpu;cpu.registers[esp]=stack;cpu.registers[ecx]=queue;cpu.diagnostic=&diagnostic;
+        HudLayout hud;hud.list=aspect==2?queue+16:queue;hud.active=1;hud.scale=0.75f;hud.anchors[0]=640;
+        if(aspect) cpu.hud_layout=&hud;
+        // Run the real queue and Crash text/bar callback at an intermediate
+        // display time, including the existing widescreen transform.
+        std::unique_ptr<Presentation> presentation;
+        GameTiming timing;
+        if(aspect>=3) {
+            presentation=std::make_unique<Presentation>();cpu.presentation=presentation.get();cpu.game_timing=&timing;
+            timing.step=1;timing.render=true;timing.started=true;
+            for(unsigned i=0;i<4;++i) memory.store<std::uint32_t>(0x2FE370+i*4,0);
+            store_float(record+8,-30);
+            // A mirrored rectangle is a new orientation, not a scale tween
+            // through zero. Exercise both axes with the original draw callback.
+            if(aspect==5) store_float(record+0x10,-100);
+            if(aspect==6) store_float(record+0x14,-40);
+            presentation->begin(cpu,memory);function(0x000C1210).run(cpu,memory);presentation->end(cpu,memory);
+            memory.store<std::uint32_t>(stack,0xABCDEF00);cpu.registers[esp]=stack;cpu.registers[ecx]=queue;
+            memory.store<std::uint32_t>(vertices+0x1C00,0);store_float(record+8,10);
+            store_float(record+0x10,100);store_float(record+0x14,40);
+            timing.step=2;timing.remainder=733333333/4;
+            if(aspect==4) {
+                // A page switch keeps this node but hides it immediately.
+                // Old position/opacity must never reappear on the next page.
+                title_ui(cpu,memory,0,0);store_float(record+0x24,0);
+            }
+            presentation->begin(cpu,memory);timing.render_frames=0.25;
+        }
         function(0x000C1210).run(cpu,memory);
+        if(presentation) presentation->end(cpu,memory);
         const auto last=vertices+(sample.vertex_count-1)*28;
+        const auto hud_x=[&](float x) {return aspect==3?(x-30)*0.75f+160:aspect==1 || aspect>=4?x*0.75f+160:x;};
+        const auto alpha=aspect==4?0U:0x80000000U;
         require(diagnostic.reached_watch && cpu.eip==0xABCDEF00 && cpu.registers[esp]==stack+4 &&
             memory.load<std::uint32_t>(vertices+0x1C00)==sample.vertex_count &&
-            load_float(vertices)==10 && load_float(vertices+4)==20 &&
-            memory.load<std::uint32_t>(vertices+16)==0x80000000 &&
-            load_float(last)==sample.last_x && load_float(last+4)==sample.last_y &&
-            memory.load<std::uint32_t>(last+16)==0x80081018,
+            load_float(vertices)==hud_x(10) && load_float(vertices+4)==20 &&
+            memory.load<std::uint32_t>(vertices+16)==alpha &&
+            load_float(last)==hud_x(sample.last_x) && load_float(last+4)==sample.last_y &&
+            load_float(record+8)==10 && load_float(record+16)==100 &&
+            memory.load<std::uint32_t>(last+16)==(alpha|0x00081018),
             std::format("Original Crash-mode UI queue differs for border ({}, {}), fill {}: callback {}, return {}, stack {}, vertices {}, first ({}, {}, {:08X}), last ({}, {}, {:08X})",
                 sample.border_x,sample.border_y,sample.fill,diagnostic.reached_watch,hex32(cpu.eip),hex32(cpu.registers[esp]),
                 memory.load<std::uint32_t>(vertices+0x1C00),load_float(vertices),load_float(vertices+4),memory.load<std::uint32_t>(vertices+16),
                 load_float(last),load_float(last+4),memory.load<std::uint32_t>(last+16)));
         ++cases;
     }
-    return cases;
+    {
+        // The original driving-message constructor shares a queue between
+        // screen-centred text and right-aligned text above the boost meter.
+        constexpr std::uint32_t manager=0x2500,message=0x2600,strings=0x2700;
+        constexpr std::array globals{0x352728U,0x35272CU,0x4D23ACU};
+        std::array<std::uint32_t,globals.size()> saved{};
+        for(unsigned i=0;i<globals.size();++i) saved[i]=memory.load<std::uint32_t>(globals[i]);
+        memory.store<std::uint32_t>(globals[0],0);memory.store(globals[1],strings);store_float(globals[2],18);
+        for(bool wide:{false,true}) for(bool centred:{false,true}) {
+            std::fill_n(bytes.begin()+record,0x900,std::byte{});
+            memory.store(manager+0x3C,queue);memory.store(queue+4,owner);
+            memory.store<std::uint32_t>(queue+8,0xFFFFFFFF);
+            memory.store(owner+8,record);memory.store(owner+0x18,record);
+            memory.store<std::uint32_t>(strings,0x2800);
+            const float x=centred?280.f:126.f,width=centred?134.f:104.f;
+            const std::array arguments{manager,0U,transform,std::bit_cast<std::uint32_t>(x),
+                std::bit_cast<std::uint32_t>(2.f),std::bit_cast<std::uint32_t>(centred?0.5f:1.f),
+                std::bit_cast<std::uint32_t>(width),0U,0U};
+            memory.store<std::uint32_t>(stack,0xABCDEF00);
+            for(unsigned i=0;i<arguments.size();++i) memory.store(stack+4+i*4,arguments[i]);
+            HudLayout hud;hud.list=queue;hud.active=1;hud.scale=wide?0.75f:1.f;hud.anchors[0]=40;
+            Cpu cpu;cpu.registers[esp]=stack;cpu.registers[ecx]=message;cpu.hud_layout=&hud;
+            function(0x0001D5C0).run(cpu,memory);
+            const auto left=40+load_float(record+8)*hud.scale;
+            const auto expected=centred?(wide?269.75f:253.f):(wide?56.5f:62.f);
+            require(cpu.eip==0xABCDEF00 && cpu.registers[esp]==stack+40 &&
+                memory.load<std::uint32_t>(message)==record+8 && std::abs(left-expected)<0.0001f &&
+                load_float(record+12)==-16 && load_float(record+16)==width && load_float(record+20)==18,
+                "Driving text lost its screen-centre or boost-meter anchor");
+            ++cases;
+        }
+        for(unsigned i=0;i<globals.size();++i) memory.store(globals[i],saved[i]);
+    }
+    {
+        constexpr std::uint32_t vehicle=0x2800,holder=0x2B00,camera=0x2C00,frame=0x2D00;
+        const auto saved_camera=memory.load<std::uint32_t>(0x443EB0);
+        const auto saved_distance=memory.load<std::uint32_t>(0x4B30A0);
+        const auto store_float=[&](std::uint32_t address,float value) {memory.store<std::uint32_t>(address,std::bit_cast<std::uint32_t>(value));};
+        memory.store<std::uint32_t>(0x443EB0,holder);memory.store<std::uint32_t>(holder,camera);
+        memory.store<std::uint32_t>(camera+4,frame);
+        // Capture frame-153796275900: the nearby sedan's body was 34% opaque
+        // because the player wreck was roughly 241 units away from it.
+        const std::array<float,3> viewpoint{-1531.203f,72.14848f,-1318.361f};
+        const std::array<float,3> sedan{-1532.230f,59.40054f,-1362.379f};
+        for(unsigned axis=0;axis<3;++axis) {
+            store_float(frame+0x40+axis*4,viewpoint[axis]);
+            store_float(vehicle+0x30+axis*4,sedan[axis]);
+        }
+        store_float(0x4B30A0,241.40826f);store_float(vehicle+0x1E0,0.6f);
+        Cpu cpu;cpu.registers.fill(0xABCD1234);cpu.flags=0x246;
+        cpu.registers[esp]=stack;memory.store<std::uint32_t>(stack,0xABCDEF00);
+        memory.store<std::uint32_t>(0x5ADCB8,0x3FA00000);invoke_native(cpu,memory,0xEE6D0);
+        cpu.floating.mxcsr=0x5F81;
+        const auto before=cpu;
+        {
+        FloatingScope guest(cpu.floating);
+        require(title_traffic_fade(cpu,memory,vehicle)==0x3F800000,
+            "Crash flyover body opacity still follows the distant player wreck");
+        for(unsigned axis=0;axis<3;++axis) for(const auto [distance,opacity]:
+            {std::pair{0.f,1.f},{225.f,1.f},{237.5f,0.5f},{250.f,0.f},{300.f,0.f}}) {
+            for(unsigned i=0;i<3;++i) {
+                store_float(frame+0x40+i*4,0);
+                store_float(vehicle+0x30+i*4,i==axis?distance:0.f);
+            }
+            require(title_traffic_fade(cpu,memory,vehicle)==std::bit_cast<std::uint32_t>(opacity),
+                "Traffic camera fade changed its original range or curve");
+            ++cases;
+        }
+        }
+        require(cpu.floating.image==before.floating.image && cpu.floating.xmm==before.floating.xmm &&
+            cpu.floating.mxcsr==before.floating.mxcsr,"Traffic fade damaged the guest floating-point context");
+        require(cpu.registers==before.registers && cpu.flags==before.flags &&
+            memory.load<std::uint32_t>(vehicle+0x1E0)==std::bit_cast<std::uint32_t>(0.6f) &&
+            memory.load<std::uint32_t>(0x4B30A0)==std::bit_cast<std::uint32_t>(241.40826f),
+            "Traffic visual fade changed vehicle alpha, simulation distance or guest registers");
+        memory.store<std::uint32_t>(0x443EB0,saved_camera);memory.store<std::uint32_t>(0x4B30A0,saved_distance);
+        ++cases;
+    }
+    return cases+check_game_timing(memory)+check_presentation(memory);
 }
 
 CpuTiming benchmark_call_chain(std::uint32_t iterations) {

@@ -1,4 +1,142 @@
+2026-10-17: retired at user request. Frame generation, its settings and geometry,
+shadow and sprite histories have been removed. Image motion estimation remains
+only for temporal upscaling; UI layer capture remains for ambient occlusion.
+The following records describe the retired implementation.
+
 Optional presentation interpolation
+
+2026-10-16 follow-up: wheels, lights, MSAA and car selection
+
+Car selection draws the reflection and then the real car using the same mesh
+identity but different transforms. The first draw previously consumed the
+history entry, leaving the real car with stationary camera motion. Repeated
+draws now retain separate histories in their original order. The captured
+showroom trace is build/captures/frame-28427993300 (reflection draws 1-5,
+car draws 31-35).
+
+Fast wheel rotation exposed a different problem: straight lines between two
+spoke positions can collapse the tyre's outline. The verified wheel draw at
+C33E0, called from 862B8, now transports the wheel by its hub movement while
+retaining the original spinning-wheel appearance. Original endpoint drawing
+is unchanged. This uses the original wheel shader and its position constants,
+not an estimated angular velocity.
+
+Depth-tested screen-space sprites, including brake glow and smoke, were being
+stored with the stationary HUD. Their original vertices, colours, textures and
+blend operations now have a separate bounded history. Each sprite follows its
+world position or the car beneath its anchor; disappearing lights select the
+appropriate endpoint. HUD blending remains separate. Replay preserves the
+surface-coverage alpha channel. Existing cached blend states are prepared when
+interpolation is enabled during a session. The three sprite histories use
+about 7 MiB of GPU storage and 2 MiB of CPU staging, independent of resolution.
+
+MSAA colour can contain a car sample even when the pixel centre misses the car.
+Motion projection now replays the actual MSAA sample positions into the existing
+single-sample motion field. Visibility uses the covered sample; attribute
+evaluation returns motion to the pixel centre. This avoids the bright fragments
+left following road motion. No additional full-resolution history is needed.
+Expanded-triangle/conservative-raster approaches were rejected for cost: their
+two motion passes took about 1.45 ms, compared with 0.12 ms for sample replay at
+2x resolution and 4x MSAA on the RTX 5060 Ti. Sample-location and attribute
+evaluation semantics are documented at:
+https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/evaluateattributesnapped
+
+Shadow texture dimensions now use the explicit rendering scale, independently
+of the main viewport width. The general renderer's smaller diagnostic targets
+otherwise attempted to create zero-sized shadow images.
+
+Focused native checks use the production code and shaders:
+- Fast wheel rotation: the previous linear method produced 9,600 interior
+  missing pixels; hub transport produces zero, including the 4x MSAA case.
+- Moving/disappearing sprite errors: zero.
+- MSAA translation: previous centre-only coverage left 239 stray pixels at 4x;
+  sample replay has zero stray pixels or holes at 2x, 4x and 8x.
+- Perspective motion alignment: maximum error below 0.00012 pixel. Differences
+  from a native re-render are confined to fractional silhouette coverage;
+  there are no distant stray pixels or holes inside the surface.
+- One-pixel lines in three orientations, textured surfaces and transparent HUD:
+  zero error. Original endpoints, alpha holes, temporal jitter, shadow separation
+  and independent two-car shadow placement also retain zero errors.
+- These checks report zero D3D11 debug warnings and runtime shader compilations.
+  Automated car-selection, race, crash, MSAA, FXAA and DLSS captures also report
+  zero runtime shader compilations. Private evidence remains under
+  build/checks/interpolation-surfaces-20261016/.
+
+2026-10-16 geometric interpolation revision
+
+Gameplay now derives correspondence from the original camera and mesh positions.
+Original draw scopes at 85AC0, C4A70 and C33E0 identify cars and their parts;
+the recompilation verifies the source bytes before adding these scopes. Mesh
+content, part and instance identify matching draws. Stream output saves previous
+and current positions during the original draw without changing its outputs.
+Camera correspondence covers static surfaces; captured meshes replace it only
+where their depth agrees with the original depth buffer, preserving alpha holes.
+Both use the original rendering grid, including the original temporal jitter.
+Full-resolution colour is projected with pixel footprints and surface depth.
+Flat 4x4 regions share a quad; discontinuities retain individual pixel coverage.
+This replaces colour confidence patches and circular splats in gameplay.
+
+The projected shadow draw at B2530 multiplies the receiver colour by (1-shadow).
+Its texture is reused between cars, so each car needs its own bounded snapshot.
+Replaying the original draw against final scene depth recovers this attenuation
+without darkening occluding cars. Removing it before scene interpolation and
+interpolating the original world-to-shadow mapping makes shadows follow cars.
+Both endpoint receiver meshes supply coverage, with stencil preventing duplicate
+attenuation. Original fixed-function projection and raster offsets are preserved.
+The native endpoint is unchanged; FXAA/upscaling filters the clean scene before
+restoring the original shadow and clipped affine HUD layers.
+
+All shaders remain ahead-of-time compiled. Bounded GPU histories avoid readback,
+runtime shader compilation and per-frame allocation. The optical method described
+below remains the fallback for scenes without a supported geometric camera;
+earlier dated measurements describe the implementation at their stated date.
+
+Validation of this revision (Windows, Ryzen 5 5600X, RTX 5060 Ti):
+- Original target SHA256 B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+- Private native D3D11 probes use the production shaders and interpolation code.
+  Vertical, horizontal and diagonal one-pixel lines, textured surfaces and
+  transparent HUD: zero image error. Original geometry stream capture: unchanged
+  native endpoints, zero visibility failures including alpha holes and temporal
+  jitter at the upscaler's native input resolution. Projected shadow separation
+  and midpoint: zero image error, including a second independently indexed car.
+  All probes report zero D3D11 debug warnings and runtime shader compilations.
+- --check-cpu passes 26,026 instruction, 1,551 memory, 6,744 floating-point and
+  109 control cases; 36,149 compiled functions. CPU coverage is not expanded by
+  the rendering metadata scopes.
+- The existing --check-window image-only estimator fails identically on the
+  saved baseline and this revision: diagonal error 1.110 (1449/720 mismatches),
+  horizontal error 1.180 (1406/960). Its original assertions remain unchanged.
+  It does not provide the geometry inputs exercised by the new native probes.
+- Airport Terminal 3, widescreen, V-sync off, 2x resolution, 4x MSAA, 360 Hz:
+  moving-race presentation increased from 299 to 320 frames/s; median measured
+  GPU spans fell from 9.40 to 7.94 ms/source frame. CPU work median was 5.41 ->
+  5.66 ms, with p99 improving from 9.70 to 7.49 ms. The source remains 60 Hz.
+- Down Hill Demolition crash sequence, same settings: presentation increased
+  from 296 to 330 frames/s, GPU median 9.61 -> 6.05 ms, CPU median 4.29 -> 4.31
+  ms and CPU p99 9.27 -> 6.45 ms. Transparent crash overlays remain intact.
+- Airport Terminal 3, DLSS, 2x output, 144 Hz: median GPU spans 9.69 -> 6.40 ms;
+  source cadence remains 60 Hz. Native, MSAA, FXAA, DLSS and 3x MSAA captures
+  were visually inspected. Moving cars, thin road furniture and projected
+  shadows remain separate from the transparent gauges and text.
+- Native 1x, 360 Hz selected, interpolation/V-sync off: repeated paired runs
+  have approximately 3.31 ms median frame intervals (~300 FPS). One candidate
+  run was 3.46 ms; repeating the unchanged binary returned 3.307 ms against
+  3.317 ms baseline. There is no repeatable native regression in these runs;
+  the project's sustained 360 FPS target is not established by this evidence.
+- The new geometry/shadow histories use additional bounded memory: the 2x MSAA
+  race target allocation was about 563 MiB versus 403 MiB baseline. The target
+  budget now respects the adapter's available budget, capped at 2 GiB, so the
+  existing 3x MSAA setting also fits. Disabling interpolation avoids these stores.
+- F9 recordings lasted 5 seconds, except the paired moving-race recordings
+  lasting approximately 8 seconds. Menu/loading automation preceded recording.
+  Original user settings and saves were preserved; private automation copies
+  and evidence are under build/checks/interpolation-surfaces-20261016/.
+
+Geometric and ordinary shadow-containing frames reset their pairing when the
+rendering mode changes. This prevents stripping a shadow before its geometry is
+available. Scene-cut/uncovered-pixel fallback uses complete endpoint images,
+including shadows and HUD. The method still cannot reconstruct unseen content;
+scenes without supported geometric correspondence retain the image-only fallback.
 
 With interpolation on, the GUI presents completed original frames at an
 independent display rate and source flips stay at 60 Hz. With interpolation off,

@@ -281,6 +281,43 @@ motion is measured at a consistent sample location:
 https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-struct
 https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-semantics
 
+Crash flyover traffic opacity (2026-10-17)
+
+User capture build/windows/Release/build/captures/frame-153796275900,
+final Crash junction flyover, 1920x1440. The gold sedan is draw 488, original
+vertex program 7, texture 190. Constant 107.w is zero; 108.w is 0.34366944.
+Its glass draw 491 has 108.w = 0.20620167 (the original 0.6 material alpha).
+The identical sedan model at draw 464 has body alpha 1. This is an original
+draw input, not interpolation, texture alpha or a blend-state leak.
+
+Verified B5207C40...ED7BF bytes: 9E950 stores horizontal player/traffic
+distances at 4B30A0, which is traffic manager 48A1C0 + 28EE0. Renderer
+9BA2C..9BA83 indexes that simulation cache by view and vehicle +10C, fading
+body/shadow opacity at +1E4 over 225..250 units (2C1ACC = 250, 2C1AD0 = 25).
+9C06C multiplies it by the independent vehicle alpha at +1E0 before 9A330.
+In contrast, body LOD at 9BEBC/9BFF3 and wheels at C3180 use the active camera.
+The capture's camera is (-1531.203,72.14848,-1318.361), the sedan is
+(-1532.230,59.40054,-1362.379), and the player body is approximately
+(-1681.674,46.17694,-1551.591). Thus the flyover sees a nearby car fading
+according to its distance from the distant wreck, while the wheels stay solid.
+
+The verified rendering branch now calculates its existing distance fade from
+the active camera. Original +1E8/+1A0 exemptions, vehicle alpha, glass alpha,
+shader blending, LOD, traffic simulation and its player-distance cache remain
+original. No changes to timing, ghost/player rendering, GPU passes or copies.
+The native scalar SIMD calculation leaves x87 resident, preserves MXCSR and
+uses a square root/division only within the fade band. No allocations or I/O.
+The existing CPU diagnostic covers the captured sedan, all three distance axes,
+225/237.5/250 boundaries, independent vehicle alpha/cache preservation, and
+live guest x87/SIMD state with non-default MXCSR. Gameplay was not automated.
+
+Validation: crash-camera-fade-final-build passed; crash-camera-fade-cpu-check
+passed all 52 groups, 26026 instruction, 3301 memory, 6744 floating and 109
+control cases, with 36149 compiled functions. The new branch is present in
+generated 9B380, after both original exemptions and before both body/shadow
+uses. No GPU code changed for this fix. No gameplay or FPS benchmark was run;
+the final moving flyover appearance remains for the user's manual check.
+
 Preservation
 Existing snowfall changes are preserved; their original diff, executable and
 settings are backed up under build/checks/correctness-20261014/baseline. Original

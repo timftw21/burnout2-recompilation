@@ -67,3 +67,12 @@ The user confirmed that the rendering issue is not completely fixed and deferred
 further investigation to another release. The offline results above establish
 the specific improvement, not complete scene correctness. The draw-distance
 tooltip and release documentation now warn about possible rendering issues.
+
+2026-10-17: superseded the two-sided workaround. Extended distance now preserves
+the track's authored visibility/material choices and scales clipping, scenery
+fades and traffic detail/opacity. Removed forced extra sections, two-sided
+geometry and background bias, so incompatible mountain backs/building proxies
+are no longer submitted together. This respects original asset visibility limits;
+it does not invent complete terrain where the original track contains none.
+See research/enhancements.txt and research/game-timing.txt for implementation,
+validation and the limited scope of the new Sunrise start-area smoke check.

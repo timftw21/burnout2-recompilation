@@ -309,6 +309,7 @@ int main(int argc, char** argv) {
                          "  b2 --watch-semaphores HANDLE [HANDLE ...]\n"
                          "  b2 --check-visibility XBE OUTPUT_DIRECTORY [--warp]\n"
                          "  b2 --check-replays XBE ISO OUTPUT_DIRECTORY\n"
+                         "  b2 --check-track-import XBE ISO ASSET_DIRECTORY OUTPUT_DIRECTORY\n"
                          "  b2 --check-music XBE ISO OUTPUT_DIRECTORY\n"
                          "  b2 --import-music FOLDER CACHE_DIRECTORY\n"
                          "  b2 --check-custom-music XBE OUTPUT_DIRECTORY [CACHE_DIRECTORY]\n"
@@ -329,6 +330,7 @@ int main(int argc, char** argv) {
             std::cout<<b2::check_visibility(argv[2],argv[3],argc==5)<<'\n';return 0;
         }
         if(command=="--check-replays" && argc==5) {std::cout<<b2::check_replays(argv[2],argv[3],argv[4])<<'\n';return 0;}
+        if(command=="--check-track-import" && argc==6) {std::cout<<b2::check_track_import(argv[2],argv[3],argv[4],argv[5])<<'\n';return 0;}
         if(command=="--check-music" && argc==5) {std::cout<<b2::check_music(argv[2],argv[3],argv[4])<<'\n';return 0;}
         if(command=="--check-custom-music" && (argc==4 || argc==5)) {std::cout<<b2::check_custom_music(argv[2],argv[3],argc==5?b2::utf8_path(argv[4]):std::filesystem::path{})<<'\n';return 0;}
         if(command=="--import-music" && argc==4) {

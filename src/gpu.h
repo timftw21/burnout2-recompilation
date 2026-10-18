@@ -14,14 +14,14 @@ class Gpu {
 public:
     Gpu(Renderer&,Memory&,std::uint32_t semaphore_base);
     ~Gpu();
-    void submit(std::uint32_t begin,std::uint32_t end);
+    void submit(std::uint32_t begin,std::uint32_t end,bool flush=true);
+    void begin_overlay();
+    void restore_feedback();
     bool busy();
     void wait();
     void wait_fence(std::uint32_t value,std::uint32_t issued);
     void snapshot();
     void invalidate_memory(std::uint32_t address,std::uint32_t size); // Guest storage is being replaced or released.
-    void distant_geometry(std::span<const std::uint32_t> vertex_buffers);
-    void extended_geometry(std::uint32_t address,std::uint32_t size);
     void capture_frame(const std::filesystem::path& directory,bool automated=false);
     void performance(Performance*);
     GpuStats stats() const;

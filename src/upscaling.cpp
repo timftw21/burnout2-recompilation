@@ -1,5 +1,5 @@
 #include "upscaling.h"
-#include "interpolation.h"
+#include "frame_processing.h"
 #include "shaders.h"
 #include <d3d11_4.h>
 #include <d3d12.h>
@@ -67,7 +67,7 @@ struct FrameUpscaling::Impl {
     HMODULE fsr_module=nullptr;
     ffxFunctions fsr{};
     ffxContext fsr_context=nullptr;
-    std::unique_ptr<FrameInterpolation> motion;
+    std::unique_ptr<FrameMotion> motion;
     ComPtr<ID3D11VertexShader> vertex;
     ComPtr<ID3D11PixelShader> convert,present;
     ComPtr<ID3D11Buffer> input_constants;
@@ -258,7 +258,7 @@ struct FrameUpscaling::Impl {
     }
     void prepare_frames(std::uint64_t& compilations) {
         if(motion) return;
-        motion=std::make_unique<FrameInterpolation>(device11.Get(),context11.Get(),width,height,compilations,false);
+        motion=std::make_unique<FrameMotion>(device11.Get(),context11.Get(),width,height,compilations);
         const auto shader=[&](ShaderKind kind) {const auto result=shader_binary(kind);compilations+=result.compiled;return result.bytes;};
         const auto vs=shader(ShaderKind::display_vertex),ps=shader(ShaderKind::upscale_inputs),display=shader(ShaderKind::display_pixel);
         checked(device11->CreateVertexShader(vs.data(),vs.size(),nullptr,&vertex),"Upscaling input vertex shader");

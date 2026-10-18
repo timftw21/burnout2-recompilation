@@ -1,0 +1,57 @@
+Baked lighting / ambient occlusion investigation (2026-10-16)
+
+Finding: original assets contain stored texture shading and per-vertex shading.
+A specifically ambient-occlusion bake is not established. Do not describe this
+investigation as proof that Burnout 2 either uses or excludes baked AO.
+
+Source: supported US Xbox XISO in Burnout 2/. Verified executable SHA-256:
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF,
+matching knowledge/supported_target.json. Original files were read only.
+
+Bounded original-asset inspection:
+- Inventoried 2,833 named texture records (896 distinct names) in all 15 forward
+  track PSS packages. This was a metadata inventory, not visual review of every
+  texture. No texture name identified AO, ambient occlusion or a lightmap.
+  Naming alone cannot establish whether AO was included in ordinary textures.
+- Each package has B2300008 at +0, texture count at +10, and pointer table at
+  +1C0 (+14 contains 8381C1C0). Pointers use image base 8381C000. Checked native
+  records contain the name at +10, raster at +60, dimensions at +6C/+70,
+  compression byte at +A5, mip count at +A8 and pixel pointer at +B4.
+- Matched all bytes of 106 captured texture payloads to their original dstl.pss
+  payloads, using the recorded address minus 0381C000 as the file offset.
+  The existing capture was frame-562156488000; no new gameplay was run.
+- Decoded 16 original architecture textures from aptl.pss and dstl.pss using
+  native DXT rendering. APT_Boarding_Wall has soft dark shading under its ledge;
+  APT_Window_Cargo has shading around/below its window. DST_Steps has shaded
+  stair surfaces and DST_WallConc2 is darker near its top edge. These details
+  already exist in the texture pixels, independently of runtime world lighting.
+  Paint, photographic source imagery, direct-shadow baking and AO baking can
+  produce similar details. Their appearance does not identify the authoring method.
+
+Original mesh/shader verification:
+- Read only seven known meshes in dstl.psw section 19: 3,4,8,11,12,13,14.
+  Their vertex prefixes match captured draws 408..414 exactly. Each uses the
+  captured shader 2 and a 24-byte vertex: position +0, UV +12, packed BGRA +20.
+- Original shader records at XBE VA 0033E160 and 0033F3F0 both match all ten
+  captured instructions exactly. Slot 6 copies vertex attribute 3 RGB directly
+  to output diffuse RGB; slot 7 supplies alpha from constant 100.w. These
+  sampled meshes do not calculate their diffuse shading from normals at runtime.
+- The original stored RGB varies substantially within meshes. Section 19 mesh
+  12 (DST_GrassGreen) has 321 vertices and 101 distinct RGB values, with mean
+  RGB brightness from 8 to 171 out of 255. Mesh 4 (DST_WallConc3) has 116 vertices,
+  41 RGB values and brightness from 9 to 143. This verifies stored vertex shading;
+  the RGB field does not say how the artist or exporter generated those values.
+
+Limits: vehicles and reverse/crash-specific packages were not audited. No
+original art source, exporter setting or developer statement identifying an AO
+bake was found in the inspected material. AO could have been merged into the
+stored RGB or ordinary texture pixels, leaving no separate AO map or flag.
+
+Private reproducible inputs, scripts, CSV inventories and structured results:
+build/checks/baked-ao-20261016/. original-textures.png is the labeled contact
+sheet; report.json contains counts, shader provenance and sampled mesh ranges.
+The private render helper links the existing native shader bank. No game code,
+settings, saves or source assets were changed; no benchmark or computer use ran.
+
+File-format selection reference (discoveries above verified from original bytes):
+https://gist.github.com/AcuteSyntax/536a2d62ab1b3fde5c14f70d268b14c0

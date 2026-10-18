@@ -1,7 +1,8 @@
 #include "render.h"
 #include "shaders.h"
-#include "interpolation.h"
+#include "frame_processing.h"
 #include "antialiasing.h"
+#include "ambient_occlusion.h"
 #include <Windows.h>
 #include <d3d11.h>
 #include <d3d11_1.h>
@@ -495,6 +496,7 @@ struct Renderer::Impl {
     std::map<std::uint32_t,FrameTarget> targets;
     std::uint32_t current_target=0;
     std::uint32_t presentation_target=0;
+    std::uint32_t feedback_target=0;
     const Visibility* visibility=nullptr;
     void visibility_scope(bool original) const {if(visibility) visibility->scope(visibility->context,original);}
     std::size_t target_bytes=0;
@@ -508,20 +510,22 @@ struct Renderer::Impl {
     ComPtr<ID3D11SamplerState> display_sampler;
     ComPtr<ID3D11RasterizerState> display_raster;
     ComPtr<ID3D11DepthStencilState> display_depth;
-    std::unique_ptr<FrameInterpolation> interpolation;
     std::unique_ptr<FrameLayers> layers;
     std::array<ComPtr<ID3D11PixelShader>,9> layer_combiners;
     std::array<ComPtr<ID3D11PixelShader>,4> layer_simple;
     bool layer_scene=false;
     std::uint32_t layer_target=UINT32_MAX;
     std::unique_ptr<FrameAntialiasing> antialiasing;
+    std::unique_ptr<FrameAmbientOcclusion> ambient_occlusion;
+    unsigned ao_quality=0;
+    float ao_strength=0.35f,camera_aspect=1;
+    bool ao_scene_only=false,ao_scene_depth=false;
     std::unique_ptr<FrameUpscaling> upscaler;
     UpscaleMethod upscale_method=UpscaleMethod::off;
     unsigned upscale_output_scale=0;
     UpscaleFrame upscale_frame;
     std::uint32_t camera_identifier=0;
     MotionCamera motion_camera;
-    bool capture_motion=false;
     bool upscaled=false,camera_valid=false,camera_reset=true;
     std::chrono::steady_clock::time_point upscale_time{};
     std::array<float,2> jitter{};
@@ -543,7 +547,7 @@ struct Renderer::Impl {
     std::uint32_t window_width=0,window_height=0;
     bool displaying=false,widescreen=false;
     struct Pipeline {
-        ComPtr<ID3D11BlendState> blend;
+        ComPtr<ID3D11BlendState> blend,layer_blend;
         ComPtr<ID3D11DepthStencilState> depth;
         ComPtr<ID3D11RasterizerState> raster;
     };
@@ -566,6 +570,7 @@ struct Renderer::Impl {
         ComPtr<ID3D11ComputeShader> compute;
         ComPtr<ID3D11InputLayout> layout;
         Bytes signature;
+        std::uint32_t input_mask=0;
         bool fixed=false,screen_space=false;
         FixedTransform fixed_key{};
         std::uint32_t constant_first=0,constant_count=192;
@@ -648,17 +653,29 @@ struct Renderer::Impl {
     std::vector<std::uint32_t> converted;
     std::string adapter;
     std::uint32_t width, height, resolution_scale;
-    static constexpr std::size_t target_limit=1024ULL*1024*1024;
+    std::size_t target_limit=1024ULL*1024*1024;
     std::size_t target_size(unsigned w,unsigned h) const {return std::size_t(w)*h*resolution_scale*resolution_scale*(samples>1?8*samples+8:12);}
     std::size_t target_usage() const {
-        auto bytes=target_bytes+(antialiasing?antialiasing->bytes():0)+(layers?layers->bytes():0)+(interpolation?interpolation->bytes():0);
+        auto bytes=target_bytes+(antialiasing?antialiasing->bytes():0)+(layers?layers->bytes():0)+(ambient_occlusion?ambient_occlusion->bytes():0);
         for(const auto& [id,target]:targets) if(target.responsive) bytes+=std::size_t(target.width)*target.height*resolution_scale*resolution_scale;
         return bytes;
     }
-    void reset_interpolation() {
-        unbind_textures();ID3D11Buffer* constants[3]{};
-        context->CSSetConstantBuffers(0,2,constants);context->PSSetConstantBuffers(0,3,constants);
-        interpolation.reset();layers.reset();layer_scene=false;layer_target=UINT32_MAX;motion_camera={};
+    void reset_layers() {
+        unbind_textures();layers.reset();layer_scene=false;layer_target=UINT32_MAX;motion_camera={};ao_scene_only=ao_scene_depth=false;
+    }
+    std::unique_ptr<FrameLayers> make_layers(bool readable=false) {
+        const auto& main=targets.at(0);
+        auto result=std::make_unique<FrameLayers>(device.Get(),context.Get(),main.width*resolution_scale,main.height*resolution_scale,samples,stats.shader_compilations,readable);
+        if(result->bytes()>target_limit-target_usage()) throw std::runtime_error("Presentation layers exceed the render-target budget.");
+        for(unsigned i=0;i<layer_combiners.size();++i) if(!layer_combiners[i]) {
+            const auto pixel=shader(ShaderKind(unsigned(ShaderKind::layer_combiner0)+i));
+            checked(device->CreatePixelShader(pixel.data(),pixel.size(),nullptr,&layer_combiners[i]),"UI layer combiner shader");
+        }
+        for(unsigned i=0;i<layer_simple.size();++i) if(!layer_simple[i]) {
+            const auto pixel=shader(ShaderKind(unsigned(ShaderKind::layer_color)+i));
+            checked(device->CreatePixelShader(pixel.data(),pixel.size(),nullptr,&layer_simple[i]),"UI layer simple shader");
+        }
+        return result;
     }
     Float4 program_viewport(const ProgramView& view,bool edge_aligned=false) const {
         // Guest screen coordinates already include a half-pixel origin. Scale
@@ -780,6 +797,14 @@ struct Renderer::Impl {
         gpu.As(&memory_adapter);
         DXGI_ADAPTER_DESC description{};
         checked(gpu->GetDesc(&description), "Adapter description");
+        if(memory_adapter) {
+            // Native-resolution motion and layer histories grow with the image.
+            // Bound them by the adapter's actual budget, with headroom for
+            // textures and driver storage, rather than rejecting a viable scale.
+            DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
+            if(SUCCEEDED(memory_adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_LOCAL,&memory)))
+                target_limit=std::clamp<std::size_t>(memory.Budget/4*3,1024ULL*1024*1024,2048ULL*1024*1024);
+        }
         adapter = utf8(description.Description);
         if (debug) checked(device.As(&info), "D3D11 debug queue");
         resize(w,h);
@@ -934,6 +959,15 @@ struct Renderer::Impl {
         std::array<ID3D11ShaderResourceView*,20> empty{};
         context->PSSetShaderResources(0,static_cast<UINT>(empty.size()),empty.data());
     }
+    void swap_main_color(std::uint32_t id) {
+        unbind_textures();context->OMSetRenderTargets(0,nullptr,nullptr);
+        auto& scene=targets.at(id);auto& main=targets.at(0);
+        std::swap(scene.color,main.color);std::swap(scene.image,main.image);
+        std::swap(scene.staging,main.staging);std::swap(scene.color_view,main.color_view);
+        std::swap(scene.texture_view,main.texture_view);std::swap(scene.multisample_view,main.multisample_view);
+        std::swap(scene.dirty,main.dirty);std::swap(scene.uniform_alpha,main.uniform_alpha);
+        textures[id].view=scene.texture_view;
+    }
     void select_target(std::uint32_t id) {
         const auto found=targets.find(id);
         if(found==targets.end()) throw std::runtime_error("Render target was not created");
@@ -953,8 +987,9 @@ struct Renderer::Impl {
         const auto required=target_size(w,h);
         const auto prior=target?target_size(width,height):0;
         const auto aa=antialiasing_quality && antialiasing_quality<=3?required/3:0;
-        if(required+aa>target_limit-(target_bytes-prior)) throw std::runtime_error("Render targets exceed 1 GiB");
+        if(required+aa>target_limit-(target_bytes-prior)) throw std::runtime_error("Render targets exceed the adapter budget");
         auto output=make_target(w,h);
+        feedback_target=0;
         targets.insert_or_assign(0,std::move(output));target_bytes=target_bytes-prior+required;
         select_target(0);ended=false;
     }
@@ -971,28 +1006,29 @@ void Renderer::reset(unsigned scale) {
     r.resolution_scale=scale;
     Impl::FrameTarget main;
     try {
-        if(r.target_size(width,height)>Impl::target_limit) throw std::runtime_error("Render targets exceed 1 GiB; reduce resolution or MSAA.");
+        if(r.target_size(width,height)>r.target_limit) throw std::runtime_error("Render targets exceed the adapter budget; reduce resolution or MSAA.");
         main=r.make_target(width,height);
     } catch(...) {r.resolution_scale=previous;throw;}
-    r.reset_interpolation();r.antialiasing.reset();r.upscaler.reset();r.upscale_method=UpscaleMethod::off;
+    r.reset_layers();r.antialiasing.reset();r.ambient_occlusion.reset();r.upscaler.reset();r.upscale_method=UpscaleMethod::off;
     r.upscaled=r.camera_valid=false;r.camera_reset=true;r.camera_identifier=0;r.upscale_time={};
     r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
     r.targets.clear();r.textures.resize(1);r.free_textures.clear();r.texture_bytes=0;
-    r.presentation_target=0;
+    r.presentation_target=r.feedback_target=0;
     r.targets.emplace(0,std::move(main));r.target_bytes=r.target_size(width,height);r.select_target(0);r.ended=false;
     const auto compilations=r.stats.shader_compilations;r.stats={};r.stats.shader_compilations=compilations;
     r.vertex_cursor=r.index_cursor=0;r.factors_valid=r.program_valid=false;
     r.factor_cursor=r.program_cursor=r.factor_offset=r.program_offset=0;
     enhancements(r.antialiasing_quality,r.anisotropy);
+    if(r.ao_quality) ambient_occlusion(r.ao_quality,r.ao_strength);
 }
 void Renderer::resize(std::uint32_t width, std::uint32_t height) {
     auto& r=*impl_;const auto& main=r.targets.at(0);
-    const bool changed=main.width!=width || main.height!=height,interpolate=bool(r.interpolation);
+    const bool changed=main.width!=width || main.height!=height;
     r.resize(width,height);
     if(changed) {
         if(r.upscale_method!=UpscaleMethod::off) configure_upscaling(r.upscale_method);
         else if(r.antialiasing_quality) enhancements(r.antialiasing_quality,r.anisotropy);
-        else if(interpolate) {r.reset_interpolation();interpolation(true);}
+        if(r.ao_quality) ambient_occlusion(r.ao_quality,r.ao_strength);
     }
 }
 std::uint32_t Renderer::create_target(std::uint32_t width,std::uint32_t height,SurfaceColor color,SurfaceDepth depth) {
@@ -1002,7 +1038,7 @@ std::uint32_t Renderer::create_target(std::uint32_t width,std::uint32_t height,S
     const auto required=r.target_size(width,height);
     const bool temporal=r.upscaler && width==r.targets.at(0).width && height==r.targets.at(0).height;
     const auto mask_bytes=temporal?std::size_t(width)*height*r.resolution_scale*r.resolution_scale:0;
-    if(!r.texture_capacity() || required+mask_bytes>Impl::target_limit-r.target_usage())
+    if(!r.texture_capacity() || required+mask_bytes>r.target_limit-r.target_usage())
         throw std::runtime_error("Render target resource limit reached");
     auto output=r.make_target(width,height,color,depth);
     if(temporal) r.make_responsive(output);
@@ -1024,7 +1060,7 @@ void Renderer::grow_target(std::uint32_t target,std::uint32_t width,std::uint32_
     if(width<prior.width || height<prior.height) throw std::runtime_error("Target growth cannot shrink either dimension");
     if(width==prior.width && height==prior.height) return;
     const auto previous=r.target_size(prior.width,prior.height),required=r.target_size(width,height);
-    if(required>Impl::target_limit-(r.target_usage()-previous)) throw std::runtime_error("Render targets exceed 1 GiB");
+    if(required>r.target_limit-(r.target_usage()-previous)) throw std::runtime_error("Render targets exceed the adapter budget");
     auto output=r.make_target(width,height,prior.color_format,prior.depth_format);
     if(r.upscaler && width==r.targets.at(0).width && height==r.targets.at(0).height) {r.make_responsive(output);r.camera_reset=true;}
     r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
@@ -1119,8 +1155,9 @@ void Renderer::copy_to_main() {
     const auto width=r.width,height=r.height;
     const auto& main=r.targets.at(0);
     if(main.width!=width || main.height!=height) throw std::runtime_error("Presentation target dimensions differ");
+    r.feedback_target=0;
     r.presentation_target=identifier;
-    if(r.layers && r.layer_target!=identifier) {r.layers->invalidate();r.layer_scene=false;}
+    if(r.layers && r.layer_target!=identifier) {r.layers->invalidate();r.layer_scene=false;r.ao_scene_depth=false;}
     r.select_target(0);
     if(format==SurfaceColor::rgb565) {
         RenderState state;state.texture_modes[0]=1;state.textures[0]=identifier;state.final_inputs={0x00000008,0x00001800};
@@ -1136,6 +1173,28 @@ void Renderer::copy_to_main() {
     r.targets.at(0).dirty=true;
     if(r.antialiasing) r.antialiasing->invalidate();
     r.ended=true;
+}
+void Renderer::begin_overlay() {
+    auto& r=*impl_;const auto id=r.current_target;
+    if(r.recording || !id || r.targets.at(id).color_format!=SurfaceColor::rgba8)
+        throw std::runtime_error("Begin overlays on an ended RGBA scene target");
+    // Make the existing presentation copy before the HUD. Draw the HUD into
+    // that copy, retaining the scene's depth, stencil and responsive mask.
+    copy_to_main();r.swap_main_color(id);r.select_target(id);
+}
+void Renderer::end_overlay() {
+    auto& r=*impl_;const auto id=r.current_target;
+    if(r.recording || !id || id!=r.presentation_target)
+        throw std::runtime_error("End overlays on their original scene target");
+    // The original surface becomes clean history; main receives the complete
+    // frame. Swapping handles costs no GPU pass, copy or allocation.
+    r.swap_main_color(id);r.select_target(0);r.feedback_target=id;r.ended=true;
+}
+void Renderer::restore_feedback() {
+    auto& r=*impl_;
+    if(!r.feedback_target) return;
+    if(r.recording) throw std::runtime_error("Restore displayed feedback outside frame submission");
+    r.swap_main_color(r.feedback_target);r.feedback_target=0;r.select_target(r.current_target);
 }
 ID3D11Device* Renderer::native_device() const {return impl_->device.Get();}
 ID3D11DeviceContext* Renderer::native_context() const {return impl_->context.Get();}
@@ -1204,7 +1263,7 @@ void Renderer::configure_upscaling(UpscaleMethod method) {
     auto& r=*impl_;
     if(r.recording) throw std::runtime_error("Configure upscaling outside frame submission.");
     if(!supports_upscaling(method)) throw std::runtime_error("This upscaling technique is unavailable on your graphics device.");
-    const bool interpolate=bool(r.interpolation);r.reset_interpolation();
+    r.reset_layers();
     r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
     r.upscaler.reset();r.upscale_method=UpscaleMethod::off;r.upscaled=false;
     auto& main=r.targets.at(0);
@@ -1217,7 +1276,7 @@ void Renderer::configure_upscaling(UpscaleMethod method) {
             main.width*r.upscale_output_scale,main.height*r.upscale_output_scale);
         next->prepare_frames(r.stats.shader_compilations);
         for(auto& [id,target]:r.targets) if(target.width==main.width && target.height==main.height) r.make_responsive(target);
-        if(r.target_usage()>Impl::target_limit) throw std::runtime_error("Temporal masks exceed the render-target budget.");
+        if(r.target_usage()>r.target_limit) throw std::runtime_error("Temporal masks exceed the render-target budget.");
         if(!r.temporal_constants) {
             D3D11_BUFFER_DESC buffer{32,D3D11_USAGE_DYNAMIC,D3D11_BIND_CONSTANT_BUFFER,D3D11_CPU_ACCESS_WRITE,0,0};
             checked(r.device->CreateBuffer(&buffer,nullptr,&r.temporal_constants),"Temporal draw constants");
@@ -1244,17 +1303,19 @@ void Renderer::configure_upscaling(UpscaleMethod method) {
         r.temporal_constants.Reset();r.jitter_vertex.Reset();
         for(auto& shader:r.responsive_combiners) shader.Reset();
         for(auto& shader:r.responsive_simple) shader.Reset();
-        r.select_target(0);if(interpolate) interpolation(true);throw;
+        r.select_target(0);throw;
     }
-    r.select_target(0);if(interpolate) interpolation(true);
+    r.select_target(0);if(r.ambient_occlusion) r.layers=r.make_layers(true);
 }
-void Renderer::camera(std::uint32_t identifier,float near_plane,float far_plane,float vertical_fov,const MotionCamera* motion) {
-    auto& r=*impl_;if(!r.upscaler && !r.interpolation) return;
-    r.motion_camera={};
+void Renderer::camera(std::uint32_t identifier,float near_plane,float far_plane,float vertical_fov,const MotionCamera* motion,float aspect) {
+    auto& r=*impl_;if(!r.upscaler && !r.ambient_occlusion) return;
+    r.motion_camera={};r.camera_valid=false;
     if(!(near_plane>0) || !(far_plane>near_plane) || !std::isfinite(far_plane) || !(vertical_fov>0 && vertical_fov<3.141593f)) return;
     r.camera_reset|=r.camera_identifier!=identifier;
     r.camera_identifier=identifier;r.camera_valid=true;
     r.motion_camera=motion?*motion:MotionCamera{};
+    if(!motion) {r.motion_camera.identifier=identifier;r.motion_camera.near_plane=near_plane;r.motion_camera.far_plane=far_plane;r.motion_camera.projection=1;}
+    const auto& main=r.targets.at(0);r.camera_aspect=aspect>0 && std::isfinite(aspect)?aspect:r.widescreen?16.0f/9:float(main.width)/main.height;
     r.upscale_frame.camera_near=near_plane;r.upscale_frame.camera_far=far_plane;r.upscale_frame.vertical_fov=vertical_fov;
 }
 void Renderer::enhancements(unsigned quality,unsigned anisotropy) {
@@ -1268,7 +1329,7 @@ void Renderer::enhancements(unsigned quality,unsigned anisotropy) {
         if(r.targets.size()!=1 || r.texture_bytes) throw std::runtime_error("Change MSAA between game sessions.");
         const auto previous_samples=r.samples,previous_quality=r.antialiasing_quality,previous_anisotropy=r.anisotropy;
         const auto previous_target=r.targets.at(0).color.Get();
-        const bool interpolate=bool(r.interpolation);
+
         r.samples=samples;r.antialiasing_quality=quality;r.anisotropy=anisotropy;
         try {reset(r.resolution_scale);} catch(...) {
             if(r.targets.at(0).color.Get()==previous_target) {
@@ -1277,61 +1338,57 @@ void Renderer::enhancements(unsigned quality,unsigned anisotropy) {
             }
             throw;
         }
-        if(interpolate) interpolation(true);return;
+        return;
     }
     std::unique_ptr<FrameAntialiasing> next;
     if(quality && quality<=3) {
         const auto& main=r.targets.at(0);
         const auto bytes=std::size_t(main.width)*main.height*r.resolution_scale*r.resolution_scale*4;
-        if(bytes>Impl::target_limit-r.target_bytes) throw std::runtime_error("Antialiasing exceeds the render-target budget.");
+        if(bytes>r.target_limit-r.target_bytes) throw std::runtime_error("Antialiasing exceeds the render-target budget.");
         next=std::make_unique<FrameAntialiasing>(r.device.Get(),r.context.Get(),main.width*r.resolution_scale,main.height*r.resolution_scale,quality,r.stats.shader_compilations);
         r.count(PerfMetric::target_creations);
     }
     if(samples==1) r.multisample_copy.reset();
     r.unbind_textures();r.antialiasing=std::move(next);r.antialiasing_quality=quality;r.anisotropy=anisotropy;
-    const bool interpolate=bool(r.interpolation);
-    r.reset_interpolation();if(interpolate) interpolation(true);
+
+    r.reset_layers();if(r.ambient_occlusion) r.layers=r.make_layers(true);
+}
+void Renderer::ambient_occlusion(unsigned quality,float strength) {
+    auto& r=*impl_;
+    if(r.recording || quality>3 || !std::isfinite(strength) || strength<0 || strength>1)
+        throw std::runtime_error("Configure valid ambient occlusion outside submission");
+    r.reset_layers();r.ambient_occlusion.reset();
+    r.ao_quality=quality;r.ao_strength=strength;
+    if(quality) {
+        const auto& main=r.targets.at(0);
+        const auto bytes=std::size_t(main.width)*main.height*r.resolution_scale*r.resolution_scale*20;
+        if(bytes>r.target_limit-r.target_usage()) throw std::runtime_error("Ambient occlusion exceeds the render-target budget");
+        r.ambient_occlusion=std::make_unique<FrameAmbientOcclusion>(r.device.Get(),r.context.Get(),main.width*r.resolution_scale,main.height*r.resolution_scale,quality,r.samples,r.stats.shader_compilations);
+    }
+    if(r.ambient_occlusion) r.layers=r.make_layers(true);
 }
 void Renderer::visibility(const Visibility* visibility) noexcept {impl_->visibility=visibility;}
-void Renderer::interpolation(bool enabled) {
-    auto& r=*impl_;
-    if(r.recording) throw std::runtime_error("Configure interpolation outside frame submission");
-    if(!enabled) {r.reset_interpolation();return;}
-    if(!r.interpolation) {
-        D3D11_TEXTURE2D_DESC image{};(r.upscaler?r.upscaler->image():r.targets.at(0).image.Get())->GetDesc(&image);
-        const bool separate=!r.upscaler && !r.antialiasing;
-        std::unique_ptr<FrameLayers> layers;
-        if(separate) {
-            layers=std::make_unique<FrameLayers>(r.device.Get(),r.context.Get(),image.Width,image.Height,r.samples,r.stats.shader_compilations);
-            if(layers->bytes()>Impl::target_limit-r.target_bytes) throw std::runtime_error("Presentation layers exceed the render-target budget.");
-            for(unsigned i=0;i<r.layer_combiners.size();++i) if(!r.layer_combiners[i]) {
-                const auto pixel=r.shader(ShaderKind(unsigned(ShaderKind::layer_combiner0)+i));
-                checked(r.device->CreatePixelShader(pixel.data(),pixel.size(),nullptr,&r.layer_combiners[i]),"UI layer combiner shader");
-            }
-            for(unsigned i=0;i<r.layer_simple.size();++i) if(!r.layer_simple[i]) {
-                const auto pixel=r.shader(ShaderKind(unsigned(ShaderKind::layer_color)+i));
-                checked(r.device->CreatePixelShader(pixel.data(),pixel.size(),nullptr,&r.layer_simple[i]),"UI layer simple shader");
-            }
-        }
-        auto interpolation=std::make_unique<FrameInterpolation>(r.device.Get(),r.context.Get(),image.Width,image.Height,r.stats.shader_compilations,true,separate,r.samples,r.capture_motion);
-        if(interpolation->bytes()+(layers?layers->bytes():0)>Impl::target_limit-r.target_usage())
-            throw std::runtime_error("Interpolation exceeds the render-target budget.");
-        r.layers=std::move(layers);r.layer_scene=false;r.interpolation=std::move(interpolation);
-    }
-}
-void Renderer::motion_capture(bool enabled) {
-    auto& r=*impl_;if(r.recording) throw std::runtime_error("Configure motion capture outside frame submission");
-    if(r.capture_motion==enabled) return;
-    const bool interpolate=bool(r.interpolation);r.reset_interpolation();r.capture_motion=enabled;
-    if(interpolate) interpolation(true);
-}
-bool Renderer::needs_motion_camera() const {return impl_->capture_motion && bool(impl_->interpolation);}
+bool Renderer::needs_motion_camera() const {return bool(impl_->ambient_occlusion);}
 void Renderer::publish_frame(bool reset) {
     auto& r=*impl_;
     PerfScope timing(r.profile,PerfPhase::publish);
     if(r.recording || !r.ended) throw std::runtime_error("Publish a completed game frame");
     {GpuSpan gpu(r.gpu_meter.get(),2);
         auto& main=r.targets.at(0);r.resolve(main);
+        ID3D11Texture2D* image=main.image.Get();ID3D11ShaderResourceView* view=main.texture_view.Get();
+        if(r.ambient_occlusion) {
+            auto& ao=*r.ambient_occlusion;ao.invalidate();
+            const bool layered=r.layers && r.layers->valid();
+            if(r.ao_scene_depth && r.camera_valid && r.motion_camera.projection==1 && r.layer_target==r.presentation_target && (layered || r.ao_scene_only)) {
+                r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
+                const auto& source=r.targets.at(r.presentation_target);
+                if(!layered) ao.capture_depth(source.depth_texture.Get());
+                const auto* images=layered?&r.layers->resolved():nullptr;
+                const auto tan_y=std::tan(r.upscale_frame.vertical_fov*0.5f);
+                ao.publish(images?images->views[0].Get():view,images,r.upscale_frame.camera_near,r.upscale_frame.camera_far,tan_y*r.camera_aspect,tan_y,r.ao_strength);
+                image=ao.image();view=ao.view();r.select_target(r.current_target);
+            }
+        }
         if(r.upscaler && r.camera_valid) {
             const auto now=std::chrono::steady_clock::now();
             r.upscale_frame.elapsed_ms=r.upscale_time.time_since_epoch().count()?std::chrono::duration<float,std::milli>(now-r.upscale_time).count():1000.0f/60;
@@ -1340,23 +1397,16 @@ void Renderer::publish_frame(bool reset) {
             r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
             const auto found=r.targets.find(r.presentation_target);
             const auto& source=found==r.targets.end()?main:found->second;
-            r.upscaler->publish_frame(main.image.Get(),source.depth_texture.Get(),source.responsive_view.Get(),r.upscale_frame);
+            const auto responsive=source.responsive_view.Get();
+            r.upscaler->publish_frame(image,source.depth_texture.Get(),responsive,r.upscale_frame);
             r.upscaled=true;r.camera_reset=false;r.upscale_time=now;
             const auto halton=[](unsigned index,unsigned base) {float result=0,factor=1;for(;index;index/=base){factor/=base;result+=factor*(index%base);}return result-0.5f;};
             const auto phase=unsigned((r.stats.published_frames+1)%32)+1;
             r.jitter={halton(phase,2),halton(phase,3)};r.applied_jitter={};
             const float zero[4]={};r.context->ClearRenderTargetView(source.responsive_target.Get(),zero);r.select_target(r.current_target);
         }
-        if(r.antialiasing) {r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);r.antialiasing->publish(main.texture_view.Get());r.select_target(r.current_target);}
-        if(r.interpolation) {
-            if(r.layers && r.layers->valid()) ++r.stats.layered_frames;
-            if(!r.upscaler || r.upscaled) {
-                const auto found=r.targets.find(r.presentation_target);
-                auto* depth=found==r.targets.end()?nullptr:found->second.depth_texture.Get();
-                r.interpolation->publish(r.upscaled?r.upscaler->image():r.antialiasing?r.antialiasing->image():main.image.Get(),reset,r.layers.get(),depth,&r.motion_camera);
-            }
-        }
-        r.layer_scene=false;r.layer_target=UINT32_MAX;
+        if(r.antialiasing) {r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);r.antialiasing->publish(view);r.select_target(r.current_target);}
+        if(r.layers) r.layers->invalidate();r.layer_scene=false;r.layer_target=UINT32_MAX;r.ao_scene_only=r.ao_scene_depth=false;
     }
     ++r.stats.published_frames;
     if(r.gpu_meter) r.gpu_meter->boundary(r.stats.published_frames+1);
@@ -1370,11 +1420,11 @@ bool Renderer::wait_frame(unsigned timeout_ms) {
     if(result!=WAIT_OBJECT_0) throw std::runtime_error("Window frame availability wait failed");
     r.frame_acquired=true;return true;
 }
-bool Renderer::display(float phase,bool wait) {
+bool Renderer::display(bool wait) {
     auto& r=*impl_;
     PerfScope timing(r.profile,PerfPhase::display);
-    if(!r.window || !r.ended || r.recording || !std::isfinite(phase) || phase<0 || phase>1)
-        throw std::runtime_error("Display a completed main image with a phase between 0 and 1");
+    if(!r.window || !r.ended || r.recording)
+        throw std::runtime_error("Display a completed main image");
     RECT rectangle{};if(!GetClientRect(r.window,&rectangle)) throw std::runtime_error("Cannot read window dimensions");
     const auto width=static_cast<std::uint32_t>(rectangle.right),height=static_cast<std::uint32_t>(rectangle.bottom);
     if(!width || !height) return false;
@@ -1401,14 +1451,9 @@ bool Renderer::display(float phase,bool wait) {
     r.context->OMSetBlendState(nullptr,nullptr,UINT_MAX);
     r.context->IASetInputLayout(nullptr);r.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     r.context->VSSetShader(r.display_vs.Get(),nullptr,0);r.context->PSSetShader(r.display_ps.Get(),nullptr,0);
-    auto texture=r.interpolation && r.interpolation->published()?r.interpolation->current():
-        r.upscaled?r.upscaler->view():r.antialiasing && r.antialiasing->ready()?r.antialiasing->view():main.texture_view.Get();
+    auto texture=r.upscaled?r.upscaler->view():r.antialiasing && r.antialiasing->ready()?r.antialiasing->view():r.ambient_occlusion && r.ambient_occlusion->ready()?r.ambient_occlusion->view():main.texture_view.Get();
     auto sampler=r.display_sampler.Get();
-    if(r.interpolation && r.interpolation->ready() && phase<1) {
-        if(phase==0) texture=r.interpolation->previous();
-        else {r.interpolation->bind(phase);++r.stats.interpolated_frames;}
-    }
-    if(phase==0 || phase==1 || !r.interpolation || !r.interpolation->ready()) r.context->PSSetShaderResources(0,1,&texture);
+    r.context->PSSetShaderResources(0,1,&texture);
     r.context->PSSetSamplers(0,1,&sampler);r.context->Draw(3,0);
     r.unbind_textures();r.displaying=true;return true;
 }
@@ -1551,6 +1596,7 @@ void Renderer::release(std::uint32_t resource) {
     // already submitted alive without a CPU wait for the GPU.
     r.unbind_textures();
     if(const auto found=r.targets.find(resource);found!=r.targets.end()) {
+        if(r.feedback_target==resource) r.feedback_target=0;
         if(r.current_target==resource) r.select_target(0);
         r.target_bytes-=r.target_size(found->second.width,found->second.height);r.targets.erase(found);
     }
@@ -1619,6 +1665,12 @@ Renderer::PreparedState Renderer::prepare(const RenderState& state) {
         ((state.color_mask & 1) ? D3D11_COLOR_WRITE_ENABLE_BLUE : 0) |
         ((state.color_mask & 0x1000000) ? D3D11_COLOR_WRITE_ENABLE_ALPHA : 0);
     checked(r.device->CreateBlendState(&blend, &pipeline.blend), "Blend state");
+    if(r.upscaler) {
+        // HUD bases all need the game's colour blend; slot 1 of the ordinary
+        // upscaling pipeline instead writes a single-channel responsive mask.
+        blend.IndependentBlendEnable=FALSE;
+        checked(r.device->CreateBlendState(&blend,&pipeline.layer_blend),"UI layer blend state");
+    }
     D3D11_DEPTH_STENCIL_DESC depth{};
     depth.DepthEnable = state.depth_test; depth.DepthWriteMask = state.depth_write ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
     depth.DepthFunc = comparison(state.depth_function);
@@ -1663,7 +1715,7 @@ std::uint32_t Renderer::prepare_program(const VertexProgram& program,bool launch
     ShaderBinary metadata;
     const auto code=r.shader(launch?ShaderKind::launch:ShaderKind::vertex,&key,&metadata);
     Impl::Program prepared{key,launch};
-    prepared.constant_first=metadata.constant_first;prepared.constant_count=metadata.constant_count;
+    prepared.input_mask=metadata.input_mask;prepared.constant_first=metadata.constant_first;prepared.constant_count=metadata.constant_count;
     prepared.upload_first=metadata.constant_first;prepared.upload_count=metadata.constant_count;
     const auto screen_programs=screen_vertex_programs();
     prepared.screen_space=!launch && std::ranges::find(screen_programs,key)!=screen_programs.end();
@@ -1714,7 +1766,7 @@ std::uint32_t Renderer::prepare_fixed(const FixedTransform& transform) {
     if(r.programs.size()>=1024) throw std::runtime_error("Vertex program cache limit reached");
     Impl::Program prepared{};prepared.fixed=true;prepared.fixed_key=transform;
     const auto metadata=shader_binary(ShaderKind(unsigned(ShaderKind::fixed0)+transform.skin));
-    prepared.constant_first=metadata.constant_first;prepared.constant_count=metadata.constant_count;
+    prepared.input_mask=metadata.input_mask;prepared.constant_first=metadata.constant_first;prepared.constant_count=metadata.constant_count;
     prepared.upload_first=metadata.constant_first;prepared.upload_count=metadata.constant_count;
     prepared.signature=r.fixed_signatures[transform.skin];prepared.vertex=r.fixed_vertices[transform.skin];prepared.layout=r.fixed_layouts[transform.skin];
     if(r.upscaler) {
@@ -1780,8 +1832,9 @@ void Renderer::clear(std::uint32_t argb, float depth) {
     auto& r = *impl_;
     PerfScope timing(r.profile,PerfPhase::render);GpuSpan gpu(r.gpu_meter.get(),0);
     if (!std::isfinite(depth) || depth < 0 || depth > 1) throw std::runtime_error("Invalid clear depth");
+    if(!r.current_target) r.feedback_target=0;
     if(!r.current_target && r.antialiasing) r.antialiasing->invalidate();
-    if(r.layers && r.layer_target==r.current_target) {r.layers->invalidate();r.layer_scene=false;}
+    if(r.layers && r.layer_target==r.current_target) {r.layers->invalidate();r.layer_scene=false;r.ao_scene_depth=false;}
     const auto rgba = color(argb);
     r.targets.at(r.current_target).uniform_alpha=rgba[3];
     if(r.samples>1) r.targets.at(r.current_target).dirty=true;
@@ -1795,8 +1848,9 @@ void Renderer::clear_buffers(std::uint32_t flags,std::uint32_t argb,float depth,
     auto& r=*impl_;
     PerfScope timing(r.profile,PerfPhase::render);GpuSpan gpu(r.gpu_meter.get(),0);
     if(flags&~0xF3U) throw std::runtime_error("Invalid clear channel flags");
+    if((flags&0xF0U) && !r.current_target) r.feedback_target=0;
     if((flags&0xF0U) && !r.current_target && r.antialiasing) r.antialiasing->invalidate();
-    if((flags&0xF0U) && r.layers && r.layer_target==r.current_target) {r.layers->invalidate();r.layer_scene=false;}
+    if((flags&0xF0U) && r.layers && r.layer_target==r.current_target) {r.layers->invalidate();r.layer_scene=false;r.ao_scene_depth=false;}
     if(r.samples>1 && (flags&0xF0U)) r.targets.at(r.current_target).dirty=true;
     if(r.targets.at(r.current_target).depth_format==SurfaceDepth::z16) flags&=~2U;
     if(!std::isfinite(depth) || depth<0 || depth>1) throw std::runtime_error("Invalid clear depth");
@@ -1830,14 +1884,16 @@ void Renderer::clear_buffers(std::uint32_t flags,std::uint32_t argb,float depth,
         auto buffer=r.clear_constants.Get();r.context->VSSetConstantBuffers(0,1,&buffer);r.context->PSSetConstantBuffers(0,1,&buffer);
         r.context->Draw(3,0);return;
     }
-    if(flags&0xF0U) {const auto rgba=color(argb);r.context->ClearRenderTargetView(r.rtv.Get(),rgba.data());}
+    if(flags&0xF0U) {
+        const auto rgba=color(argb);r.context->ClearRenderTargetView(r.rtv.Get(),rgba.data());
+    }
     const auto mask=((flags&1)?D3D11_CLEAR_DEPTH:0)|((flags&2)?D3D11_CLEAR_STENCIL:0);
     if(mask) r.context->ClearDepthStencilView(r.dsv.Get(),mask,depth,stencil);
 }
 void Renderer::begin(std::uint32_t argb, float depth, bool clear_target) {
     auto& r = *impl_;
     if (r.recording) throw std::runtime_error("Frame already begun");
-    if(!r.current_target) r.presentation_target=0;
+    if(!r.current_target) r.presentation_target=r.feedback_target=0;
     if(!r.current_target && r.antialiasing) r.antialiasing->invalidate();
     if(clear_target) clear(argb, depth);
     // Clear, presentation and native-context users may change bindings between
@@ -2165,10 +2221,6 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
     }
     const UINT stride = static_cast<UINT>(program?sizeof(ProgramVertex):sizeof(Vertex));
     auto vertex_buffer = r.vertices.Get(); auto constant_buffer = r.factor_buffer.Get();
-    if(streams) {
-        std::array<ID3D11Buffer*,17> buffers{};buffers.fill(vertex_buffer);
-        r.context->IASetVertexBuffers(0,17,buffers.data(),stream_strides.data(),stream_offsets.data());
-    } else r.context->IASetVertexBuffers(0, 1, &vertex_buffer, &stride, &vertex_offset);
     auto& bound=r.bound;
     const auto input_layout=streams?streams->layout.native.Get():program?program->layout.Get():r.layout.Get();
     const auto simple=simple_combiner(state);
@@ -2176,8 +2228,10 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
     const auto& main=r.targets.at(0);
     if(r.layers && r.width==main.width && r.height==main.height &&
        r.targets.at(r.current_target).color_format==SurfaceColor::rgba8 && state.color_mask) {
-        if(r.layer_target!=r.current_target) {r.layers->invalidate();r.layer_scene=false;r.layer_target=r.current_target;}
+        if(r.layer_target!=r.current_target) {r.layers->invalidate();r.layer_scene=false;r.ao_scene_depth=false;r.layer_target=r.current_target;}
         const bool screen=program && program->screen_space;
+        r.ao_scene_only=!screen && state.depth_test;
+        if(r.ao_scene_only && state.depth_write) r.ao_scene_depth=true;
         // Menu/video backgrounds can be opaque screen-space copies without
         // depth. Keep those copies in the scene before the following UI suffix.
         const bool scene=(!screen && state.depth_test) || (screen && !state.blend && !state.alpha_test &&
@@ -2187,28 +2241,44 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
             r.layer_scene=true;
         // Positive affine blends remain separable through RGB clamping when
         // both the transform and its clamped endpoint bounds are retained.
-        // Additive destination-alpha blends require unchanged destination alpha.
+        // Add/subtract with destination alpha remains affine while alpha is
+        // unchanged. Menus use reverse subtraction for their shadow overlay.
+        const bool offset=!(state.color_mask&0x01000000U) && state.blend_destination==1 &&
+            (state.blend_source==1 || (state.blend_source>=0x302 && state.blend_source<=0x305));
         const bool affine=!state.blend || (state.blend_equation==0x8006 &&
             ((state.blend_source==0x302 && state.blend_destination==0x303) ||
              (state.blend_source==0x304 && state.blend_destination==0x305) ||
              (state.blend_source==0x305 && state.blend_destination==0x304) ||
              (state.blend_source==1 && state.blend_destination==0) ||
-             (!(state.color_mask&0x01000000U) && state.blend_destination==1 &&
-                 (state.blend_source==1 || (state.blend_source>=0x302 && state.blend_source<=0x305))) ||
+             offset ||
              (state.blend_source==0 && (state.blend_destination<=1 ||
-                 (state.blend_destination>=0x300 && state.blend_destination<=0x303)))));
+                 (state.blend_destination>=0x300 && state.blend_destination<=0x303))))) ||
+            (state.blend_equation==0x800B && offset);
         layered=screen && !scene && affine && r.layer_scene && !(state.depth_test && state.depth_write) && !state.stencil_test;
         if(layered) {if(!r.layers->valid()) {
             const auto& target=r.targets.at(r.current_target);
             r.visibility_scope(false);
-            r.layers->begin(r.target.Get(),r.samples>1?target.multisample_view.Get():target.texture_view.Get(),target.uniform_alpha);bound.valid=false;
+            auto view=r.samples>1?target.multisample_view.Get():target.texture_view.Get();
+            r.layers->begin(r.target.Get(),view,target.uniform_alpha);bound.valid=false;
+            if(r.ambient_occlusion && r.ao_scene_depth) r.ambient_occlusion->capture_depth(target.depth_texture.Get());
         }}
-        else r.layers->invalidate();
+        else {
+            r.layers->invalidate();
+            // Once an unseparated overlay changes colour, its image no longer
+            // matches the scene depth. A later UI suffix cannot restore that.
+            if(!r.ao_scene_only) r.ao_scene_depth=false;
+        }
     }
     if(r.layers && (!bound.valid || bound.layers!=layered)) {
-        auto* target=r.rtv.Get();r.context->OMSetRenderTargets(1,&target,r.dsv.Get());
+        const auto& output=r.targets.at(r.current_target);
+        const std::array<ID3D11RenderTargetView*,2> targets{r.rtv.Get(),output.responsive_target.Get()};
+        r.context->OMSetRenderTargets(output.responsive_target?2:1,targets.data(),r.dsv.Get());
     }
     bound.layers=layered;
+    if(streams) {
+        std::array<ID3D11Buffer*,17> buffers{};buffers.fill(vertex_buffer);
+        r.context->IASetVertexBuffers(0,17,buffers.data(),stream_strides.data(),stream_offsets.data());
+    } else r.context->IASetVertexBuffers(0,1,&vertex_buffer,&stride,&vertex_offset);
     if(!bound.valid || bound.layout!=input_layout) r.context->IASetInputLayout(input_layout);
     if(!bound.valid || bound.topology!=topology) r.context->IASetPrimitiveTopology(topology);
     const bool responsive=bool(r.upscaler) && bool(r.targets.at(r.current_target).responsive_target);
@@ -2233,7 +2303,7 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
     if(!bound.valid || bound.vertex!=vertex) r.context->VSSetShader(vertex,nullptr,0);
     if(!bound.valid || bound.pixel!=pixel) r.context->PSSetShader(pixel,nullptr,0);
     const auto geometry=state.primitive==1?r.point_geometry.Get():nullptr;
-    if(geometry) {
+    if(state.primitive==1) {
         if(state.point_scale && !program) throw std::runtime_error("Point attenuation requires an original vertex transform");
         const Float4 info{1.0f/r.width,1.0f/r.height,float(state.point_sprite),state.point_scale?-1.0f:std::max(1.0f,state.point_size)};
         if(!r.point_info_valid || info!=r.last_point_info) {
@@ -2298,7 +2368,11 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
         for(unsigned i=0;i<FrameLayers::basis_count;++i) targets[i]=r.layers->target(i);
         const auto capture=simple<r.layer_simple.size()?r.layer_simple[simple].Get():r.layer_combiners[state.combiner_control&255].Get();
         r.context->OMSetRenderTargets(unsigned(targets.size()),targets.data(),r.dsv.Get());r.context->PSSetShader(capture,nullptr,0);
-        submit();auto* target=r.rtv.Get();r.context->OMSetRenderTargets(1,&target,r.dsv.Get());r.context->PSSetShader(pixel,nullptr,0);
+        if(pipeline.layer_blend) r.context->OMSetBlendState(pipeline.layer_blend.Get(),nullptr,UINT_MAX);
+        submit();const auto& output=r.targets.at(r.current_target);
+        const std::array<ID3D11RenderTargetView*,2> original_targets{r.rtv.Get(),output.responsive_target.Get()};
+        r.context->OMSetRenderTargets(output.responsive_target?2:1,original_targets.data(),r.dsv.Get());r.context->PSSetShader(pixel,nullptr,0);
+        if(pipeline.layer_blend) r.context->OMSetBlendState(pipeline.blend.Get(),nullptr,UINT_MAX);
     }
     ++r.stats.draws; r.stats.vertices += count;r.count(PerfMetric::draws);r.count(PerfMetric::vertices,count);
     if(r.samples>1 && state.color_mask) r.targets.at(r.current_target).dirty=true;
@@ -2321,10 +2395,12 @@ Image Renderer::read_target(std::uint32_t target) {
 }
 Image Renderer::read_frame() {
     if(impl_->upscaled) {
-        auto& r=*impl_;D3D11_TEXTURE2D_DESC desc{};r.upscaler->image()->GetDesc(&desc);
+        auto& r=*impl_;ComPtr<ID3D11Resource> source;
+        source=r.upscaler->image();
+        ComPtr<ID3D11Texture2D> texture;checked(source.As(&texture),"Published frame image");D3D11_TEXTURE2D_DESC desc{};texture->GetDesc(&desc);
         desc.Usage=D3D11_USAGE_STAGING;desc.BindFlags=desc.MiscFlags=0;desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
         ComPtr<ID3D11Texture2D> staging;checked(r.device->CreateTexture2D(&desc,nullptr,&staging),"Upscaled frame readback");
-        r.context->CopyResource(staging.Get(),r.upscaler->image());
+        r.context->CopyResource(staging.Get(),texture.Get());
         D3D11_MAPPED_SUBRESOURCE mapped{};checked(r.context->Map(staging.Get(),0,D3D11_MAP_READ,0,&mapped),"Upscaled frame map");
         Image image{desc.Width,desc.Height,std::vector<std::byte>(std::size_t(desc.Width)*desc.Height*4)};
         for(unsigned y=0;y<desc.Height;++y) std::memcpy(image.rgba.data()+std::size_t(y)*desc.Width*4,
@@ -2332,42 +2408,8 @@ Image Renderer::read_frame() {
         r.context->Unmap(staging.Get(),0);return image;
     }
     if(impl_->antialiasing && impl_->antialiasing->ready()) return impl_->antialiasing->readback();
+    if(impl_->ambient_occlusion && impl_->ambient_occlusion->ready()) return impl_->ambient_occlusion->readback();
     return read_target(0);
-}
-void Renderer::save_motion_inputs(const std::filesystem::path& prefix) {
-    auto& r=*impl_;if(!r.interpolation || !r.interpolation->ready()) return;
-    auto camera_path=prefix;camera_path+="-camera.json";std::ofstream cameras(camera_path);
-    cameras<<"{\"format\":\"b2-motion-camera-v1\",\"frames\":[";
-    for(unsigned i=0;i<2;++i) {
-        const auto& camera=r.interpolation->camera(i!=0);if(i) cameras<<',';
-        cameras<<std::format("{{\"identifier\":{},\"projection\":{},\"near\":{:.9g},\"far\":{:.9g},\"view\":[",camera.identifier,camera.projection,camera.near_plane,camera.far_plane);
-        for(unsigned j=0;j<camera.view.size();++j) {if(j) cameras<<',';cameras<<std::format("{:.9g}",camera.view[j]);}cameras<<"]}";
-    }
-    cameras<<"]}";cameras.flush();if(!cameras) throw std::runtime_error("Cannot write motion camera capture");
-    constexpr const char* suffixes[]{"-scene-previous.png","-scene-current.png","-depth-previous.f32","-depth-current.f32"};
-    for(unsigned i=0;i<4;++i) {
-        const bool depth=i>=2;auto* view=depth?r.interpolation->depth((i&1)!=0):r.interpolation->scene((i&1)!=0);if(!view) continue;
-        ComPtr<ID3D11Resource> resource;view->GetResource(&resource);ComPtr<ID3D11Texture2D> source;checked(resource.As(&source),"Motion input texture");
-        D3D11_TEXTURE2D_DESC desc{};source->GetDesc(&desc);
-        if(desc.SampleDesc.Count!=1 || desc.MipLevels!=1 || desc.Format!=(depth?DXGI_FORMAT_R32_FLOAT:DXGI_FORMAT_R8G8B8A8_UNORM))
-            throw std::runtime_error("Unsupported motion capture image format");
-        desc.BindFlags=desc.MiscFlags=0;desc.Usage=D3D11_USAGE_STAGING;desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
-        ComPtr<ID3D11Texture2D> staging;checked(r.device->CreateTexture2D(&desc,nullptr,&staging),"Motion input staging");
-        auto path=prefix;path+=suffixes[i];Image image{desc.Width,desc.Height,{}};std::ofstream file;
-        if(depth) {file.open(path,std::ios::binary);if(!file) throw std::runtime_error("Cannot create motion depth capture");}
-        else image.rgba.resize(std::size_t(desc.Width)*desc.Height*4);
-        r.context->CopyResource(staging.Get(),source.Get());D3D11_MAPPED_SUBRESOURCE mapped{};
-        checked(r.context->Map(staging.Get(),0,D3D11_MAP_READ,0,&mapped),"Motion input readback");
-        if(depth) {file.write("B2D1",4);file.write(reinterpret_cast<const char*>(&desc.Width),4);file.write(reinterpret_cast<const char*>(&desc.Height),4);}
-        for(unsigned y=0;y<desc.Height;++y) {
-            const auto* row=static_cast<const std::byte*>(mapped.pData)+y*mapped.RowPitch;
-            if(depth) file.write(reinterpret_cast<const char*>(row),std::streamsize(desc.Width)*4);
-            else std::memcpy(image.rgba.data()+std::size_t(y)*desc.Width*4,row,desc.Width*4);
-        }
-        r.context->Unmap(staging.Get(),0);
-        if(depth) {file.flush();if(!file) throw std::runtime_error("Cannot write motion depth capture");}
-        else save_png(image,path);
-    }
 }
 Image Renderer::readback() {
     auto& r = *impl_;

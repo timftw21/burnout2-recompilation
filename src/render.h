@@ -92,8 +92,7 @@ struct VertexStream { Bytes bytes;std::uint32_t stride; };
 
 struct RenderStats {
     std::uint64_t draws = 0, vertices = 0, shader_compilations = 0, vertex_bytes = 0;
-    std::uint64_t published_frames = 0, interpolated_frames = 0;
-    std::uint64_t layered_frames = 0;
+    std::uint64_t published_frames = 0;
     std::uint64_t reused_vertex_bytes = 0;
     double gpu_ms = 0;
     bool gpu_timing_valid = false;
@@ -140,22 +139,24 @@ public:
     void copy_target(std::uint32_t destination); // GPU copy for later sampling.
     std::uint32_t copy_cubemap(const std::array<std::uint32_t,6>& faces,std::uint32_t destination=0);
     void copy_to_main();
+    void begin_overlay(); // Reuse the presentation copy to keep UI out of scene feedback.
+    void end_overlay();
+    void restore_feedback(); // Other original framebuffer users need the complete displayed image.
     void resize(std::uint32_t width, std::uint32_t height);
     void reset(unsigned resolution_scale); // New session: discard game targets/textures, retain native pipelines.
     void attach_window(void* native_window);
     void widescreen(bool enabled); // Present the game's native anamorphic image at 16:9.
     void enhancements(unsigned antialiasing,unsigned anisotropy); // AA 0=off, 1..3=FXAA, 4..6=MSAA 2/4/8x; AF 0=original or 1/2/4/8/16.
+    void ambient_occlusion(unsigned quality,float strength=0.35f); // 0=off; 1..3=GTAO low/medium/high.
     bool supports_msaa(unsigned samples) const;
     unsigned raster_samples_per_pixel() const; // Host samples representing one original Xbox pixel.
     void upscaling(UpscaleMethod,unsigned output_scale=0);
-    void camera(std::uint32_t identifier,float near_plane,float far_plane,float vertical_fov,const MotionCamera* motion=nullptr);
+    void camera(std::uint32_t identifier,float near_plane,float far_plane,float vertical_fov,const MotionCamera* motion=nullptr,float aspect=0);
     bool supports_upscaling(UpscaleMethod) const;
-    void interpolation(bool enabled); // Allocate history only when explicitly enabled.
-    void motion_capture(bool enabled); // Retain diagnostic depth/camera only for an explicit capture.
     bool needs_motion_camera() const;
     void visibility(const Visibility*) noexcept; // Exclude presentation-only draws from original sample counts.
     void publish_frame(bool reset = false); // Snapshot a completed game frame.
-    bool display(float phase = 1,bool wait = true); // Scale the main image when a window buffer is available.
+    bool display(bool wait = true); // Scale the main image when a window buffer is available.
     bool wait_frame(unsigned timeout_ms); // Acquire one presentation slot, with a bounded wait.
     bool present(bool vsync,bool wait = true);
     void performance(Performance*); // Opt-in, bounded queries; never waits for results.
@@ -187,7 +188,6 @@ public:
     Image read_frame(); // Published presentation image, including optional antialiasing.
     Image read_target(std::uint32_t);
     Image read_display();
-    void save_motion_inputs(const std::filesystem::path& prefix); // Explicit diagnostic capture only.
     RenderStats stats() const;
     std::string adapter() const;
     std::vector<std::string> errors() const;
