@@ -16,7 +16,7 @@ If you're skeptical, I implore you to try the recompilation for yourself. I take
 ## What's new in 1.6
 
 - Reworked high-refresh motion for cars, cameras, menus and HUD animations,
-  with an **Unlimited** refresh-rate option.
+  with an **Unlimited** refresh-rate option. No more shitty interpolation!
 - Corrected timing for handling, opponents, replays, How to Play, loading screens,
   sound effects, spinning scenery, fades and the boost filter.
 - Fixed jittery Time Attack ghosts and car shadows, transparent wheels and
