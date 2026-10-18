@@ -6,7 +6,7 @@ An unofficial Windows version of the original Xbox game, focused on fast gamepla
 and preserving its look and feel.
 
 <i>Still in development: Slowdown, bugs, and crashes are possible. Open an issue if you experience a problem, and
-I'll try to respond in a timely manner.</i>
+I'll try to respond in a timely manner. This is an independent fan project, unaffiliated with the game's owners.</i>
 
 ## AI Disclosure
 
@@ -73,8 +73,8 @@ focused on speed and simplicity. I couldn't bear to keep the slop version public
 
 ## Getting started
 
-You need a 64-bit Windows PC, a graphics card that supports DirectX 11, and your
-own copy of the US Xbox release. Game files are not included.
+You need a 64-bit Windows PC, a graphics card that supports DirectX 11, and <i>your
+own copy of the US Xbox release. Game files are not included</i>.
 
 1. Install [Visual Studio 2026 Community](https://visualstudio.microsoft.com/downloads/)
    with **Desktop development with C++**, **C++ CMake tools for Windows** and the included Windows SDK,
