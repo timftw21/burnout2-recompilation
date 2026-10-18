@@ -196,5 +196,3 @@ provide the visual reference.
 See [third-party notices](THIRD_PARTY_NOTICES.txt) for dependency licenses and
 [research notes](https://github.com/timftw21/burnout2-recompilation/tree/main/research)
 for detailed findings and source links.
-
-<i>This is an independent fan project, unaffiliated with the game's owners.</i>
