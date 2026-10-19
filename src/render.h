@@ -145,7 +145,7 @@ public:
     void resize(std::uint32_t width, std::uint32_t height);
     void reset(unsigned resolution_scale); // New session: discard game targets/textures, retain native pipelines.
     void attach_window(void* native_window);
-    void widescreen(bool enabled); // Present the game's native anamorphic image at 16:9.
+    void aspect_ratio(float aspect); // Fit the game's anamorphic image to the selected display aspect.
     void enhancements(unsigned antialiasing,unsigned anisotropy); // AA 0=off, 1..3=FXAA, 4..6=MSAA 2/4/8x; AF 0=original or 1/2/4/8/16.
     void ambient_occlusion(unsigned quality,float strength=0.35f); // 0=off; 1..3=GTAO low/medium/high.
     bool supports_msaa(unsigned samples) const;

@@ -80,10 +80,11 @@ struct ControlScript {
 };
 struct Preferences {
     std::array<char,4096> xbe{},disc{},music_folder{};
-    bool vsync=false,fullscreen=false,keyboard=true,muted=false,show_fps=false,widescreen=false;
+    bool vsync=false,fullscreen=false,keyboard=true,muted=false,show_fps=false,motion_blur=true;
+    int aspect_ratio=0; // 0=4:3, 1=16:9, 2=21:9.
     int refresh_rate=60,volume=100,resolution_scale=1,antialiasing=0,anisotropy=0,upscaling=0;
     int ambient_occlusion=0,ambient_occlusion_strength=35;
-    bool custom_music=false;
+    bool custom_music=false,loop_track=false;
     bool skip_intro=false;
     int draw_distance=1;
     KeyboardBindings bindings=default_keyboard_bindings();
@@ -92,7 +93,7 @@ struct Preferences {
         strcpy_s(disc.data(),disc.size(),"Burnout 2/Burnout 2 - Point of Impact (USA).xiso.iso");
         if(!load) return;
         std::ifstream file(path);std::string line;
-        bool legacy_distance=false,has_distance=false;
+        bool legacy_distance=false,has_distance=false,has_aspect=false;
         while(std::getline(file,line)) {
             if(line.size()>8192) throw std::runtime_error("Settings line exceeds its bound");
             const auto split=line.find('=');if(split==std::string::npos) continue;
@@ -106,10 +107,16 @@ struct Preferences {
                 if(value.size()<destination.size()) strcpy_s(destination.data(),destination.size(),value.c_str());
             } else if(key=="vsync") vsync=value=="1";
             else if(key=="fullscreen") fullscreen=value=="1";
-            else if(key=="widescreen") widescreen=value=="1";
+            else if(key=="widescreen" && !has_aspect) aspect_ratio=value=="1"?1:0;
+            else if(key=="aspect_ratio") {
+                int candidate=-1;number(candidate,0,2);
+                if(candidate>=0) {aspect_ratio=candidate;has_aspect=true;}
+            }
+            else if(key=="motion_blur") motion_blur=value=="1";
             else if(key=="keyboard") keyboard=value=="1";
             else if(key=="muted") muted=value=="1";
             else if(key=="custom_music") custom_music=value=="1";
+            else if(key=="loop_track") loop_track=value=="1";
             else if(key=="skip_intro") skip_intro=value=="1";
             else if(key=="highest_lod" || key=="unlimited_distance") legacy_distance|=value=="1";
             else if(key=="draw_distance") {
@@ -142,16 +149,17 @@ struct Preferences {
         std::ofstream file(path,std::ios::trunc);
         file<<"xbe="<<xbe.data()<<"\ndisc="<<disc.data()<<"\nvsync="<<vsync<<"\nfullscreen="<<fullscreen<<"\nkeyboard="<<keyboard
             <<"\nrefresh_rate="<<refresh_rate<<"\nvolume="<<volume<<"\nmuted="<<muted
-            <<"\nresolution_scale="<<resolution_scale<<"\nshow_fps="<<show_fps<<"\nwidescreen="<<widescreen
+            <<"\nresolution_scale="<<resolution_scale<<"\nshow_fps="<<show_fps<<"\nwidescreen="<<(aspect_ratio!=0)<<"\naspect_ratio="<<aspect_ratio
             <<"\nantialiasing="<<antialiasing<<"\nanisotropy="<<anisotropy
             <<"\nambient_occlusion="<<ambient_occlusion<<"\nambient_occlusion_strength="<<ambient_occlusion_strength
             <<"\nupscaling="<<upscaling
-            <<"\nskip_intro="<<skip_intro<<"\ndraw_distance="<<draw_distance
-            <<"\ncustom_music="<<custom_music<<"\nmusic_folder="<<music_folder.data()<<'\n';
+            <<"\nskip_intro="<<skip_intro<<"\nmotion_blur="<<motion_blur<<"\ndraw_distance="<<draw_distance
+            <<"\ncustom_music="<<custom_music<<"\nloop_track="<<loop_track<<"\nmusic_folder="<<music_folder.data()<<'\n';
         for(unsigned i=0;i<keyboard_actions.size();++i) file<<"key_"<<keyboard_actions[i].id<<'='<<bindings[i]<<'\n';
         if(!file) throw std::runtime_error("Could not save settings");
     }
     void select_refresh_rate(int rate) {refresh_rate=rate;}
+    float aspect() const {return aspect_ratio==2?21.0f/9:aspect_ratio==1?16.0f/9:4.0f/3;}
 
 };
 void setting_help(const char* text) {
@@ -317,7 +325,8 @@ struct App {
     std::vector<int> refresh_rates;
     float display_refresh=0;
     int category=0,select_category=-1,binding_action=-1,active_scale=1;
-    bool running=true,playing=false,show_settings=true,launch=false,settings_dirty=false,active_widescreen=false;
+    bool running=true,playing=false,show_settings=true,launch=false,settings_dirty=false,active_widescreen=false,active_motion_blur=true;
+    int active_aspect_ratio=0;
     std::deque<std::string> log_messages;
     std::string memory_snapshot="[]";
     std::uint64_t stop_at=0,frames=0,first_frame=0,last_frame=0;
@@ -342,7 +351,7 @@ struct App {
             active_scale=settings.upscaling?std::max(1,(settings.resolution_scale+1)/2):settings.resolution_scale;
             renderer=std::make_unique<Renderer>(640,480,warp,hidden,active_scale);renderer->attach_window(handle);
             configure_enhancements();
-            active_widescreen=settings.widescreen;renderer->widescreen(active_widescreen);
+            active_aspect_ratio=settings.aspect_ratio;active_widescreen=active_aspect_ratio!=0;active_motion_blur=settings.motion_blur;renderer->aspect_ratio(settings.aspect());
             if(!script.empty()) controls=std::make_unique<ControlScript>(script);
             input=std::make_unique<Input>(controls?false:settings.keyboard,false,controls?controls->id:0);
             input->bindings(settings.bindings);
@@ -389,8 +398,8 @@ struct App {
         } catch(const std::exception& error) {performance.reset();log_message(error.what());}
     }
     std::string benchmark_settings() const {
-        return std::format("\"refresh_rate\":{},\"resolution_scale\":{},\"output_resolution_scale\":{},\"upscaling\":{},\"draw_distance\":{},\"widescreen\":{},\"vsync\":{}",
-            settings.refresh_rate,active_scale,settings.resolution_scale,settings.upscaling,settings.draw_distance,active_widescreen,settings.vsync);
+        return std::format("\"refresh_rate\":{},\"resolution_scale\":{},\"output_resolution_scale\":{},\"upscaling\":{},\"draw_distance\":{},\"widescreen\":{},\"aspect_ratio\":{},\"motion_blur\":{},\"vsync\":{}",
+            settings.refresh_rate,active_scale,settings.resolution_scale,settings.upscaling,settings.draw_distance,active_widescreen,active_aspect_ratio,active_motion_blur,settings.vsync);
     }
     void stop_benchmark() {
         if(!benchmark_started) return;
@@ -691,8 +700,10 @@ struct App {
                     }
                     case 3: {
                         ImGui::SeparatorText("DISPLAY");
-                        changed|=ImGui::Checkbox("Widescreen (16:9)",&settings.widescreen);
-                        setting_help("Uses the game's native 16:9 camera, with HUD proportions corrected and edge placement preserved. Applies when you start or restart the game.");
+                        constexpr const char* aspects[]={"Standard (4:3)","Widescreen (16:9)","Ultrawide (21:9)"};
+                        setting_label("Aspect ratio");
+                        changed|=ImGui::Combo("##Aspect ratio",&settings.aspect_ratio,aspects,int(std::size(aspects)));
+                        setting_help("Wider views reveal more of the scene horizontally. HUD proportions and edge placement are preserved. Applies when you start or restart the game.");
                         changed|=ImGui::Checkbox("V-sync",&settings.vsync);
                         setting_help("Synchronizes presentation with the display to prevent tearing. The display's refresh rate limits the maximum frame rate.");
                         if(ImGui::Checkbox("Fullscreen",&settings.fullscreen)) {
@@ -714,7 +725,7 @@ struct App {
                             setting_help(settings.upscaling?"Upscaling reconstructs this resolution from a smaller image. At 1x it provides antialiasing at native resolution. Use Restart game to apply changes.":playing?"Higher resolutions sharpen geometry and use more GPU power. Original proportions are preserved. Use Restart game to apply changes.":
                                 "Higher resolutions sharpen geometry and use more GPU power. Original proportions are preserved. Applies when you start the game.");
                         }
-                        ImGui::TextWrapped("Resolution and widescreen changes apply when you start or restart the game.");
+                        ImGui::TextWrapped("Resolution and aspect ratio changes apply when you start or restart the game.");
                         break;
                     }
                     case 4: {
@@ -771,6 +782,8 @@ struct App {
                         if(ImGui::Combo("##Anisotropic filtering",&selected,filters,int(std::size(filters)))) {settings.anisotropy=values[selected];changed=true;}
                         setting_help("Keeps road and other textures sharper at an angle. The original game uses anisotropic filtering. Original preserves each texture's settings; higher values use more GPU power.");
                         ImGui::Spacing();ImGui::SeparatorText("MISCELLANEOUS");
+                        changed|=ImGui::Checkbox("Motion blur",&settings.motion_blur);
+                        setting_help("Enables the original game's scene blur during boosting and other speed effects. Applies when you start or restart the game.");
                         changed|=ImGui::Checkbox("Skip intro splash screens",&settings.skip_intro);
                         setting_help("Starts at the title screen after the initial loading screen.");
                         ImGui::Spacing();
@@ -925,7 +938,7 @@ struct App {
         active_scale=settings.upscaling?std::max(1,(settings.resolution_scale+1)/2):settings.resolution_scale;
         renderer->reset(active_scale);
         configure_enhancements();
-        active_widescreen=settings.widescreen;renderer->widescreen(active_widescreen);
+        active_aspect_ratio=settings.aspect_ratio;active_widescreen=active_aspect_ratio!=0;active_motion_blur=settings.motion_blur;renderer->aspect_ratio(settings.aspect());
     }
     BootResult play(const std::filesystem::path& executable,const std::filesystem::path& disc,const std::filesystem::path& frame,
                     std::span<const MemorySlice> slices={},bool trace_io=false) {
@@ -937,11 +950,14 @@ struct App {
         XboxHost host{renderer.get(),input.get(),[&]{return poll_game();},[&]{game_flip();}};
         if(controls) host.storage_root=settings_path.parent_path()/"automation-user";
         host.widescreen=active_widescreen;
+        host.ultrawide=active_aspect_ratio==2;host.motion_blur=active_motion_blur;
         host.skip_intro=settings.skip_intro;host.draw_distance=unsigned(settings.draw_distance);
         host.upscaling=settings.upscaling!=0;
         const auto imported=settings_path.parent_path()/"imported-tracks/interstate";
         if(std::filesystem::exists(imported/"import.json")) host.imported_tracks=imported;
         if(settings.custom_music && music_songs) host.custom_music_root=music_cache();
+        host.loop_track=settings.loop_track;
+        host.music_loop_changed=[this](bool enabled) {settings.loop_track=enabled;settings_dirty=true;save_settings();};
         host.performance=&performance;
         host.trace_io=trace_io;
         host.watch_semaphores=watch_semaphores;
@@ -993,8 +1009,8 @@ struct App {
         }
         const auto fps=last_frame>first_frame?(frames-1)*1000000000.0/(last_frame-first_frame):0;
         const auto source_fps=last_source>first_source?(stats.published_frames-1)*1000000000.0/(last_source-first_source):0;
-        report<<std::format("],\"adapter\":{},\"shader_compilations\":{},\"uploaded_vertex_bytes\":{},\"reused_vertex_bytes\":{},\"vblank_callbacks\":{},\"refresh_rate\":{},\"resolution_scale\":{},\"widescreen\":{},\"source_fps\":{:.3f},\"presented_fps\":{:.3f},\"original_camera_far\":{},\"camera_far\":{},\"original_world_sections\":{},\"extra_world_sections\":{},\"extra_world_batches\":{},\"display_refresh\":{},\"output_resolution_scale\":{},\"upscaling\":{},\"memory\":{}}}",
-            json(result.graphics_adapter),stats.shader_compilations,stats.vertex_bytes,stats.reused_vertex_bytes,result.vblank_callbacks,settings.refresh_rate,active_scale,active_widescreen,source_fps,fps,result.original_camera_far,result.camera_far,result.original_world_sections,result.extra_world_sections,result.extra_world_batches,display_refresh,settings.resolution_scale,settings.upscaling,memory_snapshot);
+        report<<std::format("],\"adapter\":{},\"shader_compilations\":{},\"uploaded_vertex_bytes\":{},\"reused_vertex_bytes\":{},\"vblank_callbacks\":{},\"refresh_rate\":{},\"resolution_scale\":{},\"widescreen\":{},\"aspect_ratio\":{},\"motion_blur\":{},\"source_fps\":{:.3f},\"presented_fps\":{:.3f},\"original_camera_far\":{},\"camera_far\":{},\"original_world_sections\":{},\"extra_world_sections\":{},\"extra_world_batches\":{},\"display_refresh\":{},\"output_resolution_scale\":{},\"upscaling\":{},\"memory\":{}}}",
+            json(result.graphics_adapter),stats.shader_compilations,stats.vertex_bytes,stats.reused_vertex_bytes,result.vblank_callbacks,settings.refresh_rate,active_scale,active_widescreen,active_aspect_ratio,active_motion_blur,source_fps,fps,result.original_camera_far,result.camera_far,result.original_world_sections,result.extra_world_sections,result.extra_world_batches,display_refresh,settings.resolution_scale,settings.upscaling,memory_snapshot);
         return report.str();
     }
 };
@@ -1046,13 +1062,13 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     FrameRate counter_rate;counter_rate.sample(1);
     for(unsigned frame=1;frame<=60;++frame) counter_rate.sample(1+frame*1000000000ULL/120);
     if(std::abs(counter_rate.value-120)>0.01) throw std::runtime_error("Frame rate counter did not measure 120 FPS");
-    Preferences saved(false);saved.resolution_scale=3;saved.select_refresh_rate(144);saved.show_fps=true;saved.widescreen=true;saved.bindings[15]=SDL_SCANCODE_Z;
-    saved.custom_music=true;strcpy_s(saved.music_folder.data(),saved.music_folder.size(),"Music/Custom playlist");
+    Preferences saved(false);saved.resolution_scale=3;saved.select_refresh_rate(144);saved.show_fps=true;saved.aspect_ratio=2;saved.motion_blur=false;saved.bindings[15]=SDL_SCANCODE_Z;
+    saved.custom_music=true;saved.loop_track=true;strcpy_s(saved.music_folder.data(),saved.music_folder.size(),"Music/Custom playlist");
     saved.antialiasing=6;saved.anisotropy=16;saved.ambient_occlusion=3;saved.ambient_occlusion_strength=47;
     saved.skip_intro=true;saved.draw_distance=4;saved.upscaling=3;
     saved.save(preferences);Preferences restored(true,preferences);
-    if(restored.bindings!=saved.bindings || restored.resolution_scale!=3 || restored.refresh_rate!=144 || !restored.show_fps || !restored.widescreen ||
-       !restored.custom_music || restored.music_folder!=saved.music_folder || restored.antialiasing!=6 || restored.anisotropy!=16 || restored.ambient_occlusion!=3 || restored.ambient_occlusion_strength!=47 ||
+    if(restored.bindings!=saved.bindings || restored.resolution_scale!=3 || restored.refresh_rate!=144 || !restored.show_fps || restored.aspect_ratio!=2 || restored.motion_blur ||
+       !restored.custom_music || !restored.loop_track || restored.music_folder!=saved.music_folder || restored.antialiasing!=6 || restored.anisotropy!=16 || restored.ambient_occlusion!=3 || restored.ambient_occlusion_strength!=47 ||
        !restored.skip_intro || restored.draw_distance!=4 || restored.upscaling!=3)
         throw std::runtime_error("New settings did not survive save/load");
     for(const auto value:{1,2,4}) {
@@ -1072,9 +1088,14 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     if(Preferences(true,preferences).draw_distance!=2) throw std::runtime_error("Legacy distance settings were not migrated");
     {std::ofstream file(preferences);file<<"draw_distance=1\nunlimited_distance=1\n";}
     if(Preferences(true,preferences).draw_distance!=1) throw std::runtime_error("Legacy distance replaced an explicit new setting");
-    {std::ofstream file(preferences);file<<"key_accelerate="<<SDL_SCANCODE_ESCAPE<<"\nkey_brake=999999\nrefresh_rate=1\nresolution_scale=99\nantialiasing=7\nanisotropy=3\ndraw_distance=3\nambient_occlusion=4\nambient_occlusion_strength=101\n";}
+    {std::ofstream file(preferences);file<<"widescreen=1\n";}
+    if(Preferences(true,preferences).aspect_ratio!=1 || !Preferences(true,preferences).motion_blur)
+        throw std::runtime_error("Legacy settings did not preserve widescreen and original motion blur");
+    {std::ofstream file(preferences);file<<"aspect_ratio=2\nwidescreen=0\n";}
+    if(Preferences(true,preferences).aspect_ratio!=2) throw std::runtime_error("Legacy widescreen replaced an explicit aspect ratio");
+    {std::ofstream file(preferences);file<<"key_accelerate="<<SDL_SCANCODE_ESCAPE<<"\nkey_brake=999999\nrefresh_rate=1\nresolution_scale=99\nantialiasing=7\nanisotropy=3\ndraw_distance=3\nambient_occlusion=4\nambient_occlusion_strength=101\naspect_ratio=3\n";}
     Preferences invalid(true,preferences);std::filesystem::remove(preferences);
-    if(invalid.bindings!=default_keyboard_bindings() || invalid.refresh_rate!=60 || invalid.resolution_scale!=1 || invalid.antialiasing || invalid.anisotropy || invalid.draw_distance!=1 || invalid.ambient_occlusion || invalid.ambient_occlusion_strength!=35) throw std::runtime_error("Invalid settings replaced valid defaults");
+    if(invalid.bindings!=default_keyboard_bindings() || invalid.refresh_rate!=60 || invalid.resolution_scale!=1 || invalid.antialiasing || invalid.anisotropy || invalid.draw_distance!=1 || invalid.ambient_occlusion || invalid.ambient_occlusion_strength!=35 || invalid.aspect_ratio || !invalid.motion_blur) throw std::runtime_error("Invalid settings replaced valid defaults");
     SDL_Event escape{};escape.type=SDL_EVENT_KEY_DOWN;escape.key.scancode=SDL_SCANCODE_ESCAPE;
     app.event(escape);if(app.show_settings) throw std::runtime_error("Esc did not hide settings");
     escape.key.repeat=true;app.event(escape);if(app.show_settings) throw std::runtime_error("Held Esc repeated the toggle");
@@ -1150,9 +1171,11 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
         if(std::abs(measured[test]-rate)>rate*0.08) throw std::runtime_error(std::format("Frame pacing differs from {} Hz: {:.2f}",rate,measured[test]));
     }
     app.show_settings=false;
-    app.settings.widescreen=true;app.configure_graphics();
-    for(unsigned wide=0;wide<2;++wide) {
-        if(wide && !SDL_SetWindowSize(app.window,1280,540)) throw std::runtime_error(SDL_GetError());
+    app.settings.aspect_ratio=1;app.configure_graphics();
+    for(unsigned wide=0;wide<4;++wide) {
+        app.settings.aspect_ratio=wide>=2?2:1;app.configure_graphics();
+        if(wide==2 && !SDL_SetWindowSize(app.window,960,720)) throw std::runtime_error(SDL_GetError());
+        if(wide%2 && !SDL_SetWindowSize(app.window,1280,540)) throw std::runtime_error(SDL_GetError());
         app.poll();app.renderer->begin(0xFF4080C0);app.renderer->end();
         if(!app.renderer->display()) throw std::runtime_error("Widescreen image could not be displayed");
         const auto image=app.renderer->read_display();
@@ -1161,13 +1184,14 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
             return image.rgba[pixel]==std::byte{} && image.rgba[pixel+1]==std::byte{} && image.rgba[pixel+2]==std::byte{};
         };
         if(black(image.width/2,image.height/2) ||
-           (wide?(!black(40,image.height/2) || !black(image.width-40,image.height/2)):
-                 (!black(image.width/2,40) || !black(image.width/2,image.height-40))))
-            throw std::runtime_error("Native 16:9 presentation did not preserve its aspect ratio");
-        auto output=path.parent_path()/path.stem();output+=wide?"-widescreen-ultrawide":"-widescreen";output+=path.extension();
+           (wide%2?(wide==1?(!black(40,image.height/2) || !black(image.width-40,image.height/2)):
+                              (black(40,image.height/2) || black(image.width-40,image.height/2))):
+                    (!black(image.width/2,40) || !black(image.width/2,image.height-40))))
+            throw std::runtime_error("Selected display aspect ratio was not preserved");
+        auto output=path.parent_path()/path.stem();output+=wide>=2?"-ultrawide":"-widescreen";output+=wide%2?"-wide-window":"";output+=path.extension();
         save_png(image,output);app.renderer->present(false);
     }
-    app.settings.widescreen=false;app.configure_graphics();
+    app.settings.aspect_ratio=0;app.configure_graphics();
     if(!SDL_SetWindowSize(app.window,960,720)) throw std::runtime_error(SDL_GetError());
     app.poll();
     std::array<double,2> source_rates{},display_rates{};
@@ -1257,7 +1281,7 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
         throw std::runtime_error("Exit did not cancel launch and save pending settings");
     std::filesystem::remove(preferences);
     return std::format("{{\"format\":\"b2-window-check-v4\",\"passed\":true,\"backend\":\"SDL3/D3D11/ImGui\",\"adapter\":{},\"default_refresh_rate\":60,"
-        "\"bindings_and_settings\":true,\"automatic_settings_save\":true,\"restart_request\":true,\"exit_request\":true,\"widescreen_presentation\":true,\"frame_counter\":true,\"counter_image\":{},\"escape_toggle\":true,\"resolution_change\":true,"
+        "\"bindings_and_settings\":true,\"automatic_settings_save\":true,\"restart_request\":true,\"exit_request\":true,\"widescreen_presentation\":true,\"ultrawide_presentation\":true,\"motion_blur_setting\":true,\"frame_counter\":true,\"counter_image\":{},\"escape_toggle\":true,\"resolution_change\":true,"
         "\"pacing_60_hz\":{:.3f},\"pacing_120_hz\":{:.3f},\"source_at_120_hz\":{:.3f},\"source_at_144_hz\":{:.3f},\"display_120_hz\":{:.3f},\"display_144_hz\":{:.3f},"
         "\"performance_capture\":true,\"shader_compilations\":0,\"game_booted\":false,\"game_fps_established\":false,\"images\":{}}}",
         json(renderer.adapter()),json(utf8(counter_image.wstring())),measured[0],measured[1],source_rates[0],source_rates[1],display_rates[0],display_rates[1],images.str());

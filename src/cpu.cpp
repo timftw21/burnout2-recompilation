@@ -3,6 +3,50 @@
 #include <cmath>
 
 namespace b2 {
+void title_hud_widget(Cpu& cpu,Memory& memory) {
+    auto& layout=*cpu.hud_layout;
+    const auto object=cpu.registers[ecx];
+    for(unsigned i=0;i<32;++i) {
+        if(memory.load<std::uint32_t>(0x3D8580+i*4)!=object) continue;
+        const auto first=memory.load<std::uint32_t>(object+8);
+        const auto next=i==31?33U:memory.load<std::uint32_t>(memory.load<std::uint32_t>(0x3D8584+i*4)+8);
+        if(first>=next || next>layout.anchors.size()) throw NativeBoundary(cpu.eip,"invalid HUD widget range");
+        const auto method=memory.load<std::uint32_t>(memory.load<std::uint32_t>(object)+4);
+        // World markers and the split divider use scene/screen coordinates.
+        if(method==0x1F790 || method==0x24080) break;
+        auto anchor=std::bit_cast<float>(memory.load<std::uint32_t>(cpu.registers[esp]));
+        // All mode layouts share these authored right-column left edges:
+        // full view, standard split, and the two native-wide split panes.
+        // Anchor the column's right edge regardless of which widget uses it.
+        for(const auto column:{0x4D2158U,0x4D207CU,0x4D1F68U,0x4D1FE4U})
+            if(anchor==std::bit_cast<float>(memory.load<std::uint32_t>(column))) {
+                anchor+=std::bit_cast<float>(memory.load<std::uint32_t>(0x2B08D4))*
+                    std::bit_cast<float>(memory.load<std::uint32_t>(cpu.registers[esp]+8));
+                break;
+            }
+        // Lesson targets ignore the caller's x and use their own right edge.
+        if(method==0x21F50) anchor=std::bit_cast<float>(memory.load<std::uint32_t>(0x4D4884));
+        for(auto index=first;index<next;++index) {layout.anchors[index]=anchor;layout.active|=1ULL<<index;}
+        break;
+    }
+}
+bool title_hud_gauges(Memory& memory) {
+    const auto ram=memory.primary();
+    const auto manager=ram.load<std::uint32_t>(0x3D8570);
+    if(!manager) return false;
+    const auto list=ram.load<std::uint32_t>(manager+0x3C),count=ram.load<std::uint32_t>(manager+0x40);
+    // 1AA10 installs the two tachometers followed by the two boost meters.
+    // C1440 skips queues with bit 0 set or an empty node chain.
+    for(unsigned i=0;i<4;++i) {
+        const auto widget=ram.load<std::uint32_t>(0x3D8580+i*4);
+        if(!widget) continue;
+        const auto index=ram.load<std::uint32_t>(widget+8);
+        if(index>=count) continue;
+        const auto queue=list+index*16;
+        if(!(ram.load<std::uint32_t>(queue)&1) && ram.load<std::uint32_t>(queue+8)!=UINT32_MAX) return true;
+    }
+    return false;
+}
 void title_timing(Cpu& cpu,Memory& memory) {
     auto& timing=*cpu.game_timing;
     constexpr std::uint64_t frequency=733333333;

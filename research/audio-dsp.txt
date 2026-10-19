@@ -541,3 +541,149 @@ The release rebuild succeeds. Existing checks pass: 54 spatial cases with
 1000 original calculations and the corrected centered-source assertion,
 74 original binding cases, 67 audio cases, 65 effect checks and all 12 WMA
 tracks. The rebuilt build/windows/Release/b2.exe is ready for manual listening.
+
+Intermittent pop audit: sound-buffer ownership (2026-10-18)
+
+The user reports occasional quiet pops without a reproducible scene. Audit
+covered PCM/Xbox ADPCM boundaries, looping and packet resampling, gain changes,
+DSP return timing, source endings, control delivery and SDL buffer delivery.
+The existing offline audio/effects checks passed before any change. Some sharp
+transients in the saved frame-600173847000 mix also occur in isolated source
+samples; a large adjacent-sample difference alone does not establish a bug.
+
+Verified target B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF:
+original buffer AddRef at 22C1E4 increments raw object +4 (22C20F). Release's
+core 22BF2A decrements that same field and destroys only at zero. The native
+provider instead kept a separate count, missing original AddRef calls. Stream
+AddRef 22CBC4 uses raw object +8; its native methods now share that field too.
+
+Original SetOutputBuffer's shared 22DCB4/22DADD path stores a retained raw
+destination at settings +B0. At 22DB4B it releases the preceding destination;
+231D69 calls the new destination's AddRef through vtable +4. Settings destruction
+22E9FB checks +B0 and calls 22DADD(null) to release that ownership. Stream API
+22E694 reaches the same path. Bounded native disassembly is preserved under
+build/checks/audio-pops-20261018; analysis used no whole-image binary scan.
+
+Both native output setters previously omitted those references. Releasing a
+still-routed destination could therefore destroy it while sources continued.
+Audio::release then cleared their routes, abruptly changing their gain/sends
+and potentially producing a pop. The provider now retains/replaces/releases
+outputs using the verified +B0 layout and the original reference count. Final
+buffer and stream release also releases the output chain. Identical assignments
+do not add references; the native routing graph rejects cycles before mutation.
+
+Existing audio-binding diagnostics exercise the original AddRef, caller release
+while routing, identical reassignment, replacement, chained destruction and
+stream ownership. A constant PCM signal also checks that releasing the caller's
+output reference leaves every mixed sample unchanged. The old provider fails
+the new original/native reference-count check before the fix.
+
+The stream output setter is not reached by the title's fixed native entry
+table; its diagnostic invokes the verified provider binding directly. This
+does not add or claim another translated game function. Stream AddRef also
+checks the original +8 field, and clearing an output checks balanced ownership.
+
+Release rebuild and existing diagnostics pass: 119 audio binding cases, 77
+audio cases, 67 effects checks, 54 spatial cases with 1000 original calculations,
+52 CPU groups and all twelve original WMA tracks. The 96000-frame frozen scene
+matches its pre-change WAV byte for byte. Checks opened no playback device,
+booted no game and ran no gameplay benchmark. No owned workers remain.
+
+This fixes verified ownership errors capable of introducing a discontinuity.
+The user's occasional audible event was not captured during this audit, so
+manual gameplay listening is still needed to confirm that symptom is resolved.
+
+Captured pop: remaining hardware settings path overwrites samples (2026-10-18)
+
+User captures frame-218901963800 and frame-221535306300 cover 2.64 seconds of
+the first title-screen driving demo. The user identifies the red car leaving a
+bump, a couple of seconds after the first F8. The second capture contains 126720
+live stereo frames at 48 kHz. Its 264 WASAPI callbacks deliver 480 frames each;
+maximum callback time is 1.9675 ms and maximum start gap 10.0991 ms. No audio
+failure is reported. The 8192-event trace is truncated and retains the final
+approximately 1.46 seconds, so it is not a complete event replay of the interval.
+
+The live mix has a 0.6959839 adjacent-sample jump at frame 109214 (2.275291667 s).
+Isolating stereo Xbox ADPCM voice 30 from the first snapshot reproduces that
+same sample position, with a raw source jump of 61436 PCM16 units. FFmpeg's
+independent Xbox decoder gives 61438 at the same position; maximum difference
+over the surrounding five blocks is six PCM16 units, consistent with decoder
+rounding. The click precedes mixing, routing and effects processing.
+Reference source: https://github.com/FFmpeg/FFmpeg/blob/master/libavcodec/adpcm.c
+Xbox block layout: https://github.com/vgmstream/vgmstream/blob/master/src/coding/ima_decoder.c
+
+Voice 30 binds guest 01163030 with 783000h bytes. Its play start is 5635840
+frames, cursor 245888, rate 48000 and step 1. The fault is absolute source frame
+5990942, block 93608, sample 30, encoded bank byte 6739776: guest 017D0770.
+The captured block contains 32-bit effect parameters, including 00000250,
+00000290, 00016BF0, 007FFFFF and FF800001, in place of ADPCM bytes.
+
+A hardware write watch in an isolated executable copy catches the actual write:
+title 10A5F0 -> public SetI3DL2Listener 22FA52 -> 22F7CA -> 22EFFD -> 2312C7
+-> private SetEffectData 230B56 -> copy 236204. The copy submits 108h bytes
+from guest 01061D50 to 017D0730, crossing the exact captured block. Its first
+watched words are 250h, 290h, 16BF0h, 7FFFFFh. The public environment setter
+was missing from native bindings, so it still reached the SDK's original
+MCPX shadow-memory path. EnableHeadphones 22D776 also reached that path through
+22C501/231239. This is another public entry into the overwrite mechanism
+documented above on 2026-10-08; binding public SetEffectData alone was insufficient.
+
+Both settings now have verified native boundaries. Environmental listener
+parameters retain immediate/deferred behavior and update source adjustments.
+The original software-only calculator 22D1B4 derives the reverb parameters in
+Spatial's isolated scratch memory. Native commit writes the flag at effect +10h
+and the 108h-byte parameter region at +118h to the real native DSP state.
+The title's verified locations remain {reverb=2,crosstalk=4}. Headphone mode
+clears crosstalk flag bit 1 and speaker mode sets it, matching original 231239,
+while preserving unrelated DSP state. There is no sample repair, decoder change,
+voice-specific mute or output filter. Optional capture events include both calls
+and retain the environmental listener's 48 parameter bytes.
+
+Audio binding checks now create the actual native device layout. They cover
+unassigned reverb, both settings with/without an image, original deferred setter
+layout, deferred commit visibility, updated DSP processing and preservation of
+low guest RAM and a guarded 768-byte sound-bank range at 017D0618. With the
+effects image beside the XBE, 142 binding cases pass; the existing 54 spatial,
+77 audio, 67 effects, 52 CPU groups and all 12 original WMA tracks also pass.
+The compiled function count remains 36149. A frozen scene's WAV remains byte
+identical: old captures retain their already damaged samples, as expected.
+
+The corrected isolated write-watch run reaches main, loads 57 buffers and five
+effects, and completes its 200-million-checkpoint budget without the corrupt
+write or an audio error. It uses SDL dummy audio, separate storage, no visible
+game window and no gameplay benchmark. Owned debugger/game/build workers exit.
+Evidence and native analysis stay under build/checks/audio-pop-capture-20261018.
+A fresh game launch is required to load sound data without the overwrite.
+
+Music volume and pause shortcuts (2026-10-19)
+
+Verified the supported XBE hash above. XACT 210A7F sets streamed music volume
+through 22D98A, whose original bytes E94FFBFFFF jump to 22D4DE. Its pause/resume
+methods call 22D9A8 (E973F4FFFF -> 22CE20). Pitch 22D98F (E9F8FAFFFF -> 22D48C)
+and headroom 22D9A3 (E97EFCFFFF -> 22D626) use the same SDK shortcut layout.
+The game's music-volume handler C5C30 issues the XACT category-volume command
+at C5D15; 20E659/213329/21275D propagate it through the original voice setter.
+
+Function recovery follows these unconditional jumps and includes their targets.
+Native binding selection checked only the recovered function's entry, leaving
+the shortcut functions to execute original hardware setters. Those setters
+changed guest descriptors without updating the native mixer. Both included B1
+and imported WMA music use these streams. The offline binding reproduction
+confirms a -20 dB request still outputs 0.1252968 instead of 0.01252968.
+
+Lowering now recognizes an entry jump to an existing native API, verifies the
+target's original signature and emits that native call under the original
+shortcut entry. Volume, pitch, headroom and pause/resume retain their original
+arguments and calling conventions. Existing audio binding checks exercise
+audible attenuation, full mute, restoration, pause with a pending packet and
+resume, alongside the existing asynchronous stop and stream-reuse checks.
+Bounded original analysis and before/after results remain in
+build/checks/music-controls-20261019.
+
+Release rebuild and offline checks pass: 155 native audio binding cases,
+54 spatial cases/1000 calculations, 77 audio cases, 67 effects checks,
+all twelve original B1 WMA tracks, 252 custom-music cases with seven imported
+songs, and 52 CPU groups. Mixed PCM is silent at the SDK's -10000 volume setting and during
+pause; restoring volume and resuming the pending packet both restore sound.
+The compiled function count remains 36149. No game session or audio device
+was opened; the user will check the live Crash transition.

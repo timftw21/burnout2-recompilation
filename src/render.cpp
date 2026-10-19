@@ -545,7 +545,8 @@ struct Renderer::Impl {
     std::array<ComPtr<ID3D11BlendState>,16> clear_blends;
     std::array<ComPtr<ID3D11DepthStencilState>,4> clear_depths;
     std::uint32_t window_width=0,window_height=0;
-    bool displaying=false,widescreen=false;
+    bool displaying=false;
+    float display_aspect=0;
     struct Pipeline {
         ComPtr<ID3D11BlendState> blend,layer_blend;
         ComPtr<ID3D11DepthStencilState> depth;
@@ -1241,7 +1242,10 @@ void Renderer::attach_window(void* native_window) {
     checked(r.device->CreateDepthStencilState(&depth,&r.display_depth),"Display depth state");
     r.window=window;
 }
-void Renderer::widescreen(bool enabled) {impl_->widescreen=enabled;}
+void Renderer::aspect_ratio(float aspect) {
+    if(!std::isfinite(aspect) || aspect<=0) throw std::runtime_error("Invalid display aspect ratio");
+    impl_->display_aspect=aspect;
+}
 unsigned Renderer::raster_samples_per_pixel() const {return impl_->samples*impl_->resolution_scale*impl_->resolution_scale;}
 bool Renderer::supports_msaa(unsigned samples) const {return samples>=2 && samples<=8 && std::has_single_bit(samples) && (impl_->msaa_supported&samples)!=0;}
 bool Renderer::supports_upscaling(UpscaleMethod method) const {
@@ -1315,7 +1319,8 @@ void Renderer::camera(std::uint32_t identifier,float near_plane,float far_plane,
     r.camera_identifier=identifier;r.camera_valid=true;
     r.motion_camera=motion?*motion:MotionCamera{};
     if(!motion) {r.motion_camera.identifier=identifier;r.motion_camera.near_plane=near_plane;r.motion_camera.far_plane=far_plane;r.motion_camera.projection=1;}
-    const auto& main=r.targets.at(0);r.camera_aspect=aspect>0 && std::isfinite(aspect)?aspect:r.widescreen?16.0f/9:float(main.width)/main.height;
+    const auto& main=r.targets.at(0);
+    r.camera_aspect=aspect>0 && std::isfinite(aspect)?aspect:r.display_aspect>0?r.display_aspect:float(main.width)/main.height;
     r.upscale_frame.camera_near=near_plane;r.upscale_frame.camera_far=far_plane;r.upscale_frame.vertical_fov=vertical_fov;
 }
 void Renderer::enhancements(unsigned quality,unsigned anisotropy) {
@@ -1443,7 +1448,7 @@ bool Renderer::display(bool wait) {
     auto& main=r.targets.at(0);r.resolve(main);
     auto output=r.window_view.Get();r.context->OMSetRenderTargets(1,&output,nullptr);
     const float black[4]={0,0,0,1};r.context->ClearRenderTargetView(output,black);
-    const auto display_width=r.widescreen?main.height*(16.0f/9.0f):float(main.width);
+    const auto display_width=r.display_aspect>0?main.height*r.display_aspect:float(main.width);
     const auto scale=std::min(float(width)/display_width,float(height)/main.height);
     const auto image_width=display_width*scale,image_height=main.height*scale;
     const D3D11_VIEWPORT viewport{(width-image_width)/2,(height-image_height)/2,image_width,image_height,0,1};r.context->RSSetViewports(1,&viewport);

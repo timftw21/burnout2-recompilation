@@ -78,7 +78,7 @@ struct GameTiming {
     float loading_delta=0;
     double loading_fade_error=0;
     double render_frames=1;
-    float render_delta=0;
+    float render_delta=0,render_offset=0;
     bool scenery_animated=false;
     bool loading_started=false;
     bool started=false, update=true, render=true;
@@ -100,6 +100,7 @@ struct Cpu {
     Performance* profile = nullptr;
     // Optional changes to verified title logic, separate from platform bindings.
     bool skip_intro = false;
+    bool ultrawide = false,motion_blur = true;
     float draw_distance = 1;
     const WorldMaterials* world_materials = nullptr;
     const WorldView* world_view = nullptr;
@@ -137,6 +138,8 @@ inline void checkpoint(Cpu& cpu, std::uint32_t address) {
 void invoke_native(Cpu& cpu, Memory& memory, std::uint32_t address);
 void skip_title_intro(Cpu&,Memory&);
 void title_timing(Cpu&,Memory&);
+bool title_hud_gauges(Memory&);
+void title_hud_widget(Cpu&,Memory&);
 void title_loading(Cpu&,Memory&,bool update);
 std::uint32_t title_loading_fade(Cpu&,Memory&);
 void title_presentation(Cpu&,Memory&,std::uint32_t site,std::uint32_t object=0);
@@ -145,6 +148,7 @@ std::uint32_t title_blur_alpha(Cpu&,std::uint32_t alpha,std::uint32_t filter);
 std::uint32_t title_traffic_fade(Cpu&,Memory&,std::uint32_t vehicle);
 void title_enhancement(Cpu&,Memory&,std::uint32_t address);
 bool title_track(Cpu&,Memory&,std::uint32_t address,std::uint32_t object=0);
+bool title_music(Cpu&,Memory&,std::uint32_t address);
 std::uint32_t read_port(Cpu&,std::uint16_t,unsigned);
 void write_port(Cpu&,std::uint16_t,unsigned,std::uint32_t);
 

@@ -147,6 +147,25 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
                 throw std::runtime_error("Boost HUD separation added render resources, copies or draws");
             if(!native.errors().empty()) throw std::runtime_error("Boost HUD feedback produced graphics validation errors");
         });
+        run(std::format("reward-text-history-{}x-{}hz",samples,displays*60),state,white,[&](const Image&) {
+            Renderer native(64,64,warp,debug);
+            if(samples>1) native.enhancements(5,0);
+            const std::array targets{native.create_target(64,64),native.create_target(64,64)};
+            auto text=colored();text.scissor_test=true;
+            for(auto target:targets) {native.set_target(target);native.begin(0xFF000000);native.end();}
+            for(unsigned frame=0;frame<=displays;++frame) {
+                auto feedback=textured(targets[(frame+1)&1]);feedback.blend=true;
+                feedback.blend_source=0x302;feedback.blend_destination=0x303;feedback.color_mask=0x00010101;
+                text.scissor=frame?std::array<std::int32_t,4>{8,8,24,24}:std::array<std::int32_t,4>{40,8,56,24};
+                native.prepare(feedback);native.prepare(text);native.set_target(targets[frame&1]);native.begin(0xFF000000);
+                native.draw(feedback,quad({1,1,1,float(std::pow(0.7,1.0/displays))}));
+                native.draw(text,red);native.end();native.copy_to_main();native.publish_frame();
+            }
+            const auto image=native.readback();
+            expect(image,16,16,{255,0,0,255});expect(image,48,16,{179,0,0,255},3);
+            save_png(image,directory/std::format("reward-text-{}x-{}hz.png",samples,displays*60));
+            if(!native.errors().empty()) throw std::runtime_error("Reward text feedback produced graphics validation errors");
+        });
     }
     run("gpu-boost-overlay-flip-and-snapshot",state,white,[&](const Image&) {
         Renderer native(64,64,warp,debug);

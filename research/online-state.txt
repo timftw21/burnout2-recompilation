@@ -1,0 +1,169 @@
+Online prediction feasibility, 2026-10-18
+
+Verdict: first gate remains INCOMPLETE. The free-body restore/replay checks pass.
+The extended headless fixture now runs two original human cars, traffic, a real
+impact, crash recovery and sound initialization. Complete race-state restoration,
+prediction and replay side effects remain unverified. Work stopped at the user's
+request after resolving sound initialization; see the stopping point below.
+
+Verified source
+
+US default.xbe, matched through knowledge/supported_target.json:
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF
+Every executed routine comes from the existing ahead-of-time compiled image.
+There is no runtime decoder, replacement physics or invented game callback.
+Private native decode/analysis outputs and reports:
+build/checks/online-state-20261018/
+
+Original-byte findings
+
+1. 1392E0 initializes four actor records at 464220, stride 3090, with vtable
+   295E58 and embedded body vtable 295E08 at actor+F90. The body table's +14
+   update is 66410; that calls 65970 and then the shared integrator 5AD00.
+   This identifies an original physics component, not which records are human
+   players in a fully initialized two-player race.
+
+2. 5AD00..5B3A6 integrates force/torque, velocity, angular state and the matrix
+   referenced by body+10. Its first six bytes are 558BEC83E4F0. It reads shared
+   gravity at 4F08F0..4F08F8. Its state also includes cached rotation/inertia,
+   position correction at +844 and the motion-clearing value at +868. A pose
+   alone is insufficient to resume this component.
+
+3. The local component checkpoint retains body ranges +60..+FF, +100..+10F,
+   +134..+137, +140..+1AF, +844..+84F and +868..+86B, plus the pointed-to
+   64-byte matrix, original tick counter 59818C and guest floating state.
+   This is a private, fixed-layout diagnostic checkpoint, not a network schema.
+   Identical mass, initial inertia, gravity and body identity are prerequisites.
+
+4. The full update is broader. 822B0 dispatches actor methods, collision
+   collection at 51F748, other bodies, and traffic updates 9F500/9F9B0. The
+   actor method 74000 additionally advances components at actor+1FF0, +20C8,
+   +2100 and +2FE0, and uses flags/state beyond the rigid-body checkpoint.
+   The existing fixed-step boundary is not an isolated prediction boundary.
+   Their complete input/state dependencies and side effects remain unmapped.
+
+5. Replay initializer 88850 selects the buffer at 3D686C; 88890 records one
+   six-byte input record per call. At 88AAB..88ABE it saves a one-byte sum from
+   the low bytes of the summed positions of up to four actors. Playback checks
+   it at 88C57..88C7F and sets controller+14 on disagreement. It does not restore
+   either actor's position. Offsetting position errors can produce the same
+   check. This is not a state snapshot, complete state hash or synchronization
+   guarantee; the existing input replay cannot supply the missing state.
+
+What ran, without booting
+
+Command:
+build/windows/Release/b2.exe --check-prediction data/local/default.xbe OUTPUT
+OUTPUT must not already exist. The command writes OUTPUT/report.json and exits
+3 while the full gate remains incomplete; inspect components_passed separately.
+
+Two independent memory contexts each contain two moving bodies with distinct
+linear and angular force histories. These are explicitly synthetic free bodies:
+no gravity, road, wheels/contact simulation, throttle model, traffic or crashes.
+They call original 5AD00 at the original 60 Hz step, and original D7240/D73B0
+for time. No game entry point, window, graphics/audio device or socket is opened.
+The diagnostic supplies no kernel services, so attempted service calls fail.
+
+The reference runs 24 ticks uninterrupted. The other context deliberately uses
+wrong force history for body two, leaving body one unchanged. After restoring
+authoritative checkpoints it replays 0, 3, 6 and 9 ticks (0..150 ms of history).
+Every corrected result matches the reference byte for byte: selected state,
+floating context, timer, matrices, and each complete 2100-byte body region.
+The authoritative context also remains unchanged. Omitting linear velocity from
+restoration is detected, proving that a position-only restore is insufficient.
+
+A separate original-replay check links both actor positions, records 32 samples,
+and confirms that playback neither restores displaced actors nor detects equal
+and opposite displacement. Deliberately changing the check byte in either
+actor's position does trigger the original disagreement flag.
+
+Final native result: 3 component groups passed; checkpoint size 1016 bytes;
+18 corrected ticks replayed across the four history lengths; 11.3649 ms total
+on an AMD Ryzen 5 5600X. These are diagnostic timings, not gameplay or network
+latency. Report: build/checks/online-state-20261018/final/report.json.
+The Release build passed. Existing CPU diagnostics also passed all 52 groups
+(26026 instruction, 3329 memory, 6744 floating and 109 control cases).
+All owned build/diagnostic workers exited. No gameplay benchmark was run.
+An XBE copy with one changed code byte was also rejected before execution or
+output-directory creation (exit 1). Original game files were left untouched.
+
+Requirements identified after the free-body checks
+
+Create a no-boot fixture of two real player-controlled actors using verified
+original initialization and gameplay data. Map controls, wheel/contact state,
+nearby road/traffic, random generators and crash/respawn state through the full
+update. Account for allocation, timers, queues and scene/object lifetimes rather
+than copying pointers or all guest RAM. Identify which update work can be replayed
+without publishing audio, effects or storage operations twice.
+
+Then repeat correction/replay through steering, braking, boost, two-car/traffic
+contacts, crash and respawn, with negative cases that omit each causal state
+group and detect divergence or duplicated effects. Only that evidence can turn
+the first gate into a pass. The current result does not disprove that design;
+it establishes a reproducible foundation and identifies the remaining work.
+
+Extended fixture and stopping point, 2026-10-18
+
+Command:
+build/windows/Release/b2.exe --check-prediction data/local/default.xbe "Burnout 2/Burnout 2 - Point of Impact (USA).xiso.iso" OUTPUT
+The ISO form selects the real-car fixture. OUTPUT must be fresh. It still exits
+3 because the full prediction gate has not passed. Final run:
+build/checks/online-race-20261018/probe-46/report.json
+
+This fixture loads the original FWYL road/collision sectors, Traffic.TRA,
+compact-car RCX geometry and global effects dictionary. Original human actors
+are at 4B9C50 and 4BE1C0, stride 4570; their human bodies are at actor+3090.
+Two SDL virtual controllers pass through the native input provider, original
+XInput calls, original profiles and original player-control code. Physical
+controllers are excluded. Inputs are refreshed explicitly at each simulated tick.
+
+The final run executes original two-player update 19B00, including its delegate
+to physics 822B0, and original tick advance D73B0 at 60 Hz. After 120 warm-up
+ticks, it runs 480 recorded updates. Player one accelerates into an actual NPC;
+player two holds the brake. Up to 11 traffic vehicles are active. The original
+crash flag first appears at recorded tick 3, remains for 299 frames and clears
+at tick 302 through the original recovery path. No crash/contact flags are
+injected. Initial poses and speed are controlled fixture conditions.
+
+An earlier probe-24 run demonstrated direct human-car momentum transfer at
+tick 3. That probe used the physics update before full sound/mode setup; it is
+supporting evidence, not the final coverage of all scenarios. Steering, boost
+and complete collision/recovery scenarios for both players remain follow-up work.
+
+Sound failure and correction
+
+The invalid sound pointer at original 108245 was downstream of a failed resource
+creation. The fixture had installed RenderWare's default CRT file provider but
+omitted the title's provider. The effects filename became \\??\\data\\b2distfx.bin
+and failed with C0000034. Original 13550 initializes the title file pool and
+installs its verified callbacks through D85E0 and the tail at D88A0. Calling
+13550 before dictionary/sound loading resolves the real disc filenames; no
+replacement sound objects or edited asset paths are needed.
+
+Original CC3E0 then needs asynchronous reads and two original workers, routine
+112960. The isolated Xbox provider now pumps those native fibers, I/O, timers
+and DPCs while an isolated component waits, with a two-second wait limit and
+the existing instruction budget. It never starts the executable entry point.
+Teardown cancels and unwinds the workers before deleting their native stacks.
+
+Final sound initialization succeeds, loads all five compiled effects, and leaves
+both original workers waiting normally. Native audio output is explicitly
+disabled for this fixture; audio_output_open is false. There are no live sound
+voices in this scenario (audio_buffers is zero). This verifies initialization,
+not crash/engine sound playback or replay suppression. The entire recorded race
+update completes without a native boundary or memory-access error.
+
+Validation and next work
+
+Release build and existing diagnostics passed: CPU 52 groups, input 57 cases,
+storage 2061 cases, spatial 54 plus 83 binding cases, audio 70 cases and effects
+67 checks. Results are under build/checks/online-race-20261018/verification/.
+All owned build and diagnostic processes exited. No game boot, window, audio
+output, socket, computer use or gameplay benchmark was involved in this final run.
+
+Resume with a bounded checkpoint covering both complete cars, wheel/contact
+state, active traffic, randomness, timers, crash recovery, queues and object
+lifetimes. Compare authoritative and predicted contexts through corrections,
+then prove that replay does not duplicate audio, effects, rumble or file writes.
+The current real-car fixture does not yet save or restore those states. Keep
+gate_passed false until those checks and missing input scenarios are verified.

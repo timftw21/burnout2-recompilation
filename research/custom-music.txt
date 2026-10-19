@@ -144,3 +144,126 @@ Native audio checks pass 70 cases; binding checks pass 74 cases, alongside
 54 spatial cases and 1000 original calculations. No game was booted or audio
 device opened during this follow-up. Existing settings remain byte-for-byte
 unchanged. Manual in-game verification of the correction remains with the user.
+
+Loop Track in Music Selection (2026-10-19)
+
+The native Music Selection screen now has a third row, Loop Track, with Off/On
+values. It defaults to Off and saves its confirmed value as loop_track in the
+PC preferences. Original game saves are unchanged. The original menu's row
+descriptor at screen+1F9C and selector table at screen+1F68 share the extended
+three-row table. Hook 462DA installs it before the original view binds its rows.
+Native navigation handles the new string-valued row. Hook 46510 commits after
+the original soundtrack/song selections; Back leaves the setting unchanged.
+
+Looping uses the original XACT playlist repeat flag (playlist+58, bit 2), with
+one selected song in its queue. Original C91D0 builds that queue. The included
+Burnout 1 filename table is indexed by the selected song at C91F7; C92D3 queues
+one entry. Imported music's descriptor at C92F9 changes from original type 3
+(soundtrack) to verified type 4 (one song), carrying the selected song ID and
+index. Original 20DDB8 and 20DDBD create and advance both kinds of queue. Their
+repeat handling wraps the single entry without replacing the decoder or mixer.
+Loop mode skips C9333's initial song-index compensation and CA348's later index
+increment so playback notifications retain the selected song. Off preserves
+the original full playlist and song advancement. The game's normal Burnout 2
+course music already loops and is unaffected by this selected-music path.
+
+The supported original XBE hash was verified before inspecting these bounded
+address ranges. The existing custom-music diagnostic now passes 1319 cases:
+native menu navigation/confirmation/cancellation and first/middle/last songs
+from the included and seven-song imported catalogues, with Loop Track on/off.
+Forty further original queue advances per selection verify repeat/advancement.
+No audio device or game window is needed for these checks. The rebuilt Release
+also passes target verification, 155 audio bindings, 54 spatial cases and 1000
+original calculations, 77 audio cases, 67 effects cases, all 12 included music
+files, 52 CPU groups, and the offscreen settings persistence check.
+
+Evidence: build/checks/loop-track-20261019/verified. Live menu layout and gameplay
+verification are left to the user for their manual check.
+
+Initial secondary placement and uninterrupted loop changes (2026-10-19)
+
+The user confirmed looping works, requested the same toggle under Pause >
+Options, and reported that confirming a loop change restarts the menu music.
+The earlier implementation explicitly called C91D0 when confirming Loop Track.
+That function stops playback and destroys/recreates the playlist. This is the
+restart's cause. The single-song queue strategy above is superseded here.
+
+Keep the complete original playlist and change only its natural EOF advance.
+Original 2142D8 calls playlist Next (2106EF). That calls 210616, which closes
+the completed decoder/file, advances the current entry and reopens it through
+the original playback path. At 21066E, retaining the current link rather than
+reading its next link repeats that entry. The hook checks the active title
+playlist at 57C1F4 and the two verified caller return addresses, 21072C and
+2142DD. Initial song selection at C9317, explicit Next at C6123 and other audio
+playlists retain their original advancement. Changing the setting touches no
+playlist, decoder or stream. The next EOF uses the new setting.
+
+The original first-start index compensation at C9333 is restored. A repeated
+EOF records that the following start notification repeats the current song;
+CA348 consumes that fact instead of advancing its displayed index. A toggle
+between EOF and notification therefore does not misidentify the playing song.
+
+The screen initially mistaken for Pause Options uses the descriptor at screen+E8, with Music Volume
+and SFX Volume at screen+108 and +120. Hook 4C5B4 appends the shared Loop Track
+row before the view binds this descriptor. Native 45F40/45F60 provide its
+left/right controls. Hook 4BAE0 copies the volume values back to their original
+embedded fields before the original live-volume handler; it also saves a loop
+change immediately, matching the pause menu's live adjustment behavior. Both
+menus initialize their row from the same PC preference. New menu storage remains
+one page for the session. Only bounded original address ranges were inspected.
+
+Correction: this descriptor belongs to front-end Audio, not the race pause
+Options menu. The user identified the wrong placement; it is removed below.
+The two-row menu checks in this first validation exercised front-end Audio.
+
+Release validation passed: 2055 custom-music cases, including native pause
+navigation, shared setting persistence, preserved volume fields, first/middle/
+last songs from both catalogues, 40 consecutive EOF advances, toggling in both
+menus with the playlist/decoder handle unchanged, pending notification changes,
+explicit Next and unrelated playlists. Existing target, audio, spatial/bindings,
+effects, all 12 included songs, CPU and offscreen settings checks also passed.
+Evidence is under build/checks/loop-track-pause-20261019/verified. The Release
+executable was rebuilt; no game session or audio device was opened. The user
+retains live layout and playback verification. Installation.zip was produced by
+cmake/package.ps1 from the current build inputs; its 95-file payload was checked
+against those sources, with private/generated files absent and HEAD/index intact.
+
+Correct race pause Options location (2026-10-19)
+
+User evidence: build/windows/Release/build/captures/frame-121493606200/frame.png,
+captured 2026-10-19 at 13:57 local time, 1920x1440. It shows the race paused on
+OPTIONS: Music Volume, Effects Volume, Soundtrack, Track and Vibration. This is
+the requested location, distinct from front-end Audio. The new order places
+Loop Track between Track and Vibration. The original Music Selection toggle
+remains, sharing the same PC preference.
+
+Original 47330 builds the race pause screen. Its descriptor is at screen+80,
+with five 24-byte rows at screen+A0. The music selector at screen+208 binds to
+that table with soundtrack/track rows 2/3. Hook 4788F runs after the original
+row setup; it adds Loop Track at row 4 and moves Vibration to row 5 in external
+storage. Descriptor+4 and selector+1F64 share the extended table. The original
+screen allocation and embedded fields are preserved.
+
+Pause initialization at 46DB0, its navigation at 47AE0 and generic row handlers
+45F40/45F60 are retained. Verified embedded-row accesses at 46E84, 46EB6, 47C87,
+47C8E, 47CB4 and 47CE5 now read the descriptor's table. The original fixed
+five-row reset/cap at 46DDF, 46DFC and 46E04 uses the descriptor's count, so the
+sixth row stays reachable and focused. Hook 46EDA refreshes volume/vibration
+values and the loop preference before binding the Options view.
+
+The original live-volume handler at 47190 receives synchronized embedded fields
+B0/C8. Confirmation at 47220 also synchronizes Vibration at 110 and saves the
+loop setting. A confirms and Start resumes through that same original commit;
+B cancels, with an unconfirmed loop edit discarded on reopening. No playlist
+rebuild is introduced. The prior 4C5B4/4BAE0 front-end Audio hooks are removed.
+All addresses were checked against the same supported original XBE bytes.
+
+The rebuilt Release passes 2071 custom-music cases. These now check the actual
+race menu's six-row descriptor and music-selector binding, the captured row
+labels/order, native navigation from Track to Loop Track to Vibration, the final
+row boundary, confirmation/cancellation, volume and vibration synchronization,
+and the absence of a third front-end Audio row. Existing looping/continuous
+playback checks and target, spatial/audio bindings, audio, effects, twelve-song,
+CPU and hidden settings checks pass. Evidence: build/checks/loop-track-location-
+20261019/verified. No game or audio device was opened. Live verification remains
+with the user.

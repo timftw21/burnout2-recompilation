@@ -127,7 +127,7 @@ struct Xbox::State {
     float output_gain=1;
     std::unique_ptr<Spatial> audio_spatial;
     struct AudioBuffer {
-        std::uint32_t raw,descriptor,voice,identifier,references=1;AudioFormat format;
+        std::uint32_t raw,descriptor,voice,identifier;AudioFormat format;
         std::uint32_t flags=0,input_bin=UINT32_MAX;
         SpatialParameters spatial{},deferred_spatial{};
         EnvironmentParameters environment{},deferred_environment{};
@@ -136,7 +136,7 @@ struct Xbox::State {
     };
     std::map<std::uint32_t,AudioBuffer> audio_buffers;
     struct AudioStream {
-        std::uint32_t raw=0,descriptor=0,identifier=0,references=1,callback=0,context=0;
+        std::uint32_t raw=0,descriptor=0,identifier=0,callback=0,context=0;
         AudioFormat format;
         std::vector<std::array<std::uint32_t,6>> packets;
         std::uint64_t submitted=0,completed=0;
@@ -145,6 +145,9 @@ struct Xbox::State {
     std::uint32_t audio_device=0,audio_references=0;
     std::uint32_t audio_effect_descriptor=0,audio_effect_count=0;
     std::uint32_t audio_effect_program_words=0,audio_effect_scratch_bytes=0;
+    std::uint32_t audio_reverb=UINT32_MAX,audio_crosstalk=UINT32_MAX;
+    EnvironmentListener audio_environment{},audio_deferred_environment{};
+    bool audio_pending_environment=false,audio_headphones=false;
     SpatialListener audio_listener,audio_deferred_listener;
     std::uint32_t audio_pending_listener=0;
     bool audio_full_hrtf=false;
@@ -190,6 +193,7 @@ struct Xbox::State {
     std::array<std::uint32_t,4> watched_addresses{};
     std::vector<std::unique_ptr<Thread>> threads;
     Thread* current=nullptr;
+    Thread* isolated_owner=nullptr;
     void* scheduler=nullptr;
     bool converted=false,stopping=false,entry_returned=false,thread_cleanup_pending=false;
     std::string boundary;
@@ -240,6 +244,8 @@ struct Xbox::State {
     std::uint32_t world_camera=0;
     float world_original_far=0;
     bool world_ready=false,world_reflecting=false;
+    std::uint32_t music_menu_storage=0;
+    bool music_repeated=false;
     struct ImportedTrack {
         bool selected=false;
         WorldMaterials materials;
@@ -256,6 +262,8 @@ struct Xbox::State {
 
     State(Xbe& image,Memory& memory,std::span<std::byte> ram,const std::filesystem::path& disc_path,XboxHost host):image(image),memory(memory),ram(ram),host(std::move(host)) {
         if(ram.size()!=64*1024*1024 || !image.supported()) throw std::runtime_error("Native Xbox requires the verified image and 64 MiB RAM");
+        std::memcpy(audio_environment.data(),memory.access(0x00237BD8,sizeof(audio_environment)),sizeof(audio_environment));
+        audio_deferred_environment=audio_environment;
         if(this->host.draw_distance!=1 && this->host.draw_distance!=2 && this->host.draw_distance!=4)
             throw std::runtime_error("Draw distance must be 1x, 2x or 4x.");
         if(this->host.draw_distance>1) {
@@ -361,6 +369,13 @@ struct Xbox::State {
         for(auto& request:pending_io) if(request.active) {
             CancelIoEx(request.native,&request.overlap);
             DWORD transferred=0;GetOverlappedResult(request.native,&request.overlap,&transferred,TRUE);
+        }
+        if(isolated_owner && scheduler) {
+            stopping=true;
+            for(auto& thread:threads) if(thread.get()!=isolated_owner && thread->state!=ThreadState::ended) {
+                current=thread.get();SwitchToFiber(thread->fiber);
+            }
+            current=isolated_owner;
         }
         for(unsigned i=0;i<watched_addresses.size();++i) if(watched_addresses[i]) diagnostic_watch(i,nullptr);
         for(auto& thread : threads) if(thread->fiber) DeleteFiber(thread->fiber);
@@ -536,6 +551,7 @@ struct Xbox::State {
         auto& cpu=thread->cpu;
         cpu.kernel=&services; cpu.clock=&clock; cpu.diagnostic=live && graphics_initialized?nullptr:&diagnostic;
         cpu.skip_intro=host.skip_intro;cpu.draw_distance=float(host.draw_distance);
+        cpu.ultrawide=host.ultrawide;cpu.motion_blur=host.motion_blur;
         cpu.game_timing=host.renderer?&game_timing:nullptr;
         cpu.presentation=host.renderer?&presentation:nullptr;
         if(!host.imported_tracks.empty()) cpu.world_materials=&imported.materials;
@@ -583,14 +599,49 @@ struct Xbox::State {
     }
     void yield(ThreadState state=ThreadState::ready,std::uint32_t object=0,
                std::chrono::steady_clock::time_point due=std::chrono::steady_clock::time_point::max()) {
-        if(!scheduler) throw NativeBoundary(current?current->cpu.eip:0,"offline native call requires an initialized scheduler to wait");
+        if(!scheduler && current!=isolated_owner) throw NativeBoundary(current?current->cpu.eip:0,"offline native call requires an initialized scheduler to wait");
         if(memory.load<std::uint8_t>(current->tib+0x24)>1) throw NativeBoundary(current->cpu.eip,"a DPC attempted a blocking wait");
         current->state=state; current->wait_object=object; current->due=due;
         if(object) current->wait_kind=WaitKind::critical;
-        {PerfScope idle(host.performance,PerfPhase::scheduler);SwitchToFiber(scheduler);}
+        if(current==isolated_owner) pump_isolated(true);
+        else {PerfScope idle(host.performance,PerfPhase::scheduler);SwitchToFiber(scheduler);}
         if(stopping) throw ThreadExit{0xC0000120};
         current->state=ThreadState::running;
         current->wait_kind=WaitKind::none;
+    }
+    void pump_isolated(bool waiting=false) {
+        if(!isolated_owner || current!=isolated_owner)
+            throw std::runtime_error("Isolated services require their owning diagnostic CPU");
+        if(!scheduler) {
+            if(IsThreadAFiber()) scheduler=GetCurrentFiber();
+            else {scheduler=ConvertThreadToFiberEx(nullptr,FIBER_FLAG_FLOAT_SWITCH);converted=scheduler!=nullptr;}
+            if(!scheduler) throw std::runtime_error("Cannot enter isolated native scheduler");
+        }
+        HostFloatingScope floating(isolated_owner->cpu.floating);
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+        unsigned slices=0;
+        for(;;) {
+            dispatch_io();dispatch_timers();dispatch_dpcs(*isolated_owner);
+            const auto now=std::chrono::steady_clock::now();
+            if(waiting && (isolated_owner->due<=now || waiting_ready(*isolated_owner))) break;
+            Thread* selected=nullptr;
+            for(std::size_t offset=0;offset<threads.size();++offset) {
+                const auto index=(next_runnable+offset)%threads.size();auto& candidate=*threads[index];
+                if(&candidate==isolated_owner || candidate.suspended || candidate.state==ThreadState::ended) continue;
+                if(candidate.state==ThreadState::waiting) {
+                    if(candidate.due>now && !waiting_ready(candidate)) continue;
+                    candidate.state=ThreadState::ready;
+                }
+                selected=&candidate;next_runnable=(index+1)%threads.size();break;
+            }
+            if(now>=deadline) throw NativeBoundary(isolated_owner->cpu.eip,"isolated native service wait exceeded two seconds");
+            if(!selected) {if(!waiting) break;Sleep(1);continue;}
+            current=selected;clock_data();quantum_due=now+std::chrono::milliseconds(1);
+            SwitchToFiber(selected->fiber);current=isolated_owner;
+            if(!boundary.empty()) throw std::runtime_error(boundary);
+            collect_threads();
+            if(!waiting && ++slices>=threads.size()) break;
+        }
     }
     void dispatcher(std::uint32_t address,unsigned type,unsigned size,std::uint32_t signal) {
         memory.access(address,size);
@@ -1036,15 +1087,36 @@ struct Xbox::State {
         return std::memcmp(&previous,&audio_listener,sizeof(audio_listener)) ||
             std::ranges::any_of(audio_buffers,[](const auto& entry){return entry.second.has_spatial && entry.second.curve_count;});
     }
+    std::uint32_t effect_offset(std::uint32_t index) const {
+        return memory.load<std::uint32_t>(audio_effect_descriptor+8+index*32+8)-0xFE830000U;
+    }
+    void update_headphones() {
+        if(audio_crosstalk==UINT32_MAX) return;
+        std::uint32_t flags=0;const auto offset=effect_offset(audio_crosstalk)+0x10;
+        audio->effect_data(offset,std::as_writable_bytes(std::span(&flags,1)));
+        flags=audio_headphones?flags&~2U:flags|2U;
+        audio->effect_data(offset,std::as_bytes(std::span(&flags,1)),false);
+    }
+    void update_environment() {
+        if(!audio_spatial) audio_spatial=std::make_unique<Spatial>(memory);
+        audio_spatial->environment(audio_environment);
+        if(audio_reverb==UINT32_MAX) return;
+        std::array<std::byte,0x118> state;const auto offset=effect_offset(audio_reverb);
+        audio->effect_data(offset,state);const auto parameters=audio_spatial->reverb(state);
+        audio->effect_data(offset+0x10,std::span(parameters).subspan(0x10,4),true);
+        audio->effect_data(offset+0x118,std::span(parameters).subspan(0x118),true);audio->commit_effects();
+    }
     void commit_spatial() {
         const auto previous_listener=audio_listener;
         const bool listener_pending=audio_pending_listener!=0;
+        const bool environment_changed=audio_pending_environment;
+        if(environment_changed) {audio_environment=audio_deferred_environment;audio_pending_environment=false;update_environment();}
         copy_listener(audio_listener,audio_deferred_listener,audio_pending_listener);
         const bool listener_changed=listener_pending && listener_needs_update(previous_listener);
         audio_pending_listener=0;
         std::array<AudioBuffer*,256> changed_buffers;unsigned count=0;
         for(auto& [object,buffer]:audio_buffers) {
-            const bool changed=listener_changed || buffer.pending_spatial || buffer.pending_curve || buffer.pending_environment;
+            const bool changed=listener_changed || environment_changed || buffer.pending_spatial || buffer.pending_curve || buffer.pending_environment;
             if(buffer.pending_spatial) {buffer.spatial=buffer.deferred_spatial;buffer.has_spatial=true;buffer.pending_spatial=false;}
             if(buffer.pending_curve) {buffer.curve=buffer.deferred_curve;buffer.curve_count=buffer.deferred_curve_count;buffer.pending_curve=false;}
             if(buffer.pending_environment) {buffer.environment=buffer.deferred_environment;buffer.pending_environment=false;}
@@ -1084,6 +1156,31 @@ struct Xbox::State {
             }
         }
     }
+    std::uint32_t release_audio_buffer(std::uint32_t object) {
+        const auto found=audio_buffers.find(object);auto& buffer=found->second;
+        // Original AddRef (22C1E4) increments this same SDK field.
+        const auto references=memory.load<std::uint32_t>(buffer.raw+4);
+        if(!references) return 0;
+        memory.store<std::uint32_t>(buffer.raw+4,references-1);
+        if(references==1) {
+            const auto output=memory.load<std::uint32_t>(buffer.descriptor+0xB0);
+            audio->release(buffer.identifier);release_allocation(allocations.find(buffer.raw));audio_buffers.erase(found);
+            if(output) release_audio_buffer(output+28);
+        }
+        return references-1;
+    }
+    void audio_output(std::uint32_t identifier,std::uint32_t descriptor,std::uint32_t destination,std::uint32_t address) {
+        const auto target=audio_buffers.find(destination);
+        if(destination && target==audio_buffers.end()) throw NativeBoundary(address,"invalid audio output buffer");
+        const auto output=destination?target->second.raw:0,previous=memory.load<std::uint32_t>(descriptor+0xB0);
+        if(output==previous) return;
+        audio->route(identifier,destination?target->second.identifier:0);
+        // Original 22DADD/231D69 retain the output at descriptor+B0 until
+        // the source is released or routed elsewhere. Streams share this path.
+        if(output) memory.store<std::uint32_t>(output+4,memory.load<std::uint32_t>(output+4)+1);
+        memory.store<std::uint32_t>(descriptor+0xB0,output);
+        if(previous) release_audio_buffer(previous+28);
+    }
     bool audio_stream_api(Cpu& cpu,std::uint32_t address) {
         if(address==0x0022F90E) {
             if(argument(cpu,0)!=audio_device || argument(cpu,3)) throw NativeBoundary(address,"invalid sound-stream device or aggregation");
@@ -1113,13 +1210,18 @@ struct Xbox::State {
         const auto found=audio_streams.find(object);if(found==audio_streams.end()) return false;
         auto& stream=found->second;
         switch(address) {
-        case 0x0022CBC4:finish(cpu,4,++stream.references);return true;
+        case 0x0022CBC4: {
+            const auto references=memory.load<std::uint32_t>(stream.raw+8)+1;
+            memory.store<std::uint32_t>(stream.raw+8,references);finish(cpu,4,references);return true;
+        }
         case 0x0022CC0B: {
-            const auto references=--stream.references;
+            const auto references=memory.load<std::uint32_t>(stream.raw+8)-1;
+            memory.store<std::uint32_t>(stream.raw+8,references);
             if(!references) {
-                const auto identifier=stream.identifier,raw=stream.raw;
+                const auto identifier=stream.identifier,raw=stream.raw,output=memory.load<std::uint32_t>(stream.descriptor+0xB0);
                 audio->flush(identifier);publish_audio_packets(cpu,object);
                 audio->release(identifier);release_allocation(allocations.find(raw));audio_streams.erase(object);
+                if(output) release_audio_buffer(output+28);
             }
             finish(cpu,4,references);return true;
         }
@@ -1168,9 +1270,7 @@ struct Xbox::State {
         case 0x0022D3F0:audio_mixbins(stream.identifier,argument(cpu,1),true);finish(cpu,8,success);return true;
         case 0x0022E6E6:audio_mixbins(stream.identifier,argument(cpu,1));finish(cpu,8,success);return true;
         case 0x0022E694: {
-            const auto destination=argument(cpu,1);const auto target=audio_buffers.find(destination);
-            if(destination && target==audio_buffers.end()) throw NativeBoundary(address,"invalid stream output buffer");
-            audio->route(stream.identifier,destination?target->second.identifier:0);finish(cpu,8,success);return true;
+            audio_output(stream.identifier,stream.descriptor,argument(cpu,1),address);finish(cpu,8,success);return true;
         }
         case 0x0022EF6B: {
             const auto format=audio_format(argument(cpu,1));audio->format(stream.identifier,format);stream.format=format;
@@ -1194,6 +1294,8 @@ struct Xbox::State {
                 case 0x0022EF2F:case 0x0022E754:case 0x0022E770:case 0x0022D952:
                 case 0x0022D7D2:case 0x0022E738:case 0x0022D4DE:case 0x0022D48C:case 0x0022CE20:count=2;break;
                 case 0x0022CDA9:count=3;break;
+                case 0x0022FA52:count=3;break;
+                case 0x0022D776:count=2;break;
                 case 0x0022D8BA:case 0x0022C11B:count=1;break;
                 }
                 if(count) {
@@ -1203,6 +1305,10 @@ struct Xbox::State {
                     if(address==0x0022D734) {
                         event.effect_bytes=std::min<std::uint32_t>(event.arguments[4],static_cast<std::uint32_t>(event.effect_data.size()));
                         if(event.effect_bytes) std::memcpy(event.effect_data.data(),memory.access(event.arguments[3],event.effect_bytes),event.effect_bytes);
+                    }
+                    if(address==0x0022FA52) {
+                        event.effect_bytes=sizeof(EnvironmentListener);
+                        std::memcpy(event.effect_data.data(),memory.access(event.arguments[1],event.effect_bytes),event.effect_bytes);
                     }
                     const auto found=audio_buffers.find(event.arguments[0]);
                     if(found!=audio_buffers.end()) {
@@ -1234,7 +1340,7 @@ struct Xbox::State {
         if(address==0x0022FC18) {
             if(argument(cpu,0) || argument(cpu,2)) throw NativeBoundary(address,"non-default audio device or aggregation is unsupported");
             if(!audio) {
-                audio=std::make_unique<Audio>(true,output_gain);
+                audio=std::make_unique<Audio>(host.audio_output,output_gain);
                 if(host.performance && host.performance->active()) audio->performance(true);
                 // RenderWare 211634 reads the real 48 kHz processing counter.
                 // Preserve its original wraparound/time conversion, with native
@@ -1261,6 +1367,27 @@ struct Xbox::State {
         if(address==0x0022D792) {
             if(object!=audio_device) throw NativeBoundary(address,"invalid native sound device");
             audio->mixbin_headroom(argument(cpu,1),argument(cpu,2));finish(cpu,12,success);return;
+        }
+        if(address==0x0022D776) {
+            if(object!=audio_device) throw NativeBoundary(address,"invalid native sound device");
+            const bool enabled=argument(cpu,1)!=0;
+            if(enabled!=audio_headphones) {audio_headphones=enabled;update_headphones();}
+            finish(cpu,8,success);return;
+        }
+        if(address==0x0022FA52) {
+            if(object!=audio_device) throw NativeBoundary(address,"invalid native sound device");
+            if(audio_reverb==UINT32_MAX) {finish(cpu,12,0x88780032U);return;}
+            const auto deferred=argument(cpu,2);
+            if(deferred>1) throw NativeBoundary(address,"invalid environmental listener apply mode");
+            EnvironmentListener parameters;std::memcpy(parameters.data(),memory.access(argument(cpu,1),sizeof(parameters)),sizeof(parameters));
+            Spatial::validate(parameters);audio_deferred_environment=parameters;audio_pending_environment=deferred!=0;
+            if(!deferred) {
+                audio_environment=parameters;update_environment();
+                std::array<AudioBuffer*,256> buffers;unsigned count=0;
+                for(auto& [buffer_object,buffer]:audio_buffers) buffers[count++]=&buffer;
+                update_spatial(std::span(buffers).first(count));
+            }
+            finish(cpu,12,success);return;
         }
         if(address==0x0022D70D || address==0x0022D734 || address==0x0022D75E) {
             if(object!=audio_device) throw NativeBoundary(address,"invalid native sound device");
@@ -1325,6 +1452,9 @@ struct Xbox::State {
             }
             audio_effect_descriptor=descriptor;audio_effect_count=static_cast<std::uint32_t>(effects.effects.size());
             audio_effect_program_words=effects.program_words;audio_effect_scratch_bytes=scratch_bytes;
+            audio_reverb=locations?memory.load<std::uint32_t>(locations):UINT32_MAX;
+            audio_crosstalk=locations?memory.load<std::uint32_t>(locations+4):UINT32_MAX;
+            update_headphones();
             if(output) memory.store<std::uint32_t>(output,descriptor);
             finish(cpu,20,success);return;
         }
@@ -1388,7 +1518,7 @@ struct Xbox::State {
             memory.store<std::uint32_t>(body+0xBC,size);
             memory.store<std::uint32_t>(body+0xC4,size);memory.store<std::uint32_t>(body+0xCC,size);
             memory.store<std::uint16_t>(voice+18,1);
-            auto& buffer=audio_buffers.emplace(public_object,AudioBuffer{raw,body,voice,identifier,1,format,flags,input_bin}).first->second;
+            auto& buffer=audio_buffers.emplace(public_object,AudioBuffer{raw,body,voice,identifier,format,flags,input_bin}).first->second;
             if(flags&0x10) {
                 buffer.spatial[0]=76;
                 std::memcpy(buffer.spatial.data()+1,memory.access(0x00237C74,72),72);
@@ -1406,9 +1536,7 @@ struct Xbox::State {
         auto& buffer=found->second;
         switch(address) {
         case 0x0022C11B: {
-            const auto references=--buffer.references;
-            if(!references){audio->release(buffer.identifier);release_allocation(allocations.find(buffer.raw));audio_buffers.erase(found);}
-            finish(cpu,4,references);return;
+            finish(cpu,4,release_audio_buffer(object));return;
         }
         case 0x0022EF4B: {
             const auto pointer=argument(cpu,1),size=argument(cpu,2);
@@ -1428,10 +1556,7 @@ struct Xbox::State {
         case 0x0022D87A:case 0x0022D3F0:audio_mixbins(buffer.identifier,argument(cpu,1),true);finish(cpu,8,success);return;
         case 0x0022E738:audio->frequency(buffer.identifier,argument(cpu,1));finish(cpu,8,success);return;
         case 0x0022E754: {
-            const auto destination=argument(cpu,1);
-            const auto target=audio_buffers.find(destination);
-            if(destination && target==audio_buffers.end()) throw NativeBoundary(address,"invalid audio output buffer");
-            audio->route(buffer.identifier,destination?target->second.identifier:0);finish(cpu,8,success);return;
+            audio_output(buffer.identifier,buffer.descriptor,argument(cpu,1),address);finish(cpu,8,success);return;
         }
         case 0x0022E8C4: {
             const auto pointer=argument(cpu,1),count=argument(cpu,2),apply=argument(cpu,3);
@@ -1603,6 +1728,67 @@ struct Xbox::State {
         memory.store<std::uint32_t>(playlist+8,songs+36);memory.store<std::uint32_t>(playlist+0x38,1);
         memory.store<std::uint32_t>(0x57C210,1);memory.store<std::uint32_t>(0x57C1EC,index);memory.store<std::uint32_t>(0x57C208,0);
         music_call(cpu,0xC91D0,0xC9AFB,object);
+    }
+    void set_music_loop(bool enabled) {
+        if(host.loop_track==enabled) return;
+        host.loop_track=enabled;
+        if(host.music_loop_changed) host.music_loop_changed(enabled);
+    }
+    bool music_control(Cpu& cpu,std::uint32_t site) {
+        if(site==0x21066E) {
+            // The original stream's EOF path calls Next at 2142D8. Keep its
+            // current queue entry on repeat; initial selection and manual Next
+            // still advance normally. The original code reopens the song.
+            if(cpu.registers[esi]==memory.load<std::uint32_t>(0x57C1F4) && cpu.registers[ecx] &&
+               memory.load<std::uint32_t>(cpu.registers[esp]+8)==0x21072C &&
+               memory.load<std::uint32_t>(cpu.registers[ebp]+4)==0x2142DD) {
+                music_repeated=host.loop_track && memory.load<std::uint32_t>(0x57C210)!=0;
+                return music_repeated;
+            }
+        } else if(site==0xC9333) music_repeated=false;
+        else if(site==0xCA348) {const auto repeated=music_repeated;music_repeated=false;return repeated;}
+        else if(site==0x462DA || site==0x4788F || site==0x46EDA) {
+            if(!music_menu_storage) {
+                music_menu_storage=allocate(page,page,true,PAGE_READWRITE);
+                if(!music_menu_storage) throw NativeBoundary(site,"cannot allocate music menu options");
+                constexpr char label[]="Loop Track",off[]="Off",on[]="On";
+                std::memcpy(memory.access(music_menu_storage+0x60,sizeof(label)),label,sizeof(label));
+                std::memcpy(memory.access(music_menu_storage+0x70,sizeof(off)),off,sizeof(off));
+                std::memcpy(memory.access(music_menu_storage+0x78,sizeof(on)),on,sizeof(on));
+                memory.store<std::uint32_t>(music_menu_storage+0x50,music_menu_storage+0x70);
+                memory.store<std::uint32_t>(music_menu_storage+0x54,music_menu_storage+0x78);
+            }
+            const bool paused=site!=0x462DA;
+            const auto object=cpu.registers[esi],descriptor=object+(paused?0x80:0x1F9C);
+            const auto source=memory.load<std::uint32_t>(descriptor+4),storage=music_menu_storage+(paused?0x100:0);
+            const auto count=memory.load<std::uint32_t>(descriptor);
+            if(paused) {
+                if((count!=5 && count!=6) || (source!=object+0xA0 && source!=storage))
+                    throw NativeBoundary(site,"unexpected pause Options rows");
+                if(source!=storage) std::memcpy(memory.access(storage,96),memory.access(source,96),96);
+                // Preserve the original volume/vibration fields used by its
+                // live-volume and confirm handlers. Music rows stay at 2/3.
+                for(unsigned i=0;i<2;++i)
+                    memory.store<std::uint32_t>(storage+i*24+16,memory.load<std::uint32_t>(object+0xB0+i*24));
+                std::memcpy(memory.access(storage+120,24),memory.access(object+0x100,24),24);
+            } else {
+                if(count!=2) throw NativeBoundary(site,"unexpected Music Selection rows");
+                std::memcpy(memory.access(storage,48),memory.access(source,48),48);
+            }
+            const std::array<std::uint32_t,6> row{music_menu_storage+0x60,0,0,music_menu_storage+0x50,host.loop_track?1U:0U,2};
+            std::memcpy(memory.access(storage+(paused?96:48),sizeof(row)),row.data(),sizeof(row));
+            memory.store<std::uint32_t>(descriptor,paused?6:3);memory.store<std::uint32_t>(descriptor+4,storage);
+            memory.store<std::uint32_t>(object+(paused?0x216C:0x1F68),storage);
+        } else if(site==0x46510) set_music_loop(memory.load<std::uint32_t>(music_menu_storage+64)!=0);
+        else if(site==0x47190 || site==0x47220) {
+            const auto object=cpu.registers[ecx],rows=memory.load<std::uint32_t>(object+0x84);
+            if(!music_menu_storage || rows!=music_menu_storage+0x100) throw NativeBoundary(site,"pause music options are not initialized");
+            for(unsigned i=0;i<2;++i)
+                memory.store<std::uint32_t>(object+0xB0+i*24,memory.load<std::uint32_t>(rows+i*24+16));
+            memory.store<std::uint32_t>(object+0x110,memory.load<std::uint32_t>(rows+136));
+            if(site==0x47220) set_music_loop(memory.load<std::uint32_t>(rows+112)!=0);
+        } else throw NativeBoundary(site,"unsupported music control site");
+        return false;
     }
     bool imported_camera_zoom(Cpu& cpu,std::uint32_t object) {
         if(!imported.selected) return false;
@@ -1924,30 +2110,7 @@ struct Xbox::State {
     }
     void enhancement(Cpu& cpu,std::uint32_t address) {
         switch(address) {
-        case 0x1AC27: {
-            // The original widget constructors share (x,y,scale,flags,player).
-            // Keep each complete widget about its authored anchor, including
-            // text spacing, gauge needles and animated children.
-            const auto object=cpu.registers[ecx];
-            for(unsigned i=0;i<32;++i) {
-                if(memory.load<std::uint32_t>(0x3D8580+i*4)!=object) continue;
-                const auto first=memory.load<std::uint32_t>(object+8);
-                const auto next=i==31?33U:memory.load<std::uint32_t>(memory.load<std::uint32_t>(0x3D8584+i*4)+8);
-                if(first>=next || next>hud_layout.anchors.size()) throw NativeBoundary(address,"invalid HUD widget range");
-                const auto method=memory.load<std::uint32_t>(memory.load<std::uint32_t>(object)+4);
-                // Projected world markers and the split-screen divider use
-                // scene/screen coordinates rather than a HUD widget anchor.
-                if(method==0x1F790 || method==0x24080) break;
-                // Lesson targets/scores ignore the constructor's x and use
-                // their own right-aligned column for all four text rows.
-                const auto anchor=std::bit_cast<float>(memory.load<std::uint32_t>(method==0x21F50?0x4D4884:cpu.registers[esp]));
-                for(auto index=first;index<next;++index) {
-                    hud_layout.anchors[index]=anchor;hud_layout.active|=1ULL<<index;
-                }
-                break;
-            }
-            break;
-        }
+        case 0x1AC27:title_hud_widget(cpu,memory);break;
         case 0x1D121: {
             const auto queue=memory.load<std::uint32_t>(0x3D8570),root=memory.load<std::uint32_t>(queue);
             hud_layout.list=memory.load<std::uint32_t>(queue+0x3C);
@@ -1957,11 +2120,15 @@ struct Xbox::State {
             // Native wide split-screen already uses an approximately 854-wide
             // canvas. Compensate only the horizontal stretch still remaining.
             if(!(native_scale>0) || !std::isfinite(native_scale)) throw NativeBoundary(address,"invalid HUD canvas scale");
-            hud_layout.scale=std::min(1.0f,0.75f/native_scale);
+            hud_layout.scale=std::min(1.0f,(host.ultrawide?4.0f/7:0.75f)/native_scale);
             break;
         }
         case 0x81158:case 0x81369:case 0x817F7:
-            submit_graphics(false);gpu->begin_overlay();break;
+            // Shield translucent driving gauges from repeated feedback. Once
+            // they are hidden, retain the original full-frame history: reward
+            // messages deliberately leave a trail as they slide into view.
+            if(title_hud_gauges(memory)) {submit_graphics(false);gpu->begin_overlay();}
+            break;
         case 0x215CE0:
             if(gpu) {submit_graphics(false);gpu->restore_feedback();}break;
         // Preserve the original visibility/material records. Detailed sections
@@ -2074,6 +2241,19 @@ struct Xbox::State {
         if(flush && memory.load<std::uint32_t>(0x00225210)) {gpu->wait();memory.store<std::uint32_t>(context+8,flags|0x2000);}
     }
     void platform(Cpu& cpu,std::uint32_t address) {
+        if(address==0x000E03BE) {
+            const auto source=argument(cpu,0);std::string message;
+            for(unsigned i=0;i<65536;++i) {
+                const auto value=memory.load<std::uint8_t>(source+i);
+                if(!value) {
+                    OutputDebugStringA(message.c_str());
+                    diagnostic_record("{\"type\":\"guest_debug_output\",\"message\":"+json(message)+'}');
+                    finish(cpu,4);return;
+                }
+                message+=char(value);
+            }
+            throw NativeBoundary(address,"debug output exceeds its 64 KiB bound");
+        }
         if(address==0x00128CF8) {
             const auto error=cancel_io(argument(cpu,0));
             if(error) set_last_error(cpu,error);
@@ -3207,6 +3387,14 @@ struct Xbox::State {
             diagnostic_guest(&selected->cpu);{PerfScope guest(host.performance,PerfPhase::guest);SwitchToFiber(selected->fiber);}
             diagnostic_guest(nullptr);collect_threads();
         }
+        auto result=inspect();
+        // Resume sleeping native stacks with cancellation so their C++ and floating
+        // scopes unwind before DeleteFiber releases host stacks.
+        stopping=true;
+        for(auto& thread : threads) if(thread->state!=ThreadState::ended) { current=thread.get(); SwitchToFiber(thread->fiber); }
+        return result;
+    }
+    BootResult inspect() {
         BootResult result;
         result.entry_returned=entry_returned; result.main_reached=diagnostic.reached_watch;
         result.graphics_device_created=graphics!=nullptr;result.graphics_initialized=graphics_initialized;
@@ -3241,10 +3429,6 @@ struct Xbox::State {
         }
         result.cpu.kernel=nullptr; result.cpu.diagnostic=nullptr; result.cpu.clock=nullptr; result.cpu.preempt=nullptr; result.cpu.profile=nullptr;result.cpu.world_view=nullptr;result.cpu.hud_layout=nullptr;
         diagnostic_guest(nullptr);
-        // Resume sleeping native stacks with cancellation so their C++ and floating
-        // scopes unwind before DeleteFiber releases host stacks.
-        stopping=true;
-        for(auto& thread : threads) if(thread->state!=ThreadState::ended) { current=thread.get(); SwitchToFiber(thread->fiber); }
         return result;
     }
 };
@@ -3349,7 +3533,7 @@ void Xbox::capture_frame(const std::filesystem::path& directory,bool automated) 
                 event.clock,json(hex32(event.address)),json(hex32(event.caller)),event.identifier,json(hex32(event.source)),event.start,event.bytes);
             for(unsigned a=0;a<event.count;++a) {if(a) report<<',';report<<json(hex32(event.arguments[a]));}
             report<<']';
-            if(event.address==0x0022D734)
+            if(event.address==0x0022D734 || event.address==0x0022FA52)
                 report<<std::format(",\"effect_data\":{},\"effect_data_truncated\":{}",
                     json(hex_bytes(std::span(event.effect_data).first(event.effect_bytes))),event.effect_bytes<event.arguments[4]);
             report<<'}';
@@ -3367,7 +3551,7 @@ std::string check_audio_listener(const std::filesystem::path& executable,const s
     if(!image.supported() || std::filesystem::exists(output)) throw std::runtime_error("Audio binding checks require the verified XBE and a fresh output directory");
     std::vector<std::byte> ram(64*1024*1024);image.load(std::span(ram).subspan(image.base,image.image_size));Memory memory(0,ram);
     XboxHost provider;provider.storage_root=output;Xbox xbox(image,memory,ram,{},std::move(provider));auto& state=*xbox.state_;
-    state.audio=std::make_unique<Audio>(false);state.audio_device=0xA008;
+    state.host.audio_output=false;
     // Reference setters run their original software-only, deferred SDK path.
     // The separate native provider uses no audio device or game boot.
     constexpr std::uint32_t object=0xA000,settings=0xB000,stack=0xCFC0;
@@ -3380,16 +3564,20 @@ std::string check_audio_listener(const std::filesystem::path& executable,const s
     const auto require=[&](bool passed,std::string_view name) {
         if(!passed) throw std::runtime_error("Audio binding check failed: "+std::string(name));++checks;
     };
-    const auto invoke=[&](std::uint32_t entry,std::span<const std::uint32_t> arguments) {
+    const auto invoke=[&](std::uint32_t entry,std::span<const std::uint32_t> arguments,std::uint32_t expected=0,bool provider_only=false) {
         cpu.registers[esp]=stack;memory.store<std::uint32_t>(stack,return_sentinel);
         for(unsigned i=0;i<arguments.size();++i) memory.store<std::uint32_t>(stack+4+i*4,arguments[i]);
-        invoke_native(cpu,memory,entry);
-        require(cpu.eip==return_sentinel && cpu.registers[esp]==stack+4+arguments.size()*4 && cpu.registers[eax]==0,"original/native setter ABI");
+        if(provider_only) {cpu.eip=entry;state.audio_api(cpu,entry);}
+        else invoke_native(cpu,memory,entry);
+        require(cpu.eip==return_sentinel && cpu.registers[esp]==stack+4+arguments.size()*4 && cpu.registers[eax]==expected,
+            std::format("original/native audio ABI at {}: expected {}, returned {}",hex32(entry),expected,cpu.registers[eax]));
     };
     const auto values=[](const SpatialListener& listener) {
         return std::array<float,15>{listener.position[0],listener.position[1],listener.position[2],listener.velocity[0],listener.velocity[1],listener.velocity[2],
             listener.front[0],listener.front[1],listener.front[2],listener.up[0],listener.up[1],listener.up[2],listener.distance,listener.rolloff,listener.doppler};
     };
+    invoke(0x0022FC18,std::array<std::uint32_t,3>{0,0xA080,0});
+    require(state.audio_device==memory.load<std::uint32_t>(0xA080),"native sound device layout");
     const auto initial=values(state.audio_listener);
     for(unsigned i=0;i<initial.size();++i) memory.store<std::uint32_t>(settings+0x3C+i*4,std::bit_cast<std::uint32_t>(initial[i]));
     struct Setter {std::uint32_t api,reference,count;std::array<float,6> data;};
@@ -3448,6 +3636,40 @@ std::string check_audio_listener(const std::filesystem::path& executable,const s
     double after_curve=0;for(float sample:curve_mix) after_curve+=double(sample)*sample;
     require(after_curve<before_curve,"unchanged listener still observes changed curve bytes");
     invoke(0x0022C11B,std::array<std::uint32_t,1>{curved_buffer});
+    const auto make_buffer=[&](std::uint32_t flags) {
+        std::memset(memory.access(descriptor,24),0,24);memory.store<std::uint32_t>(descriptor,24);
+        memory.store<std::uint32_t>(descriptor+4,flags);memory.store<std::uint32_t>(descriptor+12,format);
+        invoke(0x0022F8EA,std::array<std::uint32_t,4>{state.audio_device,descriptor,result,0});
+        return memory.load<std::uint32_t>(result);
+    };
+    const auto retained=make_buffer(0),retained_raw=state.audio_buffers.at(retained).raw;
+    // AddRef still runs the original SDK code; Release must use the same count.
+    invoke(0x0022C1E4,std::array<std::uint32_t,1>{retained_raw},2);
+    invoke(0x0022C11B,std::array<std::uint32_t,1>{retained},1);
+    require(state.audio_buffers.contains(retained) && memory.load<std::uint32_t>(retained_raw+4)==1,"original AddRef retains native buffer");
+    invoke(0x0022C11B,std::array<std::uint32_t,1>{retained});
+    const auto routed=make_buffer(0),first_output=make_buffer(0x2000),second_output=make_buffer(0x2000),last_output=make_buffer(0x2000);
+    invoke(0x0022D85E,std::array<std::uint32_t,2>{routed,0});
+    invoke(0x0022D7D2,std::array<std::uint32_t,2>{first_output,std::bit_cast<std::uint32_t>(-1200)});
+    invoke(0x0022EF4B,std::array<std::uint32_t,3>{routed,data,sizeof(curve_samples)});
+    invoke(0x0022E754,std::array<std::uint32_t,2>{routed,first_output});
+    invoke(0x0022D896,std::array<std::uint32_t,4>{routed,0,0,1});
+    std::array<float,64> before_release{},after_release{};state.audio->mix(before_release);
+    invoke(0x0022C11B,std::array<std::uint32_t,1>{first_output},1);
+    state.audio->mix(after_release);
+    require(before_release==after_release && before_release[0]>0 && before_release[0]<0.1f,"output reference release preserves continuous mixed samples");
+    invoke(0x0022E754,std::array<std::uint32_t,2>{routed,first_output});
+    require(memory.load<std::uint32_t>(state.audio_buffers.at(first_output).raw+4)==1,"unchanged output does not retain twice");
+    invoke(0x0022E754,std::array<std::uint32_t,2>{routed,second_output});
+    require(!state.audio_buffers.contains(first_output),"replacing output releases its last routing reference");
+    invoke(0x0022E754,std::array<std::uint32_t,2>{routed,0});
+    require(memory.load<std::uint32_t>(state.audio_buffers.at(second_output).raw+4)==1,"clearing output releases its routing reference");
+    invoke(0x0022E754,std::array<std::uint32_t,2>{routed,second_output});
+    invoke(0x0022E754,std::array<std::uint32_t,2>{second_output,last_output});
+    invoke(0x0022C11B,std::array<std::uint32_t,1>{second_output},1);
+    invoke(0x0022C11B,std::array<std::uint32_t,1>{last_output},1);
+    invoke(0x0022C11B,std::array<std::uint32_t,1>{routed});
+    require(state.audio_buffers.empty(),"source release frees the final output chain without leaking voices");
     std::memset(memory.access(descriptor,24),0,24);
     memory.store<std::uint32_t>(descriptor,0x20000000);memory.store<std::uint32_t>(descriptor+4,2);memory.store<std::uint32_t>(descriptor+8,format);
     memory.store<std::uint16_t>(format,1);memory.store<std::uint16_t>(format+2,2);memory.store<std::uint32_t>(format+4,48000);
@@ -3455,6 +3677,9 @@ std::string check_audio_listener(const std::filesystem::path& executable,const s
     memory.store<std::uint16_t>(format+12,4);memory.store<std::uint16_t>(format+14,16);
     invoke(0x0022F90E,std::array<std::uint32_t,4>{state.audio_device,descriptor,result,0});
     const auto stream=memory.load<std::uint32_t>(result),vtable=memory.load<std::uint32_t>(stream);
+    invoke(0x0022CBC4,std::array<std::uint32_t,1>{stream},2);
+    require(memory.load<std::uint32_t>(stream+8)==2,"stream AddRef shares the original SDK field");
+    invoke(0x0022CC0B,std::array<std::uint32_t,1>{stream},1);
     invoke(memory.load<std::uint32_t>(vtable+8),std::array<std::uint32_t,2>{stream,result});
     require(memory.load<std::uint32_t>(result)==5 && memory.load<std::uint32_t>(result+4)==4 && memory.load<std::uint32_t>(result+12)==256,"original stream info layout and lookahead");
     const std::array<std::int16_t,8> samples{8192,-8192,4096,-4096,8192,-8192,4096,-4096};std::memcpy(memory.access(data,sizeof(samples)),samples.data(),sizeof(samples));
@@ -3467,6 +3692,27 @@ std::string check_audio_listener(const std::filesystem::path& executable,const s
     std::array<float,8> mixed{};state.audio->mix(mixed);invoke(0x0022D9CA,{});
     require(memory.load<std::uint32_t>(completed)==8 && !memory.load<std::uint32_t>(status) && memory.load<std::uint32_t>(completed+8)==8 && !memory.load<std::uint32_t>(status+8),"stream packet completion ABI");
     require(std::abs(mixed[0]-0.25f*std::pow(10.f,-600.f/2000.f))<0.000001f && mixed[1]==-mixed[0],"stream routing and default headroom");
+    // XACT calls the SDK's jump wrappers, rather than the underlying stream
+    // methods. Exercise those same entries against audible packet output.
+    memory.fill_elements<std::uint16_t>(0xF000,8192,1024,false);
+    memory.store<std::uint32_t>(packet,0xF000);memory.store<std::uint32_t>(packet+4,2048);
+    invoke(0x0022CDA9,std::array<std::uint32_t,3>{stream,packet,0});
+    std::array<float,64> control_mix{};
+    const auto settle=[&] {state.audio->mix(control_mix);state.audio->mix(control_mix);};
+    const auto headroom=std::pow(10.f,-600.f/2000.f);
+    for(const auto volume:std::array<std::int32_t,3>{-2000,-10000,0}) {
+        invoke(0x0022D98A,std::array<std::uint32_t,2>{stream,std::bit_cast<std::uint32_t>(volume)});
+        settle();const auto expected=volume==-10000?0.f:0.25f*headroom*std::pow(10.f,volume/2000.f);
+        require(std::ranges::all_of(control_mix,[&](float sample){return std::abs(sample-expected)<0.000001f;}),
+            std::format("XACT stream volume wrapper applies {} dB to audible output (sample {})",volume/100.f,control_mix[0]));
+    }
+    invoke(0x0022D9A8,std::array<std::uint32_t,2>{stream,1});settle();
+    require(std::ranges::all_of(control_mix,[](float sample){return sample==0;}),"XACT stream pause wrapper silences queued music");
+    require(memory.load<std::uint32_t>(status+8)==0x8000000A,"paused music retains its queued packet");
+    invoke(0x0022D9A8,std::array<std::uint32_t,2>{stream,0});settle();
+    require(control_mix[0]>0,"XACT stream resume wrapper restores queued music");
+    invoke(0x0022CD0D,std::array<std::uint32_t,1>{stream});
+    memory.store<std::uint32_t>(packet,data+8);memory.store<std::uint32_t>(packet+4,8);
     for(const auto flags:std::array<std::uint32_t,3>{1,3,5}) {
         invoke(0x0022CDA9,std::array<std::uint32_t,3>{stream,packet,0});
         // The original adapter and these four arguments match the live crash.
@@ -3486,7 +3732,61 @@ std::string check_audio_listener(const std::filesystem::path& executable,const s
     require(memory.load<std::uint32_t>(completed+8)==8 && memory.load<std::uint32_t>(status+8)==0x80004004,"regular flush publishes pending packets synchronously");
     invoke(0x0022CDA9,std::array<std::uint32_t,3>{stream,packet,0});state.audio->mix(mixed);invoke(0x0022D9CA,{});
     require(mixed[0]!=0 && !memory.load<std::uint32_t>(status+8),"regular flush resets envelope completion for stream reuse");
-    const auto report=std::format("{{\"format\":\"b2-audio-binding-check-v1\",\"passed\":true,\"game_booted\":false,\"audio_device_opened\":false,\"cases\":{},\"original_setters\":6}}",checks);
+    const auto stream_output=make_buffer(0x2000);
+    // This SDK method is not reached by the title's fixed entry table. Check
+    // its provider directly without claiming another translated game function.
+    invoke(0x0022E694,std::array<std::uint32_t,2>{stream,stream_output},0,true);
+    invoke(0x0022C11B,std::array<std::uint32_t,1>{stream_output},1);
+    invoke(0x0022CC0B,std::array<std::uint32_t,1>{stream});
+    require(state.audio_buffers.empty() && state.audio_streams.empty(),"stream release frees its retained output buffer");
+    const auto low_memory=std::span(ram).first(0xC0);std::array<std::byte,0xC0> before_low{};
+    std::copy(low_memory.begin(),low_memory.end(),before_low.begin());
+    invoke(0x0022D776,std::array<std::uint32_t,2>{state.audio_device,1});
+    invoke(0x0022D776,std::array<std::uint32_t,2>{state.audio_device,0});
+    require(std::ranges::equal(before_low,low_memory),"headphone mode preserves unrelated guest memory without an effect image");
+    std::memcpy(memory.access(0xE500,sizeof(state.audio_environment)),state.audio_environment.data(),sizeof(state.audio_environment));
+    invoke(0x0022FA52,std::array<std::uint32_t,3>{state.audio_device,0xE500,0},0x88780032U);
+    require(std::ranges::equal(before_low,low_memory),"unassigned reverb rejects listener changes without touching guest memory");
+    const auto effects_path=executable.parent_path()/"b2distfx.bin";
+    const bool environment_checked=std::filesystem::exists(effects_path);
+    if(environment_checked) {
+        File effects(effects_path);require(effects.size()<=65536,"bounded binding effect image");
+        const auto storage=state.allocate(static_cast<std::uint32_t>(effects.size()),page,true,PAGE_READWRITE);
+        effects.read(0,std::span(static_cast<std::byte*>(memory.access(storage,effects.size())),effects.size()));
+        // The title's verified 10AA10 upload assigns reverb 2 and crosstalk 4.
+        memory.store<std::uint32_t>(0xE540,2);memory.store<std::uint32_t>(0xE544,4);
+        invoke(0x0022D6E6,std::array<std::uint32_t,5>{state.audio_device,storage,static_cast<std::uint32_t>(effects.size()),0xE540,0xE548});
+        constexpr std::uint32_t legacy_shadow=0x017D0618;
+        std::array<std::byte,0x300> sound_data;sound_data.fill(std::byte{0x5A});
+        std::memcpy(memory.access(legacy_shadow,sound_data.size()),sound_data.data(),sound_data.size());
+        auto environment=state.audio_environment;const auto previous_environment=environment;
+        environment[0]=std::bit_cast<std::uint32_t>(-2500);environment[3]=std::bit_cast<std::uint32_t>(2.5f);
+        std::memcpy(memory.access(0xE500,sizeof(environment)),environment.data(),sizeof(environment));
+        invoke(0x0022F7CA,std::array<std::uint32_t,3>{object,0xE500,1});
+        require(std::memcmp(memory.access(settings+0x88,sizeof(environment)),environment.data(),sizeof(environment))==0,"listener layout matches the original deferred SDK setter");
+        std::array<std::byte,0x108> before_parameters,after_parameters;
+        state.audio->effect_data(state.effect_offset(2)+0x118,before_parameters);
+        invoke(0x0022FA52,std::array<std::uint32_t,3>{state.audio_device,0xE500,1});
+        state.audio->effect_data(state.effect_offset(2)+0x118,after_parameters);
+        require(state.audio_environment==previous_environment && state.audio_deferred_environment==environment && state.audio_pending_environment && before_parameters==after_parameters,"deferred environment waits for settings commit");
+        invoke(0x0022F3F5,std::array<std::uint32_t,1>{state.audio_device});
+        state.audio->effect_data(state.effect_offset(2)+0x118,after_parameters);
+        require(state.audio_environment==environment && !state.audio_pending_environment && before_parameters!=after_parameters,"settings commit updates original reverb coefficients");
+        environment[3]=std::bit_cast<std::uint32_t>(1.2f);std::memcpy(memory.access(0xE500,sizeof(environment)),environment.data(),sizeof(environment));
+        invoke(0x0022FA52,std::array<std::uint32_t,3>{state.audio_device,0xE500,0});
+        require(state.audio_environment==environment && !state.audio_pending_environment,"immediate environment updates active settings");
+        std::uint32_t flags=0;
+        invoke(0x0022D776,std::array<std::uint32_t,2>{state.audio_device,1});
+        state.audio->effect_data(state.effect_offset(4)+0x10,std::as_writable_bytes(std::span(&flags,1)));
+        require(!(flags&2),"headphones disable crosstalk processing");
+        invoke(0x0022D776,std::array<std::uint32_t,2>{state.audio_device,0});
+        state.audio->effect_data(state.effect_offset(4)+0x10,std::as_writable_bytes(std::span(&flags,1)));
+        require((flags&2)!=0,"speakers restore crosstalk processing");
+        std::array<float,64> silence;state.audio->mix(silence);
+        require(std::ranges::all_of(silence,[](float value){return std::isfinite(value);}),"updated reverb processes an original DSP block");
+        require(std::memcmp(memory.access(legacy_shadow,sound_data.size()),sound_data.data(),sound_data.size())==0 && std::ranges::equal(before_low,low_memory),"environment and headphone changes preserve sound-bank and unrelated guest bytes");
+    }
+    const auto report=std::format("{{\"format\":\"b2-audio-binding-check-v1\",\"passed\":true,\"game_booted\":false,\"audio_device_opened\":false,\"cases\":{},\"original_setters\":{},\"environment_image_checked\":{}}}",checks,environment_checked?7:6,environment_checked);
     write_text(output/"audio-bindings.json",report,false);return report;
 }
 bool Xbox::save_frame(const std::filesystem::path& path) {
@@ -3619,6 +3919,138 @@ std::string check_custom_music(const std::filesystem::path& executable,const std
     require(decoded_ms+100>=first_duration && decoded_ms<=std::uint64_t(first_duration)+100,
         std::format("complete song duration (decoded {} ms, catalogue {} ms)",decoded_ms,first_duration));
     invoke(memory.load<std::uint32_t>(vtable+4),{decoder});invoke(0x000E099C,{handle});
+    if(fixture) {
+        // Use the original catalogue and XACT queue/next methods to check the
+        // menu option without opening a window, an audio device or a game save.
+        const auto menu=state.allocate(0x3000,page,true,PAGE_READWRITE),manager=state.allocate(page,page,true,PAGE_READWRITE);
+        require(menu && manager,"bounded music menu storage");
+        cpu.registers[ecx]=0x352728;invoke(0x184C0,{});
+        cpu.registers[ecx]=manager;invoke(0xC8D70,{});memory.store<std::uint32_t>(0x443FA0,manager);
+        const auto prepare_menu=[&] {
+            memory.store<std::uint32_t>(menu+0x1F9C,2);memory.store<std::uint32_t>(menu+0x1FA0,menu+0x1F6C);
+            cpu.registers[esi]=menu;title_music(cpu,memory,0x462DA);
+        };
+        prepare_menu();const auto rows=state.music_menu_storage;
+        require(memory.load<std::uint32_t>(menu+0x1F9C)==3 && memory.load<std::uint32_t>(menu+0x1FA0)==rows &&
+            memory.load<std::uint32_t>(menu+0x1F68)==rows,"native menu and music selector share all three rows");
+        require(!std::strcmp(static_cast<const char*>(memory.access(memory.load<std::uint32_t>(rows+48),11)),"Loop Track") &&
+            !memory.load<std::uint32_t>(rows+64),"loop option is labelled and defaults off");
+        cpu.registers[ecx]=rows+48;require(invoke(0x45F60,{})==1 && memory.load<std::uint32_t>(rows+64)==1,"original right-arrow handler enables loop");
+        prepare_menu();require(!memory.load<std::uint32_t>(rows+64) && !state.host.loop_track,"reopening discards an unconfirmed loop change");
+        bool saved=false;state.host.music_loop_changed=[&](bool value){saved=value;};
+        memory.store<std::uint32_t>(0x57C210,0);memory.store<std::uint32_t>(rows+64,1);title_music(cpu,memory,0x46510);
+        prepare_menu();require(saved && state.host.loop_track && memory.load<std::uint32_t>(rows+64)==1,"confirmed loop option survives reopening");
+        memory.store<std::uint32_t>(rows+64,0);title_music(cpu,memory,0x46510);
+        require(!saved && !state.host.loop_track,"confirmed off restores ordinary playback");
+        const auto audio=menu+0x2400;
+        cpu.registers[ecx]=audio;invoke(0x4B7B0,{});
+        require(memory.load<std::uint32_t>(audio+0xE8)==2 && memory.load<std::uint32_t>(audio+0xEC)==audio+0x108,
+            "front-end Audio retains its original two volume rows");
+        const auto pause=state.allocate(0x3000,page,true,PAGE_READWRITE);
+        require(pause!=0,"bounded race pause menu storage");
+        const auto language=memory.load<std::uint32_t>(0x35272C+memory.load<std::uint32_t>(0x352728)*4);
+        const auto label=[&](unsigned index) {return memory.load<std::uint32_t>(language+index*4);};
+        memory.store<std::uint32_t>(pause+0x80,5);memory.store<std::uint32_t>(pause+0x84,pause+0xA0);
+        for(unsigned i=0;i<2;++i) {
+            const std::array<std::uint32_t,6> volume{label(i?218:219),1,0,0,i?12U:9U,18};
+            std::memcpy(memory.access(pause+0xA0+i*24,sizeof(volume)),volume.data(),sizeof(volume));
+        }
+        memory.store<std::uint32_t>(pause+0x74,label(359));memory.store<std::uint32_t>(pause+0x78,label(360));
+        const std::array<std::uint32_t,6> vibration{label(221),0,0,pause+0x74,0,2};
+        std::memcpy(memory.access(pause+0x100,sizeof(vibration)),vibration.data(),sizeof(vibration));
+        cpu.registers[ecx]=pause+0x208;invoke(0x54F70,{pause+0x80,pause+0xA0,2,3});
+        cpu.registers[esi]=pause;title_music(cpu,memory,0x4788F);
+        const auto pause_rows=memory.load<std::uint32_t>(pause+0x84);
+        require(memory.load<std::uint32_t>(pause+0x80)==6 && pause_rows==rows+0x100 &&
+            memory.load<std::uint32_t>(pause+0x216C)==pause_rows,"race pause view and music selector share all six rows");
+        require(memory.load<std::uint32_t>(pause_rows+48)==label(881) && memory.load<std::uint32_t>(pause_rows+72)==label(882) &&
+            memory.load<std::uint32_t>(pause_rows+96)==memory.load<std::uint32_t>(rows+48) && memory.load<std::uint32_t>(pause_rows+120)==label(221),
+            "race Options order is Soundtrack, Track, Loop Track, Vibration");
+        memory.store<std::uint32_t>(pause+0x88,3);cpu.registers[ecx]=pause+0x80;
+        require(invoke(0x419A0,{})==1 && memory.load<std::uint32_t>(pause+0x88)==4,"native Down reaches Loop Track after Track");
+        const auto apply_pause=[&] {cpu.registers[ecx]=pause;title_music(cpu,memory,0x47220);};
+        cpu.registers[ecx]=pause_rows+96;require(invoke(0x45F60,{})==1 && !state.host.loop_track,"pause loop edits await confirmation");
+        cpu.registers[esi]=pause;title_music(cpu,memory,0x46EDA);
+        require(!memory.load<std::uint32_t>(pause_rows+112) && !saved,"reopening cancels an unconfirmed pause loop change");
+        cpu.registers[ecx]=pause_rows+96;require(invoke(0x45F60,{})==1,"pause loop uses original option navigation");apply_pause();
+        require(saved && state.host.loop_track,"confirming pause Options saves Loop Track");
+        prepare_menu();require(memory.load<std::uint32_t>(rows+64)==1,"Music Selection reflects pause loop change");
+        cpu.registers[ecx]=pause_rows;require(invoke(0x45F60,{})==1,"pause music volume remains adjustable");
+        cpu.registers[ecx]=pause;title_music(cpu,memory,0x47190);
+        require(memory.load<std::uint32_t>(pause+0xB0)==10 && memory.load<std::uint32_t>(pause+0xC8)==12,"original pause volume fields follow the extended menu");
+        cpu.registers[ecx]=pause+0x80;require(invoke(0x419A0,{})==1 && memory.load<std::uint32_t>(pause+0x88)==5,"native Down reaches Vibration after Loop Track");
+        cpu.registers[ecx]=pause+0x80;require(invoke(0x419A0,{})==0,"native Down stops at the sixth row");
+        cpu.registers[ecx]=pause_rows+120;require(invoke(0x45F60,{})==1,"Vibration retains its native toggle");apply_pause();
+        require(memory.load<std::uint32_t>(pause+0x110)==1,"original vibration confirmation follows its relocated row");
+        cpu.registers[ecx]=pause_rows+96;require(invoke(0x45F40,{})==1,"pause left-arrow disables loop");apply_pause();
+        require(!saved && !state.host.loop_track,"both menus share the saved off setting");
+        state.host.music_loop_changed={};
+        const auto table=memory.load<std::uint32_t>(manager+4),count=memory.load<std::uint32_t>(manager+0x10);
+        unsigned sources=0;
+        for(unsigned list=0;list<count;++list) {
+            const auto record=table+list*68,track_count=memory.load<std::uint32_t>(record+0x38);
+            if(!track_count) continue;
+            ++sources;memory.store<std::uint32_t>(0x57C210,1);memory.store<std::uint32_t>(0x57C1EC,list);
+            for(const bool repeat:{false,true}) for(const auto index:std::array<unsigned,3>{0,track_count/2,track_count-1}) {
+                state.host.loop_track=repeat;memory.store<std::uint32_t>(0x57C208,index);
+                const auto playlist=state.allocate(page,page,true,PAGE_READWRITE);
+                cpu.registers[ecx]=playlist;invoke(0x20FEF1,{});memory.store<std::uint32_t>(playlist+0x58,2);
+                memory.store<std::uint32_t>(0x57C1F4,playlist);
+                const bool included=memory.load<std::uint32_t>(record+0x10)!=0;
+                if(included) {
+                    for(unsigned song_index=0;song_index<12;++song_index) {
+                        memory.store<std::uint32_t>(descriptor,2);
+                        memory.store<std::uint32_t>(descriptor+4,memory.load<std::uint32_t>(0x3402D8+song_index*4));
+                        invoke(0x20DDB8,{playlist,descriptor,0});
+                    }
+                } else {
+                    memory.fill_elements<std::uint32_t>(descriptor,0,5,false);memory.store<std::uint32_t>(descriptor,3);
+                    memory.store<std::uint32_t>(descriptor+8,memory.load<std::uint32_t>(record+0x14));
+                    invoke(0x20DDB8,{playlist,descriptor,0});
+                }
+                require(memory.load<std::uint32_t>(playlist+0x60)==track_count,"loop retains the entire original playlist");
+                const auto next_song=[&](std::uint32_t caller) {
+                    cpu.registers[esp]=stack;memory.store<std::uint32_t>(stack,caller);memory.store<std::uint32_t>(stack+4,playlist);
+                    invoke_native(cpu,memory,0x20DDBD);
+                    require(cpu.eip==caller && cpu.registers[esp]==stack+8,"original Next preserves its caller ABI");
+                };
+                for(unsigned selection=0;selection<=index;++selection) next_song(0xC931C);
+                const auto first=memory.load<std::uint32_t>(playlist+0x18);
+                require(included?!std::strcmp(static_cast<const char*>(memory.access(first+0x10,1)),
+                    static_cast<const char*>(memory.access(memory.load<std::uint32_t>(0x3402D8+index*4),1))):
+                    memory.load<std::uint32_t>(first+0x10)==memory.load<std::uint32_t>(memory.load<std::uint32_t>(record+4)+index*36),
+                    "initial selection reaches the requested song with loop on or off");
+                title_music(cpu,memory,0xC9333);
+                require(!title_music(cpu,memory,0xCA348),"initial song notification advances the original index");
+                for(unsigned end=0;end<40;++end) {
+                    next_song(0x2142DD);
+                    require(memory.load<std::uint32_t>(playlist+0x18)==first || !repeat,"original playlist keeps repeating the selected song");
+                    if(!repeat && end==0) require(memory.load<std::uint32_t>(playlist+0x18)!=first,"turning loop off advances to another song");
+                    require(title_music(cpu,memory,0xCA348)==repeat,"song notifications follow actual repeat transitions");
+                }
+                const auto unchanged=[&](auto&& toggle) {
+                    std::array<std::byte,0xA0> queue{};std::memcpy(queue.data(),memory.access(playlist,queue.size()),queue.size());
+                    toggle();
+                    require(memory.load<std::uint32_t>(0x57C1F4)==playlist &&
+                        !std::memcmp(queue.data(),memory.access(playlist,queue.size()),queue.size()),"toggling preserves the active playlist, song and decoder handle");
+                };
+                unchanged([&] {memory.store<std::uint32_t>(rows+64,!repeat);title_music(cpu,memory,0x46510);});
+                auto current=memory.load<std::uint32_t>(playlist+0x18);next_song(0x2142DD);
+                require((memory.load<std::uint32_t>(playlist+0x18)==current)==!repeat,"Music Selection toggle affects the next EOF without restarting");
+                require(title_music(cpu,memory,0xCA348)==!repeat,"pending notifications use the repeat that actually occurred");
+                unchanged([&] {memory.store<std::uint32_t>(pause_rows+112,repeat);apply_pause();});
+                current=memory.load<std::uint32_t>(playlist+0x18);next_song(0x2142DD);
+                require((memory.load<std::uint32_t>(playlist+0x18)==current)==repeat,"pause toggle resumes repeat or ordinary advancement at EOF");
+                state.host.loop_track=!repeat;
+                require(title_music(cpu,memory,0xCA348)==repeat,"toggling before a pending notification preserves its song index");
+                state.host.loop_track=true;current=memory.load<std::uint32_t>(playlist+0x18);next_song(0xC6128);
+                require(memory.load<std::uint32_t>(playlist+0x18)!=current,"explicit Next can still select a new song");
+                memory.store<std::uint32_t>(0x57C1F4,0);current=memory.load<std::uint32_t>(playlist+0x18);next_song(0x2142DD);
+                require(memory.load<std::uint32_t>(playlist+0x18)!=current,"loop does not affect other audio playlists");
+            }
+        }
+        require(sources==2,"both B1 and custom soundtrack loop paths exercised");
+    }
     const auto report=std::format("{{\"format\":\"b2-custom-music-check-v1\",\"passed\":true,\"game_booted\":false,\"audio_device_opened\":false,\"songs\":{},\"cases\":{},\"decoded_frames\":{},\"decoded_ms\":{},\"catalogue_ms\":{},\"rate\":44100,\"peak\":{},\"rms\":{},\"cancel_preserves_library\":{},\"original_soundtrack_apis\":true,\"original_wma_decoder\":true}}",songs,checks,decoded_frames,decoded_ms,first_duration,peak,std::sqrt(energy/(decoded_frames*2)),fixture?"true":"null");
     write_text(output/"custom-music.json",report,false);return report;
 }
@@ -4972,6 +5404,20 @@ bool title_track(Cpu& cpu,Memory& memory,std::uint32_t address,std::uint32_t obj
     }
     return false;
 }
+bool title_music(Cpu& cpu,Memory& memory,std::uint32_t address) {
+    if(!cpu.kernel || !cpu.kernel->context) return false;
+    if(cpu.kernel->entries[255]!=Xbox::State::dispatch_kernel<255>) throw NativeBoundary(address,"music controls require the verified Xbox host provider");
+    auto& host=*static_cast<Xbox::State*>(cpu.kernel->context);
+    if(&host.memory!=&memory) throw NativeBoundary(address,"music controls received another guest memory");
+    HostFloatingScope floating(cpu.floating);return host.music_control(cpu,address);
+}
+Cpu& Xbox::isolated_cpu() {
+    if(state_->current || !state_->threads.empty()) throw std::runtime_error("Isolated CPU requires an unused Xbox provider");
+    auto& thread=state_->create(0,0,0,state_->image.stack_commit,0,false);
+    state_->current=state_->isolated_owner=&thread;thread.cpu.preempt=nullptr;return thread.cpu;
+}
+void Xbox::isolated_io() {state_->pump_isolated();}
+BootResult Xbox::isolated_result() const {return state_->inspect();}
 void title_enhancement(Cpu& cpu,Memory& memory,std::uint32_t address) {
     if(!cpu.kernel || !cpu.kernel->context || cpu.kernel->entries[255]!=Xbox::State::dispatch_kernel<255>)
         throw NativeBoundary(address,"title enhancement requires the verified Xbox host provider");

@@ -7,6 +7,7 @@ namespace b2 {
 struct NativeApi {std::uint32_t address;std::string_view name,prefix;};
 // Independently checked original entry bytes and caller ABIs for the supported XBE.
 inline constexpr std::array native_apis{
+    NativeApi{0x000E03BE,"OutputDebugStringA","558BEC51518B45088945FC"},
     NativeApi{0x000E1DB7,"XMountUtilityDrive","558BEC81EC14010000"},
     NativeApi{0x00128CF8,"CancelIo","558BEC83EC248D45F8"},
     NativeApi{0x0021A400,"D3DDevice_Initialize","81EC680100006A04"},
@@ -30,6 +31,7 @@ inline constexpr std::array native_apis{
     NativeApi{0x0022D70D,"DirectSoundGetEffectData","558BECFF75188B4508"},
     NativeApi{0x0022D734,"DirectSoundSetEffectData","558BECFF751C8B4508"},
     NativeApi{0x0022D75E,"DirectSoundCommitEffectData","8B4424048BC883C0F8F7D9"},
+    NativeApi{0x0022D776,"DirectSoundEnableHeadphones","8B442404FF7424088BC883C0F8"},
     NativeApi{0x0022D792,"DirectSoundSetMixBinHeadroom","8B442404FF74240C8BC8FF74240C"},
     NativeApi{0x0022F932,"DirectSoundSetDistanceFactor","FF74240CD944240C8B44240851"},
     NativeApi{0x0022F9F9,"DirectSoundSetRolloffFactor","FF74240CD944240C8B44240851"},
@@ -37,6 +39,7 @@ inline constexpr std::array native_apis{
     NativeApi{0x0022F9C4,"DirectSoundSetPosition","558BECFF7518D94514"},
     NativeApi{0x0022FA1D,"DirectSoundSetVelocity","558BECFF7518D94514"},
     NativeApi{0x0022F97A,"DirectSoundSetOrientation","558BECFF7524D94520"},
+    NativeApi{0x0022FA52,"DirectSoundSetI3DL2Listener","8B442404FF74240C8BC8FF74240C"},
     NativeApi{0x0022F3F5,"DirectSoundCommitDeferredSettings","8B4424048BC883C0F8F7D9"},
     NativeApi{0x0022F8EA,"DirectSoundBufferCreate","FF7424108B442408FF7424108BC8"},
     NativeApi{0x0022F90E,"DirectSoundStreamCreate","FF7424108B442408FF7424108BC8"},

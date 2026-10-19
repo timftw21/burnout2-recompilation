@@ -1,0 +1,137 @@
+Online racing design proposal
+2026-10-18 | Design only; feasibility and budgets are not yet measured.
+
+Goal: secure, responsive racing between friends, with no hosted infrastructure
+or recurring bill. One participating player's game hosts the race.
+
+1. Scope and existing evidence
+
+Start with private two-player races, one player per PC. Reuse local multiplayer
+rules with a full-screen camera/HUD per player; verify those integration points
+first. Defer larger races, public matchmaking, rankings, chat, spectators, host
+migration and online Crash/Pursuit. Offline play stays independent.
+
+The original Xbox release offered Live scoreboards [1]. Current native networking
+only reports Ethernet link status (research/native-ethernet.txt); account actions
+remain disabled (src/recompiler.cpp). Physics already runs independently of display
+rate (research/game-timing.txt). Start with the verified US target at its original
+60 Hz, checked against knowledge/supported_target.json. Build a new native racing
+layer rather than reviving the legacy Xbox online stack.
+
+2. Strict P2P and its limits
+
+Game traffic goes directly between players. Require no project or third-party
+matchmaking, address-discovery (STUN) or relay (TURN) servers. Players share invites
+through their existing messenger; no separate hosting program is needed.
+
+Try direct IPv6 and automatic IPv4 router mapping through Windows APIs [4]. Open
+only the game's UDP port; preserve firewalls, remove our mappings on exit and use
+expiring leases where supported. Verify reachability during connection setup.
+Only the host needs to accept incoming connections.
+
+Some ISP/router arrangements prevent direct connections [5]. Explain failure and
+offer swapping hosts, IPv6, or an advanced single-port setup guide. Universal
+connectivity requires relaxing the no-server rule. Peers learn each other's IP
+address; application security cannot prevent flooding of their Internet connection.
+
+3. Connection experience
+
+Use the existing controller-accessible settings: Online -> Create race -> Copy
+invite; the friend chooses Join -> Paste invite. No account or typed IP address
+on supported connections. Show connection quality, plain-language errors and a
+shared countdown after both players are ready and loaded.
+Invites are self-contained; short room codes would require a directory service.
+
+Invites carry addresses, host authentication material and an unguessable random
+join credential (at least 128 bits). Expire after ten minutes or one admission;
+allow revocation, omit secrets from logs, authenticate the host before revealing
+the credential, and require host approval. Check protocol/build, target, gameplay
+asset hashes and physics settings before loading. Visual settings may differ;
+never transfer game files to resolve incompatibility.
+
+4. Security boundary
+
+Treat both peers as hostile. Require authenticated encryption bound to the invite,
+replay protection and fresh session keys; use maintained libraries, not custom
+cryptography. Evaluate standalone GameNetworkingSockets [2] first. Its default
+encryption does not authenticate peers [3]: invite authentication through supported
+APIs, modest dependencies and a native Python-free build are adoption gates.
+
+Accept only fixed, versioned message types. Validate sizes, counts, finite numeric
+ranges, object IDs, tick windows, ownership and scene state before applying data
+through narrow native adapters. Never accept pointers, raw guest memory, callbacks,
+paths, assets or saves. Bound handshake work, connections, assembly, queues and
+history before allocating. Reject malformed traffic; disconnect flooders. Pin and
+patch dependencies: encryption alone cannot make hostile game data safe.
+
+5. Race synchronization
+
+The host decides both cars' physics, shared traffic, collisions, boost, crashes,
+respawns, race clock and finish order. Guests send numbered controls, never claimed
+positions/results. A modified host can still cheat; keep online results separate
+from offline records and saves.
+
+Keep 60 Hz physics and independent 360 Hz presentation. Predict the guest's car
+immediately, then correct against host state by restoring verified state and
+replaying bounded recent controls. Smooth remote motion through a short buffer
+adjusted for arrival variation. Host collision outcomes win; late inputs do not
+rewind the shared race.
+
+Start with 60 Hz controls carrying the latest three samples and 20 Hz snapshots,
+both sent without retransmission. Discard stale snapshots. A separate reliable
+channel carries lobby/start, crash/respawn and finish events; IDs reject duplicates.
+Send changes against acknowledged state, with bounded full refreshes after loss.
+Replicate race-critical state and relevant traffic, not frames or RAM.
+
+Prediction needs complete relevant state, including traffic, randomness and crash
+transitions; current replay support does not prove this. Verify fields and update
+boundaries against original bytes. Replaying controls must not duplicate audio,
+effects or file writes. If bounded prediction cannot preserve handling/collisions,
+revise the design before proceeding.
+
+6. Stability and resource targets
+
+Use congestion control, paced sends, packets sized for the path and priority for
+controls/events. Reduce snapshot detail/rate before input quality. Network workers
+exchange bounded buffers at tick boundaries; no blocking I/O, allocation or logging
+in gameplay. After 100 ms without controls, release throttle/boost and brake;
+advance other cars without updates for at most 100 ms. Menus do not pause races.
+A five-second outage ends the race cleanly; host loss returns players to the lobby.
+
+Proposed targets: enjoyable play at 150 ms round-trip delay, 30 ms added jitter,
+3% loss and occasional 100 ms loss bursts; at most 256 kbit/s each direction
+including overhead, 16 MiB extra networking/history memory, and at most 0.20 ms of
+game-thread network work for 99% of frames while retaining sustained 360 FPS.
+These require measurement; connection quality depends on more than download speed.
+
+7. Delivery gates
+
+First feasibility findings: research/online-state.txt. Original body restore/replay
+passes in isolation; the full two-player prediction gate remains incomplete.
+
+Prove two-player state restoration/prediction without booting. Add authenticated
+transport and native-tool diagnostics for malformed packets, replay, flooding,
+loss/reordering and incompatibility. Then prove a two-peer simulation offline:
+consistent traffic, collisions, crash recovery and finishes under impairment.
+Integrate invites, router setup and UI after those gates pass.
+
+Validate two PCs on LAN, IPv6 and mapped IPv4, including unreachable networks.
+Record input response, corrections, bandwidth, memory and median/p99 frame times
+on named hardware. Automated gameplay benchmarks require renewed authorization:
+at most 30 seconds, Airport Terminal 3, 360 Hz, 1x native, widescreen, frame
+interpolation/V-sync off. No gameplay runs accompany this proposal. Use the
+existing Installation.zip release workflow.
+
+Sources (consulted 2026-10-18)
+
+[1] Contemporary hands-on account of the Xbox release's online rankings:
+    https://www.gamespot.com/articles/hands-onburnout-2-point-of-impact/1100-2911891/
+[2] Valve's standalone transport features and Steam-independent use:
+    https://github.com/ValveSoftware/GameNetworkingSockets
+[3] Valve's direct-IP API, including its peer-authentication warning:
+    https://github.com/ValveSoftware/GameNetworkingSockets/blob/master/include/steam/isteamnetworkingsockets.h
+[4] Microsoft router mapping interfaces and external-address query:
+    https://learn.microsoft.com/en-us/windows/win32/api/natupnp/nn-natupnp-istaticportmappingcollection
+    https://learn.microsoft.com/en-us/windows/win32/api/natupnp/nf-natupnp-istaticportmapping-get_externalipaddress
+[5] IETF connectivity establishment, address candidates and relays:
+    https://www.rfc-editor.org/rfc/rfc8445.html

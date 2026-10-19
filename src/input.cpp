@@ -24,7 +24,12 @@ void apply_keyboard(GamepadState& state,const KeyboardBindings& bindings,std::sp
         if(negative || positive) state.axes[axis]=static_cast<std::int16_t>((positive?32767:0)-(negative?32767:0));
     }
 }
-Input::Input(bool keyboard,bool pump_events,std::uint32_t device_id):keyboard_(keyboard),pump_events_(pump_events),device_id_(device_id) {
+Input::Input(bool keyboard,bool pump_events,std::uint32_t device_id)
+    :Input(keyboard,pump_events,std::span(&device_id,device_id?1:0)) {}
+Input::Input(bool keyboard,bool pump_events,std::span<const std::uint32_t> device_ids)
+    :keyboard_(keyboard),pump_events_(pump_events),filtered_(!device_ids.empty()) {
+    if(device_ids.size()>device_ids_.size()) throw std::runtime_error("Input supports at most four devices");
+    std::ranges::copy(device_ids,device_ids_.begin());
     if(!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) throw std::runtime_error(SDL_GetError());
     try {refresh();update();} catch(...) {
         for(auto device:devices_) if(device) SDL_CloseGamepad(device);
@@ -42,9 +47,10 @@ void Input::refresh() {
     int count=0;auto* ids=SDL_GetGamepads(&count);
     if(!ids) throw std::runtime_error(SDL_GetError());
     for(int i=0;i<count;++i) {
-        if(device_id_ && ids[i]!=device_id_) continue;
+        const auto selected=std::ranges::find(device_ids_,ids[i]);
+        if(filtered_ && selected==device_ids_.end()) continue;
         if(std::ranges::any_of(devices_,[&](auto device){return device && SDL_GetGamepadID(device)==ids[i];})) continue;
-        const auto slot=std::ranges::find(devices_,nullptr);
+        const auto slot=filtered_?devices_.begin()+(selected-device_ids_.begin()):std::ranges::find(devices_,nullptr);
         if(slot==devices_.end()) break;
         *slot=SDL_OpenGamepad(ids[i]);
         if(!*slot) {SDL_free(ids);throw std::runtime_error(SDL_GetError());}
@@ -55,9 +61,9 @@ void Input::event(const SDL_Event& event) {
     if(event.type==SDL_EVENT_GAMEPAD_ADDED || event.type==SDL_EVENT_GAMEPAD_REMOVED) refresh();
     if(event.type==SDL_EVENT_QUIT || event.type==SDL_EVENT_WINDOW_CLOSE_REQUESTED) quit_requested=true;
 }
-void Input::update() {
+void Input::update(bool force) {
     const auto now=SDL_GetTicksNS();
-    if(updated_ && now-updated_<8000000) return;
+    if(!force && updated_ && now-updated_<8000000) return;
     updated_=now;
     if(pump_events_) {SDL_Event value;while(SDL_PollEvent(&value)) event(value);}
     int key_count=0;const auto* keys=SDL_GetKeyboardState(&key_count);

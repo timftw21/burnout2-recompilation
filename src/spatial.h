@@ -12,6 +12,7 @@ struct SpatialListener {
 // Original 76-byte Xbox DS3DBUFFER, including its three per-source factors.
 using SpatialParameters=std::array<std::uint32_t,19>;
 using EnvironmentParameters=std::array<std::uint32_t,9>;
+using EnvironmentListener=std::array<std::uint32_t,12>;
 struct SpatialResult {
     float gain=1;
     std::array<float,2> pan{1,1};
@@ -28,11 +29,14 @@ public:
                             const EnvironmentParameters* environment=nullptr,bool mute_at_max=false);
     static void validate(const SpatialParameters&);
     static void validate(const EnvironmentParameters&);
+    static void validate(const EnvironmentListener&);
+    void environment(const EnvironmentListener&);
+    std::array<std::byte,0x220> reverb(std::span<const std::byte> state);
 private:
     void call(std::uint32_t,std::initializer_list<std::uint32_t>);
     std::array<std::byte,8192> scratch_{};
     Memory memory_;
-    std::array<std::uint32_t,12> environment_listener_{};
+    EnvironmentListener environment_listener_{};
     SpatialListener previous_listener_;
     bool listener_valid_=false;
 };

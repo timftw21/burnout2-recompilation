@@ -17,11 +17,15 @@ struct XboxHost {
     std::filesystem::path storage_root;
     Performance* performance=nullptr;
     bool widescreen=false;
+    bool ultrawide=false,motion_blur=true;
     bool skip_intro=false;
+    bool audio_output=true;
     unsigned draw_distance=1;
     bool upscaling=false;
     std::filesystem::path custom_music_root;
     std::filesystem::path imported_tracks;
+    bool loop_track=false;
+    std::function<void(bool)> music_loop_changed;
 };
 struct BootIo {
     std::uint32_t ordinal=0,status=0,information=0,callsite=0;
@@ -75,10 +79,14 @@ public:
     void capture_frame(const std::filesystem::path& directory,bool automated=false);
     void performance_recording(bool);
     PerfCounters performance_counters() const;
+    Cpu& isolated_cpu();
+    void isolated_io();
+    BootResult isolated_result() const;
 private:
     friend void native_platform(Cpu&,Memory&,std::uint32_t);
     friend void title_enhancement(Cpu&,Memory&,std::uint32_t);
     friend bool title_track(Cpu&,Memory&,std::uint32_t,std::uint32_t);
+    friend bool title_music(Cpu&,Memory&,std::uint32_t);
     friend std::string check_track_import(const std::filesystem::path&,const std::filesystem::path&,const std::filesystem::path&,const std::filesystem::path&);
     friend std::string check_storage(const std::filesystem::path&,const std::filesystem::path&);
     friend std::string check_visibility(const std::filesystem::path&,const std::filesystem::path&,bool);
@@ -92,6 +100,7 @@ private:
 std::string check_storage(const std::filesystem::path& xbe,const std::filesystem::path& output);
 std::string check_visibility(const std::filesystem::path& xbe,const std::filesystem::path& output,bool warp=false);
 std::string check_replays(const std::filesystem::path& xbe,const std::filesystem::path& disc,const std::filesystem::path& output);
+std::string check_prediction_race(const std::filesystem::path& xbe,const std::filesystem::path& disc,const std::filesystem::path& output);
 std::string check_track_import(const std::filesystem::path& xbe,const std::filesystem::path& disc,const std::filesystem::path& assets,const std::filesystem::path& output);
 std::string check_audio_listener(const std::filesystem::path& xbe,const std::filesystem::path& output);
 std::string check_music(const std::filesystem::path& xbe,const std::filesystem::path& disc,const std::filesystem::path& output);

@@ -30,11 +30,12 @@ void apply_keyboard(GamepadState&,const KeyboardBindings&,std::span<const bool> 
 class Input {
 public:
     explicit Input(bool keyboard=true,bool pump_events=true,std::uint32_t device_id=0);
+    Input(bool keyboard,bool pump_events,std::span<const std::uint32_t> device_ids);
     ~Input();
     Input(const Input&)=delete;
     Input& operator=(const Input&)=delete;
     void event(const SDL_Event&);
-    void update();
+    void update(bool force=false);
     void keyboard(bool enabled) {keyboard_=enabled;updated_=0;}
     void capture_keyboard(bool captured) {capture_keyboard_=captured;}
     void bindings(const KeyboardBindings& value) {bindings_=value;updated_=0;}
@@ -53,7 +54,8 @@ private:
     struct Rumble {std::uint16_t low=0,high=0;std::uint64_t renew=0;};
     std::array<Rumble,4> rumble_{};
     std::uint64_t updated_=0;
-    std::uint32_t device_id_=0;
+    std::array<std::uint32_t,4> device_ids_{};
+    bool filtered_=false;
 };
 std::string check_input();
 }

@@ -92,3 +92,24 @@ verified XBE and build settings still invalidate it; tool build ordering remains
 A timestamp-only renderer rebuild took 8.553 seconds with the shader stamp
 unchanged, compared with 59.292 seconds for the preceding runtime-only edit.
 Configuration and resource compilation passed in the required x64 SDK environment.
+
+2026-10-18: installer appearance and build progress
+
+The Windows PowerShell 5.1 installer now shares the game's Segoe UI typeface,
+logo, navy surfaces, orange controls and rounded panels. Its six stages follow
+actual setup operations. The compile bar parses Ninja's finished/total status
+from an incrementally read, shared output stream; partial lines survive polls,
+and buffered lines are capped at 8 KiB. No timer estimates progress. CMake can
+prune tasks after its initial graph count, so successful child exit is the final
+completion signal. Errors retain partial progress and identify the current
+stage; cancellation continues to stop only recorded PID/start-time matches.
+
+The UI helper is included in cmake/package.ps1's committed-source manifest.
+No additional executable, package, font or Python workflow was added.
+Offscreen native rendering verified initial, compiling, ready and error layouts
+without computer use. Windows PowerShell 5.1.26100.9711 checks passed split log
+lines, appended output after EOF, bounded long lines, changed task totals,
+successful/failed real workers and timed cancellation. The full Release build
+passed, and a real incremental Ninja run passed through the same progress reader.
+All owned installer/build/check workers exited. Evidence:
+build/checks/display-installer-20261018.

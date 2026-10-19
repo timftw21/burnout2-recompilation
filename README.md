@@ -13,23 +13,15 @@ I'll try to respond in a timely manner. This is an independent fan project, unaf
 Yes, AI (Codex) assisted in the development of this project. No, this project was not blindly thrown together.
 If you're skeptical, I implore you to try the recompilation for yourself. I take quality control quite seriously!👀
 
-## What's new in 1.6
+## What's new in 1.7
 
-- Reworked high-refresh motion for cars, cameras, menus and HUD animations,
-  with an **Unlimited** refresh-rate option. No more shitty interpolation!
-- Corrected timing for handling, opponents, replays, How to Play, loading screens,
-  sound effects, spinning scenery, fades and the boost filter.
-- Fixed jittery Time Attack ghosts and car shadows, transparent wheels and
-  Crash-mode cars, taillight trails, MSAA artifacts and menu transition flashes.
-- Corrected widescreen HUD proportions and text placement while keeping the
-  HUD at the screen edges. Boosting no longer darkens the speedometer or boost meter.
-- Fixed extended-distance scenery and building overlap, including
-  **Sunrise Valley Springs**, while retaining the extra draw distance.
-- Added optional **Ambient occlusion**, with three quality levels and adjustable
-  strength; fixed shading lingering over car and track selection menus.
-- Updated the executable and settings icons with the new logo.
-- Fixed a crash when switching game modes, and temporarily disabled Sign In,
-  New Account and Manage Account(s).
+- Fixed a handful of lingering audio issues (no more random audio pops!)
+- Fixed some timing issues for high-refresh gameplay.
+- Refreshed the installer's look.
+- Added ultrawide (21:9) to Graphics settings.
+- Added motion blur toggle to Enhancements settings.
+- Tweaked certain HUD elements at 16:9 and 21:9 for consistency and accuracy.
+- Added a "Loop Track" option to the in-game Music Selection screen.
 
 Download the new **Installation.zip** and run **Build.cmd** again to update.
 See [Updating between releases](#updating-between-releases) to keep your saves,
@@ -77,10 +69,13 @@ focused on speed and simplicity. I couldn't bear to keep the slop version public
 - Saved settings for display, audio and controls, with refresh rates from 60 Hz
   through **Unlimited**. High-refresh gameplay and menus keep normal game speed.
 - Custom keyboard bindings and 1×–4× internal resolution.
-- Native 16:9 camera with the HUD's original proportions and edge placement.
+- Native 16:9 and ultrawide 21:9 cameras with the HUD's original proportions
+  and edge placement.
 - Optional MSAA or FXAA antialiasing and anisotropic filtering up to 16×.
 - Optional ambient occlusion with adjustable quality and strength.
-- Imported custom music through the original Music Selection menu.
+- Imported custom music through the original Music Selection menu, with a saved
+  **Loop Track** option in Music Selection and **Pause → Options**.
+- Optional motion blur from the original game.
 - Optional intro skipping and 2×/4× draw distance, including traffic detail.
 - Experimental DLSS, FSR and XeSS upscaling.
 
@@ -106,7 +101,8 @@ own copy of the US Xbox release. Game files are not included</i>.
    and extract it, or clone the repository.
 3. Double-click **Build.cmd** and select your US Xbox XISO disc image (`.iso` or `.xiso`).
    Use an XISO; full-disc dumps need conversion to XISO first.
-   The builder prepares the game files, downloads dependencies and builds the app.
+   The builder prepares the game files, downloads dependencies and builds the app,
+   with a progress bar that follows the build tasks.
    The first build can take a while; later builds reuse previous work.
 4. Click **Open game folder**, then double-click **b2.exe**.
 
@@ -151,7 +147,8 @@ to apply graphics and enhancement changes during play.
 - **General:** Choose the refresh rate (60 Hz by default) or **Unlimited**, and
   enable the FPS overlay. Higher rates smooth gameplay and menus without changing
   game speed. Unlimited removes the frame cap; V-sync still follows your display.
-- **Graphics:** Select 1×–4× resolution, widescreen (16:9) and V-sync.
+- **Graphics:** Select 1×–4× resolution, Original (4:3), Widescreen (16:9),
+  Ultrawide (21:9), and V-sync.
   Higher resolutions use more graphics power.
 - **Enhancements:** Adjust MSAA/FXAA, anisotropic filtering and **Draw distance**
   (Original, 2× or 4×). **Ambient occlusion** adds contact shading, with three
@@ -159,11 +156,16 @@ to apply graphics and enhancement changes during play.
   Increased distance and shading quality use more resources. Experimental DLSS,
   FSR and XeSS have visual issues and may reduce performance; they replace
   separate antialiasing and use the selected output resolution.
-  **Skip intro splash screens** is under **Miscellaneous**.
+  **Motion blur** and **Skip intro splash screens** are under **Miscellaneous**.
+  Motion blur controls the original game's scene blur during boosting and other
+  speed effects; it is enabled by default.
 - **Audio:** To use custom songs, **Browse** for a music folder, click
   **Import music**, then select the collection in the game's **Music Selection**
   menu. MP3, WAV, WMA, FLAC, M4A and AAC are supported through Windows codecs.
   Importing replaces the previous collection and restarts an active game.
+  In-game music volume and Crash-mode music stopping also apply to Burnout 1 and
+  imported songs. **Loop Track** repeats the selected song until you turn it off;
+  change it in **Music Selection** or **Pause → Options** and confirm your choice.
 - **Controls:** Click a binding and press its replacement; use **Clear** or
   **Restore keyboard defaults** as needed. Esc cancels rebinding.
 - **Log:** View startup, capture and error messages.
@@ -184,10 +186,15 @@ Connected gamepads work automatically. Keyboard controls are enabled by default:
 | Move through menus | Arrow keys |
 | A button / Confirm | Space |
 | B button / Back | Left Shift |
+| Black button | R |
+| White button | F |
 | Start / Pause | Enter |
 | Toggle settings | Esc (or F1) |
 | Capture frame | F8 |
 | Record / save performance | F9 |
+
+**Black** and **White** refer to the original Xbox controller's extra face buttons.
+On modern gamepads, Black maps to **RB / R1** and White maps to **LB / L1**.
 
 ## Resources and credits
 

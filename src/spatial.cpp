@@ -52,6 +52,30 @@ void Spatial::validate(const EnvironmentParameters& parameters) {
         if(!std::isfinite(value) || value<0 || value>(i==4?10.0f:1.0f)) throw std::runtime_error("Invalid environmental audio factor");
     }
 }
+void Spatial::validate(const EnvironmentListener& parameters) {
+    for(unsigned i:{0U,1U,5U,7U}) {
+        const auto db=std::bit_cast<std::int32_t>(parameters[i]);
+        if(db<-10000 || db>(i==5?1000:i==7?2000:0)) throw std::runtime_error("Invalid environmental listener volume");
+    }
+    constexpr std::array<float,12> minimum{0,0,0,0.1f,0.1f,0,0,0,0,0,0,20};
+    constexpr std::array<float,12> maximum{0,0,10,20,2,0,0.3f,0,0.1f,100,100,20000};
+    for(unsigned i:{2U,3U,4U,6U,8U,9U,10U,11U}) {
+        const auto value=real(parameters[i]);
+        if(!std::isfinite(value) || value<minimum[i] || value>maximum[i]) throw std::runtime_error("Invalid environmental listener factor");
+    }
+}
+void Spatial::environment(const EnvironmentListener& parameters) {validate(parameters);environment_listener_=parameters;}
+std::array<std::byte,0x220> Spatial::reverb(std::span<const std::byte> state) {
+    if(state.size()!=0x118) throw std::runtime_error("Invalid original reverb state size");
+    std::memset(memory_.access(points,0x220),0,0x220);std::memcpy(memory_.access(points,state.size()),state.data(),state.size());
+    memory_.store<std::uint32_t>(listener+0x84,0xFFF);
+    std::memcpy(memory_.access(listener+0x88,sizeof(environment_listener_)),environment_listener_.data(),sizeof(environment_listener_));
+    // Original 2312C7 uses this software calculator before submitting the
+    // flag at +10 and the parameter region at +118 to the DSP.
+    call(0x0022D1B4,{listener+0x84,points});
+    memory_.store<std::uint32_t>(points+0x10,memory_.load<std::uint32_t>(points+0x10)|4U);
+    std::array<std::byte,0x220> result;std::memcpy(result.data(),memory_.access(points,result.size()),result.size());return result;
+}
 SpatialResult Spatial::calculate(const SpatialListener& value,const SpatialParameters& parameters,std::span<const std::byte> curve,
                                  const EnvironmentParameters* environment,bool mute_at_max) {
     validate(parameters);

@@ -462,3 +462,109 @@ subsequent samples. No shaders compiled and no audio errors were reported.
 Personal settings remained byte-identical; all owned build/check/game workers
 exited. This functional run was not a performance benchmark. Release SHA256:
 677B0DC5C5219C9328F44ECAB384CEBD9BEBA361D58BA36D26F30A2D27A8D1D1.
+
+Optional motion blur, 2026-10-18
+
+Bounded native analysis of A97C0 confirmed A97CE/8B01 loads the original
+filter's enabled word before the A97D4 branch to A9C6D. The latter performs
+the original x87 pop, stack cleanup and return without requesting framebuffer
+history or drawing. Ahead-of-time generation substitutes zero for this read
+when the per-session motion_blur option is off. It does not alter filter memory,
+fade curves, UI text effects or their high-refresh timing correction.
+
+The Miscellaneous checkbox defaults on, saves automatically and applies on
+start/restart. Its active value appears in live and benchmark reports. Existing
+native presentation checks now execute both original filter objects with blur
+disabled, checking unchanged 12-byte state, return address and stack, followed
+by re-enabling the original draw. All 52 CPU groups and 258 render cases passed.
+Private evidence: build/checks/display-installer-20261018.
+
+Animated barriers and reward history, 2026-10-18
+
+The supported XBE hash B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF
+was verified again. Bounded original-byte decoding of 8CA00 shows material
+animation samples timer 2FFD88 through D7340 at 8CEFA and stores its absolute
+seconds at 8CEFF. The scrolling material branch at 8D0BA..8D0D2 computes phase
+from this value; 8DF69..8DF95 applies its fractional texture translation. Repeated
+displays previously reused the fixed-step clock and visibly stepped the barriers.
+
+Sample the existing absolute timer at the presentation fraction, at verified
+instruction 8CF03/8B5708. D73B0 advances the original timer after the update's
+draw, so extra displays need (fraction-1)*delta whereas that draw needs
+fraction*delta. The timer's own running flag suppresses this adjustment while
+paused. Physics, replay clocks and authored texture-frame selection stay intact.
+The existing native presentation check executes the original material routine
+across PAL/NTSC, normal/slow motion, paused/running and two view passes: 64 cases.
+
+User video stills gE3wtgVmRM.jpg and T1qby7BcPU.jpg show the Driving 101
+LESSON PASSED reward from an overhead camera, first settled and then entering
+with trailing copies to its right. Video URL/time were not supplied. Compression
+and scaling prevent a pixel-parity claim. Private byte-identical copies are in
+build/checks/hud-effects-20261018/reward-*-reference.jpg.
+
+The existing A97C0 filter samples the previous displayed frame before the HUD
+at 81102/81312/81792. Separating every HUD draw from feedback to protect the
+translucent gauges also removed intentional reward-text trails. Limit that
+separation to visible tachometer/boost queues. Original 1AA10 installs these
+four widgets at 3D8580; C1440 skips their queues when flag bit 0 is set or the
+node head is FFFFFFFF. Hidden or empty driving gauges now allow original
+full-frame history, including reward text, with the existing elapsed-time alpha.
+No text-specific blur, extra draw pass, resource or allocation is introduced.
+
+All 52 CPU groups passed (26,026 instruction, 3,408 memory/presentation,
+6,744 floating and 109 control cases). This includes nine gauge-visibility
+cases. All 262 hardware render cases passed with an empty D3D11 debug-message
+list. Four added cases verify equal reward-history decay at 60/360 displays
+per second with 1x/4x MSAA; existing gauge-feedback checks also still pass.
+
+Functional Airport Time Attack and Driving 101 runs completed with all 20
+events each, zero runtime shader compilations and no audio errors. The lesson
+run reached gameplay but did not earn a medal, so the actual reward transition
+still requires visual confirmation. The subsequent SCORE/POS race check was
+stopped at the user's request to hand over the build. No benchmark recording
+ran. Personal settings remained byte-identical. The rebuilt Release and the
+95-file Installation.zip were handed over for manual checking; package contents
+matched current sources and excluded private/generated files. Git branch and
+index stayed unchanged. Evidence: build/checks/hud-effects-20261018.
+
+Interactive scenery and pause history, 2026-10-18
+
+Original 8C2D0 creates an interactable physics body and points body+10 at a
+64-byte matrix slot in manager 4B85B0+14C. The corresponding body pointers
+are at manager+D4C, with count E0C. These transforms do not go through the
+RenderWare E90D0 notifications used by the existing presentation history.
+Original 8EB10 removes dead bodies and compacts their matrix/pointer slots,
+then culls and draws each remaining matching prop through C3180/C33E0.
+
+Verified hook 8EBC5/8B4C2424 is after compaction and type selection, before
+frustum culling. EBP-38 points to the surviving matrix. Smooth it through the
+existing presentation pose cache, identified by its current physics-body
+pointer rather than the reusable array slot. Bounds, geometry and original
+draw consumers therefore see the same pose; duplicate views reuse it. Restore
+the exact simulation matrix at the existing scene end. No extra drawing pass,
+allocation, simulation update or generated callback is introduced. The generic
+matrix sampler now also rejects calls outside an active presentation draw.
+
+157E0 calls the world update at 15824 only when [34AB5C]+8 is zero. The host
+fixed scheduler continues stepping paused menu/UI logic. Camera wrappers and
+dirty frames formerly aged out after these scheduler steps, while car matrices
+continued collecting stationary poses each display. On resume the camera used
+the newest pose immediately, whereas the car still interpolated from its
+paused pose. This changed their relative position briefly.
+
+While the original pause flag is set, retain the active camera/frame registrations
+and sample their stationary histories on the same steps as the car. Their
+pose, zoom and near clip then resume together at the display fraction. The
+original pause, physics, clocks and menu update behavior stay intact. Bounded
+native decoding and the same supported XBE hash above verified these paths.
+Private evidence: build/checks/mode-props-pause-20261018.
+
+Release validation passed all 52 CPU groups: 26,026 instruction, 3,467 memory/
+presentation, 6,744 floating and 109 control cases, with 36,149 compiled
+functions. Added checks cover short/two-second pauses at three fractions,
+camera-relative car position and lens restoration, repeated prop views and
+recycled matrix slots, and original widget/column metadata across both split
+panes and all three aspect corrections. All 262 hardware renderer checks passed
+with no D3D11 debug messages. No gameplay automation or benchmark was run for
+this follow-up; actual Airport box interactions and all-mode visual acceptance
+remain for the user's manual check. All owned build/check workers exited.

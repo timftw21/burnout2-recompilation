@@ -86,8 +86,22 @@ constexpr std::pair<std::uint32_t,std::string_view> presentation_sites[]={
     {0xADED5,"D90588815900"},{0xADFE6,"D82588815900"},{0xAE18F,"D82588815900"},
     {0x13485,"83C40C"},{0x13488,"5E"},
     {0x8C8D0,"83EC24"},{0x8C932,"D90588815900"},{0x8C9FF,"C3"},
+    {0x8CF03,"8B5708"},
+    {0x8EBC5,"8B4C2424"},
     {0xA97FF,"89442410"},{0xB9748,"D90588815900"},
     {0xADEB4,"D91F"},{0xADEEC,"8BD8"}
+};
+struct MusicSite {std::uint32_t address;std::string_view bytes;std::uint32_t repeat_target=0;};
+constexpr MusicSite music_sites[]={
+    {0x462DA,"8B0D48B34C00"},{0x46510,"6A00"},
+    {0x4788F,"8BCE"},{0x46EDA,"6A06"},{0x47190,"DB81B0000000"},{0x47220,"56"},
+    {0xC9333,"FF0D08C25700"},{0xCA348,"42",0xCA349},
+    {0x21066E,"8B00",0x210670}
+};
+constexpr std::pair<std::uint32_t,std::string_view> pause_row_sites[]={
+    {0x46DDF,"83BE8800000005"},{0x46DFC,"C70305000000"},{0x46E04,"C7868800000004000000"},
+    {0x46E84,"8D84D6A0000000"},{0x46EB6,"8D84D6A0000000"},
+    {0x47C87,"8B8CD6B0000000"},{0x47C8E,"8D04D6"},{0x47CB4,"8D88A0000000"},{0x47CE5,"8D8CCEA0000000"}
 };
 class Emitter {
 public:
@@ -526,6 +540,15 @@ public:
             body << "    if(cpu.presentation && cpu.game_timing && cpu.game_timing->started) {\n"
                  << "    if(cpu.game_timing->scenery_animated) goto i_0008C9FF;\n"
                  << "    cpu.game_timing->scenery_animated=true;\n    }\n";
+        if(instruction.address==0x8CF03) {
+            (void)read_reg(ZYDIS_REGISTER_ESP);
+            // Material animation reads D7340's absolute game timer. Smooth
+            // its visual sample without changing that timer or physics.
+            body << "    if(cpu.presentation && cpu.game_timing && cpu.game_timing->started && ram.load<std::uint32_t>(0x2FFDA0U)) {\n"
+                 << "    const auto mxcsr=_mm_getcsr();_mm_setcsr(0x1F80);\n"
+                 << "    ram.store<std::uint32_t>(esp+44U,std::bit_cast<std::uint32_t>(std::bit_cast<float>(ram.load<std::uint32_t>(esp+44U))+cpu.game_timing->render_offset));\n"
+                 << "    _mm_setcsr(mxcsr);\n    }\n";
+        }
         if(instruction.address==0xA97FF) {
             dirty.insert(0);used.insert(0);used.insert(1);
             body << "    eax=b2::title_blur_alpha(cpu,eax,ecx);\n";
@@ -553,10 +576,11 @@ public:
         }
         if(instruction.address==0xE90D0 || instruction.address==0xE9040 || instruction.address==0xE8F60 ||
            instruction.address==0x9B380 || instruction.address==0x7BEDE || instruction.address==0x2E280 ||
-           instruction.address==0xADCA0 || instruction.address==0xA6130) {
+           instruction.address==0xADCA0 || instruction.address==0xA6130 || instruction.address==0x8EBC5) {
             calls=restores=true;
             const auto object=instruction.address==0x9B380?read_reg(ZYDIS_REGISTER_ECX):
                 instruction.address==0x7BEDE?read_reg(ZYDIS_REGISTER_EDI):
+                instruction.address==0x8EBC5?read_reg(ZYDIS_REGISTER_EBP)+"-0x38U":
                 "ram.load<std::uint32_t>("+read_reg(ZYDIS_REGISTER_ESP)+
                 (instruction.address==0x2E280 || instruction.address==0xADCA0 || instruction.address==0xA6130?"+8U)":"+4U)");
             body << "    if(cpu.presentation) {commit(); b2::title_presentation(cpu,memory,"
@@ -588,6 +612,16 @@ public:
             if(hex_bytes(Bytes(instruction.bytes).first(ins.length))!="A110C25700") throw std::runtime_error("Music file table signature changed");
             calls=restores=true;dirty.insert(7);used.insert(7);
             body << "    commit(); b2::title_track(cpu,memory,0x000C91F7U); restore();\n";
+        }
+        for(const auto& site:music_sites) if(instruction.address==site.address) {
+            calls=restores=true;
+            if(site.address==0x462DA || site.address==0x4788F || site.address==0x46EDA || site.address==0x21066E) (void)read_reg(ZYDIS_REGISTER_ESI);
+            if(site.address==0x47190 || site.address==0x47220) (void)read_reg(ZYDIS_REGISTER_ECX);
+            if(site.address==0x21066E) (void)read_reg(ZYDIS_REGISTER_EBP);
+            body << "    commit(); ";
+            if(site.repeat_target) body << "const auto repeat_music=";
+            body << "b2::title_music(cpu,memory," << constant(site.address) << "); restore();\n";
+            if(site.repeat_target) body << "    if(repeat_music) goto " << label(site.repeat_target) << ";\n";
         }
         if(instruction.address==0x90F68 || instruction.address==0x90F7E || instruction.address==0x90FDC ||
            instruction.address==0x914BF || instruction.address==0x9158F || instruction.address==0xA7306) {
@@ -782,8 +816,36 @@ public:
             if (unary && scalar) value="_mm_move_ss("+vector(operands[0])+','+value+')';
             vector_write(operands[0],value); break;
         }
-        case ZYDIS_MNEMONIC_MOV: case ZYDIS_MNEMONIC_MOVZX:
-            if(instruction.address==0x8D40C || instruction.address==0x8D734) {
+        case ZYDIS_MNEMONIC_MOV: case ZYDIS_MNEMONIC_MOVZX: {
+            // The title also inlines its aspect setter during race setup/reset.
+            constexpr std::pair<std::uint32_t,std::string_view> aspect_stores[]={
+                {0xB8739,"C700398E633F"},{0xB8741,"C700398EE33F"},
+                {0x7FF2E,"C705F4314400398EE33F"},{0x7FF38,"C70554384400398EE33F"},
+                {0x7FF44,"C705F4314400398E633F"},{0x7FF4E,"C70554384400398E633F"},
+                {0x804DC,"C705F4314400398EE33F"},{0x804E6,"C70554384400398EE33F"},
+                {0x804F2,"C705F4314400398E633F"},{0x804FC,"C70554384400398E633F"}};
+            const auto aspect=std::ranges::find(aspect_stores,instruction.address,&std::pair<std::uint32_t,std::string_view>::first);
+            // Pause Options originally indexes five embedded rows. Follow its
+            // descriptor so an extra row leaves the screen object intact.
+            if(instruction.address==0x46DFC) body << "    const auto value = " << read(operands[0]) << ";\n";
+            else if(instruction.address==0x46E04)
+                body << "    const auto value = ram.load<std::uint32_t>(" << read_reg(ZYDIS_REGISTER_ESI) << "+0x80U)-1U;\n";
+            else if(instruction.address==0x47C87)
+                body << "    const auto value = ram.load<std::uint32_t>(ram.load<std::uint32_t>(" << read_reg(ZYDIS_REGISTER_ESI)
+                     << "+0x84U)+" << read_reg(ZYDIS_REGISTER_EDX) << "*8U+0x10U);\n";
+            else if(aspect!=std::end(aspect_stores)) {
+                if(hex_bytes(Bytes(instruction.bytes).first(ins.length))!=aspect->second)
+                    throw std::runtime_error("Camera aspect signature changed");
+                // Keep vertical FOV and the original split-view layout; widen
+                // the actual camera/frustum rather than stretching a 16:9 view.
+                body << "    const auto value = cpu.ultrawide?" << (operands[1].imm.value.u==0x3F638E39?"0x3F955555U":"0x40155555U") << ':' << read(operands[1]) << ";\n";
+            } else if(instruction.address==0xA97CE) {
+                if(hex_bytes(Bytes(instruction.bytes).first(ins.length))!="8B01")
+                    throw std::runtime_error("Motion blur enable signature changed");
+                // Use the effect's own disabled path, including its x87 cleanup.
+                // Its state is untouched and no history draw is submitted.
+                body << "    const auto value = cpu.motion_blur?" << read(operands[1]) << ":0U;\n";
+            } else if(instruction.address==0x8D40C || instruction.address==0x8D734) {
                 const auto expected=instruction.address==0x8D40C?"B804000000":"B8C0000000";
                 if(hex_bytes(Bytes(instruction.bytes).first(ins.length))!=expected)
                     throw std::runtime_error("World alpha reference signature changed");
@@ -802,11 +864,16 @@ public:
                      << "+0x14U)+" << read_reg(ZYDIS_REGISTER_EAX) << "*4U+4U);\n";
             else body << "    const auto value = " << read(operands[1]) << ";\n";
             write(operands[0], "value"); break;
+        }
         case ZYDIS_MNEMONIC_MOVSX:
             body << "    const auto value = b2::sign_extend<" << operands[1].size << ">(" << read(operands[1]) << ");\n";
             type(operands[1].size); write(operands[0], "value"); break;
         case ZYDIS_MNEMONIC_LEA:
-            body << "    const auto value = " << address(operands[1], true) << ";\n";
+            if(instruction.address==0x46E84 || instruction.address==0x46EB6 || instruction.address==0x47C8E || instruction.address==0x47CE5)
+                body << "    const auto value = std::uint32_t(ram.load<std::uint32_t>(" << read_reg(ZYDIS_REGISTER_ESI)
+                     << "+0x84U)+" << read_reg(operands[1].mem.index) << "*8U);\n";
+            else if(instruction.address==0x47CB4) body << "    const auto value = " << read_reg(ZYDIS_REGISTER_EAX) << ";\n";
+            else body << "    const auto value = " << address(operands[1], true) << ";\n";
             write(operands[0], "value"); break;
         case ZYDIS_MNEMONIC_ADD: case ZYDIS_MNEMONIC_SUB: case ZYDIS_MNEMONIC_CMP:
         case ZYDIS_MNEMONIC_ADC: case ZYDIS_MNEMONIC_SBB:
@@ -823,7 +890,8 @@ public:
                 body << "    commit(); const auto imported_respawn=b2::title_track(cpu,memory,0x00084850U); restore();\n";
             }
             body << "    const std::uint32_t a = " << read(operands[0]) << ";\n"
-                 << "    const std::uint32_t b = " << (instruction.address==0xC92D3?"music_count":
+                 << "    const std::uint32_t b = " << (instruction.address==0x46DDF?
+                    "ram.load<std::uint32_t>("+read_reg(ZYDIS_REGISTER_ESI)+"+0x80U)":instruction.address==0xC92D3?"music_count":
                     instruction.address==0x84850?"(imported_respawn?edx:3U)":read(operands[1])) << ";\n";
             const auto bits = operands[0].size;
             const auto m = ins.mnemonic;
@@ -1134,9 +1202,16 @@ public:
 
 LoweredFunction lower(const Function& function,bool fuse_floating) {
     LoweredFunction result;
-    const auto api=std::ranges::find(native_apis,function.entry,&NativeApi::address);
+    auto api=std::ranges::find(native_apis,function.entry,&NativeApi::address);
+    if(api==native_apis.end()) {
+        const auto entry=function.instructions.find(function.entry);
+        // Recovery follows an SDK jump thunk into its target. Keep that
+        // native binding instead of translating the old hardware path.
+        if(entry!=function.instructions.end() && entry->second.decoded.mnemonic==ZYDIS_MNEMONIC_JMP && entry->second.target())
+            api=std::ranges::find(native_apis,*entry->second.target(),&NativeApi::address);
+    }
     if(api!=native_apis.end()) {
-        std::string prefix;auto pc=function.entry;
+        std::string prefix;auto pc=api->address;
         while(prefix.size()<api->prefix.size() && function.instructions.contains(pc)) {
             const auto& instruction=function.instructions.at(pc);
             prefix+=hex_bytes(Bytes(instruction.bytes).first(instruction.decoded.length));pc+=instruction.decoded.length;
@@ -1144,11 +1219,22 @@ LoweredFunction lower(const Function& function,bool fuse_floating) {
         if(prefix!=api->prefix) throw std::runtime_error("Native API entry signature changed: "+std::string(api->name));
         result.native_api=api->name;
         result.source=std::format("void native_platform(Cpu&,Memory&,std::uint32_t);\nvoid guest_{:08X}(Cpu& cpu,Memory& memory) {{\n"
-            "    if(b2::checkpoint_due(cpu)) b2::checkpoint(cpu,0x{:08X}U);\n    native_platform(cpu,memory,0x{:08X}U);\n}}\n",function.entry,function.entry,function.entry);
+            "    if(b2::checkpoint_due(cpu)) b2::checkpoint(cpu,0x{:08X}U);\n    native_platform(cpu,memory,0x{:08X}U);\n}}\n",function.entry,function.entry,api->address);
         return result;
     }
     Emitter emitter;
     emitter.labels.insert(function.entry);
+    for(const auto& site:music_sites) if(const auto found=function.instructions.find(site.address);found!=function.instructions.end()) {
+        if(hex_bytes(Bytes(found->second.bytes).first(found->second.decoded.length))!=site.bytes ||
+           (site.repeat_target && !function.instructions.contains(site.repeat_target)))
+            throw std::runtime_error("Original music menu or playlist boundary changed");
+        emitter.labels.insert(site.address);
+        if(site.repeat_target) emitter.labels.insert(site.repeat_target);
+    }
+    for(const auto& [address,bytes]:pause_row_sites) if(const auto found=function.instructions.find(address);found!=function.instructions.end()) {
+        if(hex_bytes(Bytes(found->second.bytes).first(found->second.decoded.length))!=bytes)
+            throw std::runtime_error("Original pause Options row access changed");
+    }
     for(const auto& gate:timing_gates) if(const auto found=function.instructions.find(gate.address);found!=function.instructions.end()) {
         if(hex_bytes(Bytes(found->second.bytes).first(found->second.decoded.length))!=gate.bytes ||
            !function.instructions.contains(gate.target))

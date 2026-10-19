@@ -152,7 +152,7 @@ void Presentation::cameras(Cpu& cpu,Memory& memory) {
     }
 }
 bool Presentation::matrix(Cpu& cpu,Memory& memory,std::uint32_t address,std::uint32_t identity) {
-    if(!address) return false;
+    if(!drawing_ || !address) return false;
     const auto& timing=*cpu.game_timing;
     auto index=((address>>4)*2654435761U)&(poses_.size()-1);
     Pose* found=nullptr;unsigned available=static_cast<unsigned>(poses_.size());
@@ -200,11 +200,23 @@ void Presentation::begin(Cpu& cpu,Memory& memory) {
         // Draw-owned animation consumes elapsed game time, including the title's
         // slow-motion scale, without changing the fixed physics/replay delta.
         timing.render_delta=float(timing.render_frames*std::bit_cast<float>(memory.load<std::uint32_t>(0x598188)));
+        // The original clock advances after an update's draw. Extra displays
+        // therefore see one more clock tick than that draw did.
+        timing.render_offset=(ui_fraction_-(timing.update?0.f:1.f))*
+            std::bit_cast<float>(memory.load<std::uint32_t>(0x598188));
         timing.scenery_animated=false;
         render_cycles_=timing.last_cycles;clock_started_=true;
     }
     // Each original update/draw boundary is visited even during catch-up, so
     // histories retain consecutive simulation poses rather than display poses.
+    // Paused updates still advance the menu/scheduler, but do not dirty scene
+    // frames. Keep their stationary histories alongside the car's history so
+    // the camera and car resume at the same presentation fraction.
+    const auto scene=memory.load<std::uint32_t>(0x34AB5C);
+    if(scene && memory.load<std::uint32_t>(scene+8)) {
+        for(auto& camera:cameras_) if(camera.wrapper && camera.touched+1>=timing.step) camera.touched=timing.step;
+        for(auto& frame:frames_) if(frame.address && frame.touched+1>=timing.step) frame.touched=timing.step;
+    }
     cameras(cpu,memory);
     for(auto& frame:frames_) if(frame.address && frame.touched+1>=timing.step) {
         frame.applied=matrix(cpu,memory,frame.address+0x10,frame.address);
@@ -416,6 +428,14 @@ void title_presentation(Cpu& cpu,Memory& memory,std::uint32_t site,std::uint32_t
     case 2:cpu.presentation->end(cpu,memory);break;
     case 0x9B380:cpu.presentation->traffic(cpu,memory,object);break;
     case 0x7BEDE:cpu.presentation->ghost(cpu,memory,object);break;
+    case 0x8EBC5: {
+        // 8EB10 compacts dead physics props before this point. Bind the
+        // remaining matrix slot to its actual body, including slot reuse.
+        const auto manager=cpu.registers[ebx];
+        const auto body=memory.load<std::uint32_t>(manager+0xD4C+(object-manager-0x14C)/16);
+        cpu.presentation->matrix(cpu,memory,object,body);
+        break;
+    }
     case 0x2E280:cpu.presentation->preview(cpu,memory,object);break;
     }
 }

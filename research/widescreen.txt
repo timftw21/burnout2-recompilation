@@ -121,3 +121,115 @@ in standard and widescreen layouts, checking the final box position, dimensions
 and calling convention. Personal settings stayed byte-identical; all owned
 build/check workers exited. No benchmark or game automation ran for this fix.
 Release SHA256: 98C5FFB256911C68CB0159F54251B75CA424FAD0A23E86363750ED2CCBFED919.
+
+Ultrawide display selection, 2026-10-18
+
+The same supported XBE hash above was verified with b2-tool. Bounded native
+decoding of B8700..B8750 reconfirmed both view-aspect stores. Ahead-of-time
+generation now selects 40155555 (21:9) at B8741/C700398EE33F and 3F955555
+(7:6, half-width split view) at B8739/C700398E633F when ultrawide is selected.
+Both original per-player fields are still written by the original loop.
+Race initialization/reset also inlines this setter at 7FF2E/7FF38/7FF44/7FF4E
+and 804DC/804E6/804F2/804FC. These eight C705 stores use the same 16:9/8:9
+constants at 4431F4/443854 and receive the same selection. An exact streaming
+native byte-pattern search found both copies, followed by bounded decoding;
+every replacement verifies its original instruction signature during generation.
+Without these copies, entering a race resets a selected ultrawide view to 16:9.
+The camera and its culling use the wider view; vertical FOV is preserved.
+No runtime decoder or game-memory patch is involved.
+
+The HUD's remaining horizontal correction becomes 4/7 rather than 3/4, divided
+by the original canvas scale. Existing widget anchors, centred messages and
+projected world markers retain their original rules. Native D3D11 presentation
+fits the selected 4:3, 16:9 or 21:9 image to the window; render targets remain
+640x480 times the selected resolution scale. Camera-derived AO/upscaler data
+continues to use the actual camera aspect.
+
+aspect_ratio=0/1/2 is saved explicitly. Existing widescreen=1 files migrate to
+16:9, regardless of line order when an explicit new setting is also present.
+The legacy flag is retained on save for compatibility. Changes apply at session
+start/restart. Live and benchmark reports record the active aspect selection.
+
+Release validation: all 52 CPU groups passed, including original full/split
+camera execution for both wide modes, calling conventions and both player
+fields (3,335 memory/presentation cases). Hidden settings diagnostics passed
+save/load, old-setting migration, invalid values, both fitted wide aspects in
+960x720 and 1280x540 windows, and existing UI/pacing checks. All 258 hardware
+render cases passed with no D3D11 debug messages. Storage checks passed all
+2,061 cases, including unchanged original 4:3/16:9 video flags and camera setup.
+Private evidence: build/checks/display-installer-20261018.
+
+Final live validation used a copy of the existing Airport Terminal 3 benchmark
+profile, separate settings/saves for each run, 360 Hz selected, 1x native,
+V-sync off, no GPU frame generation and no image enhancements. Each frame
+measurement lasted ten seconds, within the 30-second limit. Hardware:
+AMD Ryzen 5 5600X, NVIDIA GeForce RTX 5060 Ti, Windows 11.
+
+16:9 / blur on: 320.150 FPS, median 3.1075 ms, p95 3.7197 ms,
+p99 4.1239 ms, maximum 4.9730 ms over 9,998.990 ms.
+21:9 / blur off: 324.530 FPS, median 3.0422 ms, p95 3.6634 ms,
+p99 4.0926 ms, maximum 5.4617 ms over 10,000.041 ms.
+The different settings and traffic states preclude isolating either option's
+performance cost. The sustained 360 FPS target remains unmet; full performance
+acceptance still requires loading/memory and menu/crash measurements.
+
+Both runs applied all 21 input/benchmark events, compiled no shaders and reported
+no audio errors. Final original camera fields at 4431F4 and 443854 were both
+3FE38E39 in 16:9 and both 40155555 in 21:9 after racing. Native camera updates
+therefore retain the selected view through race initialization; final raw
+640x480 captures show the wider horizontal view with unchanged vertical scale.
+The hidden window check separately verifies the fitted presentation aspect.
+Settings hashes were preserved and all owned workers exited.
+Final Release SHA256:
+CF7D10A2C02C4E8037CEEABDEC24AC333D9E8EBEF807D5A7059CCF69368D9E69.
+
+SCORE/POS right-column anchor, 2026-10-18
+
+User capture frame-897550683400 shows SCORE/POS using constructor x=504.
+Original constructors 23EB0 (score) and 239A0 (position) receive the column's
+left edge, not its right margin. CRT initializer 15C870 derives the full-view
+edge by subtracting the authored 96-unit width at 2B08D4 from 2B0770; 15C930
+uses the width at the standard split-layout scale of 0.85. Scaling around the left edge
+therefore shifted the entire composite label/value column left of the gauges.
+
+Record constructor x plus 96*constructor-scale as these two queues' anchor.
+Their labels and values now share the original right margin, while vertical
+positions and unmodified 4:3 layout stay intact. At the supplied full-view
+layout, corrected x is 528 in 16:9 and 545.1429 in 21:9, rather than 504.
+The constructor signatures/call sites were checked against the supported XBE
+with bounded native decoding. Evidence: build/checks/hud-effects-20261018.
+
+Mode-wide column audit, 2026-10-18
+
+User capture frame-600173847000 shows Pursuit TOTAL TIME at x=504, while
+SCORE/POS had been corrected. Its widget uses constructor 28340, not the score
+or position constructors. Constructor-specific exceptions therefore missed
+another user of the same column. A bounded native audit covered all 32 widget
+objects, their 19 distinct virtual constructors, all 15 mode-selector entries
+at 1D12C, and their 14 normal/split/replay layout helpers in 1AC60..1CAE0.
+No layout analysis exhausted its instruction budget. Original target SHA256:
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+
+Layouts share four actual right-column left edges: 4D2158=504 (full view),
+4D207C=518.4 (standard split), 4D1F68=319 and 4D1FE4=710 (native-wide panes).
+Their CRT sources are 15C870, 15C930, 15CA60 and 15CAE0 respectively. The
+right margins are 600, 600, 415 and 806, with authored width 96 scaled by the
+constructor's 1/.85/1/1 factor. Right-column recognition now uses those layout
+values for every widget instead of checking for specific constructor names.
+This covers TOTAL TIME and SCORE/POS together, including both player panes.
+
+The audit also verified centered timers: 2B0784=320, 4D20F4=231.5 and
+4D1EEC=622.5. These are not right-column left edges and must retain their
+center anchors. Independent gauges, the lesson's explicit right edge, projected
+world markers, the split divider and centered driving-message compensation
+retain their existing rules. All correction remains at widget setup time.
+Private evidence: build/checks/mode-props-pause-20261018, including the original
+mode table, widget inventory, bounded decoded constructors/layouts and the user's
+Pursuit capture. No complete visual audit of all modes is claimed.
+
+The native checks run original 1AA10 widget metadata and the original column
+CRT initializers, then verify TOTAL TIME/SCORE/POS against the four independent
+right margins at 4:3, 16:9 and 21:9 correction strengths. Separate cases preserve
+centered timers in both split panes, gauges, lesson targets, projected markers
+and the divider. All 52 CPU groups and 262 hardware render cases passed. The
+rebuilt game and Installation.zip are supplied for the user's gameplay check.

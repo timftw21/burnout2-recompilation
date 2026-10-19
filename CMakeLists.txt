@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.2)
-project(burnout2 VERSION 1.6.0 LANGUAGES C CXX)
+project(burnout2 VERSION 1.7.0 LANGUAGES C CXX)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "The initial target is Windows x64.")
@@ -233,7 +233,7 @@ if(B2_XBE)
             src/tool.cpp src/shader_compiler.cpp src/shaders.cpp src/ambient_occlusion.cpp src/vertex_program.cpp src/xbe.cpp src/file.cpp
         VERBATIM)
     add_custom_target(b2-shaders-generated DEPENDS "${native_shader_stamp}")
-    add_executable(b2 WIN32 src/main.cpp src/cpu_checks.cpp src/cpu_reference.asm "${native_cpu}" "${native_cpu}.asm" ${native_shards} "${native_shaders}" resources/b2.rc resources/b2.manifest)
+    add_executable(b2 WIN32 src/main.cpp src/cpu_checks.cpp src/prediction_checks.cpp src/cpu_reference.asm "${native_cpu}" "${native_cpu}.asm" ${native_shards} "${native_shaders}" resources/b2.rc resources/b2.manifest)
     # Keep the same argc/argv diagnostics entry without allocating a console.
     target_link_options(b2 PRIVATE /ENTRY:mainCRTStartup)
     # Share the CPU header across all shards without embedding installation paths.
@@ -247,7 +247,7 @@ if(B2_XBE)
         VS_GLOBAL_MultiProcMaxCount 2)
     target_include_directories(b2 PRIVATE "$<$<COMPILE_LANGUAGE:RC>:${CMAKE_CURRENT_SOURCE_DIR}/resources>")
     add_dependencies(b2 b2-native-generated b2-shaders-generated)
-    target_link_libraries(b2 PRIVATE b2-core b2-graphics b2-cpu b2-app)
+    target_link_libraries(b2 PRIVATE b2-core b2-graphics b2-cpu b2-app SDL3::SDL3-static)
     b2_copy_upscalers(b2)
     target_compile_definitions(b2 PRIVATE B2_FINITE_ADDRESS=${finite_address} B2_COMPARE_ADDRESS=${compare_address})
 else()

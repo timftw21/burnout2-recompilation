@@ -15,6 +15,44 @@ $cancelled = $false
 $busy = $true
 $step = 0
 $form = $null
+$stage = 1
+$stageNames = @('Check requirements', 'Prepare build tools', 'Read game files', 'Configure the game', 'Compile the game', 'Finish installation')
+$taskProgress = @{ Completed = 0L; Total = 0L }
+$previousNinjaStatus = $env:NINJA_STATUS
+$env:NINJA_STATUS = '[%f/%t] '
+
+function Set-Stage([int]$number) {
+    $script:stage = $number
+    if (!$NoGui) { Update-SetupStage }
+}
+
+function Show-TaskProgress([long]$completed, [long]$total) {
+    if ($completed -lt 0 -or $total -lt 0 -or $completed -gt $total) { return }
+    $taskProgress.Completed = $completed
+    $taskProgress.Total = $total
+    if (!$NoGui) {
+        $progress.Value = if ($total) { [int](1000.0 * $completed / $total) } else { 0 }
+        $taskCount.Text = if ($total) { '{0:N0} of {1:N0} tasks complete' -f $completed, $total }
+            else { 'Working. Progress updates as each task finishes.' }
+        $progress.AccessibleDescription = $taskCount.Text
+    }
+}
+
+function Read-BuildProgress($tail) {
+    # Read only new output, including status lines split across polling reads.
+    # Tool reports can contain very long lines; never retain a full report here.
+    while (($count = $tail.Reader.Read($tail.Buffer, 0, $tail.Buffer.Length)) -gt 0) {
+        $tail.Pending += [string]::new($tail.Buffer, 0, $count)
+        while (($end = $tail.Pending.IndexOf("`n")) -ge 0) {
+            $line = $tail.Pending.Substring(0, $end).TrimEnd("`r")
+            $tail.Pending = $tail.Pending.Substring($end + 1)
+            if ($line -match '^\[(\d{1,9})/(\d{1,9})\](?:\s|$)') {
+                Show-TaskProgress ([long]$Matches[1]) ([long]$Matches[2])
+            }
+        }
+        if ($tail.Pending.Length -gt 8192) { $tail.Pending = $tail.Pending.Substring($tail.Pending.Length - 8192) }
+    }
+}
 
 function Show-Status([string]$message) {
     if ($buildLock) { [IO.File]::AppendAllText($logPath, "$message`r`n") }
@@ -52,8 +90,9 @@ function Stop-Workers {
     $workers.Clear()
 }
 
-function Run-Step([string]$message, [string]$program, [string[]]$arguments) {
+function Run-Step([string]$message, [string]$program, [string[]]$arguments, [switch]$Build) {
     Show-Status $message
+    Show-TaskProgress 0 0
     if ($cancelled) { throw 'Build cancelled.' }
     $script:step++
     $outputPath = Join-Path $logRoot "$step.out.log"
@@ -63,10 +102,16 @@ function Run-Step([string]$message, [string]$program, [string[]]$arguments) {
     $process = Start-Process -FilePath $program -ArgumentList $quoted -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput $outputPath -RedirectStandardError $errorPath
     # Windows PowerShell must retain the process handle to read its exit code.
     $null = $process.Handle
+    $tail = $null
     try {
+        if ($Build) {
+            $stream = [IO.FileStream]::new($outputPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            $tail = @{ Reader = [IO.StreamReader]::new($stream); Buffer = [char[]]::new(4096); Pending = '' }
+        }
         Record-Workers $process
         $lastPoll = [DateTime]::UtcNow
         while (!$process.WaitForExit(100)) {
+            if ($tail) { Read-BuildProgress $tail }
             if (!$NoGui) { [Windows.Forms.Application]::DoEvents() }
             if ($cancelled) { throw 'Build cancelled.' }
             if (([DateTime]::UtcNow - $lastPoll).TotalSeconds -ge 1) {
@@ -75,8 +120,15 @@ function Run-Step([string]$message, [string]$program, [string[]]$arguments) {
             }
         }
         $process.WaitForExit()
+        if ($tail) { Read-BuildProgress $tail }
+        if ($cancelled) { throw 'Build cancelled.' }
         if ($process.ExitCode -ne 0) { throw "$message failed. Open the build log for details." }
+        # Ninja can prune work after discovering generated dependencies. A
+        # successful process exit is the authoritative completion signal.
+        if ($taskProgress.Total) { Show-TaskProgress $taskProgress.Total $taskProgress.Total }
+        else { Show-TaskProgress 1 1 }
     } finally {
+        if ($tail) { $tail.Reader.Dispose() }
         try {
             Record-Workers $process
             Stop-Workers
@@ -138,35 +190,10 @@ function Copy-Changed([string]$source, [string]$destination) {
 }
 
 if (!$NoGui) {
-    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-    [Windows.Forms.Application]::EnableVisualStyles()
-    $form = [Windows.Forms.Form]::new()
-    $form.Text = 'Build Burnout 2'
-    $form.ClientSize = [Drawing.Size]::new(520, 190)
-    $form.StartPosition = 'CenterScreen'
-    $form.FormBorderStyle = 'FixedDialog'
-    $form.MaximizeBox = $false
-    $form.Font = [Drawing.Font]::new('Segoe UI', 10)
-    $status = [Windows.Forms.Label]::new()
-    $status.Location = [Drawing.Point]::new(20, 20)
-    $status.Size = [Drawing.Size]::new(480, 70)
-    $progress = [Windows.Forms.ProgressBar]::new()
-    $progress.Location = [Drawing.Point]::new(20, 95)
-    $progress.Size = [Drawing.Size]::new(480, 18)
-    $progress.Style = 'Marquee'
-    $logButton = [Windows.Forms.Button]::new()
-    $logButton.Text = 'Open build log'
-    $logButton.Location = [Drawing.Point]::new(20, 135)
-    $logButton.Size = [Drawing.Size]::new(150, 32)
-    $logButton.Add_Click({ Start-Process -FilePath 'notepad.exe' -ArgumentList ('"' + $logPath + '"') })
-    $openButton = [Windows.Forms.Button]::new()
-    $openButton.Text = 'Open game folder'
-    $openButton.Location = [Drawing.Point]::new(330, 135)
-    $openButton.Size = [Drawing.Size]::new(170, 32)
-    $openButton.Enabled = $false
-    $openButton.Add_Click({ Start-Process -FilePath 'explorer.exe' -ArgumentList ('"' + $gameDirectory + '"') })
-    $form.Controls.AddRange(@($status, $progress, $logButton, $openButton))
-    $form.Add_FormClosing({ param($sender, $eventArgs) if ($busy) { $script:cancelled = $true; $eventArgs.Cancel = $true } })
+    . (Join-Path $PSScriptRoot 'build-ui.ps1')
+    Initialize-SetupWindow
+    Set-Stage 1
+    Show-TaskProgress 0 0
     $form.Show()
 }
 
@@ -199,6 +226,7 @@ try {
     $ninja = Find-Program 'ninja.exe' @("$visualStudio\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe")
     $env:PATH = "$(Split-Path -Parent $cmake);$(Split-Path -Parent $git);$llvmDirectory;$(Split-Path -Parent $ninja);$env:PATH"
     $toolchain = @("-DCMAKE_C_COMPILER=$clang", "-DCMAKE_CXX_COMPILER=$clang", "-DCMAKE_MAKE_PROGRAM=$ninja")
+    if ($cancelled) { throw 'Build cancelled.' }
     if (!$DiscImage) {
         if ($NoGui) { throw 'Specify -DiscImage for a build without the file picker.' }
         $picker = [Windows.Forms.OpenFileDialog]::new()
@@ -212,13 +240,15 @@ try {
     $DiscImage = (Resolve-Path -LiteralPath $DiscImage).Path
     if (!(Test-Path -LiteralPath $DiscImage -PathType Leaf)) { throw 'Select an Xbox XISO disc image file.' }
     $bootstrap = Join-Path $buildRoot 'bootstrap'
+    Set-Stage 2
     Configure-Step 'Preparing the build tools...' $bootstrap (@('--preset', 'windows', '-B', $bootstrap, '-DB2_XBE=') + $toolchain)
-    Run-Step 'Building the game-file reader...' $cmake @('--build', $bootstrap, '--config', 'Release', '--target', 'b2-tool', '--parallel', '6')
+    Run-Step 'Building the game-file reader...' $cmake @('--build', $bootstrap, '--config', 'Release', '--target', 'b2-tool', '--parallel', '6') -Build
     $tool = Join-Path $bootstrap 'Release\b2-tool.exe'
     $importDirectory = Join-Path $logRoot ([Guid]::NewGuid().ToString())
     [IO.Directory]::CreateDirectory($importDirectory) | Out-Null
     $importXbe = Join-Path $importDirectory 'default.xbe'
     $importEffects = Join-Path $importDirectory 'b2distfx.bin'
+    Set-Stage 3
     Run-Step 'Reading the game executable...' $tool @('extract', $DiscImage, 'default.xbe', $importXbe)
     Run-Step 'Verifying the supported game version...' $tool @('verify', $importXbe)
     Run-Step 'Reading the sound effects...' $tool @('extract', $DiscImage, 'data/b2distfx.bin', $importEffects)
@@ -228,8 +258,14 @@ try {
     $localEffects = Join-Path $localDirectory 'b2distfx.bin'
     Copy-Changed $importXbe $localXbe
     Copy-Changed $importEffects $localEffects
+    Set-Stage 4
     Configure-Step 'Preparing the game build...' (Join-Path $buildRoot 'windows') (@('--preset', 'windows', "-DB2_XBE=$localXbe", "-DB2_EFFECTS=$localEffects") + $toolchain)
-    Run-Step 'Building the game. The first build can take a while...' $cmake @('--build', '--preset', 'release')
+    Set-Stage 5
+    Run-Step 'Building the game. The first build can take a while...' $cmake @('--build', '--preset', 'release') -Build
+    Set-Stage 6
+    Show-Status 'Saving game-file locations and finishing installation...'
+    if ($cancelled) { throw 'Build cancelled.' }
+    Show-TaskProgress 0 0
     $runtimeLocal = Join-Path $gameDirectory 'data\local'
     [IO.Directory]::CreateDirectory($runtimeLocal) | Out-Null
     Copy-Changed $localXbe (Join-Path $runtimeLocal 'default.xbe')
@@ -238,8 +274,7 @@ try {
     if (Test-Path -LiteralPath $settingsPath) { $settings = [IO.File]::ReadAllLines($settingsPath) }
     $settings = @('xbe=data/local/default.xbe', "disc=$DiscImage") + @($settings | Where-Object { $_ -notmatch '^(xbe|disc)=' })
     [IO.File]::WriteAllLines($settingsPath, $settings, [Text.UTF8Encoding]::new($false))
-    Show-Status 'Ready. Open the game folder and double-click b2.exe.'
-    if (!$NoGui) { $openButton.Enabled = $true }
+    Show-Status 'Open the game folder and double-click b2.exe.'
 } catch {
     $exitCode = 1
     Show-Status $_.Exception.Message
@@ -254,9 +289,10 @@ try {
     }
     if ($buildLock) { $buildLock.Dispose(); $buildLock = $null }
     $busy = $false
+    $env:NINJA_STATUS = $previousNinjaStatus
 }
 if (!$NoGui) {
-    $progress.Visible = $false
+    Complete-SetupWindow ($exitCode -eq 0)
     if ($cancelled) { $form.Close() }
     else { [Windows.Forms.Application]::Run($form) }
     $form.Dispose()

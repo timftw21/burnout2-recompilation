@@ -12,7 +12,7 @@ if (Test-Path -LiteralPath $outputPath) { throw 'Package already exists; choose 
 $inputs = @(
     'Build.cmd', 'CMakeLists.txt', 'CMakePresets.json', 'README.md', 'BUILDING.txt',
     'LICENSE', 'NOTICE.md', 'THIRD_PARTY_NOTICES.txt',
-    'cmake/build.ps1', 'cmake/target.h.in', 'cmake/kernel_names.h.in',
+    'cmake/build.ps1', 'cmake/build-ui.ps1', 'cmake/target.h.in', 'cmake/kernel_names.h.in',
     'cmake/cpu-seeds.txt.in', 'cmake/imgui-shaders.cmake',
     'cmake/upscalers.cmake', 'cmake/upscalers.json',
     'knowledge/facts.json', 'knowledge/supported_target.json', 'src', 'resources'

@@ -299,6 +299,8 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--help") {
             std::cout << "Burnout 2 native CPU diagnostics\n"
                          "  b2 --check-cpu [XBE]\n  b2 --check-input\n  b2 --bench-cpu [ITERATIONS]\n"
+                         "  b2 --check-prediction XBE OUTPUT_DIRECTORY\n"
+                         "  b2 --check-prediction XBE ISO OUTPUT_DIRECTORY\n"
                          "  b2 --check-boot XBE [VISIT_BUDGET] [--disc ISO] [--frame PNG] [--memory ADDRESS:BYTES] [--break ADDRESS[:HIT]]\n"
                          "  b2 --run-game XBE [--disc ISO] [--seconds N] [--frame PNG] [--controls SCRIPT] [--settings CFG] [--memory ADDRESS:BYTES] [--trace-io]\n"
                          "  b2 --check-window PNG [--warp]\n  b2 --check-audio [EFFECTS_IMAGE OUTPUT_DIRECTORY]\n"
@@ -317,6 +319,14 @@ int main(int argc, char** argv) {
             return 0;
         }
         const auto command = std::string_view(argv[1]);
+        if(command=="--check-prediction" && argc==5) {
+            const auto report=b2::check_prediction_race(argv[2],argv[3],argv[4]);std::cout<<report<<'\n';
+            return report.find("\"gate_passed\":true")!=std::string::npos?0:3;
+        }
+        if(command=="--check-prediction" && argc==4) {
+            const auto report=b2::check_prediction(argv[2],argv[3]);std::cout<<report<<'\n';
+            return report.find("\"gate_passed\":true")!=std::string::npos?0:3;
+        }
         if(command=="--check-memory-watch" && (argc==2 || (argc==3 && std::string_view(argv[2])=="--crash"))) {
             std::cout<<b2::check_memory_watch(argc==3)<<'\n';return 0;
         }

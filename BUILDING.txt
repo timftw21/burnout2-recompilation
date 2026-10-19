@@ -17,8 +17,10 @@ and read the effects image. It prepares data/local, configures and builds Releas
 and updates game-file locations beside b2.exe after a successful build.
 Other settings and saves are preserved. Use an Xbox XISO image;
 full-disc dumps require conversion first. One build runs per source folder.
-Build progress appears in a small
-window; Open build log shows details from build/setup/build.log. Closing the
+The installer shows each installation stage and a progress bar driven by
+completed build tasks. Downloads, configuration and linking wait for the tool's
+actual completion; the bar never advances on a timer. Open build log shows
+details from build/setup/build.log. Closing the
 window cancels the build and stops only workers started by the builder.
 
 The first build downloads pinned dependencies and compiles the game ahead of
@@ -63,7 +65,7 @@ Use C++23. Zydis is pinned and linked only into b2-tool, never the game executab
 Run PowerShell commands from the repository root. Private media and generated
 outputs remain ignored. No Python is required.
 
-Updating between releases, including 1.6:
+Updating between releases, including 1.7:
 Close the game and builder. Back up data/user and data/local/settings.cfg beside
 b2.exe, plus data/local/custom-music if you imported music. Install the required
 tools above; releases before 1.3 need LLVM 22.1 or newer. Extract the latest
@@ -129,6 +131,8 @@ Incomplete batches exit 3. Without --allow-partial they publish only the report.
 CPU, loader and original startup
 
 & .\build\windows\Release\b2.exe --check-cpu data/local/default.xbe
+& .\build\windows\Release\b2.exe --check-prediction data/local/default.xbe build/checks/prediction
+& .\build\windows\Release\b2.exe --check-prediction data/local/default.xbe 'Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso' build/checks/prediction-race
 & .\build\windows\Release\b2.exe --check-audio
 & .\build\windows\Release\b2.exe --check-audio data/local/b2distfx.bin build/checks/audio-capture
 & .\build\windows\Release\b2.exe --check-spatial data/local/default.xbe
@@ -139,6 +143,15 @@ CPU, loader and original startup
 & .\build\windows\Release\b2.exe --bench-cpu
 & .\build\windows\Release\b2-tool.exe check-image data/local/default.xbe
 & .\build\windows\Release\b2.exe --check-boot data/local/default.xbe 1000000 --disc 'Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso'
+
+Prediction checks require a fresh output directory and write report.json without
+booting, rendering, audio playback or network access. Without ISO they verify two
+isolated original physics bodies and bounded restore/replay. With ISO they load
+original road, traffic, two human cars and sound resources, using two virtual
+controllers and the original race update. Reports identify initialization failures
+and the remaining restoration/prediction work. Exit 3 means the online feasibility
+gate is incomplete, even when its component checks pass. See research/online-state.txt;
+these checks do not establish online racing or game FPS.
 
 CPU checks use native instruction references, original helpers, memory overlap
 and alignment, floating state, TLS and fixed dispatch. Direct native calls retain
@@ -478,6 +491,9 @@ Esc cancels an active key change; Esc/F1/F8/F9 remain reserved for the interface
 Settings, including scancodes and game-file paths, save automatically in
 data/local/settings.cfg after editing. Closing settings or the app also saves
 pending edits. Continuous slider/text edits do not write on every frame.
+Graphics / Display offers 4:3, 16:9 and 21:9 aspect ratios. Enhancements /
+Miscellaneous includes Motion blur, enabled by default. Both apply on game start
+or restart; existing widescreen settings migrate to 16:9.
 The cursor hides after two seconds without mouse input while the window has
 keyboard and mouse focus. Mouse movement, buttons and scrolling restore it;
 holding a mouse button keeps it visible. Settings preserve normal cursor shapes

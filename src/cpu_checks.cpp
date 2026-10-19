@@ -1051,6 +1051,44 @@ unsigned check_presentation(Memory& memory) {
         require(!std::memcmp(original.data(),memory.access(frame,original.size()),original.size()),"Camera zoom restoration changed simulation state");
         ++checks;
     }
+    // A long pause must not age the camera out while the car keeps sampling
+    // stationary poses. Resume both at the same fraction, including lens state.
+    {
+        const auto saved_timing=timing;
+        const auto saved_scene=memory.load<std::uint32_t>(0x34AB5C);
+        memory.store<std::uint32_t>(0x34AB5C,0x2500);
+        for(unsigned duration:{1U,120U}) for(unsigned fraction:{0U,1U,3U}) {
+            presentation->reset();timing={};timing.started=true;timing.step=1;
+            timing.remainder=733333333ULL*fraction/4;
+            memory.store<std::uint32_t>(0x2508,0);
+            auto view=start,body=start;body[12]=10;
+            std::memcpy(memory.access(frame+0x10,64),view.data(),64);lens(1.f,0.1f);
+            std::memcpy(memory.access(matrix,64),body.data(),64);
+            title_presentation(cpu,memory,0xADCA0,wrapper);
+            presentation->begin(cpu,memory);presentation->matrix(cpu,memory,matrix);presentation->end(cpu,memory);
+            memory.store<std::uint32_t>(0x2508,1);
+            for(unsigned step=0;step<duration;++step) {
+                ++timing.step;
+                presentation->begin(cpu,memory);presentation->matrix(cpu,memory,matrix);presentation->end(cpu,memory);
+            }
+            memory.store<std::uint32_t>(0x2508,0);++timing.step;
+            view[12]=6;body[12]=16;
+            std::memcpy(memory.access(frame+0x10,64),view.data(),64);lens(2.f,0.2f);
+            std::memcpy(memory.access(matrix,64),body.data(),64);
+            title_presentation(cpu,memory,0xADCA0,wrapper);
+            presentation->begin(cpu,memory);presentation->matrix(cpu,memory,matrix);
+            const auto camera_x=std::bit_cast<float>(memory.load<std::uint32_t>(frame+0x40));
+            const auto car_x=std::bit_cast<float>(memory.load<std::uint32_t>(matrix+48));
+            require(std::abs(car_x-camera_x-10)<0.00001f &&
+                std::abs(std::bit_cast<float>(memory.load<std::uint32_t>(camera+0x68))-(1.f+float(fraction)/4))<0.00001f,
+                "Unpause put the car and camera at different presentation times");
+            presentation->end(cpu,memory);
+            require(!std::memcmp(memory.access(matrix,64),body.data(),64) &&
+                !std::memcmp(memory.access(frame+0x10,64),view.data(),64),"Unpause leaked a display pose into physics");
+            ++checks;
+        }
+        memory.store(0x34AB5C,saved_scene);memory.store<std::uint32_t>(0x2508,0);timing=saved_timing;
+    }
     presentation->reset();timing.step=1;
     constexpr std::uint32_t parameters=0xD800,asset=0xD900;
     std::array<float,6> preview{359,5,1,1,std::bit_cast<float>(asset),0};
@@ -1133,6 +1171,96 @@ unsigned check_presentation(Memory& memory) {
         require(title_blur_alpha(cpu,178,0x4431F8)==178,"Original-cadence blur changed strength");
         ++checks;
     }
+    // Scroll a real material through 8CA00/D7340, including the clock advance
+    // after the first draw of a simulation tick. Extra views cannot change it.
+    {
+        constexpr std::uint32_t world=0x4000,data=0x5000,material=0x5200,timer=0x2FFD88;
+        std::memset(memory.access(world,0xE70),0,0xE70);
+        std::memset(memory.access(data,0x240),0,0x240);
+        memory.store(world+8,data);memory.store<std::uint32_t>(data+8,1);memory.store(data+12,material);
+        memory.store<std::uint32_t>(data+0x5C,1);
+        memory.store<std::uint32_t>(data+0xAC,std::bit_cast<std::uint32_t>(1000.f));
+        memory.store<std::uint32_t>(material+0x10,0x400);
+        memory.store<std::uint8_t>(material+0x20,1);
+        memory.store<std::uint32_t>(material+0x24,0x3F800000);
+        for(bool pal:{false,true}) for(bool slow:{false,true}) for(bool paused:{false,true}) {
+            presentation->reset();timing={};timing.started=true;timing.step=2;
+            const auto delta=std::bit_cast<float>((pal?0x3CA3D70AU:0x3C888889U)-(slow?0x01000000U:0));
+            memory.store<std::uint32_t>(0x352720,pal);memory.store<std::uint32_t>(0x598190,slow);
+            memory.store<std::uint32_t>(0x598188,std::bit_cast<std::uint32_t>(delta));
+            std::memset(memory.access(timer,28),0,28);
+            memory.store<std::uint32_t>(timer+0x18,!paused);
+            if(paused) memory.store<std::uint32_t>(timer+0x10,slow?1:4);
+            memory.store<std::uint32_t>(material+0x28,0);memory.store<std::uint32_t>(material+0x2C,0);
+            for(unsigned fraction=0;fraction<4;++fraction) {
+                timing.update=fraction==0;timing.remainder=frequency*fraction/4;
+                memory.store<std::uint32_t>(0x59818C,(slow?1:4)*(fraction?2:1));
+                presentation->begin(cpu,memory);
+                for(unsigned view=0;view<2;++view) {
+                    cpu.registers[esp]=stack;cpu.registers[ecx]=world;
+                    memory.store<std::uint32_t>(stack,0xABCDEF00);
+                    memory.store<std::uint32_t>(stack+4,0);memory.store<std::uint32_t>(stack+8,1);
+                    invoke_native(cpu,memory,0x8CA00);
+                    const auto phase=std::bit_cast<float>(memory.load<std::uint32_t>(material+0x2C));
+                    require(cpu.eip==0xABCDEF00 && cpu.registers[esp]==stack+12 &&
+                        std::abs(phase-delta*(paused?1.f:1.f+float(fraction)/4))<0.000001f,
+                        "Material scroll stepped with physics or changed between views");
+                    ++checks;
+                }
+                presentation->end(cpu,memory);
+            }
+        }
+    }
+    // Interactive scenery uses physics-owned matrix slots, separate from
+    // RenderWare frames. Repeated views and recycled slots must stay correct.
+    {
+        constexpr std::uint32_t props=0x6000,pose=props+0x14C,first=0x7800,second=0x7900;
+        cpu.registers[ebx]=props;memory.store(props+0xD4C,first);
+        for(unsigned fraction:{0U,1U,3U}) {
+            presentation->reset();timing={};timing.started=true;timing.step=1;
+            std::memcpy(memory.access(pose,64),start.data(),64);
+            presentation->begin(cpu,memory);title_presentation(cpu,memory,0x8EBC5,pose);presentation->end(cpu,memory);
+            ++timing.step;timing.remainder=733333333ULL*fraction/4;
+            std::memcpy(memory.access(pose,64),finish.data(),64);
+            presentation->begin(cpu,memory);
+            for(unsigned view=0;view<2;++view) {
+                title_presentation(cpu,memory,0x8EBC5,pose);
+                require(std::abs(std::bit_cast<float>(memory.load<std::uint32_t>(pose+48))-1.5f*fraction)<0.00001f,
+                    "Interactive scenery stepped with physics or advanced twice between views");++checks;
+            }
+            presentation->end(cpu,memory);
+            require(!std::memcmp(memory.access(pose,64),finish.data(),64),"Prop display pose changed its physics matrix");
+            ++timing.step;memory.store(props+0xD4C,second);
+            auto replacement=start;replacement[12]=80;
+            std::memcpy(memory.access(pose,64),replacement.data(),64);
+            presentation->begin(cpu,memory);title_presentation(cpu,memory,0x8EBC5,pose);
+            require(!std::memcmp(memory.access(pose,64),replacement.data(),64),"A recycled prop slot inherited another body's motion");
+            presentation->end(cpu,memory);memory.store(props+0xD4C,first);++checks;
+        }
+    }
+    // Reward overlays need the original text trails. Only visible driving
+    // gauges require scene-only feedback to prevent accumulated dark shading.
+    {
+        constexpr std::uint32_t hud=0x6000,list=0x6100,widgets=0x6200;
+        std::array<std::uint32_t,5> saved{};
+        saved[0]=memory.load<std::uint32_t>(0x3D8570);
+        memory.store(0x3D8570,hud);memory.store(hud+0x3C,list);memory.store<std::uint32_t>(hud+0x40,33);
+        for(unsigned i=0;i<4;++i) {
+            saved[i+1]=memory.load<std::uint32_t>(0x3D8580+i*4);
+            memory.store(0x3D8580+i*4,widgets+i*16);memory.store(widgets+i*16+8,i);
+            memory.store<std::uint32_t>(list+i*16,1);memory.store<std::uint32_t>(list+i*16+8,0);
+        }
+        require(!title_hud_gauges(memory),"Hidden gauges suppressed reward text trails");++checks;
+        for(unsigned i=0;i<4;++i) {
+            memory.store<std::uint32_t>(list+i*16,0);
+            require(title_hud_gauges(memory),"A visible gauge entered repeated scene feedback");++checks;
+            memory.store<std::uint32_t>(list+i*16+8,UINT32_MAX);
+            require(!title_hud_gauges(memory),"An empty gauge queue suppressed reward text trails");++checks;
+            memory.store<std::uint32_t>(list+i*16,1);
+        }
+        memory.store(0x3D8570,saved[0]);
+        for(unsigned i=0;i<4;++i) memory.store(0x3D8580+i*4,saved[i+1]);
+    }
     // Exercise the original boost enable/disable and camera-cut routines,
     // comparing one original draw with several displays in the same tick.
     // Stop A97C0 before it requests a GPU surface: the emitted alpha is already
@@ -1153,7 +1281,7 @@ unsigned check_presentation(Memory& memory) {
         try {invoke_native(cpu,memory,0xA97C0);}
         catch(const NativeBoundary& boundary) {require(boundary.address==0x215CE0,"Boost draw failed before producing alpha");drew=true;}
         cpu.diagnostic=nullptr;
-        require(drew==bool(memory.load<std::uint32_t>(object)),"Disabled boost retained a framebuffer pass");
+        require(drew==(cpu.motion_blur && bool(memory.load<std::uint32_t>(object))),"Disabled boost retained a framebuffer pass");
         if(!drew) return 0U;
         const auto alpha=memory.load<std::uint32_t>(stack-4);
         memory.store(object+8,memory.load<std::uint32_t>(object+4));
@@ -1187,6 +1315,58 @@ unsigned check_presentation(Memory& memory) {
             ++checks;
         }
     }
+    for(const auto object:{filter,reference_filter}) {
+        set_blur(object,1);std::array<std::byte,12> original{};
+        std::memcpy(original.data(),memory.access(object,12),12);
+        cpu.motion_blur=false;
+        require(draw_blur(object)==0 && cpu.eip==0xABCDEF00 && cpu.registers[esp]==stack+4,
+            "Motion blur off did not use the original disabled return");
+        require(!std::memcmp(original.data(),memory.access(object,12),12),"Motion blur off changed the original effect state");
+        cpu.motion_blur=true;(void)draw_blur(object);++checks;
+    }
+    // Build the original widget/queue table, stopping before allocation. Audit
+    // shared columns with real TOTAL TIME, SCORE/POS and centered timer types.
+    {
+        std::array<std::byte,0x90> saved{};
+        std::memcpy(saved.data(),memory.access(0x3D8570,saved.size()),saved.size());
+        cpu.registers[esp]=stack;cpu.registers[ecx]=0x3D8570;
+        memory.store<std::uint32_t>(stack,0xABCDEF00);
+        ExecutionDiagnostic diagnostic;diagnostic.break_address=0xC1320;cpu.diagnostic=&diagnostic;
+        bool reached=false;
+        try {invoke_native(cpu,memory,0x1AA10);}
+        catch(const NativeBoundary& boundary) {require(boundary.address==0xC1320,"HUD metadata failed before queue allocation");reached=true;}
+        cpu.diagnostic=nullptr;require(reached,"HUD metadata did not reach queue allocation");
+        for(const auto entry:{0x15C870U,0x15C930U,0x15C9F0U,0x15CA10U,0x15CA20U,0x15CA40U,0x15CA60U,0x15CAC0U,0x15CAE0U}) {
+            cpu.registers[esp]=stack;memory.store<std::uint32_t>(stack,0xABCDEF00);invoke_native(cpu,memory,entry);
+        }
+        memory.store<std::uint32_t>(0x4D4884,std::bit_cast<std::uint32_t>(600.f));
+        struct Column {std::uint32_t left;float right,scale;};
+        for(const auto column:std::array<Column,4>{{{0x4D2158,600,1},{0x4D207C,600,0.85f},{0x4D1F68,415,1},{0x4D1FE4,806,1}}})
+        for(unsigned widget:{8U,10U,24U}) for(float scale:{1.f,0.75f,4.f/7}) {
+            HudLayout layout;layout.list=0x7000;layout.scale=scale;cpu.hud_layout=&layout;
+            const auto object=memory.load<std::uint32_t>(0x3D8580+widget*4),index=memory.load<std::uint32_t>(object+8);
+            const auto x=std::bit_cast<float>(memory.load<std::uint32_t>(column.left));
+            cpu.registers[ecx]=object;cpu.registers[esp]=stack;
+            memory.store(stack,std::bit_cast<std::uint32_t>(x));memory.store(stack+8,std::bit_cast<std::uint32_t>(column.scale));
+            title_hud_widget(cpu,memory);
+            const auto transform=layout.transform(layout.list+index*16);
+            require(std::abs(layout.anchors[index]-column.right)<0.0001f &&
+                std::abs((x*transform[0]+transform[1])-(column.right-(column.right-x)*scale))<0.0001f,
+                "A mode's right HUD column drifted from its authored right margin");++checks;
+        }
+        struct Other {unsigned widget;float x,anchor;bool active;};
+        for(const auto sample:std::array<Other,8>{{{0,600,600,true},{2,40,40,true},{4,320,320,true},{4,231.5f,231.5f,true},
+                {4,622.5f,622.5f,true},{28,0,600,true},{27,504,0,false},{31,504,0,false}}}) {
+            HudLayout layout;cpu.hud_layout=&layout;
+            const auto object=memory.load<std::uint32_t>(0x3D8580+sample.widget*4),index=memory.load<std::uint32_t>(object+8);
+            cpu.registers[ecx]=object;cpu.registers[esp]=stack;
+            memory.store(stack,std::bit_cast<std::uint32_t>(sample.x));memory.store<std::uint32_t>(stack+8,0x3F800000);
+            title_hud_widget(cpu,memory);
+            require(bool(layout.active&(1ULL<<index))==sample.active && (!sample.active || layout.anchors[index]==sample.anchor),
+                "Shared column anchoring moved a centered, independent or projected widget");++checks;
+        }
+        cpu.hud_layout=nullptr;std::memcpy(memory.access(0x3D8570,saved.size()),saved.data(),saved.size());
+    }
     return checks;
 }
 unsigned check_cpu_image(const std::filesystem::path& path) {
@@ -1198,6 +1378,15 @@ unsigned check_cpu_image(const std::filesystem::path& path) {
     constexpr std::uint32_t stack=0x4000,begin=0x1800,size=0x1000;
     std::array<std::byte,size> expected{};
     unsigned cases=0;
+    for(bool ultrawide:{false,true}) for(unsigned split:{0U,2U}) {
+        Cpu cpu;cpu.ultrawide=ultrawide;cpu.registers[ecx]=0x3D8570;cpu.registers[esp]=stack;
+        memory.store<std::uint32_t>(stack,0xABCDEF00);memory.store<std::uint32_t>(stack+4,1);
+        memory.store<std::uint32_t>(0x3D8570+0x6AC7C,split);invoke_native(cpu,memory,0xB8700);
+        const auto aspect=ultrawide?(split?0x3F955555U:0x40155555U):(split?0x3F638E39U:0x3FE38E39U);
+        require(memory.load<std::uint32_t>(0x3D8570+0x6AC84)==aspect && memory.load<std::uint32_t>(0x3D8570+0x6AC84+0x660)==aspect,
+            "Selected full/split camera aspect was not applied to both views");
+        require(cpu.eip==0xABCDEF00 && cpu.registers[esp]==stack+8,"Camera aspect changed the calling convention");++cases;
+    }
     // The PRESS START screen is intro record 5; component 17 is save/load.
     require(memory.load<std::uint32_t>(0x333FCC)==std::bit_cast<std::uint32_t>(5.f) &&
         memory.load<std::uint32_t>(0x333FD8)==std::bit_cast<std::uint32_t>(30.f) &&
