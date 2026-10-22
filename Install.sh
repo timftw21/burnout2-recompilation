@@ -10,11 +10,13 @@ case ${1:-} in
         exit 0 ;;
     --dependencies-only) mode=dependencies; shift ;;
     --shortcuts-only) mode=shortcuts; shift ;;
+    -*) printf '%s\n' 'Unknown setup option; use --help.' >&2; exit 1 ;;
 esac
 if (( $# > 1 )) || { [[ $mode != install ]] && (( $# )); }; then
     printf '%s\n' 'Invalid setup arguments; use --help.' >&2; exit 1
 fi
 if (( $# )); then disc=$1; fi
+if [[ -n $disc && ! -f $disc ]]; then printf 'Disc image does not exist: %s\n' "$disc" >&2; exit 1; fi
 case $(uname -s):$(uname -m) in
     Linux:x86_64) platform=linux ;;
     Darwin:x86_64|Darwin:arm64) platform=macos ;;
@@ -65,29 +67,29 @@ prepare_linux() {
     getconf GNU_LIBC_VERSION >/dev/null 2>&1 || { printf '%s\n' 'Setup requires a glibc-based Linux distribution.' >&2; return 1; }
     local manager package
     local -a packages missing=() admin=()
-    if (( EUID )); then
-        command -v sudo >/dev/null || { printf '%s\n' 'sudo is required to install missing system packages.' >&2; return 1; }
-        admin=(sudo)
-    fi
     if command -v apt-get >/dev/null; then
         manager=apt
-        packages=(build-essential clang-19 lld-19 ninja-build git curl ca-certificates pkg-config patch libssl-dev libpng-dev libjpeg-dev libasound2-dev libpulse-dev libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev libxtst-dev libwayland-dev libxkbcommon-dev libdrm-dev libgbm-dev libegl1-mesa-dev libgl-dev libdecor-0-dev libudev-dev libvulkan-dev spirv-headers flex bison libjson-perl zenity xdg-utils ffmpeg)
+        packages=(build-essential clang-19 lld-19 ninja-build git curl ca-certificates tar gzip xz-utils util-linux pkg-config patch libssl-dev libpng-dev libjpeg-dev libasound2-dev libpulse-dev libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev libxtst-dev libwayland-dev libxkbcommon-dev libdrm-dev libgbm-dev libegl1-mesa-dev libgl-dev libdecor-0-dev libudev-dev libvulkan-dev spirv-headers flex bison libjson-perl zenity xdg-utils ffmpeg)
         for package in "${packages[@]}"; do
             [[ $(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true) == installed ]] || missing+=("$package")
         done
     elif command -v dnf >/dev/null; then
         manager=dnf
-        packages=(gcc gcc-c++ clang lld llvm ninja-build git curl ca-certificates pkgconf-pkg-config patch openssl-devel libpng-devel libjpeg-turbo-devel alsa-lib-devel pulseaudio-libs-devel libX11-devel libXext-devel libXrandr-devel libXcursor-devel libXi-devel libXfixes-devel libXScrnSaver-devel libXtst-devel wayland-devel libxkbcommon-devel libdrm-devel mesa-libgbm-devel mesa-libEGL-devel mesa-libGL-devel libdecor-devel systemd-devel vulkan-headers vulkan-loader-devel spirv-headers flex bison perl-JSON zenity xdg-utils ffmpeg-free)
+        packages=(gcc gcc-c++ clang lld llvm ninja-build git curl ca-certificates tar gzip xz util-linux make pkgconf-pkg-config patch openssl-devel libpng-devel libjpeg-turbo-devel alsa-lib-devel pulseaudio-libs-devel libX11-devel libXext-devel libXrandr-devel libXcursor-devel libXi-devel libXfixes-devel libXScrnSaver-devel libXtst-devel wayland-devel libxkbcommon-devel libdrm-devel mesa-libgbm-devel mesa-libEGL-devel mesa-libGL-devel libdecor-devel systemd-devel vulkan-headers vulkan-loader-devel spirv-headers flex bison perl-JSON zenity xdg-utils ffmpeg-free)
         for package in "${packages[@]}"; do rpm -q --quiet "$package" || missing+=("$package"); done
     elif command -v pacman >/dev/null; then
         manager=pacman
-        packages=(base-devel clang lld llvm ninja git curl ca-certificates pkgconf patch openssl libpng libjpeg-turbo alsa-lib libpulse libx11 libxext libxrandr libxcursor libxi libxfixes libxss libxtst wayland libxkbcommon libdrm mesa libglvnd libdecor systemd-libs vulkan-headers vulkan-icd-loader spirv-headers flex bison perl-json zenity xdg-utils ffmpeg)
+        packages=(base-devel clang lld llvm ninja git curl ca-certificates tar gzip xz util-linux make pkgconf patch openssl libpng libjpeg-turbo alsa-lib libpulse libx11 libxext libxrandr libxcursor libxi libxfixes libxss libxtst wayland libxkbcommon libdrm mesa libglvnd libdecor systemd-libs vulkan-headers vulkan-icd-loader spirv-headers flex bison perl-json zenity xdg-utils ffmpeg)
         for package in "${packages[@]}"; do pacman -Q "$package" >/dev/null 2>&1 || missing+=("$package"); done
     else
         printf '%s\n' 'Automatic dependency setup supports apt, dnf and pacman. For other distributions, use the manual dependencies in BUILDING.txt and Build.sh.' >&2
         return 1
     fi
     if (( ${#missing[@]} )); then
+        if (( EUID )); then
+            command -v sudo >/dev/null || { printf '%s\n' 'sudo is required to install missing system packages.' >&2; return 1; }
+            admin=(sudo)
+        fi
         printf '\nInstalling missing system packages. Your system may ask for your password.\n'
         case $manager in
             apt) "${admin[@]}" apt-get update; "${admin[@]}" apt-get install -y --no-install-recommends "${missing[@]}" ;;
@@ -219,4 +221,5 @@ printf 'Build log: %s\n' "$root/build/setup/install-$platform.log"
 bash "$root/Build.sh" "$disc" 2>&1 | tee "$root/build/setup/install-$platform.log"
 printf '\n[3/3] Creating application shortcut\n'
 shortcuts
-message 'Setup is complete. Launch Burnout 2 from your application menu (Linux) or your home Applications folder (macOS). Keep this source folder in place; the shortcut uses its installed game. Rerun setup here to update while preserving saves and settings.'
+if [[ $platform == linux ]]; then location='your application menu'; else location='your home Applications folder'; fi
+message "Setup is complete. Launch Burnout 2 from $location. Keep this source folder in place; the shortcut uses its installed game. Rerun setup here to update while preserving saves and settings."

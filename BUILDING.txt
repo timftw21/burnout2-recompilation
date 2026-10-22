@@ -27,7 +27,9 @@ Application shortcuts are created in the Linux application menu or in
 the game with its original native libraries and saved data in the build folder.
 
 Rerun setup in the same folder to update, preserving saves, settings and music.
-bash Install.sh --shortcuts-only repairs the shortcut after moving the folder.
+bash Install.sh --shortcuts-only recreates a deleted application shortcut.
+After moving the installation folder, rerun full setup to rebuild and refresh
+the saved game paths and native library locations.
 bash Install.sh --dependencies-only installs just the build prerequisites.
 CI=true disables dialogs; an XISO argument supports unattended full setup.
 These options do not start the game. CI uses the same dependency setup on both

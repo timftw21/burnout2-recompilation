@@ -178,8 +178,9 @@ These installer steps apply to Windows. On Linux and macOS, extract the updated
 source over your existing folder, keeping `build` and `data`. Rerun
 **Install.desktop** (Linux) or **Install.command** (macOS) and choose your XISO;
 settings, saves and imported music are preserved. Keep that folder in place so
-the application shortcut remains valid. After moving it, rerun setup or run
-`bash Install.sh --shortcuts-only` to repair the shortcut.
+the application shortcut remains valid. After moving it, rerun setup to rebuild
+and refresh the game paths. `bash Install.sh --shortcuts-only` recreates a
+deleted shortcut without rebuilding an installation that remains in place.
 
 1. Close the game and builder.
 2. Back up `data/user` and `data/local/settings.cfg` beside your current `b2.exe`.
