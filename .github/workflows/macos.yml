@@ -142,7 +142,7 @@ jobs:
         run: |
           for executable in b2 b2-tool; do
             file "build/macos/Release/$executable"
-            lipo -verify_arch "$(uname -m)" "build/macos/Release/$executable"
+            lipo "build/macos/Release/$executable" -verify_arch "$(uname -m)"
             otool -L "build/macos/Release/$executable"
           done
           build/macos/Release/b2-tool --help
