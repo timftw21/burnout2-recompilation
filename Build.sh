@@ -23,12 +23,18 @@ case "$(uname -s):$(uname -m)" in
     *) printf '%s\n' 'This builder requires Linux x86-64 or macOS Intel/Apple Silicon.' >&2; exit 1 ;;
 esac
 tools_only=false
+game_inputs=false
 if (( $# == 1 )) && [[ $1 == --tools-only ]]; then tools_only=true
+elif (( $# == 1 )) && [[ $1 == --game-inputs ]]; then
+    game_inputs=true
+    for file in default.xbe b2distfx.bin; do
+        [[ -f data/local/$file ]] || { printf 'Missing data/local/%s.\n' "$file" >&2; exit 1; }
+    done
 elif (( $# != 1 )) || [[ ! -f $1 ]]; then
-    printf '%s\n' 'Usage: bash Build.sh "/path/to/Burnout 2.xiso.iso"' >&2; exit 1
+    printf '%s\n' 'Usage: bash Build.sh "/path/to/Burnout 2.xiso.iso" | --game-inputs | --tools-only' >&2; exit 1
 fi
 disc=""
-if ! $tools_only; then disc="$(cd -- "$(dirname -- "$1")" && pwd -P)/$(basename -- "$1")"; fi
+if ! $tools_only && ! $game_inputs; then disc="$(cd -- "$(dirname -- "$1")" && pwd -P)/$(basename -- "$1")"; fi
 if [[ $disc == *$'\n'* || $root == *$'\n'* ]]; then
     printf '%s\n' 'Game and source paths cannot contain line breaks.' >&2; exit 1
 fi
@@ -88,6 +94,12 @@ fi
 cmake --build --preset "$platform-release" --target b2-tool ${build_options[@]+"${build_options[@]}"}
 if $tools_only; then printf 'Built the native tool: %s\n' "$root/build/$platform/Release/b2-tool";exit 0;fi
 tool="$root/build/$platform/Release/b2-tool"
+if $game_inputs; then
+    "$tool" verify "$root/data/local/default.xbe" > "build/$platform/target.json"
+    cmake --build --preset "$platform-release" ${build_options[@]+"${build_options[@]}"}
+    printf 'Built the native game from verified extracted inputs: %s\n' "$root/build/$platform/Release/b2"
+    exit 0
+fi
 stage=$(mktemp -d "$root/data/local/b2-setup.XXXXXX")
 "$tool" extract "$disc" default.xbe "$stage/default.xbe"
 "$tool" verify "$stage/default.xbe" > "build/$platform/target.json"
