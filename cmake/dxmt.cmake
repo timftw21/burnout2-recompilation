@@ -42,6 +42,20 @@ dxmt_sources(util src/util)
 dxmt_sources(core src/dxmt)
 dxmt_sources(dxgi src/dxgi)
 dxmt_sources(d3d11 src/d3d11)
+# Native WCHAR follows the host's wchar_t width. The Wine path's UTF-16 copy
+# produces invalid UTF-32 on macOS; use DXMT's width-aware transcoder instead.
+file(READ "${dxmt_SOURCE_DIR}/src/dxgi/dxgi_adapter.cpp" adapter_source)
+set(adapter_name_copy "device_.name().getCString((char *)pDesc->Description, sizeof(pDesc->Description), WMTUTF16StringEncoding);")
+string(FIND "${adapter_source}" "${adapter_name_copy}" adapter_name_call)
+if(adapter_name_call LESS 0)
+    message(FATAL_ERROR "Pinned DXMT adapter description source changed.")
+endif()
+string(REPLACE "${adapter_name_copy}"
+    "const auto name = device_.name().getUTF8String();\n      str::transcodeString(pDesc->Description, sizeof(pDesc->Description) / sizeof(pDesc->Description[0]) - 1, name.data(), name.size());"
+    adapter_source "${adapter_source}")
+file(CONFIGURE OUTPUT "${dxmt_generated}/dxgi_adapter.cpp" CONTENT "${adapter_source}" @ONLY)
+list(REMOVE_ITEM dxgi "${dxmt_SOURCE_DIR}/src/dxgi/dxgi_adapter.cpp")
+list(APPEND dxgi "${dxmt_generated}/dxgi_adapter.cpp")
 # The d3d11 source list already includes the six D3D10 implementation files.
 list(FILTER util EXCLUDE REGEX "wsi_.*_win32\\.cpp$")
 list(FILTER airconv EXCLUDE REGEX "airconv_cli\\.cpp$")

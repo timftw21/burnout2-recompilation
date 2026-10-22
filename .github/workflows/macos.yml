@@ -136,6 +136,16 @@ jobs:
           export PATH="$(brew --prefix perl)/bin:$PATH"
           PERL_MM_USE_DEFAULT=1 cpan -T JSON
           if ! xcrun --sdk macosx --find metal; then xcodebuild -downloadComponent MetalToolchain; fi
+      - name: Build native tooling
+        run: bash Build.sh --tools-only
+      - name: Check native offscreen Metal rendering
+        run: |
+          node -e "require('fs').writeFileSync('build/macos/ci-color.dat', Buffer.from([0,0,255,255]))"
+          if ! build/macos/Release/b2-tool render-texture build/macos/ci-color.dat 6 1 1 build/macos/ci-color.png; then
+            xcrun lldb --batch --no-lldbinit --script-language none -o run -k 'thread backtrace --count 12 all' -- \
+              build/macos/Release/b2-tool render-texture build/macos/ci-color.dat 6 1 1 build/macos/ci-color-debug.png || true
+            exit 1
+          fi
       - name: Build full native game
         run: bash Build.sh --game-inputs
       - name: Check native executables and offline CPU, audio and storage
