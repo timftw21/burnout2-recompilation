@@ -19,17 +19,15 @@ that every mode works correctly or that performance matches Windows.
 Yes, AI (Codex) assisted in the development of this project. No, this project was not blindly thrown together.
 If you're skeptical, I implore you to try the recompilation for yourself. I take quality control quite seriously!👀
 
-## What's new in 1.7
+## What's new in 1.8
 
-- Fixed a handful of lingering audio issues (no more random audio pops!)
-- Fixed some timing issues for high-refresh gameplay.
-- Refreshed the installer's look.
-- Added ultrawide (21:9) to Graphics settings.
-- Added motion blur toggle to Enhancements settings.
-- Tweaked certain HUD elements at 16:9 and 21:9 for consistency and accuracy.
-- Added a "Loop Track" option to the in-game Music Selection screen.
+- Added experimental Linux x86-64 builds using Vulkan.
+- Added native macOS builds for Intel and Apple Silicon using Metal.
+- Added full macOS CI builds and offline CPU, audio, effects and storage checks.
+- Improved music import portability and Mac graphics initialization.
 
-Download the new **Installation.zip** and run **Build.cmd** again to update.
+Download the new **Installation.zip**. On Windows, run **Build.cmd** again to
+update. On Linux and macOS, run **Build.sh** with your XISO as shown below.
 See [Updating between releases](#updating-between-releases) to keep your saves,
 settings and imported music.
 

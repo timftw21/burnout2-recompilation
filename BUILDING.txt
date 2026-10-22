@@ -191,7 +191,7 @@ Use C++23. Zydis is pinned and linked only into b2-tool, never the game executab
 Run PowerShell commands from the repository root. Private media and generated
 outputs remain ignored. No Python is required.
 
-Updating between releases, including 1.7:
+Updating Windows installations between releases, including 1.8:
 Close the game and builder. Back up data/user and data/local/settings.cfg beside
 b2.exe, plus data/local/custom-music if you imported music. Install the required
 tools above; releases before 1.3 need LLVM 22.1 or newer. Extract the latest
