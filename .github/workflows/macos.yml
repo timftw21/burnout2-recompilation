@@ -54,6 +54,7 @@ jobs:
             memset(values.contents,0,16);
             MTLTextureDescriptor *texture = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:1 height:1 mipmapped:NO];
             texture.usage = MTLTextureUsageRenderTarget;
+            texture.storageMode = MTLStorageModePrivate;
             MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
             pass.colorAttachments[0].texture = [device newTextureWithDescriptor:texture];
             pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
