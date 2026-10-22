@@ -98,9 +98,11 @@ add_library(b2-dxmt-d3d11 SHARED ${d3d11})
 target_link_libraries(b2-dxmt-d3d11 PRIVATE b2-dxmt-dxgi b2-dxmt-core b2-dxmt-parser b2-dxmt-metal)
 foreach(target IN ITEMS b2-dxmt-parser b2-dxmt-airconv b2-dxmt-metal b2-dxmt-core b2-dxmt-dxgi b2-dxmt-d3d11)
     target_include_directories(${target} PRIVATE ${dxmt_includes})
-    target_compile_options(${target} PRIVATE -fblocks -fms-extensions -Wno-ignored-attributes -Wno-extern-c-compat -Wno-microsoft-exception-spec)
+    target_compile_options(${target} PRIVATE -fblocks -Wno-ignored-attributes -Wno-extern-c-compat -Wno-microsoft-exception-spec)
     target_compile_definitions(${target} PRIVATE NOMINMAX _WIN32_WINNT=0xa00 "DXMT_PAGE_SIZE=${dxmt_page_size}")
-    set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    # Match DXMT's language mode. LLVM 15's headers predate C++23's constexpr
+    # unique_ptr, and DXMT uses _int8 as an identifier, not an MS integer type.
+    set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_STANDARD 20)
 endforeach()
 set_target_properties(b2-dxmt-metal b2-dxmt-dxgi b2-dxmt-d3d11 PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>" BUILD_RPATH "@loader_path")
