@@ -87,18 +87,32 @@ Intel hardware instruction-reference checks are explicitly unavailable on ARM;
 the remaining diagnostics still exercise original game routines and services.
 Unaligned atomic memory operations are explicitly unsupported on ARM.
 
-No physical Mac was available during this bring-up. CI builds the native tool
-and renderer libraries. A full game build, Metal rendering,
+No local Mac was available during this bring-up. CI builds the full native
+game and runs offline diagnostics. Metal rendering,
 audible playback, gameplay and performance require validation on both Mac
 architectures. Windows-only D3D12 upscalers, WARP, D3D11 debug layers and hardware
 memory watches remain unavailable. x87 transcendental results need comparison
 on game scenes; MPFR does not reproduce the Pentium's internal approximations.
 
-The Native macOS build workflow compiles b2-tool on both
-macos-15-intel and macos-15 (Apple Silicon), without uploading game files.
+The Native macOS build workflow compiles b2 and b2-tool on both
+macos-15-intel and macos-15 (Apple Silicon), without publishing game files.
 It runs when build inputs change and can also be started manually.
-Build.sh --tools-only performs the same
-source-only build locally and does not change game settings or saves. On ARM,
+The macos-game Actions environment holds compressed private inputs in encrypted
+secrets B2_CI_INPUTS_00 through B2_CI_INPUTS_58. No game inputs, generated source
+or executables are committed, cached or uploaded as artifacts. Only trusted
+pushes and manual runs receive these secrets. To replace them from verified
+local inputs, with Node.js and an authenticated GitHub CLI:
+
+node cmake/ci-game-inputs.mjs pack data/local build/ci-game-inputs.env
+gh secret set --env macos-game --env-file build/ci-game-inputs.env
+
+Delete the ignored .env file after uploading it. The workflow stages bounded
+groups of secrets to avoid Actions' template limit, restores the inputs, verifies
+the supported executable and deletes private inputs and build output afterward.
+bash Build.sh --game-inputs builds from the same extracted files locally without
+needing the disc image or changing settings and saves.
+Build.sh --tools-only provides a source-only build locally and does not change
+game settings or saves. On ARM,
 this also compiles the portable arithmetic core without needing a game image.
 
 Windows x64

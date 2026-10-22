@@ -86,10 +86,9 @@ Private diagnostics and temporary fixtures remain under build/macos-host.
 
 The GitHub workflow targets macos-15-intel and macos-15 (Apple Silicon):
 https://docs.github.com/en/actions/reference/runners/github-hosted-runners
-It builds the native tool without private game inputs, on build-input pushes or
-manual dispatch, then checks its architecture, library links and --help startup.
-On ARM the tool build also compiles the portable arithmetic core, so those
-sources are checked without requiring a game image.
+Its initial source-only version built the native tool on build-input pushes or
+manual dispatch, then checked its architecture, library links and --help startup.
+On ARM that build also compiled the portable arithmetic core without a game image.
 
 Native CI validation, 2026-10-21
 
@@ -107,3 +106,21 @@ native-call header selection, exported DXGI include paths, Mac signal-context
 headers and the standard exception include. Our own code remains C++23.
 CI keeps compiling independent targets after an error, with four workers, so
 remaining compiler failures are reported together. The final run had no failures.
+
+Full game CI bring-up, 2026-10-21
+
+The macos-game Actions environment now supplies the verified executable and
+21,756-byte effects image as compressed, encrypted secrets. Explicit references
+are staged in bounded steps: the combined input exceeds Actions' template limit
+and the OS environment limit. No original files, generated game sources or game
+executables are committed, cached or uploaded as artifacts. Both restored input
+files matched the local originals byte for byte; CI logs redacted the payload.
+Build.sh --game-inputs builds from these extracted files without altering saves
+or settings. Its full Linux build and existing CPU checks passed.
+
+Both Mac architectures exposed Xcode 16.4's missing std::jthread/stop_token support
+in music imports. The worker now uses std::thread, an atomic cancellation flag
+and explicit joins on restart and destruction. An ignored local fixture passed
+128 restart/cancel/destruction cycles and asynchronous error reporting. Linux's
+existing custom-music suite passed 2,062 cases, including cancelled-import library
+preservation. The modified native Windows input library also compiled.
