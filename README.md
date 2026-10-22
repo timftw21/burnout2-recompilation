@@ -6,13 +6,12 @@ An unofficial version of the original Xbox game for Windows, with experimental
 Linux and macOS ports, focused on fast gameplay, preserving the original's look
 and feel, and a variety of enhancements.
 
-<i>Still in development: Slowdown, bugs, and crashes are possible. Open an issue if you experience a problem, and
-I'll try to respond in a timely manner. This is an independent fan project, unaffiliated with the game's owners.</i>
-
 **Linux and macOS builds need testing.** Linux still needs gameplay, sound and
 performance checks on native desktop hardware. macOS needs those checks on both
-Intel and Apple Silicon. Successful builds and offline checks do not establish
-that every mode works correctly or that performance matches Windows.
+Intel and Apple Silicon.
+
+<i>Still in development: Slowdown, bugs, and crashes are possible. Open an issue if you experience a problem, and
+I'll try to respond in a timely manner. This is an independent fan project, unaffiliated with the game's owners.</i>
 
 ## AI Disclosure
 
