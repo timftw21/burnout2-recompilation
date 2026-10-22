@@ -138,7 +138,17 @@ jobs:
           if ! xcrun --sdk macosx --find metal; then xcodebuild -downloadComponent MetalToolchain; fi
       - name: Build native tooling
         run: bash Build.sh --tools-only
+      - name: Report native Metal capabilities
+        id: metal
+        run: |
+          build/macos/Release/b2-tool inspect-metal > build/macos/metal-info.json
+          cat build/macos/metal-info.json
+          node -e 'const fs=require("fs"), info=JSON.parse(fs.readFileSync("build/macos/metal-info.json","utf8")); fs.appendFileSync(process.env.GITHUB_OUTPUT,`supported=${info.supported}\n`);'
+          if ! node -e 'if(!JSON.parse(require("fs").readFileSync("build/macos/metal-info.json","utf8")).supported) process.exit(1)'; then
+            echo 'The runner GPU lacks the Apple7/Mac2 family support required by the Metal backend. Full compilation and CPU, audio, effects and file diagnostics still run; GPU diagnostics are unavailable.' | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Check native offscreen Metal rendering
+        if: steps.metal.outputs.supported == 'true'
         run: |
           node -e "require('fs').writeFileSync('build/macos/ci-color.dat', Buffer.from([0,0,255,255]))"
           if ! build/macos/Release/b2-tool render-texture build/macos/ci-color.dat 6 1 1 build/macos/ci-color.png; then

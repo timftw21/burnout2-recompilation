@@ -9,6 +9,9 @@
 #include "dsp_compiler.h"
 #include "shaders.h"
 #include "performance.h"
+#ifdef __APPLE__
+#include "metal.h"
+#endif
 #include <charconv>
 #include <chrono>
 #include <format>
@@ -34,6 +37,9 @@ constexpr auto usage =
     "  b2-tool extract ISO DISC_PATH OUTPUT\n"
     "  b2-tool import-interstate BURNOUT_ISO BURNOUT2_ISO OUTPUT_DIRECTORY\n"
     "  b2-tool inspect XBE\n"
+#ifdef __APPLE__
+    "  b2-tool inspect-metal\n"
+#endif
     "  b2-tool verify XBE\n"
     "  b2-tool check-image XBE\n"
     "  b2-tool compile-effects IMAGE OUTPUT.cpp [--replace]\n"
@@ -72,6 +78,12 @@ int tool_main(int argc, char** argv) {
         std::string output;
         if(command=="import-interstate" && argc==5) {
             output=b2::import_interstate(paths[2],paths[3],paths[4]);
+#ifdef __APPLE__
+        } else if(command=="inspect-metal" && argc==2) {
+            const auto metal=b2_metal_device();
+            output=std::format("{{\"format\":\"b2-metal-info-v1\",\"device\":{},\"available\":{},\"apple7\":{},\"mac2\":{},\"supported\":{}}}",
+                b2::json(metal.name),bool(metal.available),bool(metal.apple7),bool(metal.mac2),bool(metal.supported));
+#endif
         } else if(command=="check-performance" && argc==3) {
             output=b2::check_performance(paths[2]);
         } else if(command=="inspect-performance" && argc==4) {

@@ -12,6 +12,9 @@
 #include "diagnostics.h"
 #include "crypto.h"
 #include "host.h"
+#ifdef __APPLE__
+#include "metal.h"
+#endif
 #ifdef _WIN32
 #include <bcrypt.h>
 #else
@@ -4301,6 +4304,11 @@ std::string check_visibility(const std::filesystem::path& executable,const std::
 std::string check_storage(const std::filesystem::path& executable,const std::filesystem::path& output) {
     Xbe image(executable);
     if(!image.supported() || std::filesystem::exists(output)) throw std::runtime_error("Storage checks require the verified XBE and a fresh output directory");
+#ifdef __APPLE__
+    const bool graphics_checked=b2_metal_device().supported;
+#else
+    constexpr bool graphics_checked=true;
+#endif
     if(hex_bytes(image.data(0x00018390,17))!="E81A7D0C000FB6C083E001A3F8034D00C3" ||
        hex_bytes(image.data(0x000183B0,17))!="A1F8034D0050B970853D00E840030A00C3" ||
        hex_bytes(image.data(0x000B8713,6))!="C700ABAAAA3F" ||
@@ -4516,7 +4524,7 @@ std::string check_storage(const std::filesystem::path& executable,const std::fil
         memory.store<std::uint64_t>(area+0x700,0);
         require(invoke(0xFFF00000U+(reload?219U:236U)*16,{handle,0,0,0,area+0x710,profile,profile_size,area+0x700})==success &&
             memory.load<std::uint32_t>(area+0x714)==profile_size,"complete original profile write/read");
-        if(reload==1) {
+        if(reload==1 && graphics_checked) {
             // File reads replace texture bytes without releasing the allocation,
             // just as the original fixed course buffers do. Exercise both APIs.
             Renderer renderer(64,64,false,render_debug_layer);state.gpu=std::make_unique<Gpu>(renderer,memory,0x3EFE000);
@@ -4619,7 +4627,7 @@ std::string check_storage(const std::filesystem::path& executable,const std::fil
             require(reference(span(disk,16),changed)!=expected,"changed save data fails integrity verification");
         }
     }
-    return std::format("{{\"format\":\"b2-storage-check-v1\",\"passed\":true,\"game_booted\":false,\"cases\":{},\"profile_bytes\":31748,\"reopened\":true,\"overwritten\":true,\"async_write\":true,\"runtime_decoder\":false,\"storage\":{}}}",checks,json(utf8(std::filesystem::absolute(output).wstring())));
+    return std::format("{{\"format\":\"b2-storage-check-v1\",\"passed\":true,\"game_booted\":false,\"cases\":{},\"profile_bytes\":31748,\"reopened\":true,\"overwritten\":true,\"async_write\":true,\"runtime_decoder\":false,\"graphics_checked\":{},\"graphics_status\":{},\"storage\":{}}}",checks,graphics_checked,json(graphics_checked?"checked":"unsupported-metal-gpu"),json(utf8(std::filesystem::absolute(output).wstring())));
 }
 std::string check_replays(const std::filesystem::path& executable,const std::filesystem::path& disc_path,const std::filesystem::path& output) {
     Xbe image(executable);Disc disc(disc_path);

@@ -14,6 +14,7 @@
 #include <cstdlib>
 #ifdef __APPLE__
 #include <SDL3/SDL_metal.h>
+#include "metal.h"
 #else
 #include <wsi/native_wsi.h>
 #endif
@@ -834,6 +835,9 @@ struct Renderer::Impl {
 #if defined(__APPLE__)
         if(warp) throw std::runtime_error("WARP is Windows-only; macOS diagnostics use a Metal device.");
         if(debug) throw std::runtime_error("The D3D11 debug layer is Windows-only; use Metal validation on macOS.");
+        const auto metal=b2_metal_device();
+        if(!metal.available) throw std::runtime_error("No Metal GPU is available.");
+        if(!metal.supported) throw std::runtime_error(std::format("Unsupported Metal GPU: {}. The backend requires Apple7 or Mac2 GPU family support.",metal.name));
         setenv("DXMT_LOG_PATH","none",0);setenv("DXMT_LOG_LEVEL","error",0);
 #elif !defined(_WIN32)
         if(warp) throw std::runtime_error("WARP is Windows-only; select a Vulkan software ICD for Linux offscreen diagnostics.");
