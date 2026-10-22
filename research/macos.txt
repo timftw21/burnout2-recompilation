@@ -124,3 +124,42 @@ and explicit joins on restart and destruction. An ignored local fixture passed
 128 restart/cancel/destruction cycles and asynchronous error reporting. Linux's
 existing custom-music suite passed 2,062 cases, including cancelled-import library
 preservation. The modified native Windows input library also compiled.
+
+Native full game builds linked 36,149 generated functions on both architectures.
+Intel's existing CPU suite passed 52 game, 26,026 instruction, 3,467 memory,
+6,744 floating and 109 control cases. ARM passed 52 game, 2,267 memory, 6,744
+floating and 115 control cases; its report explicitly labels Intel hardware flag
+references unavailable and unaligned atomic memory unsupported. The diagnostic
+now checks aligned ARM atomics and all six nonmutating rejection paths instead
+of assuming Intel's unaligned operations work there. A native ARM fixture under
+QEMU separately verified those operations before the native CI run.
+
+The native DXGI adapter copied NSString UTF-16 bytes into a 32-bit WCHAR array,
+causing renderer initialization to throw from wstring_convert. Its generated
+native copy now uses DXMT's existing width-aware UTF-8 transcoder. The ARM job
+then passed the full game build, offscreen Metal draw, CPU/audio/effects checks
+and all 2,061 storage cases, including resident-texture replacement:
+https://github.com/timftw21/burnout2-recompilation/actions/runs/39710332686/job/119599889378
+
+The Intel CI Metal device rejected vertex-only pipelines without a declared
+pixel format even with rasterization disabled. A temporary native Metal probe
+reproduced that rejection outside DXMT. Declaring an inactive RGBA8 format passed
+on both runners and preserved all four vertex buffer writes with differently
+formatted RGBA16Float color and Depth32Float attachments. DXMT's GS/TS command
+pipelines now declare that format with color writes and rasterization disabled.
+The temporary experiment was removed; no extra executable or permanent test is
+shipped. Evidence is in the two metal-pipeline-diagnostic jobs here:
+https://github.com/timftw21/burnout2-recompilation/actions/runs/39711966599
+Both runners reported Apple Paravirtual devices, with different GPU family
+support. These are hosted component checks, not physical Mac gameplay evidence.
+
+After the pipeline fix, Intel's device creation reached DXMT's format inspection
+and returned E_FAIL. The pinned source accepts Apple7 or Mac2 GPU families and
+otherwise throws Invalid MTLDevice (src/dxmt/dxmt_format.cpp). A native capability
+query now reports those exact flags before rendering. It follows DXMT's adapter
+selection, including preferring the last discrete device on multi-GPU Macs.
+Unsupported hardware receives a clear renderer error. CI always builds the full
+game and runs CPU/audio/effects/file checks; it enables offscreen rendering and
+the storage suite's texture-cache checks only for a supported device. The storage
+JSON explicitly reports graphics_checked and graphics_status, with an actual
+case count. No capability is fabricated or substituted with a software renderer.

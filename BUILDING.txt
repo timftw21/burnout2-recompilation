@@ -88,9 +88,15 @@ the remaining diagnostics still exercise original game routines and services.
 Unaligned atomic memory operations are explicitly unsupported on ARM.
 
 No local Mac was available during this bring-up. CI builds the full native
-game and runs offline diagnostics. Metal rendering,
-audible playback, gameplay and performance require validation on both Mac
-architectures. Windows-only D3D12 upscalers, WARP, D3D11 debug layers and hardware
+game and runs offline diagnostics on both architectures. The Apple Silicon
+runner also exercises offscreen Metal rendering. The Intel runner's virtual
+GPU lacks the Apple7/Mac2 family support required by DXMT. Its CPU, audio,
+effects and file checks still run; GPU checks explicitly report unavailable.
+b2-tool inspect-metal reports the selected device and supported GPU families.
+Compatible hardware automatically enables the offscreen draw and the storage
+suite's resident-texture cases. Audible playback, gameplay and performance
+still require validation on both Mac architectures. Windows-only D3D12
+upscalers, WARP, D3D11 debug layers and hardware
 memory watches remain unavailable. x87 transcendental results need comparison
 on game scenes; MPFR does not reproduce the Pentium's internal approximations.
 

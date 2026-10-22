@@ -127,6 +127,9 @@ bash Build.sh '/path/to/Burnout 2.xiso.iso'
 Intel and Apple Silicon use separate native builds. Graphics run through DXMT
 and Metal, without Wine or Rosetta. Both architectures still need real gameplay,
 visual, audio and performance testing. No Mac gameplay result is available yet.
+CI compiles the full game on both architectures. Its Intel virtual GPU lacks
+the features required by the Metal backend, so Intel graphics need testing on
+a compatible physical Mac. Run `b2-tool inspect-metal` to check GPU support.
 
 Linux and macOS do not support the Windows D3D12 upscalers, WARP, D3D11 debug
 layers or hardware memory watches. Custom music imports require FFmpeg.
