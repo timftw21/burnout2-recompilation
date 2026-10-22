@@ -30,6 +30,10 @@ CMakeUserPresets.json
 *.o
 *.lib
 *.a
+*.so
+*.so.*
+*.dylib
+*.dSYM/
 *.pch
 *.ilk
 *.exp

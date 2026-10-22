@@ -10,10 +10,34 @@
         "CMAKE_CXX_COMPILER": "clang-cl",
         "CMAKE_LINKER_TYPE": "LLD"
       }
+    },
+    {
+      "name": "linux",
+      "generator": "Ninja Multi-Config",
+      "binaryDir": "${sourceDir}/build/linux",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_LINKER_TYPE": "LLD"
+      }
+    },
+    {
+      "name": "macos",
+      "generator": "Ninja Multi-Config",
+      "binaryDir": "${sourceDir}/build/macos",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "14.0"
+      }
     }
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "windows", "configuration": "Release", "jobs": 6 },
-    { "name": "debug", "configurePreset": "windows", "configuration": "Debug", "jobs": 6 }
+    { "name": "debug", "configurePreset": "windows", "configuration": "Debug", "jobs": 6 },
+    { "name": "linux-release", "configurePreset": "linux", "configuration": "Release", "jobs": 6 },
+    { "name": "linux-debug", "configurePreset": "linux", "configuration": "Debug", "jobs": 6 },
+    { "name": "macos-release", "configurePreset": "macos", "configuration": "Release", "jobs": 4 },
+    { "name": "macos-debug", "configurePreset": "macos", "configuration": "Debug", "jobs": 4 }
   ]
 }

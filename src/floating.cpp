@@ -1,8 +1,8 @@
 #include "floating.h"
 #include <stdexcept>
 
-extern "C" void b2_fp_enter(void* guest,void* host);
-extern "C" void b2_fp_leave(void* guest,const void* host);
+extern "C" void B2_ASM b2_fp_enter(void* guest,void* host);
+extern "C" void B2_ASM b2_fp_leave(void* guest,const void* host);
 
 namespace b2 {
 namespace {

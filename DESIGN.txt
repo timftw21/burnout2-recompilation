@@ -1,6 +1,6 @@
 Burnout 2 recompilation design
 
-Build a small Windows x64 recompilation whose first priority is performance.
+Build a small Windows x64, Linux x86-64 and macOS Intel/Apple Silicon recompilation whose first priority is performance.
 Preserve correct gameplay and achieve visual parity with the original Xbox game.
 Use knowledge/ as research input, with discoveries tied to the verified executable.
 
@@ -79,6 +79,19 @@ direct; add infrastructure only for a demonstrated requirement.
 
 SDL3 manages windows, events, controllers and audio devices/streams. Translate Xbox
 GPU commands into native D3D11 rendering and HLSL shaders on the SDL3 window.
+Linux uses DXVK Native to run the same D3D11 renderer through Vulkan, without
+Wine. SDL3 owns its Linux window and Vulkan surface. Linux file services use
+POSIX asynchronous I/O; guarded native contexts retain cooperative guest stacks.
+Instruction helpers use native ELF assembly and preserve their register ABI.
+Linux HLSL is compiled ahead of time with vkd3d-shader. Vendor D3D12 reconstruction,
+WARP and Windows hardware-watch diagnostics are explicitly unavailable there.
+
+macOS uses the same D3D11 renderer through native DXMT and Metal, with an SDL3
+Metal view and no Wine. Intel helpers use Mach-O assembly. Apple Silicon emits
+direct C++ instruction helpers with SoftFloat extended/IEEE arithmetic and MPFR
+transcendentals; it never dispatches or decodes guest instructions at runtime.
+Share POSIX file services and structured diagnostics. Native Mac gameplay,
+transcendental agreement, visuals and performance require hardware validation.
 
 SDL_GPU targets D3D12, Vulkan and Metal [1]. D3D11 therefore uses SDL3's platform
 facilities with a native graphics device and presentation path.

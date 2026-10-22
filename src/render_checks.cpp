@@ -3,7 +3,7 @@
 #include "gpu.h"
 #include "cpu.h"
 #include <d3d11.h>
-#include <wrl/client.h>
+#include "com_ptr.h"
 #include <algorithm>
 #include <bit>
 #include <chrono>
@@ -89,7 +89,7 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
         }
         const auto timing = renderer.stats();
         report += std::format("{{\"name\":{},\"passed\":{},\"error\":{},\"image\":{},\"draws\":{},\"vertices\":{},\"gpu_ms\":{},\"elapsed_ms\":{}}}",
-            json(name), error.empty(), json(error), json(utf8(image_path.wstring())), timing.draws, timing.vertices,
+            json(name), error.empty(), json(error), json(path_text(image_path)), timing.draws, timing.vertices,
             timing.gpu_timing_valid ? std::format("{}", timing.gpu_ms) : "null",
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
     };
@@ -607,7 +607,7 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
             if(const auto messages=native.errors();!messages.empty()) throw std::runtime_error("Target growth: "+messages.front());
             ++passed;
         } catch(const std::exception& failure) {error=failure.what();}
-        report+=std::format("{{\"name\":{},\"passed\":{},\"error\":{},\"image\":{}}}",json(name),error.empty(),json(error),json(utf8(image_path.wstring())));
+        report+=std::format("{{\"name\":{},\"passed\":{},\"error\":{},\"image\":{}}}",json(name),error.empty(),json(error),json(path_text(image_path)));
     };
     growth_check(false);growth_check(true);growth_check(false,true);
     for(unsigned samples:{2U,4U,8U}) if(renderer.supports_msaa(samples)) {
@@ -650,7 +650,7 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
             const auto messages=native.errors();if(!messages.empty()) throw std::runtime_error("Scaled feedback: "+messages.front());
             ++passed;
         } catch(const std::exception& failure) {error=failure.what();}
-        report+=std::format("{{\"name\":{},\"passed\":{},\"error\":{},\"image\":{}}}",json(name),error.empty(),json(error),json(utf8(image_path.wstring())));
+        report+=std::format("{{\"name\":{},\"passed\":{},\"error\":{},\"image\":{}}}",json(name),error.empty(),json(error),json(path_text(image_path)));
     }
     // SDK passthrough at XBE 00223108, identical to UI draw 546 in the user's
     // frame-51886055200 capture. Its constants include the NV2A pixel origin.
@@ -737,7 +737,7 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
             if(const auto messages=native.errors();!messages.empty()) throw std::runtime_error("UI pixel origin: "+messages.front());
             ++passed;
         } catch(const std::exception& failure) {error=failure.what();}
-        report+=std::format("{{\"name\":{},\"passed\":{},\"error\":{},\"image\":{}}}",json(name),error.empty(),json(error),json(utf8(image_path.wstring())));
+        report+=std::format("{{\"name\":{},\"passed\":{},\"error\":{},\"image\":{}}}",json(name),error.empty(),json(error),json(path_text(image_path)));
     }
     // frame-377419886700: copy the previous frame with a half-pixel-adjusted
     // rectangle, then darken it using reverse subtraction. Repeated copies
@@ -786,7 +786,7 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
             if(const auto messages=native.errors();!messages.empty()) throw std::runtime_error("Transition: "+messages.front());
             ++passed;
         } catch(const std::exception& failure) {error=failure.what();}
-        report+=std::format("{{\"name\":{},\"passed\":{},\"error\":{},\"image\":{}}}",json(name),error.empty(),json(error),json(utf8(image_path.wstring())));
+        report+=std::format("{{\"name\":{},\"passed\":{},\"error\":{},\"image\":{}}}",json(name),error.empty(),json(error),json(path_text(image_path)));
     }
     run("translated-vertex-program",colored(),white,red_pixel,{}, {},[&] {
         renderer.draw_program(colored(),gpu_program,context,view,program_vertices);
@@ -848,7 +848,7 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
         ++passed;
     } catch(const std::exception& failure) {upload_error=failure.what();}
     report+=std::format("{{\"name\":\"stream-upload-order\",\"passed\":{},\"error\":{},\"image\":{},\"draws\":32770,\"submission_ms\":{},\"completion_ms\":{},\"buffer_maps\":{},\"buffer_bytes\":{}}}",
-        upload_error.empty(),json(upload_error),json(utf8(upload_image.wstring())),upload_submit_ms,upload_complete_ms,
+        upload_error.empty(),json(upload_error),json(path_text(upload_image)),upload_submit_ms,upload_complete_ms,
         upload_counters[unsigned(PerfMetric::buffer_maps)],upload_counters[unsigned(PerfMetric::buffer_bytes)]);
     VertexLayout raw_layout{};raw_layout[0]={0,0,0x32};raw_layout[3]={1,0,0x40};
     const auto raw_case=[&](std::string_view name,std::uint32_t format,Bytes payload,std::array<unsigned,4> expected,bool repeat=false) {
@@ -1205,7 +1205,7 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
             ++passed;
         } catch(const std::exception& failure) {error=failure.what();}
         report+=std::format("{{\"name\":{},\"passed\":{},\"error\":{},\"image\":{},\"draws\":{},\"vertices\":{},\"submission_ms\":{},\"fences\":{},\"fence_queries\":{},\"fence_queue_waits\":{}}}",
-            json(name),error.empty(),json(error),json(utf8(image_path.wstring())),statistics.draws,statistics.vertices,submission_ms,statistics.fences,statistics.fence_queries,statistics.fence_queue_waits);
+            json(name),error.empty(),json(error),json(path_text(image_path)),statistics.draws,statistics.vertices,submission_ms,statistics.fences,statistics.fence_queries,statistics.fence_queue_waits);
     };
     gpu_check("gpu-packets-array-quad",false,false,false);
     gpu_check("gpu-capture-last-presented-frame",false,false,false,false,false,false,false,false,false,true);
@@ -1263,7 +1263,7 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
         ++passed;
     } catch(const std::exception& failure) {barrier_error=failure.what();}
     report+=std::format("{{\"name\":\"gpu-command-barriers\",\"passed\":{},\"error\":{},\"image\":{},\"barriers\":1024,\"submission_ms\":{},\"fence_queries\":{},\"fence_queue_waits\":{}}}",
-        barrier_error.empty(),json(barrier_error),json(utf8(barrier_image.wstring())),barrier_ms,barrier_stats.fence_queries,barrier_stats.fence_queue_waits);
+        barrier_error.empty(),json(barrier_error),json(path_text(barrier_image)),barrier_ms,barrier_stats.fence_queries,barrier_stats.fence_queue_waits);
 
     if(total++) report+=',';
     std::string fence_error;GpuStats fence_stats{};
@@ -1295,7 +1295,7 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
         ++passed;
     } catch(const std::exception& failure) {fence_error=failure.what();}
     report+=std::format("{{\"name\":\"gpu-requested-fence-wrap\",\"passed\":{},\"error\":{},\"image\":{},\"fence_queries\":{},\"fence_queue_waits\":{}}}",
-        fence_error.empty(),json(fence_error),json(utf8(fence_image.wstring())),fence_stats.fence_queries,fence_stats.fence_queue_waits);
+        fence_error.empty(),json(fence_error),json(path_text(fence_image)),fence_stats.fence_queries,fence_stats.fence_queue_waits);
 
     if(total++) report+=',';
     std::string cubemap_error;
@@ -1368,7 +1368,7 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
         ++passed;
     } catch(const std::exception& failure) {cubemap_error=failure.what();}
     report+=std::format("{{\"name\":\"gpu-packets-reflection-cubemap\",\"passed\":{},\"error\":{},\"image\":{}}}",
-        cubemap_error.empty(),json(cubemap_error),json(utf8(cubemap_image.wstring())));
+        cubemap_error.empty(),json(cubemap_error),json(path_text(cubemap_image)));
 
     for(const bool recycling:{false,true}) {
         if(total++) report+=',';
@@ -1455,7 +1455,7 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
             if(!native.errors().empty()) throw std::runtime_error("Resource recycling produced D3D11 validation messages");
             ++passed;
         } catch(const std::exception& failure) {error=failure.what();}
-        report+=std::format("{{\"name\":{},\"passed\":{},\"error\":{},\"image\":{}}}",json(name),error.empty(),json(error),json(utf8(image_path.wstring())));
+        report+=std::format("{{\"name\":{},\"passed\":{},\"error\":{},\"image\":{}}}",json(name),error.empty(),json(error),json(path_text(image_path)));
     }
     for(unsigned quality=1;quality<=3;++quality) for(const auto sample_count:{1U,4U}) {
         if(sample_count>1 && !renderer.supports_msaa(sample_count)) continue;
@@ -1546,7 +1546,7 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
             if(!native.errors().empty()) throw std::runtime_error(native.errors().front());
             ++passed;
         } catch(const std::exception& failure){error=failure.what();}
-        report+=std::format("{{\"name\":{},\"passed\":{},\"error\":{},\"image\":{},\"elapsed_ms\":{:.3f}}}",json(name),error.empty(),json(error),json(utf8(image_path.wstring())),std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count());
+        report+=std::format("{{\"name\":{},\"passed\":{},\"error\":{},\"image\":{},\"elapsed_ms\":{:.3f}}}",json(name),error.empty(),json(error),json(path_text(image_path)),std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count());
     }
     const auto messages = renderer.errors();
     report += std::format("],\"passed\":{},\"total\":{},\"shader_compilations\":{},\"debug_messages\":[",
@@ -1567,7 +1567,7 @@ std::string render_texture(const std::filesystem::path& input, TextureFormat for
     renderer.prepare(state); renderer.begin(); renderer.draw(state,quad()); renderer.end();
     save_png(renderer.readback(),output);
     return "{\"format\":\"b2-texture-render-v1\",\"adapter\":"+json(renderer.adapter())+
-        ",\"image\":"+json(utf8(output.wstring()))+",\"source_bytes\":"+std::to_string(bytes.size())+'}';
+        ",\"image\":"+json(path_text(output))+",\"source_bytes\":"+std::to_string(bytes.size())+'}';
 }
 std::string render_dictionary(const std::filesystem::path& input,
                               const std::filesystem::path& directory, bool warp) {
@@ -1575,7 +1575,7 @@ std::string render_dictionary(const std::filesystem::path& input,
     TextureDictionary dictionary(input);
     Renderer renderer(64,64,warp);
     std::filesystem::create_directories(directory);
-    std::string report="{\"format\":\"b2-dictionary-render-v1\",\"input\":"+json(utf8(input.wstring()))+
+    std::string report="{\"format\":\"b2-dictionary-render-v1\",\"input\":"+json(path_text(input))+
         ",\"adapter\":"+json(renderer.adapter())+",\"game_booted\":false,\"textures\":[";
     unsigned count=0, failures=0;
     for (const auto& texture : dictionary.textures()) {
@@ -1598,7 +1598,7 @@ std::string render_dictionary(const std::filesystem::path& input,
             if(begun)renderer.end();
         }
         report+=std::format("{{\"name\":{},\"width\":{},\"height\":{},\"nv097_format\":{},\"passed\":{},\"error\":{},\"image\":{}}}",
-            json(texture.name),texture.width,texture.height,texture.format,error.empty(),json(error),json(utf8(output.wstring())));
+            json(texture.name),texture.width,texture.height,texture.format,error.empty(),json(error),json(path_text(output)));
     }
     report+=std::format("],\"passed\":{},\"total\":{},\"failures\":{},\"shader_compilations\":{}}}",
                         failures==0,count,failures,renderer.stats().shader_compilations);

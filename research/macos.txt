@@ -1,0 +1,90 @@
+macOS bring-up, 2026-10-21
+
+No Mac is available. This is a native port candidate for Intel and Apple Silicon;
+Mac linking, Metal output, audible playback, gameplay and performance have not
+been validated. No game automation or gameplay benchmark was run for this work.
+
+Graphics source evidence
+
+DXMT provides a native Mach-O library build, separately from its Wine build:
+https://github.com/3Shain/dxmt/blob/50102f994b406f58f56d5d09f2ad20f9b90390a2/docs/DEVELOPMENT.md
+The native source lists and LLVM 15 requirement are taken from that revision's
+Meson files. Our CMake build uses those sources without running Python/Meson.
+The official LLVM 15.0.7 Mac package hashes were checked against downloads from
+the LLVM project's release. SDL3 owns the Metal view, passed to the native DXMT
+window thunk. Its previous thunk expected Wine's window driver.
+
+The pinned native allocator passed size/alignment to aligned_alloc in reverse
+order (src/util/wsi_platform_darwin.cpp). The generated copy uses posix_memalign
+with the original size and alignment. DXMT_PAGE_SIZE comes from the native
+host's getconf PAGESIZE, covering Intel and Apple Silicon page sizes.
+The renderer retains the SDL window for pixel sizing separately from the Metal
+layer handed to DXMT.
+
+CPU and service implementation
+
+Intel preserves the resident x87 stack and SSE state, with Mach-O symbols and
+the same helper register convention used on Windows/Linux. Both original Intel
+assembly files and both new stack-switching paths cross-assembled as Mach-O.
+POSIX descriptors/AIO, metadata and file sharing are shared with Linux. Mac
+paths, page sizes, extended attributes, creation time, signal context and memory
+counters use their native APIs. Mac uses guarded stacks and native assembly
+contexts, avoiding deprecated or missing Mac ucontext implementations.
+Read hints use Darwin's F_RDAHEAD, and signal stacks assign fields by name
+because Darwin and Linux order those fields differently:
+https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html
+https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/_types/_sigaltstack.h
+
+Apple Silicon lowers verified game instructions into direct C++ helpers. It
+does not decode instructions, dispatch opcodes or interpret the game at runtime.
+SoftFloat preserves IEEE and 80-bit arithmetic; its public little-endian layout
+and thread-local controls are explicit. A generated rounding routine exposes
+the rounding direction needed by x87 status bit C1. Loads/stores, constants,
+stack order, MMX register sharing and control state retain the guest layout.
+MPFR supplies transcendental functions with reusable per-thread scratch space.
+Its results can differ from hardware x87 approximations; this remains a scene
+validation concern, not a claim of bit-identical Pentium transcendental results.
+
+Validation evidence (Windows Ryzen 5 5600X, Ubuntu 24.04 WSL2, Clang 19)
+
+The portable helper build discovered and compiled the same 36,149 functions and
+713,245 instructions as the Intel build. Discovery still reports unresolved
+indirect targets; platform bindings are not counted as translated CPU coverage.
+The final portable executable passed 52 game cases, 26,026 instruction cases,
+3,467 memory cases, 6,744 floating cases and 109 control cases. Storage passed
+2,061 cases, including asynchronous writes and reopening; audio passed 70 cases
+without opening a device. The native Windows CPU/audio and hidden-window checks
+also passed, as did native Linux CPU/storage/audio. The source-only setup path
+built and ran the native tool, preserved the settings hash, and returned to a
+working full Linux build. These are component checks without a game boot.
+
+A bounded hardware comparison covered 1,036 normal-value x87 cases across four
+rounding modes. 1,004 matched the host's defined numeric and status fields; the 32
+differences were in transcendental operations. All non-transcendental samples
+matched. Four mixed x87/MMX cases separately matched stack top, register data,
+tags and memory. These checks caught and corrected constant rounding, C1 and
+MMX's reset of the stack top. They are not exhaustive IEEE conformance evidence.
+Three additional hardware comparisons passed stack-top rotation and pop,
+including preserved register contents in slots marked empty.
+
+Native ARM code ran under qemu-aarch64, using the same production arithmetic
+sources. Its result hash matched Intel: 6a21e288d6f492f5, across 2,700 integer
+results, 24 four-lane floating samples, 24 extended-arithmetic samples and nine
+transcendental samples. A 900-call check of all nine math helpers recorded zero
+heap allocations or resizes after initialization. GMP's allocation hooks use a
+fixed 64 KiB thread-local workspace; MPFR's local cache is released before the
+workspace is recycled. Persistent values are allocated at guest entry.
+The native stack-switching source completed 2,048 switches on both x86-64 and
+emulated ARM, preserving the caller's floating control state. These demonstrate
+CPU portability; they are not Mac gameplay or speed measurements.
+
+The renderer/settings sources passed a Linux syntax check against DXMT's native
+D3D headers, with only standard Apple platform-selection macros supplied for
+SDL headers. This is interface checking, not a Mac SDK or Metal build.
+Private diagnostics and temporary fixtures remain under build/macos-host.
+
+The manual GitHub workflow targets macos-15-intel and macos-15 (Apple Silicon):
+https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+It builds the native tool without private game inputs. It has not been run.
+On ARM the tool build also compiles the portable arithmetic core, so those
+sources are checked without requiring a game image.

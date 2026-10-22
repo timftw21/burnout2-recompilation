@@ -1,7 +1,8 @@
 #include "gpu.h"
+#include <thread>
 #include "cpu.h"
 #include <d3d11.h>
-#include <wrl/client.h>
+#include "com_ptr.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -530,7 +531,7 @@ struct Gpu::Impl {
             if(!fence_count) throw std::runtime_error("Requested GPU fence has no submitted completion point");
             if(!retire()) {
                 if(std::chrono::steady_clock::now()>=deadline) throw std::runtime_error("Native GPU completion timed out");
-                SwitchToThread();
+                std::this_thread::yield();
             }
         }
     }

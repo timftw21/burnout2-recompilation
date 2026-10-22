@@ -58,11 +58,11 @@ Xbe::Xbe(const std::filesystem::path& path) : file_(path) {
     file_offset(certificate_address, u32(certificate, 0));
     title_id = u32(certificate, 8);
     title_version = u32(certificate, 0xAC);
-    std::wstring wide_title;
+    std::u16string wide_title;
     for (std::size_t i = 0; i < 40; ++i) {
         const auto value = u16(certificate, 0xC + i * 2);
         if (!value) break;
-        wide_title.push_back(static_cast<wchar_t>(value));
+        wide_title.push_back(static_cast<char16_t>(value));
     }
     title = utf8(wide_title);
     struct Keys { const char* name; std::uint32_t entry, kernel; };

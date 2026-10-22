@@ -1,10 +1,19 @@
 #include "custom_music.h"
 #include "file.h"
+#include "host.h"
+#ifdef _WIN32
 #include <Windows.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
-#include <wrl/client.h>
+#include "com_ptr.h"
+#else
+#include <SDL3/SDL.h>
+#include <charconv>
+#include <codecvt>
+#include <locale>
+#include <chrono>
+#endif
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -16,8 +25,11 @@
 
 namespace b2 {
 namespace {
+#ifdef _WIN32
 using Microsoft::WRL::ComPtr;
+#endif
 constexpr std::string_view cache_marker="Burnout 2 custom music cache v1\n";
+#ifdef _WIN32
 void checked(HRESULT result,std::string_view operation) {
     if(FAILED(result)) throw std::runtime_error(std::format("{} failed (0x{:08X})",operation,static_cast<unsigned>(result)));
 }
@@ -41,11 +53,14 @@ struct Media {
     }
     ~Media() {MFShutdown();CoUninitialize();for(auto module:modules) FreeLibrary(module);}
 };
+#else
+struct Media {};
+#endif
 bool music_file(const std::filesystem::path& path) {
-    auto extension=path.extension().wstring();
-    std::ranges::transform(extension,extension.begin(),[](wchar_t value){return std::towlower(value);});
-    return extension==L".mp3" || extension==L".wav" || extension==L".wma" || extension==L".flac" ||
-        extension==L".m4a" || extension==L".aac";
+    auto extension=path_text(path.extension());
+    std::ranges::transform(extension,extension.begin(),[](unsigned char value){return char(std::tolower(value));});
+    return extension==".mp3" || extension==".wav" || extension==".wma" || extension==".flac" ||
+        extension==".m4a" || extension==".aac";
 }
 std::filesystem::path safe_directory(const std::filesystem::path& path) {
     const auto absolute=std::filesystem::absolute(path).lexically_normal();
@@ -61,11 +76,12 @@ void remove_cache(const std::filesystem::path& directory,const std::filesystem::
     if(safe_directory(directory).parent_path()!=parent || !owned_cache(directory))
         throw std::runtime_error("Refusing to remove an unrecognized music cache.");
     for(const auto& entry:std::filesystem::recursive_directory_iterator(directory)) {
-        if(GetFileAttributesW(entry.path().c_str())&FILE_ATTRIBUTE_REPARSE_POINT)
+        if(std::filesystem::is_symlink(entry.symlink_status()))
             throw std::runtime_error("Music cache contains a link or junction.");
     }
     std::filesystem::remove_all(directory);
 }
+#ifdef _WIN32
 ComPtr<IMFMediaType> wma_type() {
     ComPtr<IMFCollection> types;
     checked(MFTranscodeGetAudioOutputAvailableTypes(MFAudioFormat_WMAudioV8,MFT_ENUM_FLAG_ALL,nullptr,&types),"Finding the Xbox-compatible WMA encoder");
@@ -131,10 +147,51 @@ unsigned convert(const std::filesystem::path& source,const std::filesystem::path
     checked(writer->Finalize(),"Finishing the imported WMA file");
     return static_cast<unsigned>((frames*1000+rate-1)/rate);
 }
+#else
+unsigned convert(const std::filesystem::path& source,const std::filesystem::path& destination,
+    const std::function<bool()>& keep_running) {
+    const auto input=path_text(source),output=path_text(destination);
+    const char* arguments[]={"ffmpeg","-v","error","-nostdin","-n","-i",input.c_str(),"-map","0:a:0","-vn","-ar","44100","-ac","2","-c:a","wmav2","-b:a","128k",output.c_str(),nullptr};
+    std::unique_ptr<SDL_Process,decltype(&SDL_DestroyProcess)> process(SDL_CreateProcess(arguments,false),SDL_DestroyProcess);
+    if(!process) throw std::runtime_error(std::string("Music import requires FFmpeg on PATH: ")+SDL_GetError());
+    int code=0;
+    while(!SDL_WaitProcess(process.get(),false,&code)) {
+        if(!keep_running()) {SDL_KillProcess(process.get(),true);SDL_WaitProcess(process.get(),true,&code);throw std::runtime_error("Music import cancelled.");}
+        SDL_Delay(20);
+    }
+    if(code) throw std::runtime_error("FFmpeg could not convert "+input+"; see its error output.");
+    // Read ASF File Properties from the actual encoded output. This is also
+    // the duration the original Xbox WMA reader sees, excluding preroll.
+    File file(destination);const auto header=file.read(0,30);const auto objects=u32(header,24);
+    if(objects>128) throw std::runtime_error("Imported WMA header exceeds its object limit.");
+    std::uint64_t offset=30;
+    constexpr std::array<unsigned char,16> properties{0xA1,0xDC,0xAB,0x8C,0x47,0xA9,0xCF,0x11,0x8E,0xE4,0x00,0xC0,0x0C,0x20,0x53,0x65};
+    for(unsigned i=0;i<objects;++i) {
+        const auto object=file.read(offset,24);std::uint64_t size;std::memcpy(&size,object.data()+16,8);
+        if(size<24) throw std::runtime_error("Invalid imported WMA object.");file.check(offset,size);
+        if(!std::memcmp(object.data(),properties.data(),16)) {
+            if(size<104) throw std::runtime_error("Truncated imported WMA properties.");
+            const auto data=file.read(offset,104);std::uint64_t duration,preroll;
+            std::memcpy(&duration,data.data()+64,8);std::memcpy(&preroll,data.data()+80,8);
+            const auto milliseconds=duration/10000;
+            if(milliseconds<=preroll || milliseconds-preroll>UINT32_MAX) throw std::runtime_error("Invalid imported music duration.");
+            return static_cast<unsigned>(milliseconds-preroll);
+        }
+        offset+=size;
+    }
+    throw std::runtime_error("Imported WMA lacks its ASF duration.");
+}
+#endif
 void name(std::vector<std::byte>& database,std::size_t offset,const std::wstring& source) {
-    auto count=std::min<std::size_t>(source.size(),31);
-    if(count && source[count-1]>=0xD800 && source[count-1]<=0xDBFF) --count;
-    std::memcpy(database.data()+offset,source.data(),count*sizeof(wchar_t));
+    // ST.DB stores UTF-16LE even when the host uses 32-bit wchar_t.
+#ifdef _WIN32
+    const std::u16string text(reinterpret_cast<const char16_t*>(source.data()),source.size());
+#else
+    const auto text=std::wstring_convert<std::codecvt_utf8_utf16<char16_t>,char16_t>{}.from_bytes(utf8(source));
+#endif
+    auto count=std::min<std::size_t>(text.size(),31);
+    if(count && text[count-1]>=0xD800 && text[count-1]<=0xDBFF) --count;
+    std::memcpy(database.data()+offset,text.data(),count*sizeof(char16_t));
 }
 }
 unsigned custom_music_count(const std::filesystem::path& directory) {
@@ -163,10 +220,9 @@ unsigned import_custom_music(const std::filesystem::path& source,const std::file
     std::ranges::sort(files);
     if(std::filesystem::exists(output) && !owned_cache(output)) throw std::runtime_error("The music cache contains unrecognized files; choose another cache directory.");
     std::filesystem::create_directories(parent);
-    GUID id{};checked(CoCreateGuid(&id),"Creating the import identifier");
-    const auto suffix=std::format("{:08X}-{:04X}-{:04X}",id.Data1,id.Data2,id.Data3);
-    const auto temporary=parent/(output.filename().wstring()+L"-import-"+utf8_path(suffix).wstring());
-    const auto previous=parent/(output.filename().wstring()+L"-previous-"+utf8_path(suffix).wstring());
+    std::array<std::byte,16> id{};random_bytes(id.data(),id.size());const auto suffix=hex_bytes(id);
+    const auto temporary=parent/utf8_path(path_text(output.filename())+"-import-"+suffix);
+    const auto previous=parent/utf8_path(path_text(output.filename())+"-previous-"+suffix);
     if(std::filesystem::exists(temporary) || std::filesystem::exists(previous)) throw std::runtime_error("Music import directory already exists.");
     std::filesystem::create_directory(temporary);write_text(temporary/"cache.txt",cache_marker,false);
     try {
@@ -176,11 +232,11 @@ unsigned import_custom_music(const std::filesystem::path& source,const std::file
         const auto put=[&](std::size_t offset,std::uint32_t value){std::memcpy(database.data()+offset,&value,4);};
         put(0,1);put(4,1);put(8,2);put(12,1);
         put(512,0x21371);put(516,1);put(520,static_cast<unsigned>(files.size()));
-        const auto collection=input.filename().wstring();
+        const auto collection=wide(path_text(input.filename()));
         name(database,512+352,collection.empty()?L"Custom music":collection);
         std::uint64_t total_time=0;
         for(unsigned i=0;i<files.size();++i) {
-            const auto title=utf8(files[i].filename().wstring());
+            const auto title=path_text(files[i].filename());
             const auto keep_running=[&]{return !progress || progress(i,static_cast<unsigned>(files.size()),title);};
             if(!keep_running()) throw std::runtime_error("Music import cancelled.");
             const auto group=i/6,slot=i%6,song=((group+1)<<16)|slot;
@@ -189,7 +245,7 @@ unsigned import_custom_music(const std::filesystem::path& source,const std::file
             const auto record=0xCA00+group*512;
             put(512+12+group*4,group);put(record,0x31073);put(record+4,1);put(record+8,group);
             put(record+16+slot*4,song);put(record+40+slot*4,duration);
-            name(database,record+64+slot*64,files[i].stem().wstring());total_time+=duration;
+            name(database,record+64+slot*64,wide(path_text(files[i].stem())));total_time+=duration;
         }
         if(total_time>UINT32_MAX) throw std::runtime_error("Custom soundtrack total duration exceeds the Xbox limit.");
         put(512+348,static_cast<unsigned>(total_time));

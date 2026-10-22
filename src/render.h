@@ -5,13 +5,18 @@
 #include "upscaling.h"
 #include <array>
 #include <memory>
-#include <wrl/client.h>
+#include "com_ptr.h"
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
 struct ID3D11SamplerState;
 
 namespace b2 {
+#ifdef _WIN32
+inline constexpr bool render_debug_layer=true;
+#else
+inline constexpr bool render_debug_layer=false;
+#endif
 struct MotionCamera;
 struct Image {
     std::uint32_t width, height;

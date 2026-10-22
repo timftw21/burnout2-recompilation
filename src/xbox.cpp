@@ -1,5 +1,3 @@
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include "xbox.h"
 #include "custom_music.h"
 #include "disc.h"
@@ -13,9 +11,13 @@
 #include "presentation.h"
 #include "diagnostics.h"
 #include "crypto.h"
-#include <Windows.h>
+#include "host.h"
+#ifdef _WIN32
 #include <bcrypt.h>
-#include <iphlpapi.h>
+#else
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#endif
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -113,7 +115,9 @@ struct Xbox::State {
         std::uint32_t file_object=0,event=0,status=0,ordinal=0,callsite=0,requested=0,buffer=0,thread=0;
         std::uint64_t offset=0;
         bool active=false;
+#ifdef _WIN32
         ~PendingIo() {if(overlap.hEvent) CloseHandle(overlap.hEvent);}
+#endif
     };
     Xbe& image;
     Memory& memory;
@@ -281,10 +285,7 @@ struct Xbox::State {
             if(disc_io->native==INVALID_HANDLE_VALUE) throw std::runtime_error("Cannot open mounted disc for native asynchronous reads");
         }
         if(this->host.storage_root.empty()) {
-            std::array<wchar_t,32768> executable{};
-            const auto length=GetModuleFileNameW(nullptr,executable.data(),static_cast<DWORD>(executable.size()));
-            if(!length || length==executable.size()) throw std::runtime_error("Cannot locate native save storage");
-            user_root=std::filesystem::path(std::wstring_view(executable.data(),length)).parent_path()/"data/user";
+            user_root=executable_path().parent_path()/"data/user";
         } else user_root=std::filesystem::absolute(this->host.storage_root).lexically_normal();
         user_root=std::filesystem::absolute(user_root).lexically_normal();
         if(std::filesystem::weakly_canonical(user_root)!=user_root)
@@ -332,20 +333,16 @@ struct Xbox::State {
         memory.store<std::uint64_t>(gdt+16,0x00CF93000000FFFF);
         // This describes the native compatibility module. It contains no original
         // kernel INIT section or executable instruction stream to patch.
-        IMAGE_DOS_HEADER dos{}; dos.e_magic=IMAGE_DOS_SIGNATURE; dos.e_lfanew=0x100;
-        IMAGE_NT_HEADERS32 pe{};
-        pe.Signature=IMAGE_NT_SIGNATURE; pe.FileHeader.Machine=IMAGE_FILE_MACHINE_I386;
-        pe.FileHeader.NumberOfSections=1; pe.FileHeader.SizeOfOptionalHeader=sizeof(IMAGE_OPTIONAL_HEADER32);
-        pe.OptionalHeader.Magic=IMAGE_NT_OPTIONAL_HDR32_MAGIC; pe.OptionalHeader.ImageBase=kernel_base;
-        pe.OptionalHeader.SectionAlignment=page; pe.OptionalHeader.FileAlignment=512;
-        pe.OptionalHeader.SizeOfImage=static_cast<DWORD>(kernel_image.size()); pe.OptionalHeader.SizeOfHeaders=page;
-        IMAGE_SECTION_HEADER section{};
-        std::memcpy(section.Name,".data",5); section.VirtualAddress=page;
-        section.Misc.VirtualSize=static_cast<DWORD>(kernel_image.size()-page);
-        section.Characteristics=IMAGE_SCN_CNT_INITIALIZED_DATA|IMAGE_SCN_MEM_READ|IMAGE_SCN_MEM_WRITE;
-        std::memcpy(kernel_image.data(),&dos,sizeof(dos));
-        std::memcpy(kernel_image.data()+0x100,&pe,sizeof(pe));
-        std::memcpy(kernel_image.data()+0x100+sizeof(pe),&section,sizeof(section));
+        // The guest queries a PE32 kernel image, independent of the host OS.
+        const auto field=[&]<class T>(unsigned offset,T value){std::memcpy(kernel_image.data()+offset,&value,sizeof(value));};
+        constexpr unsigned pe=0x100,optional=pe+24,section=optional+224;
+        field(0,std::uint16_t{0x5A4D});field(0x3C,std::uint32_t{pe});field(pe,std::uint32_t{0x4550});
+        field(pe+4,std::uint16_t{0x14C});field(pe+6,std::uint16_t{1});field(pe+20,std::uint16_t{224});
+        field(optional,std::uint16_t{0x10B});field(optional+28,kernel_base);
+        field(optional+32,page);field(optional+36,std::uint32_t{512});
+        field(optional+56,static_cast<std::uint32_t>(kernel_image.size()));field(optional+60,page);
+        std::memcpy(kernel_image.data()+section,".data",5);field(section+8,static_cast<std::uint32_t>(kernel_image.size()-page));
+        field(section+12,page);field(section+36,std::uint32_t{0xC0000040});
         for(const auto& import : image.imports) memory.store<std::uint32_t>(import.address,0xFFF00000U+import.ordinal*16);
         const auto version=export_data(324,8);
         memory.store<std::uint16_t>(version,1); memory.store<std::uint16_t>(version+4,5838);
@@ -399,8 +396,7 @@ struct Xbox::State {
             throw std::runtime_error("Native save identity is a reparse point");
         std::array<std::byte,32> keys{};
         if(!std::filesystem::exists(path)) {
-            if(BCryptGenRandom(nullptr,reinterpret_cast<PUCHAR>(keys.data()),static_cast<ULONG>(keys.size()),BCRYPT_USE_SYSTEM_PREFERRED_RNG)<0)
-                throw std::runtime_error("Cannot create native save identity");
+            random_bytes(keys.data(),keys.size());
             write_text(path,std::string_view(reinterpret_cast<const char*>(keys.data()),keys.size()),false);
         }
         File file(path);
@@ -418,7 +414,7 @@ struct Xbox::State {
         derive(export_data(325,16),0xC0);derive(export_data(353,16),0xB0);
         const auto alternate=export_data(354,256);
         for(unsigned i=0;i<16;++i) derive(alternate+i*16,0xD0+i*16);
-        diagnostic_record("{\"type\":\"storage_ready\",\"root\":"+json(utf8(user_root.wstring()))+"}");
+        diagnostic_record("{\"type\":\"storage_ready\",\"root\":"+json(path_text(user_root))+"}");
     }
     std::uint32_t allocate(std::uint32_t size,std::uint32_t alignment,bool committed,std::uint32_t protect,
                            std::uint32_t requested=0,std::uint32_t lowest=0,std::uint32_t highest=UINT32_MAX,bool clear=true,bool top_down=false) {
@@ -931,7 +927,24 @@ struct Xbox::State {
             const auto base=folded(part.substr(0,part.find('.')));
             if(base=="CON" || base=="PRN" || base=="AUX" || base=="NUL" ||
                 (base.size()==4 && (base.starts_with("COM") || base.starts_with("LPT")) && base[3]>='1' && base[3]<='9')) return std::nullopt;
-            path/=std::string(part);
+            auto candidate=path/std::string(part);
+#ifndef _WIN32
+            // FATX names are case-insensitive even on a case-sensitive host.
+            // Exact names stay fast; only a miss needs a bounded directory walk.
+            std::error_code error;
+            if(!std::filesystem::exists(candidate,error) && !error && std::filesystem::is_directory(path,error) && !error) {
+                std::optional<std::filesystem::path> match;unsigned entries=0;
+                const auto wanted=folded(part);
+                for(const auto& entry:std::filesystem::directory_iterator(path)) {
+                    if(++entries>4096) throw NativeBoundary(current->cpu.eip,"native storage directory exceeds 4096 entries");
+                    if(folded(path_text(entry.path().filename()))!=wanted) continue;
+                    if(match) throw NativeBoundary(current->cpu.eip,"native storage contains ambiguous FATX filename casing");
+                    match=entry.path();
+                }
+                if(match) candidate=*match;
+            }
+#endif
+            path=std::move(candidate);
             if(!validate(path)) throw NativeBoundary(current->cpu.eip,"writable guest path crosses a reparse point");
             if(end==std::string_view::npos) break;
             start=end+1;
@@ -2246,7 +2259,9 @@ struct Xbox::State {
             for(unsigned i=0;i<65536;++i) {
                 const auto value=memory.load<std::uint8_t>(source+i);
                 if(!value) {
+#ifdef _WIN32
                     OutputDebugStringA(message.c_str());
+#endif
                     diagnostic_record("{\"type\":\"guest_debug_output\",\"message\":"+json(message)+'}');
                     finish(cpu,4);return;
                 }
@@ -2398,9 +2413,13 @@ struct Xbox::State {
         if(length>maximum || (to_unicode?false:(length&1)!=0)) return invalid_parameter;
         const auto bytes=length?memory.access(input_address,length):nullptr;
         int characters=0;
+#ifdef _WIN32
         if(length) characters=to_unicode?MultiByteToWideChar(1252,0,static_cast<const char*>(bytes),length,nullptr,0):
             WideCharToMultiByte(1252,0,static_cast<const wchar_t*>(bytes),length/2,nullptr,0,nullptr,nullptr);
         if(length && !characters) return invalid_parameter;
+#else
+        characters=to_unicode?length:length/2;
+#endif
         const auto unit=to_unicode?2U:1U,required=(static_cast<unsigned>(characters)+1)*unit;
         if(required>UINT16_MAX) return 0xC0000106;
         auto output=memory.load<std::uint32_t>(destination+4);
@@ -2413,9 +2432,28 @@ struct Xbox::State {
         } else if(memory.load<std::uint16_t>(destination+2)<required) return 0x80000005;
         auto target=memory.access(output,required);
         if(characters) {
+#ifdef _WIN32
             const auto written=to_unicode?MultiByteToWideChar(1252,0,static_cast<const char*>(bytes),length,static_cast<wchar_t*>(target),characters):
                 WideCharToMultiByte(1252,0,static_cast<const wchar_t*>(bytes),length/2,static_cast<char*>(target),characters,nullptr,nullptr);
             if(written!=characters) return invalid_parameter;
+#else
+            constexpr std::array<char16_t,32> cp1252{0x20AC,0x81,0x201A,0x192,0x201E,0x2026,0x2020,0x2021,0x2C6,0x2030,0x160,0x2039,0x152,0x8D,0x17D,0x8F,
+                0x90,0x2018,0x2019,0x201C,0x201D,0x2022,0x2013,0x2014,0x2DC,0x2122,0x161,0x203A,0x153,0x9D,0x17E,0x178};
+            for(unsigned i=0;i<unsigned(characters);++i) {
+                if(to_unicode) {
+                    const auto value=static_cast<const unsigned char*>(bytes)[i];
+                    const auto converted=char16_t(value>=0x80 && value<0xA0?cp1252[value-0x80]:value);
+                    std::memcpy(static_cast<std::byte*>(target)+i*2,&converted,2);
+                } else {
+                    char16_t value;std::memcpy(&value,static_cast<const std::byte*>(bytes)+i*2,2);
+                    const auto found=std::ranges::find(cp1252,value);
+                    // Report unsupported best-fit mappings instead of accepting
+                    // a different filename or overwriting another save.
+                    if(value>255 && found==cp1252.end()) return invalid_parameter;
+                    static_cast<unsigned char*>(target)[i]=found!=cp1252.end()?static_cast<unsigned char>(0x80+std::distance(cp1252.begin(),found)):static_cast<unsigned char>(value);
+                }
+            }
+#endif
         }
         std::memset(static_cast<std::byte*>(target)+required-unit,0,unit);
         memory.store<std::uint16_t>(destination,static_cast<std::uint16_t>(required-unit));
@@ -2477,12 +2515,16 @@ struct Xbox::State {
         if(!write) check_watched_read(cpu,output,count,file.path);
         auto request=std::ranges::find(pending_io,false,&PendingIo::active);
         if(request==pending_io.end()) throw NativeBoundary(cpu.eip,"native asynchronous file queue exceeds 32 requests");
+#ifdef _WIN32
         if(!request->overlap.hEvent) {
             request->overlap.hEvent=CreateEventW(nullptr,TRUE,FALSE,nullptr);
             if(!request->overlap.hEvent) return fail(no_memory);
         }
         const auto native_event=request->overlap.hEvent;
         request->overlap={};request->overlap.hEvent=native_event;ResetEvent(native_event);
+#else
+        request->overlap={};
+#endif
         request->file=object.file;request->file_object=object.address;
         request->event=event?handles.at(event).address:0;request->status=status;
         request->ordinal=write?236:219;request->callsite=memory.load<std::uint32_t>(cpu.registers[esp]);
@@ -2981,21 +3023,7 @@ struct Xbox::State {
             // network stack. Read the native interfaces; never initialize MCPX.
             if constexpr(Ordinal==253) if(argument(cpu,1)) throw NativeBoundary(cpu.eip,"unsupported Ethernet initialization parameter");
             if(!ethernet_initialized || argument(cpu,0)) {
-                MIB_IF_TABLE2* table=nullptr;const auto result=GetIfTable2(&table);
-                if(result!=NO_ERROR) {
-                    if constexpr(Ordinal==253) {finish(cpu,8,static_cast<std::uint32_t>(HRESULT_FROM_WIN32(result)));return;}
-                    else throw NativeBoundary(cpu.eip,"native Ethernet status query failed");
-                }
-                std::unique_ptr<MIB_IF_TABLE2,decltype(&FreeMibTable)> interfaces(table,FreeMibTable);
-                ethernet_state=0;
-                for(unsigned i=0;i<table->NumEntries;++i) {
-                    const auto& link=table->Table[i];
-                    if(link.Type!=IF_TYPE_ETHERNET_CSMACD || !link.InterfaceAndOperStatusFlags.HardwareInterface ||
-                        link.OperStatus!=IfOperStatusUp || link.MediaConnectState!=MediaConnectStateConnected) continue;
-                    const auto speed=std::min(link.TransmitLinkSpeed,link.ReceiveLinkSpeed);
-                    ethernet_state=1|(speed>=100000000?2U:speed>=10000000?4U:0U);break;
-                }
-                // Windows does not expose duplex here; do not invent either bit.
+                ethernet_state=ethernet_status();
                 ethernet_initialized=true;
             }
             finish(cpu,Ordinal==253?8:4,Ordinal==253?success:ethernet_state);
@@ -3112,10 +3140,7 @@ struct Xbox::State {
             if(recursion==1) memory.store<std::uint32_t>(address+24,0);
             finish(cpu,4);
         } else if constexpr(Ordinal==301) {
-            using Convert=ULONG(WINAPI*)(LONG);
-            static const auto convert=reinterpret_cast<Convert>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"RtlNtStatusToDosError"));
-            if(!convert) throw std::runtime_error("Native NTSTATUS conversion is unavailable");
-            finish(cpu,4,convert(static_cast<LONG>(argument(cpu,0))));
+            finish(cpu,4,dos_error(argument(cpu,0)));
         } else if constexpr(Ordinal==103) finish(cpu,0,memory.load<std::uint8_t>(cpu.fs_base+0x24));
         else if constexpr(Ordinal==104) finish(cpu,0,current->object);
         else if constexpr(Ordinal==129 || Ordinal==160 || Ordinal==161) {
@@ -3852,7 +3877,7 @@ std::string check_custom_music(const std::filesystem::path& executable,const std
     state.host.custom_music_root=std::filesystem::canonical(cache);
     const auto enumeration=invoke(0x000E0C86,{info});require(enumeration!=UINT32_MAX,"original soundtrack discovery");
     require(memory.load<std::uint32_t>(info)==1 && memory.load<std::uint32_t>(info+4)==songs,"original soundtrack identity and song count");
-    if(fixture) require(std::wstring(static_cast<const wchar_t*>(memory.access(info+12,64)))==L"Custom validation","original soundtrack name");
+    if(fixture) require(std::u16string(static_cast<const char16_t*>(memory.access(info+12,64)))==u"Custom validation","original soundtrack name");
     unsigned first_duration=0;
     for(unsigned i=0;i<songs;++i) {
         require(invoke(0x000E0D35,{1,i,song,time,title,32})!=0,"original song metadata lookup");
@@ -3860,7 +3885,7 @@ std::string check_custom_music(const std::filesystem::path& executable,const std
         if(!i) first_duration=memory.load<std::uint32_t>(time);
         if(fixture) {
             require(memory.load<std::uint32_t>(time)>=990 && memory.load<std::uint32_t>(time)<=1010,"original song duration");
-            require(std::wstring(static_cast<const wchar_t*>(memory.access(title,64)))==utf8_path(std::format("{:02} - Café",i+1)).wstring(),"original Unicode song names");
+            require(std::u16string(static_cast<const char16_t*>(memory.access(title,64)))==utf16(std::format("{:02} - Café",i+1)),"original Unicode song names");
         }
     }
     require(invoke(0x000E0D35,{1,songs+1,song,time,title,32})==0,"out-of-range song rejected by the original SDK");
@@ -4162,7 +4187,7 @@ std::string check_visibility(const std::filesystem::path& executable,const std::
     std::string results;
     for(const auto config:std::array<std::array<unsigned,2>,4>{{{1,0},{3,0},{1,5},{2,6}}}) {
         const auto scale=config[0],aa=config[1];
-        Renderer renderer(64,64,warp,true,scale);renderer.enhancements(aa,0);
+        Renderer renderer(64,64,warp,render_debug_layer,scale);renderer.enhancements(aa,0);
         std::vector<std::byte> ram(64*1024*1024);image.load(std::span(ram).subspan(image.base,image.image_size));Memory memory(0,ram);
         XboxHost provider;provider.storage_root=output/std::format("storage-{}-{}",scale,aa);
         Xbox xbox(image,memory,ram,{},std::move(provider));auto& state=*xbox.state_;
@@ -4289,6 +4314,7 @@ std::string check_storage(const std::filesystem::path& executable,const std::fil
         ++checks;
     };
     const auto reference=[&](Bytes key,Bytes bytes) {
+#ifdef _WIN32
         BCRYPT_ALG_HANDLE algorithm=nullptr;BCRYPT_HASH_HANDLE hash=nullptr;
         struct Scope {BCRYPT_ALG_HANDLE& algorithm;BCRYPT_HASH_HANDLE& hash;
             ~Scope(){if(hash) BCryptDestroyHash(hash);if(algorithm) BCryptCloseAlgorithmProvider(algorithm,0);}} scope{algorithm,hash};
@@ -4297,6 +4323,15 @@ std::string check_storage(const std::filesystem::path& executable,const std::fil
         check(BCryptCreateHash(algorithm,&hash,nullptr,0,reinterpret_cast<PUCHAR>(const_cast<std::byte*>(key.data())),static_cast<ULONG>(key.size()),0));
         if(!bytes.empty()) check(BCryptHashData(hash,reinterpret_cast<PUCHAR>(const_cast<std::byte*>(bytes.data())),static_cast<ULONG>(bytes.size()),0));
         ShaDigest digest{};check(BCryptFinishHash(hash,reinterpret_cast<PUCHAR>(digest.data()),static_cast<ULONG>(digest.size()),0));return digest;
+#else
+        ShaDigest digest{};unsigned size=0;
+        if(key.empty()) {
+            if(EVP_Digest(bytes.data(),bytes.size(),reinterpret_cast<unsigned char*>(digest.data()),&size,EVP_sha1(),nullptr)!=1)
+                throw std::runtime_error("Storage reference hash failed");
+        } else if(!HMAC(EVP_sha1(),key.data(),static_cast<int>(key.size()),reinterpret_cast<const unsigned char*>(bytes.data()),bytes.size(),reinterpret_cast<unsigned char*>(digest.data()),&size))
+            throw std::runtime_error("Storage reference HMAC failed");
+        if(size!=digest.size()) throw std::runtime_error("Storage reference digest length differs");return digest;
+#endif
     };
     std::array<std::byte,128> input{};
     for(unsigned i=0;i<input.size();++i) input[i]=static_cast<std::byte>(i*73+19);
@@ -4463,7 +4498,7 @@ std::string check_storage(const std::filesystem::path& executable,const std::fil
         require(rejected,"damaged semaphore stops at the original wait with its address reported");
         require(invoke(0xFFF00000U+187*16,{semaphore})==success,"shared semaphore close");
         require(invoke(0x000E5D08,{image.title_id,0})==success,"original title storage mount");
-        text(area,"U:\\");const std::wstring name=L"Offline storage check";
+        text(area,"U:\\");const std::u16string name=u"Offline storage check";
         std::memcpy(memory.access(area+0x40,(name.size()+1)*2),name.c_str(),(name.size()+1)*2);
         require(invoke(0x000E1445,{area,area+0x40,reload?3U:4U,0,area+0x100,260})==0,"original save-directory creation/reopening");
         std::string path;
@@ -4484,7 +4519,7 @@ std::string check_storage(const std::filesystem::path& executable,const std::fil
         if(reload==1) {
             // File reads replace texture bytes without releasing the allocation,
             // just as the original fixed course buffers do. Exercise both APIs.
-            Renderer renderer(64,64,false,true);state.gpu=std::make_unique<Gpu>(renderer,memory,0x3EFE000);
+            Renderer renderer(64,64,false,render_debug_layer);state.gpu=std::make_unique<Gpu>(renderer,memory,0x3EFE000);
             constexpr std::uint32_t texture=0x3880000,positions=0x3EF0000,coordinates=positions+128,commands=positions+256;
             constexpr std::array<Float4,4> vertices{{{-1,1,0.25f,1},{1,1,0.25f,1},{1,-1,0.25f,1},{-1,-1,0.25f,1}}};
             std::memcpy(memory.access(positions,sizeof(vertices)),vertices.data(),sizeof(vertices));
@@ -5135,7 +5170,7 @@ std::string check_track_import(const std::filesystem::path& executable,const std
     }
     memory.store<std::uint32_t>(state.imported.barrier+20,state.imported.frames[0]);
     memory.store<std::uint32_t>(0x34AB5C,scene);state.imported.selected=false;state.imported.barrier=0;
-    Renderer cutout_renderer(128,128,false,true);
+    Renderer cutout_renderer(128,128,false,render_debug_layer);
     std::array<Vertex,4> quad;
     for(unsigned i=0;i<4;++i) {
         quad[i].position={i&1?1.0f:-1.0f,i&2?-1.0f:1.0f,0.5f,1};

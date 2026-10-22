@@ -32,7 +32,7 @@ private:
     Ptr<ID3D11ComputeShader> depth_shader_,main_shader_;
     Ptr<ID3D11VertexShader> vertex_;
     Ptr<ID3D11PixelShader> composite_;
-    Ptr<ID3D11Buffer> constants_;
+    Ptr<ID3D11Buffer> constants_,depth_constants_;
     Ptr<ID3D11RasterizerState> raster_;
     Ptr<ID3D11DepthStencilState> depth_state_;
     void unbind();

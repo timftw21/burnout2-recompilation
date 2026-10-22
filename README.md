@@ -2,7 +2,7 @@
 
 # <div align="center">Burnout 2: Point of Impact — Static Recompilation</div>
 
-An unofficial Windows version of the original Xbox game, focused on fast gameplay,
+An unofficial Windows and Linux version of the original Xbox game, with macOS support in development, focused on fast gameplay,
 preserving the original's look and feel, and a variety of enhancements.
 
 <i>Still in development: Slowdown, bugs, and crashes are possible. Open an issue if you experience a problem, and
@@ -86,6 +86,19 @@ focused on speed and simplicity. I couldn't bear to keep the slop version public
 - Experimental upscaling has small visual issues and can reduce performance.
 
 ## Getting started
+
+For Linux x86-64, install the dependencies in [BUILDING.txt](BUILDING.txt), then
+run `bash Build.sh '/path/to/your/disc.xiso.iso'` and start
+`build/linux/Release/b2`. Linux uses Vulkan through DXVK Native and runs without
+Wine. Windows D3D12 upscalers and hardware memory watches are unavailable there.
+Linux gameplay and performance still need validation on a desktop.
+
+For macOS Intel and Apple Silicon, the same `Build.sh` prepares a native Metal
+build under `build/macos/Release`. See the macOS section of
+[BUILDING.txt](BUILDING.txt) for dependencies and current limits. This port is
+in bring-up; no Mac gameplay or performance result is available yet.
+
+For Windows:
 
 You need a 64-bit Windows PC, a graphics card that supports DirectX 11, and <i>your
 own copy of the US Xbox release. Game files are not included</i>.

@@ -1,7 +1,7 @@
 #pragma once
 #include "render.h"
 #include <d3d11.h>
-#include <wrl/client.h>
+#include "com_ptr.h"
 
 namespace b2 {
 // Spatial AA of completed game images. Original render targets and feedback

@@ -1,0 +1,47 @@
+name: Native macOS build
+on:
+  push:
+    paths:
+      - '.github/workflows/macos.yml'
+      - 'Build.sh'
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      - 'cmake/**'
+      - 'src/**'
+      - 'resources/**'
+      - 'knowledge/facts.json'
+      - 'knowledge/supported_target.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-tools:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15-intel, macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install native build dependencies
+        run: |
+          brew install cmake ninja pkgconf openssl@3 libpng jpeg-turbo spirv-headers bison flex perl
+          if [[ $(uname -m) == arm64 ]]; then brew install mpfr; fi
+          export PATH="$(brew --prefix perl)/bin:$PATH"
+          PERL_MM_USE_DEFAULT=1 cpan -T JSON
+          if ! xcrun --sdk macosx --find metal; then xcodebuild -downloadComponent MetalToolchain; fi
+      - name: Build without private game inputs
+        run: bash Build.sh --tools-only
+      - name: Check native executable
+        run: |
+          file build/macos/Release/b2-tool
+          otool -L build/macos/Release/b2-tool
+          build/macos/Release/b2-tool --help

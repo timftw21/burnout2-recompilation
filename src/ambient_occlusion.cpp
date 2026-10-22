@@ -1,4 +1,5 @@
 #include "ambient_occlusion.h"
+#include <climits>
 #include "shaders.h"
 #include <cstring>
 #include <format>
@@ -38,6 +39,10 @@ FrameAmbientOcclusion::FrameAmbientOcclusion(ID3D11Device* device,ID3D11DeviceCo
     }
     D3D11_BUFFER_DESC buffer{sizeof(AoConstants),D3D11_USAGE_DYNAMIC,D3D11_BIND_CONSTANT_BUFFER,D3D11_CPU_ACCESS_WRITE,0,0};
     checked_ao(device->CreateBuffer(&buffer,nullptr,&constants_),"AO constants");
+    const std::array<unsigned,4> dimensions{width,height,0,0};
+    const D3D11_BUFFER_DESC depth_buffer{sizeof(dimensions),D3D11_USAGE_IMMUTABLE,D3D11_BIND_CONSTANT_BUFFER,0,0,0};
+    const D3D11_SUBRESOURCE_DATA depth_data{dimensions.data(),0,0};
+    checked_ao(device->CreateBuffer(&depth_buffer,&depth_data,&depth_constants_),"AO depth dimensions");
     D3D11_RASTERIZER_DESC raster{};raster.FillMode=D3D11_FILL_SOLID;raster.CullMode=D3D11_CULL_NONE;raster.DepthClipEnable=TRUE;
     checked_ao(device->CreateRasterizerState(&raster,&raster_),"AO rasterizer");
     D3D11_DEPTH_STENCIL_DESC depth{};depth.DepthFunc=D3D11_COMPARISON_ALWAYS;
@@ -50,6 +55,7 @@ void FrameAmbientOcclusion::unbind() {
 }
 void FrameAmbientOcclusion::capture_depth(ID3D11ShaderResourceView* source) {
     unbind();auto output=depth_output_.Get();context_->CSSetShader(depth_shader_.Get(),nullptr,0);
+    auto constants=depth_constants_.Get();context_->CSSetConstantBuffers(0,1,&constants);
     context_->CSSetShaderResources(0,1,&source);context_->CSSetUnorderedAccessViews(0,1,&output,nullptr);
     context_->Dispatch((width_+7)/8,(height_+7)/8,1);unbind();context_->CSSetShader(nullptr,nullptr,0);
 }

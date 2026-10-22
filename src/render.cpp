@@ -3,14 +3,27 @@
 #include "frame_processing.h"
 #include "antialiasing.h"
 #include "ambient_occlusion.h"
+#ifdef _WIN32
 #include <Windows.h>
+#include <wincodec.h>
+#else
+#include <SDL3/SDL.h>
+#include <png.h>
+#include <jpeglib.h>
+#include <csetjmp>
+#include <cstdlib>
+#ifdef __APPLE__
+#include <SDL3/SDL_metal.h>
+#else
+#include <wsi/native_wsi.h>
+#endif
+#endif
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <d3d11sdklayers.h>
 #include <dxgi1_2.h>
 #include <dxgi1_5.h>
-#include <wincodec.h>
-#include <wrl/client.h>
+#include "com_ptr.h"
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -73,6 +86,7 @@ bool white_mask_mip(const TextureData& texture,std::span<const std::byte> bytes,
     }
     return true;
 }
+#ifdef _WIN32
 struct ComScope {
     HRESULT result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     ComScope() { if (result != RPC_E_CHANGED_MODE) checked(result, "COM initialization"); }
@@ -84,6 +98,7 @@ ComPtr<IWICImagingFactory> image_factory() {
                             IID_PPV_ARGS(&factory)), "WIC factory");
     return factory;
 }
+#endif
 void validate_fragment(const RenderState& state) {
     const auto count=state.combiner_control&255;
     if(count>8) throw std::runtime_error("Combiner stage count exceeds eight");
@@ -284,6 +299,7 @@ AttributeFormat attribute_format(std::uint32_t format) {
 void save_png(const Image& image, const std::filesystem::path& path, bool replace) {
     extent(image.width, image.height);
     if (image.rgba.size() != std::size_t(image.width) * image.height * 4) throw std::runtime_error("Invalid RGBA image size");
+#ifdef _WIN32
     ComScope scope;
     auto factory = image_factory();
     ComPtr<IStream> stream;
@@ -321,8 +337,18 @@ void save_png(const Image& image, const std::filesystem::path& path, bool replac
     try { write_text(path, {bytes, static_cast<std::size_t>(info.cbSize.QuadPart)}, replace); }
     catch (...) { GlobalUnlock(handle); throw; }
     GlobalUnlock(handle);
+#else
+    png_image png{};png.version=PNG_IMAGE_VERSION;png.width=image.width;png.height=image.height;png.format=PNG_FORMAT_RGBA;
+    png_alloc_size_t size=0;
+    if(!png_image_write_to_memory(&png,nullptr,&size,0,image.rgba.data(),0,nullptr) || size>128*1024*1024)
+        throw std::runtime_error("Cannot size PNG output");
+    std::string bytes(size,0);
+    if(!png_image_write_to_memory(&png,bytes.data(),&size,0,image.rgba.data(),0,nullptr)) throw std::runtime_error(png.message);
+    bytes.resize(size);write_text(path,bytes,replace);
+#endif
 }
 Image load_image(const std::filesystem::path& path) {
+#ifdef _WIN32
     ComScope scope;
     auto factory = image_factory();
     ComPtr<IWICBitmapDecoder> decoder;
@@ -340,6 +366,42 @@ Image load_image(const std::filesystem::path& path) {
     checked(converter->CopyPixels(nullptr, image.width * 4, static_cast<UINT>(image.rgba.size()),
                                   reinterpret_cast<BYTE*>(image.rgba.data())), "Image pixels");
     return image;
+#else
+    File input(path);const auto magic=input.read(0,std::min<std::uint64_t>(8,input.size()));
+    if(magic.size()==8 && !png_sig_cmp(reinterpret_cast<const unsigned char*>(magic.data()),0,8)) {
+        png_image png{};png.version=PNG_IMAGE_VERSION;
+        if(!png_image_begin_read_from_file(&png,path.c_str())) throw std::runtime_error(png.message);
+        try {
+            extent(png.width,png.height);png.format=PNG_FORMAT_RGBA;
+            Image result{png.width,png.height,std::vector<std::byte>(PNG_IMAGE_SIZE(png))};
+            if(!png_image_finish_read(&png,nullptr,result.rgba.data(),0,nullptr)) throw std::runtime_error(png.message);
+            png_image_free(&png);return result;
+        } catch(...) {png_image_free(&png);throw;}
+    }
+    // libjpeg's error callback must not unwind through C. Keep C++ allocations
+    // outside the setjmp scope and copy the bounded decoded pixels afterwards.
+    struct JpegError {jpeg_error_mgr base;jmp_buf jump;char message[JMSG_LENGTH_MAX];};
+    auto error=std::make_unique<JpegError>();auto decoder=std::make_unique<jpeg_decompress_struct>();
+    decoder->err=jpeg_std_error(&error->base);
+    error->base.error_exit=[](j_common_ptr value) {auto* e=reinterpret_cast<JpegError*>(value->err);value->err->format_message(value,e->message);longjmp(e->jump,1);};
+    FILE* file=std::fopen(path.c_str(),"rb");if(!file) throw std::runtime_error("Cannot open image");
+    unsigned char* volatile pixels=nullptr;
+    if(setjmp(error->jump)) {std::free(pixels);jpeg_destroy_decompress(decoder.get());std::fclose(file);throw std::runtime_error(error->message);}
+    jpeg_create_decompress(decoder.get());jpeg_stdio_src(decoder.get(),file);jpeg_read_header(decoder.get(),TRUE);
+    if(!decoder->image_width || !decoder->image_height || decoder->image_width>4096 || decoder->image_height>4096) {
+        jpeg_destroy_decompress(decoder.get());std::fclose(file);throw std::runtime_error("Image dimensions must be 1..4096");
+    }
+    decoder->out_color_space=JCS_EXT_RGBA;jpeg_start_decompress(decoder.get());
+    const auto width=decoder->output_width,height=decoder->output_height;
+    pixels=static_cast<unsigned char*>(std::malloc(std::size_t(width)*height*4));
+    if(!pixels) {jpeg_destroy_decompress(decoder.get());std::fclose(file);throw std::bad_alloc();}
+    while(decoder->output_scanline<height) {auto* row=pixels+std::size_t(decoder->output_scanline)*width*4;jpeg_read_scanlines(decoder.get(),&row,1);}
+    jpeg_finish_decompress(decoder.get());jpeg_destroy_decompress(decoder.get());std::fclose(file);
+    Image result{width,height,{}};
+    try {result.rgba.assign(reinterpret_cast<std::byte*>(pixels),reinterpret_cast<std::byte*>(pixels)+std::size_t(width)*height*4);}
+    catch(...) {std::free(pixels);throw;}
+    std::free(pixels);return result;
+#endif
 }
 std::string compare_images(const std::filesystem::path& actual, const std::filesystem::path& reference,
                            const std::filesystem::path& difference, unsigned tolerance) {
@@ -362,7 +424,7 @@ std::string compare_images(const std::filesystem::path& actual, const std::files
     save_png(diff, difference);
     return std::format("{{\"format\":\"b2-image-compare-v1\",\"passed\":{},\"width\":{},\"height\":{},\"tolerance\":{},\"pixels_over_tolerance\":{},\"maximum_error\":{},\"mean_absolute_error\":{},\"difference\":{}}}",
                        changed == 0, a.width, a.height, tolerance, changed, maximum,
-                       double(sum) / (double(a.width) * a.height * 3), json(utf8(difference.wstring())));
+                       double(sum) / (double(a.width) * a.height * 3), json(path_text(difference)));
 }
 
 namespace {
@@ -501,6 +563,9 @@ struct Renderer::Impl {
     void visibility_scope(bool original) const {if(visibility) visibility->scope(visibility->context,original);}
     std::size_t target_bytes=0;
     HWND window=nullptr;
+#ifdef __APPLE__
+    SDL_MetalView metal_view=nullptr;
+#endif
     ComPtr<IDXGISwapChain2> swapchain;
     HANDLE frame_ready=nullptr;
     bool frame_acquired=false,allow_tearing=false;
@@ -766,6 +831,15 @@ struct Renderer::Impl {
         if(metadata) *metadata=result;return result.bytes;
     }
     Impl(std::uint32_t w, std::uint32_t h, bool warp, bool debug,unsigned scale) : width(w), height(h),resolution_scale(scale) {
+#if defined(__APPLE__)
+        if(warp) throw std::runtime_error("WARP is Windows-only; macOS diagnostics use a Metal device.");
+        if(debug) throw std::runtime_error("The D3D11 debug layer is Windows-only; use Metal validation on macOS.");
+        setenv("DXMT_LOG_PATH","none",0);setenv("DXMT_LOG_LEVEL","error",0);
+#elif !defined(_WIN32)
+        if(warp) throw std::runtime_error("WARP is Windows-only; select a Vulkan software ICD for Linux offscreen diagnostics.");
+        if(debug) throw std::runtime_error("The D3D11 debug layer is Windows-only; use Vulkan validation on Linux.");
+        setenv("DXVK_WSI_DRIVER","SDL3",1);
+#endif
         if(!scale || scale>4) throw std::runtime_error("Internal resolution scale must be between 1 and 4");
         extent(w, h);
         const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0};
@@ -882,7 +956,14 @@ struct Renderer::Impl {
         clear_desc.DepthClipEnable=clear_desc.ScissorEnable=clear_desc.MultisampleEnable=TRUE;
         checked(device->CreateRasterizerState(&clear_desc,&clear_raster),"Clear rectangle state");
     }
-    ~Impl() {if(frame_ready) CloseHandle(frame_ready);}
+    ~Impl() {
+#ifdef _WIN32
+        if(frame_ready) CloseHandle(frame_ready);
+#elif defined(__APPLE__)
+        // Release the swapchain's retained layer before its SDL view.
+        swapchain.Reset();if(metal_view) SDL_Metal_DestroyView(metal_view);
+#endif
+    }
     void collect_timings() {
         for(auto& timing:timings) if(timing.pending) {
             D3D11_QUERY_DATA_TIMESTAMP_DISJOINT result{};UINT64 start=0,finish=0;
@@ -1205,9 +1286,22 @@ ID3D11Texture2D* Renderer::reconstruction_input(unsigned channel) const {
 }
 void Renderer::attach_window(void* native_window) {
     auto& r=*impl_;
-    if(r.window || !native_window || !IsWindow(static_cast<HWND>(native_window)))
+    if(r.window || !native_window
+#ifdef _WIN32
+       || !IsWindow(static_cast<HWND>(native_window))
+#else
+       || !SDL_GetWindowID(static_cast<SDL_Window*>(native_window))
+#endif
+    )
         throw std::runtime_error("Attach one valid native window to the renderer");
+#ifdef __APPLE__
+    r.metal_view=SDL_Metal_CreateView(static_cast<SDL_Window*>(native_window));
+    if(!r.metal_view) throw std::runtime_error(SDL_GetError());
+    const auto window=static_cast<HWND>(SDL_Metal_GetLayer(r.metal_view));
+    if(!window) throw std::runtime_error("SDL Metal layer is missing");
+#else
     const auto window=static_cast<HWND>(native_window);
+#endif
     ComPtr<IDXGIDevice> device;ComPtr<IDXGIAdapter> adapter;ComPtr<IDXGIFactory2> factory;
     checked(r.device.As(&device),"Presentation device");checked(device->GetAdapter(&adapter),"Presentation adapter");
     checked(adapter->GetParent(IID_PPV_ARGS(&factory)),"Presentation factory");
@@ -1218,14 +1312,22 @@ void Renderer::attach_window(void* native_window) {
     description.Width=r.width;description.Height=r.height;description.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
     description.SampleDesc.Count=1;description.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
     description.BufferCount=2;description.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;description.Scaling=DXGI_SCALING_STRETCH;
-    description.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
-        (r.allow_tearing?DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING:0);
+    description.Flags=(r.allow_tearing?DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING:0);
+#ifdef _WIN32
+    description.Flags|=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+#endif
     ComPtr<IDXGISwapChain1> swapchain;
     checked(factory->CreateSwapChainForHwnd(r.device.Get(),window,&description,nullptr,nullptr,&swapchain),"Window swapchain");
     checked(swapchain.As(&r.swapchain),"Window frame latency interface");
+#ifdef _WIN32
     checked(r.swapchain->SetMaximumFrameLatency(1),"Window frame latency");
     r.frame_ready=r.swapchain->GetFrameLatencyWaitableObject();
     if(!r.frame_ready) throw std::runtime_error("Window frame availability handle is missing");
+#else
+    // Native backends pace the queue in Present. Bound it through the device.
+    ComPtr<IDXGIDevice1> latency_device;checked(device.As(&latency_device),"Presentation latency device");
+    checked(latency_device->SetMaximumFrameLatency(1),"Presentation queue latency");
+#endif
     checked(factory->MakeWindowAssociation(window,DXGI_MWA_NO_ALT_ENTER),"Window association");
     const auto vs=r.shader(ShaderKind::display_vertex),ps=r.shader(ShaderKind::display_pixel);
     checked(r.device->CreateVertexShader(vs.data(),vs.size(),nullptr,&r.display_vs),"Display vertex shader");
@@ -1240,7 +1342,7 @@ void Renderer::attach_window(void* native_window) {
     depth.DepthFunc=D3D11_COMPARISON_ALWAYS;
     depth.FrontFace=depth.BackFace={D3D11_STENCIL_OP_KEEP,D3D11_STENCIL_OP_KEEP,D3D11_STENCIL_OP_KEEP,D3D11_COMPARISON_ALWAYS};
     checked(r.device->CreateDepthStencilState(&depth,&r.display_depth),"Display depth state");
-    r.window=window;
+    r.window=static_cast<HWND>(native_window);
 }
 void Renderer::aspect_ratio(float aspect) {
     if(!std::isfinite(aspect) || aspect<=0) throw std::runtime_error("Invalid display aspect ratio");
@@ -1250,11 +1352,15 @@ unsigned Renderer::raster_samples_per_pixel() const {return impl_->samples*impl_
 bool Renderer::supports_msaa(unsigned samples) const {return samples>=2 && samples<=8 && std::has_single_bit(samples) && (impl_->msaa_supported&samples)!=0;}
 bool Renderer::supports_upscaling(UpscaleMethod method) const {
     if(method==UpscaleMethod::off) return true;
+#ifndef _WIN32
+    return false;
+#else
     if(method<UpscaleMethod::dlss || method>UpscaleMethod::xess) return false;
     ComPtr<IDXGIDevice> device;ComPtr<IDXGIAdapter> adapter;DXGI_ADAPTER_DESC desc{};
     if(FAILED(impl_->device.As(&device)) || FAILED(device->GetAdapter(&adapter)) || FAILED(adapter->GetDesc(&desc))) return false;
     if(desc.VendorId==0x1414) return false;
     return method!=UpscaleMethod::dlss || desc.VendorId==0x10DE;
+#endif
 }
 void Renderer::upscaling(UpscaleMethod method,unsigned output_scale) {
     auto& r=*impl_;
@@ -1418,11 +1524,16 @@ void Renderer::publish_frame(bool reset) {
 }
 bool Renderer::wait_frame(unsigned timeout_ms) {
     auto& r=*impl_;if(r.frame_acquired) return true;
+#ifdef _WIN32
     if(!r.frame_ready) throw std::runtime_error("A window is required for presentation pacing");
     PerfScope availability(r.profile,PerfPhase::present);
     const auto result=WaitForSingleObject(r.frame_ready,timeout_ms);
     if(result==WAIT_TIMEOUT) return false;
     if(result!=WAIT_OBJECT_0) throw std::runtime_error("Window frame availability wait failed");
+#else
+    (void)timeout_ms;
+    if(!r.window) throw std::runtime_error("A window is required for presentation pacing");
+#endif
     r.frame_acquired=true;return true;
 }
 bool Renderer::display(bool wait) {
@@ -1430,16 +1541,24 @@ bool Renderer::display(bool wait) {
     PerfScope timing(r.profile,PerfPhase::display);
     if(!r.window || !r.ended || r.recording)
         throw std::runtime_error("Display a completed main image");
+#ifdef _WIN32
     RECT rectangle{};if(!GetClientRect(r.window,&rectangle)) throw std::runtime_error("Cannot read window dimensions");
     const auto width=static_cast<std::uint32_t>(rectangle.right),height=static_cast<std::uint32_t>(rectangle.bottom);
+#else
+    int pixel_width=0,pixel_height=0;
+    if(!SDL_GetWindowSizeInPixels(static_cast<SDL_Window*>(r.window),&pixel_width,&pixel_height)) throw std::runtime_error(SDL_GetError());
+    const auto width=static_cast<std::uint32_t>(pixel_width),height=static_cast<std::uint32_t>(pixel_height);
+#endif
     if(!width || !height) return false;
     extent(width,height);
-    if(!wait_frame(wait?INFINITE:0)) return false;
+    if(!wait_frame(wait?UINT32_MAX:0)) return false;
     GpuSpan gpu(r.gpu_meter.get(),2);
     r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
     if(!r.window_view || r.window_width!=width || r.window_height!=height) {
-        const auto flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
-            (r.allow_tearing?DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING:0);
+        UINT flags=r.allow_tearing?DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING:0;
+#ifdef _WIN32
+        flags|=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+#endif
         r.window_view.Reset();checked(r.swapchain->ResizeBuffers(0,width,height,DXGI_FORMAT_UNKNOWN,flags),"Window resize");
         ComPtr<ID3D11Texture2D> buffer;checked(r.swapchain->GetBuffer(0,IID_PPV_ARGS(&buffer)),"Window buffer");
         checked(r.device->CreateRenderTargetView(buffer.Get(),nullptr,&r.window_view),"Window render target");

@@ -1,4 +1,5 @@
 #include "frame_processing.h"
+#include <climits>
 #include "shaders.h"
 #include <algorithm>
 #include <format>

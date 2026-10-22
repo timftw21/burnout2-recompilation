@@ -39,7 +39,7 @@ Data read(Disc& disc,const DiscEntry& entry,unsigned offset,unsigned bytes) {
 void save(const std::filesystem::path& path,Bytes bytes) {
     std::ofstream file(path,std::ios::binary|std::ios::trunc);
     file.write(reinterpret_cast<const char*>(bytes.data()),static_cast<std::streamsize>(bytes.size()));
-    if(!file) throw std::runtime_error("Cannot write imported track: "+utf8(path.wstring()));
+    if(!file) throw std::runtime_error("Cannot write imported track: "+path_text(path));
 }
 struct PendingImport {
     std::filesystem::path directory;bool published=false;
@@ -838,7 +838,7 @@ std::string import_interstate(const std::filesystem::path& burnout,const std::fi
     require(master.size()<=0x6A4000,"imported textures exceed the original fixed texture allocation");
     const auto target_directory=std::filesystem::absolute(destination).lexically_normal();
     require(target_directory.has_filename(),"destination must name a track directory");
-    const auto staging=target_directory.parent_path()/(target_directory.filename().wstring()+L".partial");
+    const auto staging=target_directory.parent_path()/utf8_path(path_text(target_directory.filename())+".partial");
     require(!std::filesystem::exists(staging),"an unfinished import already exists beside the destination");
     std::filesystem::create_directories(staging.parent_path());
     require(std::filesystem::create_directory(staging),"cannot create import directory");PendingImport pending{staging};

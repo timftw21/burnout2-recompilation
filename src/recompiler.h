@@ -14,6 +14,6 @@ struct LoweredFunction {
     bool floating = false;
     std::string native_api;
 };
-LoweredFunction lower(const Function& function,bool fuse_floating=true);
+LoweredFunction lower(const Function& function,bool fuse_floating=true,bool portable=false);
 std::string recompile(Xbe& image, std::uint32_t address, std::uint32_t instruction_budget);
 }

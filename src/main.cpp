@@ -11,7 +11,11 @@
 #include "input.h"
 #include "diagnostics.h"
 #include "custom_music.h"
+#ifdef _WIN32
 #include <Windows.h>
+#else
+#include <SDL3/SDL.h>
+#endif
 #include <cstdio>
 #include <algorithm>
 #include <charconv>
@@ -22,15 +26,15 @@
 #include <sstream>
 
 extern "C" {
-std::uint32_t b2_add8_flags(std::uint32_t, std::uint32_t);
-std::uint32_t b2_add16_flags(std::uint32_t, std::uint32_t);
-std::uint32_t b2_add32_flags(std::uint32_t, std::uint32_t);
-std::uint32_t b2_compare8_flags(std::uint32_t, std::uint32_t);
-std::uint32_t b2_compare16_flags(std::uint32_t, std::uint32_t);
-std::uint32_t b2_compare32_flags(std::uint32_t, std::uint32_t);
-std::uint32_t b2_and8_flags(std::uint32_t, std::uint32_t);
-std::uint32_t b2_and16_flags(std::uint32_t, std::uint32_t);
-std::uint32_t b2_and32_flags(std::uint32_t, std::uint32_t);
+std::uint32_t B2_ASM b2_add8_flags(std::uint32_t, std::uint32_t);
+std::uint32_t B2_ASM b2_add16_flags(std::uint32_t, std::uint32_t);
+std::uint32_t B2_ASM b2_add32_flags(std::uint32_t, std::uint32_t);
+std::uint32_t B2_ASM b2_compare8_flags(std::uint32_t, std::uint32_t);
+std::uint32_t B2_ASM b2_compare16_flags(std::uint32_t, std::uint32_t);
+std::uint32_t B2_ASM b2_compare32_flags(std::uint32_t, std::uint32_t);
+std::uint32_t B2_ASM b2_and8_flags(std::uint32_t, std::uint32_t);
+std::uint32_t B2_ASM b2_and16_flags(std::uint32_t, std::uint32_t);
+std::uint32_t B2_ASM b2_and32_flags(std::uint32_t, std::uint32_t);
 }
 
 namespace {
@@ -56,9 +60,9 @@ b2::Cpu initial_cpu() {
 }
 
 template<unsigned Bits> unsigned validate_flags(
-    std::uint32_t (*add)(std::uint32_t, std::uint32_t),
-    std::uint32_t (*compare)(std::uint32_t, std::uint32_t),
-    std::uint32_t (*logical)(std::uint32_t, std::uint32_t)) {
+    decltype(&b2_add8_flags) add,
+    decltype(&b2_compare8_flags) compare,
+    decltype(&b2_and8_flags) logical) {
     constexpr std::uint32_t edges[] = {0, 1, 15, 16, 0x7F, 0x80, 0xFF, 0x100,
         0x7FFF, 0x8000, 0xFFFF, 0x10000, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF};
     constexpr auto original_flags = 0x202 | b2::arithmetic_flags;
@@ -93,7 +97,11 @@ unsigned validate() {
         const std::uint32_t finite = std::isfinite(std::bit_cast<double>(bits)) ? 1 : 0;
         const auto exponent_word = static_cast<std::uint16_t>((bits >> 48) & 0x7FF0);
         const auto expected_flags = (original.flags & ~b2::arithmetic_flags) |
+#ifdef __aarch64__
+            (exponent_word==0x7FF0?0x44U:(exponent_word==0x3FF0 || exponent_word==0x7FE0)?0x85U:0x81U);
+#else
             (b2_compare16_flags(exponent_word, 0x7FF0) & b2::arithmetic_flags);
+#endif
         auto expected = original.registers;
         expected[b2::eax] = finite;
         expected[b2::ecx] = finite;
@@ -102,9 +110,13 @@ unsigned validate() {
             throw std::runtime_error(std::format("Native CPU mismatch for 0x{:016X}: eax {}, flags {} (expected {})",
                 bits, cpu.registers[b2::eax], b2::hex32(cpu.flags), b2::hex32(expected_flags)));
     }
+#ifdef __aarch64__
+    return 0; // Intel hardware flag references cannot execute on ARM.
+#else
     return validate_flags<8>(b2_add8_flags, b2_compare8_flags, b2_and8_flags) +
            validate_flags<16>(b2_add16_flags, b2_compare16_flags, b2_and16_flags) +
            validate_flags<32>(b2_add32_flags, b2_compare32_flags, b2_and32_flags);
+#endif
 }
 
 std::uint32_t iterations(std::string_view text,std::uint32_t limit=10000000) {
@@ -283,6 +295,7 @@ bool check_boot(const std::filesystem::path& path,std::uint32_t budget,const std
 int main(int argc, char** argv) {
     // Command-line diagnostics can use an existing terminal; a normal launch
     // never creates one. Preserve redirected output used by build/check tools.
+#ifdef _WIN32
     if(argc>1 && !GetConsoleWindow()) {
         const auto output=GetStdHandle(STD_OUTPUT_HANDLE),error=GetStdHandle(STD_ERROR_HANDLE);
         if(AttachConsole(ATTACH_PARENT_PROCESS)) {
@@ -293,6 +306,7 @@ int main(int argc, char** argv) {
             else SetStdHandle(STD_ERROR_HANDLE,error);
         }
     }
+#endif
     b2::initialize_diagnostics();
     try {
         if(argc==1) return b2::run_app();
@@ -415,6 +429,9 @@ int main(int argc, char** argv) {
                             ",\"guest_address\":" + b2::json(b2::hex32(compiled_function.address));
         if (command == "--check-cpu") {
             std::cout << prefix << ",\"format\":\"b2-cpu-check-v2\",\"passed_cases\":" << std::size(inputs) + additional.game_cases
+#ifdef __aarch64__
+                      << ",\"hardware_flag_reference\":\"unavailable-on-arm\""
+#endif
                       << ",\"instruction_cases\":" << flag_cases + additional.instruction_cases
                       << ",\"memory_cases\":" << additional.memory_cases
                       << ",\"floating_cases\":" << additional.floating_cases
@@ -453,7 +470,13 @@ int main(int argc, char** argv) {
                   << ",\"includes_input_setup\":true,\"game_booted\":false},\"compiled_functions\":" << b2::compiled_batch.size() << "}\n";
         return 0;
     } catch (const std::exception& error) {
-        if(argc==1) MessageBoxA(nullptr,error.what(),"Burnout 2 could not start",MB_OK|MB_ICONERROR);
+        if(argc==1) {
+#ifdef _WIN32
+            MessageBoxA(nullptr,error.what(),"Burnout 2 could not start",MB_OK|MB_ICONERROR);
+#else
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,"Burnout 2 could not start",error.what(),nullptr);
+#endif
+        }
         b2::diagnostic_record("{\"type\":\"error\",\"message\":"+b2::json(error.what())+'}');
         std::cout << "{\"error\":" << b2::json(error.what()) << "}\n";
         return 1;

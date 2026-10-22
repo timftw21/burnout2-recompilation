@@ -3,9 +3,17 @@
 #include "target.h"
 #include "kernel_names.h"
 #include "native_api.h"
-#include <Windows.h>
+#include "host.h"
+#ifdef _WIN32
 #include <Psapi.h>
-#include <intrin.h>
+#else
+#include <sys/resource.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#include <libproc.h>
+#include <mach/mach.h>
+#endif
+#endif
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -87,7 +95,9 @@ std::string summary(const Data& data) {
         return std::format("{{\"samples\":{},\"median_ms\":{:.6f},\"p95_ms\":{:.6f},\"p99_ms\":{:.6f},\"max_ms\":{:.6f}}}",values.size(),percentile(.5),percentile(.95),percentile(.99),percentile(1));
     };
     std::ostringstream out;
-    out<<std::format("{{\"format\":\"b2-performance-summary-v1\",\"cpu\":{},\"gpu\":{},\"build\":{},\"logical_processors\":{},\"refresh_rate\":{},\"resolution_scale\":{},\"interpolation\":{},\"vsync\":{},\"duration_ms\":{:.3f},\"recorder_bytes\":{},\"source_intervals\":{},\"work_wall_time\":{},\"measured_gpu_spans\":{},\"source_frame_budget_ms\":{},\"frames_over_budget\":{},\"frames_over_20_ms\":{},\"diagnostic_frames_excluded\":{},\"gpu_complete_frames\":{},\"gpu_partial_frames\":{},\"gpu_pending_frames\":{},\"limits\":{{\"frames_dropped\":{},\"samples_dropped\":{},\"costs_dropped\":{},\"resources_dropped\":{}}},\"phases\":[",
+    constexpr const char* platforms[]={"windows-x64","linux-x86_64","macos-x86_64","macos-arm64"};
+    out<<std::format("{{\"capture_platform\":{},\"private_memory_kind\":{},",json(h.pad<std::size(platforms)?platforms[h.pad]:"unknown"),json(h.pad>=2?"physical_footprint":h.pad==1?"resident":"committed"));
+    out<<std::format("\"format\":\"b2-performance-summary-v1\",\"cpu\":{},\"gpu\":{},\"build\":{},\"logical_processors\":{},\"refresh_rate\":{},\"resolution_scale\":{},\"interpolation\":{},\"vsync\":{},\"duration_ms\":{:.3f},\"recorder_bytes\":{},\"source_intervals\":{},\"work_wall_time\":{},\"measured_gpu_spans\":{},\"source_frame_budget_ms\":{},\"frames_over_budget\":{},\"frames_over_20_ms\":{},\"diagnostic_frames_excluded\":{},\"gpu_complete_frames\":{},\"gpu_partial_frames\":{},\"gpu_pending_frames\":{},\"limits\":{{\"frames_dropped\":{},\"samples_dropped\":{},\"costs_dropped\":{},\"resources_dropped\":{}}},\"phases\":[",
         json(h.cpu.data()),json(h.gpu.data()),json(h.build.data()),h.processors,h.refresh,h.scale,bool(h.interpolation),bool(h.vsync),milliseconds(h.duration),h.recorder_bytes,distribution(intervals),distribution(work),distribution(gpu),rate?std::format("{:.6f}",frame_budget):"null",over_budget,spikes,diagnostic_frames,gpu_complete,gpu_partial,h.frames-gpu_complete-gpu_partial,h.frames_dropped,h.samples_dropped,h.costs_dropped,h.resources_dropped);
     for(unsigned i=0;i<phases.size();++i) {if(i) out<<',';out<<std::format("{{\"name\":{},\"wall_ms\":{:.6f}}}",json(phase_names[i]),milliseconds(phases[i]));}
     out<<"],\"counters\":{";
@@ -146,7 +156,7 @@ void reports(const Data& data,const std::filesystem::path& directory) {
     if(!intervals.empty()) text<<std::format("Game frames: median {:.3f} ms; 99th percentile {:.3f} ms; slowest {:.3f} ms. Target: {}.\n",intervals[(intervals.size()-1)/2],intervals[std::min(intervals.size()-1,std::size_t(std::ceil(.99*intervals.size()))-1)],intervals.back(),rate?std::format("{:.3f} ms",1000.0/rate):"Unlimited");
     std::uint64_t peak_working=0,peak_private=0;
     for(const auto& r:std::span(data.resources).first(h.resources)) {peak_working=std::max(peak_working,r.working_set);peak_private=std::max(peak_private,r.private_bytes);}
-    text<<std::format("Peak process RAM: {:.1f} MiB working set, {:.1f} MiB private memory.\n\n",peak_working/1048576.0,peak_private/1048576.0);
+    text<<std::format("Peak process RAM: {:.1f} MiB working set, {:.1f} MiB {}.\n\n",peak_working/1048576.0,peak_private/1048576.0,h.pad>=2?"physical footprint":h.pad==1?"private resident memory":"private committed memory");
     std::array<std::uint64_t,phase_names.size()> phases{};
     for(const auto& frame:std::span(data.frames).first(h.frames)) if(!frame.partial && !frame.phases[unsigned(PerfPhase::capture)]) for(unsigned i=0;i<phases.size();++i) phases[i]+=frame.phases[i];
     std::array<unsigned,phase_names.size()> order{};for(unsigned i=0;i<order.size();++i) order[i]=i;
@@ -192,6 +202,7 @@ struct Performance::State {
     }
 };
 std::uint64_t performance_clock() noexcept {
+#ifdef _WIN32
     static const auto conversion=[] {
         LARGE_INTEGER value{};QueryPerformanceFrequency(&value);
         const auto frequency=std::uint64_t(value.QuadPart);
@@ -203,20 +214,31 @@ std::uint64_t performance_clock() noexcept {
     // the general integer conversion for counters that do not divide a second.
     if(conversion[1]) return ticks*conversion[1];
     return (ticks/conversion[0])*1000000000ULL+(ticks%conversion[0])*1000000000ULL/conversion[0];
+#else
+    timespec value{};clock_gettime(CLOCK_MONOTONIC,&value);
+    return std::uint64_t(value.tv_sec)*1000000000ULL+value.tv_nsec;
+#endif
 }
 Performance::Performance()=default;
 Performance::~Performance()=default;
 void Performance::start(std::string_view gpu,unsigned refresh,unsigned scale,bool vsync,const PerfCounters& counters) {
     state_=std::make_unique<State>();++generation_;auto& s=*state_;auto& h=s.data.header;
-    h.refresh=refresh;h.scale=scale;h.interpolation=0;h.vsync=vsync;h.processors=GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);h.recorder_bytes=sizeof(State);
-    int info[4];__cpuid(info,0x80000000);
-    if(unsigned(info[0])>=0x80000004) for(unsigned i=0;i<3;++i) {__cpuid(info,0x80000002+i);std::memcpy(h.cpu.data()+i*16,info,16);}
-    else strcpy_s(h.cpu.data(),h.cpu.size(),"Unknown x64 CPU");
+    h.refresh=refresh;h.scale=scale;h.interpolation=0;h.vsync=vsync;h.recorder_bytes=sizeof(State);
+#ifdef _WIN32
+    h.processors=GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+#else
+    h.processors=static_cast<unsigned>(sysconf(_SC_NPROCESSORS_ONLN));
+#if defined(__APPLE__) && defined(__aarch64__)
+    h.pad=3;
+#elif defined(__APPLE__)
+    h.pad=2;
+#else
+    h.pad=1;
+#endif
+#endif
+    copy_text(h.cpu.data(),h.cpu.size(),cpu_name());
     for(unsigned i=48;i && h.cpu[i-1]==' ';--i) h.cpu[i-1]=0;
-    const auto* module=reinterpret_cast<const std::byte*>(GetModuleHandleW(nullptr));
-    const auto* dos=reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
-    const auto* image=reinterpret_cast<const IMAGE_NT_HEADERS64*>(module+dos->e_lfanew);
-    strcpy_s(h.build.data(),h.build.size(),std::format("PE {:08X}, image {} bytes",image->FileHeader.TimeDateStamp,image->OptionalHeader.SizeOfImage).c_str());
+    copy_text(h.build.data(),h.build.size(),build_description());
     const auto length=std::min(gpu.size(),h.gpu.size()-1);std::memcpy(h.gpu.data(),gpu.data(),length);
     std::copy_n(target::sha256.begin(),std::min(target::sha256.size(),h.target_sha256.size()-1),h.target_sha256.begin());
     s.previous=counters;s.started=s.last=s.frame_start=performance_clock();s.next_sample=s.next_resource=s.started;active_=true;
@@ -234,6 +256,7 @@ void Performance::resources(std::uint64_t local,std::uint64_t budget,std::uint64
     auto& h=s.data.header;if(h.resources==resource_limit) {++h.resources_dropped;return;}
     auto& r=s.data.resources[h.resources++];r.time=now-s.started;r.local=local;r.budget=budget;r.shared=shared;r.textures=textures;r.targets=targets;r.texture_bytes=texture_bytes;r.target_bytes=target_bytes;
     if(gpu_valid) r.valid|=8;
+#ifdef _WIN32
     PROCESS_MEMORY_COUNTERS_EX memory{};memory.cb=sizeof(memory);
     if(GetProcessMemoryInfo(GetCurrentProcess(),reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory),sizeof(memory))) {r.valid|=1;r.working_set=memory.WorkingSetSize;r.private_bytes=memory.PrivateUsage;r.page_faults=memory.PageFaultCount;}
     FILETIME created{},ended{},kernel{},user{};
@@ -241,6 +264,34 @@ void Performance::resources(std::uint64_t local,std::uint64_t budget,std::uint64
     if(GetThreadTimes(GetCurrentThread(),&created,&ended,&kernel,&user)) {r.valid|=4;r.main_cpu_ns=(filetime(kernel)+filetime(user))*100;}
     IO_COUNTERS io{};if(GetProcessIoCounters(GetCurrentProcess(),&io)) {r.valid|=16;r.read_bytes=io.ReadTransferCount;r.write_bytes=io.WriteTransferCount;}
     DWORD handles=0;if(GetProcessHandleCount(GetCurrentProcess(),&handles)) {r.valid|=32;r.handles=handles;}
+#else
+#ifdef __APPLE__
+    task_vm_info_data_t memory{};mach_msg_type_number_t count=TASK_VM_INFO_COUNT;
+    if(task_info(mach_task_self(),TASK_VM_INFO,reinterpret_cast<task_info_t>(&memory),&count)==KERN_SUCCESS) {
+        r.valid|=1;r.working_set=memory.resident_size;r.private_bytes=memory.phys_footprint;
+    }
+    rusage_info_v4 io{};
+    if(!proc_pid_rusage(getpid(),RUSAGE_INFO_V4,reinterpret_cast<rusage_info_t*>(&io))) {
+        r.valid|=16;r.read_bytes=io.ri_diskio_bytesread;r.write_bytes=io.ri_diskio_byteswritten;
+    }
+    const auto descriptors=proc_pidinfo(getpid(),PROC_PIDLISTFDS,0,nullptr,0);
+    if(descriptors>0) {r.valid|=32;r.handles=descriptors/sizeof(proc_fdinfo);}
+#else
+    std::ifstream memory("/proc/self/statm");std::uint64_t total=0,resident=0,shared_pages=0;
+    if(memory>>total>>resident>>shared_pages) {r.valid|=1;r.working_set=resident*sysconf(_SC_PAGESIZE);r.private_bytes=(resident-std::min(resident,shared_pages))*sysconf(_SC_PAGESIZE);}
+#endif
+    rusage usage{};if(!getrusage(RUSAGE_SELF,&usage)) r.page_faults=static_cast<std::uint32_t>(usage.ru_minflt+usage.ru_majflt);
+    timespec time{};
+    if(!clock_gettime(CLOCK_PROCESS_CPUTIME_ID,&time)) {r.valid|=2;r.process_cpu_ns=std::uint64_t(time.tv_sec)*1000000000+time.tv_nsec;}
+    if(!clock_gettime(CLOCK_THREAD_CPUTIME_ID,&time)) {r.valid|=4;r.main_cpu_ns=std::uint64_t(time.tv_sec)*1000000000+time.tv_nsec;}
+#ifndef __APPLE__
+    std::ifstream io("/proc/self/io");std::string key;std::uint64_t value;
+    while(io>>key>>value) {if(key=="read_bytes:") {r.read_bytes=value;r.valid|=16;}else if(key=="write_bytes:") r.write_bytes=value;}
+    std::error_code error;const auto end=std::filesystem::directory_iterator{};
+    for(auto entry=std::filesystem::directory_iterator("/proc/self/fd",error);!error && entry!=end;entry.increment(error)) ++r.handles;
+    if(!error) {r.valid|=32;if(r.handles) --r.handles;}
+#endif
+#endif
 }
 void Performance::guest_sample(std::uint32_t address,std::uint32_t thread) {
     if(!active_) return;auto& s=*state_;const auto now=performance_clock();if(now<s.next_sample) return;s.next_sample=now+1000000;

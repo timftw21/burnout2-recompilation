@@ -1,0 +1,5 @@
+file(READ "${INPUT}" data HEX)
+string(LENGTH "${data}" length)
+math(EXPR bytes "${length}/2")
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," data "${data}")
+file(WRITE "${OUTPUT}" "unsigned char ${NAME}[] = {${data}};\nunsigned int ${NAME}_len = ${bytes};\n")
