@@ -5,6 +5,9 @@ if command -v brew >/dev/null; then
         headers=$(brew --prefix "$package")
         export CPPFLAGS="-I$headers/include${CPPFLAGS:+ $CPPFLAGS}"
     done
+    # The upstream configure step checks the loader even for its shader library.
+    vulkan_loader=$(brew --prefix vulkan-loader)
+    export LDFLAGS="-L$vulkan_loader/lib${LDFLAGS:+ $LDFLAGS}"
 fi
 case $(uname -m) in
     arm64) llvm_name=clang+llvm-15.0.7-arm64-apple-darwin22.0
