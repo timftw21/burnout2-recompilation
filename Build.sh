@@ -22,6 +22,7 @@ case "$(uname -s):$(uname -m)" in
         ;;
     *) printf '%s\n' 'This builder requires Linux x86-64 or macOS Intel/Apple Silicon.' >&2; exit 1 ;;
 esac
+if [[ $platform == linux && -x $root/build/deps/cmake-linux/bin/cmake ]]; then export PATH="$root/build/deps/cmake-linux/bin:$PATH"; fi
 tools_only=false
 game_inputs=false
 if (( $# == 1 )) && [[ $1 == --tools-only ]]; then tools_only=true

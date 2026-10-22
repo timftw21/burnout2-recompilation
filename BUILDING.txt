@@ -1,5 +1,38 @@
 Building the game
 
+Guided Linux/macOS installation
+
+Extract Installation.zip into a permanent folder. On Linux, open Install.desktop
+(Allow Launching/Run as Program if your desktop asks), or run bash Install.sh.
+On macOS, double-click Install.command. Setup asks before installing tools,
+opens a native disc picker, uses Build.sh to verify/extract and compile the game,
+and adds an application shortcut. Build progress stays visible in the terminal;
+Control-C cancels it. Build output is saved in build/setup/install-PLATFORM.log.
+The source folder stays the installation location, as with Windows setup.
+
+Automatic Linux package setup supports Ubuntu 24.04+/Debian 13+ through apt,
+Fedora through dnf and Arch through pacman. It installs only missing packages,
+including FFmpeg and the disc picker. An older system CMake is supplemented by
+the hash-verified official CMake 4.3.3 binary under build/deps/cmake-linux.
+It does not change the system's default compiler or CMake installation.
+Other distributions can use the manual build steps below.
+
+Mac setup requires Xcode 16.3+ and its first-launch setup to be complete.
+Xcode 16.3 requires macOS 15.2+; newer Xcode versions may require newer macOS.
+The compiled game still targets macOS 14+. Setup bootstraps Homebrew from a
+hash-verified official installer, installs native dependencies and downloads
+Apple's Metal toolchain if needed. Run it natively, without Rosetta.
+Application shortcuts are created in the Linux application menu or in
+~/Applications/Burnout 2 Recompilation.app on macOS; they use Play.sh and keep
+the game with its original native libraries and saved data in the build folder.
+
+Rerun setup in the same folder to update, preserving saves, settings and music.
+bash Install.sh --shortcuts-only repairs the shortcut after moving the folder.
+bash Install.sh --dependencies-only installs just the build prerequisites.
+CI=true disables dialogs; an XISO argument supports unattended full setup.
+These options do not start the game. CI uses the same dependency setup on both
+Mac architectures and checks the generated application's metadata and launcher.
+
 Linux x86-64
 
 Use a glibc-based distribution, Clang 19 or newer, LLD, Ninja, Git, CMake 4.2
@@ -54,7 +87,7 @@ GPU performance and audible playback remain unverified.
 
 macOS Intel and Apple Silicon (bring-up)
 
-Targets macOS 14+ and a Metal 3 GPU. Build with Xcode 16.3+ and its Metal/C++23
+Targets macOS 14+ and a Metal 3 GPU. Build on macOS 15.2+ with Xcode 16.3+ and its Metal/C++23
 toolchain, CMake 4.2+, Ninja, Git and the libraries below.
 Use the native shell on each architecture. Intel and Apple Silicon are separate
 native builds; Rosetta and Wine are not used. Older Intel GPUs that cannot
