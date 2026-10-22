@@ -56,6 +56,22 @@ string(REPLACE "${adapter_name_copy}"
 file(CONFIGURE OUTPUT "${dxmt_generated}/dxgi_adapter.cpp" CONTENT "${adapter_source}" @ONLY)
 list(REMOVE_ITEM dxgi "${dxmt_SOURCE_DIR}/src/dxgi/dxgi_adapter.cpp")
 list(APPEND dxgi "${dxmt_generated}/dxgi_adapter.cpp")
+# Intel's Metal driver requires a declared format even for vertex-only work.
+# Rasterization and color writes stay disabled; no color attachment is used.
+file(READ "${dxmt_SOURCE_DIR}/src/dxmt/dxmt_command.cpp" command_source)
+foreach(stage IN ITEMS gs ts)
+    set(marshal_rasterization "${stage}_marshal_pipeline.rasterization_enabled = false;")
+    string(FIND "${command_source}" "${marshal_rasterization}" marshal_call)
+    if(marshal_call LESS 0)
+        message(FATAL_ERROR "Pinned DXMT vertex-only pipeline source changed.")
+    endif()
+    string(REPLACE "${marshal_rasterization}"
+        "${marshal_rasterization}\n    ${stage}_marshal_pipeline.colors[0].pixel_format = WMTPixelFormatRGBA8Unorm;\n    ${stage}_marshal_pipeline.colors[0].write_mask = WMTColorWriteMaskNone;"
+        command_source "${command_source}")
+endforeach()
+file(CONFIGURE OUTPUT "${dxmt_generated}/dxmt_command.cpp" CONTENT "${command_source}" @ONLY)
+list(REMOVE_ITEM core "${dxmt_SOURCE_DIR}/src/dxmt/dxmt_command.cpp")
+list(APPEND core "${dxmt_generated}/dxmt_command.cpp")
 # The d3d11 source list already includes the six D3D10 implementation files.
 list(FILTER util EXCLUDE REGEX "wsi_.*_win32\\.cpp$")
 list(FILTER airconv EXCLUDE REGEX "airconv_cli\\.cpp$")

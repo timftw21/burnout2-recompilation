@@ -17,70 +17,6 @@ permissions:
   contents: read
 
 jobs:
-  metal-pipeline-diagnostic:
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [macos-15-intel, macos-15]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 5
-    steps:
-      - name: Compare vertex-only Metal pipeline descriptors
-        run: |
-          cat > "$RUNNER_TEMP/b2-metal-probe.m" <<'OBJC'
-          #import <Foundation/Foundation.h>
-          #import <Metal/Metal.h>
-          #include <stdio.h>
-          #include <stdlib.h>
-          #include <string.h>
-          int main(int argc, char **argv) { @autoreleasepool {
-            id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-            fprintf(stderr,"device=%s apple=%d format=%s\n",device.name.UTF8String,
-              [device supportsFamily:MTLGPUFamilyApple1],argv[1]);
-            NSError *error = nil;
-            NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\nvertex void probe(device uint *values [[buffer(0)]], uint index [[vertex_id]]) {values[index]=index+123;}";
-            id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
-            if (!library) {fprintf(stderr,"library=%s\n",error.description.UTF8String);return 2;}
-            MTLRenderPipelineDescriptor *pipeline = [MTLRenderPipelineDescriptor new];
-            pipeline.vertexFunction = [library newFunctionWithName:@"probe"];
-            pipeline.rasterizationEnabled = NO;
-            if (atoi(argv[1])) {
-              pipeline.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
-              pipeline.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
-            }
-            id<MTLRenderPipelineState> state = [device newRenderPipelineStateWithDescriptor:pipeline error:&error];
-            if (!state) {fprintf(stderr,"pipeline=%s\n",error.description.UTF8String);return 3;}
-            id<MTLBuffer> values = [device newBufferWithLength:16 options:MTLResourceStorageModeShared];
-            memset(values.contents,0,16);
-            MTLTextureDescriptor *texture = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:1 height:1 mipmapped:NO];
-            texture.usage = MTLTextureUsageRenderTarget;
-            texture.storageMode = MTLStorageModePrivate;
-            MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-            pass.colorAttachments[0].texture = [device newTextureWithDescriptor:texture];
-            pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
-            pass.colorAttachments[0].storeAction = MTLStoreActionDontCare;
-            texture.pixelFormat = MTLPixelFormatDepth32Float;
-            pass.depthAttachment.texture = [device newTextureWithDescriptor:texture];
-            pass.depthAttachment.loadAction = MTLLoadActionDontCare;
-            pass.depthAttachment.storeAction = MTLStoreActionDontCare;
-            id<MTLCommandQueue> queue = [device newCommandQueue];
-            id<MTLCommandBuffer> command = [queue commandBuffer];
-            id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
-            [encoder setRenderPipelineState:state];
-            [encoder setVertexBuffer:values offset:0 atIndex:0];
-            [encoder drawPrimitives:MTLPrimitiveTypePoint vertexStart:0 vertexCount:4];
-            [encoder endEncoding];[command commit];[command waitUntilCompleted];
-            if (command.status == MTLCommandBufferStatusError) {fprintf(stderr,"command=%s\n",command.error.description.UTF8String);return 4;}
-            unsigned *result = values.contents;
-            for (unsigned i=0;i<4;++i) if(result[i]!=i+123) return 5;
-            fprintf(stderr,"vertex-only buffer writes passed with differently formatted color and depth attachments\n");
-            return 0;
-          }}
-          OBJC
-          xcrun clang -fobjc-arc -framework Foundation -framework Metal "$RUNNER_TEMP/b2-metal-probe.m" -o "$RUNNER_TEMP/b2-metal-probe"
-          for format in 0 1; do
-            if "$RUNNER_TEMP/b2-metal-probe" "$format"; then echo "format=$format accepted"; else echo "format=$format rejected ($?)"; fi
-          done
   native-game:
     environment: macos-game
     strategy:
@@ -206,7 +142,7 @@ jobs:
         run: |
           node -e "require('fs').writeFileSync('build/macos/ci-color.dat', Buffer.from([0,0,255,255]))"
           if ! build/macos/Release/b2-tool render-texture build/macos/ci-color.dat 6 1 1 build/macos/ci-color.png; then
-            xcrun lldb --batch --no-lldbinit --script-language none -o run -k 'thread backtrace --count 12 all' -- \
+            xcrun lldb --batch --no-lldbinit --script-language none -o run -k 'thread backtrace --count 32 all' -- \
               build/macos/Release/b2-tool render-texture build/macos/ci-color.dat 6 1 1 build/macos/ci-color-debug.png || true
             exit 1
           fi
