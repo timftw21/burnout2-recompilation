@@ -37,7 +37,65 @@ jobs:
       - name: Restore private build inputs
         run: |
           node cmake/ci-game-inputs.mjs restore <<'B2_PRIVATE_INPUTS'
-          ${{ toJSON(secrets) }}
+          ${{ secrets.B2_CI_INPUTS_00 }}
+          ${{ secrets.B2_CI_INPUTS_01 }}
+          ${{ secrets.B2_CI_INPUTS_02 }}
+          ${{ secrets.B2_CI_INPUTS_03 }}
+          ${{ secrets.B2_CI_INPUTS_04 }}
+          ${{ secrets.B2_CI_INPUTS_05 }}
+          ${{ secrets.B2_CI_INPUTS_06 }}
+          ${{ secrets.B2_CI_INPUTS_07 }}
+          ${{ secrets.B2_CI_INPUTS_08 }}
+          ${{ secrets.B2_CI_INPUTS_09 }}
+          ${{ secrets.B2_CI_INPUTS_10 }}
+          ${{ secrets.B2_CI_INPUTS_11 }}
+          ${{ secrets.B2_CI_INPUTS_12 }}
+          ${{ secrets.B2_CI_INPUTS_13 }}
+          ${{ secrets.B2_CI_INPUTS_14 }}
+          ${{ secrets.B2_CI_INPUTS_15 }}
+          ${{ secrets.B2_CI_INPUTS_16 }}
+          ${{ secrets.B2_CI_INPUTS_17 }}
+          ${{ secrets.B2_CI_INPUTS_18 }}
+          ${{ secrets.B2_CI_INPUTS_19 }}
+          ${{ secrets.B2_CI_INPUTS_20 }}
+          ${{ secrets.B2_CI_INPUTS_21 }}
+          ${{ secrets.B2_CI_INPUTS_22 }}
+          ${{ secrets.B2_CI_INPUTS_23 }}
+          ${{ secrets.B2_CI_INPUTS_24 }}
+          ${{ secrets.B2_CI_INPUTS_25 }}
+          ${{ secrets.B2_CI_INPUTS_26 }}
+          ${{ secrets.B2_CI_INPUTS_27 }}
+          ${{ secrets.B2_CI_INPUTS_28 }}
+          ${{ secrets.B2_CI_INPUTS_29 }}
+          ${{ secrets.B2_CI_INPUTS_30 }}
+          ${{ secrets.B2_CI_INPUTS_31 }}
+          ${{ secrets.B2_CI_INPUTS_32 }}
+          ${{ secrets.B2_CI_INPUTS_33 }}
+          ${{ secrets.B2_CI_INPUTS_34 }}
+          ${{ secrets.B2_CI_INPUTS_35 }}
+          ${{ secrets.B2_CI_INPUTS_36 }}
+          ${{ secrets.B2_CI_INPUTS_37 }}
+          ${{ secrets.B2_CI_INPUTS_38 }}
+          ${{ secrets.B2_CI_INPUTS_39 }}
+          ${{ secrets.B2_CI_INPUTS_40 }}
+          ${{ secrets.B2_CI_INPUTS_41 }}
+          ${{ secrets.B2_CI_INPUTS_42 }}
+          ${{ secrets.B2_CI_INPUTS_43 }}
+          ${{ secrets.B2_CI_INPUTS_44 }}
+          ${{ secrets.B2_CI_INPUTS_45 }}
+          ${{ secrets.B2_CI_INPUTS_46 }}
+          ${{ secrets.B2_CI_INPUTS_47 }}
+          ${{ secrets.B2_CI_INPUTS_48 }}
+          ${{ secrets.B2_CI_INPUTS_49 }}
+          ${{ secrets.B2_CI_INPUTS_50 }}
+          ${{ secrets.B2_CI_INPUTS_51 }}
+          ${{ secrets.B2_CI_INPUTS_52 }}
+          ${{ secrets.B2_CI_INPUTS_53 }}
+          ${{ secrets.B2_CI_INPUTS_54 }}
+          ${{ secrets.B2_CI_INPUTS_55 }}
+          ${{ secrets.B2_CI_INPUTS_56 }}
+          ${{ secrets.B2_CI_INPUTS_57 }}
+          ${{ secrets.B2_CI_INPUTS_58 }}
           B2_PRIVATE_INPUTS
       - name: Install native build dependencies
         run: |

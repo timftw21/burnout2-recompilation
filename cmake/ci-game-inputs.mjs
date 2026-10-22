@@ -28,12 +28,9 @@ if (process.argv[2] === 'pack' && process.argv.length === 5) {
         `${prefix}${String(index).padStart(2, '0')}=${value}\n`).join(''), {flag: 'wx', mode: 0o600});
     console.log(`Prepared ${chunks.length} encrypted-secret inputs in ${resolve(process.argv[4])}.`);
 } else if (process.argv[2] === 'restore' && process.argv.length === 3) {
-    const secrets = JSON.parse(readFileSync(0, 'utf8'));
-    const keys = Object.keys(secrets).filter(key => /^B2_CI_INPUTS_\d{2}$/.test(key)).sort();
-    if (!keys.length) throw new Error('The macos-game environment has no private build inputs.');
-    if (keys.some((key, index) => key !== `${prefix}${String(index).padStart(2, '0')}`))
-        throw new Error('A CI input secret is missing.');
-    const decoded = JSON.parse(gunzipSync(Buffer.from(keys.map(key => secrets[key]).join(''), 'base64'),
+    const encoded = readFileSync(0, 'utf8').replace(/\s/g, '');
+    if (!encoded) throw new Error('The macos-game environment has no private build inputs.');
+    const decoded = JSON.parse(gunzipSync(Buffer.from(encoded, 'base64'),
         {maxOutputLength: 8 * 1024 * 1024}));
     const files = Object.fromEntries(names.map(name => [name, Buffer.from(decoded[name], 'base64')]));
     verify(files);
@@ -41,5 +38,5 @@ if (process.argv[2] === 'pack' && process.argv.length === 5) {
     for (const name of names) writeFileSync(join('data/local', name), files[name], {flag: 'wx', mode: 0o600});
     console.log('Restored the supported executable and effects image to ignored data/local.');
 } else {
-    throw new Error('Usage: node cmake/ci-game-inputs.mjs pack INPUT_DIRECTORY OUTPUT.env | restore < secrets.json');
+    throw new Error('Usage: node cmake/ci-game-inputs.mjs pack INPUT_DIRECTORY OUTPUT.env | restore < inputs.base64');
 }
