@@ -5,6 +5,7 @@
 #include <climits>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <stdexcept>
 #include <string>

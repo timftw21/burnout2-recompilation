@@ -13,10 +13,11 @@
 #include <fcntl.h>
 #ifdef __APPLE__
 #include <pthread.h>
+#include <sys/ucontext.h>
 #else
 #include <sys/syscall.h>
-#endif
 #include <ucontext.h>
+#endif
 #include <unistd.h>
 namespace b2 {
 namespace {
