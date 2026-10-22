@@ -2,11 +2,17 @@
 
 # <div align="center">Burnout 2: Point of Impact — Static Recompilation</div>
 
-An unofficial Windows and Linux version of the original Xbox game, with macOS support in development, focused on fast gameplay,
-preserving the original's look and feel, and a variety of enhancements.
+An unofficial version of the original Xbox game for Windows, with experimental
+Linux and macOS ports, focused on fast gameplay, preserving the original's look
+and feel, and a variety of enhancements.
 
 <i>Still in development: Slowdown, bugs, and crashes are possible. Open an issue if you experience a problem, and
 I'll try to respond in a timely manner. This is an independent fan project, unaffiliated with the game's owners.</i>
+
+**Linux and macOS builds need testing.** Linux still needs gameplay, sound and
+performance checks on native desktop hardware. macOS needs those checks on both
+Intel and Apple Silicon. Successful builds and offline checks do not establish
+that every mode works correctly or that performance matches Windows.
 
 ## AI Disclosure
 
@@ -60,6 +66,9 @@ focused on speed and simplicity. I couldn't bear to keep the slop version public
 
 ## Current status
 
+The features below have been validated primarily on Windows. Linux and macOS
+support is still being tested.
+
 ### What works
 
 - Startup, menus, and all levels/modes.
@@ -77,7 +86,7 @@ focused on speed and simplicity. I couldn't bear to keep the slop version public
   **Loop Track** option in Music Selection and **Pause → Options**.
 - Optional motion blur from the original game.
 - Optional intro skipping and 2×/4× draw distance, including traffic detail.
-- Experimental DLSS, FSR and XeSS upscaling.
+- Experimental DLSS, FSR and XeSS upscaling (Windows only).
 
 ### What still needs work
 
@@ -87,21 +96,44 @@ focused on speed and simplicity. I couldn't bear to keep the slop version public
 
 ## Getting started
 
-For Linux x86-64, install the dependencies in [BUILDING.txt](BUILDING.txt), then
-run `bash Build.sh '/path/to/your/disc.xiso.iso'` and start
-`build/linux/Release/b2`. Linux uses Vulkan through DXVK Native and runs without
-Wine. Windows D3D12 upscalers and hardware memory watches are unavailable there.
-Linux gameplay and performance still need validation on a desktop.
+All platforms require **your own copy of the US Xbox release** as an XISO disc
+image. Game files are not included. Keep the source and build folders together.
 
-For macOS Intel and Apple Silicon, the same `Build.sh` prepares a native Metal
-build under `build/macos/Release`. See the macOS section of
-[BUILDING.txt](BUILDING.txt) for dependencies and current limits. This port is
-in bring-up; no Mac gameplay or performance result is available yet.
+### Linux x86-64
 
-For Windows:
+Use a glibc-based 64-bit Linux distribution, Clang 19+, CMake 4.2+, Ninja and
+a compatible Vulkan 1.3 graphics driver. Install the dependencies listed in
+[BUILDING.txt](BUILDING.txt), then run:
 
-You need a 64-bit Windows PC, a graphics card that supports DirectX 11, and <i>your
-own copy of the US Xbox release. Game files are not included</i>.
+```bash
+bash Build.sh '/path/to/Burnout 2.xiso.iso'
+./build/linux/Release/b2
+```
+
+Linux uses Vulkan through DXVK Native and runs without Wine. Desktop gameplay,
+sound and graphics performance still need testing; the existing WSL software
+rendering result does not measure native GPU performance.
+
+### macOS Intel and Apple Silicon
+
+Use macOS 14+, a Metal 3 GPU, Xcode 16.3+ and the Homebrew dependencies in
+[BUILDING.txt](BUILDING.txt). Build from a native shell on each architecture:
+
+```bash
+bash Build.sh '/path/to/Burnout 2.xiso.iso'
+./build/macos/Release/b2
+```
+
+Intel and Apple Silicon use separate native builds. Graphics run through DXMT
+and Metal, without Wine or Rosetta. Both architectures still need real gameplay,
+visual, audio and performance testing. No Mac gameplay result is available yet.
+
+Linux and macOS do not support the Windows D3D12 upscalers, WARP, D3D11 debug
+layers or hardware memory watches. Custom music imports require FFmpeg.
+
+### Windows x64
+
+You need a 64-bit Windows PC and a graphics card that supports DirectX 11.
 
 1. Install [Visual Studio 2026 Community](https://visualstudio.microsoft.com/downloads/)
    with **Desktop development with C++**, **C++ CMake tools for Windows** and the included Windows SDK,
@@ -132,7 +164,8 @@ environment variable. Close and reopen **Build.cmd** after installing it.
 
 ### Updating between releases
 
-Use these steps when updating from an earlier release:
+These installer steps apply to Windows. On Linux and macOS, update the source
+and rerun `Build.sh` with your disc image; settings and saves are preserved.
 
 1. Close the game and builder.
 2. Back up `data/user` and `data/local/settings.cfg` beside your current `b2.exe`.
@@ -174,7 +207,8 @@ to apply graphics and enhancement changes during play.
   speed effects; it is enabled by default.
 - **Audio:** To use custom songs, **Browse** for a music folder, click
   **Import music**, then select the collection in the game's **Music Selection**
-  menu. MP3, WAV, WMA, FLAC, M4A and AAC are supported through Windows codecs.
+  menu. MP3, WAV, WMA, FLAC, M4A and AAC are supported through Windows codecs
+  on Windows and FFmpeg on Linux and macOS.
   Importing replaces the previous collection and restarts an active game.
   In-game music volume and Crash-mode music stopping also apply to Burnout 1 and
   imported songs. **Loop Track** repeats the selected song until you turn it off;
@@ -185,7 +219,8 @@ to apply graphics and enhancement changes during play.
 
 Press **F9** to start or stop a performance recording. Reports are saved under
 `build/captures/performance-*`; include the whole folder when reporting a slowdown.
-Saves are in `data/user` beside `b2.exe`; back up that folder to keep your profiles.
+Saves are in `data/user` beside the game executable (`b2.exe` on Windows, `b2` on
+Linux and macOS); back up that folder to keep your profiles.
 
 ## Controls
 
@@ -230,6 +265,10 @@ provide the visual reference.
 - [Microsoft's Direct3D 11 documentation](https://learn.microsoft.com/en-us/windows/win32/direct3d11/atoc-dx-graphics-direct3d-11)
   and [Windows API documentation](https://learn.microsoft.com/en-us/windows/win32/api/):
   the Windows graphics and system backend.
+- [DXVK Native](https://github.com/doitsujin/dxvk) and
+  [DXMT](https://github.com/3Shain/dxmt): native Vulkan and Metal graphics backends.
+- [Berkeley SoftFloat](https://www.jhauser.us/arithmetic/SoftFloat.html) and
+  [MPFR](https://www.mpfr.org/): floating-point support for Apple Silicon.
 - [XeGTAO](https://github.com/GameTechDev/XeGTAO): reference for ambient occlusion.
 
 See [third-party notices](THIRD_PARTY_NOTICES.txt) for dependency licenses and
