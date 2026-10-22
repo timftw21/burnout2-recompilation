@@ -6,7 +6,8 @@ case "$(uname -s):$(uname -m)" in
     Linux:x86_64) platform=linux ;;
     Darwin:arm64|Darwin:x86_64)
         platform=macos
-        for directory in /opt/homebrew/bin /usr/local/bin /opt/homebrew/opt/bison/bin /usr/local/opt/bison/bin /opt/homebrew/opt/flex/bin /usr/local/opt/flex/bin /opt/homebrew/opt/perl/bin /usr/local/opt/perl/bin; do
+        if [[ $(uname -m) == arm64 ]]; then brew_prefix=/opt/homebrew; else brew_prefix=/usr/local; fi
+        for directory in "$brew_prefix/bin" "$brew_prefix/opt/bison/bin" "$brew_prefix/opt/flex/bin" "$brew_prefix/opt/perl/bin"; do
             [[ ! -d $directory ]] || export PATH="$directory:$PATH"
         done
         if command -v brew >/dev/null; then
@@ -22,6 +23,7 @@ case "$(uname -s):$(uname -m)" in
         ;;
     *) printf '%s\n' 'This builder requires Linux x86-64 or macOS Intel/Apple Silicon.' >&2; exit 1 ;;
 esac
+if [[ $platform == linux && -x $root/build/deps/cmake-linux/bin/cmake ]]; then export PATH="$root/build/deps/cmake-linux/bin:$PATH"; fi
 tools_only=false
 game_inputs=false
 if (( $# == 1 )) && [[ $1 == --tools-only ]]; then tools_only=true

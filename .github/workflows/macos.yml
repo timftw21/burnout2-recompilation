@@ -4,6 +4,9 @@ on:
     paths:
       - '.github/workflows/macos.yml'
       - 'Build.sh'
+      - 'Install.sh'
+      - 'Install.command'
+      - 'Play.sh'
       - 'CMakeLists.txt'
       - 'CMakePresets.json'
       - 'cmake/**'
@@ -130,12 +133,7 @@ jobs:
           node cmake/ci-game-inputs.mjs restore < data/local/ci-inputs.base64
           rm data/local/ci-inputs.base64
       - name: Install native build dependencies
-        run: |
-          brew install cmake ninja pkgconf openssl@3 libpng jpeg-turbo spirv-headers vulkan-headers vulkan-loader bison flex perl
-          if [[ $(uname -m) == arm64 ]]; then brew install mpfr gmp; fi
-          export PATH="$(brew --prefix perl)/bin:$PATH"
-          PERL_MM_USE_DEFAULT=1 cpan -T JSON
-          if ! xcrun --sdk macosx --find metal; then xcodebuild -downloadComponent MetalToolchain; fi
+        run: bash Install.command --dependencies-only
       - name: Build native tooling
         run: bash Build.sh --tools-only
       - name: Report native Metal capabilities
@@ -158,6 +156,12 @@ jobs:
           fi
       - name: Build full native game
         run: bash Build.sh --game-inputs
+      - name: Check native installer application shortcut
+        run: |
+          bash Install.command --shortcuts-only
+          plutil -lint "$HOME/Applications/Burnout 2 Recompilation.app/Contents/Info.plist"
+          bash -n "$HOME/Applications/Burnout 2 Recompilation.app/Contents/MacOS/b2"
+          PATH=/usr/bin:/bin:/usr/sbin:/sbin "$HOME/Applications/Burnout 2 Recompilation.app/Contents/MacOS/b2" --help
       - name: Check native executables and offline CPU, audio and storage
         run: |
           for executable in b2 b2-tool; do

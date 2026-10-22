@@ -22,11 +22,12 @@ If you're skeptical, I implore you to try the recompilation for yourself. I take
 
 - Added experimental Linux x86-64 builds using Vulkan.
 - Added native macOS builds for Intel and Apple Silicon using Metal.
+- Added guided Linux and macOS installers with dependency setup and application shortcuts.
 - Added full macOS CI builds and offline CPU, audio, effects and storage checks.
 - Improved music import portability and Mac graphics initialization.
 
 Download the new **Installation.zip**. On Windows, run **Build.cmd** again to
-update. On Linux and macOS, run **Build.sh** with your XISO as shown below.
+update. On Linux, open **Install.desktop**; on macOS, open **Install.command**.
 See [Updating between releases](#updating-between-releases) to keep your saves,
 settings and imported music.
 
@@ -98,14 +99,20 @@ image. Game files are not included. Keep the source and build folders together.
 
 ### Linux x86-64
 
-Use a glibc-based 64-bit Linux distribution, Clang 19+, CMake 4.2+, Ninja and
-a compatible Vulkan 1.3 graphics driver. Install the dependencies listed in
-[BUILDING.txt](BUILDING.txt), then run:
+Use a glibc-based 64-bit Linux distribution and a compatible Vulkan 1.3 graphics
+driver. Extract **Installation.zip** into a folder you will keep, then open
+**Install.desktop**. Your desktop may first require **Allow Launching** or
+**Run as Program**. You can also start setup from a terminal:
 
 ```bash
-bash Build.sh '/path/to/Burnout 2.xiso.iso'
-./build/linux/Release/b2
+bash Install.sh
 ```
+
+Setup installs missing dependencies on Ubuntu 24.04+/Debian 13+, Fedora and
+Arch Linux, opens a disc picker and builds the game. Installing system packages
+may require your password. Start the game from your application menu or run
+`bash Play.sh`. Rerun setup in the same folder to update. For other distributions
+and manual builds, see [BUILDING.txt](BUILDING.txt).
 
 Linux uses Vulkan through DXVK Native and runs without Wine. Desktop gameplay,
 sound and graphics performance still need testing; the existing WSL software
@@ -113,12 +120,15 @@ rendering result does not measure native GPU performance.
 
 ### macOS Intel and Apple Silicon
 
-Use macOS 14+, a Metal 3 GPU, Xcode 16.3+ and the Homebrew dependencies in
-[BUILDING.txt](BUILDING.txt). Build from a native shell on each architecture:
+Building requires macOS 15.2+ and Xcode 16.3+; the game targets macOS 14+ and
+a compatible Metal 3 GPU. Install Xcode and open it once to finish its setup.
+Extract **Installation.zip** into a folder you will keep, then double-click
+**Install.command**. Setup installs Homebrew and the missing build tools, opens
+a disc picker, builds for your Mac and adds **Burnout 2 Recompilation.app** to
+your home **Applications** folder. You can also start setup from a terminal:
 
 ```bash
-bash Build.sh '/path/to/Burnout 2.xiso.iso'
-./build/macos/Release/b2
+bash Install.command
 ```
 
 Intel and Apple Silicon use separate native builds. Graphics run through DXMT
@@ -165,8 +175,13 @@ environment variable. Close and reopen **Build.cmd** after installing it.
 
 ### Updating between releases
 
-These installer steps apply to Windows. On Linux and macOS, update the source
-and rerun `Build.sh` with your disc image; settings and saves are preserved.
+These installer steps apply to Windows. On Linux and macOS, extract the updated
+source over your existing folder, keeping `build` and `data`. Rerun
+**Install.desktop** (Linux) or **Install.command** (macOS) and choose your XISO;
+settings, saves and imported music are preserved. Keep that folder in place so
+the application shortcut remains valid. After moving it, rerun setup to rebuild
+and refresh the game paths. `bash Install.sh --shortcuts-only` recreates a
+deleted shortcut without rebuilding an installation that remains in place.
 
 1. Close the game and builder.
 2. Back up `data/user` and `data/local/settings.cfg` beside your current `b2.exe`.

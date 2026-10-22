@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Install Burnout 2
+Comment=Set up Burnout 2 from your own Xbox disc image
+Exec=/bin/bash -c "exec /bin/bash \\"\\$(dirname -- \\"\\$1\\")/Install.sh\\"" burnout2-setup %k
+Icon=applications-games
+Terminal=true
+Categories=Game;
