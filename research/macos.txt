@@ -1,8 +1,9 @@
 macOS bring-up, 2026-10-21
 
-No Mac is available. This is a native port candidate for Intel and Apple Silicon;
-Mac linking, Metal output, audible playback, gameplay and performance have not
-been validated. No game automation or gameplay benchmark was run for this work.
+No physical Mac is available. This is a native port candidate for Intel and
+Apple Silicon. Source-only CI builds the native tool and renderer libraries;
+full game linking, Metal output, audible playback, gameplay and performance
+remain unvalidated. No game automation or gameplay benchmark was run for this work.
 
 Graphics source evidence
 
@@ -83,8 +84,26 @@ D3D headers, with only standard Apple platform-selection macros supplied for
 SDL headers. This is interface checking, not a Mac SDK or Metal build.
 Private diagnostics and temporary fixtures remain under build/macos-host.
 
-The manual GitHub workflow targets macos-15-intel and macos-15 (Apple Silicon):
+The GitHub workflow targets macos-15-intel and macos-15 (Apple Silicon):
 https://docs.github.com/en/actions/reference/runners/github-hosted-runners
-It builds the native tool without private game inputs. It has not been run.
+It builds the native tool without private game inputs, on build-input pushes or
+manual dispatch, then checks its architecture, library links and --help startup.
 On ARM the tool build also compiles the portable arithmetic core, so those
 sources are checked without requiring a game image.
+
+Native CI validation, 2026-10-21
+
+Both jobs passed on commit 5bf43e0c6158a086692e3104b715966ab6050a7d:
+https://github.com/timftw21/burnout2-recompilation/actions/runs/39701984093
+The Intel job produced a Mach-O x86_64 executable; Apple Silicon produced
+Mach-O arm64. Both built the DXMT/Metal libraries and ran b2-tool --help
+successfully with Xcode 16.4 and the macOS 15.5 SDK, targeting macOS 14.
+No private game inputs were uploaded. This does not validate a full game build,
+rendered output, audio playback or gameplay speed.
+
+Native compilation corrected the shader compiler's Vulkan header/loader build
+requirements, explicit GMP includes/linking, DXMT's C++20 language mode and
+native-call header selection, exported DXGI include paths, Mac signal-context
+headers and the standard exception include. Our own code remains C++23.
+CI keeps compiling independent targets after an error, with four workers, so
+remaining compiler failures are reported together. The final run had no failures.

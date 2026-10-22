@@ -87,8 +87,9 @@ Intel hardware instruction-reference checks are explicitly unavailable on ARM;
 the remaining diagnostics still exercise original game routines and services.
 Unaligned atomic memory operations are explicitly unsupported on ARM.
 
-No Mac was available during this bring-up. Native Mac linking, Metal rendering,
-audible playback, full gameplay and performance require validation on both Mac
+No physical Mac was available during this bring-up. CI builds the native tool
+and renderer libraries. A full game build, Metal rendering,
+audible playback, gameplay and performance require validation on both Mac
 architectures. Windows-only D3D12 upscalers, WARP, D3D11 debug layers and hardware
 memory watches remain unavailable. x87 transcendental results need comparison
 on game scenes; MPFR does not reproduce the Pentium's internal approximations.
