@@ -35,6 +35,7 @@ target_compile_definitions(b2-softfloat PUBLIC SOFTFLOAT_FAST_INT64 LITTLEENDIAN
     PRIVATE SOFTFLOAT_ROUND_ODD INLINE_LEVEL=5 SOFTFLOAT_FAST_DIV32TO16 SOFTFLOAT_FAST_DIV64TO32)
 target_compile_options(b2-softfloat PRIVATE -O2)
 pkg_check_modules(MPFR REQUIRED IMPORTED_TARGET mpfr>=4.2)
+pkg_check_modules(GMP REQUIRED IMPORTED_TARGET gmp)
 add_library(b2-portable-cpu STATIC "${CMAKE_CURRENT_LIST_DIR}/../src/portable_floating.cpp")
 target_compile_definitions(b2-portable-cpu PUBLIC B2_PORTABLE_CPU)
-target_link_libraries(b2-portable-cpu PUBLIC b2-softfloat PkgConfig::MPFR)
+target_link_libraries(b2-portable-cpu PUBLIC b2-softfloat PkgConfig::MPFR PkgConfig::GMP)

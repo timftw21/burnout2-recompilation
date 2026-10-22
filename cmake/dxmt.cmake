@@ -89,7 +89,8 @@ set_source_files_properties("${dxmt_SOURCE_DIR}/src/winemetal/winemetal_thunks.c
 target_compile_definitions(b2-dxmt-metal PRIVATE DXMT_NATIVE=1)
 target_include_directories(b2-dxmt-metal PRIVATE "${dxmt_SOURCE_DIR}/src/winemetal/unix")
 target_link_libraries(b2-dxmt-metal PRIVATE b2-dxmt-airconv sqlite3
-    "-framework Cocoa" "-framework Metal" "-framework MetalFX" "-framework QuartzCore" "-framework ColorSync")
+    "-framework Cocoa" "-framework Foundation" "-framework CoreFoundation" "-framework CoreGraphics"
+    "-framework Metal" "-framework MetalFX" "-framework QuartzCore" "-framework ColorSync")
 add_library(b2-dxmt-core STATIC ${util} ${core} "${dxmt_generated}/dxmt_command.h")
 target_link_libraries(b2-dxmt-core PRIVATE b2-dxmt-metal)
 add_library(b2-dxmt-dxgi SHARED ${dxgi})

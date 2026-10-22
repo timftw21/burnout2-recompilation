@@ -10,7 +10,7 @@ case "$(uname -s):$(uname -m)" in
             [[ ! -d $directory ]] || export PATH="$directory:$PATH"
         done
         if command -v brew >/dev/null; then
-            for package in openssl@3 libpng jpeg-turbo mpfr; do
+            for package in openssl@3 libpng jpeg-turbo mpfr gmp; do
                 if directory=$(brew --prefix "$package" 2>/dev/null); then
                     export CMAKE_PREFIX_PATH="$directory${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
                     export PKG_CONFIG_PATH="$directory/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
