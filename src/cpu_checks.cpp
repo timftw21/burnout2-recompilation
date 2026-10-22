@@ -704,19 +704,43 @@ unsigned check_segment_setup() {
     bool rejected=false;
     try { load_code_selector(cpu,memory,16,0); } catch(const GuestTrap& trap) { rejected=trap.vector==13; }
     require(rejected,"Invalid code descriptor did not raise a guest protection exception");
-    memory.store<std::uint32_t>(gdt+1,0xAABBCCDD);
-    require(memory.exchange<std::uint32_t>(gdt+1,7)==0xAABBCCDD && memory.fetch_add<std::uint32_t>(gdt+1,3)==7 &&
-        memory.load<std::uint32_t>(gdt+1)==10,"Unaligned guest atomic memory differs from native x86");
+#ifdef __aarch64__
+    constexpr auto atomic=gdt+4;
+#else
+    constexpr auto atomic=gdt+1;
+#endif
+    memory.store<std::uint32_t>(atomic,0xAABBCCDD);
+    require(memory.exchange<std::uint32_t>(atomic,7)==0xAABBCCDD && memory.fetch_add<std::uint32_t>(atomic,3)==7 &&
+        memory.load<std::uint32_t>(atomic)==10,"Guest atomic memory lost its prior value or replacement");
     const auto compare=[&]<class T>() {
         constexpr auto expected=static_cast<T>(0xA1B2C3D4),desired=static_cast<T>(0xABCDEF12);
-        memory.store<T>(gdt+1,expected);
-        require(memory.compare_exchange<T>(gdt+1,static_cast<T>(expected^1),desired)==expected && memory.load<T>(gdt+1)==expected,
-            "Failed unaligned compare/exchange changed memory or lost the prior value");
-        require(memory.compare_exchange<T>(gdt+1,expected,desired)==expected && memory.load<T>(gdt+1)==desired,
-            "Successful unaligned compare/exchange did not store its replacement");
+        memory.store<T>(atomic,expected);
+        require(memory.compare_exchange<T>(atomic,static_cast<T>(expected^1),desired)==expected && memory.load<T>(atomic)==expected,
+            "Failed compare/exchange changed memory or lost the prior value");
+        require(memory.compare_exchange<T>(atomic,expected,desired)==expected && memory.load<T>(atomic)==desired,
+            "Successful compare/exchange did not store its replacement");
     };
     compare.operator()<std::uint8_t>();compare.operator()<std::uint16_t>();compare.operator()<std::uint32_t>();
+#ifdef __aarch64__
+    const auto unaligned=[&]<class T>() {
+        constexpr auto expected=static_cast<T>(0xA1B2C3D4);
+        memory.store<T>(gdt+1,expected);
+        const auto reject=[&](auto operation) {
+            bool unsupported=false;
+            try {operation();} catch(const std::runtime_error& error) {
+                unsupported=std::string_view(error.what())=="Unaligned guest atomic memory is unsupported on ARM";
+            }
+            require(unsupported && memory.load<T>(gdt+1)==expected,"ARM unaligned atomic rejection changed memory or was lost");
+        };
+        reject([&]{memory.exchange<T>(gdt+1,7);});
+        reject([&]{memory.fetch_add<T>(gdt+1,3);});
+        reject([&]{memory.compare_exchange<T>(gdt+1,expected,7);});
+    };
+    unaligned.operator()<std::uint16_t>();unaligned.operator()<std::uint32_t>();
+    return 15;
+#else
     return 9;
+#endif
 }
 unsigned check_flags_stack() {
     constexpr std::uint32_t stack=0x1000;

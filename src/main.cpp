@@ -431,6 +431,7 @@ int main(int argc, char** argv) {
             std::cout << prefix << ",\"format\":\"b2-cpu-check-v2\",\"passed_cases\":" << std::size(inputs) + additional.game_cases
 #ifdef __aarch64__
                       << ",\"hardware_flag_reference\":\"unavailable-on-arm\""
+                      << ",\"unaligned_atomic_memory\":\"unsupported-on-arm\""
 #endif
                       << ",\"instruction_cases\":" << flag_cases + additional.instruction_cases
                       << ",\"memory_cases\":" << additional.memory_cases

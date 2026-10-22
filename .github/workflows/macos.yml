@@ -147,10 +147,16 @@ jobs:
           done
           build/macos/Release/b2-tool --help
           build/macos/Release/b2 --help
-          build/macos/Release/b2 --check-cpu data/local/default.xbe
-          build/macos/Release/b2 --check-audio
-          build/macos/Release/b2 --check-effects data/local/b2distfx.bin
-          build/macos/Release/b2 --check-storage data/local/default.xbe build/macos/storage-check
+          status=0
+          check() {
+            printf '\nChecking %s\n' "$1"
+            build/macos/Release/b2 "$@" || status=1
+          }
+          check --check-cpu data/local/default.xbe
+          check --check-audio
+          check --check-effects data/local/b2distfx.bin
+          check --check-storage data/local/default.xbe build/macos/storage-check
+          exit "$status"
       - name: Remove private inputs and generated game output
         if: always()
         run: rm -rf -- data/local build/macos
