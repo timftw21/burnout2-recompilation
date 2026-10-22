@@ -161,6 +161,7 @@ jobs:
           bash Install.command --shortcuts-only
           plutil -lint "$HOME/Applications/Burnout 2 Recompilation.app/Contents/Info.plist"
           bash -n "$HOME/Applications/Burnout 2 Recompilation.app/Contents/MacOS/b2"
+          PATH=/usr/bin:/bin:/usr/sbin:/sbin "$HOME/Applications/Burnout 2 Recompilation.app/Contents/MacOS/b2" --help
       - name: Check native executables and offline CPU, audio and storage
         run: |
           for executable in b2 b2-tool; do

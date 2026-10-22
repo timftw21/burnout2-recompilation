@@ -25,6 +25,8 @@ Apple's Metal toolchain if needed. Run it natively, without Rosetta.
 Application shortcuts are created in the Linux application menu or in
 ~/Applications/Burnout 2 Recompilation.app on macOS; they use Play.sh and keep
 the game with its original native libraries and saved data in the build folder.
+Mac setup and launchers select the native Homebrew prefix for Intel or Apple
+Silicon; launching from Finder also finds FFmpeg for custom music imports.
 
 Rerun setup in the same folder to update, preserving saves, settings and music.
 bash Install.sh --shortcuts-only recreates a deleted application shortcut.

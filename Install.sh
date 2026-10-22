@@ -133,8 +133,9 @@ prepare_macos() {
         return 1
     fi
     xcodebuild -checkFirstLaunchStatus || { printf '%s\n' 'Open Xcode and complete its first-launch setup, then run this installer again.' >&2; return 1; }
-    for directory in /opt/homebrew/bin /usr/local/bin; do [[ ! -d $directory ]] || export PATH="$directory:$PATH"; done
-    if ! command -v brew >/dev/null; then
+    local brew_prefix
+    if [[ $(uname -m) == arm64 ]]; then brew_prefix=/opt/homebrew; else brew_prefix=/usr/local; fi
+    if [[ ! -x $brew_prefix/bin/brew ]]; then
         local brew_installer="$root/build/deps/homebrew-install.sh"
         local brew_checksum=5f333bbe53bc490e51e7ccb1df8779b3dd6ee73a1a7379efda216edb08ccb148
         mkdir -p -- "$root/build/deps"
@@ -142,8 +143,8 @@ prepare_macos() {
         [[ $(shasum -a 256 "$brew_installer.download" | cut -d' ' -f1) == "$brew_checksum" ]] || { printf '%s\n' 'Homebrew installer checksum mismatch.' >&2; return 1; }
         mv -f -- "$brew_installer.download" "$brew_installer"
         if [[ ${CI:-} == true ]]; then NONINTERACTIVE=1 /bin/bash "$brew_installer"; else /bin/bash "$brew_installer"; fi
-        for directory in /opt/homebrew/bin /usr/local/bin; do [[ ! -d $directory ]] || export PATH="$directory:$PATH"; done
     fi
+    export PATH="$brew_prefix/bin:$PATH"
     brew install cmake ninja pkgconf openssl@3 libpng jpeg-turbo spirv-headers vulkan-headers vulkan-loader bison flex perl ffmpeg
     if [[ $(uname -m) == arm64 ]]; then brew install mpfr gmp; fi
     local perl_prefix
