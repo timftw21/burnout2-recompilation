@@ -67,6 +67,9 @@ else
     source cmake/macos-dependencies.sh
 fi
 configure_options=()
+build_options=()
+# Report independent compiler failures together in CI, retaining the job limit.
+if [[ ${CI:-} == true ]]; then build_options=(-- -k0); fi
 if [[ $platform == macos ]]; then
     configure_options+=("-DB2_DXMT_LLVM=$B2_DXMT_LLVM" "-DCMAKE_C_COMPILER=$(xcrun --find clang)" "-DCMAKE_CXX_COMPILER=$(xcrun --find clang++)")
 fi
@@ -82,7 +85,7 @@ if ! $tools_only && [[ -f data/local/default.xbe && -f data/local/b2distfx.bin ]
 else
     cmake --preset "$platform" ${fresh[@]+"${fresh[@]}"} ${configure_options[@]+"${configure_options[@]}"} -DB2_XBE=
 fi
-cmake --build --preset "$platform-release" --target b2-tool
+cmake --build --preset "$platform-release" --target b2-tool ${build_options[@]+"${build_options[@]}"}
 if $tools_only; then printf 'Built the native tool: %s\n' "$root/build/$platform/Release/b2-tool";exit 0;fi
 tool="$root/build/$platform/Release/b2-tool"
 stage=$(mktemp -d "$root/data/local/b2-setup.XXXXXX")
@@ -101,7 +104,7 @@ done
 if ! $configured_game; then
     cmake --preset "$platform" ${configure_options[@]+"${configure_options[@]}"} -DB2_XBE="$root/data/local/default.xbe" -DB2_EFFECTS="$root/data/local/b2distfx.bin"
 fi
-cmake --build --preset "$platform-release"
+cmake --build --preset "$platform-release" ${build_options[@]+"${build_options[@]}"}
 settings="$root/build/$platform/Release/data/local/settings.cfg"
 mkdir -p -- "$(dirname -- "$settings")"
 {

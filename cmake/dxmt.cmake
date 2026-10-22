@@ -94,6 +94,7 @@ target_link_libraries(b2-dxmt-metal PRIVATE b2-dxmt-airconv sqlite3
 add_library(b2-dxmt-core STATIC ${util} ${core} "${dxmt_generated}/dxmt_command.h")
 target_link_libraries(b2-dxmt-core PRIVATE b2-dxmt-metal)
 add_library(b2-dxmt-dxgi SHARED ${dxgi})
+target_include_directories(b2-dxmt-dxgi PUBLIC "${dxmt_SOURCE_DIR}/src/dxgi")
 target_link_libraries(b2-dxmt-dxgi PRIVATE b2-dxmt-core b2-dxmt-metal)
 add_library(b2-dxmt-d3d11 SHARED ${d3d11})
 target_link_libraries(b2-dxmt-d3d11 PRIVATE b2-dxmt-dxgi b2-dxmt-core b2-dxmt-parser b2-dxmt-metal)
