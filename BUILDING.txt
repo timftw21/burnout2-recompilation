@@ -92,7 +92,7 @@ game and runs offline diagnostics on both architectures. The Apple Silicon
 runner also exercises offscreen Metal rendering. The Intel runner's virtual
 GPU lacks the Apple7/Mac2 family support required by DXMT. Its CPU, audio,
 effects and file checks still run; GPU checks explicitly report unavailable.
-b2-tool inspect-metal reports the selected device and supported GPU families.
+./build/macos/Release/b2-tool inspect-metal reports the device and GPU families.
 Compatible hardware automatically enables the offscreen draw and the storage
 suite's resident-texture cases. Audible playback, gameplay and performance
 still require validation on both Mac architectures. Windows-only D3D12
@@ -103,6 +103,9 @@ on game scenes; MPFR does not reproduce the Pentium's internal approximations.
 The Native macOS build workflow compiles b2 and b2-tool on both
 macos-15-intel and macos-15 (Apple Silicon), without publishing game files.
 It runs when build inputs change and can also be started manually.
+Both full Release jobs passed on 2026-10-21:
+https://github.com/timftw21/burnout2-recompilation/actions/runs/39714403670
+These checks do not boot the game or establish gameplay performance.
 The macos-game Actions environment holds compressed private inputs in encrypted
 secrets B2_CI_INPUTS_00 through B2_CI_INPUTS_58. No game inputs, generated source
 or executables are committed, cached or uploaded as artifacts. Only trusted

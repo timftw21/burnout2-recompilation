@@ -163,3 +163,21 @@ game and runs CPU/audio/effects/file checks; it enables offscreen rendering and
 the storage suite's texture-cache checks only for a supported device. The storage
 JSON explicitly reports graphics_checked and graphics_status, with an actual
 case count. No capability is fabricated or substituted with a software renderer.
+The updated full Linux build passed all 2,061 storage cases, with graphics_checked
+true, including synchronous and asynchronous resident-texture replacement.
+
+Final full Release CI passed on both architectures at commit
+4fcec7c86e3c55d24288390b59ce618f79fd0f56:
+https://github.com/timftw21/burnout2-recompilation/actions/runs/39714403670
+Both b2 and b2-tool were verified as native Mach-O executables (x86_64 and
+arm64), linked their libraries and ran --help. Both jobs passed the CPU suites
+above, 70 offline audio cases and 67 effects checks. Intel passed 2,043 storage
+cases with graphics_checked false and graphics_status unsupported-metal-gpu.
+ARM passed all 2,061 storage cases with graphics_checked true, including the
+resident-texture checks, and the separate native offscreen Metal draw.
+Both virtual adapters were available and named Apple Paravirtual device.
+Intel reported Apple7 false/Mac2 false; ARM reported Apple7 false/Mac2 true.
+These native flags confirm the Intel hardware limitation. Both jobs removed
+their private inputs and generated output; the run published zero artifacts.
+Gameplay, audible playback, visual parity and performance still need physical
+Linux and Mac hardware testing. No game boot or benchmark was performed here.
