@@ -265,14 +265,15 @@ unsigned import_custom_music(const std::filesystem::path& source,const std::file
         throw;
     }
 }
-MusicImport::~MusicImport() {cancel();}
+MusicImport::~MusicImport() {cancel();if(worker_.joinable()) worker_.join();}
 void MusicImport::start(const std::filesystem::path& source,const std::filesystem::path& destination) {
-    if(worker_.joinable()) {worker_.request_stop();worker_.join();}
+    cancel();if(worker_.joinable()) worker_.join();
+    cancelled_.store(false,std::memory_order_relaxed);
     {std::lock_guard lock(mutex_);progress_={};}
-    worker_=std::jthread([this,source,destination](std::stop_token stop) {
+    worker_=std::thread([this,source,destination] {
         try {
             const auto count=import_custom_music(source,destination,[&](unsigned completed,unsigned total,std::string_view file) {
-                if(stop.stop_requested()) return false;
+                if(cancelled_.load(std::memory_order_relaxed)) return false;
                 std::lock_guard lock(mutex_);progress_.completed=completed;progress_.total=total;
                 if(progress_.file!=file) progress_.file=file;return true;
             });
@@ -283,6 +284,6 @@ void MusicImport::start(const std::filesystem::path& source,const std::filesyste
         }
     });
 }
-void MusicImport::cancel() {if(worker_.joinable()) worker_.request_stop();}
+void MusicImport::cancel() {cancelled_.store(true,std::memory_order_relaxed);}
 MusicImportProgress MusicImport::status() const {std::lock_guard lock(mutex_);return progress_;}
 }
