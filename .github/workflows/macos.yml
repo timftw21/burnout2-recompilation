@@ -33,7 +33,7 @@ jobs:
           persist-credentials: false
       - name: Install native build dependencies
         run: |
-          brew install cmake ninja pkgconf openssl@3 libpng jpeg-turbo spirv-headers bison flex perl
+          brew install cmake ninja pkgconf openssl@3 libpng jpeg-turbo spirv-headers vulkan-headers bison flex perl
           if [[ $(uname -m) == arm64 ]]; then brew install mpfr; fi
           export PATH="$(brew --prefix perl)/bin:$PATH"
           PERL_MM_USE_DEFAULT=1 cpan -T JSON

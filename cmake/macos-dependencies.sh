@@ -1,8 +1,10 @@
 # Official native LLVM package: DXMT uses the LLVM 15 libraries, while the
 # application and our tools use the current C++23 compiler selected by Build.sh.
 if command -v brew >/dev/null; then
-    spirv_headers=$(brew --prefix spirv-headers)
-    export CPPFLAGS="-I$spirv_headers/include${CPPFLAGS:+ $CPPFLAGS}"
+    for package in spirv-headers vulkan-headers; do
+        headers=$(brew --prefix "$package")
+        export CPPFLAGS="-I$headers/include${CPPFLAGS:+ $CPPFLAGS}"
+    done
 fi
 case $(uname -m) in
     arm64) llvm_name=clang+llvm-15.0.7-arm64-apple-darwin22.0

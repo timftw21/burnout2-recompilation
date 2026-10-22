@@ -62,7 +62,7 @@ provide DXMT's D3D11 feature level are unsupported.
 
 With Xcode selected, install the native build dependencies using Homebrew:
 
-brew install cmake ninja pkgconf openssl@3 libpng jpeg-turbo spirv-headers bison flex perl
+brew install cmake ninja pkgconf openssl@3 libpng jpeg-turbo spirv-headers vulkan-headers bison flex perl
 if [ "$(uname -m)" = arm64 ]; then brew install mpfr; fi
 export PATH="$(brew --prefix perl)/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
 cpan -T JSON
