@@ -4,7 +4,7 @@
 #include <d3d11_4.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
-#include <wrl/client.h>
+#include "com_ptr.h"
 #include <nvsdk_ngx_helpers_d3d.h>
 #include <xess/xess_d3d12.h>
 #include <ffx_api_loader.h>

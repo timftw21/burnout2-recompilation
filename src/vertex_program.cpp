@@ -42,10 +42,15 @@ std::string lanes(unsigned mask) {
     return result;
 }
 constexpr std::string_view helpers=R"(
+// Classify IEEE bits explicitly, including signed infinities and signalling
+// NaNs, so both native HLSL compilers preserve Xbox exceptional inputs.
+bool nv_inf(float x) {return (asuint(x)&0x7FFFFFFF)==0x7F800000;}
+bool nv_nan(float x) {return (asuint(x)&0x7FFFFFFF)>0x7F800000;}
+bool nv_finite(float x) {return (asuint(x)&0x7F800000)!=0x7F800000;}
 float nv_mul(float a,float b) {
  if(a==0 || b==0) return 0;
  float result=a*b;
- return isinf(result) && isfinite(a) && isfinite(b) ? (asuint(result)&0x80000000 ? -asfloat(0x7F7FFFFF) : asfloat(0x7F7FFFFF)) : result;
+ return nv_inf(result) && nv_finite(a) && nv_finite(b) ? (asuint(result)&0x80000000 ? -asfloat(0x7F7FFFFF) : asfloat(0x7F7FFFFF)) : result;
 }
 float4 nv_mul4(float4 a,float4 b) { return float4(nv_mul(a.x,b.x),nv_mul(a.y,b.y),nv_mul(a.z,b.z),nv_mul(a.w,b.w)); }
 float nv_slt(float a,float b) { return a<b || (asuint(a)==0x80000000 && asuint(b)==0) ? 1 : 0; }
@@ -57,7 +62,7 @@ float nv_rcc(float x) {
 float4 nv_log(float x) {
  float value=abs(x);
  if(value==0) return float4(-asfloat(0x7F800000),1,-asfloat(0x7F800000),1);
- if(isinf(value)) return float4(value,1,value,1);
+ if(nv_inf(value)) return float4(value,1,value,1);
  float exponent=floor(log2(value));
  return float4(exponent,value/exp2(exponent),log2(value),1);
 }
@@ -71,7 +76,7 @@ float nv_fog(float d,float4 params) {
  if((asuint(d)&0x7F800000)==0x7F800000) return exceptional;
  float value=params.z==0 ? params.x+d*params.y-1 : params.z==1 ? params.x+exp2(d*params.y*16)-1.5 : params.x+exp2(-d*d*params.y*params.y*32)-1.5;
  if(params.w==2) value=abs(value);
- if(isnan(value)) return exceptional;
+ if(nv_nan(value)) return exceptional;
  return clamp(value,-asfloat(0x7F7FFFFF),asfloat(0x7F7FFFFF));
 }
 )";

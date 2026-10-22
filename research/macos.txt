@@ -1,0 +1,183 @@
+macOS bring-up, 2026-10-21
+
+No physical Mac is available. This is a native port candidate for Intel and
+Apple Silicon. Source-only CI builds the native tool and renderer libraries;
+full game linking, Metal output, audible playback, gameplay and performance
+remain unvalidated. No game automation or gameplay benchmark was run for this work.
+
+Graphics source evidence
+
+DXMT provides a native Mach-O library build, separately from its Wine build:
+https://github.com/3Shain/dxmt/blob/50102f994b406f58f56d5d09f2ad20f9b90390a2/docs/DEVELOPMENT.md
+The native source lists and LLVM 15 requirement are taken from that revision's
+Meson files. Our CMake build uses those sources without running Python/Meson.
+The official LLVM 15.0.7 Mac package hashes were checked against downloads from
+the LLVM project's release. SDL3 owns the Metal view, passed to the native DXMT
+window thunk. Its previous thunk expected Wine's window driver.
+
+The pinned native allocator passed size/alignment to aligned_alloc in reverse
+order (src/util/wsi_platform_darwin.cpp). The generated copy uses posix_memalign
+with the original size and alignment. DXMT_PAGE_SIZE comes from the native
+host's getconf PAGESIZE, covering Intel and Apple Silicon page sizes.
+The renderer retains the SDL window for pixel sizing separately from the Metal
+layer handed to DXMT.
+
+CPU and service implementation
+
+Intel preserves the resident x87 stack and SSE state, with Mach-O symbols and
+the same helper register convention used on Windows/Linux. Both original Intel
+assembly files and both new stack-switching paths cross-assembled as Mach-O.
+POSIX descriptors/AIO, metadata and file sharing are shared with Linux. Mac
+paths, page sizes, extended attributes, creation time, signal context and memory
+counters use their native APIs. Mac uses guarded stacks and native assembly
+contexts, avoiding deprecated or missing Mac ucontext implementations.
+Read hints use Darwin's F_RDAHEAD, and signal stacks assign fields by name
+because Darwin and Linux order those fields differently:
+https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html
+https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/_types/_sigaltstack.h
+
+Apple Silicon lowers verified game instructions into direct C++ helpers. It
+does not decode instructions, dispatch opcodes or interpret the game at runtime.
+SoftFloat preserves IEEE and 80-bit arithmetic; its public little-endian layout
+and thread-local controls are explicit. A generated rounding routine exposes
+the rounding direction needed by x87 status bit C1. Loads/stores, constants,
+stack order, MMX register sharing and control state retain the guest layout.
+MPFR supplies transcendental functions with reusable per-thread scratch space.
+Its results can differ from hardware x87 approximations; this remains a scene
+validation concern, not a claim of bit-identical Pentium transcendental results.
+
+Validation evidence (Windows Ryzen 5 5600X, Ubuntu 24.04 WSL2, Clang 19)
+
+The portable helper build discovered and compiled the same 36,149 functions and
+713,245 instructions as the Intel build. Discovery still reports unresolved
+indirect targets; platform bindings are not counted as translated CPU coverage.
+The final portable executable passed 52 game cases, 26,026 instruction cases,
+3,467 memory cases, 6,744 floating cases and 109 control cases. Storage passed
+2,061 cases, including asynchronous writes and reopening; audio passed 70 cases
+without opening a device. The native Windows CPU/audio and hidden-window checks
+also passed, as did native Linux CPU/storage/audio. The source-only setup path
+built and ran the native tool, preserved the settings hash, and returned to a
+working full Linux build. These are component checks without a game boot.
+
+A bounded hardware comparison covered 1,036 normal-value x87 cases across four
+rounding modes. 1,004 matched the host's defined numeric and status fields; the 32
+differences were in transcendental operations. All non-transcendental samples
+matched. Four mixed x87/MMX cases separately matched stack top, register data,
+tags and memory. These checks caught and corrected constant rounding, C1 and
+MMX's reset of the stack top. They are not exhaustive IEEE conformance evidence.
+Three additional hardware comparisons passed stack-top rotation and pop,
+including preserved register contents in slots marked empty.
+
+Native ARM code ran under qemu-aarch64, using the same production arithmetic
+sources. Its result hash matched Intel: 6a21e288d6f492f5, across 2,700 integer
+results, 24 four-lane floating samples, 24 extended-arithmetic samples and nine
+transcendental samples. A 900-call check of all nine math helpers recorded zero
+heap allocations or resizes after initialization. GMP's allocation hooks use a
+fixed 64 KiB thread-local workspace; MPFR's local cache is released before the
+workspace is recycled. Persistent values are allocated at guest entry.
+The native stack-switching source completed 2,048 switches on both x86-64 and
+emulated ARM, preserving the caller's floating control state. These demonstrate
+CPU portability; they are not Mac gameplay or speed measurements.
+
+The renderer/settings sources passed a Linux syntax check against DXMT's native
+D3D headers, with only standard Apple platform-selection macros supplied for
+SDL headers. This is interface checking, not a Mac SDK or Metal build.
+Private diagnostics and temporary fixtures remain under build/macos-host.
+
+The GitHub workflow targets macos-15-intel and macos-15 (Apple Silicon):
+https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+Its initial source-only version built the native tool on build-input pushes or
+manual dispatch, then checked its architecture, library links and --help startup.
+On ARM that build also compiled the portable arithmetic core without a game image.
+
+Native CI validation, 2026-10-21
+
+Both jobs passed on commit 5bf43e0c6158a086692e3104b715966ab6050a7d:
+https://github.com/timftw21/burnout2-recompilation/actions/runs/39701984093
+The Intel job produced a Mach-O x86_64 executable; Apple Silicon produced
+Mach-O arm64. Both built the DXMT/Metal libraries and ran b2-tool --help
+successfully with Xcode 16.4 and the macOS 15.5 SDK, targeting macOS 14.
+No private game inputs were uploaded. This does not validate a full game build,
+rendered output, audio playback or gameplay speed.
+
+Native compilation corrected the shader compiler's Vulkan header/loader build
+requirements, explicit GMP includes/linking, DXMT's C++20 language mode and
+native-call header selection, exported DXGI include paths, Mac signal-context
+headers and the standard exception include. Our own code remains C++23.
+CI keeps compiling independent targets after an error, with four workers, so
+remaining compiler failures are reported together. The final run had no failures.
+
+Full game CI bring-up, 2026-10-21
+
+The macos-game Actions environment now supplies the verified executable and
+21,756-byte effects image as compressed, encrypted secrets. Explicit references
+are staged in bounded steps: the combined input exceeds Actions' template limit
+and the OS environment limit. No original files, generated game sources or game
+executables are committed, cached or uploaded as artifacts. Both restored input
+files matched the local originals byte for byte; CI logs redacted the payload.
+Build.sh --game-inputs builds from these extracted files without altering saves
+or settings. Its full Linux build and existing CPU checks passed.
+
+Both Mac architectures exposed Xcode 16.4's missing std::jthread/stop_token support
+in music imports. The worker now uses std::thread, an atomic cancellation flag
+and explicit joins on restart and destruction. An ignored local fixture passed
+128 restart/cancel/destruction cycles and asynchronous error reporting. Linux's
+existing custom-music suite passed 2,062 cases, including cancelled-import library
+preservation. The modified native Windows input library also compiled.
+
+Native full game builds linked 36,149 generated functions on both architectures.
+Intel's existing CPU suite passed 52 game, 26,026 instruction, 3,467 memory,
+6,744 floating and 109 control cases. ARM passed 52 game, 2,267 memory, 6,744
+floating and 115 control cases; its report explicitly labels Intel hardware flag
+references unavailable and unaligned atomic memory unsupported. The diagnostic
+now checks aligned ARM atomics and all six nonmutating rejection paths instead
+of assuming Intel's unaligned operations work there. A native ARM fixture under
+QEMU separately verified those operations before the native CI run.
+
+The native DXGI adapter copied NSString UTF-16 bytes into a 32-bit WCHAR array,
+causing renderer initialization to throw from wstring_convert. Its generated
+native copy now uses DXMT's existing width-aware UTF-8 transcoder. The ARM job
+then passed the full game build, offscreen Metal draw, CPU/audio/effects checks
+and all 2,061 storage cases, including resident-texture replacement:
+https://github.com/timftw21/burnout2-recompilation/actions/runs/39710332686/job/119599889378
+
+The Intel CI Metal device rejected vertex-only pipelines without a declared
+pixel format even with rasterization disabled. A temporary native Metal probe
+reproduced that rejection outside DXMT. Declaring an inactive RGBA8 format passed
+on both runners and preserved all four vertex buffer writes with differently
+formatted RGBA16Float color and Depth32Float attachments. DXMT's GS/TS command
+pipelines now declare that format with color writes and rasterization disabled.
+The temporary experiment was removed; no extra executable or permanent test is
+shipped. Evidence is in the two metal-pipeline-diagnostic jobs here:
+https://github.com/timftw21/burnout2-recompilation/actions/runs/39711966599
+Both runners reported Apple Paravirtual devices, with different GPU family
+support. These are hosted component checks, not physical Mac gameplay evidence.
+
+After the pipeline fix, Intel's device creation reached DXMT's format inspection
+and returned E_FAIL. The pinned source accepts Apple7 or Mac2 GPU families and
+otherwise throws Invalid MTLDevice (src/dxmt/dxmt_format.cpp). A native capability
+query now reports those exact flags before rendering. It follows DXMT's adapter
+selection, including preferring the last discrete device on multi-GPU Macs.
+Unsupported hardware receives a clear renderer error. CI always builds the full
+game and runs CPU/audio/effects/file checks; it enables offscreen rendering and
+the storage suite's texture-cache checks only for a supported device. The storage
+JSON explicitly reports graphics_checked and graphics_status, with an actual
+case count. No capability is fabricated or substituted with a software renderer.
+The updated full Linux build passed all 2,061 storage cases, with graphics_checked
+true, including synchronous and asynchronous resident-texture replacement.
+
+Final full Release CI passed on both architectures at commit
+4fcec7c86e3c55d24288390b59ce618f79fd0f56:
+https://github.com/timftw21/burnout2-recompilation/actions/runs/39714403670
+Both b2 and b2-tool were verified as native Mach-O executables (x86_64 and
+arm64), linked their libraries and ran --help. Both jobs passed the CPU suites
+above, 70 offline audio cases and 67 effects checks. Intel passed 2,043 storage
+cases with graphics_checked false and graphics_status unsupported-metal-gpu.
+ARM passed all 2,061 storage cases with graphics_checked true, including the
+resident-texture checks, and the separate native offscreen Metal draw.
+Both virtual adapters were available and named Apple Paravirtual device.
+Intel reported Apple7 false/Mac2 false; ARM reported Apple7 false/Mac2 true.
+These native flags confirm the Intel hardware limitation. Both jobs removed
+their private inputs and generated output; the run published zero artifacts.
+Gameplay, audible playback, visual parity and performance still need physical
+Linux and Mac hardware testing. No game boot or benchmark was performed here.

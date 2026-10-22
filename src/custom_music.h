@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <filesystem>
 #include <functional>
 #include <mutex>
@@ -25,6 +26,7 @@ public:
 private:
     mutable std::mutex mutex_;
     MusicImportProgress progress_;
-    std::jthread worker_;
+    std::atomic<bool> cancelled_{false};
+    std::thread worker_;
 };
 }

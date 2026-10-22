@@ -105,6 +105,7 @@ constexpr std::pair<std::uint32_t,std::string_view> pause_row_sites[]={
 };
 class Emitter {
 public:
+    bool portable=false;
     std::set<unsigned> used, dirty;
     bool uses_flags = false, writes_flags = false;
     bool calls = false;
@@ -263,13 +264,23 @@ public:
             (immediate?std::format("_{:02X}",immediate->imm.value.u):"");
         native_helpers[helper]=helper+" PROC\n    db 00Fh,"+std::format("0{:02X}h",ins.opcode)+
             (empty?"":std::format(",0{:02X}h",modrm))+(immediate?std::format(",0{:02X}h",immediate->imm.value.u):"")+"\n    ret\n"+helper+" ENDP\n";
-        native_declarations[helper]="extern \"C\" void "+helper+'('+(!pointer.empty()?"void*":"")+");\n";
+        if(portable) native_helpers[helper]=std::format("extern \"C\" B2_ASM void {}({}) {{b2::portable_mmx<{},{},{}>({});}}\n",
+            helper,pointer.empty()?"":"void* p",ins.opcode,modrm,immediate?immediate->imm.value.u:0,pointer.empty()?"":"p");
+        native_declarations[helper]="extern \"C\" B2_ASM void "+helper+'('+(!pointer.empty()?"void*":"")+");\n";
         body << "    " << helper << '(' << pointer << ");\n";
         if(register_write) write(*register_operand,"mmx_word");
     }
     void x87(const Instruction& instruction) {
         const auto& ins=instruction.decoded;
         const std::string_view mnemonic=ZydisMnemonicGetString(ins.mnemonic);
+        if(portable) {
+            constexpr std::string_view supported[]={"fwait","fnstsw","fnstcw","fldcw","fnsave","frstor","fnstenv","fldenv","fnclex","fninit","fnop",
+                "fld","fst","fstp","fild","fist","fistp","fisttp","fadd","faddp","fiadd","fsub","fsubp","fsubr","fsubrp","fisub","fisubr",
+                "fmul","fmulp","fimul","fdiv","fdivp","fdivr","fdivrp","fidiv","fidivr","fsqrt","fchs","fabs","fxch","ffree","fld1","fldz",
+                "fldl2t","fldl2e","fldpi","fldlg2","fldln2","fcom","fcomp","fcompp","fucom","fucomp","fucompp","fcomi","fcomip","fucomi","fucomip",
+                "ftst","f2xm1","fyl2x","fptan","fpatan","fyl2xp1","fsincos","frndint","fscale","fsin","fcos","fdecstp","fincstp"};
+            if(std::ranges::find(supported,mnemonic)==std::end(supported)) throw std::runtime_error("Unsupported ARM x87 instruction");
+        }
         if (mnemonic.starts_with("fcmov")) throw std::runtime_error("Floating conditional move needs guest flags");
         floating=true;
         const bool waiting=mnemonic=="fwait";
@@ -289,7 +300,9 @@ public:
         if (status) assembly+="    movzx eax,ax\n";
         assembly+="    ret\n"+helper+" ENDP\n";
         native_helpers[helper]=assembly;
-        native_declarations[helper]="extern \"C\" "+std::string(status||compare_flags?"std::uint32_t ":"void ")+helper+'('+(memory?"void*":"")+");\n";
+        if(portable) native_helpers[helper]=std::format("extern \"C\" B2_ASM {} {}({}) {{return {}b2::portable_x87<{},{}>({});}}\n",
+            status||compare_flags?"std::uint32_t":"void",helper,memory?"void* p":"",status||compare_flags?"":"(void)",ins.opcode,modrm,memory?"p":"");
+        native_declarations[helper]="extern \"C\" B2_ASM "+std::string(status||compare_flags?"std::uint32_t ":"void ")+helper+'('+(memory?"void*":"")+");\n";
         const bool control=waiting || mnemonic=="fnstsw" || mnemonic=="fnstcw" || mnemonic=="fldcw" ||
             mnemonic=="fnsave" || mnemonic=="frstor" || mnemonic=="fnstenv" || mnemonic=="fldenv" ||
             mnemonic=="fnclex" || mnemonic=="fninit" || mnemonic=="fnop";
@@ -392,7 +405,7 @@ public:
             "    fnstcw word ptr [rsp]\n    movzx r8d,word ptr [rsp]\n    and r8d,3Fh\n    cmp r8d,3Fh\n    jne "+helper+"_precise\n"+
             fast+last_data+last_instruction+"    add rsp,8\n    ret\n"+helper+"_precise:\n"+
             precise+"    add rsp,8\n    ret\n"+helper+" ENDP\n";
-        native_declarations[helper]="extern \"C\" void "+helper+"(const void*,FloatingState*);\n";
+        native_declarations[helper]="extern \"C\" B2_ASM void "+helper+"(const void*,FloatingState*);\n";
         if(operands) body << "        const std::array<Operand," << operands << "> fp_operands{{\n" << pointers.str() << "        }};\n";
         // Failed range checks fall through to the original compiled sequence:
         // earlier stores, floating state and the failing instruction stay exact.
@@ -445,7 +458,7 @@ public:
         // GPRs and flags are unchanged. Keep original MMX/NT stores in order;
         // failed range preflight falls through to the individual instructions.
         native_helpers[helper]=assembly+"    ret\n"+helper+" ENDP\n";
-        native_declarations[helper]="extern \"C\" void "+helper+"(const void*);\n";
+        native_declarations[helper]="extern \"C\" B2_ASM void "+helper+"(const void*);\n";
         floating=true;
     }
     void instruction(const Instruction& instruction, bool falls_through) {
@@ -1200,7 +1213,7 @@ public:
 };
 }
 
-LoweredFunction lower(const Function& function,bool fuse_floating) {
+LoweredFunction lower(const Function& function,bool fuse_floating,bool portable) {
     LoweredFunction result;
     auto api=std::ranges::find(native_apis,function.entry,&NativeApi::address);
     if(api==native_apis.end()) {
@@ -1223,6 +1236,7 @@ LoweredFunction lower(const Function& function,bool fuse_floating) {
         return result;
     }
     Emitter emitter;
+    emitter.portable=portable;
     emitter.labels.insert(function.entry);
     for(const auto& site:music_sites) if(const auto found=function.instructions.find(site.address);found!=function.instructions.end()) {
         if(hex_bytes(Bytes(found->second.bytes).first(found->second.decoded.length))!=site.bytes ||
@@ -1278,7 +1292,7 @@ LoweredFunction lower(const Function& function,bool fuse_floating) {
         if(following==function.instructions.end() || following->first!=next) emitter.labels.insert(next);
     }
     emitter.calls=!emitter.loop_headers.empty();
-    if(fuse_floating) {
+    if(fuse_floating && !portable) {
         auto targets=emitter.labels;
         for(const auto& edge:function.edges) if(edge.to) targets.insert(*edge.to);
         for(auto current=function.instructions.begin();current!=function.instructions.end();) {

@@ -1,4 +1,5 @@
 #include "antialiasing.h"
+#include <climits>
 #include "shaders.h"
 #include <cstring>
 #include <format>

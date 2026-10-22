@@ -357,7 +357,7 @@ std::string Audio::inspect_capture(const std::filesystem::path& source,const std
         failures.empty(),saved->data.size(),saved->clock,final.report(),voices,bins,errors);
     write_text(output/"report.json",report,false);
     return std::format("{{\"format\":\"b2-audio-inspection-v1\",\"passed\":{},\"game_booted\":false,\"audio_device_opened\":false,\"voices\":{},\"frames\":96000,\"report\":{},\"failures\":[{}]}}",
-        failures.empty(),std::ranges::count_if(saved->voices,[](const auto& voice){return voice.used;}),json(utf8((output/"report.json").wstring())),errors);
+        failures.empty(),std::ranges::count_if(saved->voices,[](const auto& voice){return voice.used;}),json(path_text((output/"report.json"))),errors);
 }
 std::vector<float> decode_audio(AudioFormat format,std::span<const std::byte> data) {
     validate(format);

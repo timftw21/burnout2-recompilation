@@ -1,8 +1,12 @@
 #include "shaders.h"
 #include "xbe.h"
 #include "gui_shaders.h"
+#ifdef _WIN32
 #include <d3dcompiler.h>
-#include <wrl/client.h>
+#else
+#include <vkd3d_shader.h>
+#endif
+#include "com_ptr.h"
 #include <algorithm>
 #include <format>
 #include <map>
@@ -53,6 +57,8 @@ ShaderBinary shader_binary(ShaderKind kind,const VertexProgram* program) {
         first=translated.constant_first;count=translated.constant_count;input_mask=translated.input_mask;
     } else if((kind>=ShaderKind::fixed0 && kind<=ShaderKind::fixed6) || (kind>=ShaderKind::fixed_jitter0 && kind<=ShaderKind::fixed_jitter6)) count=96;
     const auto hlsl=source(kind,program?&key.program:nullptr);
+    std::vector<std::byte> compiled;
+#ifdef _WIN32
     ComPtr<ID3DBlob> code,errors,compact;
     auto status=D3DCompile(hlsl.data(),hlsl.size(),"b2-offline",nullptr,nullptr,"main",shader_profile(kind),
         D3DCOMPILE_ENABLE_STRICTNESS|D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&errors);
@@ -62,7 +68,20 @@ ShaderBinary shader_binary(ShaderKind kind,const VertexProgram* program) {
         D3DCOMPILER_STRIP_DEBUG_INFO|D3DCOMPILER_STRIP_REFLECTION_DATA,&compact);
     if(FAILED(status)) throw std::runtime_error("Could not strip offline shader metadata");
     const auto* data=static_cast<const std::byte*>(compact->GetBufferPointer());
-    auto [stored,inserted]=bytecode.emplace(std::move(key),Compiled{std::vector(data,data+compact->GetBufferSize()),first,count,input_mask});
+    compiled.assign(data,data+compact->GetBufferSize());
+#else
+    vkd3d_shader_hlsl_source_info hlsl_info{};hlsl_info.type=VKD3D_SHADER_STRUCTURE_TYPE_HLSL_SOURCE_INFO;
+    hlsl_info.entry_point="main";hlsl_info.profile=shader_profile(kind);
+    const vkd3d_shader_compile_option options[]={{VKD3D_SHADER_COMPILE_OPTION_STRIP_DEBUG,1}};
+    vkd3d_shader_compile_info info{};info.type=VKD3D_SHADER_STRUCTURE_TYPE_COMPILE_INFO;info.next=&hlsl_info;
+    info.source={hlsl.data(),hlsl.size()};info.source_type=VKD3D_SHADER_SOURCE_HLSL;info.target_type=VKD3D_SHADER_TARGET_DXBC_TPF;
+    info.options=options;info.option_count=std::size(options);info.log_level=VKD3D_SHADER_LOG_WARNING;info.source_name="b2-offline";
+    struct Output {vkd3d_shader_code code{};char* messages=nullptr;~Output(){vkd3d_shader_free_shader_code(&code);vkd3d_shader_free_messages(messages);}} output;
+    if(vkd3d_shader_compile(&info,&output.code,&output.messages)<0)
+        throw std::runtime_error(std::format("Offline shader {}: {}",unsigned(kind),output.messages?output.messages:"unknown compiler error"));
+    const auto* data=static_cast<const std::byte*>(output.code.code);compiled.assign(data,data+output.code.size);
+#endif
+    auto [stored,inserted]=bytecode.emplace(std::move(key),Compiled{std::move(compiled),first,count,input_mask});
     return {stored->second.bytes,inserted,first,count,input_mask};
 }
 std::span<const StaticVertex> static_vertex_shaders() {return {};}

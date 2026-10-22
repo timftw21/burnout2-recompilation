@@ -1,0 +1,14 @@
+--- a/libs/vkd3d-shader/ir.c
++++ b/libs/vkd3d-shader/ir.c
+@@ -16810,6 +16810,11 @@
+             mov_src = &mov->src[0];
+             data_type = src->reg.data_type;
+ 
++            /* A modifier is evaluated before the bitcast. Moving it across
++             * a change of type changes its meaning (e.g. asuint(-float)). */
++            if (mov_src->modifiers && data_type != mov_src->reg.data_type)
++                continue;
++
+             TRACE("Propagating write to sr%u into %s instruction.\n",
+                     src->reg.idx[0].offset, vsir_opcode_get_name(ins->opcode, "<unknown>"));
+ 

@@ -1,7 +1,7 @@
 #include "upscaling.h"
 #include "render.h"
 #include <d3d11.h>
-#include <wrl/client.h>
+#include "com_ptr.h"
 #include <algorithm>
 #include <array>
 #include <cmath>

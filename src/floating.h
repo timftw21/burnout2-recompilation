@@ -1,9 +1,10 @@
 #pragma once
+#include "native_abi.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <immintrin.h>
+#include "simd.h"
 
 namespace b2 {
 struct FloatingState {

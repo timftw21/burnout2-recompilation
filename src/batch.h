@@ -10,5 +10,5 @@ struct Batch {
 };
 Batch recompile_batch(Xbe& image, std::span<const std::uint32_t> seeds,
                       std::uint32_t function_limit, std::uint32_t instruction_limit,
-                      std::uint32_t shard_count = 0, std::string_view header_name = {});
+                      std::uint32_t shard_count = 0, std::string_view header_name = {},bool portable=false);
 }

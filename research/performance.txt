@@ -1782,3 +1782,30 @@ All six personal save hashes and the settings hash remained unchanged. No owned
 game, diagnostic or build workers remained after validation.
 Reports, source snapshots, image hashes and isolated automation settings:
 build/checks/correctness-performance-20261015.
+
+Linux gameplay validation - 2026-10-21
+--------------------------------------
+Authorized Airport Terminal 3 run under Ubuntu 24.04 / WSL2 on Ryzen 5 5600X.
+Renderer: llvmpipe (LLVM 20.1.2, 256 bits), CPU software Vulkan. The host RTX
+5060 Ti was not used. This cannot establish native Linux GPU performance.
+Settings: 360 Hz selected, 1x native, widescreen 16:9, frame generation off,
+V-sync off, upscaling and other graphics enhancements off. WSL's virtual
+monitor reported 59.96 Hz. SDL dummy audio was required because WSL's
+PulseAudio server socket was absent; audible playback was not verified.
+
+One bounded moving-car measurement completed: 29.977869 s recording,
+29.855478 s of source intervals, 233 intervals, 7.804263 FPS. Median/p95/p99/max
+frame times: 114.641452 / 139.768188 / 210.242336 / 2593.593216 ms. No recorder
+drops; settings unchanged. Captures before and after show the original race,
+vehicle movement and HUD. RAM track fields at 003525E0 retained ID 2. The game
+completed 2696 original flips and 2696 presentations, with zero runtime HLSL
+compilations, no audio-engine error and only the requested window-close stop.
+A late resource sample recorded 2213744 KiB peak resident memory for the entire
+session, including loading and the software driver. It is not GPU memory.
+The user reviewed the live result and said it looked fine. No runtime code was
+changed during this validation. All owned game processes exited.
+
+Raw benchmark: build/captures/benchmark-77301942426/benchmark.json.
+Pre/post captures: build/captures/frame-42254566464 and frame-78219613421.
+Isolated settings, saves, scripts and results are under
+build/checks/linux-gameplay-20261021-164251.

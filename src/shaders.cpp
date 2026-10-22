@@ -1,7 +1,7 @@
 #include "shaders.h"
 #include "ambient_occlusion.h"
 #include <d3dcommon.h>
-#include <Windows.h>
+#include <atomic>
 #include <format>
 #include <stdexcept>
 
@@ -9,7 +9,7 @@ namespace b2 {
 namespace {
 
 class ShaderBlob final : public ID3DBlob {
-    Bytes bytes_;LONG references_=1;
+    Bytes bytes_;std::atomic<ULONG> references_{1};
 public:
     explicit ShaderBlob(Bytes bytes):bytes_(bytes){}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** result) override {
@@ -18,9 +18,9 @@ public:
         if(iid!=__uuidof(IUnknown) && iid!=__uuidof(ID3DBlob)) return E_NOINTERFACE;
         *result=this;AddRef();return S_OK;
     }
-    ULONG STDMETHODCALLTYPE AddRef() override {return InterlockedIncrement(&references_);}
+    ULONG STDMETHODCALLTYPE AddRef() override {return ++references_;}
     ULONG STDMETHODCALLTYPE Release() override {
-        const auto count=InterlockedDecrement(&references_);if(!count) delete this;return count;
+        const auto count=--references_;if(!count) delete this;return count;
     }
     void* STDMETHODCALLTYPE GetBufferPointer() override {return const_cast<std::byte*>(bytes_.data());}
     SIZE_T STDMETHODCALLTYPE GetBufferSize() override {return bytes_.size();}
@@ -184,8 +184,9 @@ O main(float4 position:SV_Position,uint sample:SV_SampleIndex) {
     if(kind==ShaderKind::flow_depth || kind==ShaderKind::flow_depth_ms) return
         std::string(kind==ShaderKind::flow_depth_ms?"#define MULTISAMPLE 1\nTexture2DMS<float> source:register(t0);":"Texture2D<float> source:register(t0);")+R"(
 RWTexture2D<float2> depth:register(u0);
+cbuffer Size:register(b0){uint width,height;uint2 padding;}
 [numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID) {
- uint width,height;depth.GetDimensions(width,height);if(id.x>=width || id.y>=height) return;
+ if(id.x>=width || id.y>=height) return;
  uint w,h,samples=1;
 #ifdef MULTISAMPLE
  source.GetDimensions(w,h,samples);
@@ -310,9 +311,9 @@ float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target {
     case ShaderKind::flow_gradient:return R"(
 Texture2D<float4> source:register(t0);
 RWTexture2D<float4> gradient_x:register(u0),gradient_y:register(u1);
-cbuffer C:register(b0){float phase;uint level;uint first;uint spare;}
+cbuffer C:register(b0){float phase;uint level;uint first;uint spare;uint2 grid;uint2 padding;}
 [numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID) {
- uint width,height;gradient_x.GetDimensions(width,height);if(id.x>=width || id.y>=height) return;
+ uint width=(grid.x>>level)+2,height=(grid.y>>level)+2;if(id.x>=width || id.y>=height) return;
  int2 pixel=int2(id.xy)-1,last=int2(width,height)-3;
  // A zero-gradient border preserves clamped finite differences when a
  // bilinear sample moves beyond either edge of the original image.
@@ -328,7 +329,7 @@ Texture2D<float4> coarse:register(t2);RWTexture2D<float4> motion:register(u0);Sa
 Texture2D original_source:register(t3),original_destination:register(t4);
 Texture2D<float4> gradient_x:register(t5),gradient_y:register(t6);
 groupshared float3 source_window[144];
-cbuffer C:register(b0){float phase;uint level;uint first;uint spare;}
+cbuffer C:register(b0){float phase;uint level;uint first;uint spare;uint2 grid;uint2 padding;}
 float full_error(float2 uv,float2 v,float2 pixel) {
  float error=0;
  const float2 offsets[5]={float2(0,0),float2(2,0),float2(-2,0),float2(0,2),float2(0,-2)};
@@ -340,7 +341,7 @@ float full_error(float2 uv,float2 v,float2 pixel) {
  return error;
 }
 [numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID,uint3 group:SV_GroupID,uint index:SV_GroupIndex) {
- uint width,height;motion.GetDimensions(width,height);
+ uint width=grid.x>>level,height=grid.y>>level;
  // The fixed source patch is shared by all motion candidates and iterations.
  // Load each texel once for the group, including its two-pixel border.
  for(uint cell=index;cell<144;cell+=64) {

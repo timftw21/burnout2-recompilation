@@ -15,15 +15,15 @@
 
 namespace b2 {
 extern "C" {
-std::uint32_t b2_exchange8(void*,std::uint32_t);
-std::uint32_t b2_exchange16(void*,std::uint32_t);
-std::uint32_t b2_exchange32(void*,std::uint32_t);
-std::uint32_t b2_fetch_add8(void*,std::uint32_t);
-std::uint32_t b2_fetch_add16(void*,std::uint32_t);
-std::uint32_t b2_fetch_add32(void*,std::uint32_t);
-std::uint32_t b2_compare_exchange8(void*,std::uint32_t,std::uint32_t);
-std::uint32_t b2_compare_exchange16(void*,std::uint32_t,std::uint32_t);
-std::uint32_t b2_compare_exchange32(void*,std::uint32_t,std::uint32_t);
+std::uint32_t B2_ASM b2_exchange8(void*,std::uint32_t);
+std::uint32_t B2_ASM b2_exchange16(void*,std::uint32_t);
+std::uint32_t B2_ASM b2_exchange32(void*,std::uint32_t);
+std::uint32_t B2_ASM b2_fetch_add8(void*,std::uint32_t);
+std::uint32_t B2_ASM b2_fetch_add16(void*,std::uint32_t);
+std::uint32_t B2_ASM b2_fetch_add32(void*,std::uint32_t);
+std::uint32_t B2_ASM b2_compare_exchange8(void*,std::uint32_t,std::uint32_t);
+std::uint32_t B2_ASM b2_compare_exchange16(void*,std::uint32_t,std::uint32_t);
+std::uint32_t B2_ASM b2_compare_exchange32(void*,std::uint32_t,std::uint32_t);
 }
 class Memory;
 struct Cpu;
@@ -469,7 +469,7 @@ inline constexpr std::uint32_t carry = 1, parity = 4, auxiliary = 16,
 inline constexpr std::uint32_t arithmetic_flags = carry | parity | auxiliary | zero | sign | overflow;
 struct ArithmeticResult {std::uint32_t value,flags;};
 
-#if defined(__clang__) && defined(_M_X64)
+#if defined(__clang__) && (defined(_M_X64) || defined(__x86_64__))
 template<unsigned Bits,bool Subtract> __forceinline ArithmeticResult native_arithmetic(
     std::uint32_t flags,std::uint32_t a,std::uint32_t b,std::uint32_t input_carry) {
     std::uint32_t low;bool signed_overflow;
@@ -509,7 +509,7 @@ template<unsigned Bits> constexpr std::uint32_t logic_flags(std::uint32_t flags,
 }
 template<unsigned Bits> constexpr std::uint32_t sub_flags(std::uint32_t flags, std::uint32_t a, std::uint32_t b,
                                                         std::uint32_t borrow = 0) {
-#if defined(__clang__) && defined(_M_X64)
+#if defined(__clang__) && (defined(_M_X64) || defined(__x86_64__))
     if(!std::is_constant_evaluated() && borrow<=1) return native_arithmetic<Bits,true>(flags,a,b,borrow).flags;
 #endif
     a &= mask<Bits>; b &= mask<Bits>;
@@ -521,7 +521,7 @@ template<unsigned Bits> constexpr std::uint32_t sub_flags(std::uint32_t flags, s
 }
 template<unsigned Bits> constexpr std::uint32_t add_flags(std::uint32_t flags, std::uint32_t a, std::uint32_t b,
                                                         std::uint32_t input_carry = 0) {
-#if defined(__clang__) && defined(_M_X64)
+#if defined(__clang__) && (defined(_M_X64) || defined(__x86_64__))
     if(!std::is_constant_evaluated() && input_carry<=1) return native_arithmetic<Bits,false>(flags,a,b,input_carry).flags;
 #endif
     a &= mask<Bits>; b &= mask<Bits>;
@@ -533,7 +533,7 @@ template<unsigned Bits> constexpr std::uint32_t add_flags(std::uint32_t flags, s
 }
 template<unsigned Bits,bool Subtract> constexpr ArithmeticResult arithmetic(
     std::uint32_t flags,std::uint32_t a,std::uint32_t b,std::uint32_t input_carry=0) {
-#if defined(__clang__) && defined(_M_X64)
+#if defined(__clang__) && (defined(_M_X64) || defined(__x86_64__))
     if(!std::is_constant_evaluated() && input_carry<=1) return native_arithmetic<Bits,Subtract>(flags,a,b,input_carry);
 #endif
     if constexpr(Subtract) return {(a-b-input_carry)&mask<Bits>,sub_flags<Bits>(flags,a,b,input_carry)};

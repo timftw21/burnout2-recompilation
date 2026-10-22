@@ -1,6 +1,7 @@
 #include "batch.h"
 #include <algorithm>
 #include <bit>
+#include <cctype>
 #include <deque>
 #include <format>
 #include <set>
@@ -39,7 +40,7 @@ void addresses(std::ostream& out, std::span<const std::uint32_t> values) {
 
 Batch recompile_batch(Xbe& image, std::span<const std::uint32_t> seeds,
                       std::uint32_t function_limit, std::uint32_t instruction_limit,
-                      std::uint32_t shard_count, std::string_view header_name) {
+                      std::uint32_t shard_count, std::string_view header_name,bool portable) {
     if (!image.supported()) throw std::runtime_error("Batch generation requires the verified target executable");
     if (seeds.empty() || seeds.size() > 65536) throw std::runtime_error("A batch needs 1..65536 seed addresses");
     if (!function_limit || function_limit > 65536) throw std::runtime_error("Function limit must be 1..65536");
@@ -95,13 +96,13 @@ Batch recompile_batch(Xbe& image, std::span<const std::uint32_t> seeds,
             }
             std::ranges::sort(unit.calls);
             unit.calls.erase(std::unique(unit.calls.begin(), unit.calls.end()), unit.calls.end());
-            auto lowered = lower(function);
+            auto lowered = lower(function,true,portable);
             unit.source = std::move(lowered.source);
             // A small unfused reference for the matrix routine sampled in races.
             // Offline diagnostics compare identical original instructions, not a
             // replacement mathematical formula or a different precision model.
             if(function.entry==0x00227BD9) {
-                auto reference=lower(function,false);
+                auto reference=lower(function,false,portable);
                 const auto name=reference.source.find("void guest_00227BD9(");
                 if(name==std::string::npos || !reference.issues.empty()) throw std::runtime_error("Matrix reference lowering failed");
                 reference.source.replace(name,std::string_view("void guest_00227BD9(").size(),"void reference_matrix(");
@@ -238,9 +239,48 @@ Batch recompile_batch(Xbe& image, std::span<const std::uint32_t> seeds,
             "        slot=(slot+1)&" << capacity-1 << "U;\n"
             "    }\n    return nullptr;\n}\n}\n";
         result.source = source.str();
-        result.assembly="; Native instruction helpers generated from verified XBE "+image.sha256+"\noption casemap:none\n.code\n";
+        result.assembly=portable?"#include \"portable_floating.h\"\n":"; Native instruction helpers generated from verified XBE "+image.sha256+"\noption casemap:none\n.code\n";
         for(const auto& [name,assembly] : helpers) result.assembly+=assembly;
-        result.assembly+="END\n";
+        if(!portable) result.assembly+="END\n";
+#ifndef _WIN32
+        // Both assemblers consume the same verified instruction bytes. Only
+        // object-file directives and integer spelling differ on ELF.
+        if(!portable) {
+        std::istringstream masm(result.assembly);std::string line;
+        result.assembly=".intel_syntax noprefix\n.text\n";
+        while(std::getline(masm,line)) {
+            if(line.empty() || line[0]==';' || line=="option casemap:none" || line==".code" || line=="END" ||
+               line.find(".allocstack")!=std::string::npos || line.find(".endprolog")!=std::string::npos) continue;
+            if(const auto at=line.find(" PROC");at!=std::string::npos) {
+                const auto name=line.substr(0,at);
+#ifdef __APPLE__
+                line=".globl _"+name+"\n_"+name+":";
+#else
+                line=".globl "+name+"\n.type "+name+",@function\n"+name+":";
+#endif
+            } else if(const auto at=line.find(" ENDP");at!=std::string::npos) {
+                const auto name=line.substr(0,at);
+#ifdef __APPLE__
+                line.clear();
+#else
+                line=".size "+name+", .-"+name;
+#endif
+            } else {
+                if(line.starts_with("    db ")) line.replace(4,2,".byte");
+                for(std::size_t at=0;at<line.size();) {
+                    if((at && (std::isalnum(static_cast<unsigned char>(line[at-1])) || line[at-1]=='_')) || !std::isdigit(static_cast<unsigned char>(line[at]))) {++at;continue;}
+                    auto end=at;while(end<line.size() && std::isxdigit(static_cast<unsigned char>(line[end]))) ++end;
+                    if(end<line.size() && line[end]=='h') {line.replace(at,end-at+1,"0x"+line.substr(at,end-at));at=end+2;}
+                    else at=end;
+                }
+            }
+            result.assembly+=line+'\n';
+        }
+#ifndef __APPLE__
+        result.assembly+=".section .note.GNU-stack,\"\",@progbits\n";
+#endif
+        }
+#endif
         std::size_t total=result.source.size()+result.header.size()+result.assembly.size();
         for(const auto& piece : result.shards) total+=piece.size();
         if (total > source_limit) throw std::runtime_error("Generated batch exceeds the 256 MiB source limit");

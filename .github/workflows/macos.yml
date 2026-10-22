@@ -1,0 +1,182 @@
+name: Native macOS build
+on:
+  push:
+    paths:
+      - '.github/workflows/macos.yml'
+      - 'Build.sh'
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      - 'cmake/**'
+      - 'src/**'
+      - 'resources/**'
+      - 'knowledge/facts.json'
+      - 'knowledge/supported_target.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-game:
+    environment: macos-game
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15-intel, macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      # Bound each expansion below the Actions template and OS argument limits.
+      - name: Stage private build inputs 1
+        run: |
+          mkdir -p data/local
+          cat > data/local/ci-inputs.base64 <<'B2_PRIVATE_INPUTS'
+          ${{ secrets.B2_CI_INPUTS_00 }}
+          ${{ secrets.B2_CI_INPUTS_01 }}
+          ${{ secrets.B2_CI_INPUTS_02 }}
+          ${{ secrets.B2_CI_INPUTS_03 }}
+          ${{ secrets.B2_CI_INPUTS_04 }}
+          ${{ secrets.B2_CI_INPUTS_05 }}
+          ${{ secrets.B2_CI_INPUTS_06 }}
+          ${{ secrets.B2_CI_INPUTS_07 }}
+          B2_PRIVATE_INPUTS
+      - name: Stage private build inputs 2
+        run: |
+          cat >> data/local/ci-inputs.base64 <<'B2_PRIVATE_INPUTS'
+          ${{ secrets.B2_CI_INPUTS_08 }}
+          ${{ secrets.B2_CI_INPUTS_09 }}
+          ${{ secrets.B2_CI_INPUTS_10 }}
+          ${{ secrets.B2_CI_INPUTS_11 }}
+          ${{ secrets.B2_CI_INPUTS_12 }}
+          ${{ secrets.B2_CI_INPUTS_13 }}
+          ${{ secrets.B2_CI_INPUTS_14 }}
+          ${{ secrets.B2_CI_INPUTS_15 }}
+          B2_PRIVATE_INPUTS
+      - name: Stage private build inputs 3
+        run: |
+          cat >> data/local/ci-inputs.base64 <<'B2_PRIVATE_INPUTS'
+          ${{ secrets.B2_CI_INPUTS_16 }}
+          ${{ secrets.B2_CI_INPUTS_17 }}
+          ${{ secrets.B2_CI_INPUTS_18 }}
+          ${{ secrets.B2_CI_INPUTS_19 }}
+          ${{ secrets.B2_CI_INPUTS_20 }}
+          ${{ secrets.B2_CI_INPUTS_21 }}
+          ${{ secrets.B2_CI_INPUTS_22 }}
+          ${{ secrets.B2_CI_INPUTS_23 }}
+          B2_PRIVATE_INPUTS
+      - name: Stage private build inputs 4
+        run: |
+          cat >> data/local/ci-inputs.base64 <<'B2_PRIVATE_INPUTS'
+          ${{ secrets.B2_CI_INPUTS_24 }}
+          ${{ secrets.B2_CI_INPUTS_25 }}
+          ${{ secrets.B2_CI_INPUTS_26 }}
+          ${{ secrets.B2_CI_INPUTS_27 }}
+          ${{ secrets.B2_CI_INPUTS_28 }}
+          ${{ secrets.B2_CI_INPUTS_29 }}
+          ${{ secrets.B2_CI_INPUTS_30 }}
+          ${{ secrets.B2_CI_INPUTS_31 }}
+          B2_PRIVATE_INPUTS
+      - name: Stage private build inputs 5
+        run: |
+          cat >> data/local/ci-inputs.base64 <<'B2_PRIVATE_INPUTS'
+          ${{ secrets.B2_CI_INPUTS_32 }}
+          ${{ secrets.B2_CI_INPUTS_33 }}
+          ${{ secrets.B2_CI_INPUTS_34 }}
+          ${{ secrets.B2_CI_INPUTS_35 }}
+          ${{ secrets.B2_CI_INPUTS_36 }}
+          ${{ secrets.B2_CI_INPUTS_37 }}
+          ${{ secrets.B2_CI_INPUTS_38 }}
+          ${{ secrets.B2_CI_INPUTS_39 }}
+          B2_PRIVATE_INPUTS
+      - name: Stage private build inputs 6
+        run: |
+          cat >> data/local/ci-inputs.base64 <<'B2_PRIVATE_INPUTS'
+          ${{ secrets.B2_CI_INPUTS_40 }}
+          ${{ secrets.B2_CI_INPUTS_41 }}
+          ${{ secrets.B2_CI_INPUTS_42 }}
+          ${{ secrets.B2_CI_INPUTS_43 }}
+          ${{ secrets.B2_CI_INPUTS_44 }}
+          ${{ secrets.B2_CI_INPUTS_45 }}
+          ${{ secrets.B2_CI_INPUTS_46 }}
+          ${{ secrets.B2_CI_INPUTS_47 }}
+          B2_PRIVATE_INPUTS
+      - name: Stage private build inputs 7
+        run: |
+          cat >> data/local/ci-inputs.base64 <<'B2_PRIVATE_INPUTS'
+          ${{ secrets.B2_CI_INPUTS_48 }}
+          ${{ secrets.B2_CI_INPUTS_49 }}
+          ${{ secrets.B2_CI_INPUTS_50 }}
+          ${{ secrets.B2_CI_INPUTS_51 }}
+          ${{ secrets.B2_CI_INPUTS_52 }}
+          ${{ secrets.B2_CI_INPUTS_53 }}
+          ${{ secrets.B2_CI_INPUTS_54 }}
+          ${{ secrets.B2_CI_INPUTS_55 }}
+          B2_PRIVATE_INPUTS
+      - name: Stage private build inputs 8
+        run: |
+          cat >> data/local/ci-inputs.base64 <<'B2_PRIVATE_INPUTS'
+          ${{ secrets.B2_CI_INPUTS_56 }}
+          ${{ secrets.B2_CI_INPUTS_57 }}
+          ${{ secrets.B2_CI_INPUTS_58 }}
+          B2_PRIVATE_INPUTS
+      - name: Restore verified private build inputs
+        run: |
+          node cmake/ci-game-inputs.mjs restore < data/local/ci-inputs.base64
+          rm data/local/ci-inputs.base64
+      - name: Install native build dependencies
+        run: |
+          brew install cmake ninja pkgconf openssl@3 libpng jpeg-turbo spirv-headers vulkan-headers vulkan-loader bison flex perl
+          if [[ $(uname -m) == arm64 ]]; then brew install mpfr gmp; fi
+          export PATH="$(brew --prefix perl)/bin:$PATH"
+          PERL_MM_USE_DEFAULT=1 cpan -T JSON
+          if ! xcrun --sdk macosx --find metal; then xcodebuild -downloadComponent MetalToolchain; fi
+      - name: Build native tooling
+        run: bash Build.sh --tools-only
+      - name: Report native Metal capabilities
+        id: metal
+        run: |
+          build/macos/Release/b2-tool inspect-metal > build/macos/metal-info.json
+          cat build/macos/metal-info.json
+          node -e 'const fs=require("fs"), info=JSON.parse(fs.readFileSync("build/macos/metal-info.json","utf8")); fs.appendFileSync(process.env.GITHUB_OUTPUT,`supported=${info.supported}\n`);'
+          if ! node -e 'if(!JSON.parse(require("fs").readFileSync("build/macos/metal-info.json","utf8")).supported) process.exit(1)'; then
+            echo 'The runner GPU lacks the Apple7/Mac2 family support required by the Metal backend. Full compilation and CPU, audio, effects and file diagnostics still run; GPU diagnostics are unavailable.' | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Check native offscreen Metal rendering
+        if: steps.metal.outputs.supported == 'true'
+        run: |
+          node -e "require('fs').writeFileSync('build/macos/ci-color.dat', Buffer.from([0,0,255,255]))"
+          if ! build/macos/Release/b2-tool render-texture build/macos/ci-color.dat 6 1 1 build/macos/ci-color.png; then
+            xcrun lldb --batch --no-lldbinit --script-language none -o run -k 'thread backtrace --count 32 all' -- \
+              build/macos/Release/b2-tool render-texture build/macos/ci-color.dat 6 1 1 build/macos/ci-color-debug.png || true
+            exit 1
+          fi
+      - name: Build full native game
+        run: bash Build.sh --game-inputs
+      - name: Check native executables and offline CPU, audio and storage
+        run: |
+          for executable in b2 b2-tool; do
+            file "build/macos/Release/$executable"
+            lipo "build/macos/Release/$executable" -verify_arch "$(uname -m)"
+            otool -L "build/macos/Release/$executable"
+          done
+          build/macos/Release/b2-tool --help
+          build/macos/Release/b2 --help
+          status=0
+          check() {
+            printf '\nChecking %s\n' "$1"
+            build/macos/Release/b2 "$@" || status=1
+          }
+          check --check-cpu data/local/default.xbe
+          check --check-audio
+          check --check-effects data/local/b2distfx.bin
+          check --check-storage data/local/default.xbe build/macos/storage-check
+          exit "$status"
+      - name: Remove private inputs and generated game output
+        if: always()
+        run: rm -rf -- data/local build/macos

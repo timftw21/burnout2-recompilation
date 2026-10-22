@@ -10,35 +10,35 @@
 
 extern "C" {
 #define B2_REFERENCES(bits) \
-    std::uint32_t b2_adc##bits##_flags(std::uint32_t, std::uint32_t, std::uint32_t); \
-    std::uint32_t b2_sbb##bits##_flags(std::uint32_t, std::uint32_t, std::uint32_t); \
-    std::uint32_t b2_inc##bits##_flags(std::uint32_t, std::uint32_t); \
-    std::uint32_t b2_dec##bits##_flags(std::uint32_t, std::uint32_t); \
-    std::uint32_t b2_neg##bits##_flags(std::uint32_t, std::uint32_t); \
-    std::uint64_t b2_shl##bits(std::uint32_t, std::uint32_t, std::uint32_t); \
-    std::uint64_t b2_shr##bits(std::uint32_t, std::uint32_t, std::uint32_t); \
-    std::uint64_t b2_sar##bits(std::uint32_t, std::uint32_t, std::uint32_t); \
-    std::uint64_t b2_ror##bits(std::uint32_t, std::uint32_t, std::uint32_t); \
-    std::uint64_t b2_rcr##bits(std::uint32_t, std::uint32_t, std::uint32_t); \
-    std::uint64_t b2_rol##bits(std::uint32_t, std::uint32_t, std::uint32_t); \
-    std::uint64_t b2_rcl##bits(std::uint32_t, std::uint32_t, std::uint32_t); \
-    std::uint64_t b2_mul##bits(std::uint32_t, std::uint32_t, std::uint32_t*); \
-    std::uint64_t b2_imul##bits(std::uint32_t, std::uint32_t, std::uint32_t*); \
-    std::uint64_t b2_div##bits(std::uint64_t, std::uint32_t); \
-    std::uint64_t b2_idiv##bits(std::uint64_t, std::uint32_t);
+    std::uint32_t B2_ASM b2_adc##bits##_flags(std::uint32_t, std::uint32_t, std::uint32_t); \
+    std::uint32_t B2_ASM b2_sbb##bits##_flags(std::uint32_t, std::uint32_t, std::uint32_t); \
+    std::uint32_t B2_ASM b2_inc##bits##_flags(std::uint32_t, std::uint32_t); \
+    std::uint32_t B2_ASM b2_dec##bits##_flags(std::uint32_t, std::uint32_t); \
+    std::uint32_t B2_ASM b2_neg##bits##_flags(std::uint32_t, std::uint32_t); \
+    std::uint64_t B2_ASM b2_shl##bits(std::uint32_t, std::uint32_t, std::uint32_t); \
+    std::uint64_t B2_ASM b2_shr##bits(std::uint32_t, std::uint32_t, std::uint32_t); \
+    std::uint64_t B2_ASM b2_sar##bits(std::uint32_t, std::uint32_t, std::uint32_t); \
+    std::uint64_t B2_ASM b2_ror##bits(std::uint32_t, std::uint32_t, std::uint32_t); \
+    std::uint64_t B2_ASM b2_rcr##bits(std::uint32_t, std::uint32_t, std::uint32_t); \
+    std::uint64_t B2_ASM b2_rol##bits(std::uint32_t, std::uint32_t, std::uint32_t); \
+    std::uint64_t B2_ASM b2_rcl##bits(std::uint32_t, std::uint32_t, std::uint32_t); \
+    std::uint64_t B2_ASM b2_mul##bits(std::uint32_t, std::uint32_t, std::uint32_t*); \
+    std::uint64_t B2_ASM b2_imul##bits(std::uint32_t, std::uint32_t, std::uint32_t*); \
+    std::uint64_t B2_ASM b2_div##bits(std::uint64_t, std::uint32_t); \
+    std::uint64_t B2_ASM b2_idiv##bits(std::uint64_t, std::uint32_t);
 B2_REFERENCES(8)
 B2_REFERENCES(16)
 B2_REFERENCES(32)
 #undef B2_REFERENCES
-std::uint64_t b2_shld16(std::uint32_t,std::uint32_t,std::uint32_t,std::uint32_t);
-std::uint64_t b2_shld32(std::uint32_t,std::uint32_t,std::uint32_t,std::uint32_t);
-std::uint64_t b2_shrd16(std::uint32_t,std::uint32_t,std::uint32_t,std::uint32_t);
-std::uint64_t b2_shrd32(std::uint32_t,std::uint32_t,std::uint32_t,std::uint32_t);
-std::uint32_t b2_compare8_flags(std::uint32_t, std::uint32_t);
-std::uint32_t b2_and32_flags(std::uint32_t, std::uint32_t);
-void b2_string_move(void*, const void*, std::uint32_t, std::uint32_t, std::uint32_t);
-void b2_string_fill(void*, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
-void b2_fp_snapshot(void*);
+std::uint64_t B2_ASM b2_shld16(std::uint32_t,std::uint32_t,std::uint32_t,std::uint32_t);
+std::uint64_t B2_ASM b2_shld32(std::uint32_t,std::uint32_t,std::uint32_t,std::uint32_t);
+std::uint64_t B2_ASM b2_shrd16(std::uint32_t,std::uint32_t,std::uint32_t,std::uint32_t);
+std::uint64_t B2_ASM b2_shrd32(std::uint32_t,std::uint32_t,std::uint32_t,std::uint32_t);
+std::uint32_t B2_ASM b2_compare8_flags(std::uint32_t, std::uint32_t);
+std::uint32_t B2_ASM b2_and32_flags(std::uint32_t, std::uint32_t);
+void B2_ASM b2_string_move(void*, const void*, std::uint32_t, std::uint32_t, std::uint32_t);
+void B2_ASM b2_string_fill(void*, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
+void B2_ASM b2_fp_snapshot(void*);
 }
 
 namespace b2 {
@@ -46,11 +46,11 @@ void guest_00227BD9(Cpu&,Memory&);
 void reference_matrix(Cpu&,Memory&);
 const CompiledFunction* lookup_native(std::uint32_t) noexcept;
 namespace {
-using CarryReference = std::uint32_t (*)(std::uint32_t, std::uint32_t, std::uint32_t);
-using UnaryReference = std::uint32_t (*)(std::uint32_t, std::uint32_t);
-using ShiftReference = std::uint64_t (*)(std::uint32_t, std::uint32_t, std::uint32_t);
-using MultiplyReference = std::uint64_t (*)(std::uint32_t, std::uint32_t, std::uint32_t*);
-using DivideReference = std::uint64_t (*)(std::uint64_t, std::uint32_t);
+using CarryReference = decltype(&b2_adc8_flags);
+using UnaryReference = decltype(&b2_inc8_flags);
+using ShiftReference = decltype(&b2_shl8);
+using MultiplyReference = decltype(&b2_mul8);
+using DivideReference = decltype(&b2_div8);
 struct References {
     CarryReference adc, sbb;
     UnaryReference inc, dec, neg;
@@ -286,12 +286,18 @@ unsigned check_compare() {
         if (left != right) expected[ecx] = mismatch < 0 ? 0U : 15U - mismatch;
         expected[esp] += 4;
         std::uint32_t expected_flags, defined = arithmetic_flags;
+#ifdef __aarch64__
+        if(left==right) {expected_flags=0x44;defined&=~auxiliary;}
+        else if(mismatch<0) expected_flags=0x44;
+        else expected_flags=comparison<0?0x95:0x11;
+#else
         if (left == right) { expected_flags = b2_and32_flags(0, 0); defined &= ~auxiliary; }
         else if (mismatch < 0) expected_flags = b2_compare8_flags(79, 79);
         else {
             const auto less = comparison < 0 ? 1U : 0U;
             expected_flags = b2_sbb32_flags(0U - less, UINT32_MAX, less);
         }
+#endif
         auto cpu = original;
         compare.run(cpu, memory);
         require(cpu.registers == expected && cpu.eip == 0xABCDEF00 && bytes == expected_bytes &&
@@ -333,7 +339,7 @@ unsigned check_call_chain() {
         auto cpu = original;
         constructor.run(cpu, memory);
         require(cpu.registers == expected_registers && bytes == expected_bytes && cpu.eip == 0xABCDEF00 &&
-            (cpu.flags & (arithmetic_flags & ~auxiliary)) == (b2_and32_flags(0, 0) & (arithmetic_flags & ~auxiliary)) &&
+            (cpu.flags & (arithmetic_flags & ~auxiliary)) == 0x44 &&
             (cpu.flags & ~arithmetic_flags) == (flags & ~arithmetic_flags),
             "Recovered three-function constructor chain corrupted registers, flags, stack or object data");
     }
@@ -666,8 +672,7 @@ template<unsigned Bits,bool Left=false> unsigned check_rotates(ShiftReference ro
     return checked;
 }
 template<unsigned Bits> unsigned check_double_shifts(
-    std::uint64_t (*left)(std::uint32_t,std::uint32_t,std::uint32_t,std::uint32_t),
-    std::uint64_t (*right)(std::uint32_t,std::uint32_t,std::uint32_t,std::uint32_t)) {
+    decltype(&b2_shld16) left,decltype(&b2_shrd16) right) {
     unsigned checked=0;
     for(const auto a : edges) for(const auto b : edges)
         for(const auto count : {0U,1U,2U,7U,8U,15U,16U,31U,32U,33U,255U}) for(const bool shift_right : {false,true}) {
@@ -699,19 +704,43 @@ unsigned check_segment_setup() {
     bool rejected=false;
     try { load_code_selector(cpu,memory,16,0); } catch(const GuestTrap& trap) { rejected=trap.vector==13; }
     require(rejected,"Invalid code descriptor did not raise a guest protection exception");
-    memory.store<std::uint32_t>(gdt+1,0xAABBCCDD);
-    require(memory.exchange<std::uint32_t>(gdt+1,7)==0xAABBCCDD && memory.fetch_add<std::uint32_t>(gdt+1,3)==7 &&
-        memory.load<std::uint32_t>(gdt+1)==10,"Unaligned guest atomic memory differs from native x86");
+#ifdef __aarch64__
+    constexpr auto atomic=gdt+4;
+#else
+    constexpr auto atomic=gdt+1;
+#endif
+    memory.store<std::uint32_t>(atomic,0xAABBCCDD);
+    require(memory.exchange<std::uint32_t>(atomic,7)==0xAABBCCDD && memory.fetch_add<std::uint32_t>(atomic,3)==7 &&
+        memory.load<std::uint32_t>(atomic)==10,"Guest atomic memory lost its prior value or replacement");
     const auto compare=[&]<class T>() {
         constexpr auto expected=static_cast<T>(0xA1B2C3D4),desired=static_cast<T>(0xABCDEF12);
-        memory.store<T>(gdt+1,expected);
-        require(memory.compare_exchange<T>(gdt+1,static_cast<T>(expected^1),desired)==expected && memory.load<T>(gdt+1)==expected,
-            "Failed unaligned compare/exchange changed memory or lost the prior value");
-        require(memory.compare_exchange<T>(gdt+1,expected,desired)==expected && memory.load<T>(gdt+1)==desired,
-            "Successful unaligned compare/exchange did not store its replacement");
+        memory.store<T>(atomic,expected);
+        require(memory.compare_exchange<T>(atomic,static_cast<T>(expected^1),desired)==expected && memory.load<T>(atomic)==expected,
+            "Failed compare/exchange changed memory or lost the prior value");
+        require(memory.compare_exchange<T>(atomic,expected,desired)==expected && memory.load<T>(atomic)==desired,
+            "Successful compare/exchange did not store its replacement");
     };
     compare.operator()<std::uint8_t>();compare.operator()<std::uint16_t>();compare.operator()<std::uint32_t>();
+#ifdef __aarch64__
+    const auto unaligned=[&]<class T>() {
+        constexpr auto expected=static_cast<T>(0xA1B2C3D4);
+        memory.store<T>(gdt+1,expected);
+        const auto reject=[&](auto operation) {
+            bool unsupported=false;
+            try {operation();} catch(const std::runtime_error& error) {
+                unsupported=std::string_view(error.what())=="Unaligned guest atomic memory is unsupported on ARM";
+            }
+            require(unsupported && memory.load<T>(gdt+1)==expected,"ARM unaligned atomic rejection changed memory or was lost");
+        };
+        reject([&]{memory.exchange<T>(gdt+1,7);});
+        reject([&]{memory.fetch_add<T>(gdt+1,3);});
+        reject([&]{memory.compare_exchange<T>(gdt+1,expected,7);});
+    };
+    unaligned.operator()<std::uint16_t>();unaligned.operator()<std::uint32_t>();
+    return 15;
+#else
     return 9;
+#endif
 }
 unsigned check_flags_stack() {
     constexpr std::uint32_t stack=0x1000;
@@ -778,12 +807,16 @@ CpuChecks check_cpu_batch() {
 #define B2_HOST(bits) References{b2_adc##bits##_flags, b2_sbb##bits##_flags, b2_inc##bits##_flags, b2_dec##bits##_flags, b2_neg##bits##_flags, \
     {b2_shl##bits, b2_shr##bits, b2_sar##bits}, b2_mul##bits, b2_imul##bits, b2_div##bits, b2_idiv##bits}
     CpuChecks result;
+#ifndef __aarch64__
     result.instruction_cases = check_instructions<8>(B2_HOST(8)) + check_instructions<16>(B2_HOST(16)) + check_instructions<32>(B2_HOST(32));
     result.instruction_cases+=check_rotates<8>(b2_ror8,b2_rcr8)+check_rotates<16>(b2_ror16,b2_rcr16)+check_rotates<32>(b2_ror32,b2_rcr32)+
         check_rotates<8,true>(b2_rol8,b2_rcl8)+check_rotates<16,true>(b2_rol16,b2_rcl16)+check_rotates<32,true>(b2_rol32,b2_rcl32)+
         check_double_shifts<16>(b2_shld16,b2_shrd16)+check_double_shifts<32>(b2_shld32,b2_shrd32);
 #undef B2_HOST
     result.memory_cases = check_strings<std::uint8_t>() + check_strings<std::uint16_t>() + check_strings<std::uint32_t>() + check_primary<std::uint64_t>();
+#else
+    result.memory_cases=check_primary<std::uint64_t>();
+#endif
     result.game_cases = check_compare() + check_call_chain();
     result.floating_cases=check_floating_contexts()+check_reciprocal_sqrt()+check_vertex_colors()+check_mmx_copy()+check_matrix();
     result.control_cases=check_control_boundaries()+check_compact_jump_table()+check_segment_setup()+check_flags_stack();

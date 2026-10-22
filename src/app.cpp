@@ -8,10 +8,12 @@
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_dx11.h>
-#include <Windows.h>
+#include "host.h"
+#ifdef _WIN32
 #include <commdlg.h>
+#endif
 #include <d3d11.h>
-#include <wrl/client.h>
+#include "com_ptr.h"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -89,8 +91,8 @@ struct Preferences {
     int draw_distance=1;
     KeyboardBindings bindings=default_keyboard_bindings();
     explicit Preferences(bool load=true,const std::filesystem::path& path="data/local/settings.cfg") {
-        strcpy_s(xbe.data(),xbe.size(),"data/local/default.xbe");
-        strcpy_s(disc.data(),disc.size(),"Burnout 2/Burnout 2 - Point of Impact (USA).xiso.iso");
+        copy_text(xbe.data(),xbe.size(),"data/local/default.xbe");
+        copy_text(disc.data(),disc.size(),"Burnout 2/Burnout 2 - Point of Impact (USA).xiso.iso");
         if(!load) return;
         std::ifstream file(path);std::string line;
         bool legacy_distance=false,has_distance=false,has_aspect=false;
@@ -104,7 +106,7 @@ struct Preferences {
             };
             if(key=="xbe" || key=="disc" || key=="music_folder") {
                 auto& destination=key=="xbe"?xbe:key=="disc"?disc:music_folder;
-                if(value.size()<destination.size()) strcpy_s(destination.data(),destination.size(),value.c_str());
+                if(value.size()<destination.size()) copy_text(destination.data(),destination.size(),value.c_str());
             } else if(key=="vsync") vsync=value=="1";
             else if(key=="fullscreen") fullscreen=value=="1";
             else if(key=="widescreen" && !has_aspect) aspect_ratio=value=="1"?1:0;
@@ -172,19 +174,38 @@ ImFont* settings_theme() {
     auto& io=ImGui::GetIO();
     io.ConfigFlags|=ImGuiConfigFlags_NavEnableKeyboard|ImGuiConfigFlags_NavEnableGamepad;
     io.IniFilename=nullptr;
+    ImFont* heading=nullptr;
+#ifdef _WIN32
     // Use the platform's UI typeface without shipping Windows font files.
     std::array<wchar_t,MAX_PATH> directory{};
     const auto length=GetWindowsDirectoryW(directory.data(),unsigned(directory.size()));
     if(!length || length>=directory.size()) throw std::runtime_error("Cannot locate Windows fonts.");
     const auto fonts=std::filesystem::path(directory.data())/"Fonts";
-    ImFont* heading=nullptr;
     for(const auto& names:std::array<std::array<const char*,2>,3>{{{"segoeui.ttf","segoeuib.ttf"},{"tahoma.ttf","tahomabd.ttf"},{"arial.ttf","arialbd.ttf"}}}) {
         if(!std::filesystem::exists(fonts/names[0]) || !std::filesystem::exists(fonts/names[1])) continue;
-        io.FontDefault=io.Fonts->AddFontFromFileTTF(utf8((fonts/names[0]).wstring()).c_str(),18);
-        heading=io.Fonts->AddFontFromFileTTF(utf8((fonts/names[1]).wstring()).c_str(),18);
+        io.FontDefault=io.Fonts->AddFontFromFileTTF(path_text((fonts/names[0])).c_str(),18);
+        heading=io.Fonts->AddFontFromFileTTF(path_text((fonts/names[1])).c_str(),18);
         break;
     }
     if(!io.FontDefault || !heading) throw std::runtime_error("Cannot load a Windows UI font.");
+#else
+#ifdef __APPLE__
+    const auto regular=std::filesystem::path("/System/Library/Fonts/Supplemental/Arial.ttf");
+    const auto bold=std::filesystem::path("/System/Library/Fonts/Supplemental/Arial Bold.ttf");
+    if(std::filesystem::exists(regular) && std::filesystem::exists(bold)) {
+        io.FontDefault=io.Fonts->AddFontFromFileTTF(regular.c_str(),18);heading=io.Fonts->AddFontFromFileTTF(bold.c_str(),18);
+    }
+#else
+    for(const auto* directory:{"/usr/share/fonts/truetype/dejavu","/usr/share/fonts/truetype/liberation2"}) {
+        const auto root=std::filesystem::path(directory);
+        const auto regular=root/(root.filename()=="dejavu"?"DejaVuSans.ttf":"LiberationSans-Regular.ttf");
+        const auto bold=root/(root.filename()=="dejavu"?"DejaVuSans-Bold.ttf":"LiberationSans-Bold.ttf");
+        if(!std::filesystem::exists(regular) || !std::filesystem::exists(bold)) continue;
+        io.FontDefault=io.Fonts->AddFontFromFileTTF(regular.c_str(),18);heading=io.Fonts->AddFontFromFileTTF(bold.c_str(),18);break;
+    }
+#endif
+    if(!io.FontDefault || !heading) {io.FontDefault=io.Fonts->AddFontDefault();heading=io.FontDefault;}
+#endif
     ImGui::StyleColorsDark();auto& style=ImGui::GetStyle();
     style.FontSizeBase=18;style.WindowPadding={24,20};style.FramePadding={12,8};style.ItemSpacing={12,12};
     style.ItemInnerSpacing={10,6};style.CellPadding={10,7};style.IndentSpacing=20;
@@ -212,6 +233,7 @@ ImFont* settings_theme() {
     return heading;
 }
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> settings_logo(ID3D11Device* device) {
+#ifdef _WIN32
     const auto module=GetModuleHandleW(nullptr);
     const auto resource=FindResourceW(module,L"SETTINGS_LOGO",RT_RCDATA);
     const auto loaded=resource?LoadResource(module,resource):nullptr;
@@ -219,6 +241,10 @@ Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> settings_logo(ID3D11Device* dev
     if(!bytes) throw std::runtime_error("The settings logo resource is missing");
     std::unique_ptr<SDL_Surface,decltype(&SDL_DestroySurface)> pixels(
         SDL_LoadPNG_IO(SDL_IOFromConstMem(bytes,SizeofResource(module,resource)),true),SDL_DestroySurface);
+#else
+    std::unique_ptr<SDL_Surface,decltype(&SDL_DestroySurface)> pixels(
+        SDL_LoadPNG((executable_path().parent_path()/"resources/b2.png").c_str()),SDL_DestroySurface);
+#endif
     if(!pixels) throw std::runtime_error(SDL_GetError());
     if(pixels->format!=SDL_PIXELFORMAT_RGBA32) pixels.reset(SDL_ConvertSurface(pixels.get(),SDL_PIXELFORMAT_RGBA32));
     if(!pixels) throw std::runtime_error(SDL_GetError());
@@ -320,6 +346,8 @@ struct App {
     std::array<std::uint32_t,4> watch_semaphores{};
     MusicImport music_import;
     std::shared_ptr<MusicFolderSelection> music_folder_selection;
+    std::shared_ptr<MusicFolderSelection> file_selection;
+    bool file_selection_iso=false;
     unsigned music_songs=0;
     bool music_importing=false,music_import_requested=false,music_restart=false;
     std::vector<int> refresh_rates;
@@ -335,6 +363,12 @@ struct App {
     bool cursor_hidden=false;
     App(bool hidden,bool warp,const std::filesystem::path& script={},const std::filesystem::path& preferences="data/local/settings.cfg"):
         settings(!hidden,preferences),settings_path(preferences) {
+#ifndef _WIN32
+        if(settings.upscaling) {
+            settings.upscaling=0;settings_dirty=true;
+            log_message("DLSS, FSR and XeSS are Windows-only. Upscaling has been set to Off.");
+        }
+#endif
         music_songs=custom_music_count(music_cache());
         // Explicit scripts must work while the user keeps another app focused.
         // This process reads only its own virtual controller in script mode.
@@ -342,14 +376,25 @@ struct App {
             throw std::runtime_error("SDL background input is required for scripted controls");
         if(!SDL_Init(SDL_INIT_VIDEO|SDL_INIT_GAMEPAD|SDL_INIT_AUDIO)) throw std::runtime_error(SDL_GetError());
         try {
-            window=SDL_CreateWindow("Burnout 2: Point of Impact",960,720,SDL_WINDOW_RESIZABLE|SDL_WINDOW_HIGH_PIXEL_DENSITY|(hidden?SDL_WINDOW_HIDDEN:0));
+            window=SDL_CreateWindow("Burnout 2: Point of Impact",960,720,SDL_WINDOW_RESIZABLE|SDL_WINDOW_HIGH_PIXEL_DENSITY|(hidden?SDL_WINDOW_HIDDEN:0)
+#ifdef __APPLE__
+                |SDL_WINDOW_METAL
+#elif !defined(_WIN32)
+                |SDL_WINDOW_VULKAN
+#endif
+            );
             if(!window) throw std::runtime_error(SDL_GetError());
             SDL_SetWindowMinimumSize(window,640,480);
             mouse_activity=SDL_GetTicksNS();
             refresh_options();
+#ifdef _WIN32
             auto* handle=SDL_GetPointerProperty(SDL_GetWindowProperties(window),SDL_PROP_WINDOW_WIN32_HWND_POINTER,nullptr);
+            const bool native_debug=hidden;
+#else
+            void* handle=window;const bool native_debug=false;
+#endif
             active_scale=settings.upscaling?std::max(1,(settings.resolution_scale+1)/2):settings.resolution_scale;
-            renderer=std::make_unique<Renderer>(640,480,warp,hidden,active_scale);renderer->attach_window(handle);
+            renderer=std::make_unique<Renderer>(640,480,warp,native_debug,active_scale);renderer->attach_window(handle);
             configure_enhancements();
             active_aspect_ratio=settings.aspect_ratio;active_widescreen=active_aspect_ratio!=0;active_motion_blur=settings.motion_blur;renderer->aspect_ratio(settings.aspect());
             if(!script.empty()) controls=std::make_unique<ControlScript>(script);
@@ -425,13 +470,7 @@ struct App {
     void start_benchmark() {
         if(!playing || benchmark_started) return;
         stop_performance();benchmark_frames.clear();benchmark_frames.reserve(8192);benchmark_dropped=0;
-        std::array<char,49> brand{};int info[4];__cpuid(info,0x80000000);
-        if(unsigned(info[0])>=0x80000004) for(unsigned i=0;i<3;++i) {__cpuid(info,0x80000002+i);std::memcpy(brand.data()+i*16,info,16);}
-        benchmark_cpu=brand[0]?brand.data():"Unknown x64 CPU";
-        const auto* module=reinterpret_cast<const std::byte*>(GetModuleHandleW(nullptr));
-        const auto* dos=reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
-        const auto* image=reinterpret_cast<const IMAGE_NT_HEADERS64*>(module+dos->e_lfanew);
-        benchmark_build=std::format("PE {:08X}, image {} bytes",image->FileHeader.TimeDateStamp,image->OptionalHeader.SizeOfImage);
+        benchmark_cpu=cpu_name();benchmark_build=build_description();
         benchmark_properties=benchmark_settings();benchmark_started=SDL_GetTicksNS();
     }
     void toggle_performance() {
@@ -509,12 +548,21 @@ struct App {
         SDL_Event event;
         while(SDL_PollEvent(&event)) this->event(event);
         update_cursor();
+        if(file_selection && file_selection->finished.load(std::memory_order_acquire)) {
+            if(!file_selection->error.empty()) log_message(file_selection->error);
+            else if(!file_selection->path.empty()) {
+                auto& destination=file_selection_iso?settings.disc:settings.xbe;
+                if(file_selection->path.size()<destination.size()) {copy_text(destination.data(),destination.size(),file_selection->path);settings_dirty=true;}
+                else log_message("The selected file path is too long.");
+            }
+            file_selection.reset();
+        }
         if(music_folder_selection && music_folder_selection->finished.load(std::memory_order_acquire)) {
             const auto& selected=*music_folder_selection;
             if(!selected.error.empty()) log_message(selected.error);
             else if(!selected.path.empty()) {
                 if(selected.path.size()<settings.music_folder.size()) {
-                    strcpy_s(settings.music_folder.data(),settings.music_folder.size(),selected.path.c_str());settings_dirty=true;
+                    copy_text(settings.music_folder.data(),settings.music_folder.size(),selected.path.c_str());settings_dirty=true;
                 } else log_message("The music folder path is too long.");
             }
             music_folder_selection.reset();
@@ -573,6 +621,7 @@ struct App {
         log_message("Importing custom music...");
     }
     bool browse(std::array<char,4096>& path,bool iso) {
+#ifdef _WIN32
         std::array<wchar_t,32768> result{};
         OPENFILENAMEW dialog{};dialog.lStructSize=sizeof(dialog);
         dialog.hwndOwner=static_cast<HWND>(SDL_GetPointerProperty(SDL_GetWindowProperties(window),SDL_PROP_WINDOW_WIN32_HWND_POINTER,nullptr));
@@ -580,9 +629,22 @@ struct App {
         dialog.lpstrFile=result.data();dialog.nMaxFile=static_cast<DWORD>(result.size());dialog.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;
         if(GetOpenFileNameW(&dialog)) {
             const auto text=utf8(result.data());
-            if(text.size()<path.size() && text!=path.data()) {strcpy_s(path.data(),path.size(),text.c_str());return true;}
+            if(text.size()<path.size() && text!=path.data()) {copy_text(path.data(),path.size(),text.c_str());return true;}
         }
         return false;
+#else
+        if(file_selection) return false;
+        file_selection=std::make_shared<MusicFolderSelection>();file_selection_iso=iso;
+        auto* request=new std::shared_ptr<MusicFolderSelection>(file_selection);
+        const SDL_DialogFileFilter filter{iso?"Xbox game disc":"Xbox executable",iso?"iso":"xbe"};
+        SDL_ShowOpenFileDialog([](void* userdata,const char* const* files,int) {
+            std::unique_ptr<std::shared_ptr<MusicFolderSelection>> request(static_cast<std::shared_ptr<MusicFolderSelection>*>(userdata));
+            auto& result=**request;
+            if(!files) result.error=SDL_GetError();else if(files[0]) result.path=files[0];
+            result.finished.store(true,std::memory_order_release);
+        },request,window,&filter,1,path[0]?path.data():nullptr,false);
+        return false;
+#endif
     }
     void settings_interface() {
         PerfScope timing(&performance,PerfPhase::ui);
@@ -744,13 +806,23 @@ struct App {
                                 const bool supported=renderer->supports_upscaling(UpscaleMethod(i));
                                 ImGui::BeginDisabled(!supported);
                                 if(ImGui::Selectable(upscalers[i],settings.upscaling==i)) {settings.upscaling=i;changed=true;}
-                                if(!supported) setting_help("This technique is unavailable on your graphics device.");
+                                if(!supported) {
+#ifdef _WIN32
+                                    setting_help("This technique is unavailable on your graphics device.");
+#else
+                                    setting_help("DLSS, FSR and XeSS are Windows-only.");
+#endif
+                                }
                                 ImGui::EndDisabled();
                             }
                             ImGui::EndCombo();
                         }
+#ifdef _WIN32
                         setting_help("Reconstructs the output resolution selected in Graphics from a smaller image, or provides antialiasing at 1x. DLSS requires an NVIDIA RTX graphics card. FSR and XeSS also work on other supported cards.");
                         ImGui::TextWrapped("Experimental: DLSS, FSR and XeSS have visual issues and may reduce performance.");
+#else
+                        setting_help("DLSS, FSR and XeSS are Windows-only.");
+#endif
                         ImGui::BeginDisabled(settings.upscaling!=0);
                         constexpr const char* levels[]={"Off (original)","FXAA Low","FXAA Medium","FXAA High","MSAA 2x","MSAA 4x","MSAA 8x"};
                         setting_label("Antialiasing");
@@ -945,7 +1017,7 @@ struct App {
         Xbe image(executable);if(!image.supported()) throw std::runtime_error("The executable does not match the supported Burnout 2 release.");
         configure_graphics();
         diagnostic_record(std::format("{{\"type\":\"game_start\",\"xbe\":{},\"disc\":{},\"sha256\":{}}}",
-            json(utf8(executable.wstring())),json(utf8(disc.wstring())),json(image.sha256)));
+            json(path_text(executable)),json(path_text(disc)),json(image.sha256)));
         std::vector<std::byte> ram(64*1024*1024);image.load(std::span(ram).subspan(image.base,image.image_size));Memory memory(0,ram);
         XboxHost host{renderer.get(),input.get(),[&]{return poll_game();},[&]{game_flip();}};
         if(controls) host.storage_root=settings_path.parent_path()/"automation-user";
@@ -1019,10 +1091,7 @@ int run_app(const std::filesystem::path& xbe,const std::filesystem::path& disc,u
             const std::filesystem::path& controls,std::span<const MemorySlice> slices,bool trace_io,const std::filesystem::path& settings,std::span<const std::uint32_t> watch_semaphores) {
     if(watch_semaphores.size()>4) throw std::runtime_error("At most four semaphore memory watches are supported");
     if(xbe.empty()) {
-        std::array<wchar_t,32768> module{};
-        const auto length=GetModuleFileNameW(nullptr,module.data(),static_cast<DWORD>(module.size()));
-        if(!length || length==module.size()) throw std::runtime_error("Cannot locate the game folder");
-        std::filesystem::current_path(std::filesystem::path(std::wstring_view(module.data(),length)).parent_path());
+        std::filesystem::current_path(executable_path().parent_path());
     }
     App app(false,false,controls,settings);
     std::copy(watch_semaphores.begin(),watch_semaphores.end(),app.watch_semaphores.begin());
@@ -1049,7 +1118,7 @@ int run_app(const std::filesystem::path& xbe,const std::filesystem::path& disc,u
                 diagnostic_record("{\"type\":\"game_error\",\"message\":"+json(error.what())+'}');
                 app.launch=false;app.playing=false;app.show_settings=true;app.log_message(error.what());
             }
-            if(!app.launch && !diagnostic_log().empty()) app.log_message("Log file: "+utf8(diagnostic_log().wstring()));
+            if(!app.launch && !diagnostic_log().empty()) app.log_message("Log file: "+path_text(diagnostic_log()));
         }
     }
     return 0;
@@ -1057,13 +1126,17 @@ int run_app(const std::filesystem::path& xbe,const std::filesystem::path& disc,u
 std::string check_window(const std::filesystem::path& path,bool warp) {
     auto preferences=path;preferences+=".cfg";
     App app(true,warp,{},preferences);
+    const auto resize=[&](int width,int height) {
+        if(!SDL_SetWindowSize(app.window,width,height) || !SDL_SyncWindow(app.window))
+            throw std::runtime_error(SDL_GetError());
+    };
     if(app.settings.refresh_rate!=60) throw std::runtime_error("Default refresh rate differs from 60 Hz");
     if(!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
     FrameRate counter_rate;counter_rate.sample(1);
     for(unsigned frame=1;frame<=60;++frame) counter_rate.sample(1+frame*1000000000ULL/120);
     if(std::abs(counter_rate.value-120)>0.01) throw std::runtime_error("Frame rate counter did not measure 120 FPS");
     Preferences saved(false);saved.resolution_scale=3;saved.select_refresh_rate(144);saved.show_fps=true;saved.aspect_ratio=2;saved.motion_blur=false;saved.bindings[15]=SDL_SCANCODE_Z;
-    saved.custom_music=true;saved.loop_track=true;strcpy_s(saved.music_folder.data(),saved.music_folder.size(),"Music/Custom playlist");
+    saved.custom_music=true;saved.loop_track=true;copy_text(saved.music_folder.data(),saved.music_folder.size(),"Music/Custom playlist");
     saved.antialiasing=6;saved.anisotropy=16;saved.ambient_occlusion=3;saved.ambient_occlusion_strength=47;
     saved.skip_intro=true;saved.draw_distance=4;saved.upscaling=3;
     saved.save(preferences);Preferences restored(true,preferences);
@@ -1126,11 +1199,11 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
         auto output=path;
         if(tab) {output=path.parent_path()/path.stem();output+="-";output+=names[tab];output+=path.extension();}
         save_png(image,output);if(tab) images<<',';
-        images<<std::format("{{\"category\":{},\"image\":{}}}",json(names[tab]),json(utf8(output.wstring())));
+        images<<std::format("{{\"category\":{},\"image\":{}}}",json(names[tab]),json(path_text(output)));
         app.renderer->present(false);
     }
     for(const int category:{4,5}) {
-        if(!SDL_SetWindowSize(app.window,640,480)) throw std::runtime_error(SDL_GetError());
+        resize(640,480);
         app.select_category=category;
         for(unsigned frame=0;frame<3;++frame) {
             app.poll();app.renderer->begin(0xFF16344A);app.renderer->end();app.renderer->display();
@@ -1140,9 +1213,9 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
         if(image.width!=640 || image.height!=480) throw std::runtime_error("Minimum settings window dimensions differ");
         auto output=path.parent_path()/path.stem();output+="-small-";output+=names[category];output+=path.extension();
         save_png(image,output);app.renderer->present(false);
-        images<<std::format(",{{\"category\":{},\"image\":{}}}",json(std::string("small-")+names[category]),json(utf8(output.wstring())));
+        images<<std::format(",{{\"category\":{},\"image\":{}}}",json(std::string("small-")+names[category]),json(path_text(output)));
     }
-    if(!SDL_SetWindowSize(app.window,960,720)) throw std::runtime_error(SDL_GetError());
+    resize(960,720);
     images<<']';app.select_category=0;app.settings.vsync=false;
     app.launch=true;
     if(app.poll_game() || !app.running) throw std::runtime_error("Restart request did not stop the game while keeping the app open");
@@ -1174,8 +1247,8 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     app.settings.aspect_ratio=1;app.configure_graphics();
     for(unsigned wide=0;wide<4;++wide) {
         app.settings.aspect_ratio=wide>=2?2:1;app.configure_graphics();
-        if(wide==2 && !SDL_SetWindowSize(app.window,960,720)) throw std::runtime_error(SDL_GetError());
-        if(wide%2 && !SDL_SetWindowSize(app.window,1280,540)) throw std::runtime_error(SDL_GetError());
+        if(wide==2) resize(960,720);
+        if(wide%2) resize(1280,540);
         app.poll();app.renderer->begin(0xFF4080C0);app.renderer->end();
         if(!app.renderer->display()) throw std::runtime_error("Widescreen image could not be displayed");
         const auto image=app.renderer->read_display();
@@ -1192,7 +1265,7 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
         save_png(image,output);app.renderer->present(false);
     }
     app.settings.aspect_ratio=0;app.configure_graphics();
-    if(!SDL_SetWindowSize(app.window,960,720)) throw std::runtime_error(SDL_GetError());
+    resize(960,720);
     app.poll();
     std::array<double,2> source_rates{},display_rates{};
     for(unsigned test=0;test<2;++test) {
@@ -1233,7 +1306,7 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
         app.renderer->present(false);
     }
     app.settings.resolution_scale=1;app.settings.antialiasing=app.settings.anisotropy=0;app.configure_graphics();
-    if(!SDL_SetWindowSize(app.window,640,480)) throw std::runtime_error(SDL_GetError());
+    resize(640,480);
     app.poll();
     auto& renderer=*app.renderer;
     const auto pattern=[](int dx,int dy,bool occlusion=false,bool overlay=true) {
@@ -1284,6 +1357,6 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
         "\"bindings_and_settings\":true,\"automatic_settings_save\":true,\"restart_request\":true,\"exit_request\":true,\"widescreen_presentation\":true,\"ultrawide_presentation\":true,\"motion_blur_setting\":true,\"frame_counter\":true,\"counter_image\":{},\"escape_toggle\":true,\"resolution_change\":true,"
         "\"pacing_60_hz\":{:.3f},\"pacing_120_hz\":{:.3f},\"source_at_120_hz\":{:.3f},\"source_at_144_hz\":{:.3f},\"display_120_hz\":{:.3f},\"display_144_hz\":{:.3f},"
         "\"performance_capture\":true,\"shader_compilations\":0,\"game_booted\":false,\"game_fps_established\":false,\"images\":{}}}",
-        json(renderer.adapter()),json(utf8(counter_image.wstring())),measured[0],measured[1],source_rates[0],source_rates[1],display_rates[0],display_rates[1],images.str());
+        json(renderer.adapter()),json(path_text(counter_image)),measured[0],measured[1],source_rates[0],source_rates[1],display_rates[0],display_rates[1],images.str());
 }
 }

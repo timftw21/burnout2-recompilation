@@ -1,5 +1,131 @@
 Building the game
 
+Linux x86-64
+
+Use a glibc-based distribution, Clang 19 or newer, LLD, Ninja, Git, CMake 4.2
+or newer and a Vulkan 1.3 driver compatible with DXVK 2.7.1. On Ubuntu 24.04
+the native dependencies are:
+
+sudo apt install build-essential clang-19 lld-19 ninja-build git curl pkg-config patch libssl-dev libpng-dev libjpeg-dev libasound2-dev libpulse-dev libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev libxtst-dev libwayland-dev libxkbcommon-dev libdrm-dev libgbm-dev libegl1-mesa-dev libgl-dev libdecor-0-dev libudev-dev libvulkan-dev spirv-headers flex bison libjson-perl
+
+Install CMake 4.2+ separately if the distribution provides an older version.
+Ensure clang, clang++ and ld.lld select the installed LLVM toolchain on PATH.
+Run this from the extracted source directory:
+
+bash Build.sh '/path/to/Burnout 2 - Point of Impact (USA).xiso.iso'
+
+The builder fetches pinned SDL3 and DXVK Native, builds vkd3d-shader 2.1 with
+the included shader bitcast fix, verifies the original executable, and compiles
+the native game. Unchanged builds reuse the local compiler.
+No Python or Wine is used. Only the standalone native shader compiler library
+is built. FFmpeg is optional and needed only to import custom music.
+Launch build/linux/Release/b2. The settings window uses native SDL file dialogs;
+install an XDG desktop portal on Wayland if the desktop does not provide one.
+Settings, saves, logs and imported music live beside the Linux executable.
+Rebuilding refreshes game paths and preserves the other settings and saves.
+Keep the source/build directories together; rebuild after moving them.
+
+After dependency setup through Build.sh, developer builds use cmake --preset linux, then
+cmake --build --preset linux-release (or linux-debug). Set B2_XBE and B2_EFFECTS
+to verified extracted files to include the game. Without B2_XBE only b2-tool is
+built. The native diagnostics have the same options as on Windows; use b2 and
+b2-tool without the .exe suffix. CPU and effects reports are generated under
+build/linux/generated/Release. No gameplay benchmark is implied by a native build.
+
+Linux currently reports DLSS/FSR/XeSS D3D12 reconstruction, WARP, the D3D11
+debug layer and hardware memory watches as unsupported. Native resolution,
+higher internal resolutions and the shared D3D11 antialiasing paths use Vulkan.
+For software offscreen rendering, select a software Vulkan ICD through its
+standard loader environment; --warp remains Windows-only.
+
+Linux validation (2026-10-21)
+
+Ubuntu 24.04 under WSL2, Clang 19 and CMake 4.3.3 passed the native CPU, audio,
+effects, input, storage and custom-music diagnostics. All 248 rendering cases
+passed on llvmpipe. Hidden SDL3 window checks passed settings persistence,
+resizing, widescreen and ultrawide presentation, with zero HLSL compilations.
+Saves and music passed on ext4, including case-insensitive Xbox filename lookup.
+Repeat setup preserved settings, saves and unchanged extracted-file timestamps;
+an unchanged rebuild had no work to do. Crash reports retained guest context
+from the owning thread. An authorized 29.978-second Airport Terminal 3 gameplay
+benchmark also completed at 360 Hz selected, 1x, widescreen, interpolation and
+V-sync off. Its 7.804 FPS used llvmpipe CPU rendering under WSL2; native Linux
+GPU performance and audible playback remain unverified.
+
+macOS Intel and Apple Silicon (bring-up)
+
+Targets macOS 14+ and a Metal 3 GPU. Build with Xcode 16.3+ and its Metal/C++23
+toolchain, CMake 4.2+, Ninja, Git and the libraries below.
+Use the native shell on each architecture. Intel and Apple Silicon are separate
+native builds; Rosetta and Wine are not used. Older Intel GPUs that cannot
+provide DXMT's D3D11 feature level are unsupported.
+
+With Xcode selected, install the native build dependencies using Homebrew:
+
+brew install cmake ninja pkgconf openssl@3 libpng jpeg-turbo spirv-headers vulkan-headers vulkan-loader bison flex perl
+if [ "$(uname -m)" = arm64 ]; then brew install mpfr gmp; fi
+export PATH="$(brew --prefix perl)/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+cpan -T JSON
+bash Build.sh '/path/to/Burnout 2 - Point of Impact (USA).xiso.iso'
+
+Start build/macos/Release/b2. Keep the source/build folder: the native dynamic
+libraries, extracted inputs, settings and saves remain there. Build.sh selects
+Xcode's compiler and Homebrew's library paths, downloads the hash-verified official LLVM
+15.0.7 library package required by DXMT, and builds the pinned dependencies
+directly with CMake and make. It never calls Python or Meson. The native HLSL
+compiler is used only during the build. Vulkan headers and the loader are build
+dependencies of that compiler's upstream configuration. The game runs D3D11 through native DXMT
+and Metal, with an SDL-owned Metal view. FFmpeg is optional for music imports.
+
+Intel retains native x87/SSE instruction helpers in Mach-O assembly. Apple
+Silicon compiles each game instruction directly to native C++ functions, with
+SoftFloat for the Xbox's 80-bit and IEEE arithmetic and MPFR for transcendental
+functions. No guest instruction decoder, interpreter or JIT is used at runtime.
+Unimplemented ARM instructions are reported during lowering. The existing
+unresolved indirect game targets remain separate from host service bindings.
+Intel hardware instruction-reference checks are explicitly unavailable on ARM;
+the remaining diagnostics still exercise original game routines and services.
+Unaligned atomic memory operations are explicitly unsupported on ARM.
+
+No local Mac was available during this bring-up. CI builds the full native
+game and runs offline diagnostics on both architectures. The Apple Silicon
+runner also exercises offscreen Metal rendering. The Intel runner's virtual
+GPU lacks the Apple7/Mac2 family support required by DXMT. Its CPU, audio,
+effects and file checks still run; GPU checks explicitly report unavailable.
+./build/macos/Release/b2-tool inspect-metal reports the device and GPU families.
+Compatible hardware automatically enables the offscreen draw and the storage
+suite's resident-texture cases. Audible playback, gameplay and performance
+still require validation on both Mac architectures. Windows-only D3D12
+upscalers, WARP, D3D11 debug layers and hardware
+memory watches remain unavailable. x87 transcendental results need comparison
+on game scenes; MPFR does not reproduce the Pentium's internal approximations.
+
+The Native macOS build workflow compiles b2 and b2-tool on both
+macos-15-intel and macos-15 (Apple Silicon), without publishing game files.
+It runs when build inputs change and can also be started manually.
+Both full Release jobs passed on 2026-10-21:
+https://github.com/timftw21/burnout2-recompilation/actions/runs/39714403670
+These checks do not boot the game or establish gameplay performance.
+The macos-game Actions environment holds compressed private inputs in encrypted
+secrets B2_CI_INPUTS_00 through B2_CI_INPUTS_58. No game inputs, generated source
+or executables are committed, cached or uploaded as artifacts. Only trusted
+pushes and manual runs receive these secrets. To replace them from verified
+local inputs, with Node.js and an authenticated GitHub CLI:
+
+node cmake/ci-game-inputs.mjs pack data/local build/ci-game-inputs.env
+gh secret set --env macos-game --env-file build/ci-game-inputs.env
+
+Delete the ignored .env file after uploading it. The workflow stages bounded
+groups of secrets to avoid Actions' template limit, restores the inputs, verifies
+the supported executable and deletes private inputs and build output afterward.
+bash Build.sh --game-inputs builds from the same extracted files locally without
+needing the disc image or changing settings and saves.
+Build.sh --tools-only provides a source-only build locally and does not change
+game settings or saves. On ARM,
+this also compiles the portable arithmetic core without needing a game image.
+
+Windows x64
+
 Install Visual Studio 2026 with Desktop development with C++, C++ CMake tools
 for Windows and its Windows SDK, LLVM 22.1 or newer (Windows x64), CMake 4.2 or
 newer, Git for Windows, and Ninja (ninja.exe).

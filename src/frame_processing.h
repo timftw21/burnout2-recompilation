@@ -2,7 +2,7 @@
 #include <array>
 #include <cstdint>
 #include <d3d11_1.h>
-#include <wrl/client.h>
+#include "com_ptr.h"
 
 namespace b2 {
 struct MotionCamera {
