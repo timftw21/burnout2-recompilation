@@ -93,9 +93,10 @@ architectures. Windows-only D3D12 upscalers, WARP, D3D11 debug layers and hardwa
 memory watches remain unavailable. x87 transcendental results need comparison
 on game scenes; MPFR does not reproduce the Pentium's internal approximations.
 
-The manually triggered Native macOS build workflow compiles b2-tool on both
+The Native macOS build workflow compiles b2-tool on both
 macos-15-intel and macos-15 (Apple Silicon), without uploading game files.
-It has been prepared but not run. Build.sh --tools-only performs the same
+It runs when build inputs change and can also be started manually.
+Build.sh --tools-only performs the same
 source-only build locally and does not change game settings or saves. On ARM,
 this also compiles the portable arithmetic core without needing a game image.
 

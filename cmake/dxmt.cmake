@@ -59,7 +59,7 @@ list(APPEND util "${dxmt_generated}/wsi_platform_darwin.cpp")
 set(dxmt_includes "${dxmt_SOURCE_DIR}/include" "${dxmt_SOURCE_DIR}/include/native/windows"
     "${dxmt_SOURCE_DIR}/include/native/directx" "${dxmt_SOURCE_DIR}/libs"
     "${dxmt_SOURCE_DIR}/src/util" "${dxmt_SOURCE_DIR}/src/dxmt" "${dxmt_SOURCE_DIR}/src/airconv"
-    "${dxmt_SOURCE_DIR}/src/winemetal" "${dxmt_SOURCE_DIR}/src/nativemetal" "${dxmt_generated}")
+    "${dxmt_SOURCE_DIR}/src/nativemetal" "${dxmt_SOURCE_DIR}/src/winemetal" "${dxmt_generated}")
 add_library(b2-dxmt-parser STATIC ${parser})
 add_library(b2-dxmt-airconv STATIC ${airconv} "${dxmt_generated}/air_msad.h" "${dxmt_generated}/air_samplepos.h" "${dxmt_generated}/air_tessellation.h")
 target_include_directories(b2-dxmt-airconv SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
