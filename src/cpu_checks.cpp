@@ -985,14 +985,25 @@ unsigned check_presentation(Memory& memory) {
     std::array<std::byte,0x3B4> ghost_original;std::memcpy(ghost_original.data(),memory.access(ghost_pose,ghost_original.size()),ghost_original.size());
     for(unsigned fraction:{0U,1U,3U}) {
         timing.remainder=733333333ULL*fraction/4;
+        std::array<std::uint32_t,3> position{};std::memcpy(position.data(),finish.data()+12,12);
+        std::memcpy(memory.access(ghost_pose-0x10,12),position.data(),12);
         presentation->begin(cpu,memory);title_presentation(cpu,memory,0x7BEDE,ghost_pose);
         for(auto offset:ghost_offsets) require(std::abs(std::bit_cast<float>(memory.load<std::uint32_t>(ghost_pose+offset+48))-1.5f*fraction)<0.00001f,
             "Ghost body, wheels and parts did not follow the display fraction");
         require(memory.load<std::uint32_t>(ghost_pose)==0x5A5A5A5A && memory.load<std::uint32_t>(ghost_pose+0x180)==0x5A5A5A5A,
             "Ghost playback fields were treated as a transform");
+        require(!std::memcmp(memory.access(ghost_pose-0x10,12),memory.access(ghost_pose+0x40,12),12),
+            "Ghost arrow and body used different presentation positions");
+        // The original playback decoder rewrites these matrices for another view.
+        std::memcpy(memory.access(ghost_pose,ghost_original.size()),ghost_original.data(),ghost_original.size());
+        std::memcpy(memory.access(ghost_pose-0x10,12),position.data(),12);
+        title_presentation(cpu,memory,0x7BEDE,ghost_pose);
+        require(std::abs(std::bit_cast<float>(memory.load<std::uint32_t>(ghost_pose-0x10))-1.5f*fraction)<0.00001f,
+            "A repeated ghost view discarded its presentation pose");
         presentation->end(cpu,memory);
         require(!std::memcmp(ghost_original.data(),memory.access(ghost_pose,ghost_original.size()),ghost_original.size()),
             "Ghost display smoothing changed the original playback state");
+        require(!std::memcmp(memory.access(ghost_pose-0x10,12),position.data(),12),"Ghost arrow changed playback position");
         ++checks;
     }
     memory.store(0x4BA93C,old_model);memory.store(0x4B9C58,old_body);
@@ -1084,6 +1095,31 @@ unsigned check_presentation(Memory& memory) {
         require(!std::memcmp(original.data(),memory.access(frame,original.size()),original.size()),"Camera zoom restoration changed simulation state");
         ++checks;
     }
+    // Replay's visibility scratch overlaps the driving mode at wrapper+170.
+    // Only its own shot selection and the original cut notification can cut.
+    presentation->reset();timing.step=1;memory.store<std::uint32_t>(wrapper+0x228,0);
+    memory.store<std::uint32_t>(wrapper+0xF0,2);memory.store<std::uint32_t>(wrapper+0x11C,24);
+    std::memcpy(memory.access(frame+0x10,64),start.data(),64);lens(1.f,0.1f);
+    title_presentation(cpu,memory,0xA6130,wrapper);title_presentation(cpu,memory,1);title_presentation(cpu,memory,2);
+    ++timing.step;memory.store<std::uint32_t>(wrapper+0x170,1);
+    std::memcpy(memory.access(frame+0x10,64),finish.data(),64);lens(2.f,0.2f);
+    title_presentation(cpu,memory,0xA6130,wrapper);title_presentation(cpu,memory,1);
+    require(std::abs(std::bit_cast<float>(memory.load<std::uint32_t>(frame+0x40))-3.f)<0.00001f,
+        "Replay visibility scratch interrupted continuous camera motion");
+    title_presentation(cpu,memory,2);
+    for(bool new_shot:{false,true}) {
+        ++timing.step;std::memcpy(memory.access(frame+0x10,64),start.data(),64);synchronize();
+        title_presentation(cpu,memory,0xA6130,wrapper);
+        if(new_shot) memory.store<std::uint32_t>(wrapper+0x11C,25);
+        else {
+            cpu.registers[ecx]=wrapper+8;cpu.registers[esp]=stack;memory.store<std::uint32_t>(stack,0xABCDEF00);
+            invoke_native(cpu,memory,0xA9790);
+        }
+        title_presentation(cpu,memory,1);
+        require(!std::memcmp(memory.access(frame+0x10,64),start.data(),64),"Replay camera blended across an original shot cut");
+        title_presentation(cpu,memory,2);++checks;
+    }
+    memory.store<std::uint32_t>(wrapper+0x228,1);
     // A long pause must not age the camera out while the car keeps sampling
     // stationary poses. Resume both at the same fraction, including lens state.
     {
@@ -1270,6 +1306,129 @@ unsigned check_presentation(Memory& memory) {
             require(!std::memcmp(memory.access(pose,64),replacement.data(),64),"A recycled prop slot inherited another body's motion");
             presentation->end(cpu,memory);memory.store(props+0xD4C,first);++checks;
         }
+    }
+    // Compare projected prop records with the original builder at the same
+    // pose, including its alternate orientation for an overturned body.
+    {
+        constexpr std::uint32_t props=0x6000,pose=props+0x14C,body=0x7800,replacement=0x7900,shadows=0x9000,reference=0x9E00,scratch=0x9F00;
+        memory.store(props+0xD4C,body);memory.store(body+0x10,pose);
+        memory.store(shadows-0xC4,body);memory.store<std::uint32_t>(shadows-4,1);
+        std::memset(memory.access(shadows,56),0,56);
+        const auto build_shadow=[&](std::uint32_t destination,std::uint32_t source) {
+            cpu.registers[esp]=stack;cpu.registers[ecx]=destination;memory.store<std::uint32_t>(stack,0xABCDEF00);
+            invoke_native(cpu,memory,0x789E0);
+            if(destination==shadows) {
+                cpu.registers[ebx]=shadows-0xC4;
+                title_presentation(cpu,memory,0x826E7,shadows);
+            }
+            cpu.registers[esp]=stack;cpu.registers[ecx]=destination;
+            memory.store(stack+4,source+48);memory.store(stack+8,source+32);memory.store(stack+12,source);
+            memory.store<std::uint32_t>(stack+16,0x40000000);memory.store<std::uint32_t>(stack+20,0x40400000);
+            invoke_native(cpu,memory,0x789F0);
+        };
+        for(float tilt:{0.f,0.8f,-0.8f,0.9f}) for(unsigned fraction:{0U,1U,3U}) {
+            presentation->reset();timing={};timing.started=true;timing.step=1;
+            memory.store(shadows-0xC4,body);memory.store<std::uint32_t>(shadows-4,1);memory.store(body+0x10,pose);
+            memory.store(props+0xD4C,body);
+            auto a=start,b=finish;
+            if(tilt) {
+                a[0]=a[5]=std::sqrt(1-tilt*tilt);a[1]=tilt;a[4]=-tilt;b=a;b[12]=6;
+            }
+            std::memcpy(memory.access(pose,64),a.data(),64);build_shadow(shadows,pose);
+            presentation->begin(cpu,memory);title_presentation(cpu,memory,0x78C10,shadows);
+            title_presentation(cpu,memory,0x795F5);presentation->end(cpu,memory);
+            ++timing.step;timing.remainder=733333333ULL*fraction/4;
+            std::memcpy(memory.access(pose,64),b.data(),64);build_shadow(shadows,pose);
+            std::array<std::byte,48> copied;std::memcpy(copied.data(),memory.access(shadows+8,48),48);
+            // The live body list can grow after 826E7, and slots can move or
+            // be recycled before the next view. The copied shadow stays put.
+            memory.store<std::uint32_t>(shadows-4,2);
+            memory.store(shadows-0xC4,replacement);memory.store(shadows-0xC0,body);
+            memory.store(body+0x10,pose+64);memory.store(replacement+0x10,pose);
+            std::memcpy(memory.access(pose+64,64),b.data(),64);
+            auto reused=start;reused[12]=80;
+            std::memcpy(memory.access(pose,64),reused.data(),64);
+            presentation->begin(cpu,memory);
+            for(unsigned view=0;view<2;++view) {
+                title_presentation(cpu,memory,0x78C10,shadows);
+                require(!std::memcmp(memory.access(pose,64),reused.data(),64),"Shadow presentation wrote to a compactable physics slot");
+                std::array<float,16> displayed;
+                require(presentation->matrix(cpu,memory,pose,body,&displayed),"Missing prop presentation history");
+                std::memcpy(memory.access(scratch,64),displayed.data(),64);
+                std::memcpy(memory.access(reference+8,48),copied.data(),48);build_shadow(reference,scratch);
+                for(unsigned word=0;word<12;++word) {
+                    const auto actual=memory.load<std::uint32_t>(shadows+8+word*4),expected=memory.load<std::uint32_t>(reference+8+word*4);
+                    require((word<3 || (word>=4 && word<7))?
+                        std::abs(std::bit_cast<float>(actual)-std::bit_cast<float>(expected))<0.00001f:actual==expected,
+                        std::format("Prop shadow disagreed with original builder: tilt={}, fraction={}, word={}, actual={}, expected={}",tilt,fraction,word,hex32(actual),hex32(expected)));
+                }
+                title_presentation(cpu,memory,0x795F5);
+                require(!std::memcmp(memory.access(shadows+8,48),copied.data(),48),"Shadow drawing changed the fixed-update record");
+                // Geometry at the recycled address must not evict the copied
+                // shadow's history before another split-screen/extra view.
+                cpu.registers[ebx]=props;memory.store(props+0xD4C,replacement);
+                title_presentation(cpu,memory,0x8EBC5,pose);
+                require(!std::memcmp(memory.access(pose,64),reused.data(),64),"A new prop inherited the old shadow's motion");
+                ++checks;
+            }
+            memory.store(props+0xD4C,body);memory.store(body+0x10,pose);
+            std::memcpy(memory.access(pose,64),b.data(),64);
+            cpu.registers[ebx]=props;title_presentation(cpu,memory,0x8EBC5,pose);
+            require(std::abs(std::bit_cast<float>(memory.load<std::uint32_t>(pose+48))-1.5f*fraction)<0.00001f,
+                "Shadow sampling advanced the prop geometry twice");
+            presentation->end(cpu,memory);++checks;
+        }
+        // A cleared list must not retain a copied shadow; its first new owner
+        // must not inherit motion from a previous occupant of the same slot.
+        cpu.registers[esp]=stack;cpu.registers[ecx]=shadows;memory.store<std::uint32_t>(stack,0xABCDEF00);
+        invoke_native(cpu,memory,0x789E0);
+        presentation->begin(cpu,memory);title_presentation(cpu,memory,0x78C10,shadows);presentation->end(cpu,memory);
+        ++timing.step;memory.store<std::uint32_t>(shadows-0xC4,0x7A00);memory.store(0x7A10,pose);
+        auto fresh=start;fresh[12]=30;std::memcpy(memory.access(pose,64),fresh.data(),64);
+        build_shadow(shadows,pose);
+        std::array<std::byte,48> copied;std::memcpy(copied.data(),memory.access(shadows+8,48),48);
+        presentation->begin(cpu,memory);title_presentation(cpu,memory,0x78C10,shadows);
+        require(!std::memcmp(memory.access(shadows+8,48),copied.data(),48),"A replacement shadow inherited another body's motion");
+        presentation->end(cpu,memory);++checks;
+    }
+    // Spark trajectories remain original; only the cached drawing time changes.
+    // Clip a real spark before GPU submission and inspect its original endpoints.
+    {
+        constexpr std::uint32_t sparks=0x3DB094,particle=0xA000,raster=0xA100;
+        const auto old_clock=memory.load<std::uint32_t>(sparks+4),old_particles=memory.load<std::uint32_t>(sparks+0xF0),old_count=memory.load<std::uint32_t>(sparks+0xF4);
+        const auto old_camera=memory.load<std::uint32_t>(0x5ADCA0),old_raster=memory.load<std::uint32_t>(camera+0x60),old_near=memory.load<std::uint32_t>(camera+0x80);
+        memory.store(0x5ADCA0,camera);memory.store(camera+0x60,raster);memory.store<std::uint32_t>(camera+0x80,std::bit_cast<std::uint32_t>(10000.f));
+        std::memset(memory.access(raster,32),0,32);memory.store<std::uint32_t>(raster+12,640);memory.store<std::uint32_t>(raster+16,480);
+        std::memset(memory.access(particle,40),0,40);memory.store<std::uint32_t>(particle+16,std::bit_cast<std::uint32_t>(12.f));
+        memory.store(sparks+0xF0,particle);memory.store<std::uint32_t>(sparks+0xF4,1);
+        const auto draw_spark=[&] {
+            cpu.registers[esp]=stack;cpu.registers[ecx]=sparks;memory.store<std::uint32_t>(stack,0xABCDEF00);
+            invoke_native(cpu,memory,0xBB0D0);
+            require(cpu.eip==0xABCDEF00 && cpu.registers[esp]==stack+4,"Headless spark did not return normally");
+            return std::bit_cast<float>(memory.load<std::uint32_t>(((stack-4)&~15U)-0xA0+0x10));
+        };
+        for(float delta:{1.f/60,1.f/50,1.f/240,0.f}) {
+            presentation->reset();timing={};timing.started=true;timing.step=1;
+            memory.store(sparks+4,std::bit_cast<std::uint32_t>(0.25f));memory.store<std::uint32_t>(particle+32,0);
+            presentation->begin(cpu,memory);presentation->end(cpu,memory);
+            ++timing.step;memory.store(sparks+4,std::bit_cast<std::uint32_t>(0.25f+delta));
+            for(unsigned fraction:{0U,1U,3U}) {
+                timing.remainder=733333333ULL*fraction/4;
+                memory.store(sparks+4,std::bit_cast<std::uint32_t>(0.25f+delta*float(fraction)/4));
+                cpu.presentation=nullptr;const auto expected=draw_spark();cpu.presentation=presentation.get();
+                memory.store(sparks+4,std::bit_cast<std::uint32_t>(0.25f+delta));
+                presentation->begin(cpu,memory);
+                require(std::abs(draw_spark()-expected)<0.00001f,
+                    "Spark motion stepped at the simulation rate or ignored pause/slow motion");
+                // A particle born later in this update must not run backwards.
+                memory.store(particle+32,std::bit_cast<std::uint32_t>(1.f));draw_spark();memory.store<std::uint32_t>(particle+32,0);
+                presentation->end(cpu,memory);
+                require(memory.load<std::uint32_t>(sparks+4)==std::bit_cast<std::uint32_t>(0.25f+delta),"Displayed spark time leaked into emission/expiry");
+                ++checks;
+            }
+        }
+        memory.store(sparks+4,old_clock);memory.store(sparks+0xF0,old_particles);memory.store(sparks+0xF4,old_count);
+        memory.store(0x5ADCA0,old_camera);memory.store(camera+0x60,old_raster);memory.store(camera+0x80,old_near);
     }
     // Reward overlays need the original text trails. Only visible driving
     // gauges require scene-only feedback to prevent accumulated dark shading.

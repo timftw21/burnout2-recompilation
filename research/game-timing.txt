@@ -568,3 +568,115 @@ panes and all three aspect corrections. All 262 hardware renderer checks passed
 with no D3D11 debug messages. No gameplay automation or benchmark was run for
 this follow-up; actual Airport box interactions and all-mode visual acceptance
 remain for the user's manual check. All owned build/check workers exited.
+
+Ghost markers, sparks, prop shadows and replay cameras, 2026-10-23
+
+Verified data/local/default.xbe against knowledge/supported_target.json:
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+Bounded original decoding and generated native instruction comments identify:
+
+- 7B280 copies ghost+5E0 from its decoded body translation before 7BEDE
+  smooths the render record at ghost+5F0. 884B0/880A0 project that separate
+  position for the red arrow. Copy the displayed body translation to +5E0
+  during drawing and restore it at scene end. Repeated views rebuild the
+  render record, so an already-applied matrix must be reapplied without
+  sampling a second endpoint. Body, wheels, parts and arrow remain together.
+
+- BBC20 loads "fxspark" from original string 2C4D58. BAF50 caches D7340's
+  race time at spark manager+4 (3DB098), and BB0D0 evaluates both endpoints
+  from birth time +20 and velocity in each 40-byte particle record.
+  Sample that cached clock at the same fixed boundaries/fraction as poses,
+  restoring it before any original emission/expiry update. This retains the
+  title's equations, random choices, pause and slow-motion rate. BB140 skips
+  particles whose original birth is later than the displayed time, through
+  the original BB4EE loop advance. No backwards pre-birth trajectory.
+
+- 822B0 copies the +12C physics-body list into shadow records at +1F0:
+  826B1..826F8 calls 789F0 once per body, using body+10's position, forward
+  and right vectors and the original shape dimensions. 78C10 draws those
+  copied 48-byte records, independently of the prop geometry matrices.
+  Capture the body identity and source matrix at 826E7, before the original
+  copy. Sample that snapshot without reading or writing a subsequently
+  compacted physics slot, and refresh only the shadow position/orientation.
+  Pose-cache keys include both matrix address and body identity, allowing
+  copied shadows and a replacement slot owner to coexist. Preserve 789F0's
+  orientation choice: right when -0.8 <= right.y <= 0.8, otherwise forward
+  crossed with world up. Restore the copied records at 795F5 before return.
+  The same pose history supplies prop geometry at an unchanged slot. There
+  is no shadow-history matching by draw order or additional GPU pass.
+
+- A6130 uses its controller at camera wrapper+98, with mode +58 and chosen
+  shot +84. A5C50 writes 32 visibility results at controller+88..+104;
+  this overlaps the normal driving mode record at wrapper+170. Treating it
+  as a driving mode can spuriously discard replay pose history. Track which
+  controller is active, read its own mode/shot, and preserve A9790's explicit
+  cut signal. A4410 calls A9790 when selecting a replay view, including a
+  new view using the same mode. Genuine cuts discard pose/lens/UI histories;
+  ordinary replay/demo movement interpolates pose and lens together.
+
+New instruction hooks are byte-verified in the native emitter. Shadow buffers
+and the single spark-clock history are bounded; no per-frame allocation,
+particle history, simulation tick or extra render pass is introduced.
+Private bounded decode excerpts/build diagnostics: build/checks/timing-followup.
+
+Release build and all 52 native CPU groups pass: 26,026 instruction, 3,493
+memory/presentation, 6,744 floating and 109 control cases; 36,149 compiled
+functions. Regression checks compare ghost marker/body positions across rebuilt
+views, original 789F0 shadow output at multiple fractions and both tilt limits,
+exact physics/shadow restoration, clipped original BB0D0 spark trajectories
+at NTSC/PAL/slow/paused rates, and replay scratch changes versus genuine cuts.
+No gameplay automation, computer use or FPS benchmark was run. Visual acceptance
+of the four reported scenes remains for the user's manual check. All owned
+build and diagnostic workers exited.
+
+Shadow crash follow-up (2026-10-23)
+---------------------------------
+The supplied b2-20261023-214519-7516.log ends at 78C10 with "unsupported
+physics shadow list", ECX=2FE560 (2FE370+1F0), return address 80EA3.
+The added assertion incorrectly required the copied shadow count to equal
+the current body count. The log does not record the two count values.
+Original 822B0 builds shadows at 826B1..826F8, then updates vehicles at
+82700..8272A. Body allocation 81F30 can append to the +12C list and increment
++1EC at 81FCF..81FDC, or recycle a body and call 8D110 to move matrix slots.
+These live bodies are not a stable description of the earlier shadow list.
+
+The 826E7 call signature E80463FFFF was verified against the supported XBE
+bytes. The hook retains each accepted shadow's source matrix and body, with
+the original 128-entry bound and no allocation. Rendering uses that copy;
+the equality assertion and draw-time live-body lookup are removed. The
+shadow-buffer capacity check remains. Original 789E0 reset, 789F0 append,
+shape dimensions, orientation choice and exact record restoration remain.
+The existing native presentation diagnostic now changes the live count,
+reorders the body list, moves/reuses a matrix slot between shadow creation
+and drawing, draws the replacement geometry between views, and resets/reuses
+the shadow list. It compares against original 789F0 output at three display
+fractions and four tilts, including both original orientation thresholds.
+
+Release rebuild and all 52 native CPU groups pass: 26,026 instruction,
+3,518 memory/presentation, 6,744 floating and 109 control cases, with 36,149
+compiled functions. Reports: timing-followup/shadow-crash-build.log and
+timing-followup/shadow-crash-cpu.json beneath build/checks. No gameplay or
+computer use was run; the reported scene still needs manual verification.
+
+Trackside replay/demo lens follow-up (2026-10-24)
+------------------------------------------------
+The earlier camera tracking covered ADCA0's driving controller and A6130's
+crash/replay controller, but missed B58C0's trackside controller at wrapper+49C.
+A0AE0 calls B58C0 at A0B75; B57A0 dispatches the authored view and invokes
+B5100 for zoom (B5866). B5100 calls A04A0 at B520A. Therefore poses could
+interpolate while this controller's lens still advanced only at fixed ticks.
+
+Register B58C0's first stack argument as the wrapper. Its current authored
+record is controller+8 (wrapper+4A4); record+10 is the shot identity, also
+used by the original B5987/B5AE0 comparisons. Adjacent records sharing that
+identity retain history. Different shots/controller types cut immediately.
+The wrapper's reciprocal view scale at +210 now follows the displayed lens
+and is restored exactly with the original view width, height and near clip.
+
+Private native checks exercise twelve display fractions using the original
+RenderWare camera/frustum callbacks, a same-shot record change, a genuine
+shot cut, and exact restoration of pose/lens/scale. All pass, as do the 52
+existing CPU diagnostic groups (26,026 instruction, 3,518 memory/presentation,
+6,744 floating and 109 control cases; 36,149 compiled functions).
+Bounded original-byte excerpts and native diagnostics are under
+build/checks/render-followup-20261024. No permanent tests were added.

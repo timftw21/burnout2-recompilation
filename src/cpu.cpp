@@ -126,7 +126,10 @@ std::uint32_t title_traffic_fade(Cpu& cpu,Memory& memory,std::uint32_t vehicle) 
     // All guest reads precede this non-throwing scalar SIMD calculation. Keep
     // x87 resident instead of saving/restoring its whole stack for every car.
     const auto mxcsr=_mm_getcsr();_mm_setcsr(0x1F80);
-    const auto end=original_end*cpu.draw_distance,width=original_width*cpu.draw_distance;
+    // 9E950 admits ordinary traffic to the display list only within 250 units.
+    // Moving opacity's endpoint beyond that list makes cars pop at full alpha.
+    // Broaden the fade inside the available range without extending simulation.
+    const auto end=original_end,width=std::min(original_width*cpu.draw_distance,original_end);
     float squared=0;
     for(unsigned axis=0;axis<3;++axis) {const auto delta=car[axis]-view[axis];squared+=delta*delta;}
     const auto start=end-width;

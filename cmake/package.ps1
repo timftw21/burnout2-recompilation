@@ -15,7 +15,6 @@ $inputs = @(
     'LICENSE', 'NOTICE.md', 'THIRD_PARTY_NOTICES.txt',
     'cmake/build.ps1', 'cmake/build-ui.ps1', 'cmake/target.h.in', 'cmake/kernel_names.h.in',
     'cmake/cpu-seeds.txt.in', 'cmake/imgui-shaders.cmake',
-    'cmake/upscalers.cmake', 'cmake/upscalers.json',
     'cmake/linux.cmake', 'cmake/posix-dependencies.sh', 'cmake/vkd3d-copy-propagation.patch',
     'cmake/macos.cmake', 'cmake/macos-dependencies.sh', 'cmake/dxmt.cmake',
     'cmake/portable-cpu.cmake', 'cmake/binary-header.cmake',

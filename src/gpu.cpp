@@ -64,6 +64,7 @@ struct Gpu::Impl {
     std::vector<Draw> draws;
     std::array<Renderer::StreamDraw,256> stream_draws{};
     unsigned draw_count=0;
+    std::uint64_t coverage=UINT64_MAX;
     struct Surface {std::uint32_t identifier,width,height;std::uint64_t revision=0;bool color_cleared=false;};
     Surface* active_surface=nullptr;
     std::uint64_t surface_revision=0;
@@ -309,6 +310,7 @@ struct Gpu::Impl {
     }
     RenderState state(ProgramView& view) {
         RenderState s;
+        s.coverage=coverage;
         const auto horizontal=reg(0x200),vertical=reg(0x204);
         s.scissor_test=true;s.scissor={std::int32_t(horizontal&0xFFFF),std::int32_t(vertical&0xFFFF),
             std::int32_t((horizontal&0xFFFF)+(horizontal>>16)),std::int32_t((vertical&0xFFFF)+(vertical>>16))};
@@ -415,8 +417,8 @@ struct Gpu::Impl {
     }
     void capture_draw(std::uint32_t first,const Draw& draw,std::uint32_t shader) {
         if(capture_trace.tellp()>48*1024*1024 || capture_draws==2048) {capture_truncated=true;return;}
-        capture_trace<<std::format("{{\"type\":\"draw\",\"draw\":{},\"first\":{},\"count\":{},\"target\":{},\"shader\":{},\"program_start\":{},\"registers\":{},\"program\":{},\"constants\":{},\"current\":{},\"textures\":[",
-            capture_draws++,first,draw.count,target,shader,program.start,json(hex_bytes(std::as_bytes(std::span(registers[0])))),
+        capture_trace<<std::format("{{\"type\":\"draw\",\"draw\":{},\"first\":{},\"count\":{},\"target\":{},\"shader\":{},\"program_start\":{},\"coverage\":[{},{}],\"registers\":{},\"program\":{},\"constants\":{},\"current\":{},\"textures\":[",
+            capture_draws++,first,draw.count,target,shader,program.start,std::uint32_t(draw.state.coverage),std::uint32_t(draw.state.coverage>>32),json(hex_bytes(std::as_bytes(std::span(registers[0])))),
             json(hex_bytes(std::as_bytes(std::span(program.tokens)))),json(hex_bytes(std::as_bytes(std::span(constants)))),
             json(hex_bytes(std::as_bytes(std::span(current.attributes)))));
         for(unsigned i=0;i<4;++i) {
@@ -729,6 +731,7 @@ void Gpu::begin_overlay() {
     g.flush();g.select_target();g.renderer.begin_overlay();g.overlay_target=g.target;++g.gpu_work;
 }
 void Gpu::restore_feedback() {auto& g=*impl_;g.flush();g.renderer.restore_feedback();}
+void Gpu::coverage(std::uint64_t value) {impl_->coverage=value;}
 bool Gpu::busy() {auto& g=*impl_;g.poll();return g.fence_count!=0;}
 void Gpu::wait() {auto& g=*impl_;g.flush();g.finish_visibility();g.fence(0,0);g.await([&]{return !g.fence_count;},PerfGpuWait::idle);}
 void Gpu::wait_fence(std::uint32_t value,std::uint32_t issued) {

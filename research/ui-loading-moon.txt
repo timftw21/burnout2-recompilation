@@ -1,0 +1,587 @@
+Loading, HUD redraws and moon glow, 2026-10-22
+
+Target: supported US default.xbe, SHA-256
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+Evidence comes from original executable/disc bytes and the user's existing
+captures. No game automation or new gameplay capture was used.
+
+Fast load
+
+The original main loop pumps file manager D5460 and the active scene's loading
+callback before drawing. Constructors also call loading draw ADE20 directly.
+File completion is already asynchronous; there is no invented disc-speed delay
+to remove. Loading stages were instead waiting for ordinary display pacing, and
+ADE20 retains a transition fade. The option removes those presentation waits
+while leaving the original loaders, pending-read checks and error paths intact.
+
+ADEA0 selects loading UI 27; ADEAC..ADEB4 initializes the fade to 2 * 0.5 seconds.
+ADEB6 (original bytes D9 07, fld [edi]) reads this fade before its zero test.
+The AOT hook clears that one duration when Fast load is enabled. Its byte
+signature is verified during generation, and it is excluded from x87 fusion so
+the hook cannot be lost. Both original fade branches consume the same duration.
+The main/gameplay clock and simulation delta at 598188 are unchanged.
+
+The existing loading clock marks ADE20 entry, including blocking constructors;
+normal scene rendering ends that state. While it is active, Fast load bypasses
+the source-frame limiter and uses nonblocking display/present. Normal pacing
+resumes with the first gameplay draw. Input and settings continue through the
+native scheduler. The setting defaults off, persists as fast_load, and applies
+on Start/Restart. Loading duration still includes actual reads and preparation.
+
+Source evidence: bounded native decoding of ADE20..AE1CF and loading state
+machines at 80150, 93070 and C93C0. Private outputs and diagnostics are in
+build/checks/ui-loading-moon. End-to-end loading speed requires an in-game check.
+
+HUD and menu artwork
+
+Source captures under build/windows/Release/build/captures:
+  frame-803532502100: Airport start, countdown 35, position 4/4.
+  frame-989070801500: quit confirmation, white arrows and rounded buttons.
+  frame-474074354400: Airport night, countdown 89, position 1/4.
+
+The countdown and position use the same 256x256 BC3 font atlas. Its SHA-1 is
+8BD1B7A660160D24E69B109E91956DACA2D4D726 (texture-0082.bin in the night capture,
+texture-0107.bin in the quit capture). Digits 0..7 occupy y=66..87; 8 and 9
+occupy y=96..117; the position slash occupies x=140..151, y=185..207.
+The menus use the original global.dic fe_parts_xg 128x256 BC3 atlas, SHA-1
+8781ACD85F32C81754758FA8EEB9A06956A3DC3E. The three boxes occupy y=63..201;
+the two large white arrows and two small white arrows are adjacent.
+
+src/ui_art.cpp traces those silhouettes with lines and cubic curves in original
+atlas coordinates. It rasterizes at 8x during upload; exact dimensions, format
+and hashes restrict replacement to those sources. Original UVs, placement,
+colors and game-drawn outlines/shadows remain. Other atlas contents retain their
+original pixels with bilinear reconstruction. There is no substituted font,
+generated illustration, added game draw or runtime shader compilation.
+
+The initial two immutable BGRA textures totaled 24 MiB, replacing 96 KiB of BC3
+data. The Clean HUD follow-up below halves that enhanced storage. Both versions
+use the existing renderer texture budget and release/reset lifecycle.
+Tracing/rasterization runs on upload, not every draw. Native offscreen renders
+verified the source and replacement atlases with zero shader compilations and
+no D3D11 errors. Final gameplay appearance remains for the user's manual check.
+
+Moon glow
+
+Night capture frame-474074354400, draw 509, resource 89, texture-0052.bin:
+128x128 BC1, one mip, 8192 bytes, texture format register 07710C29.
+SHA-256: 9599544FB1653A2A07EE3191A4A3507A3D27311109F9DAC1FF33CBF7C14A4957.
+The entire captured texture matches the original disc's trackpss/forward/aptl.pss
+at file offset 0x487380 (4748160), verified by a bounded streaming byte search.
+
+The captured quad spans x=320.378296..380.378296 and
+y=94.786934..170.977417 in native 640x480 coordinates, with full 0..1 UVs.
+Its right edge is x=1141.134888 in the supplied 1920x1440 image. The tint is
+FFA0A8B0. U/V addressing clamps; blending is SRC_ALPHA + ONE, with alpha test
+disabled. The full-screen clip does not intersect the moon's right edge.
+
+The original texture's glow reaches the right border: the middle border pixel
+is RGB (8,8,8), alpha 255, and 99 of the 128 right-border pixels are nonblack.
+That nonzero additive light ends at the quad boundary, producing the visible
+straight cutoff. Native rendering of the original texture reproduces the edge.
+This is an original artwork boundary, not evidence of a renderer clipping bug.
+The moon texture and renderer behavior are preserved. This investigation does
+not claim a comparison against original Xbox video or a new full-scene replay.
+
+Validation
+
+Release build completed with clang-cl/CMake. Existing CPU diagnostics passed
+52 groups (26026 instruction, 3467 memory, 6744 floating and 109 control cases).
+Hidden SDL3 window diagnostics passed, including Fast load's disabled default
+and save/load round trip. The existing renderer suite passed all 262 cases on
+NVIDIA GeForce RTX 5060 Ti with the D3D11 debug layer and no debug messages.
+After including redraw preparation in upload timing, the final native renderer
+re-rendered both redrawn atlases and the unchanged moon with zero shader
+compilations and no errors. The moon pixels matched the original probe exactly.
+The user's saved settings file retained its original SHA-256. No gameplay FPS,
+load-duration measurement or original-hardware visual parity is claimed.
+
+Clean HUD follow-up
+
+The same verified font now has traced A-Z and a-z, the exclamation point, and
+the small multiplication x. Original alpha pixels establish every glyph's
+position and extent. Lowercase a-u occupy the first row, v-z precede A-O on the
+second, and P-Z precede the digits on the third. The exclamation point occupies
+x=181..186, y=186..207; multiplication x occupies x=127..138, y=191..203.
+The existing lowercase x is redrawn as part of the alphabet as well. Original
+spacing, baselines, ascenders/descenders, condensed strokes and separate
+game-drawn outlines remain. There is no substitute font or added dependency.
+
+Clean HUD is in Enhancements / Miscellaneous, defaults on to retain the prior
+redraw behavior, persists as clean_hud, and applies on Start/Restart. It controls
+all UI-art replacements. The renderer's disabled path skips identification,
+allocation and rasterization, uploading the original texture directly. Existing
+GPU texture caching avoids repeated work on ordinary draws. No extra draw,
+shader, game-frame allocation or persistent CPU copy of the atlases is added.
+
+Optimization replaces per-pixel floating-point reconstruction with exact integer
+bilinear weights (sixteenths at 8x). Each original row is expanded once; only two
+expanded rows are cached. The verified font is white RGB at every original pixel,
+so only alpha needs interpolation. Rasterization keeps one row of coverage
+instead of a full rectangular scratch image. The resulting font stores alpha
+in BC3 with constant white color blocks, reducing its GPU/upload size from
+16 MiB to 4 MiB. The parts atlas retains its colors in 8 MiB BGRA. Total enhanced
+texture storage is therefore 12 MiB, down from 24 MiB, at the same 8x resolution.
+
+Native component measurements on AMD Ryzen 5 5600X, Release clang-cl, seven
+preparation calls per original atlas (median, milliseconds):
+                    Before     After
+  Font              192.792     17.4613
+  Menu parts         83.040      9.4219
+  Sum               275.832     26.8832
+The after measurement includes all 54 additional glyphs. This measures texture
+preparation, not game FPS, total loading time or GPU upload. Private measurements,
+original glyph bounds and rendered atlases are under build/checks/clean-hud.
+
+The updated Release executable built successfully. Hidden window diagnostics
+passed the enabled default and both enabled/disabled save/load paths, without
+booting. Native offscreen renders on RTX 5060 Ti checked both atlases with the
+setting on and off, with zero shader compilations and no D3D11 errors. Resource
+reports confirmed 4/8 MiB enabled and 64/32 KiB disabled; resetting released all
+textures. Disabled output hashes match the original font and parts pixels
+exactly. Enabled parts pixels also match the earlier redraw exactly after the
+integer/rasterization optimization. The user's saved settings hash was unchanged.
+
+Outline filtering and Xbox buttons follow-up, 2026-10-22
+
+The quit capture's font draws use the same atlas for black offset copies and
+white lettering. Draws 836, 838..842, 845..847 include black copies; draw 843
+includes white lettering. Their texture filter register is 02023E9F: linear
+minification/magnification with mip filtering disabled. The 8x redraw initially
+retained that single-level sampling. Reducing such sharp high-resolution masks
+to their displayed size undersamples both the inner and outer outline edges.
+
+The redraw now supplies 8x/4x/2x/1x coverage levels, generated before font BC3
+compression. Only recognized replacement textures use a trilinear sampler with
+zero bias and these four levels. Original texture/sampler behavior is unchanged.
+Stopping at the original atlas dimensions avoids coarser levels mixing adjacent
+characters. Mip generation shrinks its working image in place and alpha-weights
+colored pixels. Prepared and immediate drawing paths use the same sampler key.
+
+A private font preview originally used x=200..213 for the 4, sampling a column
+beside the preceding 3. Capture frame-803532502100, draws 1332/1333, proves the
+game's actual quad uses x=201..213, y=61..90. Correcting the preview to those
+coordinates removed its stray vertical lines; the game UVs required no change.
+The new filtered outline preview was checked at 0.67x, 1.91x and 3.13x glyph
+sizes. It is a representative text composite, not a full-scene capture replay.
+
+The buttons_Xbox source is the original 128x128 BC3 atlas, 16384 bytes, SHA-1
+490262F84ECBE5B9A723FF40CA0C90021E4C59BB, captured as texture-0108.bin in
+frame-989070801500 (resource 10, draw 844). Its A/B/X/Y circles, button lettering,
+black/white buttons, START/BACK buttons and legends, and L/R symbols are redrawn
+at their original atlas positions. Color patches are fitted separately to each
+original colored dome's unlettered pixels. The final patch controls are bounded
+to RGB and constrained to each material's channel order. Positive Bernstein
+weights preserve that gamut throughout each patch, eliminating the false colored
+fringes seen with the initial unconstrained fit. Geometry supplies silhouettes,
+letters, rims and highlights. START and BACK use identical F4F4F4 ink per the
+user's requested correction; their original stroke weights remain distinct.
+
+All three replacements remain behind Clean HUD and use ordinary cached immutable
+textures. Font, parts and buttons use 5.3125, 10.625 and 5.3125 MiB respectively,
+including their four mip levels (21.25 MiB total). There is no added draw or
+shader, runtime compilation, per-frame image generation, or new dependency.
+Private previews, source-color fitting and diagnostics are in
+build/checks/ui-outlines. The fitting scripts are research only; the build and
+shipping game use the fixed C++ vector/color descriptions and need no scripts.
+
+Follow-up validation: Release build succeeded. All 262 existing renderer cases
+passed on NVIDIA GeForce RTX 5060 Ti with the D3D11 debug layer and no debug
+messages (155.561 s; diagnostic-only shader compilation). Focused atlas/text
+renders used the precompiled native shaders, with zero shader compilations and
+zero graphics errors. Texture reset released the replacements. Clean HUD off
+produced byte-identical original font, parts and button pixels. A bounded read
+also confirmed buttons_Xbox's original global.dic bytes match the captured hash.
+The final rendered A/B/X/Y pixels preserve their respective channel orders; both
+START and BACK's opaque pixels are exactly RGB 244,244,244.
+
+Seven-call native preparation medians on AMD Ryzen 5 5600X, Release clang-cl:
+font 21.6555 ms, parts 14.3596 ms, buttons 17.5400 ms (53.5551 ms total).
+These include the four mip levels and run only on atlas upload. They are component
+measurements, not a game FPS or load-time benchmark. No game was booted, gameplay
+input automated or computer use activated. In-game review remains manual.
+
+Dashboard gauges follow-up, 2026-10-23
+
+Sources are the supported US disc's original car speedo atlases and global.dic's
+burnbar. The night capture frame-474074354400 uses comp's speedo in draw 693,
+resource 131, texture-0081.bin. The start capture frame-803532502100 uses jmus's
+speedo in draw 1328, resource 132, texture-0092.bin. Both are 256x128 BC3, one
+level, 32768 bytes. These captured bytes match the original car dictionaries.
+Global burnbar is 128x128 BC3, one level, 16384 bytes, at global.dic offset
+1136724, SHA-1 4809BAAF2FB91516878C68BC786E996E7E9E9F5D. Its four rows contain
+the empty frame, solid fill, segmented fill and black curved mask. The flame
+animation uses separate pic00..pic59 textures and is not replaced.
+
+Bounded native disc listing and 64 KiB header reads identify speedo in all 22
+racing RCX files. A raster pointer at name-16 leads to dimensions at +0xc/+0x10,
+the D3D descriptor at +0x34, packed format at +0x44 and the payload offset at
+descriptor+4. Only each indicated 32768-byte payload was then read. Headers,
+pointer bounds, dimensions, format and hashes were checked; there was no whole
+disc binary scan. The front-end RCF headers do not contain a speedo entry.
+Private per-car offsets, hashes and source previews: build/checks/ui-gauges.
+
+Distinct original speedo SHA-1 hashes and cars:
+536A679F312C33E997C87E5833D7333C37AFED88 classic, gangsta
+90735F94EDE4DB605E3AA53E1D8C1F5C81A7E962 comp
+05EF682A0ED3113BA880330740DFC5DB6666606C compcs
+E7612CF6C7B8411AEBD8E6C20E2D4DB2EA360300 copcar
+1447AF2571294B7F70E017F946C18CB21F665221 coupe
+0305C1DAC8A371629370EBCDC9E31CC77356EFAE coupecs
+2234AB2EF1154E256D5D132018B31D5D17436D6C driveed
+F6AEEF982DE017137714627132645951C81FC58D hotrod, usmus
+2D113550B8A474133E57269643AFA28483AB1A5D jmus
+C2DE157690BA5AAE7C47E995B1AE4AE71CC2F399 pick, road, suv
+BEB15E8AE42451D0308C6190C843AAAF91EF1D75 pickcs, suvcs
+3D5E9FE9A8D2429D91C0FF76D5E9872121793666 roadcs
+8B7F3D8917AB071C301ECD76C79FD90F64B5BF66 sport
+B6474E520CE8DDDD33EBB979271D91B3E332EC57 sportcs
+FAF69775248B56DAD4D0291D37FE5F6189A6D7B3 stock, usmuscs
+572F9CFE6AFF2D408CCBA3E7AC1EED553D97631C super
+
+The four layouts retain the single dial's squared italic numerals, the paired
+dials' condensed lettering, individual redlines, tick positions, dark backings,
+chrome rims, speed window, needle sprites and indicator glow. Vector geometry
+replaces the rough silhouettes; smooth shading replaces compression noise.
+Stroke coverage uses winding so intersecting strokes (notably 4) stay filled.
+The small dial occludes the rear rim without stacking translucent backings.
+All sprite positions and the game's UVs, meter logic and animations are unchanged.
+Recognition and upload remain under Clean HUD, with no additional draws, shaders,
+per-frame artwork work, external assets or dependencies. Unknown hashes fall back
+to the original texture. Each loaded speedo uses 10.625 MiB and burnbar 5.3125 MiB,
+including the same four coverage mip levels; unused variants are not preloaded.
+
+Bounded preparation measurements, Ryzen 5 5600X, Release clang-cl, seven calls
+per atlas: single-dial medians 35.1493..37.0920 ms, paired-dial medians
+49.9841..51.2596 ms, boost 27.9028 ms. Reducing arc subdivision to a maximum
+.08 output-texel deviation and removing unnecessary distance/color work cut the
+initial gauge preparation by roughly one third. Existing font/parts/buttons
+remained 21.9580/13.7082/17.7364 ms. These are upload preparation measurements,
+not game FPS or full loading benchmarks. All 20 recognized sources also rejected
+a changed byte in the private probe, verifying exact-hash fallback.
+
+Final verification: Release build succeeded. All 16 gauge atlases rendered with
+Clean HUD on and off using the D3D11 debug layer, with zero graphics errors and
+zero shader compilations. Resource reset released each replacement. All disabled
+gauge pixels, plus disabled burnbar pixels, are byte-identical to the original
+reference renders. Enabled parts/buttons and the existing three-scale outlined
+font preview are byte-identical to their previously accepted versions. The final
+16-variant contact sheet and boost preview were visually checked. No game was
+booted, benchmark run or computer use activated; in-game review remains manual.
+
+Gauge fidelity correction, 2026-10-23
+
+Compared the original BC3 atlases against the previous replacement using native
+D3D11 renders, source-pixel alpha/color profiles, and lettering coverage/centroids.
+The previous outlines approximated several authored details incorrectly:
+- Single-dial chrome was concentric with the outer silhouette and disconnected
+  at the speed window. Its measured highlight is offset upward; a continuous
+  contour now tapers smoothly into the thin, evenly lit window border.
+- Each dial has its own upper-left reflection, rather than a shared vertical
+  gradient. Minor tick marks are detached from the chrome; the speedometer's
+  minor marks are gray. Red sectors have narrower colored interiors and borders.
+- Paired-dial clear centers were the wrong size. Alpha-edge fits give the rear
+  cutout approximately (65,69.1), radius 37.2, and the front (120.8,98.1), radius
+  37.3. The front hub is centered at (120.5,100), not at the outer rim's center.
+- Stock/usmuscs use alpha 116 for the face and red sector; the other paired
+  atlases use 127 and opaque red. Super's red is darker than the other layouts.
+- Squared digit strokes, terminals, caption weight, positions and small-dial
+  glyph proportions now follow the originals more closely. In comp, all nine
+  number ink areas are within 5.3% of the original (previously up to 22.5% off);
+  the x1000rpm legend is within 1.8% (previously 27.5% too thin). The large
+  speedometer lettering's measured centroids are now within .1 source pixel.
+- The thin needle was incorrectly rectangular and displaced to x244.6. It now
+  tapers from a two-pixel tip to a four-pixel base around original x244. The
+  other needle restores the measured fade and black end cap at y69.
+- Boost segments restore the four-pixel bevel/gap/face pattern and blue recess;
+  the fill is clipped to the interior and the border joins continuously. Bottom
+  chrome has constant brightness, instead of inheriting the upper rim's fade.
+
+Private diagnostics remain under build/checks/ui-gauges, including the previous
+comparison, corrected 16-variant sheet and gauges-corrected-comparison.png. These
+compare the actual renderer's original and replacement textures at the same size.
+At source scale, mean absolute RGB differences on gray 40 decreased for all
+representative layouts: comp 11.167 to 6.596, copcar 12.685 to 8.521, jmus 11.704
+to 9.952, stock 12.342 to 9.822, super 12.010 to 10.093 (0..255 channel units).
+Needle differences fell from about 12.4 to 4.8..5.0. These are supporting
+measurements, not a pixel-parity claim; intentionally removed compression noise
+also contributes to the residual difference.
+
+Final release build passed. All 16 corrected atlases rendered both enabled and
+disabled, plus all boost rows, with no D3D11 debug errors or shader compilation.
+Reset released each texture. Disabled gauge and boost renders, accepted parts,
+buttons and the three-scale outlined font preview remain byte-identical to their
+reference outputs. All 20 recognized textures again rejected a changed byte.
+Bounded upload preparation, same Ryzen 5 5600X, seven calls per atlas: single
+medians 40.1054..42.7153 ms; paired 53.9374..57.1281 ms; boost 34.9565 ms. The
+extra fidelity costs several milliseconds only when preparing an uploaded atlas.
+Memory sizes, cached uploads and per-frame drawing are unchanged. No game boot,
+gameplay automation, computer use or FPS benchmark was performed.
+
+Gauge detail corrections, 2026-10-23
+
+The dash above the paired tachometer's 5/6 was the rear speedometer's last tick:
+ticks were drawn after the foreground dial. Each rim is now shaded before its
+markings, and the complete rear dial is occluded by the foreground silhouette.
+This removes the unwanted overlap without deleting a scale division.
+
+The original burnbar has five gray marks at source x80..84, 88..92, 96..100,
+104..108 and 112..116, y2..4 in each of its three rows. Their source grays are
+approximately 74, 70, 67, 64 and 62. Restored these authored marks over the chrome.
+At the user's request, moved the single-dial zero 1.25 source pixels left and
+rotated its tick 1.5 degrees left; other scale divisions retain their positions.
+
+Release build and offline D3D11 rendering passed for all 16 gauge variants and
+all boost rows, with Clean HUD both on and off: no graphics errors or shader
+compilation. Disabled renders remain byte-identical to the original references.
+Compared with the previous redraw, single-dial changes are confined to zero and
+its tick, paired changes to the overlap, and boost changes to the five marks.
+Visually checked the contact sheet and gauges-details-comparison.png. Texture
+memory and the cached upload/per-frame paths are unchanged. No game was booted.
+
+Zero clearance correction, 2026-10-23
+
+The first single dial's zero still touched the window border because the
+border's curve was too far into the clear center. Original comp alpha edges
+place its tapered end at approximately (56.84,108.27), on the inner dial's
+104-degree point, and the horizontal band at y87..91.06. Replaced the inaccurate
+uniform stroke and matching backing boundary with smooth contours fitted to
+both original edges (about .13/.16 source-pixel RMS error). The zero and its tick
+retain their previous positions. Offline readback confirms the first layout's
+zero and border are now separated, including their antialiasing coverage.
+
+Release build and all 16 on/off D3D11 gauge renders passed with no errors or
+shader compilation. Changed pixels are confined to the single-dial window
+border; paired dials and all disabled renders remain byte-identical. Inspected
+the complete sheet and zero-clearance-comparison.png. No game boot or automation.
+
+Legend, laurels and Crash pulse correction, 2026-10-23
+
+The single-dial x1000rpm legend's stroked 1 had a raised/slanted baseline and
+an oversized black top join. Its traced ink contour now shares y41.5..47.5
+with the zeroes, including a horizontal baseline and the same outline width.
+
+Capture frame-124117990900 uses the fe_parts_xg atlas for the laurels behind
+the lesson numbers: texture-0003.bin, SHA-1
+8781ACD85F32C81754758FA8EEB9A06956A3DC3E, original bounds x38..87/y202..239.
+Traced its thirteen leaves per branch, mirror axis x63, and crossed gray stems
+in those same coordinates. This extends the existing cached parts replacement;
+no new texture or per-frame art work is introduced. At source resolution the
+integrated light coverage is within 1.8% of the original; this is supporting
+evidence for proportions, not a pixel-parity claim.
+
+Capture frame-188472767300's apparent ordering problem is an opacity wrap.
+The queue draws the animated bonus before the regular score and labels (draws
+516..518); renderer batching preserves that sequence. The source animation
+node 010764F8 has alpha -13.333376 in game-state.json. Three original updates
+later, the captured expanded glyph has alpha byte D0 (208), consistent with
+-48.33338 wrapping into an unsigned byte. The dimensions and first vertex
+also match the intervening three two-pixel expansions.
+
+Bounded original-byte decoding verifies 1F6AB subtracts the pulse opacity but
+retains the node until alpha reaches -128 (constant at 2B104C). C1210 clamps
+only the upper end of its color parameters. C20E0 truncates float opacity to
+an integer and packs it into ARGB without saturation. A negative value thus
+becomes visible again; this behavior exists with the original atlas too.
+Clean HUD now clamps negative opacity to zero at the verified C1306 draw
+boundary, after interpolation. It changes only the temporary draw parameters,
+preserving node lifetime, source animation, glyph geometry, queue order and
+all outline passes. Disabled Clean HUD retains the original behavior. Private
+decode evidence and offline previews are under build/checks/ui-wreaths.
+
+Final release build passed. A private native probe executes the compiled C1210
+queue, BFE70 outlined text and C20E0 packing routines with overlapping large and
+small bonus text. All 20 on/off opacity cases passed, including both captured
+negative values: only expired alpha bytes change; all 118 vertices retain their
+positions, UVs, RGB and order, the normal text stays opaque, and the animation's
+source alpha remains unchanged. The full existing CPU check passed all 52
+groups: 26,026 instruction, 3,467 memory, 6,744 floating and 109 control cases.
+
+All 16 gauges rendered on/off with no D3D11 errors or shader compilation.
+Changes from the accepted gauges are confined to the legend's 1; its measured
+white top/bottom exactly match all three zeroes in the enlarged render. Parts
+changes are confined to the wreath. Disabled gauges and native-size parts are
+byte-identical to their original references. All 20 recognized atlas variants
+still reject a modified source byte. Parts preparation median was 16.8259 ms
+over seven offline calls on the same Ryzen 5 5600X; cached atlas size remains
+10.625 MiB, with no added per-frame art generation. Inspected the final comparison
+and glyph close-up. No game boot, computer use or gameplay benchmark was run.
+
+Clean HUD fidelity audit and feature removal, 2026-10-23
+
+Compared all 20 recognized BC3 atlases with native D3D11 on/off renders and
+bounded source-pixel measurements. The gauge 4's triangular centreline produced
+an acute miter, unlike the original flat-topped numeral. It is now an ink contour
+with the original crossbar and counter. Open strokes such as the top of 5 had
+no black end caps, leaving their white ends exposed. Gauge numerals now use
+0.9-source-pixel black borders with complete caps and rounded outer joins.
+This thicker-outline change is confined to gauges, as requested; ordinary text
+keeps the game's original outline draws. The first zero remains clear of the
+window border, and the legend's 1 retains the zeroes' baseline.
+
+The small x1000rpm label had a multiplication cross and angular rpm lettering.
+Traced the original serif x and curved lowercase forms instead. Mean source-pixel
+light differences in the bounded 4/x/rpm regions decreased respectively from
+27.089/44.802/29.058 to 14.840/22.140/19.775 on the 0..255 scale. This supports the
+traces, not a pixel-parity claim. Font K/y/z also had undersized diagonal strokes
+and an undersized y descender. Alpha-edge measurements reduced their ink-area
+differences from -8.31/-8.20/-7.14 percent to -0.71/+0.36/-0.95 percent. Other
+lettering and the accepted buttons, arrows, boxes and wreath are unchanged.
+
+Moon capture draw 695 uses burnbar resource 132 (texture-0083.bin), UV texels
+(1,1)..(126,32). Draws 696/697 use its alpha-mask row (1,97)..(126,128);
+draw 697 writes only destination alpha. Draw 698 applies the animated fire with
+destination-alpha blending. The separately traced replacement mask left a gap
+inside the replacement frame, especially along its curve. The bars and mask now
+derive from the exact inner edge of that four-pixel rim; its right end also
+reaches original x126. Gray rim marks and the original animated fire remain.
+
+Removed the locked Burnout 1 Time Attack row, its menu/lookup hooks and automatic
+imported-track mounting. Existing asset research/conversion diagnostics remain.
+Removed DLSS/FSR/XeSS settings, rendering paths, shaders, SDK download/link/copy
+rules and release DLLs. Native resolution, FXAA, MSAA and GTAO remain available.
+
+Release build passes. All 52 CPU groups, the settings diagnostic, original
+30-entry Time Attack menu fixture (within check-track-import), and all 262
+renderer cases pass. D3D11 debug messages: zero. All 20 HUD atlases render on/off
+with zero shader compilations or graphics errors and release their textures on
+reset. Disabled gauge renders are byte-identical to the previous originals;
+accepted parts/buttons are byte-identical too. Altered hashes are rejected.
+Seven-call upload-preparation medians on Ryzen 5 5600X: gauges 40.410..59.773 ms,
+boost 34.767 ms, font 21.739 ms, parts 18.117 ms, buttons 17.379 ms. Cached memory
+and per-frame paths are unchanged. Private evidence is in build/checks/hud-review.
+No game boot, computer use or gameplay benchmark was performed.
+
+Gauge alignment, punctuation outlines and top crop, 2026-10-23
+
+The eight paired-dial originals center their gray light slot at approximately
+(139.5,114.5). The separate light sprite remains centered at (244.5,116.5).
+The replacement slot was at (137.7,114.6); corrected its center, preserving the
+light sprite and original placement. Removed unused lights from the copcar,
+driveed and pick/road/suv single-dial atlases: their original lamp region is
+entirely transparent. Lamp presence now follows the paired layout directly.
+
+Capture frame-115204020900 shows vertical seams through the colon and period
+in SESSION BEST. Its font hash and original metrics are unchanged: period
+UV (250,61)..(254,90), colon (250,121)..(254,150). The original C0080 italic
+text routine emits only four diagonal outline copies. Their edges can leave
+gaps around narrow ink; the original font reproduces the seams too. BFE70's
+upright equivalent has the same limitation. Clean HUD now adds their four
+edge-midpoint copies before the original final black/white passes, retaining
+outline extent, italic shear, glyph UVs, ink size and spacing. These are direct
+calls to the verified original C2700/C29F0 routines, with all seven arguments
+restored before each call (C2700 consumes its count and uses an argument as
+scratch). Original-byte call checks: C0042 E8B9260000; C0361 E88A260000.
+No font atlas edits, extra textures, per-frame allocations or I/O are needed.
+The additional four black passes increase outlined-text vertex work; this is
+not a gameplay-performance measurement.
+
+Capture frame-182524514900 draw 862 samples the single gauge from (7,4) to
+(168,124). All eight single-dial originals contain rim coverage in row 3,
+which this quad discards. At verified 251F9 (E882D00900, call C2280), Clean HUD
+extends only the temporary background quad's top to texture row zero, moving
+its screen top by the same texel scale. Existing artwork remains at precisely
+the same position and size; needles, light, labels and the bottom edge retain
+their original draws. This also preserves paired-dial geometry. Disabled
+Clean HUD retains the original crop and text passes.
+
+Release build passed. All 52 CPU groups pass: 26,026 instruction, 3,518 memory,
+6,744 floating and 109 control cases across 36,149 compiled functions. A private
+native check executes the original C1210 queue and both text routines for 12
+size/style/text cases in each mode. White foreground, UVs, spacing and original
+passes are byte-identical; the added coverage removes the punctuation seams.
+Native 25150 checks using two UV rectangles show only the first two vertices'
+top Y/V fields change; all remaining geometry, including needles, is identical.
+
+All 16 gauge atlases render in both modes without D3D11 errors or shader
+compilation; reset releases their resources. Atlas changes are confined to
+the corrected slots and removed unused lights. Disabled gauge output and all
+four other recognized atlases (font, parts, buttons, boost) are byte-identical
+to the prior accepted renders in both modes. Cached texture sizes are unchanged.
+Evidence, original-byte reads and inspected native before/after renders are
+under build/checks/hud-followup. No game boot, computer use or gameplay benchmark
+was performed.
+
+Single-dial crop coverage correction, 2026-10-23
+
+The prior crop fix missed the actual single-dial routine. Capture
+frame-160405080700 (police car) identifies callback 24440 in its UI node and
+still samples UV (7,4)..(168,124) in draw 385. Its screen clip is the full
+640x480 viewport, so this is not scissor clipping. The previous native probe
+varied two UV rectangles inside callback 25150; that did not exercise 24440.
+
+Original constructor 26740 dispatches the 22 car IDs through table 26A10 and
+selectors 26A20. Entries 26802/2681C select 24440 (single dial, two scales),
+while 26836/26850 select 25150 (double dial, two scales). Both use C2280 for
+the background. Added the same top-extension fix at 244F3, verified original
+bytes E888DD0900. The hook remains gated by Clean HUD and shares the existing
+calculation; no texture or per-frame allocation changes are required.
+
+Release rebuild passes. A corrected isolated native probe calls both actual
+routines, each scale variant, at three display sizes, with Clean HUD on/off:
+24 cases pass. It snapshots before the original buffer flush where needed,
+without a game boot or simulated platform calls. The original police-car
+quad reproduces all 112 bytes captured in draw 385. With Clean HUD enabled,
+only its first two vertices' top Y/V change (Y 316.745361 to 312.770203;
+V 4 to 0 source texels). All other generated vertex bytes, including needles,
+remain identical. An inspected D3D11 close-up reproduces the flat crop and
+shows the restored rounded top. No graphics errors or shader compilation.
+All 52 CPU check groups still pass. Evidence: build/checks/gauge-crop.
+
+Clean HUD rim, vanilla outline and upload follow-up (2026-10-24)
+---------------------------------------------------------------
+The circled single-dial defect is the outer silhouette's 0.78-texel step
+between the circular arc endpoint (53.165,123.017) and the flat panel at
+(53.16,123.8). Join these with a tangent cubic ending horizontally at
+(64,123.8). The chrome, ticks, lettering and layout stay unchanged. Across
+all four mip levels, only 287 bytes per single-dial atlas changed; the other
+12 recognized atlases are identical. Private before/after rim composites
+show that the outer edge now joins smoothly.
+
+C0042/C0361's previously verified four midpoint outline copies now apply
+regardless of Clean HUD. These close the original period/colon outline gaps
+without replacing the vanilla font. Native C1210 checks cover twelve text
+cases, three sizes and both upright/italic paths, with identical geometry
+in both settings. Offscreen images use their actual vanilla/redrawn textures.
+Both modes report zero rendering errors and zero shader compilations.
+
+paint now tracks only edges crossing the current scanline. Edge-intersection
+arithmetic, horizontal coverage and blending are unchanged. Before the rim
+edit, all 20 atlas outputs (including every mip) are byte-for-byte identical.
+On Ryzen 5 5600X, five redraws per atlas gave summed per-atlas median times
+of 835.159 ms before and 774.328 ms after (7.28% less generation time).
+The final rim variant totals 774.155 ms. This measures upload-time generation,
+not game FPS. Texture formats, mip count and resident texture bytes are
+unchanged; generation still happens only during cached atlas upload.
+Evidence: build/checks/render-followup-20261024/ui-*.jsonl, rim-comparison.png,
+punctuation-vanilla.png, punctuation-clean.png and hud-*.txt.
+
+Font symbols and trophy selection (2026-10-24)
+---------------------------------------------
+Traced &, (, ), and $ in the recognized font atlas. Original white-ink bounds
+are (234,189,16,18), (247,6,7,21), (132,216,7,21), and (221,184,12,25).
+The original parentheses have flat stems with rounded outside ends; preserve
+that design. The new paths are appended so gauge digit/alphabet indices stay
+unchanged. Clean HUD uses the existing cached atlas and four BC3 mip levels
+(5,570,560 bytes); disabled artwork and original text layout are unchanged.
+
+Capture frame-1056706802100 identifies the trophy sprite at node 005CE428,
+callback BFBF0, texture 0113A1F0. BFC3B..BFC52 read all four UV coordinates
+and the texture pointer from node+28..38. UI interpolation previously identified
+sprites using only the first three UV coordinates, overlooking texture/crop
+changes. A newly selected trophy could therefore inherit the preceding image's
+width. Include the fourth UV coordinate and texture in BFBF0's content identity
+to restart its display history when the image changes. Other callbacks retain
+their previous identity rules. Same-image scrolling still interpolates, with
+no allocations or extra draw calls; the fixed history storage grows by 8 KiB.
+
+A private native probe reproduces an 80-unit replacement drawing at width 116
+one quarter into a 128-to-80 transition before the fix. Afterwards it stays at
+80 across twelve display fractions, for both texture swaps and crop swaps;
+same-image motion/size interpolation remains intact. Both Clean HUD settings
+pass. Original C1210 text callbacks exercise all four symbols separately and
+together at three sizes, including upright and italic rendering. All fifteen
+generated vertex streams are identical with Clean HUD on/off, and both rendered
+images report zero graphics errors. Inspected original/redrawn atlas crops and
+native text images are under build/checks/trophy-glyphs-20261024. Release build
+and all 52 CPU diagnostic groups pass. No gameplay benchmark was performed.

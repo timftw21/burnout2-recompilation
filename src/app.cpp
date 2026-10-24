@@ -84,10 +84,10 @@ struct Preferences {
     std::array<char,4096> xbe{},disc{},music_folder{};
     bool vsync=false,fullscreen=false,keyboard=true,muted=false,show_fps=false,motion_blur=true;
     int aspect_ratio=0; // 0=4:3, 1=16:9, 2=21:9.
-    int refresh_rate=60,volume=100,resolution_scale=1,antialiasing=0,anisotropy=0,upscaling=0;
+    int refresh_rate=60,volume=100,resolution_scale=1,antialiasing=0,anisotropy=0;
     int ambient_occlusion=0,ambient_occlusion_strength=35;
     bool custom_music=false,loop_track=false;
-    bool skip_intro=false;
+    bool skip_intro=false,fast_load=false,clean_hud=true;
     int draw_distance=1;
     KeyboardBindings bindings=default_keyboard_bindings();
     explicit Preferences(bool load=true,const std::filesystem::path& path="data/local/settings.cfg") {
@@ -120,6 +120,8 @@ struct Preferences {
             else if(key=="custom_music") custom_music=value=="1";
             else if(key=="loop_track") loop_track=value=="1";
             else if(key=="skip_intro") skip_intro=value=="1";
+            else if(key=="fast_load") fast_load=value=="1";
+            else if(key=="clean_hud") clean_hud=value=="1";
             else if(key=="highest_lod" || key=="unlimited_distance") legacy_distance|=value=="1";
             else if(key=="draw_distance") {
                 int candidate=0;number(candidate,1,4);
@@ -131,7 +133,6 @@ struct Preferences {
             else if(key=="antialiasing") number(antialiasing,0,6);
             else if(key=="ambient_occlusion") number(ambient_occlusion,0,3);
             else if(key=="ambient_occlusion_strength") number(ambient_occlusion_strength,0,100);
-            else if(key=="upscaling") number(upscaling,0,3);
             else if(key=="anisotropy") {
                 auto candidate=anisotropy;number(candidate,0,16);
                 if(!candidate || std::has_single_bit(unsigned(candidate))) anisotropy=candidate;
@@ -154,8 +155,7 @@ struct Preferences {
             <<"\nresolution_scale="<<resolution_scale<<"\nshow_fps="<<show_fps<<"\nwidescreen="<<(aspect_ratio!=0)<<"\naspect_ratio="<<aspect_ratio
             <<"\nantialiasing="<<antialiasing<<"\nanisotropy="<<anisotropy
             <<"\nambient_occlusion="<<ambient_occlusion<<"\nambient_occlusion_strength="<<ambient_occlusion_strength
-            <<"\nupscaling="<<upscaling
-            <<"\nskip_intro="<<skip_intro<<"\nmotion_blur="<<motion_blur<<"\ndraw_distance="<<draw_distance
+            <<"\nskip_intro="<<skip_intro<<"\nfast_load="<<fast_load<<"\nclean_hud="<<clean_hud<<"\nmotion_blur="<<motion_blur<<"\ndraw_distance="<<draw_distance
             <<"\ncustom_music="<<custom_music<<"\nloop_track="<<loop_track<<"\nmusic_folder="<<music_folder.data()<<'\n';
         for(unsigned i=0;i<keyboard_actions.size();++i) file<<"key_"<<keyboard_actions[i].id<<'='<<bindings[i]<<'\n';
         if(!file) throw std::runtime_error("Could not save settings");
@@ -363,12 +363,6 @@ struct App {
     bool cursor_hidden=false;
     App(bool hidden,bool warp,const std::filesystem::path& script={},const std::filesystem::path& preferences="data/local/settings.cfg"):
         settings(!hidden,preferences),settings_path(preferences) {
-#ifndef _WIN32
-        if(settings.upscaling) {
-            settings.upscaling=0;settings_dirty=true;
-            log_message("DLSS, FSR and XeSS are Windows-only. Upscaling has been set to Off.");
-        }
-#endif
         music_songs=custom_music_count(music_cache());
         // Explicit scripts must work while the user keeps another app focused.
         // This process reads only its own virtual controller in script mode.
@@ -393,7 +387,7 @@ struct App {
 #else
             void* handle=window;const bool native_debug=false;
 #endif
-            active_scale=settings.upscaling?std::max(1,(settings.resolution_scale+1)/2):settings.resolution_scale;
+            active_scale=settings.resolution_scale;
             renderer=std::make_unique<Renderer>(640,480,warp,native_debug,active_scale);renderer->attach_window(handle);
             configure_enhancements();
             active_aspect_ratio=settings.aspect_ratio;active_widescreen=active_aspect_ratio!=0;active_motion_blur=settings.motion_blur;renderer->aspect_ratio(settings.aspect());
@@ -443,8 +437,8 @@ struct App {
         } catch(const std::exception& error) {performance.reset();log_message(error.what());}
     }
     std::string benchmark_settings() const {
-        return std::format("\"refresh_rate\":{},\"resolution_scale\":{},\"output_resolution_scale\":{},\"upscaling\":{},\"draw_distance\":{},\"widescreen\":{},\"aspect_ratio\":{},\"motion_blur\":{},\"vsync\":{}",
-            settings.refresh_rate,active_scale,settings.resolution_scale,settings.upscaling,settings.draw_distance,active_widescreen,active_aspect_ratio,active_motion_blur,settings.vsync);
+        return std::format("\"refresh_rate\":{},\"resolution_scale\":{},\"output_resolution_scale\":{},\"draw_distance\":{},\"widescreen\":{},\"aspect_ratio\":{},\"motion_blur\":{},\"vsync\":{}",
+            settings.refresh_rate,active_scale,settings.resolution_scale,settings.draw_distance,active_widescreen,active_aspect_ratio,active_motion_blur,settings.vsync);
     }
     void stop_benchmark() {
         if(!benchmark_started) return;
@@ -776,7 +770,7 @@ struct App {
                         ImGui::Spacing();ImGui::SeparatorText("RESOLUTION");
                         {
                             const auto label=std::format("{}x ({} x {})",settings.resolution_scale,640*settings.resolution_scale,480*settings.resolution_scale);
-                            setting_label(settings.upscaling?"Output resolution":"Internal resolution");
+                            setting_label("Internal resolution");
                             if(ImGui::BeginCombo("##Resolution",label.c_str())) {
                                 for(int scale=1;scale<=4;++scale) {
                                     const auto option=std::format("{}x ({} x {})",scale,640*scale,480*scale);
@@ -784,7 +778,7 @@ struct App {
                                 }
                                 ImGui::EndCombo();
                             }
-                            setting_help(settings.upscaling?"Upscaling reconstructs this resolution from a smaller image. At 1x it provides antialiasing at native resolution. Use Restart game to apply changes.":playing?"Higher resolutions sharpen geometry and use more GPU power. Original proportions are preserved. Use Restart game to apply changes.":
+                            setting_help(playing?"Higher resolutions sharpen geometry and use more GPU power. Original proportions are preserved. Use Restart game to apply changes.":
                                 "Higher resolutions sharpen geometry and use more GPU power. Original proportions are preserved. Applies when you start the game.");
                         }
                         ImGui::TextWrapped("Resolution and aspect ratio changes apply when you start or restart the game.");
@@ -797,33 +791,8 @@ struct App {
                         int distance=0;for(int i=0;i<3;++i) if(settings.draw_distance==distances[i]) distance=i;
                         setting_label("Draw distance");
                         if(ImGui::Combo("##Draw distance",&distance,distance_labels,3)) {settings.draw_distance=distances[distance];changed=true;}
-                        setting_help("Draws additional scenery farther away using compatible track views and distant models. Also extends camera range, object fades and traffic detail. Applies when you start or restart the game.");
+                        setting_help("Draws compatible scenery farther away, blends scenery detail changes, and smooths traffic fades. Higher settings can increase rendering work. Applies when you start or restart the game.");
                         ImGui::Spacing();ImGui::SeparatorText("IMAGE QUALITY");
-                        constexpr const char* upscalers[]={"Off (original)","DLSS (experimental)","FSR (experimental)","XeSS (experimental)"};
-                        setting_label("Upscaling technique");
-                        if(ImGui::BeginCombo("##Upscaling technique",upscalers[settings.upscaling])) {
-                            for(int i=0;i<int(std::size(upscalers));++i) {
-                                const bool supported=renderer->supports_upscaling(UpscaleMethod(i));
-                                ImGui::BeginDisabled(!supported);
-                                if(ImGui::Selectable(upscalers[i],settings.upscaling==i)) {settings.upscaling=i;changed=true;}
-                                if(!supported) {
-#ifdef _WIN32
-                                    setting_help("This technique is unavailable on your graphics device.");
-#else
-                                    setting_help("DLSS, FSR and XeSS are Windows-only.");
-#endif
-                                }
-                                ImGui::EndDisabled();
-                            }
-                            ImGui::EndCombo();
-                        }
-#ifdef _WIN32
-                        setting_help("Reconstructs the output resolution selected in Graphics from a smaller image, or provides antialiasing at 1x. DLSS requires an NVIDIA RTX graphics card. FSR and XeSS also work on other supported cards.");
-                        ImGui::TextWrapped("Experimental: DLSS, FSR and XeSS have visual issues and may reduce performance.");
-#else
-                        setting_help("DLSS, FSR and XeSS are Windows-only.");
-#endif
-                        ImGui::BeginDisabled(settings.upscaling!=0);
                         constexpr const char* levels[]={"Off (original)","FXAA Low","FXAA Medium","FXAA High","MSAA 2x","MSAA 4x","MSAA 8x"};
                         setting_label("Antialiasing");
                         if(ImGui::BeginCombo("##Antialiasing",levels[settings.antialiasing])) {
@@ -837,7 +806,6 @@ struct App {
                             ImGui::EndCombo();
                         }
                         setting_help("MSAA smooths geometry edges while keeping textures sharp. Higher sample counts use more GPU power and memory. FXAA smooths the whole image and can soften fine detail and in-game text.");
-                        ImGui::EndDisabled();
                         constexpr const char* ao_levels[]={"Off (original)","GTAO Low","GTAO Medium","GTAO High"};
                         setting_label("Ambient occlusion");
                         if(ImGui::Combo("##Ambient occlusion",&settings.ambient_occlusion,ao_levels,int(std::size(ao_levels)))) changed=true;
@@ -854,6 +822,10 @@ struct App {
                         if(ImGui::Combo("##Anisotropic filtering",&selected,filters,int(std::size(filters)))) {settings.anisotropy=values[selected];changed=true;}
                         setting_help("Keeps road and other textures sharper at an angle. The original game uses anisotropic filtering. Original preserves each texture's settings; higher values use more GPU power.");
                         ImGui::Spacing();ImGui::SeparatorText("MISCELLANEOUS");
+                        changed|=ImGui::Checkbox("Clean HUD",&settings.clean_hud);
+                        setting_help("Redraws the original HUD lettering, outlines, arrows, menu boxes, wreaths, Xbox button icons and gauges with smooth edges. Also prevents faded Crash bonus numbers from reappearing. Applies when you start or restart the game.");
+                        changed|=ImGui::Checkbox("Fast load",&settings.fast_load);
+                        setting_help("Finishes loading as soon as the game's assets are ready, without the original loading fades or frame delays. Applies when you start or restart the game.");
                         changed|=ImGui::Checkbox("Motion blur",&settings.motion_blur);
                         setting_help("Enables the original game's scene blur during boosting and other speed effects. Applies when you start or restart the game.");
                         changed|=ImGui::Checkbox("Skip intro splash screens",&settings.skip_intro);
@@ -966,22 +938,22 @@ struct App {
             if(playing) frame_presented();
         } else pacer.wait(settings.refresh_rate);
     }
-    void display_game() {
-        if(renderer->display()) {
+    void display_game(bool wait=true) {
+        if(renderer->display(wait)) {
             settings_interface();
-            if(renderer->present(settings.vsync)) frame_presented();
+            if(renderer->present(settings.vsync,wait)) frame_presented();
         }
     }
     void game_flip() {
+        const bool fast_loading=game && game->fast_loading();
         auto now=SDL_GetTicksNS();source_pacer.due(settings.refresh_rate,now);
-        while(running && !display_paced() && now<source_pacer.next) {
+        while(running && !fast_loading && !display_paced() && now<source_pacer.next) {
             if(!poll_game()) return;
             now=SDL_GetTicksNS();source_pacer.due(settings.refresh_rate,now);
             if(now<source_pacer.next) {PerfScope wait(&performance,PerfPhase::pacing);SDL_DelayPrecise(source_pacer.next-now);}
             now=SDL_GetTicksNS();
         }
         if(!running || launch) return;
-        const bool reset=!published_at || now-published_at>100000000;
         published_at=now;
         if(performance.active()) performance.source_frame(renderer->stats().published_frames+1,performance_counters());
         if(benchmark_started) {
@@ -989,25 +961,30 @@ struct App {
                 if(benchmark_frames.size()<8192) benchmark_frames.push_back(now);else ++benchmark_dropped;
             }
         }
-        renderer->publish_frame(reset);source_pacer.advance();
+        renderer->publish_frame();source_pacer.advance();
         game_rate.sample(now);
         if(!first_source) first_source=now;last_source=now;
         if(controls && !controls->started) controls->started=now;
-        display_game();
+        if(fast_loading) {
+            // Keep input/settings responsive, but never stall asset loading on
+            // the display queue. The first gameplay flip resumes normal pacing.
+            display_game(false);
+            source_pacer.next=now;
+        } else display_game();
     }
     void configure_enhancements() {
         if(settings.antialiasing>=4 && !renderer->supports_msaa(1U<<(settings.antialiasing-3))) {
             log_message(std::format("MSAA {}x is unavailable on this graphics device. Antialiasing has been set to Off.",1U<<(settings.antialiasing-3)));
             settings.antialiasing=0;settings_dirty=true;
         }
-        renderer->enhancements(settings.upscaling?0:settings.antialiasing,settings.anisotropy);
-        renderer->upscaling(UpscaleMethod(settings.upscaling),unsigned(settings.resolution_scale));
+        renderer->enhancements(settings.antialiasing,settings.anisotropy);
+        renderer->clean_hud(settings.clean_hud);
         renderer->ambient_occlusion(unsigned(settings.ambient_occlusion),settings.ambient_occlusion_strength/100.0f);
     }
     void configure_graphics() {
         // Preserve pipelines/UI while discarding the previous game's resources.
         // Mid-race recreation would lose feedback, depth and texture identities.
-        active_scale=settings.upscaling?std::max(1,(settings.resolution_scale+1)/2):settings.resolution_scale;
+        active_scale=settings.resolution_scale;
         renderer->reset(active_scale);
         configure_enhancements();
         active_aspect_ratio=settings.aspect_ratio;active_widescreen=active_aspect_ratio!=0;active_motion_blur=settings.motion_blur;renderer->aspect_ratio(settings.aspect());
@@ -1023,10 +1000,7 @@ struct App {
         if(controls) host.storage_root=settings_path.parent_path()/"automation-user";
         host.widescreen=active_widescreen;
         host.ultrawide=active_aspect_ratio==2;host.motion_blur=active_motion_blur;
-        host.skip_intro=settings.skip_intro;host.draw_distance=unsigned(settings.draw_distance);
-        host.upscaling=settings.upscaling!=0;
-        const auto imported=settings_path.parent_path()/"imported-tracks/interstate";
-        if(std::filesystem::exists(imported/"import.json")) host.imported_tracks=imported;
+        host.skip_intro=settings.skip_intro;host.fast_load=settings.fast_load;host.clean_hud=settings.clean_hud;host.draw_distance=unsigned(settings.draw_distance);
         if(settings.custom_music && music_songs) host.custom_music_root=music_cache();
         host.loop_track=settings.loop_track;
         host.music_loop_changed=[this](bool enabled) {settings.loop_track=enabled;settings_dirty=true;save_settings();};
@@ -1081,8 +1055,8 @@ struct App {
         }
         const auto fps=last_frame>first_frame?(frames-1)*1000000000.0/(last_frame-first_frame):0;
         const auto source_fps=last_source>first_source?(stats.published_frames-1)*1000000000.0/(last_source-first_source):0;
-        report<<std::format("],\"adapter\":{},\"shader_compilations\":{},\"uploaded_vertex_bytes\":{},\"reused_vertex_bytes\":{},\"vblank_callbacks\":{},\"refresh_rate\":{},\"resolution_scale\":{},\"widescreen\":{},\"aspect_ratio\":{},\"motion_blur\":{},\"source_fps\":{:.3f},\"presented_fps\":{:.3f},\"original_camera_far\":{},\"camera_far\":{},\"original_world_sections\":{},\"extra_world_sections\":{},\"extra_world_batches\":{},\"display_refresh\":{},\"output_resolution_scale\":{},\"upscaling\":{},\"memory\":{}}}",
-            json(result.graphics_adapter),stats.shader_compilations,stats.vertex_bytes,stats.reused_vertex_bytes,result.vblank_callbacks,settings.refresh_rate,active_scale,active_widescreen,active_aspect_ratio,active_motion_blur,source_fps,fps,result.original_camera_far,result.camera_far,result.original_world_sections,result.extra_world_sections,result.extra_world_batches,display_refresh,settings.resolution_scale,settings.upscaling,memory_snapshot);
+        report<<std::format("],\"adapter\":{},\"shader_compilations\":{},\"uploaded_vertex_bytes\":{},\"reused_vertex_bytes\":{},\"vblank_callbacks\":{},\"refresh_rate\":{},\"resolution_scale\":{},\"widescreen\":{},\"aspect_ratio\":{},\"motion_blur\":{},\"source_fps\":{:.3f},\"presented_fps\":{:.3f},\"original_camera_far\":{},\"camera_far\":{},\"original_world_sections\":{},\"extra_world_sections\":{},\"extra_world_batches\":{},\"display_refresh\":{},\"output_resolution_scale\":{},\"memory\":{}}}",
+            json(result.graphics_adapter),stats.shader_compilations,stats.vertex_bytes,stats.reused_vertex_bytes,result.vblank_callbacks,settings.refresh_rate,active_scale,active_widescreen,active_aspect_ratio,active_motion_blur,source_fps,fps,result.original_camera_far,result.camera_far,result.original_world_sections,result.extra_world_sections,result.extra_world_batches,display_refresh,settings.resolution_scale,memory_snapshot);
         return report.str();
     }
 };
@@ -1131,6 +1105,8 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
             throw std::runtime_error(SDL_GetError());
     };
     if(app.settings.refresh_rate!=60) throw std::runtime_error("Default refresh rate differs from 60 Hz");
+    if(app.settings.fast_load) throw std::runtime_error("Fast load must default to disabled");
+    if(!app.settings.clean_hud) throw std::runtime_error("Clean HUD must preserve the enabled default");
     if(!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
     FrameRate counter_rate;counter_rate.sample(1);
     for(unsigned frame=1;frame<=60;++frame) counter_rate.sample(1+frame*1000000000ULL/120);
@@ -1138,12 +1114,14 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     Preferences saved(false);saved.resolution_scale=3;saved.select_refresh_rate(144);saved.show_fps=true;saved.aspect_ratio=2;saved.motion_blur=false;saved.bindings[15]=SDL_SCANCODE_Z;
     saved.custom_music=true;saved.loop_track=true;copy_text(saved.music_folder.data(),saved.music_folder.size(),"Music/Custom playlist");
     saved.antialiasing=6;saved.anisotropy=16;saved.ambient_occlusion=3;saved.ambient_occlusion_strength=47;
-    saved.skip_intro=true;saved.draw_distance=4;saved.upscaling=3;
+    saved.skip_intro=true;saved.fast_load=true;saved.clean_hud=false;saved.draw_distance=4;
     saved.save(preferences);Preferences restored(true,preferences);
     if(restored.bindings!=saved.bindings || restored.resolution_scale!=3 || restored.refresh_rate!=144 || !restored.show_fps || restored.aspect_ratio!=2 || restored.motion_blur ||
        !restored.custom_music || !restored.loop_track || restored.music_folder!=saved.music_folder || restored.antialiasing!=6 || restored.anisotropy!=16 || restored.ambient_occlusion!=3 || restored.ambient_occlusion_strength!=47 ||
-       !restored.skip_intro || restored.draw_distance!=4 || restored.upscaling!=3)
+       !restored.skip_intro || !restored.fast_load || restored.clean_hud || restored.draw_distance!=4)
         throw std::runtime_error("New settings did not survive save/load");
+    saved.clean_hud=true;saved.save(preferences);
+    if(!Preferences(true,preferences).clean_hud) throw std::runtime_error("Enabled Clean HUD did not survive save/load");
     for(const auto value:{1,2,4}) {
         saved.draw_distance=value;saved.save(preferences);
         if(Preferences(true,preferences).draw_distance!=value) throw std::runtime_error("Draw distance did not survive save/load");

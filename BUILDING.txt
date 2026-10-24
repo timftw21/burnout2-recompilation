@@ -69,7 +69,7 @@ built. The native diagnostics have the same options as on Windows; use b2 and
 b2-tool without the .exe suffix. CPU and effects reports are generated under
 build/linux/generated/Release. No gameplay benchmark is implied by a native build.
 
-Linux currently reports DLSS/FSR/XeSS D3D12 reconstruction, WARP, the D3D11
+Linux currently reports WARP, the D3D11
 debug layer and hardware memory watches as unsupported. Native resolution,
 higher internal resolutions and the shared D3D11 antialiasing paths use Vulkan.
 For software offscreen rendering, select a software Vulkan ICD through its
@@ -133,7 +133,7 @@ effects and file checks still run; GPU checks explicitly report unavailable.
 Compatible hardware automatically enables the offscreen draw and the storage
 suite's resident-texture cases. Audible playback, gameplay and performance
 still require validation on both Mac architectures. Windows-only D3D12
-upscalers, WARP, D3D11 debug layers and hardware
+WARP, D3D11 debug layers and hardware
 memory watches remain unavailable. x87 transcendental results need comparison
 on game scenes; MPFR does not reproduce the Pentium's internal approximations.
 
@@ -597,7 +597,7 @@ Ambient occlusion offers Off/GTAO Low/Medium/High and a strength control. It
 defaults Off; the initial strength is 35%. It adds contact shading using the
 original perspective camera and a depth snapshot, without changing original
 colour/depth/feedback targets. Supported HUD layers are composed afterward.
-The added image feeds FXAA and upscaling. Shaders compile during
+The added image feeds FXAA. Shaders compile during
 the build, and AO resources are allocated only while enabled. Settings apply
 at the next start/restart. Original baked shading remains; lower strength keeps
 the added effect subtle. Screen-space AO cannot account for hidden geometry.
@@ -633,20 +633,6 @@ start/restart. Existing enabled override settings migrate to 2x; an explicit
 draw_distance=1, 2 or 4 takes precedence. Only the new setting is saved.
 Intro skip finishes the original logo sequence at the PRESS START title screen
 after required loading, preserving its normal controls and attract timeout.
-DLSS, FSR and XeSS are marked experimental in settings, with a visible warning
-about visual issues and possible performance loss. They use their pinned vendor
-SDKs, downloaded and verified by cmake/upscalers.cmake. D3D11 rendering shares
-images and GPU fences with a D3D12
-compute queue on the same adapter. Input includes native depth, camera parameters,
-vertex jitter, optical-flow motion and responsive UI/effect masks. Vertex variants
-and conversion shaders compile ahead of time. Motion is image-estimated rather
-than exact engine motion; quality around moving fine detail remains a limitation.
-Resolution selects the output size while upscaling is enabled. The game renders
-at half that scale, rounded up to a whole native scale; 1x applies the vendor's
-temporal antialiasing at native resolution.
-Separate MSAA/FXAA is inactive while upscaling is enabled; its saved choice remains.
-b2-tool check-upscaling OUTPUT runs native SDK and renderer diagnostics without
-booting. The build copies vendor libraries and license notices beside both tools.
 The FPS overlay measures display and original-game frames separately over half
 a second and is drawn at window resolution.
 Controls allows a key per action, clearing bindings and restoring defaults.
@@ -655,8 +641,32 @@ Settings, including scancodes and game-file paths, save automatically in
 data/local/settings.cfg after editing. Closing settings or the app also saves
 pending edits. Continuous slider/text edits do not write on every frame.
 Graphics / Display offers 4:3, 16:9 and 21:9 aspect ratios. Enhancements /
-Miscellaneous includes Motion blur, enabled by default. Both apply on game start
-or restart; existing widescreen settings migrate to 16:9.
+Miscellaneous includes Motion blur, enabled by default, and Fast load, disabled
+by default. Fast load removes loading fades and display pacing while the original
+asset loaders finish; it does not bypass file-completion checks or change gameplay
+timing. These settings apply on game start or restart; existing widescreen settings
+migrate to 16:9.
+Clean HUD, enabled by default in Enhancements / Miscellaneous, redraws the
+original A-Z/a-z lettering, digits, exclamation point, ampersand, parentheses,
+dollar sign, small multiplication x,
+position slash, white menu arrows, rounded menu boxes, laurel wreaths, Xbox button icons,
+speedometers, tachometers and boost gauges. All 16 original dashboard variants
+retain their markings, redlines, needles and translucent backgrounds; boost
+keeps its original animated flames. Clean HUD also prevents faded-out Crash
+bonus numbers from reappearing when their opacity goes below zero.
+Gauge numbers have complete, smooth black outlines, including stroke ends.
+The boost bars and flame mask follow the same inner edge as the redrawn frame.
+Turning it off restores the original textures and opacity behavior on
+start/restart. Exact source-atlas hashes select the
+traced outlines at upload; layout, colors and game-drawn shadows remain.
+Preparation uses cached rows and integer interpolation, with BC3 storage for the
+white font. Filtered copies down to the original atlas sizes keep both edges of
+text outlines smooth when reduced to screen size. Each Xbox button retains its
+own colors and highlights; START and BACK use the same shade. The five enhanced
+atlases for one dashboard, including filtered levels, total 37.1875 MiB. Each
+additional dashboard variant uses 10.625 MiB when uploaded. Existing texture caching avoids
+rebuilding on each draw; disabled Clean HUD skips all recognition/preparation.
+See research/ui-loading-moon.txt for source evidence and the moon-glow investigation.
 The cursor hides after two seconds without mouse input while the window has
 keyboard and mouse focus. Mouse movement, buttons and scrolling restore it;
 holding a mouse button keeps it visible. Settings preserve normal cursor shapes

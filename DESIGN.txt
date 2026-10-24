@@ -83,8 +83,7 @@ Linux uses DXVK Native to run the same D3D11 renderer through Vulkan, without
 Wine. SDL3 owns its Linux window and Vulkan surface. Linux file services use
 POSIX asynchronous I/O; guarded native contexts retain cooperative guest stacks.
 Instruction helpers use native ELF assembly and preserve their register ABI.
-Linux HLSL is compiled ahead of time with vkd3d-shader. Vendor D3D12 reconstruction,
-WARP and Windows hardware-watch diagnostics are explicitly unavailable there.
+Linux HLSL is compiled ahead of time with vkd3d-shader. WARP and Windows hardware-watch diagnostics are explicitly unavailable there.
 
 macOS uses the same D3D11 renderer through native DXMT and Metal, with an SDL3
 Metal view and no Wine. Intel helpers use Mach-O assembly. Apple Silicon emits

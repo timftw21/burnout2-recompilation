@@ -48,6 +48,7 @@ struct ExecutionDiagnostic {
 enum Register : unsigned { eax, ecx, edx, ebx, esp, ebp, esi, edi };
 struct WorldView {
     std::uint32_t manager=0,count=0,list=0;
+    bool blending=false,props_blending=false;
     std::array<std::uint32_t,256> sectors{};
 };
 struct HudLayout {
@@ -99,8 +100,9 @@ struct Cpu {
     std::uint16_t gdt_limit = 0;
     Performance* profile = nullptr;
     // Optional changes to verified title logic, separate from platform bindings.
-    bool skip_intro = false;
+    bool skip_intro = false, fast_load = false, clean_hud = false;
     bool ultrawide = false,motion_blur = true;
+    bool traffic_shared_wheels = false;
     float draw_distance = 1;
     const WorldMaterials* world_materials = nullptr;
     const WorldView* world_view = nullptr;

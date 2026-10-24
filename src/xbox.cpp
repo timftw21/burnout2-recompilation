@@ -224,24 +224,50 @@ struct Xbox::State {
     std::filesystem::path world_loaded_path;
     struct WorldCone {
         std::array<float,2> center{},left{},right{};
+        std::array<float,3> low{},high{};
+        unsigned material=0;
         bool geometry=false,bounded=false;
         bool contains(const std::array<float,2>& point) const {
             const auto x=point[0]-center[0],z=point[1]-center[1];
             return !bounded || (left[0]*z-left[1]*x>=0 && right[0]*z-right[1]*x<=0);
         }
     };
-    struct WorldRecord {unsigned section=0,origin=0,row=0;};
+    struct WorldRecord {
+        unsigned section=0,origin=0,row=0;
+        std::array<std::uint64_t,2> meshes{};
+        bool contains(unsigned mesh) const {return (meshes[mesh/64]>>(mesh%64))&1;}
+        void add(unsigned mesh) {meshes[mesh/64]|=1ULL<<(mesh%64);}
+    };
     struct WorldSection {
         std::array<float,3> low{},high{};
+        std::array<std::array<float,3>,4> corners{};
+        float height=0;
         std::array<float,2> center{};
         std::array<WorldCone,80> cones{};
         std::array<std::uint64_t,2> backgrounds{};
         std::vector<WorldRecord> additions;
+        std::vector<WorldRecord> props;
     };
     std::vector<WorldSection> world_sections;
     WorldView world_view;
     HudLayout hud_layout;
-    std::array<WorldRecord,256> world_draws{};
+    std::vector<WorldRecord> world_draws;
+    std::vector<std::uint64_t> world_coverage;
+    std::vector<unsigned> world_handoff_draws,world_handoff_backgrounds;
+    std::array<std::uint64_t,128> world_background_coverage{};
+    std::array<std::uint64_t,256> world_prop_coverage{};
+    std::array<bool,256> world_prop_admitted{};
+    std::array<std::uint64_t,8*64> traffic_wheel_coverage{};
+    std::array<unsigned,256> world_section_ids{};
+    std::uint64_t world_applied_coverage=UINT64_MAX;
+    struct WorldHandoff {
+        std::uint32_t camera=0;
+        unsigned origin=0,cursor=0;
+        double fraction=0;
+        std::array<std::uint8_t,64> views{};
+        std::array<std::uint64_t,256> props{};
+    };
+    std::array<WorldHandoff,32> world_handoffs{};
     unsigned world_draw_count=0,world_original_count=0,world_added_count=0;
     unsigned world_origin=0;
     std::uint64_t world_added_batches=0;
@@ -256,7 +282,7 @@ struct Xbox::State {
     struct ImportedTrack {
         bool selected=false;
         WorldMaterials materials;
-        std::uint32_t storage=0,choices=0;
+        std::uint32_t storage=0;
         std::array<std::uint32_t,7> names{},welcomes{},tables{};
         std::uint32_t barrier=0;
         std::array<std::uint32_t,5> frames{};
@@ -549,7 +575,7 @@ struct Xbox::State {
         memory.store<std::uint32_t>(thread->tib+0x28,thread->object);
         auto& cpu=thread->cpu;
         cpu.kernel=&services; cpu.clock=&clock; cpu.diagnostic=live && graphics_initialized?nullptr:&diagnostic;
-        cpu.skip_intro=host.skip_intro;cpu.draw_distance=float(host.draw_distance);
+        cpu.skip_intro=host.skip_intro;cpu.fast_load=host.fast_load;cpu.clean_hud=host.clean_hud;cpu.draw_distance=float(host.draw_distance);
         cpu.ultrawide=host.ultrawide;cpu.motion_blur=host.motion_blur;
         cpu.game_timing=host.renderer?&game_timing:nullptr;
         cpu.presentation=host.renderer?&presentation:nullptr;
@@ -1658,6 +1684,14 @@ struct Xbox::State {
             imported.playlist=0;
         }
         if(!selected) {imported.barrier=0;imported.materials={};}
+        // Retained for offline imported-asset diagnostics; no frontend entry.
+        if(selected && !imported.storage) {
+            imported.storage=allocate(4096,page,true,PAGE_READWRITE);
+            if(!imported.storage) throw std::runtime_error("Cannot allocate imported asset labels");
+            constexpr char label[]="Interstate|Burnout 1",welcome[]="Welcome to Interstate";
+            std::memcpy(memory.access(imported.storage+0x600,sizeof(label)),label,sizeof(label));
+            std::memcpy(memory.access(imported.storage+0x640,sizeof(welcome)),welcome,sizeof(welcome));
+        }
         imported.selected=selected;
         name_imported_track(selected);
     }
@@ -1839,54 +1873,6 @@ struct Xbox::State {
         memory.store<std::uint32_t>(object+0xE0,std::bit_cast<std::uint32_t>(distance));
         memory.store<std::uint32_t>(camera+(slot+2)*0xBC,std::bit_cast<std::uint32_t>(distance));return true;
     }
-    void track_menu(std::uint32_t site,std::uint32_t object) {
-        if(host.imported_tracks.empty()) return;
-        if(site==0x4D2A9) {
-            // 4379F installs Time Attack as frontend mode 8; mode 5 is Free Run.
-            if(memory.load<std::uint32_t>(0x4CCABC)!=8) {select_imported_track(false);return;}
-            const auto count=memory.load<std::uint32_t>(object+12),table=memory.load<std::uint32_t>(object+20);
-            if(!count || count>30) throw NativeBoundary(site,"unexpected original track menu dimensions");
-            if(!imported.storage) {
-                imported.storage=allocate(4096,page,true,PAGE_READWRITE);
-                if(!imported.storage) throw NativeBoundary(site,"cannot allocate imported track menu");
-                constexpr char label[]="Interstate|Burnout 1 (Coming Soon)";
-                std::memcpy(memory.access(imported.storage+0x600,sizeof(label)),label,sizeof(label));
-                constexpr char welcome[]="Welcome to Interstate";
-                std::memcpy(memory.access(imported.storage+0x640,sizeof(welcome)),welcome,sizeof(welcome));
-            }
-            const auto storage=imported.storage;imported.choices=count;
-            std::memcpy(memory.access(storage,count*20),memory.access(table,count*20),count*20);
-            std::memcpy(memory.access(storage+0x400,32),memory.access(0x329820,32),32);
-            memory.store<std::uint32_t>(storage+0x408,std::bit_cast<std::uint32_t>(8.039576f));
-            // Use the original locked-track flag: display the upcoming course,
-            // but let the original confirmation handler reject activation.
-            memory.store<std::uint32_t>(storage+count*20,1);
-            memory.store<std::uint32_t>(storage+count*20+4,storage+0x400);
-            memory.store<std::uint32_t>(storage+count*20+8,3);
-            memory.store<std::uint32_t>(storage+count*20+12,7);
-            memory.store<std::uint32_t>(storage+count*20+16,0);
-            memory.store<std::uint32_t>(object+12,count+1);memory.store<std::uint32_t>(object+20,storage);
-            if(imported.selected) memory.store<std::uint32_t>(object+16,count);
-            // Browsing a course must not mount its files or enable its world
-            // hooks. Activation belongs to the original unlocked-confirm path.
-            select_imported_track(false);
-            site=0x4CCFD;
-        }
-        if(site==0x4CC40) {
-            // The original exit callback runs on both confirm and Back.
-            // Restore normal labels when leaving an uncommitted preview.
-            name_imported_track(imported.selected);
-        } else if(site==0x4CCFD || site==0x4CEE0) {
-            const auto count=memory.load<std::uint32_t>(object+12),table=memory.load<std::uint32_t>(object+20);
-            bool selected=false;
-            if(table==imported.storage && count && memory.load<std::uint32_t>(0x4CCABC)==8) {
-                const auto index=static_cast<std::int32_t>(memory.load<std::uint32_t>(object+16));
-                selected=(index%static_cast<int>(count)+count)%count==imported.choices;
-            }
-            if(site==0x4CEE0) select_imported_track(selected);
-            else name_imported_track(selected);
-        } else throw NativeBoundary(site,"unsupported imported track menu site");
-    }
     std::filesystem::path imported_file(std::string_view relative) {
         if(!imported.selected || host.imported_tracks.empty() || memory.load<std::uint32_t>(0x4CCABC)!=8) return {};
         const auto path=folded(relative);
@@ -1910,6 +1896,25 @@ struct Xbox::State {
         }
         return true;
     }
+    unsigned world_groups(std::uint32_t source) const {
+        // 920F0 submits the groups after +7AC in a separate, later pass.
+        return memory.load<std::uint32_t>(source+0x7AC)+memory.load<std::uint16_t>(source+0x212);
+    }
+    unsigned world_phase(std::uint32_t source,unsigned group) const {
+        return group<memory.load<std::uint8_t>(source+0x214)?0U:group<memory.load<std::uint8_t>(source+0x215)?1U:
+            group<memory.load<std::uint32_t>(source+0x7AC)?2U:3U;
+    }
+    bool world_visible(unsigned index,const std::array<std::array<float,4>,6>& planes) const {
+        const auto& section=world_sections[index];
+        // 90740's rotated base and raised corners, without enlarging the box.
+        for(const auto& plane:planes) {
+            float nearest=INFINITY;
+            for(const auto& corner:section.corners)
+                nearest=std::min(nearest,corner[0]*plane[0]+corner[1]*plane[1]+corner[2]*plane[2]);
+            if(nearest+std::min(0.f,section.height*plane[1])>plane[3]) return false;
+        }
+        return true;
+    }
     void prepare_world(Cpu& cpu) {
         if(world_preparing) return;
         const auto manager=cpu.registers[ecx],master=memory.load<std::uint32_t>(0x4B85B8);
@@ -1920,7 +1925,10 @@ struct Xbox::State {
         const auto count=memory.load<std::uint32_t>(master+0x5C);
         if(!count || count>256 || std::uint64_t(count)*world_stride!=entry.size)
             throw NativeBoundary(0x8EEB0,"unsupported extended scenery dimensions");
-        world_view.manager=0;world_loaded.reset();world_preparing=true;
+        world_view.manager=0;world_view.blending=false;world_draw_count=0;world_draws.clear();world_loaded.reset();world_preparing=true;
+        world_handoffs={};world_handoff_draws.clear();world_handoff_backgrounds.clear();
+        world_section_ids.fill(UINT32_MAX);
+        world_coverage.assign(count*80*4,0);world_handoff_draws.reserve(count*80*4);world_handoff_backgrounds.reserve(128);
         struct Guard {bool& flag;~Guard(){flag=false;}} guard{world_preparing};
         if(gpu) gpu->invalidate_memory(world_base,64U*1024*1024);
         std::optional<File> replacement;
@@ -1941,16 +1949,24 @@ struct Xbox::State {
             auto& section=world_sections[s];
             const auto rows=memory.load<std::uint32_t>(sector+0x204),groups=memory.load<std::uint32_t>(sector+0x7AC);
             const auto meshes=memory.load<std::uint32_t>(sector+0xBC);
-            if(!rows || rows>18 || groups>80 || meshes>80 ||
+            if(!rows || rows>18 || world_groups(sector)>80 || meshes>80 ||
                memory.load<std::uint8_t>(sector+0x214)>memory.load<std::uint8_t>(sector+0x215) ||
                memory.load<std::uint8_t>(sector+0x215)>groups)
                 throw NativeBoundary(0x8EEB0,"unsupported scenery visibility/material table");
+            // The prop-table ID is a permutation of the stream order (Airport
+            // starts at ID 70), shared by resident and extended section copies.
+            const auto id=memory.load<std::uint32_t>(sector+0xB8);
+            if(id>=world_section_ids.size() || world_section_ids[id]!=UINT32_MAX)
+                throw NativeBoundary(0x8EEB0,"invalid scenery instance section ID");
+            world_section_ids[id]=s;
             section.low.fill(INFINITY);section.high.fill(-INFINITY);
             const auto height=real(sector+0x0C);
             if(!std::isfinite(height) || height<0) throw NativeBoundary(0x8EEB0,"invalid scenery bounds");
+            section.height=height;
             for(unsigned corner=0;corner<4;++corner) for(unsigned axis=0;axis<3;++axis) {
                 const auto value=real(sector+corner*16+axis*4);
                 if(!std::isfinite(value)) throw NativeBoundary(0x8EEB0,"invalid scenery corner");
+                section.corners[corner][axis]=value;
                 section.low[axis]=std::min(section.low[axis],value);
                 section.high[axis]=std::max(section.high[axis],value+(axis==1?height:0));
                 if(axis!=1) section.center[axis/2]+=value*.25f;
@@ -1964,6 +1980,7 @@ struct Xbox::State {
             }
             for(unsigned m=0;m<meshes;++m) {
                 const auto mesh=memory.load<std::uint32_t>(sector+0xC4+m*4),material=memory.load<std::uint32_t>(mesh+20);
+                section.cones[m].material=material;
                 if(material>=memory.load<std::uint32_t>(master+4)) throw NativeBoundary(0x8EEB0,"invalid scenery material");
                 const auto flags=memory.load<std::uint32_t>(memory.load<std::uint32_t>(master+12)+material*52+16);
                 // Same pipeline order as original 90A50/90BC0; C5550 and
@@ -1974,17 +1991,18 @@ struct Xbox::State {
                 const auto stride=memory.load<std::uint32_t>(pipeline+8),vertices=memory.load<std::uint32_t>(mesh+4);
                 const auto indices=memory.load<std::uint32_t>(mesh+12),n=memory.load<std::uint32_t>(mesh+16);
                 if(stride<12 || stride>64 || n>32768) throw NativeBoundary(0x8EEB0,"unsupported scenery vertex layout");
-                std::array<float,2> low{INFINITY,INFINITY},high{-INFINITY,-INFINITY};
+                std::array<float,3> low{INFINITY,INFINITY,INFINITY},high{-INFINITY,-INFINITY,-INFINITY};
                 for(unsigned j=0;j<n;++j) {
                     const auto vertex=vertices+memory.load<std::uint16_t>(indices+j*2)*stride;
                     // D7A60 clears the Xbox CPU alias bit on vertex buffers.
                     if(vertex-(sector&0x7FFFFFFF)>world_stride-stride)
                         throw NativeBoundary(0x8EEB0,std::format("scenery vertex leaves section {} mesh {} (stride {})",s,m,stride));
-                    for(unsigned a=0;a<2;++a) {const auto v=real(vertex+a*8);if(!std::isfinite(v)) throw NativeBoundary(0x8EEB0,"invalid scenery vertex");low[a]=std::min(low[a],v);high[a]=std::max(high[a],v);}
+                    for(unsigned a=0;a<3;++a) {const auto v=real(vertex+a*4);if(!std::isfinite(v)) throw NativeBoundary(0x8EEB0,"invalid scenery vertex");low[a]=std::min(low[a],v);high[a]=std::max(high[a],v);}
                 }
                 if(n) {
                     section.cones[m].geometry=true;
-                    for(unsigned a=0;a<2;++a) section.cones[m].center[a]=(low[a]+high[a])*.5f;
+                    section.cones[m].low=low;section.cones[m].high=high;
+                    for(unsigned a=0;a<2;++a) section.cones[m].center[a]=(low[a*2]+high[a*2])*.5f;
                 }
             }
         }
@@ -1994,13 +2012,17 @@ struct Xbox::State {
         std::vector<std::vector<float>> angles(count*80);
         for(unsigned s=0;s<count;++s) {
             const auto source=world_base+s*world_stride;
-            const auto rows=memory.load<std::uint32_t>(source+0x204),groups=memory.load<std::uint32_t>(source+0x7AC);
+            const auto rows=memory.load<std::uint32_t>(source+0x204),groups=world_groups(source);
             for(unsigned r=0;r<rows;++r) {
                 const auto target=world_target(s,r),sector=world_base+target*world_stride;
                 for(unsigned g=0;g<groups;++g) {
                     const auto mesh=memory.load<std::uint8_t>(source+0x21C+r*0x54+g);
                     if(mesh==255) continue;
                     if(mesh>=memory.load<std::uint32_t>(sector+0xBC)) throw NativeBoundary(0x8EEB0,"invalid distant scenery mesh");
+                    auto& metadata=world_sections[target].cones[mesh];
+                    if(metadata.material!=memory.load<std::uint32_t>(source+0x7B0+g*4))
+                        throw NativeBoundary(0x8EEB0,"inconsistent scenery material");
+                    if(g>=memory.load<std::uint32_t>(source+0x7AC)) continue;
                     if(!world_sections[target].cones[mesh].geometry) continue;
                     const auto& center=world_sections[target].cones[mesh].center;
                     angles[target*80+mesh].push_back(std::atan2(world_sections[s].center[1]-center[1],world_sections[s].center[0]-center[0]));
@@ -2019,14 +2041,26 @@ struct Xbox::State {
             auto& cone=world_sections[s].cones[m];cone.bounded=true;
             cone.left={std::cos(left),std::sin(left)};cone.right={std::cos(right),std::sin(right)};
         }
-        // Precompute extra rows during loading. Each row must coexist with all
-        // active backdrops; this preserves the game's near/far model ownership.
-        // Keep its actual per-material choices instead of using a self row.
+        // Choose each mesh independently from rows compatible with the active
+        // backdrops. One unsafe terrain mesh must not hide an entire section,
+        // nor should a partially visible section exclude its missing meshes.
+        // Retain the selected row's material and phase, drawing each mesh once.
+        std::size_t capacity=0;
         for(unsigned s=0;s<count;++s) {
             auto& current=world_sections[s];const auto source=world_base+s*world_stride;
-            std::array<bool,256> original{};std::array<float,256> best;best.fill(INFINITY);
-            std::array<WorldRecord,256> chosen{};
-            for(unsigned r=0;r<memory.load<std::uint32_t>(source+0x204);++r) original[world_target(s,r)]=true;
+            std::vector<std::array<float,80>> best(count);
+            std::vector<std::array<WorldRecord,80>> chosen(count);
+            std::array<float,256> prop_best;prop_best.fill(INFINITY);
+            std::array<WorldRecord,256> prop_rows{};
+            for(auto& distances:best) distances.fill(INFINITY);
+            for(unsigned r=0;r<memory.load<std::uint32_t>(source+0x204);++r) {
+                const auto target=world_target(s,r);
+                prop_best[target]=-1;
+                for(unsigned g=0;g<memory.load<std::uint32_t>(source+0x7AC);++g) {
+                    const auto mesh=memory.load<std::uint8_t>(source+0x21C+r*0x54+g);
+                    if(mesh!=255) best[target][mesh]=-1;
+                }
+            }
             for(unsigned from=0;from<count;++from) {
                 const auto& candidate=world_sections[from];
                 if((candidate.backgrounds[0]&current.backgrounds[0])!=current.backgrounds[0] ||
@@ -2035,51 +2069,252 @@ struct Xbox::State {
                 const auto distance=dx*dx+dz*dz;const auto origin=world_base+from*world_stride;
                 for(unsigned r=0;r<memory.load<std::uint32_t>(origin+0x204);++r) {
                     const auto target=world_target(from,r);const WorldRecord record{target,from,r};
-                    if(original[target] || distance>=best[target] || !world_faces(record,current.center)) continue;
-                    chosen[target]=record;best[target]=distance;
+                    if(distance<prop_best[target] && world_faces(record,current.center)) {
+                        prop_rows[target]=record;prop_best[target]=distance;
+                    }
+                    for(unsigned g=0;g<memory.load<std::uint32_t>(origin+0x7AC);++g) {
+                        const auto mesh=memory.load<std::uint8_t>(origin+0x21C+r*0x54+g);
+                        if(mesh==255 || !world_sections[target].cones[mesh].geometry || distance>=best[target][mesh]) continue;
+                        chosen[target][mesh]=record;best[target][mesh]=distance;
+                    }
                 }
             }
-            for(unsigned target=0;target<count;++target) if(std::isfinite(best[target])) current.additions.push_back(chosen[target]);
+            for(unsigned target=0;target<count;++target) for(unsigned mesh=0;mesh<80;++mesh) {
+                if(best[target][mesh]<0 || !std::isfinite(best[target][mesh])) continue;
+                const auto record=chosen[target][mesh];
+                auto found=std::ranges::find_if(current.additions,[&](const auto& r) {
+                    return r.section==record.section && r.origin==record.origin && r.row==record.row;
+                });
+                if(found==current.additions.end()) {current.additions.push_back(record);found=std::prev(current.additions.end());}
+                found->add(mesh);
+            }
+            // Props have independent bounds and may stand above or beside the
+            // static mesh. Preserve their previous whole-section selection;
+            // neither a culled road mesh nor a partial terrain view owns them.
+            for(unsigned target=0;target<count;++target)
+                if(prop_best[target]>=0 && std::isfinite(prop_best[target])) current.props.push_back(prop_rows[target]);
+            capacity=std::max(capacity,current.additions.size());
         }
+        world_draws.clear();world_draws.reserve(capacity);
         world_loaded=entry;world_loaded_path=world_paths[mode];world_ready=true;
     }
-    void select_world(Cpu& cpu) {
-        world_view.manager=0;world_view.count=0;world_draw_count=0;
+    void select_world(Cpu& cpu,bool late=false) {
+        world_view.manager=0;world_view.blending=false;world_view.props_blending=false;world_view.count=0;world_draw_count=0;world_draws.clear();
+        world_prop_admitted={};
         world_added_count=0;world_original_count=0;
         if(!world_loaded || world_preparing || world_reflecting) return;
-        const auto manager=cpu.registers[esi],origin=memory.load<std::uint32_t>(manager+0x118);
+        const auto manager=cpu.registers[late?edi:esi],origin=memory.load<std::uint32_t>(manager+0x118);
         unsigned index=0;
         for(;index<world_sections.size();++index)
             if(!std::memcmp(memory.access(origin,64),memory.access(world_base+index*world_stride,64),64)) break;
         if(index==world_sections.size()) throw NativeBoundary(0x90F68,"unknown scenery visibility origin");
         world_origin=index;
         const auto camera=memory.load<std::uint32_t>(0x5232C0),frame=memory.load<std::uint32_t>(camera+4);
-        const std::array position{std::bit_cast<float>(memory.load<std::uint32_t>(frame+0x40)),std::bit_cast<float>(memory.load<std::uint32_t>(frame+0x48))};
+        std::array<float,3> position;
+        std::memcpy(position.data(),memory.access(frame+0x40,12),12);
+        std::array<std::array<float,4>,6> planes;
+        std::memcpy(planes.data(),memory.access(manager+0x11C,96),96);
+        std::array<bool,256> present{};
         const auto append=[&](std::uint32_t sector) {
             const auto slot=world_view.count++;world_view.sectors[slot]=sector;
+            world_prop_coverage[slot]=UINT64_MAX;
             memory.store<std::uint32_t>(world_view.list+slot*4,slot);
         };
         const auto original=memory.load<std::uint32_t>(manager+0x310);
         if(original>18) throw NativeBoundary(0x90F68,"invalid original scenery list");
-        for(unsigned i=0;i<original;++i) append(memory.load<std::uint32_t>(manager+0xD0+memory.load<std::uint32_t>(manager+0x2C8+i*4)*4));
+        // Admission is independent of which way the camera points. A tree
+        // outside the frustum remains available, so looking back cannot start
+        // its loading fade again when the player turns forwards.
+        const auto source=world_base+index*world_stride;
+        for(unsigned row=0;row<memory.load<std::uint32_t>(source+0x204);++row)
+            world_prop_admitted[world_target(index,row)]=true;
+        for(unsigned i=0;i<original;++i) {
+            const auto row=memory.load<std::uint32_t>(manager+0x2C8+i*4);
+            present[world_target(index,row)]=true;
+            append(memory.load<std::uint32_t>(manager+0xD0+row*4));
+        }
         world_original_count=original;
         const auto range=world_original_far*host.draw_distance;
-        for(const auto record:world_sections[index].additions) {
+        for(const auto& record:world_sections[index].props) {
             const auto& section=world_sections[record.section];float squared=0;
-            for(unsigned a=0;a<2;++a) {const auto d=position[a]-std::clamp(position[a],section.low[a*2],section.high[a*2]);squared+=d*d;}
-            if(squared>range*range || !world_faces(record,position)) continue;
-            const auto sector=world_base+record.section*world_stride;
-            const auto saved_eax=cpu.registers[eax],saved_edx=cpu.registers[edx];
-            cpu.registers[eax]=sector;cpu.registers[edx]=manager+0x11C;
-            const auto visible=world_call(cpu,0x90740,0);
-            cpu.registers[eax]=saved_eax;cpu.registers[edx]=saved_edx;
-            if(visible==2) continue;
-            append(sector);world_draws[world_draw_count++]=record;
+            for(unsigned a=0;a<2;++a) {const auto d=position[a*2]-std::clamp(position[a*2],section.low[a*2],section.high[a*2]);squared+=d*d;}
+            if(squared>range*range || !world_faces(record,{position[0],position[2]})) continue;
+            world_prop_admitted[record.section]=true;
+            if(!world_visible(record.section,planes)) continue;
+            append(world_base+record.section*world_stride);present[record.section]=true;++world_added_count;
         }
-        world_added_count=world_draw_count;world_view.manager=manager;
+        for(auto record:world_sections[index].additions) {
+            const auto& section=world_sections[record.section];
+            for(unsigned word=0;word<2;++word) {
+                auto remaining=record.meshes[word];
+                while(remaining) {
+                    const auto bit=std::countr_zero(remaining);remaining&=remaining-1;
+                    const auto& mesh=section.cones[word*64+bit];
+                    if(!mesh.contains({position[0],position[2]})) {record.meshes[word]&=~(1ULL<<bit);continue;}
+                    float squared=0;
+                    for(unsigned a=0;a<3;++a) {const auto d=position[a]-std::clamp(position[a],mesh.low[a],mesh.high[a]);squared+=d*d;}
+                    if(squared>range*range) {record.meshes[word]&=~(1ULL<<bit);continue;}
+                    bool visible=true;
+                    // 90740 rejects a box only if every corner has n.p > d.
+                    // Test the closest corner of each mesh's actual bounds.
+                    for(const auto& plane:planes) {
+                        float distance=-plane[3];
+                        for(unsigned a=0;a<3;++a) distance+=plane[a]*(plane[a]<0?mesh.high[a]:mesh.low[a]);
+                        if(distance>0) {visible=false;break;}
+                    }
+                    if(!visible) record.meshes[word]&=~(1ULL<<bit);
+                }
+            }
+            if(!(record.meshes[0]|record.meshes[1])) continue;
+            if(!present[record.section]) {present[record.section]=true;++world_added_count;}
+            world_draws.push_back(record);
+        }
+        world_draw_count=static_cast<unsigned>(world_draws.size());
+        world_view.manager=manager;
+        select_world_handoff(camera,index,position,planes,!late);
+    }
+    void select_world_handoff(std::uint32_t camera,unsigned origin,const std::array<float,3>& position,
+                              const std::array<std::array<float,4>,6>& planes,bool advance=true) {
+        auto found=std::ranges::find(world_handoffs,camera,&WorldHandoff::camera);
+        bool reset=false;
+        if(found==world_handoffs.end()) {
+            found=std::ranges::find(world_handoffs,0U,&WorldHandoff::camera);
+            if(found==world_handoffs.end()) throw NativeBoundary(0x90F68,"scenery handoff camera limit exceeded");
+            found->camera=camera;found->origin=origin;found->views.fill(static_cast<std::uint8_t>(origin));
+            reset=true;
+        }
+        auto& handoff=*found;
+        if(handoff.origin!=origin) {
+            // Unrelated visibility regions indicate a camera cut or teleport.
+            // Nearby section changes retain their exact outgoing representation.
+            const auto source=world_base+origin*world_stride;bool nearby=false;
+            for(unsigned r=0;r<memory.load<std::uint32_t>(source+0x204);++r) nearby|=world_target(origin,r)==handoff.origin;
+            if(!nearby) {handoff.views.fill(static_cast<std::uint8_t>(origin));handoff.fraction=0;handoff.cursor=0;reset=true;}
+            handoff.origin=origin;
+        }
+        // Each of 64 ordered coverage samples moves to the newest authored
+        // view over a quarter second. Interrupted/reversed handoffs preserve
+        // the remaining samples, so no representation is dropped mid-fade.
+        const auto delta=game_timing.started?game_timing.render_delta:
+            std::bit_cast<float>(memory.load<std::uint32_t>(0x598188));
+        if(advance) handoff.fraction+=(std::isfinite(delta)?std::clamp(double(delta),0.0,0.25):0.25)*256;
+        const auto steps=static_cast<unsigned>(handoff.fraction);handoff.fraction-=steps;
+        const auto changed=steps==64?UINT64_MAX:std::rotl((1ULL<<steps)-1,int(handoff.cursor));
+        for(unsigned i=0;i<steps;++i) {handoff.views[handoff.cursor]=static_cast<std::uint8_t>(origin);handoff.cursor=(handoff.cursor+1)%64;}
+        if(advance) {
+            // Fade admission changes, not frustum visibility. Keep outgoing
+            // instances until their last sample fades, culling them normally.
+            std::array<bool,256> present{};
+            for(unsigned slot=0;slot<world_view.count;++slot)
+                present[world_section_ids[memory.load<std::uint32_t>(world_view.sectors[slot]+0xB8)]]=true;
+            for(unsigned s=0;s<world_sections.size();++s)
+                handoff.props[s]=reset?(world_prop_admitted[s]?UINT64_MAX:0):
+                    (handoff.props[s]&~changed)|(world_prop_admitted[s]?changed:0);
+            for(unsigned slot=0;slot<world_view.count;++slot)
+                world_prop_coverage[slot]=handoff.props[world_section_ids[memory.load<std::uint32_t>(world_view.sectors[slot]+0xB8)]];
+            for(unsigned s=0;s<world_sections.size();++s) {
+                const auto coverage=handoff.props[s];
+                if(!present[s] && !world_prop_admitted[s] && coverage && world_visible(s,planes)) {
+                    const auto slot=world_view.count++;world_view.sectors[slot]=world_base+s*world_stride;
+                    world_prop_coverage[slot]=coverage;memory.store<std::uint32_t>(world_view.list+slot*4,slot);
+                }
+            }
+            for(unsigned slot=0;slot<world_view.count;++slot) world_view.props_blending|=world_prop_coverage[slot]!=UINT64_MAX;
+        }
+        std::array<std::uint64_t,256> views{};
+        for(unsigned i=0;i<64;++i) views[handoff.views[i]]|=1ULL<<i;
+        if(views[origin]==UINT64_MAX) return;
+        world_view.blending=true;
+        for(const auto key:world_handoff_draws) world_coverage[key]=0;
+        world_handoff_draws.clear();world_handoff_backgrounds.clear();world_background_coverage={};
+        const auto range=world_original_far*host.draw_distance;
+        const auto add=[&](unsigned section,unsigned mesh,unsigned phase,std::uint64_t coverage,bool original) {
+            const auto& bounds=world_sections[section].cones[mesh];
+            if(!bounds.geometry) return;
+            if(!original) {
+                if(!bounds.contains({position[0],position[2]})) return;
+                float squared=0;
+                for(unsigned a=0;a<3;++a) {const auto d=position[a]-std::clamp(position[a],bounds.low[a],bounds.high[a]);squared+=d*d;}
+                if(squared>range*range) return;
+            }
+            for(const auto& plane:planes) {
+                float distance=-plane[3];
+                for(unsigned a=0;a<3;++a) distance+=plane[a]*(plane[a]<0?bounds.high[a]:bounds.low[a]);
+                if(distance>0) return;
+            }
+            // A few materials change render phase between authored views.
+            // Keep those submissions separate with complementary coverage.
+            const auto key=(section*80+mesh)*4+phase;
+            if(!world_coverage[key]) world_handoff_draws.push_back(key);
+            world_coverage[key]|=coverage;
+        };
+        const auto view=[&](unsigned s) {
+            const auto coverage=views[s];const auto source=world_base+s*world_stride;
+            const auto rows=memory.load<std::uint32_t>(source+0x204),groups=world_groups(source);
+            // 90A50 emits rows backwards, 90BC0 forwards. Keep the current
+            // view's material order; shared meshes are submitted only once.
+            for(unsigned g=0;g<groups;++g) {
+                const auto phase=world_phase(source,g);
+                for(unsigned i=0;i<rows;++i) {
+                    const auto r=phase==1?i:rows-1-i,mesh=unsigned(memory.load<std::uint8_t>(source+0x21C+r*0x54+g));
+                    if(mesh!=255) add(world_target(s,r),mesh,phase,coverage,true);
+                }
+            }
+            for(const auto& record:world_sections[s].additions) {
+                const auto from=world_base+record.origin*world_stride;
+                for(unsigned g=0;g<memory.load<std::uint32_t>(from+0x7AC);++g) {
+                    const auto mesh=memory.load<std::uint8_t>(from+0x21C+record.row*0x54+g);
+                    const auto phase=world_phase(from,g);
+                    if(mesh!=255 && record.contains(mesh)) add(record.section,mesh,phase,coverage,false);
+                }
+            }
+            for(unsigned b=0;b<4;++b) {
+                const auto mesh=memory.load<std::uint8_t>(source+0x208+b);
+                if(mesh==255) continue;
+                if(!world_background_coverage[mesh]) world_handoff_backgrounds.push_back(mesh);
+                world_background_coverage[mesh]|=coverage;
+            }
+        };
+        if(views[origin]) view(origin);
+        for(unsigned s=0;s<world_sections.size();++s) if(s!=origin && views[s]) view(s);
+    }
+    void draw_world_handoff(Cpu& cpu,unsigned phase) {
+        std::uint64_t coverage=UINT64_MAX;
+        const auto apply=[&](std::uint64_t value) {
+            if(coverage==value) return;
+            submit_graphics(false);gpu->coverage(value);coverage=value;
+        };
+        if(phase==4) {
+            for(const auto mesh:world_handoff_backgrounds) {
+                apply(world_background_coverage[mesh]);
+                const std::array arguments{mesh,UINT32_MAX,UINT32_MAX,UINT32_MAX};
+                world_call(cpu,0x8EA80,0x4B85B0,arguments);
+            }
+        } else {
+            unsigned material=UINT32_MAX,pipeline=0;
+            for(const auto key:world_handoff_draws) {
+                if(key%4!=phase) continue;
+                const auto section=key/4/80,mesh=key/4%80;
+                const auto& metadata=world_sections[section].cones[mesh];
+                if(material!=metadata.material) {
+                    material=metadata.material;const std::array arguments{material,1U};
+                    const auto flags=world_call(cpu,0x8D1A0,0x4B85B0,arguments);
+                    // Original 90A50/90BC0's material-to-pipeline dispatch.
+                    pipeline=flags&0x8000200?0x4B86B0U:flags&0xFC004A00?0x4B8690U:
+                        flags&0x3E00000?0x4B8660U:flags&0x100000?0x4B8670U:flags&0x80000?0x4B8650U:flags&0x8000?0x4B8640U:0;
+                }
+                if(!pipeline) continue;
+                apply(world_coverage[key]);
+                const std::array arguments{memory.load<std::uint32_t>(world_base+section*world_stride+0xC4+mesh*4)};
+                world_call(cpu,pipeline==0x4B8640?0xC3C70:0xC5550,pipeline,arguments);
+            }
+        }
+        apply(UINT64_MAX);
     }
     void draw_world(Cpu& cpu,unsigned phase) {
         if(!world_view.manager) return;
+        if(world_view.blending) {draw_world_handoff(cpu,phase);return;}
+        if(phase>=3) return;
         std::memcpy(memory.access(world_scratch+0x11C,96),memory.access(world_view.manager+0x11C,96),96);
         for(unsigned i=0;i<world_draw_count;++i) {
             const auto record=world_draws[i];const auto origin=world_base+record.origin*world_stride;
@@ -2093,10 +2328,57 @@ struct Xbox::State {
             const auto begin=phase==0?0U:phase==1?unsigned(opaque):unsigned(alpha);
             const auto end=phase==0?unsigned(opaque):phase==1?unsigned(alpha):groups;
             for(unsigned group=begin;group<end;++group) {
-                if(memory.load<std::uint8_t>(origin+0x21C+record.row*0x54+group)==255) continue;
+                const auto mesh=memory.load<std::uint8_t>(origin+0x21C+record.row*0x54+group);
+                if(mesh==255 || !record.contains(mesh)) continue;
                 const std::array arguments{group};world_call(cpu,phase==1?0x90BC0:0x90A50,world_scratch,arguments);++world_added_batches;
             }
         }
+    }
+    void world_prop_mask(std::uint64_t coverage) {
+        if(coverage==world_applied_coverage) return;
+        submit_graphics(false);gpu->coverage(coverage);world_applied_coverage=coverage;
+    }
+    void traffic_detail(Cpu& cpu) {
+        const auto manager=cpu.registers[ecx],stack=cpu.registers[esp];
+        std::array<std::uint32_t,4> arguments;
+        for(unsigned i=0;i<arguments.size();++i) arguments[i]=memory.load<std::uint32_t>(stack+i*4);
+        const auto vehicle=arguments[0],lod=arguments[1];
+        if(lod>2) throw NativeBoundary(0x9C09A,"invalid traffic detail level");
+        const bool shared_wheels=lod==0 || memory.load<std::uint32_t>(vehicle+0x1A0)!=0;
+        std::uint64_t coverage=UINT64_MAX;
+        if(lod<2 && !memory.load<std::uint32_t>(vehicle+0x1E8)) {
+            // 9BFF3 has already measured this camera-relative vector. Fade
+            // inside the original LOD's range; traffic admission is unchanged.
+            float squared=0;
+            for(unsigned i=0;i<3;++i) {
+                const auto delta=std::bit_cast<float>(memory.load<std::uint32_t>(stack+0x50+i*4));squared+=delta*delta;
+            }
+            const auto end=std::bit_cast<float>(memory.load<std::uint32_t>(manager+0x2E280+lod*4));
+            const auto start=end*.8f;
+            if(end>0 && squared>start*start) {
+                const auto count=unsigned(std::clamp((end-std::sqrt(squared))/(end-start)*64.f,0.f,64.f));
+                coverage=count==64?UINT64_MAX:(1ULL<<count)-1;
+            }
+        }
+        std::array<unsigned,8> wheels;
+        for(unsigned i=0;i<wheels.size();++i) wheels[i]=memory.load<unsigned>(0x528130+i*4);
+        world_prop_mask(coverage);
+        world_call(cpu,0x9A330,manager,arguments);
+        // Wheels are queued separately from the body. Shared wheels stay
+        // solid across 0/1 (and for physics-owned wheels at every LOD).
+        // Ordinary traffic's 1/2 transition uses the body's same mask.
+        for(unsigned i=0;i<wheels.size();++i) {
+            const auto count=memory.load<unsigned>(0x528130+i*4);
+            if(count>64 || wheels[i]>count) throw NativeBoundary(0x9C09A,"invalid traffic wheel queue");
+            for(unsigned j=wheels[i];j<count;++j) traffic_wheel_coverage[i*64+j]=shared_wheels?UINT64_MAX:coverage;
+        }
+        if(coverage!=UINT64_MAX) {
+            arguments[1]=lod+1;arguments[3]=0;
+            cpu.traffic_shared_wheels=shared_wheels;
+            world_prop_mask(~coverage);world_call(cpu,0x9A330,manager,arguments);
+            cpu.traffic_shared_wheels=false;
+        }
+        world_prop_mask(UINT64_MAX);
     }
     void extend_camera(Cpu& cpu) {
         // Reflection rendering uses its own visibility and sky geometry. Its
@@ -2126,6 +2408,15 @@ struct Xbox::State {
     }
     void enhancement(Cpu& cpu,std::uint32_t address) {
         switch(address) {
+        case 0x9B380:traffic_wheel_coverage.fill(UINT64_MAX);break;
+        case 0x9C09A:traffic_detail(cpu);break;
+        case 0x9C12A: {
+            const auto matrix=cpu.registers[edi];
+            if(matrix<0x5283D8 || matrix>=0x5303D8 || (matrix-0x5283D8)%64)
+                throw NativeBoundary(address,"invalid traffic wheel matrix");
+            world_prop_mask(traffic_wheel_coverage[(matrix-0x5283D8)/64]);break;
+        }
+        case 0x9C152:world_prop_mask(UINT64_MAX);break;
         case 0x1AC27:title_hud_widget(cpu,memory);break;
         case 0x1D121: {
             const auto queue=memory.load<std::uint32_t>(0x3D8570),root=memory.load<std::uint32_t>(queue);
@@ -2147,19 +2438,23 @@ struct Xbox::State {
             break;
         case 0x215CE0:
             if(gpu) {submit_graphics(false);gpu->restore_feedback();}break;
-        // Preserve the original visibility/material records. Detailed sections
-        // outside that set contain open terrain backs and overlap the distant
-        // models. Extend clipping, scenery fades and traffic LOD within those
-        // authored views instead of submitting incompatible geometry twice.
+        // Extra meshes retain authored material/background compatibility;
+        // reflection cameras continue to use their original visibility.
         case 0x8EEB0:prepare_world(cpu);break;
         case 0xE8450:if(host.draw_distance>1) extend_camera(cpu);break;
         case 0xA6E00:world_reflecting=true;break;
         case 0xA7306:world_reflecting=false;break;
         case 0x90F68:select_world(cpu);break;
         case 0x90F7E:draw_world(cpu,0);break;
+        case 0x90F9E:draw_world(cpu,4);break;
         case 0x90FDC:draw_world(cpu,1);break;
-        case 0x914BF:draw_world(cpu,2);break;
+        case 0x910F6:case 0x913E5:world_prop_mask(world_prop_coverage[cpu.registers[edx]]);break;
+        case 0x91295:world_prop_mask(world_prop_coverage[cpu.registers[eax]]);break;
+        case 0x91370:world_prop_mask(UINT64_MAX);break;
+        case 0x914BF:world_prop_mask(UINT64_MAX);draw_world(cpu,2);break;
         case 0x9158F:world_view.manager=0;break;
+        case 0x92149:select_world(cpu,true);draw_world(cpu,3);break;
+        case 0x92182:world_view.manager=0;break;
         default:throw NativeBoundary(address,"unsupported title enhancement site");
         }
     }
@@ -2207,7 +2502,7 @@ struct Xbox::State {
         gpu_cursor=memory.load<std::uint32_t>(context+0x24);
         gpu=std::make_unique<Gpu>(*graphics,memory,notification);
         gpu->flip=[this] {
-            if(host.upscaling || graphics->needs_motion_camera()) {
+            if(graphics->needs_motion_camera()) {
             // 92030 reads the main world camera through this original holder;
             // frontend drawing uses 443EC0. Read their real clip and view data.
                 const auto holder=memory.load<std::uint32_t>(0x443EB0);
@@ -3462,6 +3757,7 @@ struct Xbox::State {
 };
 Xbox::Xbox(Xbe& image,Memory& memory,std::span<std::byte> ram,const std::filesystem::path& disc,XboxHost host):state_(std::make_unique<State>(image,memory,ram,disc,std::move(host))) {}
 Xbox::~Xbox()=default;
+bool Xbox::fast_loading() const {return state_->host.fast_load && state_->game_timing.loading_started;}
 void Xbox::output_gain(float gain) {
     if(!(gain>=0 && gain<=1)) throw std::runtime_error("Output volume must be between zero and one");
     if(state_->audio) state_->audio->output_gain(gain);
@@ -5262,15 +5558,14 @@ std::string check_track_import(const std::filesystem::path& executable,const std
         names[language]=memory.load<std::uint32_t>(tables[language]+390*4);
         welcomes[language]=memory.load<std::uint32_t>(tables[language]+728*4);
     }
-    // Original frontend bindings from 2A5C0. Replay the real menu rather than
-    // manufacturing its records and calling the extension directly.
+    // Verify original frontend list construction without booting the game.
     constexpr std::pair<unsigned,unsigned> widgets[]={
         {0x4CB330,0x328D28},{0x4CB354,0x326508},{0x4CB35C,0x320BE0},
         {0x4CB360,0x320690},{0x4CB364,0x31E8D8},{0x4CB368,0x322C80},
         {0x4CB374,0x31CEA0},{0x4CB370,0x324B70},{0x4CB358,0x31C958},{0x4CB380,0x31DD7C}};
     for(const auto& [destination,source]:widgets) memory.store<std::uint32_t>(destination,memory.load<std::uint32_t>(source));
     const auto menu_fixture=[&] {
-        // Stop after original list construction and extension, before the
+        // Stop after original list construction, before the
         // original buttons allocate draw queues for the on-screen frontend.
         state.diagnostic.break_address=0x2AB40;state.diagnostic.break_hit=1;
         try {invoke(0x4D290,0x3344D8);throw std::runtime_error("Track menu boundary was not reached");}
@@ -5280,51 +5575,13 @@ std::string check_track_import(const std::filesystem::path& executable,const std
         state.diagnostic.break_address=0;
     };
     memory.store<std::uint32_t>(0x4CCABC,attack_mode);menu_fixture();
-    require(memory.load<std::uint32_t>(0x3344E4)==31,"native Time Attack menu appends one track");
-    memory.store<std::uint32_t>(0x3344E8,29);
-    memory.store<std::uint16_t>(0x3D810C,1);
-    state.diagnostic.break_address=0x36E30;state.diagnostic.break_hit=1;
-    try {invoke(0x4CC70,0x3344D8,{0});throw std::runtime_error("Track details boundary was not reached");}
-    catch(const std::runtime_error&) {if(cpu.eip!=0x36E30) throw;}
-    state.diagnostic.break_address=0;memory.store<std::uint16_t>(0x3D810C,0);
-    require(memory.load<std::uint32_t>(0x3344E8)==30 && !state.imported.selected &&
-        state.imported_file("trackpss/forward/fwyl.pss").empty(),
-        "original scroll previews the appended track without activating imported assets");
-    for(const auto table:tables) require(memory.load<std::uint32_t>(table+390*4)==state.imported.storage+0x600,
-        "original menu lookup displays the imported track name in every language");
-    for(const auto table:tables) require(memory.load<std::uint32_t>(table+728*4)==state.imported.storage+0x640,
-        "opening caption names Interstate instead of the original B2 track");
-    constexpr char upcoming_label[]="Interstate|Burnout 1 (Coming Soon)";
-    require(!std::memcmp(memory.access(state.imported.storage+0x600,sizeof(upcoming_label)),upcoming_label,sizeof(upcoming_label)) &&
-        memory.load<std::uint32_t>(state.imported.storage+30*20)==1,"upcoming track is labelled and locked");
-    memory.store<std::uint16_t>(0x3D8130,1);
-    state.diagnostic.break_address=0xCA5E0;state.diagnostic.break_hit=1;
-    try {invoke(0x4CC70,0x3344D8,{0});throw std::runtime_error("Locked track input boundary was not reached");}
-    catch(const std::runtime_error&) {if(cpu.eip!=0xCA5E0) throw;}
-    require(memory.load<std::uint32_t>(cpu.registers[esp])==0x4CEDB &&
-        memory.load<std::uint32_t>(cpu.registers[esp]+4)==5 && !state.imported.selected,
-        "original confirm input rejects the upcoming track without activating imported assets");
-    state.diagnostic.break_address=0;memory.store<std::uint16_t>(0x3D8130,0);
-    invoke(0x4CC40,0x3344D8);
-    require(!state.imported.selected && state.imported_file("trackpss/forward/fwyl.pss").empty(),
-        "leaving the locked preview keeps original track loading active");
+    require(memory.load<std::uint32_t>(0x3344E4)==30,"Time Attack retains only its original tracks");
     for(unsigned language=0;language<tables.size();++language) {
-        require(memory.load<std::uint32_t>(tables[language]+390*4)==names[language],"leaving a preview restores original track names");
-        require(memory.load<std::uint32_t>(tables[language]+728*4)==welcomes[language],"leaving a preview restores original opening captions");
+        require(memory.load<std::uint32_t>(tables[language]+390*4)==names[language],"Time Attack retains original track labels");
+        require(memory.load<std::uint32_t>(tables[language]+728*4)==welcomes[language],"Time Attack retains original opening captions");
     }
-    // Exercise imported assets offline through the real accepted-confirm path.
-    // The live menu remains locked; only this diagnostic's row is unlocked.
-    menu_fixture();memory.store<std::uint32_t>(0x3344E8,30);
-    memory.store<std::uint32_t>(state.imported.storage+30*20,0);
-    memory.store<std::uint16_t>(0x3D8130,1);
-    state.diagnostic.break_address=0x8BC80;state.diagnostic.break_hit=1;
-    try {invoke(0x4CC70,0x3344D8,{0});throw std::runtime_error("Confirmed track boundary was not reached");}
-    catch(const std::runtime_error&) {if(cpu.eip!=0x8BC80) throw;}
-    require(memory.load<std::uint32_t>(cpu.registers[esp])==0x4CEEA && state.imported.selected,
-        "only the original unlocked-confirm path activates imported assets");
-    state.diagnostic.break_address=0;memory.store<std::uint16_t>(0x3D8130,0);
-    invoke(0x4CC40,0x3344D8);
-    require(state.imported.selected && memory.load<std::uint32_t>(0x4CCAE0)==3,"native imported track selection");
+    // Imported content is exercised only by this explicit offline diagnostic.
+    state.select_imported_track(true);memory.store<std::uint32_t>(0x4CCAE0,3);
     memory.store<std::uint32_t>(0x34AB58,attack_mode);
     require(title_track(cpu,memory,0x18030),"imported laps cannot enter built-in track records");
     std::vector<std::byte> records(0x6AA0);std::memcpy(records.data(),memory.access(0x34ABC8,records.size()),records.size());
@@ -5398,8 +5655,10 @@ std::string check_track_import(const std::filesystem::path& executable,const std
     // Retain another owner to exercise the original playlist Release without
     // constructing an audio device in this asset/menu diagnostic.
     memory.store<std::uint32_t>(0xAF00,2);memory.store<std::uint32_t>(0x57C1F4,0xAF00);
+    state.select_imported_track(false);
+    state.music_call(cpu,0x20DDB3,0xC925C,0,{0xAF00});memory.store<std::uint32_t>(0x57C1F4,0);
     menu_fixture();
-    require(!state.imported.selected,"returning to track browsing ends the previous imported selection");
+    require(memory.load<std::uint32_t>(0x3344E4)==30,"original menu remains unchanged after offline asset checks");
     memory.store<std::uint32_t>(0x3344E8,3);invoke(0x4CC40,0x3344D8);
     require(!state.imported.selected && state.imported_file("trackpss/forward/fwyl.pss").empty(),"original Interstate Loop remains selectable");
     require(!state.imported.playlist && !std::memcmp(memory.access(music_playlist,68),saved_playlist.data(),68) &&
@@ -5421,7 +5680,7 @@ std::string check_track_import(const std::filesystem::path& executable,const std
         memory.store<std::uint32_t>(0x4CCABC,mode);menu_fixture();
         require(memory.load<std::uint32_t>(0x3344E4)==30,"other modes keep their original track list");
     }
-    const auto report=std::format("{{\"format\":\"b2-track-import-check-v1\",\"passed\":true,\"game_booted\":false,\"checks\":{},\"sections\":{},\"collision_triangles\":{},\"road_contacts\":{},\"instances\":{},\"lap_metres\":{},\"native_world_draws\":{},\"native_prop_draws\":{},\"odd_index_draws\":{},\"checkpoints\":{},\"native_checkpoint_crossings\":{},\"barrier_triangles\":{},\"barrier_contacts\":{},\"barrier_frames\":5,\"arrow_rates\":[60,144,360],\"music_track\":7,\"native_music_selection\":true,\"cutout_images\":3,\"native_time_attack_menu\":true,\"native_time_attack_selection\":true,\"time_attack_mode\":{}}}",checks,sections,triangles,contacts,instances,metres,world_draws,prop_count,odd_draws,checkpoint_count,checkpoint_crossings,barrier_triangles,barrier_contacts,attack_mode);
+    const auto report=std::format("{{\"format\":\"b2-track-import-check-v1\",\"passed\":true,\"game_booted\":false,\"checks\":{},\"sections\":{},\"collision_triangles\":{},\"road_contacts\":{},\"instances\":{},\"lap_metres\":{},\"native_world_draws\":{},\"native_prop_draws\":{},\"odd_index_draws\":{},\"checkpoints\":{},\"native_checkpoint_crossings\":{},\"barrier_triangles\":{},\"barrier_contacts\":{},\"barrier_frames\":5,\"arrow_rates\":[60,144,360],\"music_track\":7,\"native_music_selection\":true,\"cutout_images\":3,\"native_time_attack_menu\":true,\"offline_import_selection\":true,\"time_attack_mode\":{}}}",checks,sections,triangles,contacts,instances,metres,world_draws,prop_count,odd_draws,checkpoint_count,checkpoint_crossings,barrier_triangles,barrier_contacts,attack_mode);
     write_text(output/"report.json",report+'\n',true);return report;
 }
 bool title_track(Cpu& cpu,Memory& memory,std::uint32_t address,std::uint32_t object) {
@@ -5438,13 +5697,6 @@ bool title_track(Cpu& cpu,Memory& memory,std::uint32_t address,std::uint32_t obj
     if(address==0xC93C0) {host.imported_music(cpu,object);return false;}
     if(address==0xC91F7) {if(host.imported.playlist) cpu.registers[edi]+=24;return false;}
     if(address==0xC92D3) return host.imported.playlist!=0;
-    const bool music_active=host.imported.playlist!=0;
-    host.track_menu(address,object);
-    if(music_active && !host.imported.playlist) {
-        const auto playlist=memory.load<std::uint32_t>(0x57C1F4);
-        if(playlist) host.music_call(cpu,0x20DDB3,0xC925C,0,{playlist});
-        memory.store<std::uint32_t>(0x57C1F4,0);
-    }
     return false;
 }
 bool title_music(Cpu& cpu,Memory& memory,std::uint32_t address) {

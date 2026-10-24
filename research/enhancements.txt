@@ -651,3 +651,230 @@ metadata checks at the reported problem locations, not a full-track visual audit
 The exact old Sunrise viewpoint was not revisited in the live runs. All owned
 workers exited. The user declined benchmarks and will check performance; no
 performance-regression claim is made. Detailed evidence: private verification.json.
+
+Mesh-level distance selection and traffic cutoff (2026-10-24)
+
+User reported noticeable large-scenery and traffic pop-in with the extended
+Draw distance option. Verified supported original executable SHA-256
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+Private native diagnostics and bounded original decodes: build/checks/distance-review.
+
+The extension rejected a whole visibility row when any one mesh failed its
+viewing cone. It also rejected rows during loading using the section center,
+so a row could never become available at a valid actual camera position within
+that section. Selection now retains compatible candidates per mesh, checks the
+actual camera, and submits each additional mesh only once. Existing original
+mesh selections, source material groups/phases and backdrop compatibility remain.
+Unsafe meshes no longer suppress unrelated valid geometry in the same section.
+
+Bounds come from each mesh's actual indexed vertices and original pipeline
+stride. Frustum rejection follows original 90740: reject only if every corner
+is on the positive side of a plane (n.p > d). Per-mesh bounds avoid submitting
+offscreen portions of an otherwise visible section. Lists reserve their maximum
+capacity during loading; selection adds no allocations, file access or shader
+compilation. The separate world allocation is unchanged. Reflections retain
+their original path. Original (1x) does not prepare or select extra scenery.
+
+Keep the existing conservative viewing cones. Section corner extents are not
+evidence of all permitted camera positions: an experimental widening admitted
+known defective Sunrise mountain meshes and was removed before Release.
+
+Traffic: original 9E950 compares the player distance with 275 at 9E9DC and
+250 at 9EA57 (constants 2C1B5C / 2C1B60), clearing the relevant view bit at or
+beyond 250. 9F3BF and subsequent view branches use those bits for the render lists.
+The extension had moved body fading from 225..250 to 450..500 or 900..1000,
+leaving admitted cars fully opaque at the unchanged list cutoff. Keep the
+endpoint at 250 and widen the available fade to 200..250 (2x) or 150..250 (4x).
+This does not extend traffic spawning, simulation, lists or physics. The 1x
+curve, camera-relative calculation, damage/script exemptions and material alpha
+remain. UI help now describes traffic fading instead of implying a larger
+traffic simulation radius.
+
+Offline checks used the real original initializer 8BB50, world relocation
+8EEB0, original PSS/PSW/P2W assets, and the production selection implementation.
+All 60 variants (forward/reverse and both world files) passed preparation,
+selection and 869590 mesh-uniqueness checks. Selected source rows retained their
+original target; no added mesh duplicated an original or another added mesh.
+The six known defective mountain meshes (37:3/4, 38:7/8, 39:8/9) remain excluded
+at the reported Sunrise viewpoint (2145.499, 170.53622 in XZ).
+
+Synthetic camera samples at section centers, eight headings each, 90-degree
+horizontal field of view: Airport average added meshes 18.50 -> 19.58, Sunrise
+39.08 -> 60.65. New added-index averages were 2333 / 8156 respectively.
+Selection time including props in this component diagnostic was roughly
+1.54 -> 1.09 us and 4.43 -> 2.67 us respectively. These timings measure
+selection only; they do not
+establish gameplay FPS or the cost of drawing the additional visible geometry.
+No gameplay automation, full-track visual comparison or FPS benchmark was run.
+Authored backdrop changes and viewing envelopes still bound available scenery;
+this is not a claim that every possible pop-in is eliminated.
+
+The final implementation keeps the old prop-selection plans independently of
+static mesh selection. Props must neither vanish with a culled road mesh nor
+appear on an unsafe partial terrain view. Its cached four corners and height
+evaluate original 90740's eight-corner rejection without the repeated guest
+function calls. Old/new ordered prop lists matched across 25520 sampled views
+covering all 60 world variants. Native traffic admission checks also confirm
+the cutoff is strictly below 250, regardless of the distance setting. All
+3021 fade/admission cases passed at 1x, 2x and 4x, including continuity,
+the untouched original curve and zero opacity at/beyond the list cutoff.
+
+Validation: final Release build and all 52 CPU diagnostic groups passed
+(26026 instruction, 3518 memory, 6744 floating, 109 control cases; 36149
+compiled functions). git diff --check passed. All owned build and diagnostic
+workers exited. Visual pop-in and gameplay performance require manual checking.
+
+Airport control-tower detail handoff (2026-10-24)
+
+The user localized the remaining detail pop to the tall tower near the start
+of Airport Terminal 1/2. Bounded native decoding and original aptl PSW/PSS reads
+confirm this is an authored backdrop handoff, not a distance-based mesh LOD.
+In forward aptl, sections 4..9 select PSS backdrop 19; section 10 drops it and
+selects detailed tower meshes in sections 15/16. Backdrop 19 reaches Y=271.3;
+the detailed tower includes section 15 mesh 11, reaching Y=269.8. The previous
+backdrop-compatibility safeguard correctly kept these representations separate,
+but did not smooth the section boundary that exchanges them.
+
+90F9E..90FC9 selects the four backdrop indices at origin+208..20B. 8EA80 uses
+master+40's 24-byte mesh records through original 8D1A0/8E750. 90A50/90BC0
+select fixed per-material meshes; the bounded Airport/Sunrise audit found no
+per-material mesh-number LOD changes. All decoded originals retain the verified
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF hash.
+Private evidence and checks: build/checks/lod-review.
+
+At 2x/4x, adjacent authored scenery views now hand off over 0.25 seconds using
+64 complementary ordered coverage samples. Each screen sample belongs to one
+complete view, preserving the original depth, material and blend state without
+near/far surface overlap. Common geometry merges its coverage and is submitted
+once per render phase. Only a transition draws the union of the changing views;
+the ordinary static rendering path resumes after all samples reach the new view.
+Rapid reversals or a third nearby view update the remaining samples rather than
+dropping a partially visible version. Camera banks are independent; a cut to an
+unrelated authored visibility region resets the handoff. Elapsed render time
+drives the transition independently of the display refresh rate.
+
+The transition retains both views' material order and original AOT draw helpers.
+Some Sunrise meshes change render phase between source sections, so coverage is
+keyed by mesh AND phase. Main-pass skips at 90F7E/90F9E/90FDC/914BF bypass only
+the replaced static loops; sky, props, later effects and cleanup continue through
+the original code. Original distance and reflection views keep their normal path.
+The existing prop-list hashes remain identical across all 60 layouts. Existing
+mesh viewing envelopes, backdrop compatibility, distance and frustum selection
+are retained. Storage is reserved while loading; handoffs allocate nothing,
+perform no file I/O and introduce no runtime shaders or additional screen pass.
+F8 draw records include the two 32-bit coverage words for inspection.
+
+Native offline checks passed all 60 forward/reverse PSW/P2W variants, 869590
+mesh-uniqueness checks and 19541333 handoff selection/ownership checks. The exact
+tower backdrop/detail masks remain complementary during approach and reversal
+at 60/144/360 Hz; camera separation and distant cuts passed. All 780 native GPU
+coverage/depth checks passed on RTX 5060 Ti and WARP, with and without 4x MSAA,
+using simple, textured and general combiners. No D3D debug errors or runtime
+shader compilations occurred in those checks. The smooth handoff uses temporary
+screen-door coverage, not a change to the original geometry or textures. Game
+visuals and FPS still require the user's manual check; no game was booted and
+no performance benchmark was run.
+
+Final validation: Release rebuilt successfully; all 262 renderer regression
+cases passed on RTX 5060 Ti with zero D3D debug messages. The tool compiled 47
+diagnostic shader variants offline; the baked-shader coverage probe compiled
+none at runtime. All 52 CPU groups passed on the final executable (36149
+compiled functions). git diff --check passed and all owned workers exited.
+
+Scenery objects omitted from the handoff (2026-10-24)
+
+User capture: build/windows/Release/build/captures/frame-133447642600,
+Airport Terminal 1/2 at night, authored view 23. Draw 645 matches animated
+prop model 3 in aptl.pss (164 indices, captured texture 178). Its two authored
+placements are prop-table IDs 19 and 32, at (-2741.261,169.304,-378.372),
+corresponding to PSW stream sections 27 and 40. Section+B8 is an ID permutation,
+not the stream index; the forward Airport stream starts at ID 70. Build a
+validated ID-to-stream map once during loading, shared by resident/extended
+section copies. This keeps rotating and instanced objects on their original
+native transforms and rendering paths.
+
+The OMEGA AIR LINES lettering uses captured texture 199 in draws 820..822,
+matching section/mesh 23:23, 25:5 and 26:24. These are late material groups,
+not main-pass meshes or instanced props. Original 920F0 submits +212 additional
+groups starting at +7AC, after its separately controlled 8EC50 call. The old
+handoff stopped at +7AC and could never mask this lettering. All new hook
+signatures were checked against the supported B5207C40...ED7BF original bytes.
+Private evidence and offline probes: build/checks/scenery-objects.
+
+The existing 0.25-second, 64-sample handoff now includes a fourth static phase
+for these late groups. At 92149 it reconstructs the current camera's handoff
+without advancing time again; only the replaced material loop is skipped, to
+92182. The preceding 8EC50 call retains its original conditions. Ordinary
+steady-state late rendering and the existing distant-mesh admission rules are
+preserved. Late mesh references/materials are validated during world loading.
+
+For instances, each camera also retains coverage for the actual admitted
+sections. Newly admitted objects fade even when the camera remains inside one
+authored view. Outgoing sections remain until their last sample disappears;
+common instances keep full coverage, reversals retain progress, and camera
+cuts reset immediately. Mask hooks at 910F6/91295/913E5 surround the three
+original per-section instance loops. 91370 restores full coverage before
+independent moving objects; 914BF restores it before later scenery/effects.
+The original object animation, frustum checks and distance fade still run.
+Steady-state instance hooks avoid host callbacks; storage is fixed or reserved while
+loading, with no per-frame allocation, I/O, shader compilation or screen pass.
+
+Validation: all 60 forward/reverse PSW/P2W layouts passed, with 869590 mesh
+uniqueness checks and 19931461 handoff/late-phase ownership checks. Steady-state
+prop-list hashes match the previous implementation for every layout. The
+captured radar's instance records passed admission, removal, reversal, common
+object, independent-camera and cut checks at 60/144/360 Hz (529 checks). The
+late pass leaves the camera's fade clock and instance history unchanged. The
+earlier Airport tower backdrop/detail complement checks still pass. Release
+rebuilt successfully; all 52 CPU groups passed on the final executable (36149
+compiled functions). No game boot, computer use or performance benchmark was
+performed; final in-game appearance remains for the user's manual check.
+
+Scenery admission and traffic detail follow-up (2026-10-24)
+---------------------------------------------------------
+The earlier prop handoff used the current draw list as admission. Original
+90740 frustum culling removes sections from that list when looking away;
+this incorrectly faded already-available instances back in on returning.
+Track authored/range admission separately from frustum visibility. Original
+rows and range-qualified extras retain their history while offscreen. Draw
+submission still uses the original four-base/four-raised-corner predicate.
+Only genuine admission changes fade; outgoing props are culled normally.
+
+The native private probe passes all 60 PSW/P2W track variants: 869,590 mesh
+uniqueness checks, 19,931,461 handoff/late-pass checks and 814 instance checks.
+At 60/144/360 Hz, hiding an admitted radar for half a second and looking back
+keeps full coverage without restarting a fade. Distance withdrawal, reversal,
+camera cuts and late-pass clock ownership remain covered. All sixty steady
+prop-list hashes match the previous accepted build.
+
+9B380 already faded body distance but selected LOD 0/1/2 abruptly at
+9BFFC/9C01E. In enhanced distance modes, 9C09A now draws complementary
+coverage for adjacent original LODs through 9A330 over the last 20% of each
+LOD range. It reuses the camera-relative vector already computed at 9BFF3.
+Material opacity and the original high-detail effect amount stay intact.
+Ordinary wheel geometry disappears at LOD 2, so its deferred queue carries
+the same coverage as the body. Shared 0/1 wheels and physics-owned wheels
+are queued once: the second LOD skips only the verified 9AB49..9AEFD wheel
+queue block. 9C12A applies wheel coverage; 9C152 restores full coverage.
+Masks occupy a fixed 8*64 array. No traffic spawning, simulation or visibility
+list changes, extra shaders, or per-frame allocations were added. 1x retains
+its original detail selection.
+
+Authorized automated Airport Time Attack and attract-demo runs completed
+normally on Ryzen 5 5600X / RTX 5060 Ti, 360 Hz selected, 1x native, widescreen,
+V-sync off, draw distance 4x. These were functional runs, not FPS benchmarks.
+The initial diagnostic invocation omitted --disc and stayed on the missing-
+disc screen; the two accepted runs explicitly supplied the verified disc.
+Both accepted runs report no audio error and zero shader compilations.
+The demo captures confirm original replay playback active (frames 420/1500)
+with 62/71 interpolated poses, across Airport origins 8/17.
+
+Traffic evidence from the accepted Airport run:
+- build/captures/frame-62567982000, draws 1115..1121 / 1122..1128:
+  original high/middle models use exact complementary 48/16 coverage masks.
+- build/captures/frame-68568298800, draws 1028..1034 / 1035..1041:
+  original middle/low models use complementary 49/15 masks. All four wheels,
+  draws 1055..1058, use the middle body's 49-sample mask; following wheels
+  return to full coverage. Other scene/HUD draws retain full coverage.
+Private reports: build/checks/render-followup-20261024. No permanent tests
+or gameplay logging were added. Final Release and all 52 CPU groups pass.

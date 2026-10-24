@@ -2,7 +2,6 @@
 #include "file.h"
 #include "vertex_program.h"
 #include "performance.h"
-#include "upscaling.h"
 #include <array>
 #include <memory>
 #include "com_ptr.h"
@@ -53,6 +52,7 @@ struct Vertex {
 };
 // Numeric primitive, comparison, blending and combiner fields retain NV097 values.
 struct RenderState {
+    std::uint64_t coverage = UINT64_MAX; // Complementary 8x8 coverage for scenery handoffs.
     std::uint32_t primitive = 5;
     float point_size = 1;
     bool point_sprite = false, point_scale = false;
@@ -152,15 +152,14 @@ public:
     void attach_window(void* native_window);
     void aspect_ratio(float aspect); // Fit the game's anamorphic image to the selected display aspect.
     void enhancements(unsigned antialiasing,unsigned anisotropy); // AA 0=off, 1..3=FXAA, 4..6=MSAA 2/4/8x; AF 0=original or 1/2/4/8/16.
+    void clean_hud(bool); // New uploads only; configure before starting a session.
     void ambient_occlusion(unsigned quality,float strength=0.35f); // 0=off; 1..3=GTAO low/medium/high.
     bool supports_msaa(unsigned samples) const;
     unsigned raster_samples_per_pixel() const; // Host samples representing one original Xbox pixel.
-    void upscaling(UpscaleMethod,unsigned output_scale=0);
     void camera(std::uint32_t identifier,float near_plane,float far_plane,float vertical_fov,const MotionCamera* motion=nullptr,float aspect=0);
-    bool supports_upscaling(UpscaleMethod) const;
     bool needs_motion_camera() const;
     void visibility(const Visibility*) noexcept; // Exclude presentation-only draws from original sample counts.
-    void publish_frame(bool reset = false); // Snapshot a completed game frame.
+    void publish_frame(); // Snapshot a completed game frame.
     bool display(bool wait = true); // Scale the main image when a window buffer is available.
     bool wait_frame(unsigned timeout_ms); // Acquire one presentation slot, with a bounded wait.
     bool present(bool vsync,bool wait = true);
@@ -168,7 +167,6 @@ public:
     RenderResources resources() const;
     ID3D11Device* native_device() const;
     ID3D11DeviceContext* native_context() const;
-    ID3D11Texture2D* reconstruction_input(unsigned channel) const; // Explicit diagnostic readback only.
     PreparedState prepare(const RenderState&); // Borrowed bindings, valid for this renderer's lifetime.
     std::uint32_t prepare_program(const VertexProgram&, bool launch = false);
     std::uint32_t prepare_fixed(const FixedTransform& = {});
@@ -197,7 +195,6 @@ public:
     std::string adapter() const;
     std::vector<std::string> errors() const;
 private:
-    void configure_upscaling(UpscaleMethod);
     std::unique_ptr<Impl> impl_;
 };
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.2)
-project(burnout2 VERSION 1.8.0 LANGUAGES C CXX)
+project(burnout2 VERSION 1.9.0 LANGUAGES C CXX)
 
 if((NOT WIN32 AND NOT APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux") OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR
    (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$" AND NOT (APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")))
@@ -90,21 +90,17 @@ else()
     endif()
 endif()
 
-add_library(b2-graphics STATIC src/render.cpp src/render_checks.cpp src/vertex_program.cpp src/shaders.cpp src/gpu.cpp src/frame_processing.cpp src/antialiasing.cpp src/ambient_occlusion.cpp)
+add_library(b2-graphics STATIC src/render.cpp src/render_checks.cpp src/vertex_program.cpp src/shaders.cpp src/gpu.cpp src/frame_processing.cpp src/antialiasing.cpp src/ambient_occlusion.cpp src/ui_art.cpp)
 target_link_libraries(b2-graphics PUBLIC b2-core)
 if(WIN32)
     target_link_libraries(b2-graphics PRIVATE d3d11 dxgi windowscodecs ole32)
-    include(cmake/upscalers.cmake)
 else()
     target_link_libraries(b2-graphics PRIVATE b2-d3d11 PNG::PNG JPEG::JPEG)
-    target_sources(b2-graphics PRIVATE src/upscaling_unavailable.cpp)
     if(APPLE)
         target_sources(b2-graphics PRIVATE src/metal.m)
         set_source_files_properties(src/metal.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
         target_link_libraries(b2-graphics PRIVATE "-framework Foundation" "-framework Metal")
     endif()
-    function(b2_copy_upscalers target)
-    endfunction()
 endif()
 
 add_executable(b2-tool src/tool.cpp src/decoder.cpp src/recompiler.cpp src/batch.cpp src/dsp_compiler.cpp src/shader_compiler.cpp)
@@ -115,7 +111,6 @@ if(WIN32)
 else()
     target_link_libraries(b2-tool PRIVATE b2-hlsl)
 endif()
-b2_copy_upscalers(b2-tool)
 add_custom_command(TARGET b2-tool POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES.txt" "$<TARGET_FILE_DIR:b2-tool>/THIRD_PARTY_NOTICES.txt"
@@ -360,7 +355,6 @@ if(B2_XBE)
     target_include_directories(b2 PRIVATE "$<$<COMPILE_LANGUAGE:RC>:${CMAKE_CURRENT_SOURCE_DIR}/resources>")
     add_dependencies(b2 b2-native-generated b2-shaders-generated)
     target_link_libraries(b2 PRIVATE b2-core b2-graphics b2-cpu b2-app SDL3::SDL3-static)
-    b2_copy_upscalers(b2)
     target_compile_definitions(b2 PRIVATE B2_FINITE_ADDRESS=${finite_address} B2_COMPARE_ADDRESS=${compare_address})
 else()
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/gui_shaders.h"

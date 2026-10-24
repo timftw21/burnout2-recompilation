@@ -84,13 +84,13 @@ support is still being tested.
   **Loop Track** option in Music Selection and **Pause → Options**.
 - Optional motion blur from the original game.
 - Optional intro skipping and 2×/4× draw distance, including traffic detail.
-- Experimental DLSS, FSR and XeSS upscaling (Windows only).
+- Clean HUD redraws the original low-resolution interface assets with smooth edges.
+- Optional fast loading skips loading transitions and frame delays.
 
 ### What still needs work
 
 - Testing all modes, tracks and saved-game progression.
 - Checking sound balance and consistently smooth performance across the whole game.
-- Experimental upscaling has small visual issues and can reduce performance.
 
 ## Getting started
 
@@ -139,7 +139,7 @@ the features required by the Metal backend, so Intel graphics need testing on
 a compatible physical Mac. Run `./build/macos/Release/b2-tool inspect-metal` to
 check GPU support.
 
-Linux and macOS do not support the Windows D3D12 upscalers, WARP, D3D11 debug
+Linux and macOS do not support WARP, D3D11 debug
 layers or hardware memory watches. Custom music imports require FFmpeg.
 
 ### Windows x64
@@ -215,10 +215,12 @@ to apply graphics and enhancement changes during play.
 - **Enhancements:** Adjust MSAA/FXAA, anisotropic filtering and **Draw distance**
   (Original, 2× or 4×). **Ambient occlusion** adds contact shading, with three
   quality levels and a strength slider; Off preserves the original appearance.
-  Increased distance and shading quality use more resources. Experimental DLSS,
-  FSR and XeSS have visual issues and may reduce performance; they replace
-  separate antialiasing and use the selected output resolution.
-  **Motion blur** and **Skip intro splash screens** are under **Miscellaneous**.
+  Increased distance and shading quality use more resources. Extended draw distance
+  fades scenery and traffic detail changes for smoother transitions.
+  **Clean HUD**, **Fast load**, **Motion blur** and **Skip intro splash screens**
+  are under **Miscellaneous**. Clean HUD is enabled by default and redraws the
+  original lettering, icons and gauges. Fast load is optional and removes loading
+  transitions and frame limits while the game's assets load.
   Motion blur controls the original game's scene blur during boosting and other
   speed effects; it is enabled by default.
 - **Audio:** To use custom songs, **Browse** for a music folder, click

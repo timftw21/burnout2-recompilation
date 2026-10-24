@@ -18,10 +18,9 @@ struct XboxHost {
     Performance* performance=nullptr;
     bool widescreen=false;
     bool ultrawide=false,motion_blur=true;
-    bool skip_intro=false;
+    bool skip_intro=false,fast_load=false,clean_hud=false;
     bool audio_output=true;
     unsigned draw_distance=1;
-    bool upscaling=false;
     std::filesystem::path custom_music_root;
     std::filesystem::path imported_tracks;
     bool loop_track=false;
@@ -76,6 +75,7 @@ public:
     BootResult run(std::uint32_t visit_budget,std::uint32_t break_address=0,std::uint32_t break_hit=1);
     bool save_frame(const std::filesystem::path&);
     void output_gain(float);
+    bool fast_loading() const;
     void capture_frame(const std::filesystem::path& directory,bool automated=false);
     void performance_recording(bool);
     PerfCounters performance_counters() const;

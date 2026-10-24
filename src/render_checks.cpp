@@ -1533,13 +1533,6 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
             native.release(scene);
 
             if(sample_count==1) {native.enhancements(2,0);expect(draw(true,true),64,48,{255,0,0,255},1);native.enhancements(0,0);}
-            if(quality==2 && sample_count==1 && native.supports_upscaling(UpscaleMethod::fsr)) {
-                native.upscaling(UpscaleMethod::fsr,1);draw(true,true);expect(draw(true,true),64,48,{255,0,0,255},1);
-                const auto reconstructed=native.create_target(128,96);
-                native.set_target(reconstructed);expect(draw(true,true,false,true),64,48,{255,0,0,255},1);
-                native.release(reconstructed);
-                native.upscaling(UpscaleMethod::off);
-            }
             native.ambient_occlusion(0);const auto disabled=draw(true,false);
             if(disabled.rgba!=original.rgba || native.resources().target_bytes!=baseline_bytes)
                 throw std::runtime_error("Disabling AO did not restore original pixels/resource usage");

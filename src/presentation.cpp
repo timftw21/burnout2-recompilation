@@ -81,8 +81,9 @@ void Presentation::reset() {
     for(auto& preview:previews_) preview.address=0;
     for(auto& camera:cameras_) camera={};
     for(auto& item:ui_) item.node=0;
+    for(auto& source:shadow_sources_) source.record=0;
     applied_count_=0;drawing_=syncing_=clock_started_=false;
-    blur_={};
+    blur_={};sparks_={};ghost_position_=0;shadow_count_=0;
 }
 void Presentation::forget(std::uint32_t address) {
     for(auto& pose:poses_) if(pose.address==address) {pose.identity=UINT32_MAX;pose.step=0;pose.applied=false;}
@@ -106,7 +107,7 @@ void Presentation::frame(Cpu& cpu,std::uint32_t address,bool destroy) {
     if(!available) throw NativeBoundary(0xE90D0,"presentation frame capacity exceeded");
     *available={address,timing->step};
 }
-void Presentation::camera(Cpu& cpu,std::uint32_t wrapper) {
+void Presentation::camera(Cpu& cpu,std::uint32_t wrapper,unsigned controller) {
     const auto& timing=*cpu.game_timing;
     if(!wrapper || drawing_ || !timing.started || !timing.update || timing.loading) return;
     auto found=std::ranges::find(cameras_,wrapper,&Camera::wrapper);
@@ -115,19 +116,35 @@ void Presentation::camera(Cpu& cpu,std::uint32_t wrapper) {
         if(found==cameras_.end()) throw NativeBoundary(cpu.eip,"presentation camera capacity exceeded");
         *found={};found->wrapper=wrapper;
     }
+    found->cut|=found->controller!=controller;found->controller=controller;
     found->touched=timing.step;
+}
+void Presentation::camera_cut(Cpu& cpu,std::uint32_t wrapper) {
+    if(drawing_ || !cpu.game_timing->update) return;
+    for(auto& camera:cameras_) if(camera.wrapper==wrapper) camera.cut=true;
 }
 void Presentation::cameras(Cpu& cpu,Memory& memory) {
     const auto& timing=*cpu.game_timing;
     for(auto& camera:cameras_) if(camera.wrapper && camera.touched+1>=timing.step) {
-        // ADCA0/A6130 receive the title's camera wrapper. The original mode
-        // stack distinguishes a deliberate view switch from ordinary motion.
+        // Replay uses the controller at wrapper+98. Its visibility scratch
+        // array overlaps the driving camera's first mode record at +170.
+        // Read the active controller's mode/shot, not that changing scratch.
         const auto address=memory.load<std::uint32_t>(camera.wrapper),slot=memory.load<std::uint32_t>(camera.wrapper+0x228);
         if(!address) continue;
         if(slot>2) throw NativeBoundary(0xADCA0,"unsupported camera mode stack");
-        const auto frame=memory.load<std::uint32_t>(address+4),mode=memory.load<std::uint32_t>(camera.wrapper+0x170+slot*0xBC);
+        const auto frame=memory.load<std::uint32_t>(address+4);
+        auto mode=camera.controller==1?
+            memory.load<std::uint32_t>(camera.wrapper+0xF0)|(memory.load<std::uint32_t>(camera.wrapper+0x11C)<<8):
+            memory.load<std::uint32_t>(camera.wrapper+0x170+slot*0xBC);
+        if(camera.controller==2) {
+            // B58C0 owns the trackside replay/demo cameras, including B5100's
+            // zoom. Adjacent records can describe the same continuous shot.
+            const auto record=memory.load<std::uint32_t>(camera.wrapper+0x4A4);
+            mode=record?memory.load<std::uint32_t>(record+0x10):memory.load<std::uint32_t>(camera.wrapper+0x4A0);
+        }
         const auto projection=memory.load<std::uint32_t>(address+0x14);
-        const bool cut=address!=camera.address || frame!=camera.frame || mode!=camera.mode || projection!=camera.projection || camera.step+1<timing.step;
+        const bool cut=camera.cut || address!=camera.address || frame!=camera.frame || mode!=camera.mode || projection!=camera.projection || camera.step+1<timing.step;
+        camera.cut=false;
         if(cut) {
             forget(frame+0x10);camera.paired=false;
             // Projected HUD labels must not slide across an intentional cut.
@@ -147,36 +164,46 @@ void Presentation::cameras(Cpu& cpu,Memory& memory) {
             memory.store<std::uint32_t>(address+0x68+i*4,std::bit_cast<std::uint32_t>(current[i]));
             memory.store<std::uint32_t>(address+0x70+i*4,std::bit_cast<std::uint32_t>(1.f/current[i]));
         }
+        camera.view_scale=std::bit_cast<float>(memory.load<std::uint32_t>(camera.wrapper+0x210));
+        memory.store(camera.wrapper+0x210,std::bit_cast<std::uint32_t>(1.f/current[0]));
         syncing_=true;original(cpu,memory,0xE8490,address,std::bit_cast<std::uint32_t>(current[2]));syncing_=false;
         camera.applied=true;
     }
 }
-bool Presentation::matrix(Cpu& cpu,Memory& memory,std::uint32_t address,std::uint32_t identity) {
+bool Presentation::matrix(Cpu& cpu,Memory& memory,std::uint32_t address,std::uint32_t identity,Matrix* output,const Matrix* source) {
     if(!drawing_ || !address) return false;
     const auto& timing=*cpu.game_timing;
     auto index=((address>>4)*2654435761U)&(poses_.size()-1);
     Pose* found=nullptr;unsigned available=static_cast<unsigned>(poses_.size());
     for(unsigned probe=0;probe<poses_.size();++probe,index=(index+1)&(poses_.size()-1)) {
         auto& candidate=poses_[index];
-        if(candidate.address==address) {found=&candidate;break;}
+        // A copied shadow can still reference an old owner after a prop slot
+        // is reused. Keep both identities until that snapshot stops drawing.
+        if(candidate.address==address && candidate.identity==identity) {found=&candidate;break;}
         if(!candidate.applied && (!candidate.address || candidate.step+2<timing.step) && available==poses_.size()) available=static_cast<unsigned>(index);
         if(!candidate.address) break;
     }
     if(!found && available<poses_.size()) {index=available;found=&poses_[index];}
     if(!found) throw NativeBoundary(cpu.eip,"presentation pose capacity exceeded");
     auto& pose=*found;
-    if(pose.applied) return true;
-    Matrix current;std::memcpy(current.data(),memory.access(address,64),64);
-    if(pose.address!=address || pose.identity!=identity || pose.step+1<timing.step) {
-        pose={};pose.address=address;pose.identity=identity;pose.current=current;pose.step=timing.step;
-    } else if(pose.step!=timing.step) {
-        pose.previous=pose.current;pose.current=current;pose.step=timing.step;pose.paired=true;
+    if(!pose.applied) {
+        Matrix current;
+        if(source) current=*source;
+        else std::memcpy(current.data(),memory.access(address,64),64);
+        if(pose.address!=address || pose.identity!=identity || pose.step+1<timing.step) {
+            pose={};pose.address=address;pose.identity=identity;pose.current=current;pose.step=timing.step;
+        } else if(pose.step!=timing.step) {
+            pose.previous=pose.current;pose.current=current;pose.step=timing.step;pose.paired=true;
+        }
     }
     if(!timing.render || !pose.paired) return false;
     Matrix blended;
     if(!interpolate(pose.previous,pose.current,float(double(timing.remainder)/733333333.0),blended)) return false;
+    if(output) {*output=blended;return true;}
+    // Ghost playback rebuilds its draw record for each view. Reapply the same
+    // pose even if this address has already been drawn, without sampling twice.
     std::memcpy(memory.access(address,64),blended.data(),64);
-    pose.applied=true;applied_[applied_count_++]=static_cast<std::uint16_t>(index);
+    if(!pose.applied) {pose.applied=true;applied_[applied_count_++]=static_cast<std::uint16_t>(index);}
     return true;
 }
 void Presentation::car(Cpu& cpu,Memory& memory,std::uint32_t car) {
@@ -225,9 +252,29 @@ void Presentation::begin(Cpu& cpu,Memory& memory) {
         }
     }
     if(!timing.loading) for(unsigned i=0;i<4;++i) car(cpu,memory,memory.load<std::uint32_t>(0x2FE370+i*4));
+    if(!timing.loading) {
+        // BAF50 caches the race clock for fxspark. BB0D0 evaluates both ends
+        // of each spark from that time, its birth time and original velocity.
+        // Sample the clock alongside the poses; paused/slow-motion updates
+        // then need no special prediction or extra particle simulation.
+        constexpr auto address=0x3DB098U;
+        const auto current=std::bit_cast<float>(memory.load<std::uint32_t>(address));
+        if(!sparks_.step || sparks_.step+1<timing.step || current<sparks_.current) {
+            sparks_={};sparks_.current=current;sparks_.step=timing.step;
+        } else if(sparks_.step!=timing.step) {
+            sparks_.previous=sparks_.current;sparks_.current=current;sparks_.step=timing.step;sparks_.paired=true;
+        }
+        if(timing.render && sparks_.paired) {
+            memory.store(address,std::bit_cast<std::uint32_t>(sparks_.previous+(sparks_.current-sparks_.previous)*ui_fraction_));
+            sparks_.applied=true;
+        }
+    }
 }
 void Presentation::end(Cpu& cpu,Memory& memory) {
     if(!drawing_) return;
+    restore_shadows(memory);
+    if(ghost_position_) {std::memcpy(memory.access(ghost_position_,12),ghost_original_.data(),12);ghost_position_=0;}
+    if(sparks_.applied) {memory.store(0x3DB098,std::bit_cast<std::uint32_t>(sparks_.current));sparks_.applied=false;}
     for(unsigned i=0;i<applied_count_;++i) {
         auto& pose=poses_[applied_[i]];
         if(!pose.applied) continue;
@@ -246,6 +293,7 @@ void Presentation::end(Cpu& cpu,Memory& memory) {
                 memory.store<std::uint32_t>(camera.address+0x70+i*4,std::bit_cast<std::uint32_t>(1.f/camera.current[i]));
             }
             original(cpu,memory,0xE8490,camera.address,std::bit_cast<std::uint32_t>(camera.current[2]));
+            memory.store(camera.wrapper+0x210,std::bit_cast<std::uint32_t>(camera.view_scale));
             camera.applied=false;synchronized=true;
         }
         for(auto& frame:frames_) if(frame.applied) {
@@ -280,6 +328,52 @@ void Presentation::ghost(Cpu& cpu,Memory& memory,std::uint32_t address) {
     matrix(cpu,memory,address+0x10,model);
     for(unsigned i=0;i<wheels;++i) matrix(cpu,memory,address+0x70+i*64,model);
     for(unsigned i=0;i<parts;++i) matrix(cpu,memory,address+0x1B0+i*64,model);
+    // 884B0 projects the separate position at ghost+5E0. 7B280 copied it
+    // before smoothing the render record at +5F0, so use its displayed body.
+    if(cpu.game_timing->render) {
+        if(!ghost_position_) {
+            ghost_position_=address-0x10;
+            std::memcpy(ghost_original_.data(),memory.access(ghost_position_,12),12);
+        }
+        std::memcpy(memory.access(address-0x10,12),memory.access(address+0x40,12),12);
+    }
+}
+void Presentation::shadow_source(Memory& memory,std::uint32_t manager,std::uint32_t body) {
+    const auto index=memory.load<std::uint32_t>(manager+4);
+    if(index>=shadow_sources_.size()) return; // 789F0 also refuses a full buffer.
+    auto& source=shadow_sources_[index];
+    source.record=manager+8+index*0x30;source.body=body;
+    source.address=memory.load<std::uint32_t>(body+0x10);
+    std::memcpy(source.pose.data(),memory.access(source.address,64),64);
+}
+void Presentation::shadows(Cpu& cpu,Memory& memory,std::uint32_t manager) {
+    if(!drawing_) return;
+    // 826E7 records the source while 789F0 copies each shadow. Later vehicle
+    // updates can add/recycle bodies, and drawing can compact matrix slots.
+    // Neither the live list nor its matrices still describe this snapshot.
+    const auto count=memory.load<std::uint32_t>(manager+4);
+    if(!count) return;
+    if(count>shadows_.size()) throw NativeBoundary(0x78C10,"physics shadow capacity exceeded");
+    for(unsigned i=0;i<count;++i) {
+        const auto record=manager+8+i*0x30;
+        const auto& source=shadow_sources_[i];
+        if(source.record!=record) continue;
+        Matrix pose;
+        if(!matrix(cpu,memory,source.address,source.body,&pose,&source.pose)) continue;
+        auto& saved=shadows_[shadow_count_++];saved.address=record;
+        std::memcpy(saved.original.data(),memory.access(record,48),48);
+        std::memcpy(memory.access(record,12),pose.data()+12,12);
+        // Match 789F0's orientation choice, including overturned bodies.
+        const std::array right=std::abs(pose[1])<=0.8f?std::array{pose[0],pose[1],pose[2]}:
+            std::array{pose[10],0.f,-pose[8]};
+        std::memcpy(memory.access(record+0x10,12),right.data(),12);
+    }
+}
+void Presentation::restore_shadows(Memory& memory) {
+    for(unsigned i=0;i<shadow_count_;++i) {
+        const auto& saved=shadows_[i];std::memcpy(memory.access(saved.address,48),saved.original.data(),48);
+    }
+    shadow_count_=0;
 }
 void Presentation::preview(Cpu& cpu,Memory& memory,std::uint32_t address) {
     if(!drawing_) return;
@@ -332,9 +426,13 @@ void Presentation::ui(Cpu& cpu,Memory& memory,std::uint32_t node,std::uint32_t p
     if(!found) throw NativeBoundary(0xC1306,"presentation UI capacity exceeded");
     const auto ram=memory.primary();
     // Font callbacks keep their measured layout at payload+8 (1E720/229D0).
-    // A changed string width must not stretch the replacement glyphs.
-    const std::array identity{ram.load<std::uint32_t>(node+0x48),ram.load<std::uint32_t>(node+0x50),
-        ram.load<std::uint32_t>(node+0x28),ram.load<std::uint32_t>(node+0x2C),ram.load<std::uint32_t>(node+0x30)};
+    // BFBF0 instead reads four UVs and a texture at payload+10. A different
+    // image/crop must not inherit the previous trophy's shape while scrolling.
+    const auto callback=ram.load<std::uint32_t>(node+0x50);
+    const std::array identity{ram.load<std::uint32_t>(node+0x48),callback,
+        ram.load<std::uint32_t>(node+0x28),ram.load<std::uint32_t>(node+0x2C),ram.load<std::uint32_t>(node+0x30),
+        callback==0xBFBF0?ram.load<std::uint32_t>(node+0x34):0U,
+        callback==0xBFBF0?ram.load<std::uint32_t>(node+0x38):0U};
     auto* output=ram.access(parameters,32);
     // 235C6 advances the Burnout text's wipe/blur amount on original updates;
     // 22A60 only reads it. Keep it at the same display fraction as the text.
@@ -420,7 +518,11 @@ void title_presentation(Cpu& cpu,Memory& memory,std::uint32_t site,std::uint32_t
     case 0:cpu.presentation->reset();return;
     case 0xE90D0:cpu.presentation->frame(cpu,object);return;
     case 0xE9040:case 0xE8F60:cpu.presentation->frame(cpu,object,true);return;
-    case 0xADCA0:case 0xA6130:cpu.presentation->camera(cpu,object);return;
+    case 0xADCA0:case 0xA6130:cpu.presentation->camera(cpu,object,site==0xA6130);return;
+    case 0xB58C0:cpu.presentation->camera(cpu,object,2);return;
+    case 0xA9790:cpu.presentation->camera_cut(cpu,object-8);return;
+    case 0x826E7:cpu.presentation->shadow_source(memory,object,memory.load<std::uint32_t>(cpu.registers[ebx]));return;
+    case 0x795F5:cpu.presentation->restore_shadows(memory);return;
     }
     HostFloatingScope floating(cpu.floating);
     switch(site) {
@@ -428,6 +530,7 @@ void title_presentation(Cpu& cpu,Memory& memory,std::uint32_t site,std::uint32_t
     case 2:cpu.presentation->end(cpu,memory);break;
     case 0x9B380:cpu.presentation->traffic(cpu,memory,object);break;
     case 0x7BEDE:cpu.presentation->ghost(cpu,memory,object);break;
+    case 0x78C10:cpu.presentation->shadows(cpu,memory,object);break;
     case 0x8EBC5: {
         // 8EB10 compacts dead physics props before this point. Bind the
         // remaining matrix slot to its actual body, including slot reuse.

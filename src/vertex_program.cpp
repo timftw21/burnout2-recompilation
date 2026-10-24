@@ -112,7 +112,7 @@ std::string ilu_operation(unsigned opcode) {
 }
 }
 namespace {
-std::string draw_source(const std::string& body,unsigned first=0,unsigned count=192,bool jitter=false) {
+std::string draw_source(const std::string& body,unsigned first=0,unsigned count=192) {
     std::string source(helpers);
     source+=std::format("\n#define B2_CONSTANT_FIRST {}\ncbuffer Program:register(b1) {{ ",first);
     if(count) source+=std::format("float4 k[{}]; ",count);
@@ -151,12 +151,6 @@ p.fog=nv_fog(o[5].x,fog_params);
 p.size=o[6].x;
 return p; }
 )";
-    if(jitter) {
-        const auto main=source.find("P main(I input)");
-        source.insert(main,"cbuffer Temporal:register(b3){float4 jitter;float4 temporal;}\n");
-        const auto end=source.find("p.c=saturate(o[3]);");
-        source.insert(end,"p.p.xy+=jitter.xy*p.p.w;\n");
-    }
     return source;
 }
 }
@@ -172,7 +166,7 @@ void validate_fixed_transform(const FixedTransform& state) {
             throw std::runtime_error("Invalid NV097 texgen component");
     }
 }
-std::string fixed_transform_source(std::uint32_t skin,bool jitter) {
+std::string fixed_transform_source(std::uint32_t skin) {
     if(skin>6) throw std::runtime_error("Reserved NV097 skin mode");
     const auto matrix=[](std::string_view vector,unsigned row) {
         return std::format("float4(dot({},k[{}]),dot({},k[{}]),dot({},k[{}]),dot({},k[{}]))",
@@ -227,7 +221,7 @@ if(fixed_flags.y) {
  o[6].x=clamp((attenuation+point_params[1].z)*point_params[0].w+point_params[1].w,minimum,maximum);
 }
 )";
-    return draw_source(body,0,96,jitter);
+    return draw_source(body,0,96);
 }
 VertexProgram normalize_vertex_program(const VertexProgram& program) {
     if(program.start>=program.tokens.size()) throw std::runtime_error("NV2A vertex start exceeds 136 slots");
@@ -238,7 +232,7 @@ VertexProgram normalize_vertex_program(const VertexProgram& program) {
     }
     throw std::runtime_error("NV2A vertex program has no final instruction within 136 slots");
 }
-VertexTranslation translate_vertex_program(const VertexProgram& program,bool launch,bool jitter) {
+VertexTranslation translate_vertex_program(const VertexProgram& program,bool launch) {
     if(program.start>=program.tokens.size()) throw std::runtime_error("NV2A vertex start exceeds 136 slots");
     VertexTranslation result;
     std::string body="float4 r[12]; float4 o[13]; int a0=0;\n[unroll] for(int i=0;i<12;++i) r[i]=0;\n[unroll] for(int i=0;i<13;++i) o[i]=float4(0,0,0,1);\n";
@@ -311,7 +305,7 @@ VertexTranslation translate_vertex_program(const VertexProgram& program,bool lau
         result.source+="#define B2_CONSTANT_FIRST 0\nRWStructuredBuffer<float4> k:register(u0); StructuredBuffer<float4> inputs:register(t0);\n[numthreads(1,1,1)] void main(uint3 id:SV_DispatchThreadID) { float4 v[16]; [unroll] for(int i=0;i<16;++i) v[i]=inputs[i];\n"+body+"}\n";
     } else {
         if((result.output_masks[0]&14)!=14) throw std::runtime_error("NV2A vertex program does not write complete position XYZ");
-        result.source=draw_source(body,result.constant_first,result.constant_count,jitter);
+        result.source=draw_source(body,result.constant_first,result.constant_count);
     }
     return result;
 }
