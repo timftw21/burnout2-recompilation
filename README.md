@@ -18,13 +18,13 @@ I'll try to respond in a timely manner. This is an independent fan project, unaf
 Yes, AI (Codex) assisted in the development of this project. No, this project was not blindly thrown together.
 If you're skeptical, I implore you to try the recompilation for yourself. I take quality control quite seriously!👀
 
-## What's new in 1.8
+## What's new in 1.9
 
-- Added experimental Linux x86-64 builds using Vulkan.
-- Added native macOS builds for Intel and Apple Silicon using Metal.
-- Added guided Linux and macOS installers with dependency setup and application shortcuts.
-- Added full macOS CI builds and offline CPU, audio, effects and storage checks.
-- Improved music import portability and Mac graphics initialization.
+- Added a "Clean HUD" option to miscellaneous enhancements. Many low-resolution assets were redrawn. It's enabled by default.
+- Added a "Fast load" option to miscellaneous enhancements. When enabled, screen transitions are disabled and framerate is uncapped during loading.
+- Fixed some lingering timing issues.
+- Improved the render distance enhancement. Assets now fade in for smooth LOD transitions.
+- Removed DLSS, FSR, and XeSS. They weren't worth the trouble.
 
 Download the new **Installation.zip**. On Windows, run **Build.cmd** again to
 update. On Linux, open **Install.desktop**; on macOS, open **Install.command**.
