@@ -477,8 +477,8 @@ void Presentation::ui(Cpu& cpu,Memory& memory,std::uint32_t node,std::uint32_t p
         auto previous=_mm_loadu_ps(item.previous.data()+i);const auto next=_mm_loadu_ps(current.data()+i);
         if(i==0 && period>0) {
             const auto length=_mm_set_ss(period);
-            const auto wraps=_mm_cvtss_si32(_mm_div_ss(_mm_sub_ss(next,previous),length));
-            previous=_mm_add_ss(previous,_mm_mul_ss(length,_mm_cvtsi32_ss(_mm_setzero_ps(),wraps)));
+            const auto wraps=_mm_cvt_ss2si(_mm_div_ss(_mm_sub_ss(next,previous),length));
+            previous=_mm_add_ss(previous,_mm_mul_ss(length,_mm_cvtsi32_ss(length,wraps)));
         }
         _mm_storeu_ps(current.data()+i,_mm_add_ps(previous,_mm_mul_ps(_mm_sub_ps(next,previous),fraction)));
     }
