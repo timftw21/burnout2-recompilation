@@ -24,11 +24,11 @@ set(SDL_METAL ON CACHE BOOL "" FORCE)
 FetchContent_Declare(sdl3
     URL https://github.com/libsdl-org/SDL/archive/829a65d769d935c4852f8159e964312c0957260a.tar.gz
     URL_HASH SHA256=48E15CF1A6928453D77AFA955D1FDFBBCA9169E2BC3D76D111ACB9B8BB076D66
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
 FetchContent_MakeAvailable(sdl3)
 FetchContent_Declare(dxmt
     GIT_REPOSITORY https://github.com/3Shain/dxmt.git
-    GIT_TAG 50102f994b406f58f56d5d09f2ad20f9b90390a2
+    GIT_TAG 9839e55f98d4aca103957ee4132d6395a325a9ed
     GIT_SUBMODULES include/native/directx)
 FetchContent_MakeAvailable(dxmt)
 include(cmake/dxmt.cmake)

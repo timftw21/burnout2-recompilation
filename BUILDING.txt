@@ -13,7 +13,7 @@ The source folder stays the installation location, as with Windows setup.
 Automatic Linux package setup supports Ubuntu 24.04+/Debian 13+ through apt,
 Fedora through dnf and Arch through pacman. It installs only missing packages,
 including FFmpeg and the disc picker. An older system CMake is supplemented by
-the hash-verified official CMake 4.3.3 binary under build/deps/cmake-linux.
+the hash-verified official CMake 4.4.4 binary under build/deps/cmake-linux.
 It does not change the system's default compiler or CMake installation.
 Other distributions can use the manual build steps below.
 
@@ -37,13 +37,56 @@ CI=true disables dialogs; an XISO argument supports unattended full setup.
 These options do not start the game. CI uses the same dependency setup on both
 Mac architectures and checks the generated application's metadata and launcher.
 
+Steam Deck / SteamOS
+
+In Desktop Mode, extract Installation.zip to a permanent folder in your home
+directory or on a Linux-formatted microSD card, then open Install.desktop.
+SteamOS automatically uses the Steam Deck setup. To select it on another Linux
+system, run bash Install.sh --steamdeck '/path/to/Burnout 2.xiso.iso'.
+
+Setup installs the Freedesktop 25.08 runtime, SDK and LLVM 20 extension through
+Flatpak --user. It never runs sudo, pacman or steamos-readonly. Build tools,
+headers and libraries stay in your user account; SteamOS remains read-only.
+The first setup downloads several GB and builds with two compiler jobs to limit
+memory use. Keep enough free storage for the SDK, source build and your disc.
+The original executable and audio effects are verified by the same native builder.
+No Python, Wine or Proton is used. An AppImage is not required: the shared
+Flatpak runtime supplies the game libraries and Mesa/Vulkan drivers.
+
+Launch Burnout 2 from the application menu, or run bash Play.sh --steamdeck.
+For Gaming Mode, in Desktop Mode choose Steam > Games > Add a Non-Steam Game,
+then select Burnout 2: Point of Impact from the applications list. Leave the
+compatibility-tool override disabled. The existing gamepad controls and settings
+navigation work through SDL3 and Steam Input. First-install defaults select
+fullscreen, 1x resolution, widescreen and the display's refresh rate.
+
+The native game, settings, saves and music stay in build/steamdeck/Release,
+separate from ordinary Linux builds. Rerunning setup preserves them. Play.sh
+detects this installation and launches it inside the runtime; launch through
+that script instead of starting b2 outside its runtime. Keep the source folder
+and disc in place. Move a folder only after closing the game, then rerun setup.
+Install.sh --steamdeck --dependencies-only prepares just the user build tools;
+--shortcuts-only recreates the application shortcut. Runtime updates use
+flatpak update --user. Hardware gameplay, audible balance and performance still
+require validation on a physical Steam Deck; offline checks are not an FPS claim.
+
+Local validation (2026-10-26): the full native game built with the user-installed
+25.08 SDK and LLVM 20 under WSL2. Running through the separate playback runtime
+passed 52 CPU groups, 77 audio cases, 54 spatial cases and 155 audio bindings,
+67 effects checks, 57 input cases, 2061 storage cases and the hidden settings
+window. Rendering used llvmpipe with zero runtime HLSL compilations. These checks
+booted no game and opened no playback device.
+Repeated setup preserved settings, storage and unchanged extracted-file
+timestamps. The application shortcut and automatic Play.sh launcher also passed.
+
 Linux x86-64
 
 Use a glibc-based distribution, Clang 19 or newer, LLD, Ninja, Git, CMake 4.2
-or newer and a Vulkan 1.3 driver compatible with DXVK 2.7.1. On Ubuntu 24.04
+or newer and a Vulkan 1.4 driver compatible with DXVK 3.1.1 (RADV 25.0+,
+Nvidia 575.51.02+, or ANV/NVK 25.1+). On Ubuntu 24.04
 the native dependencies are:
 
-sudo apt install build-essential clang-19 lld-19 ninja-build git curl pkg-config patch libssl-dev libpng-dev libjpeg-dev libasound2-dev libpulse-dev libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev libxtst-dev libwayland-dev libxkbcommon-dev libdrm-dev libgbm-dev libegl1-mesa-dev libgl-dev libdecor-0-dev libudev-dev libvulkan-dev spirv-headers flex bison libjson-perl
+sudo apt install build-essential clang-19 lld-19 ninja-build git curl pkg-config patch libssl-dev libfontconfig-dev libpng-dev libjpeg-dev libasound2-dev libpulse-dev libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev libxtst-dev libwayland-dev libxkbcommon-dev libdrm-dev libgbm-dev libegl1-mesa-dev libgl-dev libdecor-0-dev libudev-dev libvulkan-dev glslang-tools spirv-headers flex bison libjson-perl
 
 Install CMake 4.2+ separately if the distribution provides an older version.
 Ensure clang, clang++ and ld.lld select the installed LLVM toolchain on PATH.
@@ -54,10 +97,14 @@ bash Build.sh '/path/to/Burnout 2 - Point of Impact (USA).xiso.iso'
 The builder fetches pinned SDL3 and DXVK Native, builds vkd3d-shader 2.1 with
 the included shader bitcast fix, verifies the original executable, and compiles
 the native game. Unchanged builds reuse the local compiler.
-No Python or Wine is used. Only the standalone native shader compiler library
-is built. FFmpeg is optional and needed only to import custom music.
+DXVK Native 3.1.1 is built with upstream swapchain resize fix 3dbf33cb, which
+corrects blurred Wayland presentation. The cached Muon 0.7.0 build tool is
+bootstrapped from C; the display-name table generator uses Perl. Python and
+Wine are not used. FFmpeg is optional and needed only to import custom music.
 Launch build/linux/Release/b2. The settings window uses native SDL file dialogs;
 install an XDG desktop portal on Wayland if the desktop does not provide one.
+Settings use the desktop sans-serif fonts through Fontconfig, with a scalable
+built-in font when no suitable system font is available.
 Settings, saves, logs and imported music live beside the Linux executable.
 Rebuilding refreshes game paths and preserves the other settings and saves.
 Keep the source/build directories together; rebuild after moving them.
@@ -163,17 +210,20 @@ this also compiles the portable arithmetic core without needing a game image.
 
 Windows x64
 
-Install Visual Studio 2026 with Desktop development with C++, C++ CMake tools
-for Windows and its Windows SDK, LLVM 22.1 or newer (Windows x64), CMake 4.2 or
-newer, Git for Windows, and Ninja (ninja.exe).
-Ninja is included with Visual Studio's C++ CMake tools for Windows component.
-If it is missing, open Visual Studio Installer, choose Modify for Visual Studio
-2026, and install that component under Individual components. Alternatively,
-download ninja-win.zip from https://github.com/ninja-build/ninja/releases/latest,
-extract it and add its folder to PATH. Reopen Build.cmd after installing it.
-Download and extract the project source.
-Double-click Build.cmd, select the supported US Xbox disc image, and wait for
-the build. Click Open game folder and double-click b2.exe. No commands are needed.
+Extract Installation.zip into a permanent folder, double-click Install.cmd,
+select the supported US Xbox XISO disc image and wait for setup. Click Launch
+game when it finishes. Build.cmd remains an alias for the same installer.
+
+Setup reuses compatible installed tools and automatically downloads missing
+CMake, MinGit, Ninja and LLVM into build/deps/windows. Downloads come from the
+official projects, use fixed versions and SHA-256 checks, and remain cached for
+retries. The tool directories are added only to setup's process PATH.
+Microsoft C++ Build Tools 2026 and Windows SDK 10.0.26100 are installed when
+missing, through Microsoft's signed installer and the normal Windows permission
+prompt. An existing Visual Studio 2026 installation is supplemented if needed;
+the full editor is not required. If Microsoft requests a restart, restart Windows
+and rerun Install.cmd. First setup requires internet access and several GB of
+free storage. There is no prerequisite package manager or manual PATH setup.
 
 The builder uses the native b2-tool to extract and verify the game executable
 and read the effects image. It prepares data/local, configures and builds Release,
@@ -181,10 +231,12 @@ and updates game-file locations beside b2.exe after a successful build.
 Other settings and saves are preserved. Use an Xbox XISO image;
 full-disc dumps require conversion first. One build runs per source folder.
 The installer shows each installation stage and a progress bar driven by
-completed build tasks. Downloads, configuration and linking wait for the tool's
-actual completion; the bar never advances on a timer. Open build log shows
-details from build/setup/build.log. Closing the
-window cancels the build and stops only workers started by the builder.
+completed build tasks. Downloads display their size and progress. Configuration
+and linking wait for the tool's actual completion; the bar never advances on a
+timer. Open build log shows details from build/setup/build.log. Closing the
+window cancels the build and stops only workers started by the builder. During
+Microsoft tool installation, use Microsoft's own Cancel button; setup waits for
+that installer to finish its work or rollback without killing system services.
 
 The first build downloads pinned dependencies and compiles the game ahead of
 time. Later builds reuse unchanged outputs. Keep the source and build folders
@@ -217,6 +269,96 @@ checks passed from the installed game with an absolute non-English input path.
 The game declares UTF-8 startup encoding so those command-line paths stay intact.
 See research/build-time.txt for measurements and native validation.
 
+Asset mods
+
+Mods replace files from the original disc without changing the disc or saves.
+Open Mods in settings, then Open folder. Each mod has its own folder beside
+the game executable, under mods. Refresh after installing or editing a mod.
+Use the Enabled checkboxes to choose mods. Expand a mod's name for its details.
+Short descriptions below the names explain what each mod changes.
+Enabled mods appear first; when several are enabled, use the up/down arrows to
+set their order. The lower enabled mod is used when files overlap. Check mods reports
+conflicts and checks file paths against your verified US disc. Changes apply on
+game start/restart. No mods are enabled by default. Missing or invalid enabled
+mods stop startup with an explanation; disable or repair them to continue.
+
+Fresh disc-based setup on Windows, Linux, macOS and Steam Deck also installs
+Test Mod, disabled by default. It recolors the Burnout 2 logos with magenta
+and cyan checks. Enable it in Mods and start/restart the game to try it. Setup
+generates it from your verified original disc; no original game assets are
+included in Installation.zip. Repeated setup preserves the installed mod and
+your enabled-mod selections. Older unmodified copies named Modding test are
+renamed to Test Mod during setup; their folder id remains modding-test.
+Developer builds using --game-inputs have no disc
+and skip this optional mod. To install it manually beside a completed build:
+
+& .\build\windows\Release\b2-tool.exe install-modding-test 'Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso' build/windows/Release/mods
+
+Create a mod after opening the mods folder (or creating it manually):
+
+& .\build\windows\Release\b2-tool.exe create-mod build/windows/Release/mods/my-mod 'My mod'
+
+This creates mod.cfg and an empty files folder. mod.cfg uses these fields:
+
+format=1
+target=burnout-2-poi-usa-v3-b5207c40
+name=My mod
+description=Briefly explain what this mod changes.
+version=1.0
+author=Your name
+
+format and target are required; name, description, version and author are optional.
+Descriptions are one line of up to 256 UTF-8 bytes; the interface wraps them to
+fit. Older mods without a description still load. Each key may appear once.
+Lines beginning with # are comments. Keep folder ids to 1-64
+lowercase letters, digits, underscores or hyphens.
+
+The files folder mirrors paths inside the disc. For example, a replacement for
+trackpss/forward/fwyl.pss goes in mods/my-mod/files/trackpss/forward/fwyl.pss.
+Use b2-tool list ISO [DIRECTORY] to find original paths and b2-tool extract ISO
+DISC_PATH OUTPUT to copy individual assets for editing. Existing inspect-textures
+and render-dictionary commands can inspect original Xbox texture dictionaries.
+Mod files must retain formats the game understands; loose PNGs, arbitrary audio
+files and scripts are not converted by the mod loader. Custom music uses the
+separate Audio settings import. Assets packaged together must be replaced as a
+complete file. Validation checks the mount, not the behavior of edited assets.
+
+Only existing disc files can be replaced. Matching ignores ASCII case and treats
+both slash styles alike. The index is prepared once per session; reads use the
+same native synchronous/asynchronous file services as the original disc. File
+sizes, partial reads, directory listings and extended scenery use replacements.
+Files stay read-only. Changes to a mod on disk require a restart. Saves, settings
+and the original executable remain separate. Mod discovery is bounded to 128
+folders, 16384 asset entries, 16 directory levels and Xbox-compatible names/sizes; links,
+junctions, ambiguous paths and duplicate filenames ignoring case are rejected.
+
+Replacing .xbe executables or data/b2distfx.bin requires rebuilding the native
+game and is rejected by this loader. Runtime scripts, native plugin DLLs,
+executable patches, new disc files and hot reload are unsupported. The original
+verified executable and compiled CPU/shader/sound programs stay in use. Mods take
+priority over the built-in imported-track file mounts; replacements for those
+files must also be compatible with that imported track.
+
+Inspect an ordered set of mods without booting the game:
+
+& .\build\windows\Release\b2-tool.exe inspect-mods 'Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso' build/windows/Release/mods my-mod another-mod
+
+The JSON report lists enabled ids, the winning provider and size of each file,
+and conflicts. Failures return a nonzero exit code. Session logs record the same
+mount report, and opt-in frame captures include mods.json when mods are active.
+Enabled ids save as repeated mod= lines in settings.cfg, in load order. Back up
+the mods folder with your saves/settings when moving the installation. Rebuilding
+preserves mods; personal mod files are excluded from source control and releases.
+Linux/macOS use the same layout beside b2 and the same commands without .exe.
+
+The focused native diagnostic exercises ordering, validation, original directory
+entries, file sizes, read-only handles, synchronous/asynchronous reads and EOF
+without booting, opening an audio device or running a gameplay benchmark:
+
+& .\build\windows\Release\b2.exe --check-mods data/local/default.xbe 'Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso' build/checks/mods
+
+Choose a fresh output directory. It retains small fixture mods and mods-check.json.
+
 Developer commands and native diagnostics
 
 Windows x64, Visual Studio 2026 C++ tools, Windows SDK, LLVM 22.1+, CMake 4.2+
@@ -230,13 +372,12 @@ outputs remain ignored. No Python is required.
 
 Updating Windows installations between releases, including 1.8:
 Close the game and builder. Back up data/user and data/local/settings.cfg beside
-b2.exe, plus data/local/custom-music if you imported music. Install the required
-tools above; releases before 1.3 need LLVM 22.1 or newer. Extract the latest
+b2.exe, plus data/local/custom-music if you imported music. Extract the latest
 Installation.zip over the existing source folder containing Build.cmd, replacing
-source files while keeping build and data folders. Run Build.cmd again and select
-your XISO. The builder refreshes game-file locations and preserves other settings,
+source files while keeping build and data folders. Run Install.cmd again and select
+your XISO. Setup prepares missing tools, refreshes game-file locations and preserves other settings,
 saves and imported music. For a new-folder installation, build first, restore
-those backups beside the new b2.exe, then run Build.cmd once more to refresh
+those backups beside the new b2.exe, then run Install.cmd once more to refresh
 game-file locations. With V-sync enabled, display rates are limited by the
 monitor's refresh rate; lower selected rates keep their cap.
 
@@ -545,7 +686,9 @@ the original text blur keeps its duration and follows the same display timing.
 Loading animations follow elapsed time, including during blocking loads.
 Track animations, screen fades and boost blur retain their original timing at
 higher refresh rates, including pause and slow motion.
-Audio controls master volume and mute through SDL3's output gain. Browse a music
+Audio controls master volume and mute through SDL3's output gain. Mute on focus
+loss optionally silences the output while another window has focus and restores
+the selected volume on return; playback keeps its place. Browse a music
 folder and choose Import music to make its songs available in the original
 Music Selection menu. Each import replaces the collection with up to 500 files
 from that folder, without scanning subfolders. Folder and filenames provide
@@ -627,7 +770,9 @@ and viewpoint. Reflection views and depth/culling states remain original.
 Extended modes preload world data into separate 64 MiB rendering storage and
 prepare the extra visibility lists during loading; Original does neither. Each scene
 camera retains its original range across camera switches, so scaling never
-compounds. Traffic spawning, physics and the original three detail levels remain.
+compounds. Traffic bodies and wheels extend together to 500 units at 2x and
+750 units at 4x, bounded by the original traffic pool. Their fade shares the
+same range. Traffic spawning, physics and the original three detail levels remain.
 No extra reads or allocations occur during normal rendering. Changes apply on
 start/restart. Existing enabled override settings migrate to 2x; an explicit
 draw_distance=1, 2 or 4 takes precedence. Only the new setting is saved.
@@ -647,9 +792,9 @@ asset loaders finish; it does not bypass file-completion checks or change gamepl
 timing. These settings apply on game start or restart; existing widescreen settings
 migrate to 16:9.
 Clean HUD, enabled by default in Enhancements / Miscellaneous, redraws the
-original A-Z/a-z lettering, digits, exclamation point, ampersand, parentheses,
-dollar sign, small multiplication x,
-position slash, white menu arrows, rounded menu boxes, laurel wreaths, Xbox button icons,
+original A-Z/a-z lettering, digits, punctuation and symbols, including mathematical
+signs, copyright/trademark marks and font arrows, white menu arrows, rounded menu
+boxes, laurel wreaths, Xbox button icons,
 speedometers, tachometers and boost gauges. All 16 original dashboard variants
 retain their markings, redlines, needles and translucent backgrounds; boost
 keeps its original animated flames. Clean HUD also prevents faded-out Crash
@@ -683,12 +828,19 @@ all settings pages, Esc, scaled targets, 60/120 Hz pacing, original frames at
 120/144 Hz, antialiasing and performance capture. They export images and timing
 without booting. These measurements do not establish gameplay FPS or visual parity.
 Live logs report game FPS separately from presented FPS.
-F8, or Capture frame in Graphics, records the next complete GPU frame under
+F8, or Capture frame in Diagnostics, records the next complete GPU frame under
 build/captures. It exports target images and streaming draws.jsonl records with
-the original registers, shader tokens, constants and bounded vertex prefixes,
-plus clear events with their layout, color, channels and rectangle.
+the original registers, shader tokens, constants, vertex layouts and complete
+vertex/index buffers, plus clear events with their layout, color, channels and
+rectangle.
 Ordinary texture records include dimensions, formats and the current guest texture
-bytes in separate .bin files, bounded to 64 MiB per capture.
+bytes in separate .bin files. Game captures also export the compiled native shader
+bank as .dxbc files. These binary files share a 64 MiB bound. settings.cfg records
+the selected settings, and the GPU header identifies the graphics adapter.
+window.json records the desktop/session, SDL video driver and version, fonts,
+window/pixel dimensions and display scaling at the capture request.
+window.png saves the displayed window. F8 also works before starting a game,
+allowing startup settings/display problems to be captured without gameplay.
 game-state.json records replay state, relevant memory and recent file operations
 at the capture request; the GPU image records the next complete frame.
 audio.bin saves sample banks, voice controls, routing and DSP history at the
@@ -712,7 +864,8 @@ Inspect a captured audio.bin without booting or opening an audio device:
 Use a fresh output directory. report.json shows source, routed and processed
 signal levels, controls and failures; scene.wav replays two seconds of the saved
 scene with frozen controls, before master volume. It does not replay game events.
-GPU captures are opt-in, bounded to 1024 draws/32 MiB, and report truncation explicitly.
+GPU captures are opt-in, bounded to 2048 draws/48 MiB of trace data plus the binary
+files, and report truncation explicitly. Missing buffers have a null data field.
 
 Performance recording
 

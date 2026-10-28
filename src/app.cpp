@@ -4,6 +4,7 @@
 #include "xbox.h"
 #include "diagnostics.h"
 #include "custom_music.h"
+#include "mods.h"
 #include <SDL3/SDL.h>
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
@@ -11,6 +12,9 @@
 #include "host.h"
 #ifdef _WIN32
 #include <commdlg.h>
+#elif defined(__linux__)
+#include <fontconfig/fontconfig.h>
+#include <dlfcn.h>
 #endif
 #include <d3d11.h>
 #include "com_ptr.h"
@@ -82,11 +86,12 @@ struct ControlScript {
 };
 struct Preferences {
     std::array<char,4096> xbe{},disc{},music_folder{};
+    std::vector<std::string> enabled_mods;
     bool vsync=false,fullscreen=false,keyboard=true,muted=false,show_fps=false,motion_blur=true;
     int aspect_ratio=0; // 0=4:3, 1=16:9, 2=21:9.
     int refresh_rate=60,volume=100,resolution_scale=1,antialiasing=0,anisotropy=0;
     int ambient_occlusion=0,ambient_occlusion_strength=35;
-    bool custom_music=false,loop_track=false;
+    bool custom_music=false,loop_track=false,mute_on_focus_loss=false;
     bool skip_intro=false,fast_load=false,clean_hud=true;
     int draw_distance=1;
     KeyboardBindings bindings=default_keyboard_bindings();
@@ -117,11 +122,14 @@ struct Preferences {
             else if(key=="motion_blur") motion_blur=value=="1";
             else if(key=="keyboard") keyboard=value=="1";
             else if(key=="muted") muted=value=="1";
+            else if(key=="mute_on_focus_loss") mute_on_focus_loss=value=="1";
             else if(key=="custom_music") custom_music=value=="1";
             else if(key=="loop_track") loop_track=value=="1";
             else if(key=="skip_intro") skip_intro=value=="1";
             else if(key=="fast_load") fast_load=value=="1";
             else if(key=="clean_hud") clean_hud=value=="1";
+            else if(key=="mod" && valid_mod_id(value) && enabled_mods.size()<128 &&
+                    std::ranges::find(enabled_mods,value)==enabled_mods.end()) enabled_mods.push_back(value);
             else if(key=="highest_lod" || key=="unlimited_distance") legacy_distance|=value=="1";
             else if(key=="draw_distance") {
                 int candidate=0;number(candidate,1,4);
@@ -151,17 +159,19 @@ struct Preferences {
         if(!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
         std::ofstream file(path,std::ios::trunc);
         file<<"xbe="<<xbe.data()<<"\ndisc="<<disc.data()<<"\nvsync="<<vsync<<"\nfullscreen="<<fullscreen<<"\nkeyboard="<<keyboard
-            <<"\nrefresh_rate="<<refresh_rate<<"\nvolume="<<volume<<"\nmuted="<<muted
+            <<"\nrefresh_rate="<<refresh_rate<<"\nvolume="<<volume<<"\nmuted="<<muted<<"\nmute_on_focus_loss="<<mute_on_focus_loss
             <<"\nresolution_scale="<<resolution_scale<<"\nshow_fps="<<show_fps<<"\nwidescreen="<<(aspect_ratio!=0)<<"\naspect_ratio="<<aspect_ratio
             <<"\nantialiasing="<<antialiasing<<"\nanisotropy="<<anisotropy
             <<"\nambient_occlusion="<<ambient_occlusion<<"\nambient_occlusion_strength="<<ambient_occlusion_strength
             <<"\nskip_intro="<<skip_intro<<"\nfast_load="<<fast_load<<"\nclean_hud="<<clean_hud<<"\nmotion_blur="<<motion_blur<<"\ndraw_distance="<<draw_distance
             <<"\ncustom_music="<<custom_music<<"\nloop_track="<<loop_track<<"\nmusic_folder="<<music_folder.data()<<'\n';
         for(unsigned i=0;i<keyboard_actions.size();++i) file<<"key_"<<keyboard_actions[i].id<<'='<<bindings[i]<<'\n';
+        for(const auto& id:enabled_mods) file<<"mod="<<id<<'\n';
         if(!file) throw std::runtime_error("Could not save settings");
     }
     void select_refresh_rate(int rate) {refresh_rate=rate;}
     float aspect() const {return aspect_ratio==2?21.0f/9:aspect_ratio==1?16.0f/9:4.0f/3;}
+    float output_gain(bool focused) const {return muted || (mute_on_focus_loss && !focused)?0:volume/100.0f;}
 
 };
 void setting_help(const char* text) {
@@ -170,7 +180,7 @@ void setting_help(const char* text) {
         ImGui::TextUnformatted(text);ImGui::PopTextWrapPos();ImGui::EndTooltip();
     }
 }
-ImFont* settings_theme() {
+ImFont* settings_theme(ImFont*& italic) {
     auto& io=ImGui::GetIO();
     io.ConfigFlags|=ImGuiConfigFlags_NavEnableKeyboard|ImGuiConfigFlags_NavEnableGamepad;
     io.IniFilename=nullptr;
@@ -181,30 +191,44 @@ ImFont* settings_theme() {
     const auto length=GetWindowsDirectoryW(directory.data(),unsigned(directory.size()));
     if(!length || length>=directory.size()) throw std::runtime_error("Cannot locate Windows fonts.");
     const auto fonts=std::filesystem::path(directory.data())/"Fonts";
-    for(const auto& names:std::array<std::array<const char*,2>,3>{{{"segoeui.ttf","segoeuib.ttf"},{"tahoma.ttf","tahomabd.ttf"},{"arial.ttf","arialbd.ttf"}}}) {
-        if(!std::filesystem::exists(fonts/names[0]) || !std::filesystem::exists(fonts/names[1])) continue;
+    for(const auto& names:std::array<std::array<const char*,3>,2>{{{"segoeui.ttf","segoeuib.ttf","segoeuii.ttf"},{"arial.ttf","arialbd.ttf","ariali.ttf"}}}) {
+        if(!std::filesystem::exists(fonts/names[0]) || !std::filesystem::exists(fonts/names[1]) || !std::filesystem::exists(fonts/names[2])) continue;
         io.FontDefault=io.Fonts->AddFontFromFileTTF(path_text((fonts/names[0])).c_str(),18);
         heading=io.Fonts->AddFontFromFileTTF(path_text((fonts/names[1])).c_str(),18);
+        italic=io.Fonts->AddFontFromFileTTF(path_text((fonts/names[2])).c_str(),18);
         break;
     }
-    if(!io.FontDefault || !heading) throw std::runtime_error("Cannot load a Windows UI font.");
+    if(!io.FontDefault || !heading || !italic) throw std::runtime_error("Cannot load a Windows UI font.");
 #else
 #ifdef __APPLE__
     const auto regular=std::filesystem::path("/System/Library/Fonts/Supplemental/Arial.ttf");
     const auto bold=std::filesystem::path("/System/Library/Fonts/Supplemental/Arial Bold.ttf");
+    const auto slanted=std::filesystem::path("/System/Library/Fonts/Supplemental/Arial Italic.ttf");
     if(std::filesystem::exists(regular) && std::filesystem::exists(bold)) {
         io.FontDefault=io.Fonts->AddFontFromFileTTF(regular.c_str(),18);heading=io.Fonts->AddFontFromFileTTF(bold.c_str(),18);
     }
+    if(std::filesystem::exists(slanted)) italic=io.Fonts->AddFontFromFileTTF(slanted.c_str(),18);
 #else
-    for(const auto* directory:{"/usr/share/fonts/truetype/dejavu","/usr/share/fonts/truetype/liberation2"}) {
-        const auto root=std::filesystem::path(directory);
-        const auto regular=root/(root.filename()=="dejavu"?"DejaVuSans.ttf":"LiberationSans-Regular.ttf");
-        const auto bold=root/(root.filename()=="dejavu"?"DejaVuSans-Bold.ttf":"LiberationSans-Bold.ttf");
-        if(!std::filesystem::exists(regular) || !std::filesystem::exists(bold)) continue;
-        io.FontDefault=io.Fonts->AddFontFromFileTTF(regular.c_str(),18);heading=io.Fonts->AddFontFromFileTTF(bold.c_str(),18);break;
-    }
+    // Resolve the desktop's fonts instead of assuming Debian font directories.
+    const auto font=[&](const char* name)->ImFont* {
+        using Pattern=std::unique_ptr<FcPattern,decltype(&FcPatternDestroy)>;
+        Pattern request(FcNameParse(reinterpret_cast<const FcChar8*>(name)),FcPatternDestroy);
+        if(!request || !FcConfigSubstitute(nullptr,request.get(),FcMatchPattern)) return nullptr;
+        FcDefaultSubstitute(request.get());FcResult result=FcResultNoMatch;
+        Pattern match(FcFontMatch(nullptr,request.get(),&result),FcPatternDestroy);
+        FcBool outline=FcFalse;
+        if(!match || FcPatternGetBool(match.get(),FC_OUTLINE,0,&outline)!=FcResultMatch || !outline) return nullptr;
+        FcChar8* file=nullptr;
+        if(FcPatternGetString(match.get(),FC_FILE,0,&file)!=FcResultMatch) return nullptr;
+        int index=0;FcPatternGetInteger(match.get(),FC_INDEX,0,&index);
+        ImFontConfig config;config.FontNo=index&0xFFFF; // Collection face, excluding any variable-font instance.
+        return io.Fonts->AddFontFromFileTTF(reinterpret_cast<const char*>(file),18,&config);
+    };
+    io.FontDefault=font("sans-serif:outline=true");heading=font("sans-serif:bold:outline=true");
+    italic=font("sans-serif:slant=italic:outline=true");
 #endif
-    if(!io.FontDefault || !heading) {io.FontDefault=io.Fonts->AddFontDefault();heading=io.FontDefault;}
+    if(!io.FontDefault || !heading) {io.FontDefault=io.Fonts->AddFontDefaultVector();heading=io.FontDefault;}
+    if(!italic) italic=io.FontDefault;
 #endif
     ImGui::StyleColorsDark();auto& style=ImGui::GetStyle();
     style.FontSizeBase=18;style.WindowPadding={24,20};style.FramePadding={12,8};style.ItemSpacing={12,12};
@@ -264,7 +288,14 @@ void settings_icon(ImDrawList& draw,int kind,ImVec2 p,ImU32 color) {
     const auto point=[&](float x,float y){return ImVec2{p.x+x,p.y+y};};
     const auto line=[&](float x,float y,float u,float v){draw.AddLine(point(x,y),point(u,v),color,1.6f);};
     switch(kind) {
-    case 0:draw.AddRect(point(1,6),point(19,18),color,2);line(1,6,1,3);line(1,3,8,3);line(8,3,11,6);break;
+    case 0:
+        draw.AddCircle(point(10,10),8.5f,color,32,1.6f);
+        draw.AddCircle(point(10,10),2.3f,color,16,1.6f);
+        for(const float start:{-.95f,2.19f}) {
+            draw.PathArcTo(point(10,10),5.5f,start,start+.7f,8);
+            draw.PathStroke(color,0,1.6f);
+        }
+        break;
     case 1:for(int i=0;i<3;++i) {const float y=4.0f+6*i,x=i==1?13.0f:7.0f;line(1,y,19,y);draw.AddCircleFilled(point(x,y),2.5f,color);}break;
     case 2:line(2,7,6,7);line(6,7,11,3);line(11,3,11,18);line(11,18,6,14);line(6,14,2,14);line(2,14,2,7);
         draw.PathArcTo(point(11,10.5f),7,-.8f,.8f,10);draw.PathStroke(color,0,1.6f);break;
@@ -289,7 +320,21 @@ void settings_icon(ImDrawList& draw,int kind,ImVec2 p,ImU32 color) {
         draw.PathStroke(color,ImDrawFlags_Closed,1.6f);
         line(6.3f,7.5f,6.3f,11.5f);line(4.3f,9.5f,8.3f,9.5f);
         draw.AddCircleFilled(point(13,8.5f),1.1f,color);draw.AddCircleFilled(point(15.7f,11),1.1f,color);break;
-    case 6:draw.AddRect(point(2,1),point(18,19),color,2);for(int i=0;i<3;++i) line(6,6.0f+4*i,14,6.0f+4*i);break;
+    case 6:
+        draw.PathLineTo(point(3,5));draw.PathLineTo(point(7,5));
+        draw.PathBezierCubicCurveTo(point(6,2),point(7.2f,1),point(9,1));
+        draw.PathBezierCubicCurveTo(point(10.8f,1),point(12,2),point(11,5));
+        draw.PathLineTo(point(15,5));draw.PathLineTo(point(15,9));
+        draw.PathBezierCubicCurveTo(point(18,8),point(19,9.2f),point(19,11));
+        draw.PathBezierCubicCurveTo(point(19,12.8f),point(18,14),point(15,13));
+        draw.PathLineTo(point(15,18));draw.PathLineTo(point(11,18));
+        draw.PathBezierCubicCurveTo(point(12,15),point(10.8f,14),point(9,14));
+        draw.PathBezierCubicCurveTo(point(7.2f,14),point(6,15),point(7,18));
+        draw.PathLineTo(point(3,18));draw.PathLineTo(point(3,13));
+        draw.PathBezierCubicCurveTo(point(6,14),point(7,12.8f),point(7,11));
+        draw.PathBezierCubicCurveTo(point(7,9.2f),point(6,8),point(3,9));
+        draw.PathStroke(color,ImDrawFlags_Closed,1.6f);break;
+    case 7:draw.AddRect(point(2,1),point(18,19),color,2);for(int i=0;i<3;++i) line(6,6.0f+4*i,14,6.0f+4*i);break;
     }
 }
 void setting_label(const char* text) {
@@ -332,9 +377,9 @@ struct App {
     std::unique_ptr<Input> input;
     std::unique_ptr<ControlScript> controls;
     Preferences settings;
-    ImFont* heading_font=nullptr;
+    ImFont* heading_font=nullptr;ImFont* italic_font=nullptr;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> logo;
-    std::filesystem::path settings_path;
+    std::filesystem::path settings_path,pending_window_capture;
     FramePacer pacer,source_pacer;
     FrameRate display_rate,game_rate;
     Performance performance;
@@ -349,6 +394,11 @@ struct App {
     std::shared_ptr<MusicFolderSelection> file_selection;
     bool file_selection_iso=false;
     unsigned music_songs=0;
+    std::filesystem::path mods_root;
+    std::vector<Mod> available_mods;
+    std::vector<ModConflict> mod_conflicts;
+    std::string mods_status;
+    bool mods_error=false;
     bool music_importing=false,music_import_requested=false,music_restart=false;
     std::vector<int> refresh_rates;
     float display_refresh=0;
@@ -360,10 +410,12 @@ struct App {
     std::uint64_t stop_at=0,frames=0,first_frame=0,last_frame=0;
     std::uint64_t published_at=0,first_source=0,last_source=0;
     std::uint64_t mouse_activity=0;
-    bool cursor_hidden=false;
+    bool cursor_hidden=false,focused=false;
     App(bool hidden,bool warp,const std::filesystem::path& script={},const std::filesystem::path& preferences="data/local/settings.cfg"):
         settings(!hidden,preferences),settings_path(preferences) {
         music_songs=custom_music_count(music_cache());
+        mods_root=std::filesystem::absolute(hidden?preferences.parent_path()/"mods":executable_path().parent_path()/"mods").lexically_normal();
+        refresh_mods();
         // Explicit scripts must work while the user keeps another app focused.
         // This process reads only its own virtual controller in script mode.
         if(!script.empty() && !SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS,"1"))
@@ -379,7 +431,11 @@ struct App {
             );
             if(!window) throw std::runtime_error(SDL_GetError());
             SDL_SetWindowMinimumSize(window,640,480);
+            // Finalize fullscreen geometry before creating the presentation surface.
+            if(!hidden && settings.fullscreen && (!SDL_SetWindowFullscreen(window,true) || !SDL_SyncWindow(window)))
+                throw std::runtime_error(SDL_GetError());
             mouse_activity=SDL_GetTicksNS();
+            focused=(SDL_GetWindowFlags(window)&SDL_WINDOW_INPUT_FOCUS)!=0;
             refresh_options();
 #ifdef _WIN32
             auto* handle=SDL_GetPointerProperty(SDL_GetWindowProperties(window),SDL_PROP_WINDOW_WIN32_HWND_POINTER,nullptr);
@@ -395,11 +451,10 @@ struct App {
             input=std::make_unique<Input>(controls?false:settings.keyboard,false,controls?controls->id:0);
             input->bindings(settings.bindings);
             IMGUI_CHECKVERSION();ImGui::CreateContext();
-            heading_font=settings_theme();
+            heading_font=settings_theme(italic_font);
             if(!ImGui_ImplSDL3_InitForD3D(window) || !ImGui_ImplDX11_Init(renderer->native_device(),renderer->native_context()))
                 throw std::runtime_error("Could not initialize the settings interface");
             logo=settings_logo(renderer->native_device());
-            if(!hidden && settings.fullscreen && !SDL_SetWindowFullscreen(window,true)) throw std::runtime_error(SDL_GetError());
         } catch(...) {cleanup();throw;}
     }
     void cleanup() {
@@ -482,11 +537,31 @@ struct App {
         } catch(const std::exception& error) {renderer->performance(nullptr);if(game) game->performance_recording(false);performance.reset();log_message(error.what());}
     }
     void capture_frame() {
-        if(!game) return;
+        if(!pending_window_capture.empty()) return;
         const auto directory=std::filesystem::path("build/captures")/std::format("frame-{}",SDL_GetTicksNS());
         PerfScope capture(&performance,PerfPhase::capture);
-        try {if(performance.active()) performance.save(directory);game->capture_frame(directory,bool(controls));log_message("Frame and audio capture: "+directory.string());}
+        try {
+            settings.save(directory/"settings.cfg");write_text(directory/"window.json",window_diagnostic()+'\n',false);
+            if(performance.active()) performance.save(directory);
+            if(game) game->capture_frame(directory,bool(controls));
+            pending_window_capture=directory/"window.png";
+            log_message(std::string(game?"Frame and audio capture: ":"Window capture: ")+directory.string());
+        }
         catch(const std::exception& error) {log_message(error.what());}
+    }
+    std::string window_diagnostic() const {
+        int width=0,height=0,pixel_width=0,pixel_height=0;
+        if(!SDL_GetWindowSize(window,&width,&height) || !SDL_GetWindowSizeInPixels(window,&pixel_width,&pixel_height))
+            throw std::runtime_error(SDL_GetError());
+        const auto environment=[](const char* name) {const auto* value=SDL_getenv(name);return json(value?value:"");};
+        const char* graphics_runtime="D3D11";
+#ifdef __linux__
+        Dl_info runtime{};
+        if(const auto symbol=dlsym(RTLD_DEFAULT,"D3D11CreateDevice");symbol && dladdr(symbol,&runtime)) graphics_runtime=runtime.dli_fname;
+#endif
+        return std::format("{{\"format\":\"b2-window-state-v1\",\"desktop\":{},\"session\":{},\"video_driver\":{},\"graphics_runtime\":{},\"sdl_version\":{},\"settings_font\":{},\"logical_size\":[{},{}],\"pixel_size\":[{},{}],\"pixel_density\":{},\"display_scale\":{},\"fullscreen\":{}}}",
+            environment("XDG_CURRENT_DESKTOP"),environment("XDG_SESSION_TYPE"),json(SDL_GetCurrentVideoDriver()),json(graphics_runtime),SDL_GetVersion(),json(ImGui::GetIO().FontDefault->GetDebugName()),
+            width,height,pixel_width,pixel_height,SDL_GetWindowPixelDensity(window),SDL_GetWindowDisplayScale(window),(SDL_GetWindowFlags(window)&SDL_WINDOW_FULLSCREEN)!=0);
     }
     void refresh_options() {
         refresh_rates={0,30,60,75,90,120,144,165,180,240,360};
@@ -505,7 +580,12 @@ struct App {
         refresh_rates.erase(std::unique(refresh_rates.begin(),refresh_rates.end()),refresh_rates.end());
     }
     void event(const SDL_Event& event) {
-        ImGui_ImplSDL3_ProcessEvent(&event);input->event(event);
+        input->event(event);
+        if((event.type==SDL_EVENT_WINDOW_FOCUS_GAINED || event.type==SDL_EVENT_WINDOW_FOCUS_LOST) &&
+           event.window.windowID==SDL_GetWindowID(window)) {
+            focused=event.type==SDL_EVENT_WINDOW_FOCUS_GAINED;
+            if(game) game->output_gain(settings.output_gain(focused));
+        }
         if((event.type==SDL_EVENT_MOUSE_MOTION && (event.motion.xrel || event.motion.yrel)) ||
            event.type==SDL_EVENT_MOUSE_BUTTON_DOWN || event.type==SDL_EVENT_MOUSE_BUTTON_UP ||
            event.type==SDL_EVENT_MOUSE_WHEEL || event.type==SDL_EVENT_WINDOW_MOUSE_ENTER ||
@@ -520,10 +600,16 @@ struct App {
             } else log_message("That key is reserved for settings or captures.");
             return;
         }
-        if(event.type==SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+        if((event.type==SDL_EVENT_KEY_DOWN || event.type==SDL_EVENT_KEY_UP) &&
            (event.key.scancode==SDL_SCANCODE_ESCAPE || event.key.scancode==SDL_SCANCODE_F1)) {
-            show_settings=!show_settings;binding_action=-1;if(!show_settings) save_settings();
+            if(event.type==SDL_EVENT_KEY_DOWN && !event.key.repeat) {
+                show_settings=!show_settings;binding_action=-1;if(!show_settings) save_settings();
+            }
+            // This shortcut belongs to the app. Letting ImGui also handle Escape
+            // leaves the focused child and highlights its whole panel on reopen.
+            return;
         }
+        ImGui_ImplSDL3_ProcessEvent(&event);
         if(event.type==SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.scancode==SDL_SCANCODE_F8) capture_frame();
         if(event.type==SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.scancode==SDL_SCANCODE_F9) toggle_performance();
     }
@@ -598,6 +684,147 @@ struct App {
     }
     bool poll_game() {return poll() && !launch;}
     std::filesystem::path music_cache() const {return settings_path.parent_path()/"custom-music";}
+    void refresh_mods() {
+        available_mods.clear();mod_conflicts.clear();mods_status.clear();mods_error=false;
+        try {available_mods=discover_mods(mods_root);}
+        catch(const std::exception& error) {mods_status=error.what();mods_error=true;}
+    }
+    bool mods_interface() {
+        bool changed=false;
+        ImGui::TextWrapped(playing?"Restart the game to apply changes.":"Enable the mods you want to use.");
+        ImGui::PushFont(italic_font,0);
+        ImGui::TextWrapped("Mod support currently covers replacement game files. Scripts and executable patches are not yet supported.");
+        ImGui::PopFont();
+        const bool reorder=settings.enabled_mods.size()>1;
+        std::string action;int direction=0;
+        if(available_mods.empty() && settings.enabled_mods.empty()) {
+            ImGui::TextDisabled("No mods installed.");
+        } else if(ImGui::BeginTable("Mods list",reorder?3:2,ImGuiTableFlags_RowBg|ImGuiTableFlags_BordersInnerH|ImGuiTableFlags_PadOuterX)) {
+            ImGui::TableSetupColumn("Enabled",ImGuiTableColumnFlags_WidthFixed,ImGui::CalcTextSize("Enabled").x);
+            ImGui::TableSetupColumn("Mod",ImGuiTableColumnFlags_WidthStretch);
+            if(reorder) ImGui::TableSetupColumn("Order",ImGuiTableColumnFlags_WidthFixed,ImGui::GetFrameHeight()*2+ImGui::GetStyle().ItemSpacing.x);
+            ImGui::TableHeadersRow();
+            const auto row=[&](const std::string& id,const Mod* mod,std::size_t order) {
+                bool enabled=order<settings.enabled_mods.size();
+                ImGui::PushID(id.c_str());ImGui::TableNextRow();ImGui::TableNextColumn();
+                const auto inset=(ImGui::GetContentRegionAvail().x-ImGui::GetFrameHeight())*.5f;
+                if(inset>0) ImGui::SetCursorPosX(ImGui::GetCursorPosX()+inset);
+                ImGui::BeginDisabled(!enabled && (!mod || !mod->error.empty() || settings.enabled_mods.size()==128));
+                if(ImGui::Checkbox("##Enabled",&enabled)) action=id;
+                setting_help("Applies when you start or restart the game.");ImGui::EndDisabled();
+                ImGui::TableNextColumn();
+                ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,ImVec2{ImGui::GetStyle().ItemSpacing.x,4});
+                const bool details=ImGui::TreeNodeEx("##Details",ImGuiTreeNodeFlags_FramePadding|ImGuiTreeNodeFlags_SpanAvailWidth|ImGuiTreeNodeFlags_NoTreePushOnOpen,
+                    "%s",mod?mod->name.c_str():id.c_str());
+                setting_help("Expand for version, author and file details.");
+                ImGui::Indent(ImGui::GetTreeNodeToLabelSpacing());
+                if(mod && !mod->description.empty()) {
+                    ImGui::PushTextWrapPos(0);ImGui::TextDisabled("%s",mod->description.c_str());ImGui::PopTextWrapPos();
+                }
+                if(!mod || !mod->error.empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text,ImVec4{1,.55f,.42f,1});
+                    ImGui::TextWrapped("%s",mod?mod->error.c_str():"Missing mod. Restore its folder or turn it off.");
+                    ImGui::PopStyleColor();
+                }
+                if(details) {
+                    if(ImGui::CalcTextSize(mod?mod->name.c_str():id.c_str()).x>ImGui::GetContentRegionAvail().x)
+                        ImGui::TextWrapped("%s",mod?mod->name.c_str():id.c_str());
+                    if(mod) {
+                        if(!mod->version.empty()) ImGui::TextWrapped("Version: %s",mod->version.c_str());
+                        if(!mod->author.empty()) ImGui::TextWrapped("Author: %s",mod->author.c_str());
+                        ImGui::TextDisabled("%zu %s",mod->files.size(),mod->files.size()==1?"file":"files");
+                    }
+                    ImGui::TextWrapped("Folder: %s",id.c_str());
+                }
+                ImGui::Unindent(ImGui::GetTreeNodeToLabelSpacing());
+                ImGui::PopStyleVar();
+                if(reorder) {
+                    ImGui::TableNextColumn();
+                    if(order<settings.enabled_mods.size()) {
+                        ImGui::BeginDisabled(order==0);
+                        if(ImGui::ArrowButton("Up",ImGuiDir_Up)) {action=id;direction=-1;}
+                        setting_help("Move this mod up in the enabled list.");ImGui::EndDisabled();
+                        ImGui::SameLine();ImGui::BeginDisabled(order+1==settings.enabled_mods.size());
+                        if(ImGui::ArrowButton("Down",ImGuiDir_Down)) {action=id;direction=1;}
+                        setting_help("Move this mod down in the enabled list.");ImGui::EndDisabled();
+                    }
+                }
+                ImGui::PopID();
+            };
+            for(std::size_t i=0;i<settings.enabled_mods.size();++i) {
+                const auto& id=settings.enabled_mods[i];const auto mod=std::ranges::find(available_mods,id,&Mod::id);
+                row(id,mod==available_mods.end()?nullptr:&*mod,i);
+            }
+            for(const auto& mod:available_mods) if(std::ranges::find(settings.enabled_mods,mod.id)==settings.enabled_mods.end())
+                row(mod.id,&mod,settings.enabled_mods.size());
+            ImGui::EndTable();
+        }
+        // Apply after drawing so rows and their widget IDs stay stable this frame.
+        if(!action.empty()) {
+            const auto found=std::ranges::find(settings.enabled_mods,action);
+            if(direction) {
+                if(found!=settings.enabled_mods.end() && (direction<0?found!=settings.enabled_mods.begin():found+1!=settings.enabled_mods.end()))
+                    std::iter_swap(found,found+direction);
+            } else if(found!=settings.enabled_mods.end()) settings.enabled_mods.erase(found);
+            else settings.enabled_mods.push_back(action);
+            changed=true;mod_conflicts.clear();mods_status.clear();mods_error=false;
+        }
+        if(reorder) ImGui::TextWrapped("If files overlap, the lower enabled mod is used.");
+        ImGui::Spacing();
+        if(ImGui::Button("Open folder")) {
+            try {
+                std::filesystem::create_directories(mods_root);
+                auto path=path_text(mods_root);std::replace(path.begin(),path.end(),'\\','/');
+                if(!path.starts_with('/')) path='/'+path;
+                std::string url="file://";
+                for(unsigned char ch:path) {
+                    if(ch>32 && ch<127 && ch!='%' && ch!='#' && ch!='?') url+=char(ch);
+                    else url+=std::format("%{:02X}",ch);
+                }
+                if(!SDL_OpenURL(url.c_str())) throw std::runtime_error(SDL_GetError());
+            } catch(const std::exception& error) {mods_status=error.what();mods_error=true;}
+        }
+        setting_help("Open the folder where your mods are installed.");
+        const auto toolbar_next=[](const char* label) {
+            const auto right=ImGui::GetCursorScreenPos().x+ImGui::GetContentRegionAvail().x;
+            if(ImGui::GetItemRectMax().x+ImGui::CalcTextSize(label).x+ImGui::GetStyle().FramePadding.x*2+ImGui::GetStyle().ItemSpacing.x<=right)
+                ImGui::SameLine();
+        };
+        toolbar_next("Refresh");if(ImGui::Button("Refresh")) refresh_mods();
+        setting_help("Find newly installed or edited mods.");
+        toolbar_next("Check mods");ImGui::BeginDisabled(settings.enabled_mods.empty());
+        if(ImGui::Button("Check mods")) {
+            try {
+                Xbe image(utf8_path(settings.xbe.data()));Disc disc(utf8_path(settings.disc.data()));
+                if(!image.supported() || disc.sha256(disc.find("default.xbe"))!=image.sha256)
+                    throw std::runtime_error("Select the supported original executable and disc in Game files first.");
+                Mods mounted(mods_root,settings.enabled_mods,disc);mod_conflicts=mounted.conflicts();
+                mods_error=false;
+                mods_status=mod_conflicts.empty()?"Enabled mods passed file checks.":std::format("{} file conflict{}.",mod_conflicts.size(),mod_conflicts.size()==1?"":"s");
+                diagnostic_record(mounted.report());
+            } catch(const std::exception& error) {mod_conflicts.clear();mods_status=error.what();mods_error=true;}
+        }
+        setting_help("Check enabled mods against your original disc and find files changed by more than one mod. Edited assets must still use the game's original formats.");
+        ImGui::EndDisabled();
+        if(!mods_status.empty()) {
+            if(mods_error) ImGui::PushStyleColor(ImGuiCol_Text,ImVec4{1,.55f,.42f,1});
+            ImGui::TextWrapped("%s",mods_status.c_str());
+            if(mods_error) ImGui::PopStyleColor();
+        }
+        if(!mod_conflicts.empty() && ImGui::CollapsingHeader("File conflicts")) {
+            const auto name=[&](const std::string& id) {
+                const auto mod=std::ranges::find(available_mods,id,&Mod::id);
+                return mod==available_mods.end()?id.c_str():mod->name.c_str();
+            };
+            for(const auto& conflict:mod_conflicts) ImGui::TextWrapped("%s\n%s replaces %s",conflict.path.c_str(),name(conflict.winner),name(conflict.previous));
+        }
+        ImGui::Spacing();
+        if(ImGui::CollapsingHeader("Adding mods")) {
+            ImGui::TextWrapped("Place each mod in its own folder, then refresh the list. A mod contains mod.cfg and a files folder matching the disc paths. See BUILDING.txt for creation steps.");
+            ImGui::TextWrapped("Folder: %s",path_text(mods_root).c_str());
+        }
+        return changed;
+    }
     void browse_music() {
         music_folder_selection=std::make_shared<MusicFolderSelection>();
         auto* request=new std::shared_ptr<MusicFolderSelection>(music_folder_selection);
@@ -661,8 +888,8 @@ struct App {
             ImGui::Image(logo.Get(),{64,64});
             ImGui::SetCursorPos({header.x,header.y+74});ImGui::Separator();ImGui::Spacing();
             bool changed=false;
-            constexpr const char* categories[]={"Game files","General","Audio","Graphics","Enhancements","Controls","Diagnostics"};
-            constexpr const char* navigation[]={"        Game files","        General","        Audio","        Graphics","        Enhancements","        Controls","        Diagnostics"};
+            constexpr const char* categories[]={"Game files","General","Audio","Graphics","Enhancements","Controls","Mods","Diagnostics"};
+            constexpr const char* navigation[]={"        Game files","        General","        Audio","        Graphics","        Enhancements","        Controls","        Mods","        Diagnostics"};
             if(select_category>=0 && select_category<int(std::size(categories))) {category=select_category;binding_action=-1;}
             select_category=-1;
             ImGui::BeginChild("Settings body",{0,-66},0,ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_NoScrollWithMouse);
@@ -727,8 +954,10 @@ struct App {
                         setting_help("Applies to both music and sound effects.");
                         audio_changed|=ImGui::Checkbox("Mute",&settings.muted);
                         setting_help("Mutes all game audio without changing the master volume.");
+                        audio_changed|=ImGui::Checkbox("Mute on focus loss",&settings.mute_on_focus_loss);
+                        setting_help("Silences game audio while another window has focus. Restores your volume when you return.");
                         changed|=audio_changed;
-                        if(audio_changed && game) game->output_gain(settings.muted?0:settings.volume/100.0f);
+                        if(audio_changed && game) game->output_gain(settings.output_gain(focused));
                         ImGui::Spacing();ImGui::SeparatorText("YOUR SOUNDTRACK");
                         ImGui::BeginDisabled(music_songs==0 || music_importing);
                         changed|=ImGui::Checkbox("Custom music",&settings.custom_music);
@@ -791,7 +1020,7 @@ struct App {
                         int distance=0;for(int i=0;i<3;++i) if(settings.draw_distance==distances[i]) distance=i;
                         setting_label("Draw distance");
                         if(ImGui::Combo("##Draw distance",&distance,distance_labels,3)) {settings.draw_distance=distances[distance];changed=true;}
-                        setting_help("Draws compatible scenery farther away, blends scenery detail changes, and smooths traffic fades. Higher settings can increase rendering work. Applies when you start or restart the game.");
+                        setting_help("Draws compatible scenery and traffic farther away, with smoother detail changes and fades. Higher settings can increase rendering work. Applies when you start or restart the game.");
                         ImGui::Spacing();ImGui::SeparatorText("IMAGE QUALITY");
                         constexpr const char* levels[]={"Off (original)","FXAA Low","FXAA Medium","FXAA High","MSAA 2x","MSAA 4x","MSAA 8x"};
                         setting_label("Antialiasing");
@@ -859,15 +1088,16 @@ struct App {
                             ImGui::EndTable();
                         }
                         break;
-                    case 6:
+                    case 6:changed|=mods_interface();break;
+                    case 7:
                         ImGui::SeparatorText("CAPTURE & PERFORMANCE");
-                        ImGui::BeginDisabled(!playing);
                         if(ImGui::Button("Capture frame (F8)")) capture_frame();
-                        setting_help("Saves the current frame and audio in build/captures. Also includes performance data while recording.");
+                        setting_help("Saves a window image and display details in build/captures. During a game, also saves the game frame and audio.");
+                        ImGui::BeginDisabled(!playing);
                         if(ImGui::Button(performance.active()?"Save performance (F9)":"Record performance (F9)")) toggle_performance();
                         setting_help("Record a slowdown, then press F9 to save. Recording stops after 60 seconds. F8 also saves performance while recording.");
                         ImGui::EndDisabled();
-                        if(!playing) ImGui::TextDisabled("Available while a game is running.");
+                        if(!playing) ImGui::TextDisabled("Performance recording is available while a game is running.");
                         ImGui::Spacing();ImGui::SeparatorText("ACTIVITY");
                         if(log_messages.empty()) ImGui::TextUnformatted("No messages yet.");
                         for(auto message=log_messages.rbegin();message!=log_messages.rend();++message) {
@@ -922,6 +1152,12 @@ struct App {
             ImGui::TextUnformatted("Recording performance - F9 saves");ImGui::End();
         }
         ImGui::Render();ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        if(!pending_window_capture.empty()) {
+            PerfScope capture(&performance,PerfPhase::capture);
+            auto path=std::move(pending_window_capture);pending_window_capture.clear();
+            try {save_png(renderer->read_display(),path);}
+            catch(const std::exception& error) {log_message(error.what());}
+        }
     }
     void frame_presented() {
         last_frame=SDL_GetTicksNS();display_rate.sample(last_frame);
@@ -1002,13 +1238,14 @@ struct App {
         host.ultrawide=active_aspect_ratio==2;host.motion_blur=active_motion_blur;
         host.skip_intro=settings.skip_intro;host.fast_load=settings.fast_load;host.clean_hud=settings.clean_hud;host.draw_distance=unsigned(settings.draw_distance);
         if(settings.custom_music && music_songs) host.custom_music_root=music_cache();
+        host.mods_root=mods_root;host.enabled_mods=settings.enabled_mods;
         host.loop_track=settings.loop_track;
         host.music_loop_changed=[this](bool enabled) {settings.loop_track=enabled;settings_dirty=true;save_settings();};
         host.performance=&performance;
         host.trace_io=trace_io;
         host.watch_semaphores=watch_semaphores;
         Xbox xbox(image,memory,ram,disc,std::move(host));
-        xbox.output_gain(settings.muted?0:settings.volume/100.0f);
+        xbox.output_gain(settings.output_gain(focused));
         struct Session {App& app;~Session(){app.stop_benchmark();app.stop_performance();app.game=nullptr;app.playing=false;app.show_settings=true;app.published_at=0;}} session{*this};
         game=&xbox;playing=true;show_settings=false;binding_action=-1;frames=first_frame=last_frame=published_at=first_source=last_source=0;pacer={};source_pacer={};display_rate={};game_rate={};memory_snapshot="[]";
         auto result=xbox.run(0);
@@ -1107,19 +1344,34 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     if(app.settings.refresh_rate!=60) throw std::runtime_error("Default refresh rate differs from 60 Hz");
     if(app.settings.fast_load) throw std::runtime_error("Fast load must default to disabled");
     if(!app.settings.clean_hud) throw std::runtime_error("Clean HUD must preserve the enabled default");
+    if(app.settings.mute_on_focus_loss) throw std::runtime_error("Focus muting must default to disabled");
     if(!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
     FrameRate counter_rate;counter_rate.sample(1);
     for(unsigned frame=1;frame<=60;++frame) counter_rate.sample(1+frame*1000000000ULL/120);
     if(std::abs(counter_rate.value-120)>0.01) throw std::runtime_error("Frame rate counter did not measure 120 FPS");
     Preferences saved(false);saved.resolution_scale=3;saved.select_refresh_rate(144);saved.show_fps=true;saved.aspect_ratio=2;saved.motion_blur=false;saved.bindings[15]=SDL_SCANCODE_Z;
-    saved.custom_music=true;saved.loop_track=true;copy_text(saved.music_folder.data(),saved.music_folder.size(),"Music/Custom playlist");
+    saved.custom_music=true;saved.loop_track=true;saved.mute_on_focus_loss=true;copy_text(saved.music_folder.data(),saved.music_folder.size(),"Music/Custom playlist");
     saved.antialiasing=6;saved.anisotropy=16;saved.ambient_occlusion=3;saved.ambient_occlusion_strength=47;
     saved.skip_intro=true;saved.fast_load=true;saved.clean_hud=false;saved.draw_distance=4;
+    saved.enabled_mods={"paint","sound"};
     saved.save(preferences);Preferences restored(true,preferences);
     if(restored.bindings!=saved.bindings || restored.resolution_scale!=3 || restored.refresh_rate!=144 || !restored.show_fps || restored.aspect_ratio!=2 || restored.motion_blur ||
-       !restored.custom_music || !restored.loop_track || restored.music_folder!=saved.music_folder || restored.antialiasing!=6 || restored.anisotropy!=16 || restored.ambient_occlusion!=3 || restored.ambient_occlusion_strength!=47 ||
-       !restored.skip_intro || !restored.fast_load || restored.clean_hud || restored.draw_distance!=4)
+       !restored.custom_music || !restored.loop_track || !restored.mute_on_focus_loss || restored.music_folder!=saved.music_folder || restored.antialiasing!=6 || restored.anisotropy!=16 || restored.ambient_occlusion!=3 || restored.ambient_occlusion_strength!=47 ||
+       !restored.skip_intro || !restored.fast_load || restored.clean_hud || restored.draw_distance!=4 || restored.enabled_mods!=saved.enabled_mods)
         throw std::runtime_error("New settings did not survive save/load");
+    restored.volume=37;
+    if(restored.output_gain(false)!=0 || restored.output_gain(true)!=.37f)
+        throw std::runtime_error("Focus muting did not preserve the selected volume");
+    restored.muted=true;
+    if(restored.output_gain(false)!=0 || restored.output_gain(true)!=0)
+        throw std::runtime_error("Focus restored manually muted audio");
+    restored.muted=false;restored.mute_on_focus_loss=false;restored.save(preferences);
+    if(restored.output_gain(false)!=.37f || Preferences(true,preferences).mute_on_focus_loss)
+        throw std::runtime_error("Focus muting could not be disabled");
+    SDL_Event focus{};focus.type=SDL_EVENT_WINDOW_FOCUS_GAINED;focus.window.windowID=SDL_GetWindowID(app.window);app.event(focus);
+    if(!app.focused) throw std::runtime_error("Focus gain was ignored");
+    focus.type=SDL_EVENT_WINDOW_FOCUS_LOST;app.event(focus);
+    if(app.focused) throw std::runtime_error("Focus loss was ignored");
     saved.clean_hud=true;saved.save(preferences);
     if(!Preferences(true,preferences).clean_hud) throw std::runtime_error("Enabled Clean HUD did not survive save/load");
     for(const auto value:{1,2,4}) {
@@ -1161,7 +1413,7 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     if(automatic.bindings[15]!=SDL_SCANCODE_Z || app.settings_dirty) throw std::runtime_error("Edited settings were not saved when closing settings");
     app.event(escape);
     app.log_message("Starting game...");
-    constexpr const char* names[]={"game-files","general","audio","graphics","enhancements","controls","log"};
+    constexpr const char* names[]={"game-files","general","audio","graphics","enhancements","controls","mods","log"};
     std::ostringstream images;images<<'[';
     for(int tab=0;tab<int(std::size(names));++tab) {
         app.select_category=tab;
@@ -1180,7 +1432,36 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
         images<<std::format("{{\"category\":{},\"image\":{}}}",json(names[tab]),json(path_text(output)));
         app.renderer->present(false);
     }
-    for(const int category:{4,5}) {
+    // Reopen a panel after mouse focus, then verify keyboard focus still works.
+    // Escape must only toggle settings, not select the child panel itself.
+    const auto settings_frame=[&] {
+        app.renderer->begin(0xFF16344A);app.renderer->end();app.renderer->display();
+        app.settings_interface();app.renderer->present(false);
+    };
+    auto& ui=ImGui::GetIO();
+    ui.ClearInputKeys();ui.AddFocusEvent(true);
+    app.playing=true;app.select_category=6;
+    for(unsigned frame=0;frame<3;++frame) settings_frame();
+    ui.AddMousePosEvent(550,450);settings_frame();
+    ui.AddMouseButtonEvent(0,true);settings_frame();
+    ui.AddMouseButtonEvent(0,false);settings_frame();
+    for(const auto key:{SDL_SCANCODE_ESCAPE,SDL_SCANCODE_F1}) {
+        SDL_Event toggle{};toggle.key.windowID=SDL_GetWindowID(app.window);
+        toggle.key.scancode=key;toggle.key.key=key==SDL_SCANCODE_ESCAPE?SDLK_ESCAPE:SDLK_F1;
+        for(unsigned press=0;press<2;++press) {
+            toggle.type=SDL_EVENT_KEY_DOWN;app.event(toggle);settings_frame();
+            toggle.type=SDL_EVENT_KEY_UP;app.event(toggle);settings_frame();
+            if(app.show_settings!=(press==1)) throw std::runtime_error("Settings shortcut did not toggle the panel");
+            if(ui.NavVisible) throw std::runtime_error("Settings shortcut selected a panel navigation outline");
+        }
+    }
+    ui.AddKeyEvent(ImGuiKey_Tab,true);settings_frame();
+    ui.AddKeyEvent(ImGuiKey_Tab,false);settings_frame();
+    if(!ui.NavVisible) throw std::runtime_error("Keyboard settings navigation lost its focus indicator");
+    ui.AddMouseButtonEvent(0,true);settings_frame();
+    ui.AddMouseButtonEvent(0,false);settings_frame();
+    app.playing=false;
+    for(const int category:{4,5,6}) {
         resize(640,480);
         app.select_category=category;
         for(unsigned frame=0;frame<3;++frame) {
@@ -1195,6 +1476,11 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     }
     resize(960,720);
     images<<']';app.select_category=0;app.settings.vsync=false;
+    app.capture_frame();const auto window_capture=app.pending_window_capture.parent_path();app.display(true);
+    const auto captured_window=load_image(window_capture/"window.png");
+    if(captured_window.width!=960 || captured_window.height!=720 || !std::filesystem::exists(window_capture/"window.json") ||
+       !std::filesystem::exists(window_capture/"settings.cfg") || !app.pending_window_capture.empty())
+        throw std::runtime_error("Settings capture omitted the window image or display details");
     app.launch=true;
     if(app.poll_game() || !app.running) throw std::runtime_error("Restart request did not stop the game while keeping the app open");
     const auto before_restart=app.renderer->stats().published_frames;app.game_flip();
@@ -1331,10 +1617,11 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     if(app.running || app.launch || app.binding_action!=-1 || app.settings_dirty || closed.volume!=37)
         throw std::runtime_error("Exit did not cancel launch and save pending settings");
     std::filesystem::remove(preferences);
-    return std::format("{{\"format\":\"b2-window-check-v4\",\"passed\":true,\"backend\":\"SDL3/D3D11/ImGui\",\"adapter\":{},\"default_refresh_rate\":60,"
+    return std::format("{{\"format\":\"b2-window-check-v4\",\"passed\":true,\"backend\":\"SDL3/D3D11/ImGui\",\"adapter\":{},\"window\":{},\"settings_font\":{},\"heading_font\":{},\"default_refresh_rate\":60,"
         "\"bindings_and_settings\":true,\"automatic_settings_save\":true,\"restart_request\":true,\"exit_request\":true,\"widescreen_presentation\":true,\"ultrawide_presentation\":true,\"motion_blur_setting\":true,\"frame_counter\":true,\"counter_image\":{},\"escape_toggle\":true,\"resolution_change\":true,"
         "\"pacing_60_hz\":{:.3f},\"pacing_120_hz\":{:.3f},\"source_at_120_hz\":{:.3f},\"source_at_144_hz\":{:.3f},\"display_120_hz\":{:.3f},\"display_144_hz\":{:.3f},"
-        "\"performance_capture\":true,\"shader_compilations\":0,\"game_booted\":false,\"game_fps_established\":false,\"images\":{}}}",
-        json(renderer.adapter()),json(path_text(counter_image)),measured[0],measured[1],source_rates[0],source_rates[1],display_rates[0],display_rates[1],images.str());
+        "\"window_capture\":true,\"performance_capture\":true,\"shader_compilations\":0,\"game_booted\":false,\"game_fps_established\":false,\"images\":{}}}",
+        json(renderer.adapter()),app.window_diagnostic(),json(ImGui::GetIO().FontDefault->GetDebugName()),json(app.heading_font->GetDebugName()),
+        json(path_text(counter_image)),measured[0],measured[1],source_rates[0],source_rates[1],display_rates[0],display_rates[1],images.str());
 }
 }

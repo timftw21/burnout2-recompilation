@@ -1,4 +1,5 @@
 #include "gpu.h"
+#include "shaders.h"
 #include <thread>
 #include "cpu.h"
 #include <d3d11.h>
@@ -96,7 +97,7 @@ struct Gpu::Impl {
     std::filesystem::path capture_requested,capture_directory;
     std::ostringstream capture_trace;
     unsigned capture_draws=0;
-    std::uint64_t capture_serial=0,capture_texture_bytes=0;
+    std::uint64_t capture_serial=0,capture_bytes=0;
     unsigned capture_textures=0;
     bool capture_truncated=false,capture_automated=false;
     Impl(Renderer& r,Memory& m,Gpu& o,std::uint32_t base):renderer(r),memory(m),owner(o),semaphore_base(base) {
@@ -295,13 +296,8 @@ struct Gpu::Impl {
             mips,linear?pitch:0,cube,depth}),size}).first;
         if(!capture_directory.empty() && found->second.captured!=capture_serial) {
             found->second.captured=capture_serial;
-            if(size>64*1024*1024-capture_texture_bytes) capture_truncated=true;
-            else {
-                const auto name=std::format("texture-{:04}.bin",capture_textures++);
-                std::ofstream output(capture_directory/name,std::ios::binary);
-                output.write(static_cast<const char*>(memory.access(address,static_cast<std::size_t>(size))),static_cast<std::streamsize>(size));
-                if(!output) throw std::runtime_error("Cannot write captured texture bytes");
-                capture_texture_bytes+=size;
+            const auto name=std::format("texture-{:04}.bin",capture_textures++);
+            if(capture_data(name,Bytes(static_cast<const std::byte*>(memory.access(address,static_cast<std::size_t>(size))),static_cast<std::size_t>(size)))) {
                 capture_trace<<std::format("{{\"type\":\"texture\",\"resource\":{},\"address\":{},\"format\":{},\"width\":{},\"height\":{},\"depth\":{},\"mip_levels\":{},\"pitch\":{},\"cubemap\":{},\"bytes\":{},\"data\":{}}}\n",
                     found->second.identifier,json(hex32(address)),json(hex32(format)),width,height,depth,mips,linear?pitch:0,cube,size,json(name));
             }
@@ -410,15 +406,32 @@ struct Gpu::Impl {
             prepared_layout=renderer.prepare_layout(shader,layout);layout_program=shader;prepared_attributes=layout;
         }
         draw.layout=prepared_layout;draw.bindings=renderer.prepare(draw.state);
-        if(!capture_directory.empty()) capture_draw(first,draw,shader);
+        if(!capture_directory.empty()) capture_draw(first,draw,shader,elements);
         draw.indices.assign(elements.begin(),elements.end());
         if(draw.state.color_mask) {active_surface->revision=++surface_revision;active_surface->color_cleared=false;}
         if(++draw_count==draws.size()) flush();
     }
-    void capture_draw(std::uint32_t first,const Draw& draw,std::uint32_t shader) {
+    bool capture_data(std::string_view name,Bytes bytes) {
+        if(bytes.size()>64*1024*1024-capture_bytes) {capture_truncated=true;return false;}
+        std::ofstream output(capture_directory/name,std::ios::binary);
+        output.write(reinterpret_cast<const char*>(bytes.data()),static_cast<std::streamsize>(bytes.size()));
+        if(!output) throw std::runtime_error("Cannot write captured GPU bytes");
+        capture_bytes+=bytes.size();return true;
+    }
+    void capture_shader(ShaderKind kind,unsigned index=0,const VertexProgram* vertex=nullptr) {
+        const auto binary=shader_binary(kind,vertex);
+        const auto name=std::format("shader-{:02}-{:02}.dxbc",unsigned(kind),index);
+        if(!capture_data(name,binary.bytes)) return;
+        capture_trace<<std::format("{{\"type\":\"native_shader\",\"kind\":{},\"constant_first\":{},\"constant_count\":{},\"input_mask\":{},\"bytes\":{},\"data\":{}",
+            unsigned(kind),binary.constant_first,binary.constant_count,binary.input_mask,binary.bytes.size(),json(name));
+        if(vertex) capture_trace<<std::format(",\"program_start\":{},\"program\":{}",vertex->start,json(hex_bytes(std::as_bytes(std::span(vertex->tokens)))));
+        capture_trace<<"}\n";
+    }
+    void capture_draw(std::uint32_t first,const Draw& draw,std::uint32_t shader,std::span<const std::uint32_t> elements) {
         if(capture_trace.tellp()>48*1024*1024 || capture_draws==2048) {capture_truncated=true;return;}
-        capture_trace<<std::format("{{\"type\":\"draw\",\"draw\":{},\"first\":{},\"count\":{},\"target\":{},\"shader\":{},\"program_start\":{},\"coverage\":[{},{}],\"registers\":{},\"program\":{},\"constants\":{},\"current\":{},\"textures\":[",
-            capture_draws++,first,draw.count,target,shader,program.start,std::uint32_t(draw.state.coverage),std::uint32_t(draw.state.coverage>>32),json(hex_bytes(std::as_bytes(std::span(registers[0])))),
+        const auto number=capture_draws++;
+        capture_trace<<std::format("{{\"type\":\"draw\",\"draw\":{},\"first\":{},\"count\":{},\"target\":{},\"shader\":{},\"program_start\":{},\"primitive\":{},\"coverage\":[{},{}],\"registers\":{},\"program\":{},\"constants\":{},\"current\":{},\"textures\":[",
+            number,first,draw.count,target,shader,program.start,draw.state.primitive,std::uint32_t(draw.state.coverage),std::uint32_t(draw.state.coverage>>32),json(hex_bytes(std::as_bytes(std::span(registers[0])))),
             json(hex_bytes(std::as_bytes(std::span(program.tokens)))),json(hex_bytes(std::as_bytes(std::span(constants)))),
             json(hex_bytes(std::as_bytes(std::span(current.attributes)))));
         for(unsigned i=0;i<4;++i) {
@@ -428,9 +441,18 @@ struct Gpu::Impl {
         capture_trace<<"],\"streams\":[";
         for(unsigned i=0;i<draw.stream_count;++i) {
             if(i) capture_trace<<',';const auto& stream=draw.streams[i];
-            capture_trace<<std::format("{{\"stride\":{},\"size\":{},\"prefix\":{}}}",stream.stride,stream.bytes.size(),json(hex_bytes(stream.bytes.first(std::min<std::size_t>(128,stream.bytes.size())))));
+            const auto name=std::format("vertex-{:04}-{}.bin",number,i);
+            capture_trace<<std::format("{{\"stride\":{},\"size\":{},\"prefix\":{},\"data\":{}}}",stream.stride,stream.bytes.size(),
+                json(hex_bytes(stream.bytes.first(std::min<std::size_t>(128,stream.bytes.size())))),capture_data(name,stream.bytes)?json(name):"null");
         }
-        capture_trace<<']';
+        capture_trace<<"],\"attributes\":[";
+        for(unsigned i=0;i<prepared_attributes.size();++i) {
+            if(i) capture_trace<<',';const auto& attribute=prepared_attributes[i];
+            capture_trace<<std::format("[{}, {}, {}]",attribute.stream,attribute.offset,attribute.format);
+        }
+        const auto name=std::format("indices-{:04}.bin",number);
+        capture_trace<<std::format("],\"indices\":{{\"count\":{},\"element_bytes\":4,\"data\":{}}}",elements.size(),
+            !elements.empty() && capture_data(name,std::as_bytes(elements))?json(name):"null");
         capture_trace<<"}\n";
     }
     void capture_flip() {
@@ -442,15 +464,22 @@ struct Gpu::Impl {
                 capture_trace<<std::format("{{\"type\":\"surface\",\"resource\":{},\"color\":{},\"depth\":{},\"format\":{},\"pitch\":{},\"width\":{},\"height\":{},\"image\":{}}}\n",
                     surface.identifier,json(hex32(key[0])),json(hex32(key[1])),json(hex32(key[2])),json(hex32(key[3])),surface.width,surface.height,json(name));
             }
-            capture_trace<<std::format("{{\"type\":\"end\",\"draws\":{},\"truncated\":{}}}\n",capture_draws,capture_truncated);
+            capture_trace<<std::format("{{\"type\":\"end\",\"draws\":{},\"binary_bytes\":{},\"truncated\":{}}}\n",capture_draws,capture_bytes,capture_truncated);
             write_text(capture_directory/"draws.jsonl",capture_trace.view(),false);
             capture_directory.clear();capture_trace=std::ostringstream{};
         }
         if(!capture_requested.empty()) {
             capture_directory=std::move(capture_requested);capture_requested.clear();
             std::filesystem::create_directories(capture_directory);
-            capture_draws=0;capture_truncated=false;capture_textures=0;capture_texture_bytes=0;++capture_serial;
-            capture_trace<<std::format("{{\"type\":\"header\",\"format\":\"b2-gpu-frame-v1\",\"game_inputs_automated\":{}}}\n",capture_automated);
+            capture_draws=0;capture_truncated=false;capture_textures=0;capture_bytes=0;++capture_serial;
+            const auto vertices=static_vertex_shaders();
+            capture_trace<<std::format("{{\"type\":\"header\",\"format\":\"b2-gpu-frame-v1\",\"game_inputs_automated\":{},\"adapter\":{},\"native_shader_bank\":{}}}\n",
+                capture_automated,json(renderer.adapter()),!vertices.empty());
+            if(!vertices.empty()) {
+                for(unsigned i=0;i<unsigned(ShaderKind::count);++i)
+                    if(i!=unsigned(ShaderKind::vertex) && i!=unsigned(ShaderKind::launch)) capture_shader(ShaderKind(i));
+                for(unsigned i=0;i<vertices.size();++i) capture_shader(vertices[i].launch?ShaderKind::launch:ShaderKind::vertex,i,&vertices[i].program);
+            }
         }
     }
     Fence& completion() {

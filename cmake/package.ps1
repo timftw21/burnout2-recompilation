@@ -10,12 +10,14 @@ if (Test-Path -LiteralPath $outputPath) { throw 'Package already exists; choose 
 
 # Archive only committed build inputs, instructions and required license notices.
 $inputs = @(
-    'Build.cmd', 'Build.sh', 'Install.sh', 'Install.command', 'Install.desktop', 'Play.sh',
+    'Install.cmd', 'Build.cmd', 'Build.sh', 'Install.sh', 'Install.command', 'Install.desktop', 'Play.sh',
     'CMakeLists.txt', 'CMakePresets.json', 'README.md', 'BUILDING.txt',
     'LICENSE', 'NOTICE.md', 'THIRD_PARTY_NOTICES.txt',
-    'cmake/build.ps1', 'cmake/build-ui.ps1', 'cmake/target.h.in', 'cmake/kernel_names.h.in',
+    'cmake/build.ps1', 'cmake/build-ui.ps1', 'cmake/windows-dependencies.ps1', 'cmake/target.h.in', 'cmake/kernel_names.h.in',
     'cmake/cpu-seeds.txt.in', 'cmake/imgui-shaders.cmake',
     'cmake/linux.cmake', 'cmake/posix-dependencies.sh', 'cmake/vkd3d-copy-propagation.patch',
+    'cmake/steamdeck.sh', 'cmake/cmake-linux.sh', 'cmake/vkd3d-json.patch',
+    'cmake/dxvk-native.cmake', 'cmake/build-dxvk.cmake', 'cmake/dxvk-native.patch', 'cmake/dxvk-pnp.pl',
     'cmake/macos.cmake', 'cmake/macos-dependencies.sh', 'cmake/dxmt.cmake',
     'cmake/portable-cpu.cmake', 'cmake/binary-header.cmake',
     'cmake/install-dialog.applescript',

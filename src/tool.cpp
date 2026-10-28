@@ -1,5 +1,6 @@
 #include "decoder.h"
 #include "disc.h"
+#include "mods.h"
 #include "recompiler.h"
 #include "batch.h"
 #include "render.h"
@@ -34,6 +35,9 @@ constexpr auto usage =
     "Burnout 2 native tools (C++23)\n"
     "  b2-tool list ISO [DIRECTORY]\n"
     "  b2-tool extract ISO DISC_PATH OUTPUT\n"
+    "  b2-tool create-mod MOD_DIRECTORY NAME\n"
+    "  b2-tool install-modding-test ISO MODS_DIRECTORY\n"
+    "  b2-tool inspect-mods ISO MODS_DIRECTORY [MOD_ID ...]\n"
     "  b2-tool import-interstate BURNOUT_ISO BURNOUT2_ISO OUTPUT_DIRECTORY\n"
     "  b2-tool inspect XBE\n"
 #ifdef __APPLE__
@@ -74,7 +78,15 @@ int tool_main(int argc, char** argv) {
         const auto started = std::chrono::steady_clock::now();
         int result = 0;
         std::string output;
-        if(command=="import-interstate" && argc==5) {
+        if(command=="create-mod" && argc==4) {
+            output=b2::create_mod(paths[2],argv[3]);
+        } else if(command=="install-modding-test" && argc==4) {
+            output=b2::install_modding_test(paths[2],paths[3]);
+        } else if(command=="inspect-mods" && argc>=4 && argc<=132) {
+            std::vector<std::string> enabled;
+            for(int i=4;i<argc;++i) enabled.emplace_back(argv[i]);
+            output=b2::inspect_mods(paths[2],paths[3],enabled);
+        } else if(command=="import-interstate" && argc==5) {
             output=b2::import_interstate(paths[2],paths[3],paths[4]);
 #ifdef __APPLE__
         } else if(command=="inspect-metal" && argc==2) {

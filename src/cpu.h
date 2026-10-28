@@ -148,6 +148,7 @@ void title_presentation(Cpu&,Memory&,std::uint32_t site,std::uint32_t object=0);
 void title_ui(Cpu&,Memory&,std::uint32_t node,std::uint32_t parameters);
 std::uint32_t title_blur_alpha(Cpu&,std::uint32_t alpha,std::uint32_t filter);
 std::uint32_t title_traffic_fade(Cpu&,Memory&,std::uint32_t vehicle);
+bool title_traffic_visible(Cpu&,Memory&,std::uint32_t vehicle,std::uint32_t views,unsigned view);
 void title_enhancement(Cpu&,Memory&,std::uint32_t address);
 bool title_track(Cpu&,Memory&,std::uint32_t address,std::uint32_t object=0);
 bool title_music(Cpu&,Memory&,std::uint32_t address);

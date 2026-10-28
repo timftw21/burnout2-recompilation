@@ -687,3 +687,51 @@ songs, and 52 CPU groups. Mixed PCM is silent at the SDK's -10000 volume setting
 pause; restoring volume and resuming the pending packet both restore sound.
 The compiled function count remains 36149. No game session or audio device
 was opened; the user will check the live Crash transition.
+
+Sound balance audit (2026-10-26)
+
+The user reports the same symptom with any car and any camera view. Focus the
+audit on shared mixing, rather than introducing car/view-specific adjustments.
+
+Reverified default.xbe against supported_target.json: SHA256
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+Reviewed the latest recorded control correction (2026-10-19), the original
+232FED speaker gain calculation, native source/FXIN routing, per-source and
+mix-bin headroom, environmental sends and stereo folding. The latest control
+fix restores music volume and pause through original SDK shortcuts; changing
+music can change perceived masking, but does not retune engine or tire cues.
+The earlier rear-speaker correction remains present. No sound-specific volume
+override was found or added.
+
+Existing Windows offline audio, effects and spatial checks pass, including 155
+original/native audio-binding cases. Replayed three existing user captures
+without opening a playback device or booting the game. Each replay uses 96000
+stereo frames and excludes the captured master mute/volume. An ignored native
+diagnostic then restores the same snapshot for the complete scene, the sources
+routed through engine FXIN bin 14, and the remaining sources. Routing, original
+gains, DSP parameters and history are retained; unselected source gains are
+zeroed only in those diagnostic copies. Frozen controls and retained effect
+tails mean these are comparisons, not independent recordings of each category.
+
+Capture (date)              Scene RMS   Engine RMS  Other RMS   Clipped samples
+frame-60548904000 (Oct 24)  0.15544331  0.08460542  0.12885813  0
+frame-42550016600 (Oct 24)  0.10929511  0.03247569  0.10647113  0
+frame-78219613421 (Oct 21)  0.10727907  0.03065522  0.10269341  0
+
+All three category comparisons also have zero clipped output samples. Scene
+peaks are 0.66594356, 0.47280600 and 0.94573190. The newest complete-scene WAV
+matches the normal capture inspector byte for byte (SHA256
+918A91187255B9DB8E88CA7F5D3EF4528A4DD1856AF9036A8F80D90EE43659CA).
+The engine is 3.65, 10.31 and 10.50 dB below the remaining sources combined;
+that is not a measurement of the tire/drifting cue by itself.
+The newest frame is the title-screen driving demo; it does not establish the
+reported drifting balance during a race. Diagnostic C++,
+JSON and scene/engine/other-sfx WAVs stay under
+build/checks/audio-balance-20261026; original captures remain unchanged.
+
+No new balance defect is established by this evidence, so production gains
+remain unchanged. Existing console HRTF approximations and the lack of an
+identified drifting capture/reference prevent claiming audible balance parity.
+A fresh F8 capture during the reported drift, plus a matched original reference
+if available, would distinguish a tire-cue gain problem
+from spatial placement or masking. No gameplay automation or benchmark ran.

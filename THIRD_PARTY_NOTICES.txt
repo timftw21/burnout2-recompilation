@@ -99,7 +99,7 @@ freely, subject to the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 
 
-Dear ImGui 1.92.9b (f1cc2ae15e53a861a874c3034aae6798fde194ab)
+Dear ImGui 1.93.0 (c1aaac65e896a45f81f47a4d68f9959e0f86c859)
 https://github.com/ocornut/imgui
 
 The MIT License (MIT)
@@ -124,9 +124,12 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-DXVK Native 2.7.1 (Linux only)
-https://github.com/doitsujin/dxvk/tree/v2.7.1
-The unmodified native D3D11 and DXGI libraries are fetched into the build tree.
+DXVK Native 3.1.1 (Linux only)
+https://github.com/doitsujin/dxvk/tree/v3.1.1
+The released SDK headers are fetched into the build tree. Native D3D11 and DXGI
+libraries are built from pinned sources with upstream resize fix
+3dbf33cb2205dd0d573cbc7a65e3855d97a4800b. Alterations are recorded in
+cmake/dxvk-native.patch; the display-name table generator uses Perl.
 
                   Copyright (c) 2017 Philip Rebohle
                   Copyright (c) 2019 Joshua Ashton
@@ -153,6 +156,41 @@ freely, subject to the following restrictions:
 
 – This notice may not be removed or altered from any source distribution.
 
+
+Muon 0.7.0 (Linux build tool only)
+https://github.com/muon-build/muon/tree/74f8b8858f59e158bd12b417931d308b64105bed
+GPL-3.0-only, with per-file notices retained in the downloaded source and LICENSES.
+Muon is bootstrapped from source and is not linked into the game.
+
+dxbc-spirv (DXVK's pinned shader translator)
+https://github.com/doitsujin/dxbc-spirv/tree/bf14419e5fa7eacb817b7b632f03cb61d61bbad7
+MIT License. Copyright (c) 2025 Philip Rebohle.
+The MIT terms below also apply to this component.
+
+libdisplay-info (DXVK's pinned submodule)
+https://github.com/doitsujin/libdisplay-info/tree/275e6459c7ab1ddd4b125f28d0440716e4888078
+MIT License. Copyright (c) 2022 The libdisplay-info Contributors.
+Its original PNP generator credits Copyright (c) 2020 Simon Ser and
+Copyright 2022 Collabora, Ltd. Sources and license notices are retained in
+build/linux/_deps/b2_dxvk_source-src/subprojects/libdisplay-info.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 DXVK Native DirectX headers
 The MinGW-w64 header notices are preserved in the downloaded headers.
@@ -299,18 +337,19 @@ vkd3d-shader 2.1 (POSIX build tool only)
 https://dl.winehq.org/vkd3d/source/vkd3d-2.1.tar.xz
 Licensed under LGPL 2.1 or later. The native compiler is dynamically linked only
 by b2-tool. The original source archive remains in build/deps/vkd3d-2.1.tar.xz.
-cmake/vkd3d-copy-propagation.patch preserves modifier types across bitcasts;
-the patched source, COPYING and individual copyright notices remain in
+cmake/vkd3d-copy-propagation.patch preserves modifier types across bitcasts.
+cmake/vkd3d-json.patch uses Perl's core JSON::PP module for code generation.
+The patched source, COPYING and individual copyright notices remain in
 build/deps/vkd3d-source (or vkd3d-source-macos-ARCH). The builder installs COPYING under
 build/deps/vkd3d/share/licenses/vkd3d and the patch under build/deps/vkd3d/share/b2.
 
-Linux libcrypto (OpenSSL), libpng and libjpeg are shared system dependencies.
+Linux libcrypto (OpenSSL), libpng, libjpeg and Fontconfig are shared system dependencies.
 Their licenses and source packages are supplied by the Linux distribution.
 Installation.zip contains build sources and instructions, not these binaries.
 FFmpeg is an optional external music-import program and is not redistributed.
 
 DXMT (macOS Metal backend)
-https://github.com/3Shain/dxmt/tree/50102f994b406f58f56d5d09f2ad20f9b90390a2
+https://github.com/3Shain/dxmt/tree/9839e55f98d4aca103957ee4132d6395a325a9ed
 Copyright (c) 2023-2026 Feifan He for CodeWeavers.
 Licensed under LGPL 2.1 or later. DXMT is built as replaceable native dynamic
 libraries; Wine is not included or required. cmake/dxmt.cmake builds the pinned
@@ -337,7 +376,7 @@ manager with their licenses and source packages. They are not redistributed in
 Installation.zip. Intel builds do not need these dependencies.
 
 Berkeley SoftFloat Release 3e (Apple Silicon IEEE and extended arithmetic)
-https://github.com/ucb-bar/berkeley-softfloat-3/tree/32eb3295a3c814c1551f94ebc29eed1dec3cb3b1
+https://github.com/ucb-bar/berkeley-softfloat-3/tree/497c81c1f5016dc6ef5b3219ece2f3c261d4d8f1
 The original source and license remain in build/macos/_deps/softfloat-src.
 cmake/portable-cpu.cmake generates a copy of the extended rounding routine
 that publishes x87's rounding-direction bit. The modified source is retained as

@@ -878,3 +878,48 @@ Traffic evidence from the accepted Airport run:
   return to full coverage. Other scene/HUD draws retain full coverage.
 Private reports: build/checks/render-followup-20261024. No permanent tests
 or gameplay logging were added. Final Release and all 52 CPU groups pass.
+
+Traffic distance and detached wheels (2026-10-27)
+------------------------------------------------
+The previous wider body fade still ended at 250 while wheel/model detail
+extended farther. Original 9E950 independently builds the four render lists
+at 9F3BF/9F405/9F447/9F488 from vehicle+101 bits; those same bits also serve
+simulation. Its per-view distances are cached at 4B30A0, indexed by the
+16-bit vehicle ID at +10C plus view*FE. Verified constants are 250 at
+2C1B60 and the traffic lifetime limit 750 at 2C1B64.
+
+Only the final four render-list tests now accept additional active-view
+traffic within min(250*draw_distance,750). The original nearby lists,
+simulation flags, retirement, exemptions and 30-per-model list bounds
+remain intact. Body opacity uses the matching camera-relative endpoint
+and a 25*draw_distance fade width. This gives 500 units at 2x and 750 at 4x.
+
+9C06C..9C099 passes the product of body range/material opacity as 9A330's
+third argument. Wheels have no deferred opacity field, so their existing
+coverage array now carries that opacity too. Both LOD queue submissions
+receive their own complementary masks; shared wheels are still queued once.
+The original body fade is retained. No new shader, simulation update or
+per-frame allocation is needed. Evidence is tied to the supported XBE SHA256
+and kept privately under build/checks/audio-logo-traffic-name-20261027.
+Release, all 52 CPU groups, 3,015 range/fade/view cases and 24 original
+traffic simulation/lifetime cases pass. The existing offscreen visibility
+diagnostic passes 13,116 checks across four resolution/MSAA combinations,
+with no D3D11 debug messages. No gameplay automation or FPS benchmark ran.
+
+Settings navigation and mod notice (2026-10-27)
+-----------------------------------------------
+Escape was delivered both to the app's settings toggle and to ImGui. ImGui's
+NavUpdateCancelRequest then left the focused Options child, selected its child
+ID and drew an orange navigation cursor around the whole panel. App shortcuts
+now consume their press/release/repeat events before ImGui receives input.
+Rebinding key presses are likewise owned by the binding picker.
+
+The existing hidden-window check reproduces the outline with the original
+routing and passes with the fix. It focuses Options by mouse, closes/reopens
+using Escape and F1, and verifies that Tab still displays keyboard focus.
+The Game files icon is now a consistent 1.6-pixel disc outline. Mods has an
+always-visible disclaimer about unsupported scripts and executable patches,
+using the platform's italic font. Windows uses Segoe UI Italic or Arial Italic;
+no font is redistributed. Release and the hidden-window diagnostics pass on
+the RTX 5060 Ti, including regular and minimum-size settings layouts.
+Evidence: build/checks/settings-followup-20261027. No game was booted.

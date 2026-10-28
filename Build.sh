@@ -24,6 +24,10 @@ case "$(uname -s):$(uname -m)" in
     *) printf '%s\n' 'This builder requires Linux x86-64 or macOS Intel/Apple Silicon.' >&2; exit 1 ;;
 esac
 if [[ $platform == linux && -x $root/build/deps/cmake-linux/bin/cmake ]]; then export PATH="$root/build/deps/cmake-linux/bin:$PATH"; fi
+build_directory=${B2_BUILD_DIRECTORY:-"$root/build/$platform"}
+[[ $build_directory == /* ]] || build_directory="$root/$build_directory"
+build_jobs=${B2_BUILD_JOBS:-6}
+if [[ $platform == macos && -z ${B2_BUILD_JOBS:-} ]]; then build_jobs=4; fi
 tools_only=false
 game_inputs=false
 if (( $# == 1 )) && [[ $1 == --tools-only ]]; then tools_only=true
@@ -51,7 +55,7 @@ fi
 for program in cmake ninja clang clang++ git curl pkg-config; do
     command -v "$program" >/dev/null || { printf 'Missing %s; see BUILDING.txt.\n' "$program" >&2; exit 1; }
 done
-mkdir -p "build/$platform" data/local
+mkdir -p "$build_directory" data/local
 lock_directory=""
 stage=""
 cleanup() {
@@ -75,6 +79,7 @@ else
     source cmake/macos-dependencies.sh
 fi
 configure_options=()
+if [[ $platform == linux ]]; then configure_options+=("-DB2_LINK_JOBS=$build_jobs"); fi
 build_options=()
 # Report independent compiler failures together in CI, retaining the job limit.
 if [[ ${CI:-} == true ]]; then build_options=(-- -k0); fi
@@ -82,32 +87,32 @@ if [[ $platform == macos ]]; then
     configure_options+=("-DB2_DXMT_LLVM=$B2_DXMT_LLVM" "-DCMAKE_C_COMPILER=$(xcrun --find clang)" "-DCMAKE_CXX_COMPILER=$(xcrun --find clang++)")
 fi
 fresh=()
-cache="$root/build/$platform/CMakeCache.txt"
-if [[ -f $cache ]] && { [[ $(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$cache") != "$root" ]] || [[ $(sed -n 's/^CMAKE_CACHEFILE_DIR:INTERNAL=//p' "$cache") != "$root/build/$platform" ]]; }; then
+cache="$build_directory/CMakeCache.txt"
+if [[ -f $cache ]] && { [[ $(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$cache") != "$root" ]] || [[ $(sed -n 's/^CMAKE_CACHEFILE_DIR:INTERNAL=//p' "$cache") != "$build_directory" ]]; }; then
     fresh=(--fresh)
 fi
 configured_game=false
 if ! $tools_only && [[ -f data/local/default.xbe && -f data/local/b2distfx.bin ]]; then
-    cmake --preset "$platform" ${fresh[@]+"${fresh[@]}"} ${configure_options[@]+"${configure_options[@]}"} -DB2_XBE="$root/data/local/default.xbe" -DB2_EFFECTS="$root/data/local/b2distfx.bin"
+    cmake --preset "$platform" -B "$build_directory" ${fresh[@]+"${fresh[@]}"} ${configure_options[@]+"${configure_options[@]}"} -DB2_XBE="$root/data/local/default.xbe" -DB2_EFFECTS="$root/data/local/b2distfx.bin"
     configured_game=true
 else
-    cmake --preset "$platform" ${fresh[@]+"${fresh[@]}"} ${configure_options[@]+"${configure_options[@]}"} -DB2_XBE=
+    cmake --preset "$platform" -B "$build_directory" ${fresh[@]+"${fresh[@]}"} ${configure_options[@]+"${configure_options[@]}"} -DB2_XBE=
 fi
-cmake --build --preset "$platform-release" --target b2-tool ${build_options[@]+"${build_options[@]}"}
-if $tools_only; then printf 'Built the native tool: %s\n' "$root/build/$platform/Release/b2-tool";exit 0;fi
-tool="$root/build/$platform/Release/b2-tool"
+cmake --build "$build_directory" --config Release --parallel "$build_jobs" --target b2-tool ${build_options[@]+"${build_options[@]}"}
+if $tools_only; then printf 'Built the native tool: %s\n' "$build_directory/Release/b2-tool";exit 0;fi
+tool="$build_directory/Release/b2-tool"
 if $game_inputs; then
-    "$tool" verify "$root/data/local/default.xbe" > "build/$platform/target.json"
-    cmake --build --preset "$platform-release" ${build_options[@]+"${build_options[@]}"}
-    printf 'Built the native game from verified extracted inputs: %s\n' "$root/build/$platform/Release/b2"
+    "$tool" verify "$root/data/local/default.xbe" > "$build_directory/target.json"
+    cmake --build "$build_directory" --config Release --parallel "$build_jobs" ${build_options[@]+"${build_options[@]}"}
+    printf 'Built the native game from verified extracted inputs: %s\n' "$build_directory/Release/b2"
     exit 0
 fi
 stage=$(mktemp -d "$root/data/local/b2-setup.XXXXXX")
 "$tool" extract "$disc" default.xbe "$stage/default.xbe"
-"$tool" verify "$stage/default.xbe" > "build/$platform/target.json"
+"$tool" verify "$stage/default.xbe" > "$build_directory/target.json"
 printf '%s\n' 'Verified the supported US Xbox executable.'
 "$tool" extract "$disc" data/b2distfx.bin "$stage/b2distfx.bin"
-"$tool" compile-effects "$stage/b2distfx.bin" "$stage/effects.cpp" > "build/$platform/effects.json"
+"$tool" compile-effects "$stage/b2distfx.bin" "$stage/effects.cpp" > "$build_directory/effects.json"
 for file in default.xbe b2distfx.bin; do
     if [[ -f data/local/$file ]] && cmp -s -- "$stage/$file" "data/local/$file"; then
         rm -- "$stage/$file"
@@ -116,10 +121,11 @@ for file in default.xbe b2distfx.bin; do
     fi
 done
 if ! $configured_game; then
-    cmake --preset "$platform" ${configure_options[@]+"${configure_options[@]}"} -DB2_XBE="$root/data/local/default.xbe" -DB2_EFFECTS="$root/data/local/b2distfx.bin"
+    cmake --preset "$platform" -B "$build_directory" ${configure_options[@]+"${configure_options[@]}"} -DB2_XBE="$root/data/local/default.xbe" -DB2_EFFECTS="$root/data/local/b2distfx.bin"
 fi
-cmake --build --preset "$platform-release" ${build_options[@]+"${build_options[@]}"}
-settings="$root/build/$platform/Release/data/local/settings.cfg"
+cmake --build "$build_directory" --config Release --parallel "$build_jobs" ${build_options[@]+"${build_options[@]}"}
+"$tool" install-modding-test "$disc" "$build_directory/Release/mods"
+settings="$build_directory/Release/data/local/settings.cfg"
 mkdir -p -- "$(dirname -- "$settings")"
 {
     if [[ -f $settings ]]; then
@@ -130,4 +136,8 @@ mkdir -p -- "$(dirname -- "$settings")"
     printf 'xbe=%s\ndisc=%s\n' "$root/data/local/default.xbe" "$disc"
 } > "$settings.tmp"
 mv -f -- "$settings.tmp" "$settings"
-printf '\nBuilt successfully. Start the game with:\n  %q\n' "$root/build/$platform/Release/b2"
+if [[ -n ${B2_LAUNCH_SCRIPT:-} ]]; then
+    printf '\nBuilt successfully. Start the game with:\n  bash %q\n' "$B2_LAUNCH_SCRIPT"
+else
+    printf '\nBuilt successfully. Start the game with:\n  %q\n' "$build_directory/Release/b2"
+fi

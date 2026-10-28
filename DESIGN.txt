@@ -103,6 +103,18 @@ audio controls and controller remapping. Support keyboard and controller navigat
 clear error messages, persistent settings and restore-defaults. Keep developer
 diagnostics in a separate advanced view.
 
+8. Asset mods
+
+Load optional folder-based replacements through the native disc-file services.
+Require a versioned manifest tied to the supported target, preserve original disc
+paths and formats, and make enabled order and conflicts visible in settings and
+offline JSON diagnostics. Apply the mount once per session, using the existing
+read-only asynchronous/synchronous handles and directory metadata. Avoid scanning
+folders or decoding mod content during rendering or file reads. Leave the disc,
+executable, saves and compiled programs intact. Executable patches, scripts,
+runtime plugins and hot reload are unsupported; changes to native game behavior
+remain source changes compiled ahead of time.
+
 Implementation order
 
 Build native extraction/recompilation and offline validation first. Establish

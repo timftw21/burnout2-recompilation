@@ -113,3 +113,45 @@ successful/failed real workers and timed cancellation. The full Release build
 passed, and a real incremental Ninja run passed through the same progress reader.
 All owned installer/build/check workers exited. Evidence:
 build/checks/display-installer-20261018.
+
+2026-10-27: automatic Windows prerequisites
+
+Install.cmd selects 64-bit Windows PowerShell 5.1; Build.cmd forwards to it.
+After disc selection, setup reuses compatible installed tools or fetches pinned,
+SHA-256-checked CMake 4.4.5, MinGit 2.56.0.4, Ninja 1.13.2 and LLVM 22.1.8.
+Portable tools and verified downloads stay under build/deps/windows. The path
+change is local to setup. Missing Microsoft 2026 C++ tools and SDK 26100 use
+Microsoft's signed bootstrapper, or modify an existing 2026 installation.
+Only the bootstrapper supports --wait. Microsoft's installer owns cancellation
+and rollback; its service/MSI workers are never killed by our worker cleanup.
+
+Actual Windows PowerShell 5.1 downloads, hashes, extraction and execution passed
+with spaces, Japanese characters and an accented character in the cache path.
+LLVM 23.1.4's tar.zst requires a larger decoding window than CMake/libarchive
+permits; use the compatible 22.1.8 tar.xz instead. The four primary tool
+executables have no Visual C++ redistributable import.
+The downloaded tools built b2-tool and the full Release game, verified the
+supported original XBE and passed all 52 CPU groups (26,026 instruction cases,
+3,518 memory cases, 6,744 floating-point cases and 109 control cases). The CMake
+cache confirms all four tools came from the downloaded Unicode-path cache.
+Existing Microsoft/SDK/tool reuse passed without downloads or system changes.
+Private checks passed offline cache reuse, corrupt-cache replacement, hash
+failure retries, cancellation, missing-program repair and cache-directory bounds.
+Microsoft result handling (success, restart, cancellation, busy, failure and UAC
+decline) and fresh/existing installation plans passed simulated-exit/inventory
+checks. A clean-Windows Microsoft installation was not performed on this host.
+The ready screen renders offscreen with Close first and Launch game at the right.
+The Installation.zip manifest includes both entry points and the dependency
+helper, and its extracted PowerShell entry point passes under a Unicode path.
+The private package snapshot preserves the real Git index/branch and includes
+no private game data, generated files, research or AGENTS.md.
+Evidence: build/checks/windows-setup-20261027.
+
+Official sources:
+https://learn.microsoft.com/en-us/visualstudio/install/use-command-line-parameters-to-install-visual-studio?view=visualstudio
+https://learn.microsoft.com/en-us/visualstudio/install/workload-component-id-vs-build-tools?view=visualstudio
+https://github.com/Kitware/CMake/releases/tag/v4.4.5
+https://github.com/git-for-windows/git/releases/tag/v2.56.0.windows.4
+https://github.com/ninja-build/ninja/releases/tag/v1.13.2
+https://github.com/llvm/llvm-project/releases/tag/llvmorg-22.1.8
+https://github.com/microsoft/vswhere/releases/tag/3.1.7

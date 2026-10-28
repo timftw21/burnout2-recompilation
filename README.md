@@ -18,15 +18,19 @@ I'll try to respond in a timely manner. This is an independent fan project, unaf
 Yes, AI (Codex) assisted in the development of this project. No, this project was not blindly thrown together.
 If you're skeptical, I implore you to try the recompilation for yourself. I take quality control quite seriously!👀
 
-## What's new in 1.9
+## What's new in 1.10
 
-- Added a "Clean HUD" option to miscellaneous enhancements. Many low-resolution assets were redrawn. It's enabled by default.
-- Added a "Fast load" option to miscellaneous enhancements. When enabled, screen transitions are disabled and framerate is uncapped during loading.
-- Fixed some lingering timing issues.
-- Improved the render distance enhancement. Assets now fade in for smooth LOD transitions.
-- Removed DLSS, FSR, and XeSS. They weren't worth the trouble.
+- Windows setup now downloads missing build tools automatically and offers **Launch game** when finished.
+- Added asset mods with enable/disable controls, load order, conflict checks and an optional **Test Mod**.
+- Added experimental Steam Deck / SteamOS installation through a user-installed Flatpak runtime.
+- Added **Mute on focus loss** to Audio settings.
+- Finished redrawing the remaining Clean HUD font symbols.
+- Fixed distant traffic appearing as floating tires with increased draw distance.
+- Fixed the flashing **END** box when scrolling through profile-name characters.
+- Improved settings icons and mod guidance, and fixed the orange panel outline when reopening settings.
+- Updated Linux and macOS graphics dependencies and improved diagnostic captures.
 
-Download the new **Installation.zip**. On Windows, run **Build.cmd** again to
+Download the new **Installation.zip**. On Windows, run **Install.cmd** again to
 update. On Linux, open **Install.desktop**; on macOS, open **Install.command**.
 See [Updating between releases](#updating-between-releases) to keep your saves,
 settings and imported music.
@@ -86,6 +90,8 @@ support is still being tested.
 - Optional intro skipping and 2×/4× draw distance, including traffic detail.
 - Clean HUD redraws the original low-resolution interface assets with smooth edges.
 - Optional fast loading skips loading transitions and frame delays.
+- Asset replacement mods with saved load order and conflict checks.
+- Optional automatic muting when the game loses focus.
 
 ### What still needs work
 
@@ -99,7 +105,7 @@ image. Game files are not included. Keep the source and build folders together.
 
 ### Linux x86-64
 
-Use a glibc-based 64-bit Linux distribution and a compatible Vulkan 1.3 graphics
+Use a glibc-based 64-bit Linux distribution and a compatible Vulkan 1.4 graphics
 driver. Extract **Installation.zip** into a folder you will keep, then open
 **Install.desktop**. Your desktop may first require **Allow Launching** or
 **Run as Program**. You can also start setup from a terminal:
@@ -142,36 +148,41 @@ check GPU support.
 Linux and macOS do not support WARP, D3D11 debug
 layers or hardware memory watches. Custom music imports require FFmpeg.
 
+### Steam Deck / SteamOS
+
+In Desktop Mode, extract **Installation.zip** into a permanent folder, then open
+**Install.desktop**. Setup detects SteamOS and installs its build tools and
+runtime through Flatpak in your user account. It leaves SteamOS's system files
+alone. The first installation needs internet access and several GB of free space.
+
+Launch from the application menu, or add **Burnout 2: Point of Impact** to Steam
+as a non-Steam game for Gaming Mode. Leave the compatibility-tool override off.
+You can also run `bash Install.sh --steamdeck` and later `bash Play.sh --steamdeck`.
+Keep the installation folder and XISO in place. Steam Deck support is experimental;
+gameplay, sound and performance still need checking on physical hardware.
+
 ### Windows x64
 
 You need a 64-bit Windows PC and a graphics card that supports DirectX 11.
 
-1. Install [Visual Studio 2026 Community](https://visualstudio.microsoft.com/downloads/)
-   with **Desktop development with C++**, **C++ CMake tools for Windows** and the included Windows SDK,
-   [CMake 4.2 or newer](https://cmake.org/download/), and
-   [Git for Windows](https://git-scm.com/downloads/win).
-   Also install the Windows x64 version of [LLVM 22.1 or newer](https://github.com/llvm/llvm-project/releases).
-   **[Ninja](https://github.com/ninja-build/ninja/releases/latest)** (`ninja.exe`)
-   is also required. Visual Studio includes it with **C++ CMake tools for Windows**.
-2. Download [Installation.zip](https://github.com/timftw21/burnout2-recompilation/releases/latest/download/Installation.zip)
-   and extract it, or clone the repository.
-3. Double-click **Build.cmd** and select your US Xbox XISO disc image (`.iso` or `.xiso`).
+1. Download [Installation.zip](https://github.com/timftw21/burnout2-recompilation/releases/latest/download/Installation.zip)
+   and extract it into a folder you will keep.
+2. Double-click **Install.cmd** and select your US Xbox XISO disc image (`.iso` or `.xiso`).
    Use an XISO; full-disc dumps need conversion to XISO first.
-   The builder prepares the game files, downloads dependencies and builds the app,
-   with a progress bar that follows the build tasks.
-   The first build can take a while; later builds reuse previous work.
-4. Click **Open game folder**, then double-click **b2.exe**.
+   Setup automatically downloads missing tools and builds the game. If Microsoft
+   C++ tools are missing, approve the Windows permission prompt for their installer.
+   The first installation needs internet access and can take a while; progress
+   and download sizes appear in the setup window.
+3. Click **Launch game**. For later launches, open `build/windows/Release/b2.exe`.
 
-There are no commands to type. If building fails, click **Open build log**.
+There are no separate tool downloads, commands to type or PATH changes to make.
+Compatible installed tools are reused; portable tools stay in `build/deps/windows`.
+The full Visual Studio editor is not required. **Build.cmd** also opens the same
+installer. If setup asks for a restart, restart Windows and run **Install.cmd**
+again. Verified downloads and completed build work are kept for retries.
+If building fails, click **Open build log**.
 The [developer build instructions](https://github.com/timftw21/burnout2-recompilation/blob/main/BUILDING.txt)
 also cover offline debugging.
-
-If the builder reports **ninja.exe is missing**, open **Visual Studio Installer**,
-click **Modify** for Visual Studio 2026, and install **C++ CMake tools for Windows**
-under **Individual components**. Alternatively, download **ninja-win.zip** from
-the [official Ninja releases](https://github.com/ninja-build/ninja/releases/latest),
-extract it, and add the folder containing `ninja.exe` to your Windows **Path**
-environment variable. Close and reopen **Build.cmd** after installing it.
 
 ### Updating between releases
 
@@ -186,18 +197,16 @@ deleted shortcut without rebuilding an installation that remains in place.
 1. Close the game and builder.
 2. Back up `data/user` and `data/local/settings.cfg` beside your current `b2.exe`.
    These contain your saves and settings. If you imported music, also back up
-   `data/local/custom-music`.
-3. Check the prerequisites above. Updates from releases before 1.3 require
-   LLVM 22.1 or newer; Visual Studio and its Windows SDK are still required.
-4. Download the latest **Installation.zip** and extract it into your existing
+   `data/local/custom-music`. Back up the `mods` folder as well if you added mods.
+3. Download the latest **Installation.zip** and extract it into your existing
    source folder—the folder containing **Build.cmd**—replacing the source files.
    Keep the existing `build` and `data` folders.
-5. Run **Build.cmd** again and select your XISO. It rebuilds the game and updates
-   game-file locations while preserving your other settings, saves and imported
-   music. Open the game folder when the build finishes.
+4. Run **Install.cmd** again and select your XISO. It prepares any missing tools,
+   rebuilds the game and updates game-file locations while preserving your other
+   settings, saves and imported music. Click **Launch game** when the build finishes.
 
 For a new-folder installation, build it first, then restore your backups to the
-same locations beside the new `b2.exe`. Run **Build.cmd** once more to refresh
+same locations beside the new `b2.exe`. Run **Install.cmd** once more to refresh
 game-file locations while keeping the restored settings.
 
 ### Game settings
@@ -223,7 +232,8 @@ to apply graphics and enhancement changes during play.
   transitions and frame limits while the game's assets load.
   Motion blur controls the original game's scene blur during boosting and other
   speed effects; it is enabled by default.
-- **Audio:** To use custom songs, **Browse** for a music folder, click
+- **Audio:** Adjust volume, mute the game, or enable **Mute on focus loss** to
+  silence it while another window has focus. To use custom songs, **Browse** for a music folder, click
   **Import music**, then select the collection in the game's **Music Selection**
   menu. MP3, WAV, WMA, FLAC, M4A and AAC are supported through Windows codecs
   on Windows and FFmpeg on Linux and macOS.
@@ -233,7 +243,14 @@ to apply graphics and enhancement changes during play.
   change it in **Music Selection** or **Pause → Options** and confirm your choice.
 - **Controls:** Click a binding and press its replacement; use **Clear** or
   **Restore keyboard defaults** as needed. Esc cancels rebinding.
-- **Log:** View startup, capture and error messages.
+- **Mods:** Open the mods folder, add a mod, then **Refresh**. Enable the mods you
+  want and use the arrows to set their order; lower enabled mods override earlier
+  ones when files overlap. **Check mods** reports conflicts. Changes apply when
+  you start or restart the game. Setup includes **Test Mod**, disabled by default,
+  which recolors the game's logos using files generated from your own disc.
+  *Scripts and executable patches are not yet supported.* See
+  [BUILDING.txt](BUILDING.txt) for the mod format and creation steps.
+- **Diagnostics:** View startup and error messages, capture a frame, or record performance.
 
 Press **F9** to start or stop a performance recording. Reports are saved under
 `build/captures/performance-*`; include the whole folder when reporting a slowdown.

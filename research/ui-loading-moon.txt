@@ -585,3 +585,35 @@ generated vertex streams are identical with Clean HUD on/off, and both rendered
 images report zero graphics errors. Inspected original/redrawn atlas crops and
 native text images are under build/checks/trophy-glyphs-20261024. Release build
 and all 52 CPU diagnostic groups pass. No gameplay benchmark was performed.
+
+Remaining font symbols (2026-10-27)
+----------------------------------
+Verified the supported executable SHA-256 and original 256x256 font atlas SHA-1
+listed above. The original character table at 317900 has 20-byte records starting
+at +10 for character 20; BFD7D..BFDF2 confirms unsigned character indexing, crop
+width and UV selection. A bounded 4512-byte table read identifies 26 remaining
+distinct symbol crops: double quote, percent, apostrophe, asterisk, plus, comma,
+hyphen, period, colon, semicolon, less/greater than, equals, question mark,
+square brackets, down arrow, underscore, bullet, trademark, inverted exclamation,
+copyright, right arrow, registered trademark, degree and inverted question mark.
+Quotation/dash aliases and the degree/ordinal alias share those same crops.
+Unmapped characters remain unsupported; no substitute glyphs or mappings are added.
+
+Appended outlines traced from original alpha pixels, preserving the existing
+digit/alphabet indices and original text metrics. The percent slash follows its
+original half-texel-per-row slope; the question marks retain their asymmetric
+stems. The down arrow's actual triangle is 57 texels wide within its 59-texel
+crop; the stray right-edge pixels belong to the neighboring asterisk.
+All four font mip levels retain 5,570,560 bytes total. Comparing every BC3 block
+against the previous implementation finds changes only within the added symbol
+rectangles or blocks intersecting them. Earlier lettering/digits and other atlas
+content remain intact. Preparation still occurs only at cached texture upload.
+Private source inventories, original/redrawn comparisons and native verification
+are under build/checks/remaining-symbols-20261027.
+
+Release game/tool builds succeeded. Native C1210 text calls checked 34 character
+codes (26 shapes plus eight aliases), upright and italic at 0.67x, 1.91x and
+3.13x: 204 cases per Clean HUD setting. Enabled/disabled vertex streams match
+exactly. Both offscreen D3D11 runs reported zero graphics errors and zero shader
+compilations; texture reset released the atlas. Inspected symbol comparisons and
+the native text renders. No game boot, computer use or gameplay benchmark ran.

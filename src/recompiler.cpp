@@ -935,7 +935,14 @@ public:
                 // B1 can prohibit more than three consecutive respawn slots.
                 body << "    commit(); const auto imported_respawn=b2::title_track(cpu,memory,0x00084850U); restore();\n";
             }
-            body << "    const std::uint32_t a = " << read(operands[0]) << ";\n"
+            constexpr std::uint32_t traffic_tests[]={0x9F3BF,0x9F405,0x9F447,0x9F488};
+            const auto traffic=std::ranges::find(traffic_tests,instruction.address);
+            if(traffic!=std::end(traffic_tests)) {
+                const auto view=unsigned(traffic-std::begin(traffic_tests));
+                (void)read_reg(ZYDIS_REGISTER_EBX);
+                body << "    const std::uint32_t a=b2::title_traffic_visible(cpu,memory,ebx,traffic_views," << view << ")?" << (1U<<view) << "U:0U;\n";
+            } else body << "    const std::uint32_t a = " << read(operands[0]) << ";\n";
+            body
                  << "    const std::uint32_t b = " << (instruction.address==0x46DDF?
                     "ram.load<std::uint32_t>("+read_reg(ZYDIS_REGISTER_ESI)+"+0x80U)":instruction.address==0xC92D3?"music_count":
                     instruction.address==0x84850?"(imported_respawn?edx:3U)":read(operands[1])) << ";\n";
@@ -1330,6 +1337,8 @@ LoweredFunction lower(const Function& function,bool fuse_floating,bool portable)
         {0x9B3DC,"8D642400"},{0xA7306,"C20800"},
         {0x9C09A,"E891E2FFFF"},{0x9C09F,"83C730"},{0x9AB49,"8B4340"},
         {0x9C12A,"E8B1720200"},{0x9C152,"6A00"},
+        {0x9F3BF,"F6830101000001"},{0x9F405,"F6830101000002"},
+        {0x9F447,"F6830101000004"},{0x9F488,"F6830101000008"},
         {0xC31C4,"D9442410"},{0xC3A2E,"D945FC"},
         {0x9BA15,"8B4E0C"},{0x9BA18,"8B81E8010000"},{0x9BA24,"3991A0010000"},
         {0x9BA2C,"8B4508"},{0x9BA42,"8D9C98E08E0200"},{0x9BA49,"D903"},
@@ -1461,6 +1470,8 @@ LoweredFunction lower(const Function& function,bool fuse_floating,bool portable)
         out << "    const auto hud_transform=cpu.hud_layout?cpu.hud_layout->transform(cpu.registers[b2::ecx]):std::array<float,2>{1,0};\n";
     if(function.entry==0xC1210)
         out << "    std::uint32_t ui_blur_value=0;bool ui_blur=false;\n";
+    if(function.entry==0x9E950)
+        out << "    const auto traffic_views=ram.load<std::uint32_t>(cpu.registers[b2::esp]+4U);\n";
     if(function.entry==0xC1160)
         // The original clip cache compares only the rectangle pointer. The
         // same rectangle at another widget anchor also needs a state update.

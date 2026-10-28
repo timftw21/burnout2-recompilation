@@ -1,6 +1,7 @@
 #include "xbox.h"
 #include "custom_music.h"
 #include "disc.h"
+#include "mods.h"
 #include "tracks.h"
 #include "input.h"
 #include "audio.h"
@@ -126,6 +127,7 @@ struct Xbox::State {
     Memory& memory;
     std::span<std::byte> ram;
     std::unique_ptr<Disc> disc;
+    std::unique_ptr<Mods> mods;
     std::shared_ptr<OpenFile> disc_io;
     std::array<PendingIo,32> pending_io{};
     unsigned pending_io_count=0;
@@ -312,6 +314,11 @@ struct Xbox::State {
             disc_io->native=CreateFileW(disc_path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,
                 FILE_FLAG_OVERLAPPED|FILE_FLAG_RANDOM_ACCESS,nullptr);
             if(disc_io->native==INVALID_HANDLE_VALUE) throw std::runtime_error("Cannot open mounted disc for native asynchronous reads");
+        }
+        if(!this->host.enabled_mods.empty()) {
+            if(!disc || this->host.mods_root.empty()) throw std::runtime_error("Enabled mods require a mounted disc and a mods folder.");
+            mods=std::make_unique<Mods>(this->host.mods_root,this->host.enabled_mods,*disc);
+            diagnostic_record(mods->report());
         }
         if(this->host.storage_root.empty()) {
             user_root=executable_path().parent_path()/"data/user";
@@ -1882,6 +1889,10 @@ struct Xbox::State {
         if(path=="TRACKS\\FORWARD\\FWYL\\FWYL_0.BCD") return host.imported_tracks/"interstate.bcd";
         return {};
     }
+    std::filesystem::path replacement_file(std::string_view relative) {
+        if(mods) if(const auto* file=mods->lookup(relative)) return file->source;
+        return imported_file(relative);
+    }
     unsigned world_target(unsigned origin,unsigned row) const {
         const auto relative=std::bit_cast<std::int32_t>(memory.load<std::uint32_t>(world_base+origin*world_stride+0x218+row*0x54));
         const auto count=static_cast<int>(world_sections.size());
@@ -2348,7 +2359,7 @@ struct Xbox::State {
         std::uint64_t coverage=UINT64_MAX;
         if(lod<2 && !memory.load<std::uint32_t>(vehicle+0x1E8)) {
             // 9BFF3 has already measured this camera-relative vector. Fade
-            // inside the original LOD's range; traffic admission is unchanged.
+            // inside the current LOD's range.
             float squared=0;
             for(unsigned i=0;i<3;++i) {
                 const auto delta=std::bit_cast<float>(memory.load<std::uint32_t>(stack+0x50+i*4));squared+=delta*delta;
@@ -2360,22 +2371,25 @@ struct Xbox::State {
                 coverage=count==64?UINT64_MAX:(1ULL<<count)-1;
             }
         }
-        std::array<unsigned,8> wheels;
-        for(unsigned i=0;i<wheels.size();++i) wheels[i]=memory.load<unsigned>(0x528130+i*4);
-        world_prop_mask(coverage);
-        world_call(cpu,0x9A330,manager,arguments);
-        // Wheels are queued separately from the body. Shared wheels stay
-        // solid across 0/1 (and for physics-owned wheels at every LOD).
-        // Ordinary traffic's 1/2 transition uses the body's same mask.
-        for(unsigned i=0;i<wheels.size();++i) {
-            const auto count=memory.load<unsigned>(0x528130+i*4);
-            if(count>64 || wheels[i]>count) throw NativeBoundary(0x9C09A,"invalid traffic wheel queue");
-            for(unsigned j=wheels[i];j<count;++j) traffic_wheel_coverage[i*64+j]=shared_wheels?UINT64_MAX:coverage;
-        }
+        // The wheel queue has no opacity field. Carry the body's final opacity
+        // as sample coverage, including both sides of a wheel LOD transition.
+        const auto samples=unsigned(std::clamp(std::bit_cast<float>(arguments[2])*64.f,0.f,64.f));
+        const auto fade=samples==64?UINT64_MAX:(1ULL<<samples)-1;
+        const auto draw=[&](std::uint64_t body_mask,std::uint64_t wheel_mask) {
+            std::array<unsigned,8> wheels;
+            for(unsigned i=0;i<wheels.size();++i) wheels[i]=memory.load<unsigned>(0x528130+i*4);
+            world_prop_mask(body_mask);world_call(cpu,0x9A330,manager,arguments);
+            for(unsigned i=0;i<wheels.size();++i) {
+                const auto count=memory.load<unsigned>(0x528130+i*4);
+                if(count>64 || wheels[i]>count) throw NativeBoundary(0x9C09A,"invalid traffic wheel queue");
+                for(unsigned j=wheels[i];j<count;++j) traffic_wheel_coverage[i*64+j]=fade&wheel_mask;
+            }
+        };
+        draw(coverage,shared_wheels?UINT64_MAX:coverage);
         if(coverage!=UINT64_MAX) {
             arguments[1]=lod+1;arguments[3]=0;
             cpu.traffic_shared_wheels=shared_wheels;
-            world_prop_mask(~coverage);world_call(cpu,0x9A330,manager,arguments);
+            draw(~coverage,~coverage);
             cpu.traffic_shared_wheels=false;
         }
         world_prop_mask(UINT64_MAX);
@@ -2798,7 +2812,7 @@ struct Xbox::State {
         };
         if(offset>INT64_MAX) return fail(invalid_parameter);
         if(file.entry.directory() && !file.device) return fail(0xC00000BA);
-        if(write && file.native==INVALID_HANDLE_VALUE) return fail(write_protected);
+        if(write && (file.disc_file || file.native==INVALID_HANDLE_VALUE)) return fail(write_protected);
         if(!write && !(file.access&(0x80000000U|1U))) return fail(access_denied);
         const auto sector=file.native!=INVALID_HANDLE_VALUE && !file.disc_file?512U:2048U;
         // Original sample.xsb/b2distfx.bin callers use ordinary heap buffers.
@@ -2891,7 +2905,7 @@ struct Xbox::State {
         if(!disc) return no_media;
         auto entry=disc->lookup(*relative);
         if(!entry) return name_not_found;
-        const auto replacement=imported_file(*relative);
+        const auto replacement=replacement_file(*relative);
         if(!replacement.empty()) {
             const auto size=std::filesystem::file_size(replacement);
             if(size>UINT32_MAX) return invalid_parameter;entry->size=static_cast<std::uint32_t>(size);
@@ -3086,6 +3100,9 @@ struct Xbox::State {
                 auto offset=offset_pointer?memory.load<std::uint64_t>(offset_pointer):UINT64_MAX-1;
                 if(offset==UINT64_MAX-1) offset=file.position;
                 trace_buffer=output;trace_requested=length;trace_offset=offset;
+                if constexpr(Ordinal==236) if(file.disc_file) {
+                    io_complete(cpu,write_protected,0);finish(cpu,cleanup,write_protected);return;
+                }
                 if(!(file.options&0x30)) {
                     if constexpr(Ordinal==236) if(offset==UINT64_MAX) offset=file_size(file);
                     finish(cpu,cleanup,queue_io(cpu,found->second,Ordinal==236,offset));return;
@@ -3150,8 +3167,8 @@ struct Xbox::State {
                             const auto relative=disc_path(file.path);
                             if(!relative) throw NativeBoundary(cpu.eip,"directory left its mounted disc");
                             file.listing=disc->list(*relative);
-                            if(imported.selected) for(auto& entry:file.listing) if(!entry.directory()) {
-                                const auto replacement=imported_file(*relative+"/"+entry.name);
+                            if(mods || imported.selected) for(auto& entry:file.listing) if(!entry.directory()) {
+                                const auto replacement=replacement_file(relative->empty()?entry.name:*relative+"/"+entry.name);
                                 if(!replacement.empty()) entry.size=static_cast<std::uint32_t>(std::filesystem::file_size(replacement));
                             }
                         }
@@ -3282,7 +3299,7 @@ struct Xbox::State {
             }
             auto entry=disc && relative?disc->lookup(*relative):std::nullopt;
             if(!entry) {finish(cpu,8,disc?name_not_found:no_media);return;}
-            const auto replacement=imported_file(*relative);
+            const auto replacement=replacement_file(*relative);
             if(!replacement.empty()) entry->size=static_cast<std::uint32_t>(std::filesystem::file_size(replacement));
             OpenFile file;file.entry=*entry;file.path=*name;file.disc_file=true;
             std::uint32_t written=0;finish(cpu,8,file_information(file,argument(cpu,1),52,34,written));
@@ -3783,6 +3800,7 @@ PerfCounters Xbox::performance_counters() const {
 void Xbox::capture_frame(const std::filesystem::path& directory,bool automated) {
     if(!state_->gpu) throw std::runtime_error("The game has not initialized graphics yet");
     state_->gpu->capture_frame(directory,automated);
+    if(state_->mods) write_text(directory/"mods.json",state_->mods->report(),false);
     const auto& memory=state_->memory;
     std::ostringstream snapshot;
     snapshot<<std::format("{{\"format\":\"b2-game-state-v1\",\"phase\":\"capture_request\",\"source_sha256\":{},\"widescreen\":{},\"replay\":{{\"frames\":{},\"index\":{},\"loaded\":{},\"playback\":{},\"finished\":{},\"fade_state\":{},\"deadline_bits\":{},\"buffer\":{}}},\"memory\":[",
@@ -4924,6 +4942,102 @@ std::string check_storage(const std::filesystem::path& executable,const std::fil
         }
     }
     return std::format("{{\"format\":\"b2-storage-check-v1\",\"passed\":true,\"game_booted\":false,\"cases\":{},\"profile_bytes\":31748,\"reopened\":true,\"overwritten\":true,\"async_write\":true,\"runtime_decoder\":false,\"graphics_checked\":{},\"graphics_status\":{},\"storage\":{}}}",checks,graphics_checked,json(graphics_checked?"checked":"unsupported-metal-gpu"),json(utf8(std::filesystem::absolute(output).wstring())));
+}
+std::string check_mods(const std::filesystem::path& executable,const std::filesystem::path& disc_path,const std::filesystem::path& output) {
+    Xbe image(executable);Disc disc(disc_path);
+    if(!image.supported() || disc.sha256(disc.find("default.xbe"))!=image.sha256 || std::filesystem::exists(output))
+        throw std::runtime_error("Mod checks require the verified executable/disc and a fresh output directory.");
+    const auto root=std::filesystem::absolute(output).lexically_normal()/"mods";
+    std::filesystem::create_directories(root);
+    create_mod(root/"base","Base assets");create_mod(root/"override","Override assets");create_mod(root/"broken","Broken mod");
+    constexpr std::string_view asset="trackpss/forward/fwyl.pss";
+    const auto original=disc.find(asset);
+    std::string base(4097,'B'),override_data(3001,'O');
+    for(unsigned i=0;i<override_data.size();++i) override_data[i]=char(i%251);
+    write_text(root/"base/files"/asset,base,false);
+    write_text(root/"base/files/tracks1/forward/fwyl/fwyl.psw","world-stream-fixture",false);
+    write_text(root/"override/files/TrAcKpSs/Forward/FwYl.PsS",override_data,false);
+    write_text(root/"broken/files/default.xbe","unsupported executable",false);
+    unsigned checks=0;
+    const auto require=[&](bool passed,std::string_view name) {
+        if(!passed) throw std::runtime_error("Mod check failed: "+std::string(name));++checks;
+    };
+    const auto rejects=[&](const auto& operation,std::string_view message) {
+        bool rejected=false;
+        try {operation();} catch(const std::exception& error) {rejected=std::string_view(error.what()).find(message)!=std::string_view::npos;}
+        require(rejected,message);
+    };
+    const std::vector<std::string> order{"base","override"},reversed{"override","base"};
+    Mods mounted(root,order,disc),reverse(root,reversed,disc),disabled(root,{},disc);
+    require(mounted.lookup("TrAcKpSs\\FORWARD\\FWYL.pss")->size==override_data.size(),"case-insensitive mixed-separator lookup");
+    require(mounted.conflicts().size()==1 && mounted.conflicts()[0].winner=="override","last enabled mod wins with conflict details");
+    require(reverse.lookup(asset)->mod=="base" && !disabled.lookup(asset),"reordering and disabling change the mount");
+    require(!valid_mod_id("../base") && !valid_mod_id("C:base") && !valid_mod_id("BASE"),"mod ids cannot escape their folder");
+    rejects([&]{Mods invalid(root,std::vector<std::string>{"missing"},disc);},"Enabled mod is missing");
+    rejects([&]{Mods invalid(root,std::vector<std::string>{"base","base"},disc);},"duplicate enabled mod");
+    rejects([&]{Mods invalid(root,std::vector<std::string>{"broken"},disc);},"compiled DSP replacements");
+    write_text(root/"base/files/not-on-disc.dat","not a disc asset",false);
+    rejects([&]{Mods invalid(root,order,disc);},"existing disc file");
+    std::filesystem::remove(root/"base/files/not-on-disc.dat");
+    const auto run=[&](const std::vector<std::string>& enabled,std::string_view expected,std::uint32_t size,unsigned session) {
+        std::vector<std::byte> ram(64*1024*1024);image.load(std::span(ram).subspan(image.base,image.image_size));Memory memory(0,ram);
+        XboxHost provider;provider.storage_root=output/std::format("storage-{}",session);provider.mods_root=root;provider.enabled_mods=enabled;provider.audio_output=false;provider.draw_distance=2;
+        Xbox xbox(image,memory,ram,disc_path,std::move(provider));auto& state=*xbox.state_;
+        auto& thread=state.create(0,0,0,image.stack_commit,0,false);state.current=&thread;
+        auto& cpu=thread.cpu;cpu.preempt=nullptr;const auto stack=cpu.registers[esp]-4096;
+        const auto invoke=[&](unsigned ordinal,std::initializer_list<std::uint32_t> arguments) {
+            cpu.registers[esp]=stack;memory.store<std::uint32_t>(stack,return_sentinel);
+            unsigned index=0;for(auto value:arguments) memory.store<std::uint32_t>(stack+4+index++*4,value);
+            invoke_native(cpu,memory,0xFFF00000U+ordinal*16);
+            require(cpu.eip==return_sentinel && cpu.registers[esp]==stack+4+arguments.size()*4,"native file calling convention");
+            return cpu.registers[eax];
+        };
+        const auto name=[&](std::string_view path) {
+            memory.store<std::uint32_t>(0xA010,0);memory.store<std::uint32_t>(0xA014,0xA030);
+            memory.store<std::uint16_t>(0xA030,static_cast<std::uint16_t>(path.size()));memory.store<std::uint16_t>(0xA032,static_cast<std::uint16_t>(path.size()+1));
+            memory.store<std::uint32_t>(0xA034,0xA100);std::memcpy(memory.access(0xA100,path.size()),path.data(),path.size());memory.store<std::uint8_t>(0xA100+static_cast<std::uint32_t>(path.size()),0);
+        };
+        name("\\Device\\CdRom0\\TRACKPSS\\forward\\FWYL.PSS");
+        require(invoke(210,{0xA010,0xB000})==success && memory.load<std::uint64_t>(0xB028)==size,"path query reports mounted size");
+        for(const unsigned options:{0x20U,0U}) {
+            require(invoke(190,{0xA000,GENERIC_READ,0xA010,0xA050,0,0,1,1,options})==success,"open mod file");
+            const auto handle=memory.load<std::uint32_t>(0xA000);
+            require(invoke(211,{handle,0xA050,0xB000,24,5})==success && memory.load<std::uint64_t>(0xB008)==size,"handle query reports mounted size");
+            memory.store<std::uint64_t>(0xA060,32);
+            const auto result=invoke(219,{handle,0,0,0,0xA050,0xC000,8192,0xA060});
+            require(result==(options?success:0x103),"synchronous and asynchronous read status");
+            const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+            while(state.pending_io_count && std::chrono::steady_clock::now()<deadline) {state.dispatch_io();if(state.pending_io_count) Sleep(1);}
+            const auto count=std::min(8192U,size-32);
+            require(!state.pending_io_count && memory.load<std::uint32_t>(0xA050)==success && memory.load<std::uint32_t>(0xA054)==count &&
+                expected.size()>=32+count && !std::memcmp(memory.access(0xC000,count),expected.data()+32,count),"native reads return mounted bytes and partial EOF length");
+            memory.store<std::uint64_t>(0xA060,size);
+            require(invoke(219,{handle,0,0,0,0xA050,0xC000,8,0xA060})==end_of_file,"replacement EOF");
+            memory.store<std::uint64_t>(0xA060,0);
+            require(invoke(236,{handle,0,0,0,0xA050,0xC000,8,0xA060})==write_protected,"mod files retain disc write protection");
+            require(invoke(187,{handle})==success,"close mod file");
+        }
+        name("\\Device\\CdRom0\\trackpss\\forward");
+        require(invoke(190,{0xA000,GENERIC_READ,0xA010,0xA050,0,0,1,1,0x21})==success,"open original directory");
+        const auto handle=memory.load<std::uint32_t>(0xA000);
+        require(invoke(207,{handle,0,0,0,0xA050,0xB000,4096,1,0,1})==success,"enumerate original directory with mod sizes");
+        const auto& listing=state.handles.at(handle).file->listing;
+        const auto entry=std::ranges::find_if(listing,[](const auto& file){return folded(file.name)=="FWYL.PSS";});
+        require(entry!=listing.end() && entry->size==size,"directory listing agrees with reads");
+        require(invoke(187,{handle})==success,"close directory");
+        name("\\Device\\CdRom0\\trackpss\\forward\\fwyl.pss");
+        require(invoke(190,{0xA000,GENERIC_WRITE,0xA010,0xA050,0,0,1,1,0x20})==access_denied,"opening mods for writing is denied");
+        name("\\Device\\CdRom0\\tracks1\\forward\\fwyl\\fwyl.psw");
+        require(invoke(190,{0xA000,GENERIC_READ,0xA010,0xA050,0,0,1,1,0x20})==success,"world stream remains available");
+        require(state.world_streams[0].has_value() && (enabled.empty()?state.world_paths[0].empty():state.world_paths[0]==root/"base/files/tracks1/forward/fwyl/fwyl.psw"),"extended scenery uses the mounted source");
+        require(invoke(187,{memory.load<std::uint32_t>(0xA000)})==success,"close world stream");
+    };
+    run(order,override_data,static_cast<std::uint32_t>(override_data.size()),0);run(reversed,base,static_cast<std::uint32_t>(base.size()),1);
+    std::array<std::byte,8224> original_bytes{};disc.read(original,0,original_bytes);
+    run({},std::string_view(reinterpret_cast<const char*>(original_bytes.data()),original_bytes.size()),original.size,2);
+    const auto fallback=disc.find(asset);require(fallback.size==original.size && disc.sha256(disc.find("default.xbe"))==image.sha256,"original disc stays unchanged");
+    const auto report=std::format("{{\"format\":\"b2-mod-check-v1\",\"passed\":true,\"game_booted\":false,\"cases\":{},\"sync_reads\":true,\"async_reads\":true,\"read_only\":true,\"priority\":true,\"directory_sizes\":true,\"mount\":{}}}",checks,mounted.report());
+    write_text(output/"mods-check.json",report,false);return report;
 }
 std::string check_replays(const std::filesystem::path& executable,const std::filesystem::path& disc_path,const std::filesystem::path& output) {
     Xbe image(executable);Disc disc(disc_path);

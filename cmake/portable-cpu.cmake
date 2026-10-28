@@ -2,7 +2,7 @@
 # The upstream native makefile is the authoritative list of C translation units.
 FetchContent_Declare(softfloat
     GIT_REPOSITORY https://github.com/ucb-bar/berkeley-softfloat-3.git
-    GIT_TAG 32eb3295a3c814c1551f94ebc29eed1dec3cb3b1)
+    GIT_TAG 497c81c1f5016dc6ef5b3219ece2f3c261d4d8f1)
 FetchContent_MakeAvailable(softfloat)
 file(READ "${softfloat_SOURCE_DIR}/build/Linux-x86_64-GCC/Makefile" softfloat_make)
 string(REGEX MATCHALL "[A-Za-z_][A-Za-z_0-9]*\\$\\(OBJ\\)" softfloat_objects "${softfloat_make}")

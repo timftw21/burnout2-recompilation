@@ -1,0 +1,20 @@
+--- a/configure
++++ b/configure
+@@ -5817 +5817 @@
+-          if $PERL -e "use JSON;" 2>&5
++          if $PERL -e "use JSON::PP;" 2>&5
+--- a/configure.ac
++++ b/configure.ac
+@@ -38 +38 @@
+-VKD3D_CHECK_PERL_MODULE([JSON],
++VKD3D_CHECK_PERL_MODULE([JSON::PP],
+--- a/libs/vkd3d-shader/make_spirv
++++ b/libs/vkd3d-shader/make_spirv
+@@ -21 +21 @@
+-use JSON;
++use JSON::PP;
+--- a/demos/make_objc
++++ b/demos/make_objc
+@@ -21 +21 @@
+-use JSON;
++use JSON::PP;

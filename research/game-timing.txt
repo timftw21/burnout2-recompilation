@@ -680,3 +680,28 @@ existing CPU diagnostic groups (26,026 instruction, 3,518 memory/presentation,
 6,744 floating and 109 control cases; 36,149 compiled functions).
 Bounded original-byte excerpts and native diagnostics are under
 build/checks/render-followup-20261024. No permanent tests were added.
+
+Profile-name row wrapping (2026-10-27)
+-------------------------------------
+User capture: build/windows/Release/build/captures/frame-527644429600.
+The END outline is node 5C9028; its repeated copy shares carousel parent
+5DEFE0. Original widget 31E8E0 (cell 4CB364) stores that parent at +34,
+the looping list descriptor at +0C, and scroll position at +434. The name
+list has 39 entries (450B3); horizontal spacing is float 4D922C (80).
+2F050 reduces the scroll position modulo the entry count and writes the
+parent offset at 2F0CE. 30050..301CE constructs four copies at either end.
+The visibility loop's negative-index expression at 2F112 leaves the last
+END copy drawable offscreen. This is harmless without pose interpolation.
+
+An isolated run of the original 2F050 reproduces the flash: crossing phase
+38.95 to 39 moves this copy from x=-2915 to x=201. The former interpolation
+draws it at x=-1357 halfway through that update, leaving the visible END
+rectangle absent. Scrolling left exposes the same discontinuity in reverse.
+Presentation now expresses the previous X in the current wrap before
+interpolating. The period comes from the live list count, original spacing
+and composed parent scale. The original selection, callbacks, culling and
+text remain unchanged. Private evidence and diagnostics are under
+build/checks/audio-logo-traffic-name-20261027.
+Validation: 2,256 displayed END frames driven by original 2F050 pass in both
+directions at 60/144/360 Hz. The fixed wrap shows x=203 halfway between the
+two rightward samples above. All 52 existing CPU diagnostic groups also pass.

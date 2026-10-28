@@ -23,6 +23,8 @@ struct XboxHost {
     unsigned draw_distance=1;
     std::filesystem::path custom_music_root;
     std::filesystem::path imported_tracks;
+    std::filesystem::path mods_root;
+    std::vector<std::string> enabled_mods;
     bool loop_track=false;
     std::function<void(bool)> music_loop_changed;
 };
@@ -91,6 +93,7 @@ private:
     friend std::string check_storage(const std::filesystem::path&,const std::filesystem::path&);
     friend std::string check_visibility(const std::filesystem::path&,const std::filesystem::path&,bool);
     friend std::string check_replays(const std::filesystem::path&,const std::filesystem::path&,const std::filesystem::path&);
+    friend std::string check_mods(const std::filesystem::path&,const std::filesystem::path&,const std::filesystem::path&);
     friend std::string check_audio_listener(const std::filesystem::path&,const std::filesystem::path&);
     friend std::string check_music(const std::filesystem::path&,const std::filesystem::path&,const std::filesystem::path&);
     friend std::string check_custom_music(const std::filesystem::path&,const std::filesystem::path&,const std::filesystem::path&);
@@ -100,6 +103,7 @@ private:
 std::string check_storage(const std::filesystem::path& xbe,const std::filesystem::path& output);
 std::string check_visibility(const std::filesystem::path& xbe,const std::filesystem::path& output,bool warp=false);
 std::string check_replays(const std::filesystem::path& xbe,const std::filesystem::path& disc,const std::filesystem::path& output);
+std::string check_mods(const std::filesystem::path& xbe,const std::filesystem::path& disc,const std::filesystem::path& output);
 std::string check_prediction_race(const std::filesystem::path& xbe,const std::filesystem::path& disc,const std::filesystem::path& output);
 std::string check_track_import(const std::filesystem::path& xbe,const std::filesystem::path& disc,const std::filesystem::path& assets,const std::filesystem::path& output);
 std::string check_audio_listener(const std::filesystem::path& xbe,const std::filesystem::path& output);

@@ -123,13 +123,13 @@ std::uint32_t title_traffic_fade(Cpu& cpu,Memory& memory,std::uint32_t vehicle) 
     std::memcpy(view.data(),ram.access(position,sizeof(view)),sizeof(view));
     const auto original_end=std::bit_cast<float>(ram.load<std::uint32_t>(0x2C1ACC));
     const auto original_width=std::bit_cast<float>(ram.load<std::uint32_t>(0x2C1AD0));
+    const auto limit=std::bit_cast<float>(ram.load<std::uint32_t>(0x2C1B64));
     // All guest reads precede this non-throwing scalar SIMD calculation. Keep
     // x87 resident instead of saving/restoring its whole stack for every car.
     const auto mxcsr=_mm_getcsr();_mm_setcsr(0x1F80);
-    // 9E950 admits ordinary traffic to the display list only within 250 units.
-    // Moving opacity's endpoint beyond that list makes cars pop at full alpha.
-    // Broaden the fade inside the available range without extending simulation.
-    const auto end=original_end,width=std::min(original_width*cpu.draw_distance,original_end);
+    // Match the extended display list, bounded by the original traffic pool's
+    // 750-unit lifetime. Physics and traffic spawning keep their own ranges.
+    const auto end=std::min(original_end*cpu.draw_distance,limit),width=original_width*cpu.draw_distance;
     float squared=0;
     for(unsigned axis=0;axis<3;++axis) {const auto delta=car[axis]-view[axis];squared+=delta*delta;}
     const auto start=end-width;
@@ -138,6 +138,21 @@ std::uint32_t title_traffic_fade(Cpu& cpu,Memory& memory,std::uint32_t vehicle) 
         (end-_mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(squared))))/width;
     _mm_setcsr(mxcsr);
     return std::bit_cast<std::uint32_t>(alpha);
+}
+bool title_traffic_visible(Cpu& cpu,Memory& memory,std::uint32_t vehicle,std::uint32_t views,unsigned view) {
+    const auto ram=memory.primary();
+    if(ram.load<std::uint8_t>(vehicle+0x101)&(1U<<view)) return true;
+    if(cpu.draw_distance<=1 || !ram.load<std::uint32_t>(views+view*0x60+0x10)) return false;
+    // Use the distance 9E950 just measured for this active view. Only its final
+    // render-list tests change; collision/nearby lists and lifetime flags do not.
+    const auto id=ram.load<std::uint16_t>(vehicle+0x10C);
+    const auto distance=std::bit_cast<float>(ram.load<std::uint32_t>(0x4B30A0+(id+view*0xFE)*4));
+    const auto end=std::bit_cast<float>(ram.load<std::uint32_t>(0x2C1B60));
+    const auto limit=std::bit_cast<float>(ram.load<std::uint32_t>(0x2C1B64));
+    const auto mxcsr=_mm_getcsr();_mm_setcsr(0x1F80);
+    const bool visible=distance<std::min(end*cpu.draw_distance,limit);
+    _mm_setcsr(mxcsr);
+    return visible;
 }
 void skip_title_intro(Cpu& cpu,Memory& memory) {
     if(!cpu.skip_intro || memory.load<std::uint32_t>(0x4CCAA8)!=19) return;

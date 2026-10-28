@@ -16,7 +16,7 @@ $busy = $true
 $step = 0
 $form = $null
 $stage = 1
-$stageNames = @('Check requirements', 'Prepare build tools', 'Read game files', 'Configure the game', 'Compile the game', 'Finish installation')
+$stageNames = @('Install requirements', 'Prepare build tools', 'Read game files', 'Configure the game', 'Compile the game', 'Finish installation')
 $taskProgress = @{ Completed = 0L; Total = 0L }
 $previousNinjaStatus = $env:NINJA_STATUS
 $env:NINJA_STATUS = '[%f/%t] '
@@ -90,7 +90,7 @@ function Stop-Workers {
     $workers.Clear()
 }
 
-function Run-Step([string]$message, [string]$program, [string[]]$arguments, [switch]$Build) {
+function Run-Step([string]$message, [string]$program, [string[]]$arguments, [switch]$Build, [string]$Directory = $projectRoot) {
     Show-Status $message
     Show-TaskProgress 0 0
     if ($cancelled) { throw 'Build cancelled.' }
@@ -99,7 +99,7 @@ function Run-Step([string]$message, [string]$program, [string[]]$arguments, [swi
     $errorPath = Join-Path $logRoot "$step.err.log"
     # Quote for the native Windows argument parser; never pass paths through a shell.
     $quoted = @($arguments | ForEach-Object { '"' + ($_ -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"' }) -join ' '
-    $process = Start-Process -FilePath $program -ArgumentList $quoted -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput $outputPath -RedirectStandardError $errorPath
+    $process = Start-Process -FilePath $program -ArgumentList $quoted -WorkingDirectory $Directory -WindowStyle Hidden -PassThru -RedirectStandardOutput $outputPath -RedirectStandardError $errorPath
     # Windows PowerShell must retain the process handle to read its exit code.
     $null = $process.Handle
     $tail = $null
@@ -143,20 +143,7 @@ function Run-Step([string]$message, [string]$program, [string[]]$arguments, [swi
     }
 }
 
-function Find-Program([string]$name, [string[]]$candidates, [version]$minimum) {
-    $paths = @((Get-Command $name -CommandType Application -All -ErrorAction SilentlyContinue).Source) + $candidates
-    foreach ($candidate in $paths | Select-Object -Unique) {
-        if (!$candidate -or !(Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
-        if ($minimum) {
-            $versionLine = @(& $candidate --version)[0]
-            if ($LASTEXITCODE -ne 0 -or $versionLine -notmatch '\bversion (\d+\.\d+\.\d+)' -or [version]$Matches[1] -lt $minimum) { continue }
-        }
-        return $candidate
-    }
-    if ($name -eq 'ninja.exe') { throw 'Ninja (ninja.exe) is missing. Open Visual Studio Installer, choose Modify and install C++ CMake tools for Windows. For a standalone Ninja download, see README.md.' }
-    if ($minimum) { throw "$name $minimum or newer is required. Install it from the link in README.md." }
-    throw "$name is missing. Install the build requirements listed in README.md."
-}
+. (Join-Path $PSScriptRoot 'windows-dependencies.ps1')
 
 function Configure-Step([string]$message, [string]$directory, [string[]]$arguments) {
     $directory = [IO.Path]::GetFullPath($directory)
@@ -208,24 +195,8 @@ try {
         throw
     }
     [IO.File]::WriteAllText($logPath, '', [Text.UTF8Encoding]::new($false))
-    Show-Status 'Checking build requirements...'
+    Show-Status 'Select your game disc image. Setup will download any missing build requirements automatically.'
     if (![Environment]::Is64BitOperatingSystem) { throw 'A 64-bit Windows PC is required.' }
-    $vswhere = Find-Program 'vswhere.exe' @("${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe")
-    $visualStudio = & $vswhere -latest -products '*' -version '[18.0,19.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-    if (!$visualStudio) { throw 'Install Visual Studio 2026 with Desktop development with C++, including the Windows SDK.' }
-    $cmake = Find-Program 'cmake.exe' @("$env:ProgramFiles\CMake\bin\cmake.exe", "$visualStudio\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe") ([version]'4.2.0')
-    $git = Find-Program 'git.exe' @("$env:ProgramFiles\Git\cmd\git.exe", "$visualStudio\Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\Git\cmd\git.exe")
-    $clang = Find-Program 'clang-cl.exe' @("$env:ProgramFiles\LLVM\bin\clang-cl.exe", "$visualStudio\VC\Tools\Llvm\x64\bin\clang-cl.exe") ([version]'22.1.0')
-    $llvmDirectory = Split-Path -Parent $clang
-    foreach ($name in @('lld-link.exe', 'llvm-lib.exe')) {
-        if (!(Test-Path -LiteralPath (Join-Path $llvmDirectory $name) -PathType Leaf)) { throw 'Install the complete LLVM toolchain listed in README.md.' }
-    }
-    $developerShell = Join-Path $visualStudio 'Common7\Tools\Launch-VsDevShell.ps1'
-    if (!(Test-Path -LiteralPath $developerShell)) { throw 'Repair Visual Studio 2026 with Desktop development with C++ and the Windows SDK.' }
-    & $developerShell -Arch amd64 -HostArch amd64 -SkipAutomaticLocation -NoLogo
-    $ninja = Find-Program 'ninja.exe' @("$visualStudio\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe")
-    $env:PATH = "$(Split-Path -Parent $cmake);$(Split-Path -Parent $git);$llvmDirectory;$(Split-Path -Parent $ninja);$env:PATH"
-    $toolchain = @("-DCMAKE_C_COMPILER=$clang", "-DCMAKE_CXX_COMPILER=$clang", "-DCMAKE_MAKE_PROGRAM=$ninja")
     if ($cancelled) { throw 'Build cancelled.' }
     if (!$DiscImage) {
         if ($NoGui) { throw 'Specify -DiscImage for a build without the file picker.' }
@@ -239,6 +210,9 @@ try {
     }
     $DiscImage = (Resolve-Path -LiteralPath $DiscImage).Path
     if (!(Test-Path -LiteralPath $DiscImage -PathType Leaf)) { throw 'Select an Xbox XISO disc image file.' }
+    Show-Status 'Checking and preparing build requirements...'
+    Initialize-WindowsTools
+    $toolchain = @("-DCMAKE_C_COMPILER=$clang", "-DCMAKE_CXX_COMPILER=$clang", "-DCMAKE_MAKE_PROGRAM=$ninja")
     $bootstrap = Join-Path $buildRoot 'bootstrap'
     Set-Stage 2
     Configure-Step 'Preparing the build tools...' $bootstrap (@('--preset', 'windows', '-B', $bootstrap, '-DB2_XBE=') + $toolchain)
@@ -266,6 +240,7 @@ try {
     Show-Status 'Saving game-file locations and finishing installation...'
     if ($cancelled) { throw 'Build cancelled.' }
     Show-TaskProgress 0 0
+    Run-Step 'Installing the optional Test Mod (disabled by default)...' $tool @('install-modding-test', $DiscImage, (Join-Path $gameDirectory 'mods'))
     $runtimeLocal = Join-Path $gameDirectory 'data\local'
     [IO.Directory]::CreateDirectory($runtimeLocal) | Out-Null
     Copy-Changed $localXbe (Join-Path $runtimeLocal 'default.xbe')
@@ -274,7 +249,7 @@ try {
     if (Test-Path -LiteralPath $settingsPath) { $settings = [IO.File]::ReadAllLines($settingsPath) }
     $settings = @('xbe=data/local/default.xbe', "disc=$DiscImage") + @($settings | Where-Object { $_ -notmatch '^(xbe|disc)=' })
     [IO.File]::WriteAllLines($settingsPath, $settings, [Text.UTF8Encoding]::new($false))
-    Show-Status 'Open the game folder and double-click b2.exe.'
+    Show-Status 'Installation is complete. Select Launch game to play.'
 } catch {
     $exitCode = 1
     Show-Status $_.Exception.Message

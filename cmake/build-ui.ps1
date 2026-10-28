@@ -129,17 +129,20 @@ function Initialize-SetupWindow {
     $card.Controls.Add($progress)
     $script:taskCount = New-SetupLabel $card '' 24 220 490 44 10
     $taskCount.ForeColor = [Drawing.Color]::FromArgb(153, 166, 181)
-    $script:logButton = New-SetupButton 'Open build log' 24 160
-    $logButton.Add_Click({ Start-Process -FilePath 'notepad.exe' -ArgumentList ('"' + $logPath + '"') })
-    $script:cancelButton = New-SetupButton 'Cancel' 198 110
+    $script:cancelButton = New-SetupButton 'Cancel' 24 110
     $cancelButton.Add_Click({
         if ($busy) { $script:cancelled = $true; $cancelButton.Enabled = $false; $cancelButton.Text = 'Cancelling...' }
         else { $form.Close() }
     })
-    $script:openButton = New-SetupButton 'Open game folder' 596 200
+    $script:logButton = New-SetupButton 'Open build log' 148 160
+    $logButton.Add_Click({ Start-Process -FilePath 'notepad.exe' -ArgumentList ('"' + $logPath + '"') })
+    $script:openButton = New-SetupButton 'Open game folder' 322 190
     $openButton.Enabled = $false
     $openButton.Add_Click({ Start-Process -FilePath 'explorer.exe' -ArgumentList ('"' + $gameDirectory + '"') })
-    $form.AcceptButton = $openButton
+    $script:playButton = New-SetupButton 'Launch game' 596 200
+    $playButton.Enabled = $false
+    $playButton.Add_Click({ Start-Process -FilePath (Join-Path $gameDirectory 'b2.exe') -WorkingDirectory $gameDirectory })
+    $form.AcceptButton = $playButton
     $form.CancelButton = $cancelButton
     $form.Add_FormClosing({ param($sender, $eventArgs) if ($busy) { $script:cancelled = $true; $eventArgs.Cancel = $true } })
     [B2Setup.Surface]::DarkTitleBar($form.Handle)
@@ -163,10 +166,11 @@ function Complete-SetupWindow([bool]$succeeded) {
         $stageTitle.Text = 'Ready to race.'
         $progress.Value = 1000
         $taskCount.Text = 'Installation complete. Your game is ready.'
-        $openButton.BackColor = [Drawing.Color]::FromArgb(255, 126, 48)
-        $openButton.ForeColor = [Drawing.Color]::FromArgb(20, 18, 15)
+        $playButton.BackColor = [Drawing.Color]::FromArgb(255, 126, 48)
+        $playButton.ForeColor = [Drawing.Color]::FromArgb(20, 18, 15)
+        $playButton.Enabled = $true
         $openButton.Enabled = $true
-        $openButton.Focus() | Out-Null
+        $playButton.Focus() | Out-Null
         foreach ($label in $stageLabels) { $label.ForeColor = [Drawing.Color]::FromArgb(237, 240, 245) }
     } else {
         $stageTitle.Text = if ($cancelled) { 'Build cancelled' } else { 'Build needs attention' }

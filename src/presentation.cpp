@@ -451,6 +451,20 @@ void Presentation::ui(Cpu& cpu,Memory& memory,std::uint32_t node,std::uint32_t p
         item.previous=item.current;item.current=current;item.step=timing.step;item.paired=true;
     }
     if(!item.paired || timing.render_frames>=1 || !std::memcmp(item.previous.data(),current.data(),sizeof(current))) return;
+    // 2F050 wraps the looping character row by its full length. Its last END
+    // duplicate stays drawable even offscreen; interpolating that coordinate
+    // jump sweeps it across the row (or hides it for one update). Put the old
+    // position in the current wrap before blending, for either scroll direction.
+    std::uint32_t count=0;float spacing=0,scale=0;
+    const auto carousel=ram.load<std::uint32_t>(0x4CB364);
+    if(carousel && identity[0]==ram.load<std::uint32_t>(carousel+0x34)) {
+        const auto model=ram.load<std::uint32_t>(carousel+0xC);
+        if(model && ram.load<std::uint32_t>(model+4)) {
+            count=ram.load<std::uint32_t>(model+8);
+            spacing=std::bit_cast<float>(ram.load<std::uint32_t>(0x4D922C));
+            scale=std::bit_cast<float>(ram.load<std::uint32_t>(identity[0]+8));
+        }
+    }
     // C1210 supplies only float position, size and colour here. Sample those
     // visual values before the widescreen transform; the original font/image
     // callback draws sharp geometry and its own blur at that position. Text,
@@ -458,8 +472,14 @@ void Presentation::ui(Cpu& cpu,Memory& memory,std::uint32_t node,std::uint32_t p
     // Keep the live guest x87 stack resident; all throwing reads precede SSE.
     const auto mxcsr=_mm_getcsr();_mm_setcsr(0x1F80);
     const auto fraction=_mm_set1_ps(ui_fraction_);
+    const auto period=spacing*scale*count;
     for(unsigned i=0;i<8;i+=4) {
-        const auto previous=_mm_loadu_ps(item.previous.data()+i),next=_mm_loadu_ps(current.data()+i);
+        auto previous=_mm_loadu_ps(item.previous.data()+i);const auto next=_mm_loadu_ps(current.data()+i);
+        if(i==0 && period>0) {
+            const auto length=_mm_set_ss(period);
+            const auto wraps=_mm_cvtss_si32(_mm_div_ss(_mm_sub_ss(next,previous),length));
+            previous=_mm_add_ss(previous,_mm_mul_ss(length,_mm_cvtsi32_ss(_mm_setzero_ps(),wraps)));
+        }
         _mm_storeu_ps(current.data()+i,_mm_add_ps(previous,_mm_mul_ps(_mm_sub_ps(next,previous),fraction)));
     }
     if(blur) {

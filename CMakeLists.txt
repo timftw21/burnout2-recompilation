@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.2)
-project(burnout2 VERSION 1.9.0 LANGUAGES C CXX)
+project(burnout2 VERSION 1.10.0 LANGUAGES C CXX)
 
 if((NOT WIN32 AND NOT APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux") OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR
    (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$" AND NOT (APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")))
@@ -19,6 +19,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 option(B2_PROFILE_GENERATE "Collect LLVM profiles for native game optimization" OFF)
 option(B2_AVX2 "Build native code for an AVX2-capable CPU and operating system" OFF)
+set(B2_LINK_JOBS 6 CACHE STRING "Maximum parallel LLVM link optimization jobs")
+if(NOT B2_LINK_JOBS MATCHES "^[1-9][0-9]*$")
+    message(FATAL_ERROR "B2_LINK_JOBS must be a positive integer.")
+endif()
 set(B2_PROFILE_USE "" CACHE FILEPATH "LLVM indexed profile for native game optimization")
 if(B2_PROFILE_GENERATE AND B2_PROFILE_USE)
     message(FATAL_ERROR "Choose profile collection or profile use, not both.")
@@ -66,7 +70,7 @@ FetchContent_Declare(zydis
     GIT_PROGRESS FALSE)
 FetchContent_MakeAvailable(zydis)
 
-add_library(b2-core STATIC src/file.cpp src/disc.cpp src/xbe.cpp src/assets.cpp src/tracks.cpp src/effects.cpp src/crypto.cpp src/performance.cpp)
+add_library(b2-core STATIC src/file.cpp src/disc.cpp src/mods.cpp src/xbe.cpp src/assets.cpp src/tracks.cpp src/effects.cpp src/crypto.cpp src/performance.cpp)
 target_include_directories(b2-core PUBLIC src PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 if(WIN32)
     target_sources(b2-core PRIVATE src/diagnostics.cpp src/host_windows.cpp)
@@ -172,7 +176,7 @@ if(B2_XBE)
     FetchContent_Declare(sdl3
         URL https://github.com/libsdl-org/SDL/archive/829a65d769d935c4852f8159e964312c0957260a.tar.gz
         URL_HASH SHA256=48E15CF1A6928453D77AFA955D1FDFBBCA9169E2BC3D76D111ACB9B8BB076D66
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+        DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
     FetchContent_MakeAvailable(sdl3)
     if(NOT WIN32)
         if(NOT TARGET SDL3::SDL3-static)
@@ -185,9 +189,9 @@ if(B2_XBE)
         set_property(TARGET SDL3-static PROPERTY PRECOMPILE_HEADERS "<SDL_internal.h>")
     endif()
     FetchContent_Declare(imgui
-        URL https://github.com/ocornut/imgui/archive/f1cc2ae15e53a861a874c3034aae6798fde194ab.tar.gz
-        URL_HASH SHA256=F30BE7F3E2136615B1848A9AFB72F6DFD8A60820DDF1C1A85997BF3B722E7CFC
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+        URL https://github.com/ocornut/imgui/archive/c1aaac65e896a45f81f47a4d68f9959e0f86c859.tar.gz
+        URL_HASH SHA256=B3D8F99838BB3FF05E14185562345F85E00C032DA4D8FC277608D7898D847114
+        DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
     FetchContent_MakeAvailable(imgui)
     include(cmake/imgui-shaders.cmake)
     add_library(b2-ui STATIC
@@ -230,6 +234,10 @@ if(B2_XBE)
     if(WIN32)
         target_link_libraries(b2-app PRIVATE comdlg32)
     else()
+        if(NOT APPLE)
+            find_package(Fontconfig REQUIRED)
+            target_link_libraries(b2-app PRIVATE Fontconfig::Fontconfig)
+        endif()
         configure_file(resources/b2.png "${CMAKE_CURRENT_BINARY_DIR}/resources/b2.png" COPYONLY)
     endif()
     string(JSON finite_address GET "${facts_json}" title TITLE_FLOAT_FINITE_CHECK_ADDRESS value)
@@ -391,7 +399,7 @@ foreach(target IN ITEMS b2-core b2-portable-cpu b2-cpu b2-input b2-graphics b2-a
         endif()
         if(NOT APPLE AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_LINKER_TYPE STREQUAL "LLD" AND target MATCHES "^b2(-tool)?$")
             target_link_options(${target} PRIVATE
-                "$<$<CONFIG:Release>:LINKER:--thinlto-jobs=6>"
+                "$<$<CONFIG:Release>:LINKER:--thinlto-jobs=${B2_LINK_JOBS}>"
                 "$<$<CONFIG:Release>:LINKER:--thinlto-cache-dir=lto-cache/${target}/Release>"
                 "$<$<CONFIG:Release>:LINKER:--thinlto-cache-policy=cache_size_bytes=3g>")
         endif()
