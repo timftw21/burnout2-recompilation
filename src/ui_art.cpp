@@ -1,7 +1,6 @@
 #include "ui_art.h"
 #include "crypto.h"
 #include <algorithm>
-#include <charconv>
 #include <cmath>
 
 namespace b2 {
@@ -270,9 +269,19 @@ std::vector<Edge> outline(std::string_view path,float x,float y) {
     std::vector<Edge> edges;edges.reserve(256);Point current{},start{};
     const auto number=[&]() {
         while(!path.empty() && path.front()==' ') path.remove_prefix(1);
-        float value;const auto result=std::from_chars(path.data(),path.data()+path.size(),value);
-        if(result.ec!=std::errc{}) throw std::runtime_error("Invalid built-in UI outline");
-        path.remove_prefix(result.ptr-path.data());return value;
+        // Built-in coordinates use decimal notation only. Parse independently
+        // of the locale and floating-point from_chars support in the host library.
+        const bool negative=path.starts_with('-');if(negative) path.remove_prefix(1);
+        double value=0,divisor=1;unsigned digits=0;bool decimal=false;
+        while(!path.empty()) {
+            const auto c=path.front();
+            if(c=='.' && !decimal) {decimal=true;path.remove_prefix(1);continue;}
+            if(c<'0' || c>'9') break;
+            value=value*10+(c-'0');if(decimal) divisor*=10;
+            ++digits;path.remove_prefix(1);
+        }
+        if(!digits) throw std::runtime_error("Invalid built-in UI outline");
+        return float((negative?-value:value)/divisor);
     };
     const auto point=[&]() {const auto a=number(),b=number();return Point{a+x,b+y};};
     const auto line=[&](Point p) {if(p.x!=current.x || p.y!=current.y) edges.push_back({current,p});current=p;};
