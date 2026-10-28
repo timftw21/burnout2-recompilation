@@ -7,7 +7,7 @@ case "$(uname -s):$(uname -m)" in
     Darwin:arm64|Darwin:x86_64)
         platform=macos
         if [[ $(uname -m) == arm64 ]]; then brew_prefix=/opt/homebrew; else brew_prefix=/usr/local; fi
-        for directory in "$brew_prefix/bin" "$brew_prefix/opt/bison/bin" "$brew_prefix/opt/flex/bin" "$brew_prefix/opt/perl/bin"; do
+        for directory in "$brew_prefix/bin" "$brew_prefix/opt/make/libexec/gnubin" "$brew_prefix/opt/bison/bin" "$brew_prefix/opt/flex/bin" "$brew_prefix/opt/perl/bin"; do
             [[ ! -d $directory ]] || export PATH="$directory:$PATH"
         done
         if command -v brew >/dev/null; then

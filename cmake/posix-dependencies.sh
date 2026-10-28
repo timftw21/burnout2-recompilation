@@ -25,7 +25,9 @@ if ! pkg-config --atleast-version=2.1 b2-vkd3d-shader ||
         cd -- "$source_directory"
         patch -p1 < "$root/cmake/vkd3d-copy-propagation.patch"
         patch -p1 < "$root/cmake/vkd3d-json.patch"
-        ./configure --prefix="$prefix" --disable-tests --disable-demos --disable-doxygen-doc
+        # The release archive includes configure/Makefile.in; our patch updates
+        # configure and configure.ac together, so no Autotools regeneration is needed.
+        ./configure --prefix="$prefix" --disable-maintainer-mode --disable-tests --disable-demos --disable-doxygen-doc
         make include/private/vkd3d_version.h libvkd3d-shader.pc
         make -j2 libvkd3d-shader.la
         make install-libLTLIBRARIES lib_LTLIBRARIES=libvkd3d-shader.la

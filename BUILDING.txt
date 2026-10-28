@@ -146,7 +146,7 @@ provide DXMT's D3D11 feature level are unsupported.
 
 With Xcode selected, install the native build dependencies using Homebrew:
 
-brew install cmake ninja pkgconf openssl@3 libpng jpeg-turbo spirv-headers vulkan-headers vulkan-loader bison flex perl
+brew install cmake ninja make pkgconf openssl@3 libpng jpeg-turbo spirv-headers vulkan-headers vulkan-loader bison flex perl
 if [ "$(uname -m)" = arm64 ]; then brew install mpfr gmp; fi
 export PATH="$(brew --prefix perl)/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
 cpan -T JSON
@@ -156,7 +156,9 @@ Start build/macos/Release/b2. Keep the source/build folder: the native dynamic
 libraries, extracted inputs, settings and saves remain there. Build.sh selects
 Xcode's compiler and Homebrew's library paths, downloads the hash-verified official LLVM
 15.0.7 library package required by DXMT, and builds the pinned dependencies
-directly with CMake and make. It never calls Python or Meson. The native HLSL
+directly with CMake and GNU Make 4.3+ from Homebrew. It uses the release archive's
+generated configuration files without requiring Autotools. It never calls Python
+or Meson. The native HLSL
 compiler is used only during the build. Vulkan headers and the loader are build
 dependencies of that compiler's upstream configuration. The game runs D3D11 through native DXMT
 and Metal, with an SDL-owned Metal view. FFmpeg is optional for music imports.

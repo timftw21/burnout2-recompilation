@@ -142,7 +142,7 @@ prepare_macos() {
         if [[ ${CI:-} == true ]]; then NONINTERACTIVE=1 /bin/bash "$brew_installer"; else /bin/bash "$brew_installer"; fi
     fi
     export PATH="$brew_prefix/bin:$PATH"
-    brew install cmake ninja pkgconf openssl@3 libpng jpeg-turbo spirv-headers vulkan-headers vulkan-loader bison flex perl ffmpeg
+    brew install cmake ninja make pkgconf openssl@3 libpng jpeg-turbo spirv-headers vulkan-headers vulkan-loader bison flex perl ffmpeg
     if [[ $(uname -m) == arm64 ]]; then brew install mpfr gmp; fi
     local perl_prefix
     perl_prefix=$(brew --prefix perl)
