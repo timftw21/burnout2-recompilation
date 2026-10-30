@@ -1,3 +1,12 @@
+Achievement notification sound: "Achievement Unlocked" by DenielCZ via Pixabay
+https://pixabay.com/sound-effects/technology-achievement-unlocked-463070/
+Licensed under the Pixabay Content License:
+https://pixabay.com/service/terms/
+https://pixabay.com/service/license-summary/
+The user supplied the original MP3; resources/achievement-unlocked.wav is its
+PCM conversion, used with the achievement notification interface. This asset is
+covered by the Pixabay Content License, not the project's source-code license.
+
 GTAO horizon integration / XeGTAO
 https://github.com/GameTechDev/XeGTAO
 Adapted normal projection and analytic horizon integration in src/ambient_occlusion.cpp.

@@ -473,6 +473,8 @@ int main(int argc, char** argv) {
                   << ",\"includes_input_setup\":true,\"game_booted\":false},\"compiled_functions\":" << b2::compiled_batch.size() << "}\n";
         return 0;
     } catch (const std::exception& error) {
+        b2::diagnostic_record("{\"type\":\"error\",\"message\":"+b2::json(error.what())+'}');
+        std::cout << "{\"error\":" << b2::json(error.what()) << "}\n" << std::flush;
         if(argc==1) {
 #ifdef _WIN32
             MessageBoxA(nullptr,error.what(),"Burnout 2 could not start",MB_OK|MB_ICONERROR);
@@ -480,8 +482,6 @@ int main(int argc, char** argv) {
             SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,"Burnout 2 could not start",error.what(),nullptr);
 #endif
         }
-        b2::diagnostic_record("{\"type\":\"error\",\"message\":"+b2::json(error.what())+'}');
-        std::cout << "{\"error\":" << b2::json(error.what()) << "}\n";
         return 1;
     }
 }

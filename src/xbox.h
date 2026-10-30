@@ -27,6 +27,7 @@ struct XboxHost {
     std::vector<std::string> enabled_mods;
     bool loop_track=false;
     std::function<void(bool)> music_loop_changed;
+    Achievements* achievements=nullptr;
 };
 struct BootIo {
     std::uint32_t ordinal=0,status=0,information=0,callsite=0;

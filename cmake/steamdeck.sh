@@ -56,7 +56,9 @@ case ${1:-} in
         [[ -x $game ]] || { printf '%s\n' 'Run Install.sh --steamdeck to build the game first.' >&2; exit 1; }
         # Steam's host loader paths must not replace the runtime's libraries.
         unset LD_LIBRARY_PATH LD_PRELOAD
-        exec flatpak run --user --share=ipc --socket=wayland --socket=fallback-x11 \
+        # Keep XWayland available even when a Wayland socket exists: Gaming Mode
+        # or SDL's driver selection may still require the X11 display.
+        exec flatpak run --user --share=ipc --socket=wayland --socket=x11 \
             --socket=pulseaudio --device=all --filesystem=host \
             --unset-env=LD_LIBRARY_PATH --unset-env=LD_PRELOAD \
             --command="$game" "$platform/x86_64/$runtime" "$@"

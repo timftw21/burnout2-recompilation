@@ -787,6 +787,26 @@ Esc cancels an active key change; Esc/F1/F8/F9 remain reserved for the interface
 Settings, including scancodes and game-file paths, save automatically in
 data/local/settings.cfg after editing. Closing settings or the app also saves
 pending edits. Continuous slider/text edits do not write on every frame.
+The Achievements tab appears above Mods and lists locked and unlocked achievements.
+The ten achievements cover Crash Zone medals, Driving 101 golds, race wins,
+Championship/Pursuit completion, starting boosts, Burnout x15, and a 40-second
+Crystal Summit Peak lap in Time Attack. Crash + Burn keeps the original test
+achievement's saved unlock. Bronze-or-better repeat Crash Zone results qualify.
+Aggregate goals count medals and completions already in the loaded game profile,
+and are checked when you next complete the relevant event. Championship finishes
+at Custom Series Qualifier; Custom Series finishes at Heart Attack Grand Prix.
+Each achievement uses the project icon; locked achievements appear at half opacity.
+Unlocking shows a five-second notification with a 250 ms fade-in, a 350 ms fade-out
+and the supplied achievement sound. The sound follows master volume, mute and
+focus muting. Reset achievements asks for confirmation before clearing achievement
+progress and notifications so you can earn them again. The dialog dims settings
+and defaults to Cancel; Escape also cancels. Disable achievements stops
+new unlocks and notifications while keeping progress; Enable achievements resumes
+tracking future results. The enabled/disabled choice also persists across launches.
+Progress is shared across game profiles in this installation and saves separately
+in data/local/achievements.cfg
+beside settings.cfg. Back up this file with your saves. Saves run in the background;
+closing the app finishes pending writes. Existing medals do not unlock retroactively.
 Graphics / Display offers 4:3, 16:9 and 21:9 aspect ratios. Enhancements /
 Miscellaneous includes Motion blur, enabled by default, and Fast load, disabled
 by default. Fast load removes loading fades and display pacing while the original

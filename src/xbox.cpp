@@ -586,6 +586,7 @@ struct Xbox::State {
         cpu.ultrawide=host.ultrawide;cpu.motion_blur=host.motion_blur;
         cpu.game_timing=host.renderer?&game_timing:nullptr;
         cpu.presentation=host.renderer?&presentation:nullptr;
+        cpu.achievements=host.achievements;
         if(!host.imported_tracks.empty()) cpu.world_materials=&imported.materials;
         if(host.draw_distance>1) cpu.world_view=&world_view;
         if(host.widescreen) cpu.hud_layout=&hud_layout;
@@ -3768,6 +3769,7 @@ struct Xbox::State {
             for(unsigned i=0;i<result.stack_word_count;++i) result.stack_words[i]=memory.load<std::uint32_t>(stack+i*4);
         }
         result.cpu.kernel=nullptr; result.cpu.diagnostic=nullptr; result.cpu.clock=nullptr; result.cpu.preempt=nullptr; result.cpu.profile=nullptr;result.cpu.world_view=nullptr;result.cpu.hud_layout=nullptr;
+        result.cpu.achievements=nullptr;
         diagnostic_guest(nullptr);
         return result;
     }

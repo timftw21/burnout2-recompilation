@@ -1,3 +1,5 @@
 // Artwork supplied by the user: Burnout2_Recomp_Logo_128_Corrected.png.
 1 ICON "b2.ico"
 SETTINGS_LOGO RCDATA "b2.png"
+// Achievement Unlocked by DenielCZ via Pixabay; see THIRD_PARTY_NOTICES.txt.
+ACHIEVEMENT_SOUND RCDATA "achievement-unlocked.wav"

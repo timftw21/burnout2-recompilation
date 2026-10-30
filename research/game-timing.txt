@@ -705,3 +705,100 @@ build/checks/audio-logo-traffic-name-20261027.
 Validation: 2,256 displayed END frames driven by original 2F050 pass in both
 directions at 60/144/360 Hz. The fixed wrap shows x=203 halfway between the
 two rightward samples above. All 52 existing CPU diagnostic groups also pass.
+
+Reward-text feedback precision, 2026-10-29
+
+User capture build/windows/Release/build/captures/frame-593979578500 shows
+the crash gold-medal result, with Congratulations and the medal text over the
+crash scene. The user identified the lingering text trail. Capture settings
+were 144 Hz, 3x resolution, 4x MSAA, V-sync and clean HUD enabled. This is a
+recomp capture, not an original Xbox visual-parity reference.
+
+Original A97C0 blends the previous displayed framebuffer over the new scene;
+draw 991 in the capture samples target 1 into target 4, followed by the medal
+and outlined font draws. The existing elapsed-time alpha correction is already
+active. The problem is subsequent RGB8 framebuffer rounding: with retention
+pow(0.7,60/refresh), a departing red rectangle leaves red=8/255 after 0.5 seconds
+at 360 Hz, versus 1/255 at 60 Hz. Both single-sample and 4x MSAA reproduce it.
+The original regression checked only the first tick and missed this residual.
+
+RGBA framebuffers now retain UNORM16 colour through rendering, feedback,
+copies, MSAA resolve and the scene saved before UI composition. Unlike a half
+float, this keeps equal precision near black and white, with the same [0,1]
+clamping. Ordinary uploaded textures, window presentation and PNG output keep
+their existing formats. Readback converts the wider colour channels to bytes;
+resource accounting, cubemap copies and MSAA capability checks include the
+actual format. No additional draw or copy passes are introduced. Colour
+storage grows from four to eight bytes per pixel/sample; gameplay frame times
+and the effect of that extra bandwidth have not been measured.
+
+Source-colour dithering was rejected: native blending still accumulated two
+or three byte values of error on stationary midtones. Retaining precision in
+the buffers fixes the loss instead of adding noise or changing the fade rate.
+
+The extended existing native check follows the complete fade over black,
+midtone and white backgrounds at 60, 144 and 360 Hz, with 1x and 4x MSAA.
+All six finish with zero byte error across the background and departed-text
+region. All 264 hardware graphics checks pass on NVIDIA GeForce RTX 5060 Ti,
+including gauge-history separation, UI layers, antialiasing, ambient occlusion,
+copies and readbacks; the D3D11 debug-message list is empty. Evidence is in
+build/checks/text-animation-20261029, especially precision.json, fade-pixels.json
+and the before/precision PNGs. The rebuilt Release executable also passes its
+hidden-window diagnostic, with zero runtime shader compilations. That check
+uses isolated preferences; the user's achievement file remained byte-identical
+across it. No gameplay automation or benchmark was run.
+
+Reduced memory for framebuffer feedback, 2026-10-29
+
+The follow-up replaces the wide colour buffers above with RGBA8 buffers and
+controlled rounding of the completed feedback blend. Dithering only the source
+had failed because the native blend could round it again. The new shader reads
+both colours, completes their original alpha blend, then rounds once to a byte.
+Balanced spatial/temporal thresholds let a faint remainder keep fading instead
+of becoming permanent. The 257 thresholds resolve even an alpha decrement of
+1/255 and avoid repeating in step with common frame ratios or byte-alpha error
+feedback. Original alpha testing, RGB write masks and overlay composition stay
+in effect. The two shaders are compiled into the native shader bank.
+
+One reusable RGBA8 image holds the destination colour before each eligible
+framebuffer blend. It has the main image's dimensions and sample count, with
+no depth, resolved copy or readback allocation. It is created with the main
+image during setup/reset/resize and included in resource budgeting. Every MSAA
+sample is copied and read separately. Default pixel-centre interpolation keeps
+the original history texture sampling; only the destination read uses the
+sample index. The interpolation rule is documented in Microsoft's D3D11.3
+functional specification, section 16.4:
+https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm
+
+The existing presentation buffer cannot safely serve as scratch: it retains
+the completed HUD for later GetBackBuffer consumers. The native check now
+verifies that this image survives the next frame's blur draw until replacement.
+The dedicated scratch image avoids that lifetime conflict. Each feedback draw
+adds one GPU copy, with no additional drawing pass or allocation during frames.
+MSAA uses a shader invocation per sample; gameplay performance is unmeasured.
+
+For frame-593979578500, three 640x480 RGBA targets (including presentation) and
+one 256x256 RGBA target had been widened. The six RGB565 reflection faces were
+unchanged. Normal-play allocation estimates, excluding driver overhead:
+
+                         Wider buffers     Compact feedback
+1x, no MSAA               3.77 MiB           1.17 MiB extra
+1x, 4x MSAA              18.83 MiB           4.69 MiB extra
+3x, no MSAA              33.89 MiB          10.55 MiB extra
+3x, 4x MSAA             169.45 MiB          42.19 MiB extra
+
+At the captured 3x/4x settings this saves 127.27 MiB, a 75.10% reduction in the
+added colour storage. These are buffer dimensions, not measured driver VRAM.
+
+All 264 native hardware graphics checks pass with no D3D11 debug warnings on
+NVIDIA GeForce RTX 5060 Ti. Existing reward cases now use the original SDK
+screen program and batched vertex streams at 60/144/360 Hz and 1x/4x MSAA;
+the 144 Hz cases also exercise separated UI composition. All six recover the
+exact black, midtone and white backgrounds after 0.5 seconds. Additional checks
+within those cases verify a one-byte disturbance fades completely with alpha
+254/255, the completed HUD survives, the original buffer formats are retained,
+and frames allocate no additional images. Evidence: final.json, fade-pixels.json,
+memory.json and images in build/checks/text-memory-20261029. The rebuilt Release
+also passes the hidden-window diagnostic with zero runtime shader compilations;
+the user's achievement file remains byte-identical across that check. No
+gameplay automation or benchmark was run.

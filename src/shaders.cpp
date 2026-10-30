@@ -163,10 +163,44 @@ const char* shader_profile(ShaderKind kind) {
        kind==ShaderKind::copy_multisample || kind==ShaderKind::copy_multisample_stencil ||
        (kind>=ShaderKind::color && kind<=ShaderKind::modulate3d) ||
        (kind>=ShaderKind::layer_combiner0 && kind<=ShaderKind::layer_modulate3d) ||
-       kind==ShaderKind::layer_begin || kind==ShaderKind::layer_begin_ms || kind==ShaderKind::ao_composite) return "ps_5_0";
+       kind==ShaderKind::layer_begin || kind==ShaderKind::layer_begin_ms || kind==ShaderKind::ao_composite ||
+       kind==ShaderKind::feedback || kind==ShaderKind::feedback_ms) return "ps_5_0";
     return "vs_5_0";
 }
 std::string shader_source(ShaderKind kind) {
+    if(kind==ShaderKind::feedback || kind==ShaderKind::feedback_ms) {
+        auto source=shader_source(ShaderKind::modulate2d);
+        const std::string_view signature="float4 main(P p):SV_Target";
+        source.replace(source.find(signature),signature.size(),"float4 shade(P p)");
+        source+='\n';
+        source+=kind==ShaderKind::feedback_ms?
+            "#define MULTISAMPLE 1\nTexture2DMS<float4> scene:register(t12);\n":
+            "Texture2D<float4> scene:register(t12);\n";
+        return source+R"(
+float4 main(P p
+#ifdef MULTISAMPLE
+ ,uint sample_index:SV_SampleIndex
+#endif
+):SV_Target {
+ // Default linear interpolation keeps history sampling at the pixel centre;
+ // SV_SampleIndex selects only the destination's individual MSAA samples.
+ float4 history=shade(p);
+#ifdef MULTISAMPLE
+ float4 current=scene.Load(int2(p.p.xy),sample_index);
+#else
+ float4 current=scene.Load(int3(int2(p.p.xy),0));
+#endif
+ float3 result=lerp(current.rgb,history.rgb,history.a);
+ // Quantize the completed blend, not its source: fixed-function RGB8
+ // blending can round the source before multiplication and retain a ghost.
+ // 257 thresholds resolve even a 1/255 alpha decrement, without repeating
+ // in step with the existing 8-bit alpha quantizer or common frame ratios.
+ uint2 xy=uint2(p.p.xy);uint x=xy.x^xy.y,y=xy.y;
+ uint rank=((x&1)<<7)|((y&1)<<6)|((x&2)<<4)|((y&2)<<3)|((x&4)<<1)|(y&4)|((x&8)>>2)|((y&8)>>3);
+ float threshold=(float((rank+coverage.z-1)%257)+0.5)/257;
+ return float4(floor(saturate(result)*255+threshold)/255,current.a);
+})";
+    }
     if(kind>=ShaderKind::ao_low && kind<=ShaderKind::ao_composite)
         return ambient_occlusion_shader(unsigned(kind)-unsigned(ShaderKind::ao_low)+1,kind==ShaderKind::ao_composite);
 

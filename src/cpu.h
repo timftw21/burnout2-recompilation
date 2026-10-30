@@ -28,6 +28,7 @@ std::uint32_t B2_ASM b2_compare_exchange32(void*,std::uint32_t,std::uint32_t);
 class Memory;
 struct Cpu;
 class Presentation;
+class Achievements;
 struct KernelServices {
     void* context = nullptr;
     std::array<void (*)(void*, Cpu&, Memory&), 512> entries{};
@@ -109,6 +110,7 @@ struct Cpu {
     HudLayout* hud_layout = nullptr;
     GameTiming* game_timing = nullptr;
     Presentation* presentation = nullptr;
+    Achievements* achievements = nullptr;
 };
 
 class NativeBoundary : public std::runtime_error {
@@ -152,6 +154,13 @@ bool title_traffic_visible(Cpu&,Memory&,std::uint32_t vehicle,std::uint32_t view
 void title_enhancement(Cpu&,Memory&,std::uint32_t address);
 bool title_track(Cpu&,Memory&,std::uint32_t address,std::uint32_t object=0);
 bool title_music(Cpu&,Memory&,std::uint32_t address);
+void title_crash_result(Cpu&,Memory&,std::uint32_t progress,std::uint32_t zone,std::uint32_t medal);
+void title_training_result(Cpu&,Memory&,std::uint32_t progress);
+void title_championship_result(Cpu&,Memory&,std::uint32_t progress);
+void title_race_result(Cpu&,Memory&,std::uint32_t stats);
+void title_starting_boost(Cpu&,Memory&,std::uint32_t vehicle);
+void title_burnout_chain(Cpu&,Memory&,std::uint32_t boost,std::uint32_t racer);
+void title_time_attack_lap(Cpu&,Memory&,std::uint32_t session,std::uint32_t time_bits);
 std::uint32_t read_port(Cpu&,std::uint16_t,unsigned);
 void write_port(Cpu&,std::uint16_t,unsigned,std::uint32_t);
 

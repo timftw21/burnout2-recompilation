@@ -121,6 +121,7 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
                 native.prepare(feedback);native.set_target(target);native.begin();
                 native.draw(world,frame<displays*3?white:blue);
                 native.draw(feedback,quad({1,1,1,float(std::pow(0.7,1.0/displays))}));native.end();
+                if(frame) expect(native.read_target(0),48,16,{255,0,0,255}); // The completed HUD must survive until replacement.
                 native.begin_overlay();native.begin(0,1,false);
                 native.draw(hud,quad({0,0,0,0.3f}));native.draw(text,red);
                 // The presentation copy must still use the scene's depth.
@@ -142,28 +143,100 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
             }
             const auto after=native.resources();const auto counts=native.stats().counters;
             if(after.targets!=resources.targets || after.target_bytes!=resources.target_bytes ||
-               counts[unsigned(PerfMetric::target_creations)] || counts[unsigned(PerfMetric::target_copies)]!=frames ||
+               counts[unsigned(PerfMetric::target_creations)] || counts[unsigned(PerfMetric::target_copies)]!=frames*2 ||
                counts[unsigned(PerfMetric::draws)]!=frames*5)
-                throw std::runtime_error("Boost HUD separation added render resources, copies or draws");
+                throw std::runtime_error("Boost HUD feedback exceeded its existing buffers, two copies or five draws per frame");
             if(!native.errors().empty()) throw std::runtime_error("Boost HUD feedback produced graphics validation errors");
         });
-        run(std::format("reward-text-history-{}x-{}hz",samples,displays*60),state,white,[&](const Image&) {
+    }
+    for(unsigned samples:{1U,4U}) for(unsigned refresh:{60U,144U,360U}) {
+        if(samples>1 && !renderer.supports_msaa(samples)) continue;
+        run(std::format("reward-text-history-{}x-{}hz",samples,refresh),state,white,[&](const Image&) {
             Renderer native(64,64,warp,debug);
             if(samples>1) native.enhancements(5,0);
             const std::array targets{native.create_target(64,64),native.create_target(64,64)};
+            const auto original_budget=3ULL*64*64*(samples>1?8*samples+8:12);
+            if(native.resources().target_bytes>original_budget+64ULL*64*samples*4)
+                throw std::runtime_error("Framebuffer feedback exceeded one RGBA8 colour-only scratch image");
+            if(refresh==144) native.ambient_occlusion(1,0);
             auto text=colored();text.scissor_test=true;
-            for(auto target:targets) {native.set_target(target);native.begin(0xFF000000);native.end();}
-            for(unsigned frame=0;frame<=displays;++frame) {
+            auto dark=text;dark.scissor={0,0,64,16};
+            auto light=text;light.scissor={0,32,64,64};
+            dark.depth_test=dark.depth_write=light.depth_test=light.depth_write=true;
+            text.blend=true;text.blend_source=0x302;text.blend_destination=0x303;text.color_mask=0x00010101;
+            native.prepare(dark);
+            const auto background=[&] {
+                native.camera(1,0.1f,100,1.047197551f);
+                native.begin(0xFF807060);native.draw(dark,quad({0,0,0,1}));native.draw(light,white);
+            };
+            for(auto target:targets) {native.set_target(target);background();native.end();}
+            const auto alpha=float(std::pow(0.7,60.0/refresh));
+            const auto first=(refresh+59)/60;
+            const auto program=native.prepare_program(screen_vertex_programs()[0]);
+            VertexLayout attributes{};attributes[0]={0,offsetof(Vertex,position),0x42};
+            attributes[3]={0,offsetof(Vertex,color),0x42};attributes[9]={0,offsetof(Vertex,uv),0x42};
+            const auto layout=native.prepare_layout(program,attributes);
+            VertexConstants constants{};constants[0]={1,1,16777215,1};constants[1]={0.53125f,0.53125f,0,0};
+            ProgramView view;view.depth_scale=16777215;ProgramVertex current;
+            auto history_vertices=quad({1,1,1,alpha}),text_vertices=red;
+            for(auto* vertices:{&history_vertices,&text_vertices}) for(auto& vertex:*vertices) {
+                vertex.position[0]=(vertex.position[0]+1)*32;vertex.position[1]=(1-vertex.position[1])*32;
+            }
+            const std::array history_stream{VertexStream{std::as_bytes(std::span(history_vertices)),sizeof(Vertex)}};
+            const std::array text_stream{VertexStream{std::as_bytes(std::span(text_vertices)),sizeof(Vertex)}};
+            const auto resources=native.resources();
+            // Include the full fade on black, midtone and white backgrounds.
+            // One tick misses faint history trapped by RGB8 rounding.
+            for(unsigned frame=0;frame<=refresh/2;++frame) {
                 auto feedback=textured(targets[(frame+1)&1]);feedback.blend=true;
                 feedback.blend_source=0x302;feedback.blend_destination=0x303;feedback.color_mask=0x00010101;
-                text.scissor=frame?std::array<std::int32_t,4>{8,8,24,24}:std::array<std::int32_t,4>{40,8,56,24};
-                native.prepare(feedback);native.prepare(text);native.set_target(targets[frame&1]);native.begin(0xFF000000);
-                native.draw(feedback,quad({1,1,1,float(std::pow(0.7,1.0/displays))}));
-                native.draw(text,red);native.end();native.copy_to_main();native.publish_frame();
+                text.scissor=frame?std::array<std::int32_t,4>{8,8,24,56}:std::array<std::int32_t,4>{40,8,56,56};
+                const auto feedback_bindings=native.prepare(feedback),text_bindings=native.prepare(text);
+                native.set_target(targets[frame&1]);background();
+                const std::array batch{
+                    Renderer::StreamDraw{&feedback,&constants,&view,history_stream,&current,{},&feedback_bindings,layout,4},
+                    Renderer::StreamDraw{&text,&constants,&view,text_stream,&current,{},&text_bindings,layout,4}};
+                native.draw_streams(batch);native.end();native.copy_to_main();native.publish_frame();
+                if(frame==first) {
+                    const auto image=native.readback();const auto fade=std::pow(0.7,60.0*frame/refresh);
+                    const auto blend=[&](unsigned background,unsigned text) {return unsigned(std::lround(background+(double(text)-background)*fade));};
+                    expect(image,16,12,{255,0,0,255});
+                    expect(image,48,12,{blend(0,255),0,0,255},3);
+                    expect(image,48,24,{blend(128,255),blend(112,0),blend(96,0),255},3);
+                    expect(image,48,48,{255,blend(255,0),blend(255,0),255},3);
+                    save_png(image,directory/std::format("reward-text-{}x-{}hz.png",samples,refresh));
+                }
             }
-            const auto image=native.readback();
-            expect(image,16,16,{255,0,0,255});expect(image,48,16,{179,0,0,255},3);
-            save_png(image,directory/std::format("reward-text-{}x-{}hz.png",samples,displays*60));
+            const auto settled=native.readback();
+            save_png(settled,directory/std::format("reward-text-settled-{}x-{}hz.png",samples,refresh));
+            for(unsigned y=8;y<56;++y) for(unsigned x=32;x<56;++x)
+                expect(settled,x,y,y<16?std::array{0U,0U,0U,255U}:y<32?std::array{128U,112U,96U,255U}:std::array{255U,255U,255U,255U},1);
+            if(refresh==144) {
+                const auto composed=native.read_frame();
+                expect(composed,16,12,{255,0,0,255});expect(composed,48,12,{0,0,0,255},1);
+                expect(composed,48,24,{128,112,96,255},1);expect(composed,48,48,{255,255,255,255},1);
+            }
+            if(refresh==360) {
+                // Even the weakest non-opaque byte alpha must erase a one-byte
+                // disturbance on both black and white within one second.
+                for(auto target:targets) {
+                    native.set_target(target);background();
+                    native.draw(dark,quad({1.0f/255,1.0f/255,1.0f/255,1},0.25f));
+                    native.draw(light,quad({254.0f/255,254.0f/255,254.0f/255,1},0.25f));native.end();
+                }
+                for(unsigned frame=0;frame<refresh;++frame) {
+                    auto feedback=textured(targets[(frame+1)&1]);feedback.blend=true;
+                    feedback.blend_source=0x302;feedback.blend_destination=0x303;feedback.color_mask=0x00010101;
+                    native.prepare(feedback);native.set_target(targets[frame&1]);background();
+                    native.draw(feedback,quad({1,1,1,254.0f/255}));native.end();native.copy_to_main();native.publish_frame();
+                }
+                const auto faint=native.readback();
+                save_png(faint,directory/std::format("reward-last-byte-{}x.png",samples));
+                for(unsigned y=0;y<64;++y) for(unsigned x=0;x<64;++x)
+                    expect(faint,x,y,y<16?std::array{0U,0U,0U,255U}:y<32?std::array{128U,112U,96U,255U}:std::array{255U,255U,255U,255U},0);
+            }
+            if(native.resources().target_bytes!=resources.target_bytes || native.resources().targets!=resources.targets)
+                throw std::runtime_error("Framebuffer feedback allocated additional images");
             if(!native.errors().empty()) throw std::runtime_error("Reward text feedback produced graphics validation errors");
         });
     }

@@ -5,6 +5,7 @@
 #include "diagnostics.h"
 #include "custom_music.h"
 #include "mods.h"
+#include "achievements.h"
 #include <SDL3/SDL.h>
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
@@ -26,6 +27,7 @@
 #include <cmath>
 #include <deque>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <sstream>
 
@@ -240,8 +242,10 @@ ImFont* settings_theme(ImFont*& italic) {
     c[ImGuiCol_Text]={.93f,.94f,.96f,1};c[ImGuiCol_TextDisabled]={.60f,.65f,.71f,1};
     c[ImGuiCol_WindowBg]={.055f,.067f,.086f,1};c[ImGuiCol_ChildBg]={.078f,.094f,.118f,1};
     c[ImGuiCol_PopupBg]={.09f,.11f,.14f,1};c[ImGuiCol_Border]={.19f,.23f,.28f,1};c[ImGuiCol_BorderShadow]={0,0,0,0};
+    c[ImGuiCol_ModalWindowDimBg]={0,0,0,.65f};
     c[ImGuiCol_FrameBg]={.12f,.145f,.18f,1};c[ImGuiCol_FrameBgHovered]={.18f,.21f,.26f,1};
     c[ImGuiCol_FrameBgActive]={.21f,.25f,.30f,1};
+    c[ImGuiCol_TitleBg]=c[ImGuiCol_TitleBgActive]=c[ImGuiCol_TitleBgCollapsed]=c[ImGuiCol_FrameBg];
     c[ImGuiCol_CheckboxSelectedBg]={.30f,.19f,.13f,1};c[ImGuiCol_InputTextCursor]={1,.49f,.19f,1};
     c[ImGuiCol_Button]={.16f,.19f,.23f,1};c[ImGuiCol_ButtonHovered]={.23f,.27f,.32f,1};
     c[ImGuiCol_ButtonActive]={.29f,.33f,.39f,1};
@@ -321,6 +325,15 @@ void settings_icon(ImDrawList& draw,int kind,ImVec2 p,ImU32 color) {
         line(6.3f,7.5f,6.3f,11.5f);line(4.3f,9.5f,8.3f,9.5f);
         draw.AddCircleFilled(point(13,8.5f),1.1f,color);draw.AddCircleFilled(point(15.7f,11),1.1f,color);break;
     case 6:
+        draw.PathLineTo(point(5,2));draw.PathLineTo(point(15,2));draw.PathLineTo(point(14,9));
+        draw.PathBezierCubicCurveTo(point(13,14),point(7,14),point(6,9));
+        draw.PathStroke(color,ImDrawFlags_Closed,1.6f);
+        draw.PathLineTo(point(5,4));draw.PathLineTo(point(2,4));
+        draw.PathBezierCubicCurveTo(point(2,9),point(3,10),point(7,10));draw.PathStroke(color,0,1.6f);
+        draw.PathLineTo(point(15,4));draw.PathLineTo(point(18,4));
+        draw.PathBezierCubicCurveTo(point(18,9),point(17,10),point(13,10));draw.PathStroke(color,0,1.6f);
+        line(10,13,10,18);line(6,18,14,18);break;
+    case 7:
         draw.PathLineTo(point(3,5));draw.PathLineTo(point(7,5));
         draw.PathBezierCubicCurveTo(point(6,2),point(7.2f,1),point(9,1));
         draw.PathBezierCubicCurveTo(point(10.8f,1),point(12,2),point(11,5));
@@ -334,7 +347,7 @@ void settings_icon(ImDrawList& draw,int kind,ImVec2 p,ImU32 color) {
         draw.PathBezierCubicCurveTo(point(6,14),point(7,12.8f),point(7,11));
         draw.PathBezierCubicCurveTo(point(7,9.2f),point(6,8),point(3,9));
         draw.PathStroke(color,ImDrawFlags_Closed,1.6f);break;
-    case 7:draw.AddRect(point(2,1),point(18,19),color,2);for(int i=0;i<3;++i) line(6,6.0f+4*i,14,6.0f+4*i);break;
+    case 8:draw.AddRect(point(2,1),point(18,19),color,2);for(int i=0;i<3;++i) line(6,6.0f+4*i,14,6.0f+4*i);break;
     }
 }
 void setting_label(const char* text) {
@@ -371,12 +384,28 @@ struct MusicFolderSelection {
     std::atomic<bool> finished{false};
     std::string path,error;
 };
+constexpr std::uint64_t achievement_duration=5000000000ULL;
+float achievement_opacity(std::uint64_t elapsed) {
+    if(elapsed>=achievement_duration) return 0;
+    const auto fraction=std::min({1.0f,float(elapsed)/250000000.0f,float(achievement_duration-elapsed)/350000000.0f});
+    return fraction*fraction*(3-2*fraction);
+}
 struct App {
     SDL_Window* window=nullptr;
     std::unique_ptr<Renderer> renderer;
     std::unique_ptr<Input> input;
     std::unique_ptr<ControlScript> controls;
     Preferences settings;
+    Achievements achievements;
+    std::filesystem::path achievements_path;
+    std::future<void> achievements_save;
+    std::string achievements_error;
+    std::optional<AchievementId> achievement_notification;
+    std::uint64_t achievement_started=0;
+    bool achievement_reset_open=false;
+    SDL_AudioStream* achievement_audio=nullptr;
+    Uint8* achievement_audio_data=nullptr;
+    Uint32 achievement_audio_size=0;
     ImFont* heading_font=nullptr;ImFont* italic_font=nullptr;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> logo;
     std::filesystem::path settings_path,pending_window_capture;
@@ -413,6 +442,9 @@ struct App {
     bool cursor_hidden=false,focused=false;
     App(bool hidden,bool warp,const std::filesystem::path& script={},const std::filesystem::path& preferences="data/local/settings.cfg"):
         settings(!hidden,preferences),settings_path(preferences) {
+        achievements_path=hidden?std::filesystem::path(preferences).concat(".achievements"):preferences.parent_path()/"achievements.cfg";
+        if(!hidden) try {achievements.load(achievements_path);}
+        catch(const std::exception& error) {achievements_error=error.what();log_message("Achievements: "+achievements_error);}
         music_songs=custom_music_count(music_cache());
         mods_root=std::filesystem::absolute(hidden?preferences.parent_path()/"mods":executable_path().parent_path()/"mods").lexically_normal();
         refresh_mods();
@@ -422,7 +454,10 @@ struct App {
             throw std::runtime_error("SDL background input is required for scripted controls");
         if(!SDL_Init(SDL_INIT_VIDEO|SDL_INIT_GAMEPAD|SDL_INIT_AUDIO)) throw std::runtime_error(SDL_GetError());
         try {
+            // Request fullscreen before showing the window, without requiring a
+            // separate window-manager transition to finish before the first frame.
             window=SDL_CreateWindow("Burnout 2: Point of Impact",960,720,SDL_WINDOW_RESIZABLE|SDL_WINDOW_HIGH_PIXEL_DENSITY|(hidden?SDL_WINDOW_HIDDEN:0)
+                |(!hidden && settings.fullscreen?SDL_WINDOW_FULLSCREEN:0)
 #ifdef __APPLE__
                 |SDL_WINDOW_METAL
 #elif !defined(_WIN32)
@@ -431,9 +466,6 @@ struct App {
             );
             if(!window) throw std::runtime_error(SDL_GetError());
             SDL_SetWindowMinimumSize(window,640,480);
-            // Finalize fullscreen geometry before creating the presentation surface.
-            if(!hidden && settings.fullscreen && (!SDL_SetWindowFullscreen(window,true) || !SDL_SyncWindow(window)))
-                throw std::runtime_error(SDL_GetError());
             mouse_activity=SDL_GetTicksNS();
             focused=(SDL_GetWindowFlags(window)&SDL_WINDOW_INPUT_FOCUS)!=0;
             refresh_options();
@@ -455,9 +487,17 @@ struct App {
             if(!ImGui_ImplSDL3_InitForD3D(window) || !ImGui_ImplDX11_Init(renderer->native_device(),renderer->native_context()))
                 throw std::runtime_error("Could not initialize the settings interface");
             logo=settings_logo(renderer->native_device());
+            try {load_achievement_sound(!hidden);}
+            catch(const std::exception& error) {
+                if(achievement_audio) SDL_DestroyAudioStream(achievement_audio);
+                achievement_audio=nullptr;
+                log_message(std::string("Achievement sound unavailable: ")+error.what());
+            }
         } catch(...) {cleanup();throw;}
     }
     void cleanup() {
+        if(achievement_audio) SDL_DestroyAudioStream(achievement_audio);
+        achievement_audio=nullptr;SDL_free(achievement_audio_data);achievement_audio_data=nullptr;
         if(ImGui::GetCurrentContext()) {
             if(ImGui::GetIO().BackendRendererUserData) ImGui_ImplDX11_Shutdown();
             if(ImGui::GetIO().BackendPlatformUserData) ImGui_ImplSDL3_Shutdown();
@@ -465,7 +505,7 @@ struct App {
         }
         logo.Reset();input.reset();controls.reset();renderer.reset();if(window) SDL_DestroyWindow(window);window=nullptr;SDL_Quit();
     }
-    ~App() {music_import.cancel();save_settings();cleanup();}
+    ~App() {music_import.cancel();save_settings();save_achievements(true);cleanup();}
     void log_message(std::string message) {
         if(message.empty()) return;
         if(log_messages.size()==64) log_messages.pop_front();
@@ -476,6 +516,131 @@ struct App {
         settings_dirty=false;
         try {settings.save(settings_path);}
         catch(const std::exception& error) {log_message(error.what());}
+    }
+    void save_achievements(bool wait=false) {
+        const auto failed=[&](const std::exception& error) {
+            achievements.dirty(true);achievements_error=error.what();log_message("Achievements could not be saved: "+achievements_error);
+        };
+        if(achievements_save.valid()) {
+            if(!wait && achievements_save.wait_for(std::chrono::seconds(0))!=std::future_status::ready) return;
+            try {achievements_save.get();achievements_error.clear();}
+            catch(const std::exception& error) {failed(error);}
+        }
+        if(!achievements.dirty() || (!wait && !achievements_error.empty())) return;
+        try {
+            if(wait) {achievements.save(achievements_path);achievements_error.clear();}
+            else achievements_save=std::async(std::launch::async,[snapshot=achievements,path=achievements_path] {snapshot.save(path);});
+            achievements.dirty(false);
+        } catch(const std::exception& error) {failed(error);}
+    }
+    void load_achievement_sound(bool output) {
+        SDL_AudioSpec format{};
+#ifdef _WIN32
+        const auto module=GetModuleHandleW(nullptr);
+        const auto resource=FindResourceW(module,L"ACHIEVEMENT_SOUND",RT_RCDATA);
+        const auto loaded=resource?LoadResource(module,resource):nullptr;
+        const auto* bytes=loaded?LockResource(loaded):nullptr;
+        if(!bytes) throw std::runtime_error("The achievement sound resource is missing");
+        auto* source=SDL_IOFromConstMem(bytes,SizeofResource(module,resource));
+#else
+        auto* source=SDL_IOFromFile((executable_path().parent_path()/"resources/achievement-unlocked.wav").c_str(),"rb");
+#endif
+        if(!SDL_LoadWAV_IO(source,true,&format,&achievement_audio_data,&achievement_audio_size))
+            throw std::runtime_error(SDL_GetError());
+        achievement_audio=output?SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,&format,nullptr,nullptr):
+            SDL_CreateAudioStream(&format,&format);
+        if(!achievement_audio || !SDL_SetAudioStreamGain(achievement_audio,settings.output_gain(focused)) ||
+           (output && !SDL_ResumeAudioStreamDevice(achievement_audio))) throw std::runtime_error(SDL_GetError());
+    }
+    void update_audio_gain() {
+        const auto gain=settings.output_gain(focused);
+        if(game) game->output_gain(gain);
+        if(achievement_audio && !SDL_SetAudioStreamGain(achievement_audio,gain)) log_message(SDL_GetError());
+    }
+    void stop_achievement_notification() {
+        achievement_notification.reset();
+        if(achievement_audio) SDL_ClearAudioStream(achievement_audio);
+    }
+    template<class... Args> void disabled_text(const char* format,Args... args) {
+        ImGui::PushFont(italic_font,0);ImGui::PushTextWrapPos(0);
+        if constexpr(sizeof...(args)) ImGui::TextDisabled(format,args...);
+        else ImGui::TextDisabled("%s",format);
+        ImGui::PopTextWrapPos();ImGui::PopFont();
+    }
+    void achievements_interface() {
+        ImGui::Text("%u of %u unlocked",achievements.count(),unsigned(achievement_definitions.size()));
+        const auto available=ImGui::GetContentRegionAvail().x;
+        const bool enabled=achievements.enabled();
+        const auto* toggle=enabled?"Disable achievements":"Enable achievements";
+        if(ImGui::Button(toggle)) achievements.enabled(!enabled);
+        setting_help(enabled?"Stops new unlocks and notifications. Existing progress is kept.":"Allows achievements to unlock again when you meet their criteria.");
+        const auto toggle_width=ImGui::GetItemRectSize().x;
+        if(toggle_width+ImGui::GetStyle().ItemSpacing.x+ImGui::CalcTextSize("Reset achievements").x+2*ImGui::GetStyle().FramePadding.x<=available) ImGui::SameLine();
+        ImGui::BeginDisabled(!achievements.count());
+        if(ImGui::Button("Reset achievements")) {achievement_reset_open=true;ImGui::OpenPopup("Reset achievements?");}
+        setting_help("Clears achievement progress so you can earn them again.");
+        ImGui::EndDisabled();
+        const auto* viewport=ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(viewport->GetCenter(),ImGuiCond_Appearing,{.5f,.5f});
+        ImGui::SetNextWindowSize({std::min(440.0f,viewport->WorkSize.x-32),0});
+        if(ImGui::BeginPopupModal("Reset achievements?",&achievement_reset_open,ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoSavedSettings)) {
+            ImGui::TextWrapped("This will clear all achievement progress so you can earn them again. This cannot be undone. Are you sure?");
+            ImGui::Spacing();
+            if(ImGui::IsWindowAppearing()) {ImGui::SetKeyboardFocusHere();ImGui::SetNavCursorVisible(true);}
+            if(ImGui::Button("Cancel")) {achievement_reset_open=false;ImGui::CloseCurrentPopup();}
+            ImGui::SameLine();
+            if(ImGui::Button("Reset achievements")) {
+                achievements.reset();stop_achievement_notification();achievement_reset_open=false;ImGui::CloseCurrentPopup();
+            }
+            if(ImGui::IsKeyPressed(ImGuiKey_Escape) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight)) {
+                achievement_reset_open=false;ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+        if(!achievements.enabled()) disabled_text("Achievements are disabled. Existing progress is kept.");
+        ImGui::Spacing();
+        for(unsigned i=0;i<achievement_definitions.size();++i) {
+            const auto& entry=achievement_definitions[i];const bool unlocked=achievements.unlocked(AchievementId(i));
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha,ImGui::GetStyle().Alpha*(unlocked?1.0f:.5f));
+            ImGui::SeparatorText(unlocked?"UNLOCKED":"LOCKED");
+            ImGui::Image(logo.Get(),{56,56});ImGui::SameLine();ImGui::BeginGroup();
+            ImGui::PushFont(heading_font,22);ImGui::TextWrapped("%s",entry.title);ImGui::PopFont();
+            ImGui::TextWrapped("%s",entry.description);ImGui::EndGroup();ImGui::Spacing();
+            ImGui::PopStyleVar();
+        }
+        if(!achievements_error.empty()) {
+            ImGui::Spacing();ImGui::TextWrapped("Achievement progress: %s",achievements_error.c_str());
+            if(achievements.dirty() && ImGui::Button("Retry saving achievements")) {achievements_error.clear();save_achievements();}
+        }
+    }
+    void achievement_toast() {
+        if(achievement_notification && (!achievements.enabled() || !achievements.unlocked(*achievement_notification))) stop_achievement_notification();
+        if(!achievements.enabled()) return;
+        if(!achievement_notification) {
+            achievement_notification=achievements.take_notification();
+            if(!achievement_notification) return;
+            achievement_started=SDL_GetTicksNS();
+            if(achievement_audio && (!SDL_ClearAudioStream(achievement_audio) ||
+               !SDL_PutAudioStreamDataNoCopy(achievement_audio,achievement_audio_data,int(achievement_audio_size),nullptr,nullptr) ||
+               !SDL_FlushAudioStream(achievement_audio))) log_message(std::string("Achievement sound: ")+SDL_GetError());
+        }
+        const auto elapsed=SDL_GetTicksNS()-achievement_started;
+        if(elapsed>=achievement_duration) {stop_achievement_notification();return;}
+        const auto& entry=achievement_definitions[unsigned(*achievement_notification)];
+        const auto* viewport=ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos({viewport->WorkPos.x+viewport->WorkSize.x-16,viewport->WorkPos.y+viewport->WorkSize.y-16},ImGuiCond_Always,{1,1});
+        ImGui::SetNextWindowSize({std::min(380.0f,viewport->WorkSize.x-32),0});
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha,ImGui::GetStyle().Alpha*achievement_opacity(elapsed));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,{16,14});
+        ImGui::PushStyleColor(ImGuiCol_WindowBg,ImVec4{.08f,.10f,.14f,.97f});
+        ImGui::PushStyleColor(ImGuiCol_Border,ImVec4{1,.55f,.27f,1});
+        ImGui::Begin("Achievement unlocked",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_AlwaysAutoResize|
+            ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoFocusOnAppearing|ImGuiWindowFlags_NoNav|ImGuiWindowFlags_NoInputs);
+        ImGui::Image(logo.Get(),{56,56});ImGui::SameLine();ImGui::BeginGroup();
+        ImGui::TextColored({1,.55f,.27f,1},"Achievement unlocked");
+        ImGui::PushFont(heading_font,22);ImGui::TextWrapped("%s",entry.title);ImGui::PopFont();
+        ImGui::TextWrapped("%s",entry.description);
+        ImGui::EndGroup();ImGui::End();ImGui::PopStyleColor(2);ImGui::PopStyleVar(2);
     }
     void exit_game() {running=false;launch=false;binding_action=-1;save_settings();}
     PerfCounters performance_counters() const {
@@ -584,7 +749,7 @@ struct App {
         if((event.type==SDL_EVENT_WINDOW_FOCUS_GAINED || event.type==SDL_EVENT_WINDOW_FOCUS_LOST) &&
            event.window.windowID==SDL_GetWindowID(window)) {
             focused=event.type==SDL_EVENT_WINDOW_FOCUS_GAINED;
-            if(game) game->output_gain(settings.output_gain(focused));
+            update_audio_gain();
         }
         if((event.type==SDL_EVENT_MOUSE_MOTION && (event.motion.xrel || event.motion.yrel)) ||
            event.type==SDL_EVENT_MOUSE_BUTTON_DOWN || event.type==SDL_EVENT_MOUSE_BUTTON_UP ||
@@ -602,6 +767,7 @@ struct App {
         }
         if((event.type==SDL_EVENT_KEY_DOWN || event.type==SDL_EVENT_KEY_UP) &&
            (event.key.scancode==SDL_SCANCODE_ESCAPE || event.key.scancode==SDL_SCANCODE_F1)) {
+            if(achievement_reset_open || event.type==SDL_EVENT_KEY_UP) {ImGui_ImplSDL3_ProcessEvent(&event);return;}
             if(event.type==SDL_EVENT_KEY_DOWN && !event.key.repeat) {
                 show_settings=!show_settings;binding_action=-1;if(!show_settings) save_settings();
             }
@@ -698,7 +864,7 @@ struct App {
         const bool reorder=settings.enabled_mods.size()>1;
         std::string action;int direction=0;
         if(available_mods.empty() && settings.enabled_mods.empty()) {
-            ImGui::TextDisabled("No mods installed.");
+            disabled_text("No mods installed.");
         } else if(ImGui::BeginTable("Mods list",reorder?3:2,ImGuiTableFlags_RowBg|ImGuiTableFlags_BordersInnerH|ImGuiTableFlags_PadOuterX)) {
             ImGui::TableSetupColumn("Enabled",ImGuiTableColumnFlags_WidthFixed,ImGui::CalcTextSize("Enabled").x);
             ImGui::TableSetupColumn("Mod",ImGuiTableColumnFlags_WidthStretch);
@@ -719,7 +885,7 @@ struct App {
                 setting_help("Expand for version, author and file details.");
                 ImGui::Indent(ImGui::GetTreeNodeToLabelSpacing());
                 if(mod && !mod->description.empty()) {
-                    ImGui::PushTextWrapPos(0);ImGui::TextDisabled("%s",mod->description.c_str());ImGui::PopTextWrapPos();
+                    disabled_text("%s",mod->description.c_str());
                 }
                 if(!mod || !mod->error.empty()) {
                     ImGui::PushStyleColor(ImGuiCol_Text,ImVec4{1,.55f,.42f,1});
@@ -732,7 +898,7 @@ struct App {
                     if(mod) {
                         if(!mod->version.empty()) ImGui::TextWrapped("Version: %s",mod->version.c_str());
                         if(!mod->author.empty()) ImGui::TextWrapped("Author: %s",mod->author.c_str());
-                        ImGui::TextDisabled("%zu %s",mod->files.size(),mod->files.size()==1?"file":"files");
+                        disabled_text("%zu %s",mod->files.size(),mod->files.size()==1?"file":"files");
                     }
                     ImGui::TextWrapped("Folder: %s",id.c_str());
                 }
@@ -869,6 +1035,7 @@ struct App {
     }
     void settings_interface() {
         PerfScope timing(&performance,PerfPhase::ui);
+        save_achievements();
         ImGui_ImplDX11_NewFrame();ImGui_ImplSDL3_NewFrame();ImGui::NewFrame();
         if(show_settings) {
             const auto* viewport=ImGui::GetMainViewport();
@@ -888,8 +1055,8 @@ struct App {
             ImGui::Image(logo.Get(),{64,64});
             ImGui::SetCursorPos({header.x,header.y+74});ImGui::Separator();ImGui::Spacing();
             bool changed=false;
-            constexpr const char* categories[]={"Game files","General","Audio","Graphics","Enhancements","Controls","Mods","Diagnostics"};
-            constexpr const char* navigation[]={"        Game files","        General","        Audio","        Graphics","        Enhancements","        Controls","        Mods","        Diagnostics"};
+            constexpr const char* categories[]={"Game files","General","Audio","Graphics","Enhancements","Controls","Achievements","Mods","Diagnostics"};
+            constexpr const char* navigation[]={"        Game files","        General","        Audio","        Graphics","        Enhancements","        Controls","        Achievements","        Mods","        Diagnostics"};
             if(select_category>=0 && select_category<int(std::size(categories))) {category=select_category;binding_action=-1;}
             select_category=-1;
             ImGui::BeginChild("Settings body",{0,-66},0,ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_NoScrollWithMouse);
@@ -957,13 +1124,13 @@ struct App {
                         audio_changed|=ImGui::Checkbox("Mute on focus loss",&settings.mute_on_focus_loss);
                         setting_help("Silences game audio while another window has focus. Restores your volume when you return.");
                         changed|=audio_changed;
-                        if(audio_changed && game) game->output_gain(settings.output_gain(focused));
+                        if(audio_changed) update_audio_gain();
                         ImGui::Spacing();ImGui::SeparatorText("YOUR SOUNDTRACK");
                         ImGui::BeginDisabled(music_songs==0 || music_importing);
                         changed|=ImGui::Checkbox("Custom music",&settings.custom_music);
                         setting_help("Makes imported music available in the game's Music Selection menu. Applies when you start or restart the game.");
                         ImGui::EndDisabled();
-                        ImGui::TextDisabled("%u songs imported",music_songs);
+                        disabled_text("%u songs imported",music_songs);
                         ImGui::BeginDisabled(music_importing || music_folder_selection!=nullptr);
                         setting_label("Music folder");ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x-104);
                         ImGui::InputText("##Music folder",settings.music_folder.data(),settings.music_folder.size(),ImGuiInputTextFlags_ReadOnly);
@@ -1088,8 +1255,9 @@ struct App {
                             ImGui::EndTable();
                         }
                         break;
-                    case 6:changed|=mods_interface();break;
-                    case 7:
+                    case 6:achievements_interface();break;
+                    case 7:changed|=mods_interface();break;
+                    case 8:
                         ImGui::SeparatorText("CAPTURE & PERFORMANCE");
                         if(ImGui::Button("Capture frame (F8)")) capture_frame();
                         setting_help("Saves a window image and display details in build/captures. During a game, also saves the game frame and audio.");
@@ -1097,7 +1265,7 @@ struct App {
                         if(ImGui::Button(performance.active()?"Save performance (F9)":"Record performance (F9)")) toggle_performance();
                         setting_help("Record a slowdown, then press F9 to save. Recording stops after 60 seconds. F8 also saves performance while recording.");
                         ImGui::EndDisabled();
-                        if(!playing) ImGui::TextDisabled("Performance recording is available while a game is running.");
+                        if(!playing) disabled_text("Performance recording is available while a game is running.");
                         ImGui::Spacing();ImGui::SeparatorText("ACTIVITY");
                         if(log_messages.empty()) ImGui::TextUnformatted("No messages yet.");
                         for(auto message=log_messages.rbegin();message!=log_messages.rend();++message) {
@@ -1113,7 +1281,7 @@ struct App {
             const auto button_width=std::clamp((available-spacing*(count-1))/count,1.0f,145.0f);
             const auto row_width=button_width*count+spacing*(count-1);
             const auto footer=ImGui::GetCursorPos();
-            if(available-row_width>175) {ImGui::AlignTextToFramePadding();ImGui::TextDisabled("Saved automatically");}
+            if(available-row_width>175) {ImGui::AlignTextToFramePadding();disabled_text("Saved automatically");}
             ImGui::SetCursorPos({footer.x+available-row_width,footer.y});
             ImGui::BeginDisabled(music_importing || music_import_requested);
             ImGui::PushStyleColor(ImGuiCol_Text,ImVec4{.08f,.07f,.06f,1});
@@ -1151,6 +1319,7 @@ struct App {
             ImGui::Begin("Performance recording",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoInputs|ImGuiWindowFlags_NoFocusOnAppearing);
             ImGui::TextUnformatted("Recording performance - F9 saves");ImGui::End();
         }
+        achievement_toast();
         ImGui::Render();ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         if(!pending_window_capture.empty()) {
             PerfScope capture(&performance,PerfPhase::capture);
@@ -1241,6 +1410,7 @@ struct App {
         host.mods_root=mods_root;host.enabled_mods=settings.enabled_mods;
         host.loop_track=settings.loop_track;
         host.music_loop_changed=[this](bool enabled) {settings.loop_track=enabled;settings_dirty=true;save_settings();};
+        host.achievements=&achievements;
         host.performance=&performance;
         host.trace_io=trace_io;
         host.watch_semaphores=watch_semaphores;
@@ -1305,6 +1475,7 @@ int run_app(const std::filesystem::path& xbe,const std::filesystem::path& disc,u
         std::filesystem::current_path(executable_path().parent_path());
     }
     App app(false,false,controls,settings);
+    diagnostic_record("{\"type\":\"window_ready\",\"window\":"+app.window_diagnostic()+'}');
     std::copy(watch_semaphores.begin(),watch_semaphores.end(),app.watch_semaphores.begin());
     if(seconds) app.stop_at=SDL_GetTicksNS()+std::uint64_t(seconds)*1000000000;
     if(!xbe.empty()) {
@@ -1337,6 +1508,9 @@ int run_app(const std::filesystem::path& xbe,const std::filesystem::path& disc,u
 std::string check_window(const std::filesystem::path& path,bool warp) {
     auto preferences=path;preferences+=".cfg";
     App app(true,warp,{},preferences);
+    if(!app.achievement_audio || !app.achievement_audio_size ||
+       !std::any_of(app.achievement_audio_data,app.achievement_audio_data+app.achievement_audio_size,[](Uint8 value){return value!=0;}))
+        throw std::runtime_error("Achievement notification sound is missing or silent");
     const auto resize=[&](int width,int height) {
         if(!SDL_SetWindowSize(app.window,width,height) || !SDL_SyncWindow(app.window))
             throw std::runtime_error(SDL_GetError());
@@ -1368,10 +1542,15 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     restored.muted=false;restored.mute_on_focus_loss=false;restored.save(preferences);
     if(restored.output_gain(false)!=.37f || Preferences(true,preferences).mute_on_focus_loss)
         throw std::runtime_error("Focus muting could not be disabled");
+    const auto default_volume=app.settings.volume;
+    app.settings.volume=37;app.settings.mute_on_focus_loss=true;
     SDL_Event focus{};focus.type=SDL_EVENT_WINDOW_FOCUS_GAINED;focus.window.windowID=SDL_GetWindowID(app.window);app.event(focus);
-    if(!app.focused) throw std::runtime_error("Focus gain was ignored");
+    if(!app.focused || SDL_GetAudioStreamGain(app.achievement_audio)!=.37f) throw std::runtime_error("Focus gain or notification volume was ignored");
     focus.type=SDL_EVENT_WINDOW_FOCUS_LOST;app.event(focus);
-    if(app.focused) throw std::runtime_error("Focus loss was ignored");
+    if(app.focused || SDL_GetAudioStreamGain(app.achievement_audio)!=0) throw std::runtime_error("Focus loss or notification muting was ignored");
+    app.settings.mute_on_focus_loss=false;app.settings.muted=true;app.update_audio_gain();
+    if(SDL_GetAudioStreamGain(app.achievement_audio)!=0) throw std::runtime_error("Mute did not silence achievement notifications");
+    app.settings.muted=false;app.settings.volume=default_volume;app.update_audio_gain();
     saved.clean_hud=true;saved.save(preferences);
     if(!Preferences(true,preferences).clean_hud) throw std::runtime_error("Enabled Clean HUD did not survive save/load");
     for(const auto value:{1,2,4}) {
@@ -1413,7 +1592,7 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     if(automatic.bindings[15]!=SDL_SCANCODE_Z || app.settings_dirty) throw std::runtime_error("Edited settings were not saved when closing settings");
     app.event(escape);
     app.log_message("Starting game...");
-    constexpr const char* names[]={"game-files","general","audio","graphics","enhancements","controls","mods","log"};
+    constexpr const char* names[]={"game-files","general","audio","graphics","enhancements","controls","achievements","mods","log"};
     std::ostringstream images;images<<'[';
     for(int tab=0;tab<int(std::size(names));++tab) {
         app.select_category=tab;
@@ -1434,13 +1613,13 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     }
     // Reopen a panel after mouse focus, then verify keyboard focus still works.
     // Escape must only toggle settings, not select the child panel itself.
-    const auto settings_frame=[&] {
+    const auto settings_frame=[&](bool present=true) {
         app.renderer->begin(0xFF16344A);app.renderer->end();app.renderer->display();
-        app.settings_interface();app.renderer->present(false);
+        app.settings_interface();if(present) app.renderer->present(false);
     };
     auto& ui=ImGui::GetIO();
     ui.ClearInputKeys();ui.AddFocusEvent(true);
-    app.playing=true;app.select_category=6;
+    app.playing=true;app.select_category=7;
     for(unsigned frame=0;frame<3;++frame) settings_frame();
     ui.AddMousePosEvent(550,450);settings_frame();
     ui.AddMouseButtonEvent(0,true);settings_frame();
@@ -1461,7 +1640,7 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     ui.AddMouseButtonEvent(0,true);settings_frame();
     ui.AddMouseButtonEvent(0,false);settings_frame();
     app.playing=false;
-    for(const int category:{4,5,6}) {
+    for(const int category:{4,5,6,7}) {
         resize(640,480);
         app.select_category=category;
         for(unsigned frame=0;frame<3;++frame) {
@@ -1475,6 +1654,94 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
         images<<std::format(",{{\"category\":{},\"image\":{}}}",json(std::string("small-")+names[category]),json(path_text(output)));
     }
     resize(960,720);
+    if(achievement_opacity(0)!=0 || achievement_opacity(250000000)!=1 || achievement_opacity(4650000000ULL)!=1 ||
+       achievement_opacity(achievement_duration)!=0 || std::abs(achievement_opacity(125000000)-.5f)>.0001f ||
+       std::abs(achievement_opacity(4825000000ULL)-.5f)>.0001f)
+        throw std::runtime_error("Achievement fades do not cover the notification's start and end");
+    app.achievements.crash_result(0,1);app.show_settings=false;
+    for(unsigned frame=0;frame<3;++frame) settings_frame();
+    if(app.achievement_notification!=AchievementId::crash_course || !app.achievements.unlocked(AchievementId::crash_course))
+        throw std::runtime_error("Achievement notification did not appear with settings closed");
+    if(SDL_GetAudioStreamQueued(app.achievement_audio)!=int(app.achievement_audio_size))
+        throw std::runtime_error("Achievement sound was omitted or played more than once");
+    for(const auto [name,elapsed]:std::array<std::pair<const char*,std::uint64_t>,3>{{
+        {"achievement-unlocked",1000000000ULL},{"achievement-fade-in",125000000},{"achievement-fade-out",4825000000ULL}}}) {
+        app.achievement_started=SDL_GetTicksNS()-elapsed;settings_frame(false);
+        auto toast_image=path.parent_path()/path.stem();toast_image+="-";toast_image+=name;toast_image+=".png";
+        save_png(app.renderer->read_display(),toast_image);app.renderer->present(false);
+        images<<std::format(",{{\"category\":{},\"image\":{}}}",json(name),json(path_text(toast_image)));
+    }
+    app.save_achievements(true);
+    Achievements restored_achievements;restored_achievements.load(app.achievements_path);
+    restored_achievements.crash_result(29,3);
+    if(!app.achievements_error.empty() || app.achievements.dirty() || !restored_achievements.unlocked(AchievementId::crash_course) ||
+       restored_achievements.dirty() || restored_achievements.take_notification())
+        throw std::runtime_error("Achievement save/load lost progress or repeated its notification");
+    app.achievement_started=SDL_GetTicksNS()-achievement_duration;settings_frame();
+    if(app.achievement_notification) throw std::runtime_error("Achievement notification did not expire");
+    app.show_settings=true;app.select_category=6;
+    for(unsigned frame=0;frame<3;++frame) settings_frame(frame!=2);
+    auto unlocked_image=path.parent_path()/path.stem();unlocked_image+="-achievements-complete.png";
+    save_png(app.renderer->read_display(),unlocked_image);
+    app.renderer->present(false);
+    images<<std::format(",{{\"category\":\"achievements-complete\",\"image\":{}}}",json(path_text(unlocked_image)));
+    const auto click_reset=[&] {
+        ui.AddMousePosEvent(500,252);settings_frame();
+        ui.AddMouseButtonEvent(0,true);settings_frame();
+        ui.AddMouseButtonEvent(0,false);settings_frame();
+        for(unsigned frame=0;frame<2;++frame) settings_frame();
+        if(!app.achievement_reset_open || app.achievements.count()!=1)
+            throw std::runtime_error("Reset did not request confirmation before clearing progress");
+    };
+    const auto press=[&](ImGuiKey key) {
+        ui.AddKeyEvent(key,true);settings_frame();ui.AddKeyEvent(key,false);settings_frame();
+    };
+    click_reset();SDL_Delay(180);settings_frame(false);
+    auto confirmation_image=path.parent_path()/path.stem();confirmation_image+="-achievements-reset.png";
+    save_png(app.renderer->read_display(),confirmation_image);app.renderer->present(false);
+    images<<std::format(",{{\"category\":\"achievements-reset\",\"image\":{}}}",json(path_text(confirmation_image)));
+    SDL_Event cancel{};cancel.type=SDL_EVENT_KEY_DOWN;cancel.key.windowID=SDL_GetWindowID(app.window);
+    cancel.key.scancode=SDL_SCANCODE_ESCAPE;cancel.key.key=SDLK_ESCAPE;app.event(cancel);settings_frame();
+    cancel.type=SDL_EVENT_KEY_UP;app.event(cancel);settings_frame();
+    if(app.achievement_reset_open || !app.show_settings || app.achievements.count()!=1 || ImGui::IsKeyDown(ImGuiKey_Escape))
+        throw std::runtime_error("Escape did not cancel the reset while keeping settings and progress");
+    click_reset();press(ImGuiKey_Enter);
+    if(app.achievement_reset_open || app.achievements.count()!=1)
+        throw std::runtime_error("Reset confirmation did not default to Cancel");
+    click_reset();press(ImGuiKey_Tab);press(ImGuiKey_Enter);
+    if(app.achievement_reset_open || app.achievements.count())
+        throw std::runtime_error("Confirming Reset did not clear achievement progress");
+    auto legacy=app.achievements_path;legacy+=".legacy";
+    write_text(legacy,"b2-achievements-v1\ncrash_course=1\n",true);
+    Achievements legacy_achievements;legacy_achievements.load(legacy);
+    if(!legacy_achievements.enabled() || legacy_achievements.count()!=1 || legacy_achievements.take_notification())
+        throw std::runtime_error("Existing achievement files lost progress or became disabled");
+    auto complete_path=app.achievements_path;complete_path+=".complete";
+    Achievements complete;
+    for(unsigned i=0;i<achievement_definitions.size();++i) complete.unlock(AchievementId(i));
+    complete.save(complete_path);Achievements restored_complete;restored_complete.load(complete_path);
+    if(restored_complete.count()!=achievement_definitions.size() || restored_complete.take_notification())
+        throw std::runtime_error("The full achievement list did not persist cleanly");
+    app.achievements.reset();app.achievements.crash_result(0,1);settings_frame();
+    app.achievements.enabled(false);settings_frame(false);
+    auto disabled_image=path.parent_path()/path.stem();disabled_image+="-achievements-disabled.png";
+    save_png(app.renderer->read_display(),disabled_image);app.renderer->present(false);app.save_achievements(true);
+    images<<std::format(",{{\"category\":\"achievements-disabled\",\"image\":{}}}",json(path_text(disabled_image)));
+    Achievements disabled;disabled.load(app.achievements_path);
+    if(disabled.enabled() || disabled.count()!=1 || app.achievement_notification || app.achievements.take_notification() || SDL_GetAudioStreamQueued(app.achievement_audio))
+        throw std::runtime_error("Disabling achievements lost progress, kept a notification or did not persist");
+    app.achievements.reset();app.achievements.crash_result(29,3);settings_frame();app.save_achievements(true);
+    Achievements reset;reset.load(app.achievements_path);
+    if(reset.count() || reset.enabled() || app.achievements.count() || app.achievement_notification || app.achievements.take_notification())
+        throw std::runtime_error("Reset did not persist or disabled achievements continued unlocking");
+    app.achievements.enabled(true);settings_frame();
+    if(app.achievement_notification || app.achievements.count()) throw std::runtime_error("Enabling achievements replayed a disabled result");
+    app.achievements.crash_result(29,1);settings_frame();
+    if(app.achievement_notification!=AchievementId::crash_course) throw std::runtime_error("Reset achievements could not be earned again");
+    app.achievements.reset();settings_frame();app.save_achievements(true);
+    Achievements cleared;cleared.load(app.achievements_path);
+    if(app.achievement_notification || cleared.count() || !cleared.enabled() || !app.achievements_error.empty() || SDL_GetAudioStreamQueued(app.achievement_audio))
+        throw std::runtime_error("Reset kept an active notification or enabling did not persist");
     images<<']';app.select_category=0;app.settings.vsync=false;
     app.capture_frame();const auto window_capture=app.pending_window_capture.parent_path();app.display(true);
     const auto captured_window=load_image(window_capture/"window.png");
@@ -1620,7 +1887,7 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     return std::format("{{\"format\":\"b2-window-check-v4\",\"passed\":true,\"backend\":\"SDL3/D3D11/ImGui\",\"adapter\":{},\"window\":{},\"settings_font\":{},\"heading_font\":{},\"default_refresh_rate\":60,"
         "\"bindings_and_settings\":true,\"automatic_settings_save\":true,\"restart_request\":true,\"exit_request\":true,\"widescreen_presentation\":true,\"ultrawide_presentation\":true,\"motion_blur_setting\":true,\"frame_counter\":true,\"counter_image\":{},\"escape_toggle\":true,\"resolution_change\":true,"
         "\"pacing_60_hz\":{:.3f},\"pacing_120_hz\":{:.3f},\"source_at_120_hz\":{:.3f},\"source_at_144_hz\":{:.3f},\"display_120_hz\":{:.3f},\"display_144_hz\":{:.3f},"
-        "\"window_capture\":true,\"performance_capture\":true,\"shader_compilations\":0,\"game_booted\":false,\"game_fps_established\":false,\"images\":{}}}",
+        "\"achievements_save_load\":true,\"achievements_reset\":true,\"achievement_reset_confirmation\":true,\"achievements_disable\":true,\"achievement_notification\":true,\"achievement_sound\":true,\"achievement_fades\":true,\"window_capture\":true,\"performance_capture\":true,\"shader_compilations\":0,\"game_booted\":false,\"game_fps_established\":false,\"images\":{}}}",
         json(renderer.adapter()),app.window_diagnostic(),json(ImGui::GetIO().FontDefault->GetDebugName()),json(app.heading_font->GetDebugName()),
         json(path_text(counter_image)),measured[0],measured[1],source_rates[0],source_rates[1],display_rates[0],display_rates[1],images.str());
 }

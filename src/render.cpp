@@ -269,9 +269,9 @@ void write_uniforms(void* output,const ProgramUniforms& values,unsigned first,un
     if(count) std::memcpy(bytes,values.constants.data()+first,constants);
     std::memcpy(bytes+constants,&values.viewport,sizeof(ProgramUniforms)-sizeof(VertexConstants));
 }
-Constants fragment_constants(const RenderState& state) {
+Constants fragment_constants(const RenderState& state,std::uint32_t feedback_phase) {
     Constants values{};
-    values.coverage={std::uint32_t(state.coverage),std::uint32_t(state.coverage>>32),0,0};
+    values.coverage={std::uint32_t(state.coverage),std::uint32_t(state.coverage>>32),feedback_phase,0};
     for(unsigned i=0;i<8;++i) {
         values.factor0[i]=color(state.factor0[i]);values.factor1[i]=color(state.factor1[i]);
         values.combiners[i]={state.color_inputs[i],state.alpha_inputs[i],state.color_outputs[i],state.alpha_outputs[i]};
@@ -509,6 +509,8 @@ struct Renderer::Impl {
     std::unique_ptr<GpuMeter> gpu_meter;
     void count(PerfMetric metric,std::uint64_t amount=1) {if(profile) stats.counters[unsigned(metric)]+=amount;}
     std::array<ComPtr<ID3D11PixelShader>,4> simple_combiners;
+    std::array<ComPtr<ID3D11PixelShader>,2> feedback_shaders;
+    ComPtr<ID3D11BlendState> feedback_blend;
     ComPtr<ID3D11Texture2D> target, depth, staging;
     ComPtr<ID3D11RenderTargetView> rtv;
     ComPtr<ID3D11DepthStencilView> dsv;
@@ -535,7 +537,7 @@ struct Renderer::Impl {
         ID3D11VertexShader* vertex=nullptr;ID3D11PixelShader* pixel=nullptr;
         ID3D11GeometryShader* geometry=nullptr;
         ID3D11BlendState* blend=nullptr;ID3D11DepthStencilState* depth=nullptr;ID3D11RasterizerState* raster=nullptr;
-        std::array<ID3D11ShaderResourceView*,12> views{};
+        std::array<ID3D11ShaderResourceView*,13> views{};
         std::array<ID3D11SamplerState*,4> samplers{};
         UINT stencil=0;D3D11_RECT scissor{};
         UINT factor_offset=0,program_offset=0,program_count=0;
@@ -564,6 +566,11 @@ struct Renderer::Impl {
     std::uint32_t current_target=0;
     std::uint32_t presentation_target=0;
     std::uint32_t feedback_target=0;
+    struct FeedbackImage {
+        ComPtr<ID3D11Texture2D> image;
+        ComPtr<ID3D11ShaderResourceView> view;
+        std::size_t bytes=0;
+    } feedback_image;
     const Visibility* visibility=nullptr;
     void visibility_scope(bool original) const {if(visibility) visibility->scope(visibility->context,original);}
     std::size_t target_bytes=0;
@@ -712,9 +719,13 @@ struct Renderer::Impl {
     std::string adapter;
     std::uint32_t width, height, resolution_scale;
     std::size_t target_limit=1024ULL*1024*1024;
-    std::size_t target_size(unsigned w,unsigned h) const {return std::size_t(w)*h*resolution_scale*resolution_scale*(samples>1?8*samples+8:12);}
+    std::size_t target_size(unsigned w,unsigned h,SurfaceColor color=SurfaceColor::rgba8) const {
+        const auto bytes=color==SurfaceColor::rgb565?2U:frame_color_bytes;
+        return std::size_t(w)*h*resolution_scale*resolution_scale*(samples>1?(bytes+4)*samples+bytes*2:bytes*2+4);
+    }
+    std::size_t feedback_size(unsigned w,unsigned h) const {return std::size_t(w)*h*resolution_scale*resolution_scale*samples*frame_color_bytes;}
     std::size_t target_usage() const {
-        auto bytes=target_bytes+(antialiasing?antialiasing->bytes():0)+(layers?layers->bytes():0)+(ambient_occlusion?ambient_occlusion->bytes():0);
+        auto bytes=target_bytes+feedback_image.bytes+(antialiasing?antialiasing->bytes():0)+(layers?layers->bytes():0)+(ambient_occlusion?ambient_occlusion->bytes():0);
         return bytes;
     }
     void reset_layers() {
@@ -847,12 +858,12 @@ struct Renderer::Impl {
         checked(device->CreateSamplerState(&sampler,&default_sampler),"Default texture sampler");
         for(unsigned count:{2U,4U,8U}) {
             bool supported=true;
-            for(auto format:{DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_B5G6R5_UNORM,DXGI_FORMAT_D16_UNORM,DXGI_FORMAT_D24_UNORM_S8_UINT}) {
+            for(auto format:{frame_color_format,DXGI_FORMAT_B5G6R5_UNORM,DXGI_FORMAT_D16_UNORM,DXGI_FORMAT_D24_UNORM_S8_UINT}) {
                 UINT quality=0;supported&=SUCCEEDED(device->CheckMultisampleQualityLevels(format,count,&quality)) && quality!=0;
             }
-            for(auto format:{DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_B5G6R5_UNORM,DXGI_FORMAT_R16_UNORM,DXGI_FORMAT_R24_UNORM_X8_TYPELESS,DXGI_FORMAT_X24_TYPELESS_G8_UINT}) {
+            for(auto format:{frame_color_format,DXGI_FORMAT_B5G6R5_UNORM,DXGI_FORMAT_R16_UNORM,DXGI_FORMAT_R24_UNORM_X8_TYPELESS,DXGI_FORMAT_X24_TYPELESS_G8_UINT}) {
                 UINT flags=0;supported&=SUCCEEDED(device->CheckFormatSupport(format,&flags)) && (flags&D3D11_FORMAT_SUPPORT_MULTISAMPLE_LOAD)!=0;
-                if(format==DXGI_FORMAT_R8G8B8A8_UNORM || format==DXGI_FORMAT_B5G6R5_UNORM) supported&=(flags&D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE)!=0;
+                if(format==frame_color_format || format==DXGI_FORMAT_B5G6R5_UNORM) supported&=(flags&D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE)!=0;
             }
             if(supported) msaa_supported|=count;
         }
@@ -898,6 +909,14 @@ struct Renderer::Impl {
             const auto pixel=shader(ShaderKind(unsigned(ShaderKind::color)+i));
             checked(device->CreatePixelShader(pixel.data(),pixel.size(),nullptr,&simple_combiners[i]),"Simple combiner shader");
         }
+        for(unsigned i=0;i<feedback_shaders.size();++i) {
+            const auto pixel=shader(i?ShaderKind::feedback_ms:ShaderKind::feedback);
+            checked(device->CreatePixelShader(pixel.data(),pixel.size(),nullptr,&feedback_shaders[i]),"Framebuffer feedback shader");
+        }
+        D3D11_BLEND_DESC feedback{};auto& blend=feedback.RenderTarget[0];
+        blend.SrcBlend=blend.SrcBlendAlpha=D3D11_BLEND_ONE;blend.DestBlend=blend.DestBlendAlpha=D3D11_BLEND_ZERO;
+        blend.BlendOp=blend.BlendOpAlpha=D3D11_BLEND_OP_ADD;blend.RenderTargetWriteMask=7;
+        checked(device->CreateBlendState(&feedback,&feedback_blend),"Framebuffer feedback output");
         std::array<D3D11_INPUT_ELEMENT_DESC,16> program_inputs{};
         for(unsigned i=0;i<program_inputs.size();++i)
             program_inputs[i]={"TEXCOORD",i,DXGI_FORMAT_R32G32B32A32_FLOAT,0,i*16,D3D11_INPUT_PER_VERTEX_DATA,0};
@@ -984,7 +1003,7 @@ struct Renderer::Impl {
     FrameTarget make_target(std::uint32_t w,std::uint32_t h,SurfaceColor color_format=SurfaceColor::rgba8,SurfaceDepth depth_format=SurfaceDepth::z24s8) {
         extent(w,h);
         FrameTarget output{w,h,color_format,depth_format};
-        const auto native_color=color_format==SurfaceColor::rgb565?DXGI_FORMAT_B5G6R5_UNORM:DXGI_FORMAT_R8G8B8A8_UNORM;
+        const auto native_color=color_format==SurfaceColor::rgb565?DXGI_FORMAT_B5G6R5_UNORM:frame_color_format;
         D3D11_TEXTURE2D_DESC texture{};
         texture.Width=w*resolution_scale; texture.Height=h*resolution_scale; texture.MipLevels=texture.ArraySize=1;
         extent(texture.Width,texture.Height);
@@ -1018,8 +1037,29 @@ struct Renderer::Impl {
     void resolve(FrameTarget& output) {
         if(samples==1 || !output.dirty) return;
         unbind_textures();context->OMSetRenderTargets(0,nullptr,nullptr);
-        context->ResolveSubresource(output.image.Get(),0,output.color.Get(),0,output.color_format==SurfaceColor::rgb565?DXGI_FORMAT_B5G6R5_UNORM:DXGI_FORMAT_R8G8B8A8_UNORM);
+        context->ResolveSubresource(output.image.Get(),0,output.color.Get(),0,output.color_format==SurfaceColor::rgb565?DXGI_FORMAT_B5G6R5_UNORM:frame_color_format);
         output.dirty=false;auto color=rtv.Get();context->OMSetRenderTargets(1,&color,dsv.Get());
+    }
+    FeedbackImage make_feedback(unsigned w,unsigned h) {
+        FeedbackImage result;result.bytes=feedback_size(w,h);
+        D3D11_TEXTURE2D_DESC image{};image.Width=w*resolution_scale;image.Height=h*resolution_scale;
+        image.MipLevels=image.ArraySize=1;image.Format=frame_color_format;image.SampleDesc.Count=samples;
+        image.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+        checked(device->CreateTexture2D(&image,nullptr,&result.image),"Framebuffer blend destination");
+        checked(device->CreateShaderResourceView(result.image.Get(),nullptr,&result.view),"Framebuffer blend destination view");
+        count(PerfMetric::target_creations);return result;
+    }
+    std::uint32_t feedback_phase(const RenderState& state) const {
+        if(state.depth_test || !state.blend || state.blend_source!=0x302 ||
+           state.blend_destination!=0x303 || state.blend_equation!=0x8006 || state.color_mask!=0x00010101 ||
+           simple_combiner(state)!=1) return 0;
+        const auto previous=targets.find(state.textures[0]);
+        if(previous==targets.end()) return 0;
+        const auto& current=targets.at(current_target);const auto& main=targets.at(0);
+        if(previous->second.color_format!=SurfaceColor::rgba8 || current.color_format!=SurfaceColor::rgba8 ||
+           current.width!=main.width || current.height!=main.height ||
+           previous->second.width!=current.width || previous->second.height!=current.height) return 0;
+        return 1+std::uint32_t((stats.published_frames*157)%257);
     }
     void unbind_textures() {
         bound.valid=false;
@@ -1052,11 +1092,12 @@ struct Renderer::Impl {
         if (target && width==w && height==h) return;
         const auto required=target_size(w,h);
         const auto prior=target?target_size(width,height):0;
-        const auto aa=antialiasing_quality && antialiasing_quality<=3?required/3:0;
-        if(required+aa>target_limit-(target_bytes-prior)) throw std::runtime_error("Render targets exceed the adapter budget");
-        auto output=make_target(w,h);
+        const auto aa=antialiasing_quality && antialiasing_quality<=3?std::size_t(w)*h*resolution_scale*resolution_scale*4:0;
+        if(required+feedback_size(w,h)+aa>target_limit-(target_bytes-prior)) throw std::runtime_error("Render targets exceed the adapter budget");
+        auto output=make_target(w,h);auto feedback=make_feedback(w,h);
         feedback_target=0;
         targets.insert_or_assign(0,std::move(output));target_bytes=target_bytes-prior+required;
+        feedback_image=std::move(feedback);
         select_target(0);ended=false;
     }
 };
@@ -1071,15 +1112,16 @@ void Renderer::reset(unsigned scale) {
     const auto width=r.targets.at(0).width,height=r.targets.at(0).height,previous=r.resolution_scale;
     r.resolution_scale=scale;
     Impl::FrameTarget main;
+    Impl::FeedbackImage feedback;
     try {
-        if(r.target_size(width,height)>r.target_limit) throw std::runtime_error("Render targets exceed the adapter budget; reduce resolution or MSAA.");
-        main=r.make_target(width,height);
+        if(r.target_size(width,height)+r.feedback_size(width,height)>r.target_limit) throw std::runtime_error("Render targets exceed the adapter budget; reduce resolution or MSAA.");
+        main=r.make_target(width,height);feedback=r.make_feedback(width,height);
     } catch(...) {r.resolution_scale=previous;throw;}
     r.reset_layers();r.antialiasing.reset();r.ambient_occlusion.reset();
     r.camera_valid=false;
     r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
     r.targets.clear();r.textures.resize(1);r.free_textures.clear();r.texture_bytes=0;
-    r.presentation_target=r.feedback_target=0;
+    r.presentation_target=r.feedback_target=0;r.feedback_image=std::move(feedback);
     r.targets.emplace(0,std::move(main));r.target_bytes=r.target_size(width,height);r.select_target(0);r.ended=false;
     const auto compilations=r.stats.shader_compilations;r.stats={};r.stats.shader_compilations=compilations;
     r.vertex_cursor=r.index_cursor=0;r.factors_valid=r.program_valid=false;
@@ -1100,7 +1142,7 @@ std::uint32_t Renderer::create_target(std::uint32_t width,std::uint32_t height,S
     auto& r=*impl_;extent(width,height);
     PerfScope timing(r.profile,PerfPhase::resources);r.count(PerfMetric::target_creations);
     if(r.recording) throw std::runtime_error("Create render targets before frame submission");
-    const auto required=r.target_size(width,height);
+    const auto required=r.target_size(width,height,color);
     if(!r.texture_capacity() || required>r.target_limit-r.target_usage())
         throw std::runtime_error("Render target resource limit reached");
     auto output=r.make_target(width,height,color,depth);
@@ -1121,7 +1163,7 @@ void Renderer::grow_target(std::uint32_t target,std::uint32_t width,std::uint32_
     const auto& prior=found->second;
     if(width<prior.width || height<prior.height) throw std::runtime_error("Target growth cannot shrink either dimension");
     if(width==prior.width && height==prior.height) return;
-    const auto previous=r.target_size(prior.width,prior.height),required=r.target_size(width,height);
+    const auto previous=r.target_size(prior.width,prior.height,prior.color_format),required=r.target_size(width,height,prior.color_format);
     if(required>r.target_limit-(r.target_usage()-previous)) throw std::runtime_error("Render targets exceed the adapter budget");
     auto output=r.make_target(width,height,prior.color_format,prior.depth_format);
     r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
@@ -1183,7 +1225,7 @@ std::uint32_t Renderer::copy_cubemap(const std::array<std::uint32_t,6>& faces,st
     description.MiscFlags=D3D11_RESOURCE_MISC_TEXTURECUBE;
     ComPtr<ID3D11Texture2D> cube;
     if(!destination) {
-        const auto required=std::size_t(description.Width)*description.Height*6*(description.Format==DXGI_FORMAT_B5G6R5_UNORM?2:4);
+        const auto required=std::size_t(description.Width)*description.Height*6*(description.Format==DXGI_FORMAT_B5G6R5_UNORM?2:frame_color_bytes);
         if(!r.texture_capacity() || required>256*1024*1024-r.texture_bytes)
             throw std::runtime_error("Cubemap texture resource limit reached");
         checked(r.device->CreateTexture2D(&description,nullptr,&cube),"GPU cubemap");
@@ -1363,7 +1405,7 @@ void Renderer::enhancements(unsigned quality,unsigned anisotropy) {
     if(quality && quality<=3) {
         const auto& main=r.targets.at(0);
         const auto bytes=std::size_t(main.width)*main.height*r.resolution_scale*r.resolution_scale*4;
-        if(bytes>r.target_limit-r.target_bytes) throw std::runtime_error("Antialiasing exceeds the render-target budget.");
+        if(bytes>r.target_limit-r.target_bytes-r.feedback_image.bytes) throw std::runtime_error("Antialiasing exceeds the render-target budget.");
         next=std::make_unique<FrameAntialiasing>(r.device.Get(),r.context.Get(),main.width*r.resolution_scale,main.height*r.resolution_scale,quality,r.stats.shader_compilations);
         r.count(PerfMetric::target_creations);
     }
@@ -1616,7 +1658,7 @@ void Renderer::release(std::uint32_t resource) {
     if(const auto found=r.targets.find(resource);found!=r.targets.end()) {
         if(r.feedback_target==resource) r.feedback_target=0;
         if(r.current_target==resource) r.select_target(0);
-        r.target_bytes-=r.target_size(found->second.width,found->second.height);r.targets.erase(found);
+        r.target_bytes-=r.target_size(found->second.width,found->second.height,found->second.color_format);r.targets.erase(found);
     }
     r.texture_bytes-=r.textures[resource].bytes;r.textures[resource]={};r.free_textures.push_back(resource);
 }
@@ -1977,7 +2019,7 @@ void Renderer::draw_streams(std::span<const StreamDraw> draws) {
             if(index_size>Impl::max_indices*4-index_bytes) break;
             auto& staged=r.stream_uploads[last];
             if(r.constant_context) {
-                staged.factors=fragment_constants(*draw.state);
+                staged.factors=fragment_constants(*draw.state,r.feedback_phase(*draw.state));
                 const auto program_id=r.stream_layouts[draw.layout-1].program;
                 const auto& program=r.programs[program_id-1];
                 const auto program_size=uniform_capacity(program.upload_count);
@@ -2154,8 +2196,9 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
         write(mapped.pData); r.context->Unmap(buffer, 0);
     };
     std::optional<Constants> local_factors;
-    const auto* constants=constant_batch?&constant_batch->factors:&local_factors.emplace(fragment_constants(state));
-    std::array<ID3D11ShaderResourceView*, 12> views{};
+    const auto* constants=constant_batch?&constant_batch->factors:&local_factors.emplace(fragment_constants(state,r.feedback_phase(state)));
+    const bool feedback=constants->coverage[2]!=0;
+    std::array<ID3D11ShaderResourceView*, 13> views{};
     std::array<ID3D11SamplerState*, 4> samplers{};
     samplers.fill(r.default_sampler.Get()); // Static shaders declare all four slots.
     for (unsigned i = 0; i < 4; ++i) {
@@ -2177,6 +2220,14 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
             if(sampler==r.sampler_states.end()) throw std::runtime_error("Sampler was not prepared before submission");
             samplers[i]=sampler->second.Get();
         }
+    }
+    if(feedback) {
+        // One reusable colour-only image retains every destination sample.
+        // Main must remain intact for completed-frame/HUD restoration.
+        r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
+        r.context->CopyResource(r.feedback_image.image.Get(),r.target.Get());r.count(PerfMetric::target_copies);
+        views[12]=r.feedback_image.view.Get();
+        auto target=r.rtv.Get();r.context->OMSetRenderTargets(1,&target,r.dsv.Get());
     }
     UINT vertex_offset=0;
     std::array<UINT,17> stream_offsets{},stream_strides{};
@@ -2280,7 +2331,9 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
     if(!bound.valid || bound.layout!=input_layout) r.context->IASetInputLayout(input_layout);
     if(!bound.valid || bound.topology!=topology) r.context->IASetPrimitiveTopology(topology);
     auto vertex=program?program->vertex.Get():r.vs.Get();
-    auto pixel=simple<r.simple_combiners.size()?r.simple_combiners[simple].Get():r.combiners[state.combiner_control&255].Get();
+    auto pixel=feedback?r.feedback_shaders[r.samples>1].Get():
+        simple<r.simple_combiners.size()?r.simple_combiners[simple].Get():r.combiners[state.combiner_control&255].Get();
+    auto blend=feedback?r.feedback_blend.Get():pipeline.blend.Get();
     if(!bound.valid || bound.vertex!=vertex) r.context->VSSetShader(vertex,nullptr,0);
     if(!bound.valid || bound.pixel!=pixel) r.context->PSSetShader(pixel,nullptr,0);
     const auto geometry=state.primitive==1?r.point_geometry.Get():nullptr;
@@ -2313,7 +2366,7 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
     bound.program_offset=r.program_offset;bound.factor_offset=r.factor_offset;bound.program_count=r.program_count;
     if(!bound.valid || bound.views!=views) r.context->PSSetShaderResources(0,static_cast<UINT>(views.size()),views.data());
     if(!bound.valid || bound.samplers!=samplers) r.context->PSSetSamplers(0,4,samplers.data());
-    if(!bound.valid || bound.blend!=pipeline.blend.Get()) r.context->OMSetBlendState(pipeline.blend.Get(),nullptr,~0U);
+    if(!bound.valid || bound.blend!=blend) r.context->OMSetBlendState(blend,nullptr,~0U);
     if(!bound.valid || bound.depth!=pipeline.depth.Get() || bound.stencil!=state.stencil_reference)
         r.context->OMSetDepthStencilState(pipeline.depth.Get(),state.stencil_reference);
     if(!bound.valid || bound.raster!=pipeline.raster.Get()) r.context->RSSetState(pipeline.raster.Get());
@@ -2325,7 +2378,7 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
         bound.scissor=rect;
     }
     bound.layout=input_layout;bound.topology=topology;bound.vertex=vertex;bound.pixel=pixel;bound.geometry=geometry;
-    bound.views=views;bound.samplers=samplers;bound.blend=pipeline.blend.Get();bound.depth=pipeline.depth.Get();bound.raster=pipeline.raster.Get();
+    bound.views=views;bound.samplers=samplers;bound.blend=blend;bound.depth=pipeline.depth.Get();bound.raster=pipeline.raster.Get();
     bound.stencil=state.stencil_reference;bound.scissor_enabled=state.scissor_test;bound.valid=true;
     if(plan.count) {
         UINT index_offset=plan.offset;
@@ -2349,8 +2402,10 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
         for(unsigned i=0;i<FrameLayers::basis_count;++i) targets[i]=r.layers->target(i);
         const auto capture=simple<r.layer_simple.size()?r.layer_simple[simple].Get():r.layer_combiners[state.combiner_control&255].Get();
         r.context->OMSetRenderTargets(unsigned(targets.size()),targets.data(),r.dsv.Get());r.context->PSSetShader(capture,nullptr,0);
+        if(feedback) r.context->OMSetBlendState(pipeline.blend.Get(),nullptr,~0U);
         submit();auto target=r.rtv.Get();
         r.context->OMSetRenderTargets(1,&target,r.dsv.Get());r.context->PSSetShader(pixel,nullptr,0);
+        if(feedback) r.context->OMSetBlendState(blend,nullptr,~0U);
     }
     ++r.stats.draws; r.stats.vertices += count;r.count(PerfMetric::draws);r.count(PerfMetric::vertices,count);
     if(r.samples>1 && state.color_mask) r.targets.at(r.current_target).dirty=true;

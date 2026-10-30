@@ -18,17 +18,15 @@ I'll try to respond in a timely manner. This is an independent fan project, unaf
 Yes, AI (Codex) assisted in the development of this project. No, this project was not blindly thrown together.
 If you're skeptical, I implore you to try the recompilation for yourself. I take quality control quite seriously!👀
 
-## What's new in 1.10
+## What's new in 1.11
 
-- Windows setup now downloads missing build tools automatically and offers **Launch game** when finished.
-- Added asset mods with enable/disable controls, load order, conflict checks and an optional **Test Mod**.
-- Added experimental Steam Deck / SteamOS installation through a user-installed Flatpak runtime.
-- Added **Mute on focus loss** to Audio settings.
-- Finished redrawing the remaining Clean HUD font symbols.
-- Fixed distant traffic appearing as floating tires with increased draw distance.
-- Fixed the flashing **END** box when scrolling through profile-name characters.
-- Improved settings icons and mod guidance, and fixed the orange panel outline when reopening settings.
-- Updated Linux and macOS graphics dependencies and improved diagnostic captures.
+- Added ten achievements covering Crash Zones, races, Driving 101, Championships,
+  starting boosts, Burnout chains and Time Attack.
+- Added an **Achievements** settings tab with saved progress, icons, notifications
+  that fade in and out, and an unlock sound. Disable tracking at any time, or
+  reset progress after confirmation.
+- Fixed lingering trails behind animated text at high refresh rates.
+- Fixed Steam Deck Game Mode startup by keeping X11 available alongside Wayland.
 
 Download the new **Installation.zip**. On Windows, run **Install.cmd** again to
 update. On Linux, open **Install.desktop**; on macOS, open **Install.command**.
@@ -90,6 +88,7 @@ support is still being tested.
 - Optional intro skipping and 2×/4× draw distance, including traffic detail.
 - Clean HUD redraws the original low-resolution interface assets with smooth edges.
 - Optional fast loading skips loading transitions and frame delays.
+- Ten achievements with saved progress and animated unlock notifications.
 - Asset replacement mods with saved load order and conflict checks.
 - Optional automatic muting when the game loses focus.
 
@@ -195,8 +194,9 @@ and refresh the game paths. `bash Install.sh --shortcuts-only` recreates a
 deleted shortcut without rebuilding an installation that remains in place.
 
 1. Close the game and builder.
-2. Back up `data/user` and `data/local/settings.cfg` beside your current `b2.exe`.
-   These contain your saves and settings. If you imported music, also back up
+2. Back up `data/user`, `data/local/settings.cfg` and, if present,
+   `data/local/achievements.cfg` beside your current `b2.exe`. These contain your
+   saves, settings and achievements. If you imported music, also back up
    `data/local/custom-music`. Back up the `mods` folder as well if you added mods.
 3. Download the latest **Installation.zip** and extract it into your existing
    source folder—the folder containing **Build.cmd**—replacing the source files.
@@ -243,6 +243,10 @@ to apply graphics and enhancement changes during play.
   change it in **Music Selection** or **Pause → Options** and confirm your choice.
 - **Controls:** Click a binding and press its replacement; use **Clear** or
   **Restore keyboard defaults** as needed. Esc cancels rebinding.
+- **Achievements:** View progress and the requirements for each achievement.
+  **Disable achievements** pauses new unlocks and notifications while keeping
+  progress; **Enable achievements** resumes tracking. **Reset achievements** asks
+  for confirmation before clearing achievement progress. Game saves are kept.
 - **Mods:** Open the mods folder, add a mod, then **Refresh**. Enable the mods you
   want and use the arrows to set their order; lower enabled mods override earlier
   ones when files overlap. **Check mods** reports conflicts. Changes apply when
@@ -256,6 +260,27 @@ Press **F9** to start or stop a performance recording. Reports are saved under
 `build/captures/performance-*`; include the whole folder when reporting a slowdown.
 Saves are in `data/user` beside the game executable (`b2.exe` on Windows, `b2` on
 Linux and macOS); back up that folder to keep your profiles.
+
+### Achievements
+
+Achievements unlock as you play and are shared across game profiles in the same
+installation. Progress is saved in `data/local/achievements.cfg` beside the game
+executable. Loading an existing save does not immediately award achievements;
+previous medals and completions count toward aggregate goals when you next finish
+a relevant event.
+
+| Achievement | Requirement |
+| --- | --- |
+| Crash + Burn | Earn bronze or better on any Crash Zone. |
+| See You in Hell | Earn gold on all Crash Zones. |
+| Dangerous Driving | Earn gold on all Offensive Driving 101 lessons. |
+| You're Winner ! | Earn first place in any race. |
+| Copped Cars | Complete Pursuit 1, Pursuit 2, and Pursuit 3 in Championship mode. |
+| Burnout Big Leagues | Complete Championship mode. |
+| Burnt Out | Complete Custom Series Championship mode. |
+| Started in Second Gear | Activate a starting boost. |
+| Burnout x Achievement | Achieve a Burnout x 15 or higher. |
+| Stay Frosty | Achieve a time of 0:40.00 or faster on Crystal Summit Peak in Time Attack mode. |
 
 ## Controls
 

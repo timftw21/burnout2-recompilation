@@ -13,7 +13,7 @@ FrameLayers::Images FrameLayers::history(ID3D11Device* device,unsigned width,uns
     Images images;
     D3D11_TEXTURE2D_DESC image{};image.Width=width;image.Height=height;image.MipLevels=image.ArraySize=image.SampleDesc.Count=1;
     for(unsigned i=0;i<image_count;++i) {
-        image.Format=i==1 || i==2?DXGI_FORMAT_R16G16B16A16_FLOAT:DXGI_FORMAT_R8G8B8A8_UNORM;
+        image.Format=!i?frame_color_format:i==1 || i==2?DXGI_FORMAT_R16G16B16A16_FLOAT:DXGI_FORMAT_R8G8B8A8_UNORM;
         image.BindFlags=D3D11_BIND_SHADER_RESOURCE|(render_targets && i?D3D11_BIND_RENDER_TARGET:0);
         checked_flow(device->CreateTexture2D(&image,nullptr,&images.textures[i]),"UI layer image");
         checked_flow(device->CreateShaderResourceView(images.textures[i].Get(),nullptr,&images.views[i]),"UI layer view");
@@ -31,12 +31,12 @@ FrameLayers::FrameLayers(ID3D11Device* device,ID3D11DeviceContext* context,unsig
     D3D11_DEPTH_STENCIL_DESC depth{};depth.DepthFunc=D3D11_COMPARISON_ALWAYS;
     depth.FrontFace=depth.BackFace={D3D11_STENCIL_OP_KEEP,D3D11_STENCIL_OP_KEEP,D3D11_STENCIL_OP_KEEP,D3D11_COMPARISON_ALWAYS};
     checked_flow(device->CreateDepthStencilState(&depth,&depth_),"UI layer initialization depth state");
-    if(samples==1) {images_=history(device,width,height,true);bytes_=std::size_t(width)*height*28;return;}
+    if(samples==1) {images_=history(device,width,height,true);bytes_=std::size_t(width)*height*(frame_color_bytes+24);return;}
     D3D11_TEXTURE2D_DESC image{};image.Width=width;image.Height=height;image.MipLevels=image.ArraySize=1;
-    image.SampleDesc.Count=1;image.Format=DXGI_FORMAT_R8G8B8A8_UNORM;image.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+    image.SampleDesc.Count=1;image.Format=frame_color_format;image.BindFlags=D3D11_BIND_SHADER_RESOURCE;
     checked_flow(device->CreateTexture2D(&image,nullptr,&images_.textures[0]),"Scene before UI");
     checked_flow(device->CreateShaderResourceView(images_.textures[0].Get(),nullptr,&images_.views[0]),"Scene before UI view");
-    bytes_=std::size_t(width)*height*4;
+    bytes_=std::size_t(width)*height*frame_color_bytes;
     if(readable) {images_=history(device,width,height,false);bytes_+=std::size_t(width)*height*24;}
     image.BindFlags=D3D11_BIND_RENDER_TARGET;image.SampleDesc.Count=samples;
     for(unsigned i=0;i<basis_count;++i) {

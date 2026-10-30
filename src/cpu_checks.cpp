@@ -3,6 +3,7 @@
 #include "presentation.h"
 #include "file.h"
 #include "xbe.h"
+#include "achievements.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -1570,6 +1571,140 @@ unsigned check_cpu_image(const std::filesystem::path& path) {
     constexpr std::uint32_t stack=0x4000,begin=0x1800,size=0x1000;
     std::array<std::byte,size> expected{};
     unsigned cases=0;
+    // Execute the original medal calculation at every zone's real boundaries,
+    // including a repeat worse than the saved best. No game boot is required.
+    for(unsigned zone=0;zone<30;++zone) for(unsigned previous:{0U,3U}) {
+        const auto bronze=std::bit_cast<float>(memory.load<std::uint32_t>(0x2FC690+zone*12)),
+            silver=std::bit_cast<float>(memory.load<std::uint32_t>(0x2FC694+zone*12)),gold=std::bit_cast<float>(memory.load<std::uint32_t>(0x2FC698+zone*12));
+        require(bronze>0 && bronze<silver && silver<gold,"Original crash medal targets are not ordered");
+        const std::array<std::pair<float,unsigned>,6> scores{{
+            {std::nextafter(bronze,0.f),0},{bronze,1},{std::nextafter(silver,0.f),1},
+            {silver,2},{std::nextafter(gold,0.f),2},{gold,3}}};
+        for(const auto [score,medal]:scores) {
+            Achievements achievements;
+            constexpr unsigned profile=0x8000,profile_size=0x8C;
+            const auto award=[&](bool observe) {
+                memory.fill_elements<std::uint32_t>(profile,0,profile_size/4,false);
+                memory.store(profile+zone*4,previous);
+                memory.store<std::uint32_t>(stack,0xABCDEF00);memory.store(stack+4,zone);memory.store(stack+8,std::bit_cast<std::uint32_t>(score));
+                Cpu cpu;cpu.registers[ecx]=profile;cpu.registers[esp]=stack;cpu.achievements=observe?&achievements:nullptr;
+                function(0x12650).run(cpu,memory);return cpu;
+            };
+            const auto original=award(false);
+            std::array<std::byte,profile_size> saved{};std::memcpy(saved.data(),memory.access(profile,profile_size),profile_size);
+            const auto observed=award(true);
+            require(observed.registers==original.registers && observed.flags==original.flags && observed.eip==original.eip &&
+                !std::memcmp(saved.data(),memory.access(profile,profile_size),profile_size),"Achievement observation changed the original medal award");
+            require(observed.eip==0xABCDEF00 && observed.registers[esp]==stack+12 && observed.registers[eax]==medal &&
+                memory.load<unsigned>(profile+0x78)==medal,"Original crash medal result or calling convention differs");
+            require(achievements.unlocked(AchievementId::crash_course)==(medal!=0) && achievements.take_notification()==
+                (medal?std::optional(AchievementId::crash_course):std::nullopt),"Crash medal did not produce exactly the qualifying achievement");
+            award(true);
+            require(!achievements.take_notification(),"Repeated crash results notified twice");++cases;
+        }
+    }
+    {
+        Achievements achievements;
+        for(unsigned medal:{0U,4U,UINT32_MAX}) achievements.crash_result(0,medal);
+        for(unsigned zone:{30U,UINT32_MAX}) achievements.crash_result(zone,1);
+        require(!achievements.count() && !achievements.dirty() && !achievements.take_notification(),"Invalid crash results unlocked an achievement");++cases;
+    }
+    {
+        // Exercise the new result observers in a private image, without booting
+        // the game or touching the player's profile. Keep later checks pristine.
+        auto event_bytes=bytes;Memory events(0,event_bytes);
+        constexpr unsigned progress=0x8000,racer=0xA000,stats=racer+0x0C,boost=racer+0x608,vehicle=0xC000,session=0x303C34;
+        const auto value=[&](unsigned address,unsigned data) {events.store(address,data);};
+        const auto number=[&](unsigned address,float data) {value(address,std::bit_cast<unsigned>(data));};
+        const auto setup=[&] {
+            events.fill_elements<unsigned>(progress,0,0x1000/4,false);
+            events.fill_elements<unsigned>(racer,0,0xD80/4,false);
+            events.fill_elements<unsigned>(vehicle,0,0x1100/4,false);
+            value(0x2FFD74,0);value(0x2FE370,racer);value(0x2FE374,0);
+            value(racer+0xCC4,1);value(racer+8,vehicle);value(stats+0x634,racer);value(vehicle+0xFC0,racer);
+            value(0x34AB58,8);value(0x48A150,10);
+        };
+        setup();
+        for(unsigned missing=0;missing<=30;++missing) {
+            Achievements achievements;Cpu cpu;cpu.achievements=&achievements;
+            events.fill_elements<unsigned>(progress,3,30,false);
+            if(missing<30) value(progress+missing*4,2);
+            title_crash_result(cpu,events,progress,0,3);
+            require(achievements.unlocked(AchievementId::see_you_in_hell)==(missing==30),"Crash gold requires all 30 zones");++cases;
+        }
+        for(unsigned missing=0;missing<=6;++missing) {
+            Achievements achievements;Cpu cpu;cpu.achievements=&achievements;
+            events.fill_elements<unsigned>(progress,2,6,false);value(progress+0x24,2);
+            if(missing<6) value(progress+missing*4,1);
+            title_training_result(cpu,events,progress);
+            require(achievements.unlocked(AchievementId::dangerous_driving)==(missing==6),"Driving 101 gold requires all six lessons");++cases;
+        }
+        for(unsigned completed=0;completed<8;++completed) {
+            Achievements achievements;Cpu cpu;cpu.achievements=&achievements;
+            events.fill_elements<unsigned>(progress,0,0x1000/4,false);value(progress,11);
+            for(unsigned i=0;i<3;++i) value(progress+(4+i*4)*0x9C,(completed>>i)&1);
+            title_championship_result(cpu,events,progress);
+            require(achievements.unlocked(AchievementId::copped_cars)==(completed==7) && achievements.count()==(completed==7),
+                "Pursuit completion incorrectly awarded a season or skipped a Pursuit");++cases;
+        }
+        for(unsigned chain:{13U,14U,15U}) {
+            Achievements achievements;
+            const auto run=[&](bool observe) {
+                setup();number(0x598188,1.f/60);number(0x4F3330,100.f);number(0x4F3328,5.f);
+                number(boost,0.001f);number(boost+4,100.f);number(boost+0x10,5.f);value(boost+8,1);value(boost+0x1C,chain);
+                value(stack,0xABCDEF00);value(stack+4,racer);
+                Cpu cpu;cpu.registers[ecx]=boost;cpu.registers[esp]=stack;cpu.achievements=observe?&achievements:nullptr;
+                function(0x796E0).run(cpu,events);return cpu;
+            };
+            const auto original=run(false);std::array<std::byte,0x2C> saved{};std::memcpy(saved.data(),events.access(boost,saved.size()),saved.size());
+            const auto observed=run(true);
+            require(observed.registers==original.registers && observed.flags==original.flags && observed.floating.image==original.floating.image &&
+                !std::memcmp(saved.data(),events.access(boost,saved.size()),saved.size()),"Burnout observer changed the original boost calculation");
+            require(events.load<unsigned>(boost+0x1C)==chain+1 && achievements.unlocked(AchievementId::burnout_x_achievement)==(chain>=14),
+                "Burnout x15 must unlock on the fifteenth completed boost");++cases;
+        }
+        for(unsigned mode:{1U,8U}) for(unsigned track:{9U,10U,25U})
+            for(float seconds:{0.f,-1.f,39.99f,40.f,std::nextafter(40.f,41.f),std::numeric_limits<float>::quiet_NaN()}) {
+                setup();value(0x34AB58,mode);value(0x48A150,track);
+                Achievements achievements;
+                const auto run=[&](bool observe) {
+                    for(unsigned i=0;i<5;++i) number(session+0x18+i*4,std::numeric_limits<float>::max());
+                    value(session+0x2C,0);value(stack,0xABCDEF00);number(stack+4,seconds);
+                    Cpu cpu;cpu.registers[ecx]=session;cpu.registers[esp]=stack;cpu.achievements=observe?&achievements:nullptr;
+                    function(0x188A0).run(cpu,events);return cpu;
+                };
+                const auto original=run(false);std::array<std::byte,24> saved{};std::memcpy(saved.data(),events.access(session+0x18,saved.size()),saved.size());
+                const auto observed=run(true);
+                require(observed.registers==original.registers && observed.flags==original.flags && observed.floating.image==original.floating.image &&
+                    !std::memcmp(saved.data(),events.access(session+0x18,saved.size()),saved.size()),"Lap observer changed the original Time Attack record");
+                require(achievements.unlocked(AchievementId::stay_frosty)==(mode==8 && track==10 && seconds>0 && seconds<=40.f),
+                    "Stay Frosty accepted the wrong mode, track, or lap time");++cases;
+            }
+        for(unsigned mode:{1U,2U,5U,6U,8U,10U,11U,15U}) for(unsigned place:{1U,2U}) {
+            setup();value(0x34AB58,mode);value(0x4B8468,4);
+            events.fill_elements<unsigned>(0x522A10,0,0x60/4,false);
+            value(stats+0x14,1);value(stats+0x378,1);value(stats+0x34,place);number(stats+8,60.f);
+            value(stack,0xABCDEF00);value(stack+4,0);value(stack+8,0);
+            Achievements achievements;Cpu cpu;cpu.registers[ecx]=stats;cpu.registers[esp]=stack;cpu.achievements=&achievements;
+            function(0x8B840).run(cpu,events);
+            require(events.load<unsigned>(stats+0x2C)==1 && achievements.unlocked(AchievementId::youre_winner)==(place==1 && mode!=8 && mode!=15),
+                "A natural race finish did not award exactly a first-place race result");++cases;
+        }
+        for(bool enabled:{false,true}) for(bool demo:{false,true}) for(bool human:{false,true}) {
+            setup();value(0x2FFD74,demo);value(racer+0xCC4,human);
+            Achievements achievements;achievements.enabled(enabled);Cpu cpu;cpu.achievements=&achievements;
+            events.fill_elements<unsigned>(progress,3,30,false);title_crash_result(cpu,events,progress,0,3);
+            events.fill_elements<unsigned>(progress,2,6,false);value(progress+0x24,2);title_training_result(cpu,events,progress);
+            value(progress,21);for(unsigned event:{3U,7U,11U,14U,21U}) value(progress+(event+1)*0x9C,1);
+            title_championship_result(cpu,events,progress);value(stats+0x2C,1);value(stats+0x34,1);value(0x34AB58,1);
+            title_race_result(cpu,events,stats);title_starting_boost(cpu,events,vehicle);value(boost+0x1C,15);title_burnout_chain(cpu,events,boost,racer);
+            value(0x34AB58,8);title_time_attack_lap(cpu,events,session,std::bit_cast<unsigned>(40.f));
+            const unsigned expected_count=enabled && !demo?(human?10:7):0;
+            require(achievements.count()==expected_count,"Achievement events ignored disable, demo, player, or completion rules");
+            unsigned notifications=0;while(achievements.take_notification()) ++notifications;
+            require(notifications==expected_count,"Simultaneous achievements lost a notification");++cases;
+        }
+    }
     for(bool ultrawide:{false,true}) for(unsigned split:{0U,2U}) {
         Cpu cpu;cpu.ultrawide=ultrawide;cpu.registers[ecx]=0x3D8570;cpu.registers[esp]=stack;
         memory.store<std::uint32_t>(stack,0xABCDEF00);memory.store<std::uint32_t>(stack+4,1);

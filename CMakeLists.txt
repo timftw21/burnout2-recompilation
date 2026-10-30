@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.2)
-project(burnout2 VERSION 1.10.0 LANGUAGES C CXX)
+project(burnout2 VERSION 1.11.0 LANGUAGES C CXX)
 
 if((NOT WIN32 AND NOT APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux") OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR
    (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$" AND NOT (APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")))
@@ -70,7 +70,7 @@ FetchContent_Declare(zydis
     GIT_PROGRESS FALSE)
 FetchContent_MakeAvailable(zydis)
 
-add_library(b2-core STATIC src/file.cpp src/disc.cpp src/mods.cpp src/xbe.cpp src/assets.cpp src/tracks.cpp src/effects.cpp src/crypto.cpp src/performance.cpp)
+add_library(b2-core STATIC src/file.cpp src/disc.cpp src/mods.cpp src/xbe.cpp src/assets.cpp src/tracks.cpp src/effects.cpp src/crypto.cpp src/performance.cpp src/achievements.cpp)
 target_include_directories(b2-core PUBLIC src PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 if(WIN32)
     target_sources(b2-core PRIVATE src/diagnostics.cpp src/host_windows.cpp)
@@ -239,6 +239,7 @@ if(B2_XBE)
             target_link_libraries(b2-app PRIVATE Fontconfig::Fontconfig)
         endif()
         configure_file(resources/b2.png "${CMAKE_CURRENT_BINARY_DIR}/resources/b2.png" COPYONLY)
+        configure_file(resources/achievement-unlocked.wav "${CMAKE_CURRENT_BINARY_DIR}/resources/achievement-unlocked.wav" COPYONLY)
     endif()
     string(JSON finite_address GET "${facts_json}" title TITLE_FLOAT_FINITE_CHECK_ADDRESS value)
     string(JSON compare_address GET "${facts_json}" title TITLE_FIXED_WIDTH_COMPARE_ADDRESS value)

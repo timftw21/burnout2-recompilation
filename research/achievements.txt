@@ -1,0 +1,156 @@
+Crash achievement evidence (2026-10-28)
+
+Verified data/local/default.xbe against knowledge/supported_target.json:
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+Bounded native analyses are in build/checks/achievements-20261028.
+
+15190 obtains the current crash score through 8ABC0 on 4B9C5C, reads the
+zone at 4CCB04, and calls 12650 with the zone and score on profile+58.
+12650 compares that score against 2FC690+zone*12 (bronze), +4 (silver),
+and +8 (gold). Equality qualifies. EBX is the current run's award: 0 for
+none, 1 bronze, 2 silver, 3 gold. EDI is the zone. 15210 bounds the zone
+sequence to 30. 126FC updates the saved best only when the new award is
+better; 1275A/895E78 always stores the current award at profile+78.
+
+The AOT observer at 1275D/741C runs after that store on every return path,
+including repeated or worse results. It reads EDI/EBX without changing
+guest registers, flags, memory or control flow. No per-frame memory polling,
+guest callbacks or runtime decoding is added. The observer only updates
+fixed achievement bits; saving and notification drawing belong to the host UI.
+Loading a save, showing a zone, or retaining an older medal cannot trigger it.
+
+The existing CPU image diagnostic exercises the actual compiled 12650 at
+all six threshold boundaries in all 30 zones, with empty and gold personal
+bests, comparing observed and original outputs. The hidden window diagnostic
+covers the new tab, notification with settings closed, expiration, persistence
+and suppression after reload. These diagnostics do not boot the game.
+
+Validation: the Windows Release build passed. --check-cpu with the supported
+XBE passed all 52 groups (26026 instruction, 3879 memory/image, 6744 floating
+and 109 control cases), including 360 original medal boundary/personal-best
+combinations and rejection of invalid achievement events. --check-window passed
+on the RTX 5060 Ti with zero runtime shader compilation. Its locked/unlocked
+pages, minimum-size page and notification images were inspected. No gameplay,
+computer use or gameplay benchmark ran; live play remains a manual check.
+
+Controls and presentation follow-up (2026-10-28): the user confirmed the original
+achievement unlock works in live play. Notifications now fade in over 250 ms and
+out over 350 ms within their five-second lifetime. The existing project logo is
+reused in the list and notification. Reset clears unlocks and queued/active
+notifications. Disabling preserves progress, suppresses new unlocks and clears
+notifications; re-enabling tracks future results. The choice persists in the
+existing achievement file, with older files defaulting to enabled.
+
+The incremental Release build and both existing diagnostics passed again. The
+hidden window checks cover old-file compatibility, disable/enable persistence,
+reset persistence, suppressed results while disabled and earning again after
+reset. Full-opacity and half-opacity fade images and both page sizes were
+inspected. Reports and images are in
+build/checks/achievements-controls-20261028. The personal achievement file's hash
+was unchanged. No game boot, computer use or gameplay benchmark was performed.
+
+Sound and confirmation follow-up (2026-10-28): the user supplied
+denielcz-achievement-unlocked-463070.mp3, SHA-256
+AD6B5C0451CB86F48CF6F4891729817B36DFF25B80A3F67C8C9304D4D3AEC2D1.
+FFmpeg converted it to resources/achievement-unlocked.wav without changing its
+48 kHz stereo layout or 0.576-second duration. The PCM16 asset loads at startup;
+each notification queues the same samples once through SDL. Master volume, mute
+and focus muting apply. Reset or disable clears queued sound. Windows embeds the
+asset; Linux/macOS copy it alongside the existing settings logo. The original
+MP3 is untouched and no runtime MP3 decoder or new dependency is required.
+
+Disable now precedes Reset. Muted explanatory text uses the existing italic
+font, and locked entries use half opacity. Reset opens a modal with Cancel as
+the initial keyboard selection. Escape dismisses it without closing settings.
+The modal darkens the background and uses the existing dark header palette;
+its prompt ends with the user-requested "Are you sure?".
+
+Release build passed. The hidden window diagnostic passed cancellation,
+confirmation, keyboard navigation, sound queuing, volume/mute/focus behavior,
+reset and disabling. The native audio diagnostic passed all 70 cases. Updated
+dialog, locked/disabled pages and minimum-size layout were visually inspected.
+Reports are in build/checks/achievement-sound-20261028; final images are in its
+themed-dialog directory. These checks opened no audio output device and booted
+no game; audible playback remains for manual verification. The personal
+achievement file's hash was unchanged. No computer use or benchmark ran.
+
+Full achievement list (2026-10-29)
+
+The same supported XBE hash was verified again. Bounded native analyses and
+English language-table reads are in build/checks/achievement-list-20261029.
+Crash + Burn retains the crash_course save key. All ten definitions share the
+existing persistence, icon, notification, sound, reset and disable behavior.
+
+See You in Hell observes the same 1275D result and reads the 30 best-medal
+dwords at ESI. Native 12580 uses exactly these entries and requires 3 in each.
+126FC has already written this event's best medal before this observation.
+
+Driving 101 has six medal dwords at 3525E0. Unlike Crash, gold is 2, silver 1,
+bronze 0 and no medal -1. 12B20 sums six entries; 12F46 compares the sum with
+12 for the original all-gold reward. Observe 12F36/8B461C, after the current
+award at ESI+24 and any improved best at ESI+EBX*4 have been stored.
+
+11470 accepts Championship event wins and writes the completed flag at
+ESI+(event+1)*9C. Observe 11538/395D3C immediately after this write. Its Pursuit
+branch requires the target car's health at +C90 to reach zero; other events
+require player zero at the top of the final standings. Configs at 2FACD8,
+stride A8, and English labels 413+event identify Pursuits 1/2/3 as events
+3/7/11. The game's own unlock at 116D4 checks the same completion flags
+(+270/+4E0/+750). Events 14 and 21 are Custom Series Qualifier and Heart
+Attack GP. 52380 selects the first-season completion text for event 14
+(52556) and the final completion text for event 21 (5262E). These are the
+two season-end achievements, independent of whether every race was gold.
+
+8B840 processes checkpoint/lap crossings. Its final crossing calls 84250
+at 8BB12 to finish and snapshot the racer; observe 8BB17/8B0D58AB3400.
+ESI is the live statistics block: +2C finished, +30 retired, +34 position,
++634 owner racer. This site excludes forced end-of-session finishes, which
+also call 84250 elsewhere. Race modes are 1/2/5/6/10/11: single races,
+Championship races, Face Off and two-player races. The racer must be in
+2FE370/2FE374 and have human-control type 1 at +CC4. Pursuit, Crash,
+Time Attack and Driving 101 are not first-place race results.
+
+60820 evaluates the physical car's countdown accelerator/brake sequence
+at 609C5..60AC0. The timed success sets +E50 at 60AC0/898E500E0000;
+observe that success using ESI and its owner at +FC0. The independent
+automatic Crash launch writes +E50 at 60ADD and has no observer.
+
+The boost controller is racer+608 (stats+5FC). 796E0 completes a full bar,
+increments total Burnouts at +14 and the current chain at +1C. Observe
+797B9/8B4714 immediately after the latter increment, with ECX controller
+and EDI racer; require chain >=15 and a human-controlled racer. The HUD
+at 23459 loads language entry 382 (Burnout x) and prints stats+618 directly,
+without adding one. 79860 later preserves the best chain at controller+24
+and clears the active chain. Observation therefore happens when achieved.
+
+188A0 inserts completed Time Attack laps into the session's best-five
+list. Both callers in 18A30 pass completed times: 18B14 uses 17420 to read
+the completed lap and 18B59 handles a finished point-to-point course.
+Observe entry 188A0/D9442404 with ECX session and the float argument at
+ESP+4. Require session 303C34, mode 8, course 10 and a finite time >0 and
+<=40 seconds. 16520 explicitly sets Time Attack mode 8. 3281C indexes
+course names at language+5FC+course*4; English index 393 is Crystal Summit
+Peak, hence course 10. Course 25 is the reverse variant and does not count.
+
+All observers exclude attract/demo playback via 2FFD74 and disabled
+achievements. They read guest state and change only host achievement bits.
+Aggregate achievements use the loaded profile's existing medals/completions
+when a new qualifying result occurs; loading a profile alone awards nothing.
+Each inserted instruction site checks its exact original byte signature.
+
+Validation: the Windows Release build passed. The existing CPU diagnostic
+passed 52 groups, including 3988 memory/image cases (109 added achievement
+cases). Native 796E0, 188A0 and 8B840 exercised the Burnout x15 boundary,
+Time Attack lap boundaries and natural race finishes. Observed boost/lap
+calculations matched the unobserved guest registers, flags, floating state
+and result memory. Aggregate checks cover every missing Crash Zone/lesson,
+all Pursuit completion combinations, both seasons, demo/AI exclusion,
+disable behavior and the simultaneous ten-notification queue.
+
+The hidden window diagnostic passed all ten persisted unlocks, legacy key
+compatibility, reset confirmation, disabling, sound and fades. The normal
+and minimum-size Achievements pages and notification were visually inspected.
+Reports/images are in achievement-list-20261029/verification. The personal
+achievement file retained SHA256 C91B9160E9356968F425059E07A4529C327D467AE494B7D110D68FE3C1064C73.
+No gameplay, computer use or benchmark ran; live gameplay remains for manual
+verification.

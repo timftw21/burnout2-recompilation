@@ -5,6 +5,9 @@
 #include "com_ptr.h"
 
 namespace b2 {
+// Feedback shaders control rounding so frame history can retain ordinary RGBA8 storage.
+inline constexpr DXGI_FORMAT frame_color_format=DXGI_FORMAT_R8G8B8A8_UNORM;
+inline constexpr unsigned frame_color_bytes=4;
 struct MotionCamera {
     std::array<float,16> view{};
     float near_plane=0,far_plane=0;
