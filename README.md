@@ -3,11 +3,11 @@
 # <div align="center">Burnout 2: Point of Impact — Static Recompilation</div>
 
 An unofficial version of the original Xbox game for Windows, with experimental
-Linux and macOS ports, focused on fast gameplay, preserving the original's look
+Linux, Steam Deck, and macOS ports, focused on fast gameplay, preserving the original's look
 and feel, and a variety of enhancements.
 
-**Linux and macOS builds need testing.** Linux still needs gameplay, sound and
-performance checks on native desktop hardware. macOS needs those checks on both
+**Linux, Steam Deck, and macOS builds need testing.** Linux and Steam Deck still need gameplay, sound and
+performance checks. macOS needs those checks on both
 Intel and Apple Silicon.
 
 <i>Still in development: Slowdown, bugs, and crashes are possible. Open an issue if you experience a problem, and
