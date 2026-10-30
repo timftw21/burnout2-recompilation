@@ -58,10 +58,14 @@ case ${1:-} in
         unset LD_LIBRARY_PATH LD_PRELOAD
         # Keep XWayland available even when a Wayland socket exists: Gaming Mode
         # or SDL's driver selection may still require the X11 display.
-        exec flatpak run --user --share=ipc --socket=wayland --socket=x11 \
+        # Abstract X11 sockets need the host network namespace. A host-launch
+        # wrapper can replace DISPLAY, so also retain Steam's game display.
+        display=()
+        if [[ -n ${DISPLAY:-} ]]; then display+=("DISPLAY=$DISPLAY"); fi
+        exec flatpak run --user --share=ipc --share=network --socket=wayland --socket=x11 \
             --socket=pulseaudio --device=all --filesystem=host \
             --unset-env=LD_LIBRARY_PATH --unset-env=LD_PRELOAD \
-            --command="$game" "$platform/x86_64/$runtime" "$@"
+            --command=env "$platform/x86_64/$runtime" "${display[@]}" "$game" "$@"
         ;;
     *) printf '%s\n' 'Use Install.sh --steamdeck or Play.sh --steamdeck.' >&2; exit 1 ;;
 esac

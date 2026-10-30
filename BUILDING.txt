@@ -60,6 +60,14 @@ compatibility-tool override disabled. The existing gamepad controls and settings
 navigation work through SDL3 and Steam Input. First-install defaults select
 fullscreen, 1x resolution, widescreen and the display's refresh rate.
 
+The same --steamdeck runtime works on other Linux handhelds. Its launcher keeps
+Steam's selected X11 display and shares the host network namespace so Gaming Mode
+can also connect through abstract X11 sockets, including on Anatase. The earlier
+X11 socket permission alone did not cover that connection. After updating the
+source files, Play.sh uses the corrected launcher without rebuilding the game.
+User confirmation (2026-10-30): Gaming Mode startup works on Xbox Ally X with
+Anatase Linux: https://github.com/timftw21/burnout2-recompilation/issues/23#issuecomment-6534229563
+
 The native game, settings, saves and music stay in build/steamdeck/Release,
 separate from ordinary Linux builds. Rerunning setup preserves them. Play.sh
 detects this installation and launches it inside the runtime; launch through
