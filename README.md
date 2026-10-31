@@ -18,15 +18,17 @@ I'll try to respond in a timely manner. This is an independent fan project, unaf
 Yes, AI (Codex) assisted in the development of this project. No, this project was not blindly thrown together.
 If you're skeptical, I implore you to try the recompilation for yourself. I take quality control quite seriously!👀
 
-## What's new in 1.11
+## What's new in 1.12
 
-- Added ten achievements covering Crash Zones, races, Driving 101, Championships,
-  starting boosts, Burnout chains and Time Attack.
-- Added an **Achievements** settings tab with saved progress, icons, notifications
-  that fade in and out, and an unlock sound. Disable tracking at any time, or
-  reset progress after confirmation.
-- Fixed lingering trails behind animated text at high refresh rates.
-- Fixed Steam Deck Game Mode startup by keeping X11 available alongside Wayland.
+- Graphics and enhancement settings now apply during play, including resolution,
+  aspect ratio, antialiasing, draw distance and Clean HUD. Mods and imported music
+  still use a game restart.
+- Added optional **HDR output** on Windows, with controls for normal image
+  brightness and peak highlights. Enable HDR for your display in Windows first.
+- Added controller remapping for up to four players. Assign buttons, triggers or
+  stick directions, keep the full analog range, and save each player's bindings.
+- Fixed the remaining animated-text trails missed by the 1.11 fix, including
+  high-refresh play with increased resolution and MSAA.
 
 Download the new **Installation.zip**. On Windows, run **Install.cmd** again to
 update. On Linux, open **Install.desktop**; on macOS, open **Install.command**.
@@ -77,11 +79,12 @@ support is still being tested.
 - Gamepad and keyboard input.
 - Saved settings for display, audio and controls, with refresh rates from 60 Hz
   through **Unlimited**. High-refresh gameplay and menus keep normal game speed.
-- Custom keyboard bindings and 1×–4× internal resolution.
+- Custom keyboard and controller bindings, and 1×–4× internal resolution.
 - Native 16:9 and ultrawide 21:9 cameras with the HUD's original proportions
   and edge placement.
 - Optional MSAA or FXAA antialiasing and anisotropic filtering up to 16×.
 - Optional ambient occlusion with adjustable quality and strength.
+- Optional Windows HDR output with adjustable image and highlight brightness.
 - Imported custom music through the original Music Selection menu, with a saved
   **Loop Track** option in Music Selection and **Pause → Options**.
 - Optional motion blur from the original game.
@@ -212,8 +215,8 @@ game-file locations while keeping the restored settings.
 ### Game settings
 
 Click **Start game** to play; press **Esc** to open or close settings. Changes
-save automatically. Hover over options for details, and use **Restart game**
-to apply graphics and enhancement changes during play.
+save automatically. Graphics, controls and enhancement changes apply during play.
+Mods and imported music still use a game restart. Hover over options for details.
 
 - **General:** Choose the refresh rate (60 Hz by default) or **Unlimited**, and
   enable the FPS overlay. Higher rates smooth gameplay and menus without changing
@@ -221,6 +224,10 @@ to apply graphics and enhancement changes during play.
 - **Graphics:** Select 1×–4× resolution, Original (4:3), Widescreen (16:9),
   Ultrawide (21:9), and V-sync.
   Higher resolutions use more graphics power.
+  On Windows, **HDR output** expands highlights from the original SDR image.
+  Enable HDR in Windows first, then adjust **Paper white** for normal image and
+  interface brightness. Use the display's reported peak brightness or set a
+  calibrated value. Output falls back to SDR when HDR is unavailable.
 - **Enhancements:** Adjust MSAA/FXAA, anisotropic filtering and **Draw distance**
   (Original, 2× or 4×). **Ambient occlusion** adds contact shading, with three
   quality levels and a strength slider; Off preserves the original appearance.
@@ -232,6 +239,8 @@ to apply graphics and enhancement changes during play.
   transitions and frame limits while the game's assets load.
   Motion blur controls the original game's scene blur during boosting and other
   speed effects; it is enabled by default.
+  Intro skipping affects any remaining splash screens, or the next game session
+  if the intro has already finished.
 - **Audio:** Adjust volume, mute the game, or enable **Mute on focus loss** to
   silence it while another window has focus. To use custom songs, **Browse** for a music folder, click
   **Import music**, then select the collection in the game's **Music Selection**
@@ -241,8 +250,12 @@ to apply graphics and enhancement changes during play.
   In-game music volume and Crash-mode music stopping also apply to Burnout 1 and
   imported songs. **Loop Track** repeats the selected song until you turn it off;
   change it in **Music Selection** or **Pause → Options** and confirm your choice.
-- **Controls:** Click a binding and press its replacement; use **Clear** or
-  **Restore keyboard defaults** as needed. Esc cancels rebinding.
+- **Controls:** Choose **Keyboard** or **Controller 1–4**, then select a binding.
+  Press a new key, or release the controller controls before pressing a button,
+  pulling a trigger or moving a stick. Controller mappings save separately for
+  each player slot and preserve analog input. Use **Clear** or restore defaults
+  for the selected device. Esc cancels rebinding; controller capture also has a
+  **Cancel binding** button and a ten-second timeout.
 - **Achievements:** View progress and the requirements for each achievement.
   **Disable achievements** pauses new unlocks and notifications while keeping
   progress; **Enable achievements** resumes tracking. **Reset achievements** asks
@@ -284,7 +297,9 @@ a relevant event.
 
 ## Controls
 
-Connected gamepads work automatically. Keyboard controls are enabled by default:
+Connected gamepads work automatically. Keyboard controls are enabled by default.
+Remap either in **Settings → Controls**; settings navigation keeps its standard
+controls. The default keyboard bindings are:
 
 | Action | Key |
 | --- | --- |
@@ -302,7 +317,7 @@ Connected gamepads work automatically. Keyboard controls are enabled by default:
 | Record / save performance | F9 |
 
 **Black** and **White** refer to the original Xbox controller's extra face buttons.
-On modern gamepads, Black maps to **RB / R1** and White maps to **LB / L1**.
+On modern gamepads, Black defaults to **RB / R1** and White to **LB / L1**.
 
 ## Resources and credits
 

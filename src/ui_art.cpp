@@ -1149,9 +1149,12 @@ UiArt mip_chain(std::vector<std::byte> pixels,unsigned width,unsigned height,boo
 }
 }
 
+bool ui_art_candidate(const TextureData& t) {
+    return t.format==TextureFormat::dxt5 && t.mip_levels==1 && t.depth==1 && !t.cubemap && !t.pitch &&
+        (t.height==128 || t.height==256) && (t.width==128 || t.width==256) && t.bytes.size()==std::size_t(t.width)*t.height;
+}
 std::optional<UiArt> redraw_ui_texture(const TextureData& t) {
-    if(t.format!=TextureFormat::dxt5 || t.mip_levels!=1 || t.depth!=1 || t.cubemap || t.pitch ||
-       (t.height!=128 && t.height!=256) || (t.width!=128 && t.width!=256) || t.bytes.size()!=std::size_t(t.width)*t.height) return {};
+    if(!ui_art_candidate(t)) return {};
     Sha1 sha;sha.reset();sha.update(t.bytes);const auto digest=hex_bytes(sha.finish());
     const bool font=t.width==256 && t.height==256 && digest=="8BD1B7A660160D24E69B109E91956DACA2D4D726";
     const bool parts=t.width==128 && t.height==256 && digest=="8781ACD85F32C81754758FA8EEB9A06956A3DC3E";

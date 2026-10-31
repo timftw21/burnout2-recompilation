@@ -15,6 +15,7 @@ public:
     bool ready() const {return ready_;}
     ID3D11Texture2D* image() const {return image_[1].Get();}
     ID3D11Texture2D* scene() const {return image_[0].Get();}
+    ID3D11ShaderResourceView* scene_view() const {return view_[0].Get();}
     ID3D11ShaderResourceView* view() const {return view_[1].Get();}
     std::size_t bytes() const {return std::size_t(width_)*height_*20;}
     Image readback();

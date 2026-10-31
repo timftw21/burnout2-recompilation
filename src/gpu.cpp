@@ -1,4 +1,5 @@
 #include "gpu.h"
+#include "ui_art.h"
 #include "shaders.h"
 #include <thread>
 #include "cpu.h"
@@ -70,7 +71,7 @@ struct Gpu::Impl {
     Surface* active_surface=nullptr;
     std::uint64_t surface_revision=0;
     std::map<std::array<std::uint32_t,4>,Surface> targets;
-    struct Texture {std::uint32_t identifier;std::uint64_t size,captured=0;};
+    struct Texture {std::uint32_t identifier;std::uint64_t size,captured=0;bool ui_art=false;};
     std::map<std::array<std::uint32_t,5>,Texture> textures;
     struct Cubemap {std::uint32_t identifier;std::array<std::uint64_t,6> revisions;std::uint64_t size;};
     std::map<std::array<std::uint32_t,5>,Cubemap> cubemaps;
@@ -291,9 +292,12 @@ struct Gpu::Impl {
         }
         if(!size || size>64*1024*1024) throw std::runtime_error("NV097 texture payload exceeds its bound");
         auto found=textures.find(key);
-        if(found==textures.end()) found=textures.emplace(key,Texture{renderer.upload({width,height,static_cast<TextureFormat>(code),
+        if(found==textures.end()) {
+            const TextureData source{width,height,static_cast<TextureFormat>(code),
             Bytes(static_cast<const std::byte*>(memory.access(address,static_cast<std::size_t>(size))),static_cast<std::size_t>(size)),
-            mips,linear?pitch:0,cube,depth}),size}).first;
+            mips,linear?pitch:0,cube,depth};
+            found=textures.emplace(key,Texture{renderer.upload(source),size,0,ui_art_candidate(source)}).first;
+        }
         if(!capture_directory.empty() && found->second.captured!=capture_serial) {
             found->second.captured=capture_serial;
             const auto name=std::format("texture-{:04}.bin",capture_textures++);
@@ -760,6 +764,15 @@ void Gpu::begin_overlay() {
     g.flush();g.select_target();g.renderer.begin_overlay();g.overlay_target=g.target;++g.gpu_work;
 }
 void Gpu::restore_feedback() {auto& g=*impl_;g.flush();g.renderer.restore_feedback();}
+void Gpu::clean_hud(bool enabled) {
+    auto& g=*impl_;g.flush();g.renderer.clean_hud(enabled);
+    // Only atlas candidates need new uploads. Keep world textures, rendered
+    // surfaces and their feedback history in place.
+    for(auto it=g.textures.begin();it!=g.textures.end();) {
+        if(it->second.ui_art) {g.renderer.release(it->second.identifier);it=g.textures.erase(it);}
+        else ++it;
+    }
+}
 void Gpu::coverage(std::uint64_t value) {impl_->coverage=value;}
 bool Gpu::busy() {auto& g=*impl_;g.poll();return g.fence_count!=0;}
 void Gpu::wait() {auto& g=*impl_;g.flush();g.finish_visibility();g.fence(0,0);g.await([&]{return !g.fence_count;},PerfGpuWait::idle);}

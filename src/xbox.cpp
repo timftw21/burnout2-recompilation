@@ -278,7 +278,8 @@ struct Xbox::State {
     std::array<WorldCamera,32> world_cameras{};
     std::uint32_t world_camera=0;
     float world_original_far=0;
-    bool world_ready=false,world_reflecting=false;
+    bool world_ready=false,world_reflecting=false,world_prepare_pending=false;
+    unsigned world_mode=0;
     std::uint32_t music_menu_storage=0;
     bool music_repeated=false;
     struct ImportedTrack {
@@ -588,8 +589,8 @@ struct Xbox::State {
         cpu.presentation=host.renderer?&presentation:nullptr;
         cpu.achievements=host.achievements;
         if(!host.imported_tracks.empty()) cpu.world_materials=&imported.materials;
-        if(host.draw_distance>1) cpu.world_view=&world_view;
-        if(host.widescreen) cpu.hud_layout=&hud_layout;
+        if(!world_storage.empty()) cpu.world_view=&world_view;
+        hud_layout.enabled=host.widescreen;cpu.hud_layout=&hud_layout;
         cpu.profile=host.performance && host.performance->active()?host.performance:nullptr;
         cpu.preempt=[](Cpu& cpu) {
             auto& host=*static_cast<State*>(cpu.kernel->context);
@@ -1927,10 +1928,9 @@ struct Xbox::State {
         }
         return true;
     }
-    void prepare_world(Cpu& cpu) {
+    void prepare_world(Cpu& cpu,unsigned mode) {
         if(world_preparing) return;
-        const auto manager=cpu.registers[ecx],master=memory.load<std::uint32_t>(0x4B85B8);
-        const auto mode=unsigned(memory.load<std::uint32_t>(manager+0x14)!=0);
+        const auto master=memory.load<std::uint32_t>(0x4B85B8);
         if(!master || !world_streams[mode] || !disc) throw NativeBoundary(0x8EEB0,"extended scenery has no world stream");
         const auto entry=*world_streams[mode];
         if(world_loaded && world_loaded->sector==entry.sector && world_loaded_path==world_paths[mode]) return;
@@ -2111,6 +2111,9 @@ struct Xbox::State {
         world_loaded=entry;world_loaded_path=world_paths[mode];world_ready=true;
     }
     void select_world(Cpu& cpu,bool late=false) {
+        if(world_prepare_pending && !world_preparing && !world_reflecting) {
+            prepare_world(cpu,world_mode);world_prepare_pending=false;
+        }
         world_view.manager=0;world_view.blending=false;world_view.props_blending=false;world_view.count=0;world_draw_count=0;world_draws.clear();
         world_prop_admitted={};
         world_added_count=0;world_original_count=0;
@@ -2406,6 +2409,7 @@ struct Xbox::State {
         if(!(far_plane>0) || !std::isfinite(far_plane)) throw NativeBoundary(0xE8450,"invalid original camera distance");
         auto found=std::ranges::find(world_cameras,camera,&WorldCamera::address);
         if(found==world_cameras.end()) {
+            if(host.draw_distance==1) return;
             found=std::ranges::find(world_cameras,0U,&WorldCamera::address);
             if(found==world_cameras.end()) throw NativeBoundary(0xE8450,"extended world camera limit exceeded");
             found->address=camera;
@@ -2442,7 +2446,7 @@ struct Xbox::State {
             // Native wide split-screen already uses an approximately 854-wide
             // canvas. Compensate only the horizontal stretch still remaining.
             if(!(native_scale>0) || !std::isfinite(native_scale)) throw NativeBoundary(address,"invalid HUD canvas scale");
-            hud_layout.scale=std::min(1.0f,(host.ultrawide?4.0f/7:0.75f)/native_scale);
+            hud_layout.scale=host.widescreen?std::min(1.0f,(host.ultrawide?4.0f/7:0.75f)/native_scale):1;
             break;
         }
         case 0x81158:case 0x81369:case 0x817F7:
@@ -2455,8 +2459,13 @@ struct Xbox::State {
             if(gpu) {submit_graphics(false);gpu->restore_feedback();}break;
         // Extra meshes retain authored material/background compatibility;
         // reflection cameras continue to use their original visibility.
-        case 0x8EEB0:prepare_world(cpu);break;
-        case 0xE8450:if(host.draw_distance>1) extend_camera(cpu);break;
+        case 0x8EEB0:
+            if(!world_preparing) {
+                world_mode=unsigned(memory.load<std::uint32_t>(cpu.registers[ecx]+0x14)!=0);
+                if(host.draw_distance>1) {prepare_world(cpu,world_mode);world_prepare_pending=false;}
+            }
+            break;
+        case 0xE8450:extend_camera(cpu);break;
         case 0xA6E00:world_reflecting=true;break;
         case 0xA7306:world_reflecting=false;break;
         case 0x90F68:select_world(cpu);break;
@@ -2927,7 +2936,7 @@ struct Xbox::State {
         if(!base) return no_memory;
         const auto address=base|0x80000000U,handle=next_handle; next_handle+=4;
         auto file=std::make_shared<OpenFile>();file->entry=*entry;file->path=*name;file->disc_file=true;
-        if(host.draw_distance>1) {
+        {
             const auto path=folded(*relative);
             if(path.ends_with(".PSW") || path.ends_with(".P2W")) {
                 const auto mode=unsigned(path.ends_with(".P2W"));world_streams[mode]=*entry;world_paths[mode]=replacement;
@@ -3777,6 +3786,37 @@ struct Xbox::State {
 Xbox::Xbox(Xbe& image,Memory& memory,std::span<std::byte> ram,const std::filesystem::path& disc,XboxHost host):state_(std::make_unique<State>(image,memory,ram,disc,std::move(host))) {}
 Xbox::~Xbox()=default;
 bool Xbox::fast_loading() const {return state_->host.fast_load && state_->game_timing.loading_started;}
+void Xbox::settings(const GameSettings& settings) {
+    auto& s=*state_;auto& host=s.host;
+    if(settings.draw_distance!=1 && settings.draw_distance!=2 && settings.draw_distance!=4)
+        throw std::runtime_error("Draw distance must be 1x, 2x or 4x.");
+    if(settings.draw_distance>1 && s.world_storage.empty()) {
+        s.world_storage.resize(64U*1024*1024+4096);
+        s.memory.map(s.world_base&0x7FFFFFFF,s.world_storage);s.memory.map(s.world_base,s.world_storage);
+        s.world_view.list=s.world_scratch+0x400;
+    }
+    const bool aspect_changed=host.widescreen!=settings.widescreen || host.ultrawide!=settings.ultrawide;
+    if(host.clean_hud!=settings.clean_hud && s.gpu) s.gpu->clean_hud(settings.clean_hud);
+    host.widescreen=settings.widescreen;host.ultrawide=settings.ultrawide;host.motion_blur=settings.motion_blur;
+    host.skip_intro=settings.skip_intro;host.fast_load=settings.fast_load;host.clean_hud=settings.clean_hud;
+    if(host.draw_distance!=settings.draw_distance) {
+        s.world_view.manager=0;s.world_view.blending=s.world_view.props_blending=false;s.world_handoffs={};
+        s.world_prepare_pending=settings.draw_distance>1;
+    }
+    host.draw_distance=settings.draw_distance;s.hud_layout.enabled=host.widescreen;
+    for(auto& thread:s.threads) {
+        auto& cpu=thread->cpu;
+        cpu.skip_intro=host.skip_intro;cpu.fast_load=host.fast_load;cpu.clean_hud=host.clean_hud;
+        cpu.ultrawide=host.ultrawide;cpu.motion_blur=host.motion_blur;cpu.draw_distance=float(host.draw_distance);
+        cpu.world_view=s.world_storage.empty()?nullptr:&s.world_view;
+    }
+    if(aspect_changed && s.current) {
+        // Refresh the title's own saved video flag and both view aspects through
+        // its verified native routines. Existing cameras consume these on draw.
+        auto& cpu=s.current->cpu;
+        s.world_call(cpu,0x18390,0);s.world_call(cpu,0x183B0,0);
+    }
+}
 void Xbox::output_gain(float gain) {
     if(!(gain>=0 && gain<=1)) throw std::runtime_error("Output volume must be between zero and one");
     if(state_->audio) state_->audio->output_gain(gain);
@@ -4753,6 +4793,25 @@ std::string check_storage(const std::filesystem::path& executable,const std::fil
             memory.store<std::uint32_t>(view+0x6AC7C,2);invoke(0x000183B0,{});
             require(memory.load<std::uint32_t>(aspect)==0x3F638E39U && memory.load<std::uint32_t>(aspect+0x660)==0x3F638E39U,
                 "original widescreen split-screen camera aspect");
+        }
+        if(!reload) {
+            const auto count=state.threads.size();
+            for(unsigned mode:{0U,2U}) for(unsigned ratio:{1U,2U,0U}) {
+                memory.store<std::uint32_t>(view+0x6AC7C,mode);
+                const bool enabled=ratio!=0;
+                xbox.settings({enabled,ratio==2,!enabled,enabled,enabled,enabled,ratio==2?4U:enabled?2U:1U});
+                const auto expected=ratio==2?(mode==2?0x3F955555U:0x40155555U):ratio==1?(mode==2?0x3F638E39U:0x3FE38E39U):0x3FAAAAABU;
+                require(memory.load<std::uint32_t>(0x4D03F8)==unsigned(enabled) && memory.load<std::uint32_t>(aspect)==expected &&
+                    memory.load<std::uint32_t>(aspect+0x660)==expected,"live aspect switch uses both original view slots");
+                require(state.threads.size()==count && cpu.hud_layout && cpu.hud_layout->enabled==enabled &&
+                    cpu.skip_intro==enabled && cpu.fast_load==enabled && cpu.clean_hud==enabled && cpu.motion_blur!=enabled &&
+                    cpu.draw_distance==(ratio==2?4:enabled?2:1),"live enhancements preserve the running guest thread");
+            }
+            auto& worker=state.create(0,0,0,image.stack_commit,0,true);
+            xbox.settings({true,true,false,true,true,true,4});
+            require(worker.cpu.ultrawide && worker.cpu.fast_load && worker.cpu.clean_hud && worker.cpu.draw_distance==4,
+                "live settings update suspended workers");
+            xbox.settings({});memory.store<std::uint32_t>(view+0x6AC7C,0);
         }
         const auto text=[&](std::uint32_t address,std::string_view value) {
             std::memcpy(memory.access(address,value.size()),value.data(),value.size());memory.store<std::uint8_t>(address+static_cast<std::uint32_t>(value.size()),0);

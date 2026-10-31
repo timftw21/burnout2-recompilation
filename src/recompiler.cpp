@@ -529,7 +529,7 @@ public:
             dirty.insert(2);used.insert(2);
             // Use the ordinary tachometer dimensions before the common HUD
             // correction; the native wide variant scales width/height .9/1.2.
-            body << "    if(cpu.hud_layout) edx&=~4U;\n";
+            body << "    if(cpu.hud_layout && cpu.hud_layout->enabled) edx&=~4U;\n";
         }
         if(instruction.address==0x244F3 || instruction.address==0x251F9) {
             (void)read_reg(ZYDIS_REGISTER_ESP);
@@ -687,7 +687,8 @@ public:
         if(instruction.address==0x90F68 || instruction.address==0x90F7E || instruction.address==0x90F9E || instruction.address==0x90FDC ||
            instruction.address==0x914BF || instruction.address==0x9158F || instruction.address==0x92149 || instruction.address==0x92182 || instruction.address==0xA7306) {
             calls=restores=true;
-            body << "    if(cpu.draw_distance>1) { commit(); b2::title_enhancement(cpu,memory,"
+            body << (instruction.address==0xA7306?"    if(cpu.world_view)":"    if(cpu.draw_distance>1)")
+                 << " { commit(); b2::title_enhancement(cpu,memory,"
                  << constant(instruction.address) << "); restore(); }\n";
             constexpr std::pair<std::uint32_t,std::uint32_t> handoffs[]={
                 {0x90F7E,0x90F9E},{0x90F9E,0x90FCE},{0x90FDC,0x91001},{0x914BF,0x914ED},{0x92149,0x92182}};
@@ -1473,7 +1474,8 @@ LoweredFunction lower(const Function& function,bool fuse_floating,bool portable)
             prefix+=hex_bytes(Bytes(instruction.bytes).first(instruction.decoded.length));pc+=instruction.decoded.length;
         }
         if(prefix!=bytes) throw std::runtime_error("World enhancement entry signature changed");
-        out << "    if(cpu.draw_distance>1) b2::title_enhancement(cpu,memory," << constant(entry) << ");\n";
+        out << (entry==0x8EEB0?"    if(cpu.kernel) ":"    if(cpu.world_view) ")
+            << "b2::title_enhancement(cpu,memory," << constant(entry) << ");\n";
     }
     constexpr std::uint32_t timed_functions[]={0x0021F9C0,0x00227BD9,0x00219750,0x000ED570,0x00109B40,
         0x00090420,0x00090660,0x00090A50,0x000BDEE0,0x0010DA90,0x00219370};

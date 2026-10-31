@@ -11,6 +11,12 @@ struct ID3D11DeviceContext;
 struct ID3D11SamplerState;
 
 namespace b2 {
+struct HdrSettings {
+    bool enabled=false;
+    unsigned paper_white=200,peak=0; // Nits; zero peak uses the display's reported limit.
+};
+struct HdrStatus {bool available=false,active=false;float display_peak=0;};
+struct HdrImage {unsigned width,height;std::vector<Float4> pixels;};
 #ifdef _WIN32
 inline constexpr bool render_debug_layer=true;
 #else
@@ -149,10 +155,13 @@ public:
     void restore_feedback(); // Other original framebuffer users need the complete displayed image.
     void resize(std::uint32_t width, std::uint32_t height);
     void reset(unsigned resolution_scale); // New session: discard game targets/textures, retain native pipelines.
+    void configure(unsigned resolution_scale,unsigned antialiasing,unsigned anisotropy,unsigned ao,float ao_strength,HdrSettings hdr={});
     void attach_window(void* native_window);
+    void refresh_display(); // Re-query output capabilities after a display/HDR change.
+    HdrStatus hdr_status() const;
     void aspect_ratio(float aspect); // Fit the game's anamorphic image to the selected display aspect.
     void enhancements(unsigned antialiasing,unsigned anisotropy); // AA 0=off, 1..3=FXAA, 4..6=MSAA 2/4/8x; AF 0=original or 1/2/4/8/16.
-    void clean_hud(bool); // New uploads only; configure before starting a session.
+    void clean_hud(bool); // Gpu invalidates matching cached uploads when changed during a session.
     void ambient_occlusion(unsigned quality,float strength=0.35f); // 0=off; 1..3=GTAO low/medium/high.
     bool supports_msaa(unsigned samples) const;
     unsigned raster_samples_per_pixel() const; // Host samples representing one original Xbox pixel.
@@ -191,6 +200,7 @@ public:
     Image read_frame(); // Published presentation image, including optional antialiasing.
     Image read_target(std::uint32_t);
     Image read_display();
+    HdrImage read_hdr(); // Explicit linear scRGB readback; 1.0 represents 80 nits.
     RenderStats stats() const;
     std::string adapter() const;
     std::vector<std::string> errors() const;

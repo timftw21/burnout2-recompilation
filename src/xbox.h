@@ -7,6 +7,11 @@
 
 namespace b2 {
 class Input;
+struct GameSettings {
+    bool widescreen=false,ultrawide=false,motion_blur=true;
+    bool skip_intro=false,fast_load=false,clean_hud=false;
+    unsigned draw_distance=1;
+};
 struct XboxHost {
     Renderer* renderer=nullptr;
     Input* input=nullptr;
@@ -79,6 +84,7 @@ public:
     bool save_frame(const std::filesystem::path&);
     void output_gain(float);
     bool fast_loading() const;
+    void settings(const GameSettings&); // Apply at a completed game frame.
     void capture_frame(const std::filesystem::path& directory,bool automated=false);
     void performance_recording(bool);
     PerfCounters performance_counters() const;

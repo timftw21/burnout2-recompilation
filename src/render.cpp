@@ -3,10 +3,12 @@
 #include "frame_processing.h"
 #include "antialiasing.h"
 #include "ambient_occlusion.h"
+#include "hdr.h"
 #include "ui_art.h"
 #ifdef _WIN32
 #include <Windows.h>
 #include <wincodec.h>
+#include <dxgi1_6.h>
 #else
 #include <SDL3/SDL.h>
 #include <png.h>
@@ -587,6 +589,12 @@ struct Renderer::Impl {
     ComPtr<ID3D11SamplerState> display_sampler;
     ComPtr<ID3D11RasterizerState> display_raster;
     ComPtr<ID3D11DepthStencilState> display_depth;
+    ComPtr<ID3D11Buffer> display_constants;
+    Float4 display_values{};
+    DXGI_FORMAT window_format=DXGI_FORMAT_R8G8B8A8_UNORM;
+    HdrSettings hdr_settings;
+    HdrStatus hdr_output;
+    std::unique_ptr<FrameHdr> hdr;
     std::unique_ptr<FrameLayers> layers;
     std::array<ComPtr<ID3D11PixelShader>,9> layer_combiners;
     std::array<ComPtr<ID3D11PixelShader>,4> layer_simple;
@@ -600,7 +608,7 @@ struct Renderer::Impl {
     float camera_near=0.1f,camera_far=1000,vertical_fov=1;
     MotionCamera motion_camera;
     bool camera_valid=false;
-    std::unique_ptr<MultisampleCopy> multisample_copy;
+    std::unique_ptr<SurfaceCopy> surface_copy;
     unsigned antialiasing_quality=0,anisotropy=0,samples=1,msaa_supported=0;
     ComPtr<ID3D11VertexShader> clear_vs;
     ComPtr<ID3D11PixelShader> clear_ps;
@@ -725,16 +733,34 @@ struct Renderer::Impl {
     }
     std::size_t feedback_size(unsigned w,unsigned h) const {return std::size_t(w)*h*resolution_scale*resolution_scale*samples*frame_color_bytes;}
     std::size_t target_usage() const {
-        auto bytes=target_bytes+feedback_image.bytes+(antialiasing?antialiasing->bytes():0)+(layers?layers->bytes():0)+(ambient_occlusion?ambient_occlusion->bytes():0);
+        auto bytes=target_bytes+feedback_image.bytes+(antialiasing?antialiasing->bytes():0)+(layers?layers->bytes():0)+(ambient_occlusion?ambient_occlusion->bytes():0)+(hdr?hdr->bytes():0);
         return bytes;
+    }
+    float hdr_peak() const {return hdr_settings.peak?float(hdr_settings.peak):hdr_output.display_peak>0?hdr_output.display_peak:1000.0f;}
+    float hdr_white() const {return std::min(float(hdr_settings.paper_white),hdr_peak());}
+    void output_format(bool high_dynamic_range) {
+        const auto format=high_dynamic_range?DXGI_FORMAT_R16G16B16A16_FLOAT:DXGI_FORMAT_R8G8B8A8_UNORM;
+        if(!swapchain || format==window_format) return;
+#ifdef _WIN32
+        ComPtr<IDXGISwapChain3> colors;checked(swapchain.As(&colors),"Display color-space interface");
+        DXGI_SWAP_CHAIN_DESC1 description{};checked(swapchain->GetDesc1(&description),"Display format");
+        unbind_textures();context->OMSetRenderTargets(0,nullptr,nullptr);window_view.Reset();
+        checked(swapchain->ResizeBuffers(0,description.Width,description.Height,format,description.Flags),"HDR display format");
+        const auto space=high_dynamic_range?DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709:DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+        UINT support=0;auto result=colors->CheckColorSpaceSupport(space,&support);
+        if(SUCCEEDED(result)) result=support&DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT?colors->SetColorSpace1(space):DXGI_ERROR_UNSUPPORTED;
+        if(FAILED(result)) {
+            checked(swapchain->ResizeBuffers(0,description.Width,description.Height,window_format,description.Flags),"Restore display format");
+            checked(colors->SetColorSpace1(window_format==DXGI_FORMAT_R16G16B16A16_FLOAT?DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709:DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709),"Restore display color space");
+            checked(result,"HDR display color space");
+        }
+        window_format=format;
+#endif
     }
     void reset_layers() {
         unbind_textures();layers.reset();layer_scene=false;layer_target=UINT32_MAX;motion_camera={};ao_scene_only=ao_scene_depth=false;
     }
-    std::unique_ptr<FrameLayers> make_layers(bool readable=false) {
-        const auto& main=targets.at(0);
-        auto result=std::make_unique<FrameLayers>(device.Get(),context.Get(),main.width*resolution_scale,main.height*resolution_scale,samples,stats.shader_compilations,readable);
-        if(result->bytes()>target_limit-target_usage()) throw std::runtime_error("Presentation layers exceed the render-target budget.");
+    void prepare_layer_shaders() {
         for(unsigned i=0;i<layer_combiners.size();++i) if(!layer_combiners[i]) {
             const auto pixel=shader(ShaderKind(unsigned(ShaderKind::layer_combiner0)+i));
             checked(device->CreatePixelShader(pixel.data(),pixel.size(),nullptr,&layer_combiners[i]),"UI layer combiner shader");
@@ -743,7 +769,12 @@ struct Renderer::Impl {
             const auto pixel=shader(ShaderKind(unsigned(ShaderKind::layer_color)+i));
             checked(device->CreatePixelShader(pixel.data(),pixel.size(),nullptr,&layer_simple[i]),"UI layer simple shader");
         }
-        return result;
+    }
+    std::unique_ptr<FrameLayers> make_layers(bool readable=false) {
+        const auto& main=targets.at(0);
+        auto result=std::make_unique<FrameLayers>(device.Get(),context.Get(),main.width*resolution_scale,main.height*resolution_scale,samples,stats.shader_compilations,readable);
+        if(result->bytes()>target_limit-target_usage()) throw std::runtime_error("Presentation layers exceed the render-target budget.");
+        prepare_layer_shaders();return result;
     }
     Float4 program_viewport(const ProgramView& view,bool edge_aligned=false) const {
         // Guest screen coordinates already include a half-pixel origin. Scale
@@ -1029,7 +1060,7 @@ struct Renderer::Impl {
             if(samples==1) {view.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D;view.Texture2D.MipLevels=1;}
             view.Format=depth_format==SurfaceDepth::z16?DXGI_FORMAT_R16_UNORM:DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
             checked(device->CreateShaderResourceView(output.depth.Get(),&view,&output.depth_texture),"Multisample depth view");
-            if(samples>1 && depth_format!=SurfaceDepth::z16) {view.Format=DXGI_FORMAT_X24_TYPELESS_G8_UINT;checked(device->CreateShaderResourceView(output.depth.Get(),&view,&output.stencil_texture),"Multisample stencil view");}
+            if(depth_format!=SurfaceDepth::z16) {view.Format=DXGI_FORMAT_X24_TYPELESS_G8_UINT;checked(device->CreateShaderResourceView(output.depth.Get(),&view,&output.stencil_texture),"Stencil view");}
         }
         // Readback storage is created only for explicit diagnostics.
         return output;
@@ -1051,8 +1082,15 @@ struct Renderer::Impl {
     }
     std::uint32_t feedback_phase(const RenderState& state) const {
         if(state.depth_test || !state.blend || state.blend_source!=0x302 ||
-           state.blend_destination!=0x303 || state.blend_equation!=0x8006 || state.color_mask!=0x00010101 ||
-           simple_combiner(state)!=1) return 0;
+           state.blend_destination!=0x303 || state.blend_equation!=0x8006 || state.color_mask!=0x00010101) return 0;
+        // The game's framebuffer filter copies texture RGB with vertex alpha;
+        // it does not multiply either channel by the other input. Keep this
+        // exact combiner reduction alongside the modulated feedback path.
+        const bool copy=state.texture_modes==std::array{1U,0U,0U,0U} && (state.combiner_control&255)==1 &&
+            state.color_inputs[0]==0x00002008 && state.alpha_inputs[0]==0x14200000 &&
+            state.color_outputs[0]==0xC00 && state.alpha_outputs[0]==0xC00 &&
+            state.final_inputs==std::array{12U,0x1C80U};
+        if(!copy && simple_combiner(state)!=1) return 0;
         const auto previous=targets.find(state.textures[0]);
         if(previous==targets.end()) return 0;
         const auto& current=targets.at(current_target);const auto& main=targets.at(0);
@@ -1117,7 +1155,7 @@ void Renderer::reset(unsigned scale) {
         if(r.target_size(width,height)+r.feedback_size(width,height)>r.target_limit) throw std::runtime_error("Render targets exceed the adapter budget; reduce resolution or MSAA.");
         main=r.make_target(width,height);feedback=r.make_feedback(width,height);
     } catch(...) {r.resolution_scale=previous;throw;}
-    r.reset_layers();r.antialiasing.reset();r.ambient_occlusion.reset();
+    r.reset_layers();r.antialiasing.reset();r.ambient_occlusion.reset();r.hdr.reset();
     r.camera_valid=false;
     r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
     r.targets.clear();r.textures.resize(1);r.free_textures.clear();r.texture_bytes=0;
@@ -1126,17 +1164,15 @@ void Renderer::reset(unsigned scale) {
     const auto compilations=r.stats.shader_compilations;r.stats={};r.stats.shader_compilations=compilations;
     r.vertex_cursor=r.index_cursor=0;r.factors_valid=r.program_valid=false;
     r.factor_cursor=r.program_cursor=r.factor_offset=r.program_offset=0;
-    enhancements(r.antialiasing_quality,r.anisotropy);
-    if(r.ao_quality) ambient_occlusion(r.ao_quality,r.ao_strength);
+    const auto quality=r.antialiasing_quality,ao=r.ao_quality;
+    r.antialiasing_quality=r.ao_quality=0;
+    configure(scale,quality,r.anisotropy,ao,r.ao_strength,r.hdr_settings);
 }
 void Renderer::resize(std::uint32_t width, std::uint32_t height) {
     auto& r=*impl_;const auto& main=r.targets.at(0);
     const bool changed=main.width!=width || main.height!=height;
     r.resize(width,height);
-    if(changed) {
-        if(r.antialiasing_quality) enhancements(r.antialiasing_quality,r.anisotropy);
-        if(r.ao_quality) ambient_occlusion(r.ao_quality,r.ao_strength);
-    }
+    if(changed) configure(r.resolution_scale,r.antialiasing_quality,r.anisotropy,r.ao_quality,r.ao_strength,r.hdr_settings);
 }
 std::uint32_t Renderer::create_target(std::uint32_t width,std::uint32_t height,SurfaceColor color,SurfaceDepth depth) {
     auto& r=*impl_;extent(width,height);
@@ -1171,8 +1207,8 @@ void Renderer::grow_target(std::uint32_t target,std::uint32_t width,std::uint32_
     r.context->ClearRenderTargetView(output.color_view.Get(),black);
     r.context->ClearDepthStencilView(output.depth_view.Get(),D3D11_CLEAR_DEPTH|(prior.depth_format==SurfaceDepth::z16?0:D3D11_CLEAR_STENCIL),1,0);
     if(r.samples>1) {
-        r.multisample_copy->grow(prior.multisample_view.Get(),prior.depth_texture.Get(),prior.stencil_texture.Get(),
-            output.color_view.Get(),output.depth_view.Get(),prior.width*r.resolution_scale,prior.height*r.resolution_scale);
+        r.surface_copy->copy(prior.multisample_view.Get(),prior.depth_texture.Get(),prior.stencil_texture.Get(),
+            output.color_view.Get(),output.depth_view.Get(),prior.width*r.resolution_scale,prior.height*r.resolution_scale,r.samples,r.samples);
     } else {
     r.context->CopySubresourceRegion(output.color.Get(),0,0,0,0,prior.color.Get(),0,nullptr);
     // Depth/stencil resources require whole copies with matching dimensions.
@@ -1224,23 +1260,26 @@ std::uint32_t Renderer::copy_cubemap(const std::array<std::uint32_t,6>& faces,st
     description.ArraySize=6;description.BindFlags=D3D11_BIND_SHADER_RESOURCE;
     description.MiscFlags=D3D11_RESOURCE_MISC_TEXTURECUBE;
     ComPtr<ID3D11Texture2D> cube;
-    if(!destination) {
-        const auto required=std::size_t(description.Width)*description.Height*6*(description.Format==DXGI_FORMAT_B5G6R5_UNORM?2:frame_color_bytes);
-        if(!r.texture_capacity() || required>256*1024*1024-r.texture_bytes)
-            throw std::runtime_error("Cubemap texture resource limit reached");
-        checked(r.device->CreateTexture2D(&description,nullptr,&cube),"GPU cubemap");
-        ComPtr<ID3D11ShaderResourceView> view;
-        checked(r.device->CreateShaderResourceView(cube.Get(),nullptr,&view),"GPU cubemap view");
-        destination=r.retain_texture(std::move(view),3,required);
-    } else {
+    if(destination) {
         if(destination>=r.textures.size() || r.textures[destination].dimension!=3)
             throw std::runtime_error("Cubemap destination was not created");
         ComPtr<ID3D11Resource> resource;r.textures[destination].view->GetResource(&resource);
         checked(resource.As(&cube),"GPU cubemap resource");
         D3D11_TEXTURE2D_DESC existing{};cube->GetDesc(&existing);
-        if(existing.Width!=description.Width || existing.Height!=description.Height || existing.Format!=description.Format ||
-            existing.MipLevels!=1 || existing.ArraySize!=6 || existing.Usage!=D3D11_USAGE_DEFAULT)
-            throw std::runtime_error("Cubemap destination differs from its faces");
+        if(existing.MipLevels!=1 || existing.ArraySize!=6 || existing.Usage!=D3D11_USAGE_DEFAULT)
+            throw std::runtime_error("Cubemap destination is not a rendered cubemap");
+        if(existing.Width!=description.Width || existing.Height!=description.Height || existing.Format!=description.Format) cube.Reset();
+    }
+    if(!cube) {
+        const auto required=std::size_t(description.Width)*description.Height*6*(description.Format==DXGI_FORMAT_B5G6R5_UNORM?2:frame_color_bytes);
+        const auto previous=destination?r.textures[destination].bytes:0;
+        if((!destination && !r.texture_capacity()) || required>256*1024*1024-(r.texture_bytes-previous))
+            throw std::runtime_error("Cubemap texture resource limit reached");
+        checked(r.device->CreateTexture2D(&description,nullptr,&cube),"GPU cubemap");
+        ComPtr<ID3D11ShaderResourceView> view;
+        checked(r.device->CreateShaderResourceView(cube.Get(),nullptr,&view),"GPU cubemap view");
+        if(!destination) destination=r.retain_texture(std::move(view),3,required);
+        else {r.textures[destination].view=std::move(view);r.textures[destination].bytes=required;r.texture_bytes=r.texture_bytes-previous+required;}
     }
     r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
     for(unsigned face=0;face<faces.size();++face)
@@ -1275,6 +1314,7 @@ void Renderer::copy_to_main() {
     r.targets.at(0).uniform_alpha=r.targets.at(identifier).uniform_alpha;
     r.targets.at(0).dirty=true;
     if(r.antialiasing) r.antialiasing->invalidate();
+    if(r.hdr) r.hdr->invalidate();
     r.ended=true;
 }
 void Renderer::begin_overlay() {
@@ -1349,6 +1389,8 @@ void Renderer::attach_window(void* native_window) {
     const auto vs=r.shader(ShaderKind::display_vertex),ps=r.shader(ShaderKind::display_pixel);
     checked(r.device->CreateVertexShader(vs.data(),vs.size(),nullptr,&r.display_vs),"Display vertex shader");
     checked(r.device->CreatePixelShader(ps.data(),ps.size(),nullptr,&r.display_ps),"Display pixel shader");
+    D3D11_BUFFER_DESC constants{};constants.ByteWidth=16;constants.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
+    checked(r.device->CreateBuffer(&constants,nullptr,&r.display_constants),"Display color constants");
     D3D11_SAMPLER_DESC sampler{};sampler.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     sampler.AddressU=sampler.AddressV=sampler.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;sampler.MaxLOD=D3D11_FLOAT32_MAX;
     sampler.ComparisonFunc=D3D11_COMPARISON_ALWAYS;
@@ -1360,7 +1402,32 @@ void Renderer::attach_window(void* native_window) {
     depth.FrontFace=depth.BackFace={D3D11_STENCIL_OP_KEEP,D3D11_STENCIL_OP_KEEP,D3D11_STENCIL_OP_KEEP,D3D11_COMPARISON_ALWAYS};
     checked(r.device->CreateDepthStencilState(&depth,&r.display_depth),"Display depth state");
     r.window=static_cast<HWND>(native_window);
+    refresh_display();
 }
+void Renderer::refresh_display() {
+    auto& r=*impl_;r.hdr_output.available=false;r.hdr_output.display_peak=0;
+#ifdef _WIN32
+    if(!r.window) return;
+    ComPtr<IDXGISwapChain3> colors;if(FAILED(r.swapchain.As(&colors))) return;
+    // A fresh factory avoids stale capabilities after Windows HDR or monitor
+    // changes. This runs on display events, never on the steady rendering path.
+    ComPtr<IDXGIFactory1> factory;if(FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return;
+    const auto monitor=MonitorFromWindow(r.window,MONITOR_DEFAULTTONEAREST);
+    for(unsigned i=0;;++i) {
+        ComPtr<IDXGIAdapter1> adapter;if(FAILED(factory->EnumAdapters1(i,&adapter))) break;
+        for(unsigned j=0;;++j) {
+            ComPtr<IDXGIOutput> output;if(FAILED(adapter->EnumOutputs(j,&output))) break;
+            ComPtr<IDXGIOutput6> modern;DXGI_OUTPUT_DESC1 description{};
+            if(FAILED(output.As(&modern)) || FAILED(modern->GetDesc1(&description)) || description.Monitor!=monitor) continue;
+            r.hdr_output.available=description.ColorSpace==DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+            if(std::isfinite(description.MaxLuminance) && description.MaxLuminance>=80 && description.MaxLuminance<=10000)
+                r.hdr_output.display_peak=description.MaxLuminance;
+            return;
+        }
+    }
+#endif
+}
+HdrStatus Renderer::hdr_status() const {auto result=impl_->hdr_output;result.active=bool(impl_->hdr);return result;}
 void Renderer::aspect_ratio(float aspect) {
     if(!std::isfinite(aspect) || aspect<=0) throw std::runtime_error("Invalid display aspect ratio");
     impl_->display_aspect=aspect;
@@ -1380,53 +1447,82 @@ void Renderer::camera(std::uint32_t identifier,float near_plane,float far_plane,
 }
 void Renderer::clean_hud(bool enabled) {impl_->clean_hud=enabled;}
 void Renderer::enhancements(unsigned quality,unsigned anisotropy) {
-    auto& r=*impl_;
-    if(r.recording || quality>6 || anisotropy>16 || (anisotropy && !std::has_single_bit(anisotropy)))
-        throw std::runtime_error("Configure valid graphics enhancements outside submission.");
-    const auto samples=quality>=4?1U<<(quality-3):1U;
-    if(samples>1 && !supports_msaa(samples)) throw std::runtime_error(std::format("MSAA {}x is unavailable on this graphics device.",samples));
-    if(samples>1 && !r.multisample_copy) r.multisample_copy=std::make_unique<MultisampleCopy>(r.device.Get(),r.context.Get(),r.stats.shader_compilations);
-    if(samples!=r.samples) {
-        if(r.targets.size()!=1 || r.texture_bytes) throw std::runtime_error("Change MSAA between game sessions.");
-        const auto previous_samples=r.samples,previous_quality=r.antialiasing_quality,previous_anisotropy=r.anisotropy;
-        const auto previous_target=r.targets.at(0).color.Get();
-
-        r.samples=samples;r.antialiasing_quality=quality;r.anisotropy=anisotropy;
-        try {reset(r.resolution_scale);} catch(...) {
-            if(r.targets.at(0).color.Get()==previous_target) {
-                r.samples=previous_samples;r.antialiasing_quality=previous_quality;r.anisotropy=previous_anisotropy;
-                if(previous_samples==1) r.multisample_copy.reset();
-            }
-            throw;
-        }
-        return;
-    }
-    std::unique_ptr<FrameAntialiasing> next;
-    if(quality && quality<=3) {
-        const auto& main=r.targets.at(0);
-        const auto bytes=std::size_t(main.width)*main.height*r.resolution_scale*r.resolution_scale*4;
-        if(bytes>r.target_limit-r.target_bytes-r.feedback_image.bytes) throw std::runtime_error("Antialiasing exceeds the render-target budget.");
-        next=std::make_unique<FrameAntialiasing>(r.device.Get(),r.context.Get(),main.width*r.resolution_scale,main.height*r.resolution_scale,quality,r.stats.shader_compilations);
-        r.count(PerfMetric::target_creations);
-    }
-    if(samples==1) r.multisample_copy.reset();
-    r.unbind_textures();r.antialiasing=std::move(next);r.antialiasing_quality=quality;r.anisotropy=anisotropy;
-
-    r.reset_layers();if(r.ambient_occlusion) r.layers=r.make_layers(true);
+    const auto& r=*impl_;configure(r.resolution_scale,quality,anisotropy,r.ao_quality,r.ao_strength,r.hdr_settings);
 }
 void Renderer::ambient_occlusion(unsigned quality,float strength) {
+    const auto& r=*impl_;configure(r.resolution_scale,r.antialiasing_quality,r.anisotropy,quality,strength,r.hdr_settings);
+}
+void Renderer::configure(unsigned scale,unsigned quality,unsigned anisotropy,unsigned ao,float strength,HdrSettings hdr_settings) {
     auto& r=*impl_;
-    if(r.recording || quality>3 || !std::isfinite(strength) || strength<0 || strength>1)
-        throw std::runtime_error("Configure valid ambient occlusion outside submission");
-    r.reset_layers();r.ambient_occlusion.reset();
-    r.ao_quality=quality;r.ao_strength=strength;
-    if(quality) {
-        const auto& main=r.targets.at(0);
-        const auto bytes=std::size_t(main.width)*main.height*r.resolution_scale*r.resolution_scale*20;
-        if(bytes>r.target_limit-r.target_usage()) throw std::runtime_error("Ambient occlusion exceeds the render-target budget");
-        r.ambient_occlusion=std::make_unique<FrameAmbientOcclusion>(r.device.Get(),r.context.Get(),main.width*r.resolution_scale,main.height*r.resolution_scale,quality,r.samples,r.stats.shader_compilations);
+    if(r.recording || !scale || scale>4 || quality>6 || anisotropy>16 || (anisotropy && !std::has_single_bit(anisotropy)) ||
+       ao>3 || !std::isfinite(strength) || strength<0 || strength>1)
+        throw std::runtime_error("Configure valid graphics enhancements outside submission.");
+    if(hdr_settings.paper_white<80 || hdr_settings.paper_white>500 || (hdr_settings.peak && (hdr_settings.peak<200 || hdr_settings.peak>10000)))
+        throw std::runtime_error("HDR brightness must be 80-500 nits, with an automatic or 200-10000 nit peak.");
+    const bool hdr=hdr_settings.enabled && (!r.window || r.hdr_output.available);
+    const auto samples=quality>=4?1U<<(quality-3):1U;
+    if(samples>1 && !supports_msaa(samples)) throw std::runtime_error(std::format("MSAA {}x is unavailable on this graphics device.",samples));
+    if(scale==r.resolution_scale && quality==r.antialiasing_quality && ao==r.ao_quality && hdr==bool(r.hdr) &&
+       (!r.antialiasing || r.antialiasing->bytes()==std::size_t(r.targets.at(0).width)*r.targets.at(0).height*scale*scale*4) &&
+       (!r.ambient_occlusion || r.ambient_occlusion->bytes()==std::size_t(r.targets.at(0).width)*r.targets.at(0).height*scale*scale*20) &&
+       (!r.hdr || r.hdr->bytes()==std::size_t(r.targets.at(0).width)*r.targets.at(0).height*scale*scale*8)) {
+        r.anisotropy=anisotropy;r.ao_strength=strength;r.hdr_settings=hdr_settings;r.bound.valid=false;
+        return;
     }
-    if(r.ambient_occlusion) r.layers=r.make_layers(true);
+    const auto previous_scale=r.resolution_scale,previous_samples=r.samples;
+    const bool migrate=scale!=previous_scale || samples!=previous_samples;
+    const auto& main=r.targets.at(0);const auto width=main.width*scale,height=main.height*scale;
+    decltype(r.targets) targets;
+    Impl::FeedbackImage feedback;
+    std::unique_ptr<FrameAntialiasing> antialiasing;
+    std::unique_ptr<FrameAmbientOcclusion> occlusion;
+    std::unique_ptr<FrameHdr> next_hdr;
+    std::unique_ptr<FrameLayers> layers;
+    std::size_t target_bytes=0;
+    // Allocate the replacement set first. A rejected setting leaves every live
+    // resource and its identifier intact, including the current feedback image.
+    r.resolution_scale=scale;r.samples=samples;
+    try {
+        for(const auto& [id,target]:r.targets) target_bytes+=r.target_size(target.width,target.height,target.color_format);
+        const auto& old_feedback=r.targets.at(r.feedback_target);
+        auto required=target_bytes+r.feedback_size(old_feedback.width,old_feedback.height);
+        if(quality && quality<=3) required+=std::size_t(width)*height*4;
+        if(ao) required+=std::size_t(width)*height*20;
+        if(hdr) required+=std::size_t(width)*height*8;
+        if(required>r.target_limit) throw std::runtime_error("Render targets exceed the adapter budget; reduce resolution or MSAA.");
+        if(ao || hdr) {
+            r.prepare_layer_shaders();
+            layers=std::make_unique<FrameLayers>(r.device.Get(),r.context.Get(),width,height,samples,r.stats.shader_compilations,true);
+            if(layers->bytes()>r.target_limit-required) throw std::runtime_error("Presentation layers exceed the render-target budget.");
+        }
+        if(ao) occlusion=std::make_unique<FrameAmbientOcclusion>(r.device.Get(),r.context.Get(),width,height,ao,samples,r.stats.shader_compilations);
+        if(hdr) next_hdr=std::make_unique<FrameHdr>(r.device.Get(),r.context.Get(),width,height,r.stats.shader_compilations);
+        if(quality && quality<=3) antialiasing=std::make_unique<FrameAntialiasing>(r.device.Get(),r.context.Get(),width,height,quality,r.stats.shader_compilations);
+        if(migrate) {
+            if(!r.surface_copy) r.surface_copy=std::make_unique<SurfaceCopy>(r.device.Get(),r.context.Get(),r.stats.shader_compilations);
+            for(const auto& [id,target]:r.targets) {
+                auto next=r.make_target(target.width,target.height,target.color_format,target.depth_format);
+                next.uniform_alpha=target.uniform_alpha;targets.emplace(id,std::move(next));
+            }
+            feedback=r.make_feedback(old_feedback.width,old_feedback.height);
+        }
+        r.output_format(hdr);
+    } catch(...) {r.resolution_scale=previous_scale;r.samples=previous_samples;throw;}
+    r.reset_layers();r.context->OMSetRenderTargets(0,nullptr,nullptr);
+    if(migrate) {
+        for(auto& [id,target]:targets) {
+            const auto& prior=r.targets.at(id);
+            r.context->ClearDepthStencilView(target.depth_view.Get(),D3D11_CLEAR_DEPTH|(target.depth_format==SurfaceDepth::z16?0:D3D11_CLEAR_STENCIL),1,0);
+            r.surface_copy->copy(previous_samples>1?prior.multisample_view.Get():prior.texture_view.Get(),prior.depth_texture.Get(),prior.stencil_texture.Get(),
+                target.color_view.Get(),target.depth_view.Get(),target.width*scale,target.height*scale,previous_samples,samples,float(previous_scale)/scale);
+            if(id) r.textures[id].view=target.texture_view;
+        }
+        r.targets=std::move(targets);r.target_bytes=target_bytes;r.feedback_image=std::move(feedback);
+    }
+    r.antialiasing=std::move(antialiasing);r.ambient_occlusion=std::move(occlusion);r.layers=std::move(layers);
+    r.hdr=std::move(next_hdr);r.hdr_settings=hdr_settings;
+    r.antialiasing_quality=quality;r.anisotropy=anisotropy;r.ao_quality=ao;r.ao_strength=strength;
+    r.select_target(r.current_target);r.factors_valid=r.program_valid=false;
 }
 void Renderer::visibility(const Visibility* visibility) noexcept {impl_->visibility=visibility;}
 bool Renderer::needs_motion_camera() const {return bool(impl_->ambient_occlusion);}
@@ -1451,6 +1547,13 @@ void Renderer::publish_frame() {
             }
         }
         if(r.antialiasing) {r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);r.antialiasing->publish(view);r.select_target(r.current_target);}
+        if(r.hdr) {
+            const auto* images=r.layers && r.layers->valid() && r.layer_target==r.presentation_target?&r.layers->resolved():nullptr;
+            auto scene=r.ambient_occlusion && r.ambient_occlusion->ready()?r.ambient_occlusion->scene_view():images?images->views[0].Get():view;
+            auto image=r.antialiasing?r.antialiasing->view():view;
+            r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
+            r.hdr->publish(image,scene,images,r.hdr_white(),r.hdr_peak());r.select_target(r.current_target);
+        }
         if(r.layers) r.layers->invalidate();r.layer_scene=false;r.layer_target=UINT32_MAX;r.ao_scene_only=r.ao_scene_depth=false;
     }
     ++r.stats.published_frames;
@@ -1493,7 +1596,10 @@ bool Renderer::display(bool wait) {
 #ifdef _WIN32
         flags|=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 #endif
-        r.window_view.Reset();checked(r.swapchain->ResizeBuffers(0,width,height,DXGI_FORMAT_UNKNOWN,flags),"Window resize");
+        r.window_view.Reset();
+        DXGI_SWAP_CHAIN_DESC1 description{};checked(r.swapchain->GetDesc1(&description),"Window buffer dimensions");
+        if(description.Width!=width || description.Height!=height)
+            checked(r.swapchain->ResizeBuffers(0,width,height,DXGI_FORMAT_UNKNOWN,flags),"Window resize");
         ComPtr<ID3D11Texture2D> buffer;checked(r.swapchain->GetBuffer(0,IID_PPV_ARGS(&buffer)),"Window buffer");
         checked(r.device->CreateRenderTargetView(buffer.Get(),nullptr,&r.window_view),"Window render target");
         r.window_width=width;r.window_height=height;
@@ -1509,7 +1615,11 @@ bool Renderer::display(bool wait) {
     r.context->OMSetBlendState(nullptr,nullptr,UINT_MAX);
     r.context->IASetInputLayout(nullptr);r.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     r.context->VSSetShader(r.display_vs.Get(),nullptr,0);r.context->PSSetShader(r.display_ps.Get(),nullptr,0);
-    auto texture=r.antialiasing && r.antialiasing->ready()?r.antialiasing->view():r.ambient_occlusion && r.ambient_occlusion->ready()?r.ambient_occlusion->view():main.texture_view.Get();
+    const bool hdr_source=r.hdr && r.hdr->ready();
+    const Float4 display_values{r.hdr?1.0f:0.0f,r.hdr_white()/80,hdr_source?1.0f:0.0f,0};
+    if(display_values!=r.display_values) {r.context->UpdateSubresource(r.display_constants.Get(),0,nullptr,display_values.data(),0,0);r.display_values=display_values;}
+    auto constants=r.display_constants.Get();r.context->PSSetConstantBuffers(1,1,&constants);
+    auto texture=hdr_source?r.hdr->view():r.antialiasing && r.antialiasing->ready()?r.antialiasing->view():r.ambient_occlusion && r.ambient_occlusion->ready()?r.ambient_occlusion->view():main.texture_view.Get();
     auto sampler=r.display_sampler.Get();
     r.context->PSSetShaderResources(0,1,&texture);
     r.context->PSSetSamplers(0,1,&sampler);r.context->Draw(3,0);
@@ -1879,6 +1989,7 @@ void Renderer::clear(std::uint32_t argb, float depth) {
     if (!std::isfinite(depth) || depth < 0 || depth > 1) throw std::runtime_error("Invalid clear depth");
     if(!r.current_target) r.feedback_target=0;
     if(!r.current_target && r.antialiasing) r.antialiasing->invalidate();
+    if(!r.current_target && r.hdr) r.hdr->invalidate();
     if(r.layers && r.layer_target==r.current_target) {r.layers->invalidate();r.layer_scene=false;r.ao_scene_depth=false;}
     const auto rgba = color(argb);
     r.targets.at(r.current_target).uniform_alpha=rgba[3];
@@ -1894,6 +2005,7 @@ void Renderer::clear_buffers(std::uint32_t flags,std::uint32_t argb,float depth,
     if(flags&~0xF3U) throw std::runtime_error("Invalid clear channel flags");
     if((flags&0xF0U) && !r.current_target) r.feedback_target=0;
     if((flags&0xF0U) && !r.current_target && r.antialiasing) r.antialiasing->invalidate();
+    if((flags&0xF0U) && !r.current_target && r.hdr) r.hdr->invalidate();
     if((flags&0xF0U) && r.layers && r.layer_target==r.current_target) {r.layers->invalidate();r.layer_scene=false;r.ao_scene_depth=false;}
     if(r.samples>1 && (flags&0xF0U)) r.targets.at(r.current_target).dirty=true;
     if(r.targets.at(r.current_target).depth_format==SurfaceDepth::z16) flags&=~2U;
@@ -2431,6 +2543,10 @@ Image Renderer::read_frame() {
     if(impl_->ambient_occlusion && impl_->ambient_occlusion->ready()) return impl_->ambient_occlusion->readback();
     return read_target(0);
 }
+HdrImage Renderer::read_hdr() {
+    if(!impl_->hdr) throw std::runtime_error("HDR output is not enabled");
+    return impl_->hdr->readback();
+}
 Image Renderer::readback() {
     auto& r = *impl_;
     if (!r.ended || r.recording) throw std::runtime_error("End a frame before reading back");
@@ -2468,6 +2584,8 @@ Image Renderer::read_display() {
     ComPtr<ID3D11Texture2D> buffer,staging;
     checked(r.swapchain->GetBuffer(0,IID_PPV_ARGS(&buffer)),"Window image");
     D3D11_TEXTURE2D_DESC description{};buffer->GetDesc(&description);
+    if(description.Format==DXGI_FORMAT_R16G16B16A16_FLOAT)
+        return hdr_sdr_image(read_hdr_image(r.device.Get(),r.context.Get(),buffer.Get()),r.hdr_white());
     description.Usage=D3D11_USAGE_STAGING;description.BindFlags=0;description.MiscFlags=0;description.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
     checked(r.device->CreateTexture2D(&description,nullptr,&staging),"Window readback storage");
     r.context->CopyResource(staging.Get(),buffer.Get());

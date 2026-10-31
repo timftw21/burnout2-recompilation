@@ -33,18 +33,19 @@ private:
     Ptr<ID3D11DepthStencilState> depth_;
 };
 
-// Grow multisample colour/depth/stencil without discarding individual samples.
-// D3D11 forbids ordinary partial copies of multisampled resources.
-class MultisampleCopy {
+// Preserve colour/depth/stencil when growing or rescaling live render targets.
+class SurfaceCopy {
 public:
-    MultisampleCopy(ID3D11Device*,ID3D11DeviceContext*,std::uint64_t& compilations);
-    void grow(ID3D11ShaderResourceView* color,ID3D11ShaderResourceView* depth,ID3D11ShaderResourceView* stencil,
-              ID3D11RenderTargetView*,ID3D11DepthStencilView*,unsigned width,unsigned height);
+    SurfaceCopy(ID3D11Device*,ID3D11DeviceContext*,std::uint64_t& compilations);
+    void copy(ID3D11ShaderResourceView* color,ID3D11ShaderResourceView* depth,ID3D11ShaderResourceView* stencil,
+              ID3D11RenderTargetView*,ID3D11DepthStencilView*,unsigned width,unsigned height,
+              unsigned source_samples,unsigned destination_samples,float source_scale=1);
 private:
     template<class T> using Ptr=Microsoft::WRL::ComPtr<T>;
     ID3D11DeviceContext* context_;
     Ptr<ID3D11VertexShader> vertex_;
-    Ptr<ID3D11PixelShader> pixel_,stencil_;
+    std::array<Ptr<ID3D11PixelShader>,2> pixel_,stencil_;
+    Ptr<ID3D11Buffer> constants_;
     Ptr<ID3D11RasterizerState> raster_;
     Ptr<ID3D11DepthStencilState> depth_;
     std::array<Ptr<ID3D11DepthStencilState>,8> stencil_states_;

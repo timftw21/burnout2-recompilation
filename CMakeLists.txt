@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.2)
-project(burnout2 VERSION 1.11.0 LANGUAGES C CXX)
+project(burnout2 VERSION 1.12.0 LANGUAGES C CXX)
 
 if((NOT WIN32 AND NOT APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux") OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR
    (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$" AND NOT (APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")))
@@ -94,7 +94,7 @@ else()
     endif()
 endif()
 
-add_library(b2-graphics STATIC src/render.cpp src/render_checks.cpp src/vertex_program.cpp src/shaders.cpp src/gpu.cpp src/frame_processing.cpp src/antialiasing.cpp src/ambient_occlusion.cpp src/ui_art.cpp)
+add_library(b2-graphics STATIC src/render.cpp src/render_checks.cpp src/vertex_program.cpp src/shaders.cpp src/gpu.cpp src/frame_processing.cpp src/antialiasing.cpp src/ambient_occlusion.cpp src/hdr.cpp src/ui_art.cpp)
 target_link_libraries(b2-graphics PUBLIC b2-core)
 if(WIN32)
     target_link_libraries(b2-graphics PRIVATE d3d11 dxgi windowscodecs ole32)

@@ -17,6 +17,7 @@ public:
     void submit(std::uint32_t begin,std::uint32_t end,bool flush=true);
     void begin_overlay();
     void restore_feedback();
+    void clean_hud(bool);
     void coverage(std::uint64_t); // Applies to subsequently submitted packets.
     bool busy();
     void wait();

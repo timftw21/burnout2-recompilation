@@ -58,12 +58,18 @@ Image FrameAntialiasing::readback() {
     for(unsigned row=0;row<height_;++row) std::memcpy(result.rgba.data()+std::size_t(row)*width_*4,static_cast<const std::byte*>(mapped.pData)+std::size_t(row)*mapped.RowPitch,width_*4);
     context_->Unmap(staging.Get(),0);return result;
 }
-MultisampleCopy::MultisampleCopy(ID3D11Device* device,ID3D11DeviceContext* context,std::uint64_t& compilations):context_(context) {
-    const auto vertex=shader_binary(ShaderKind::display_vertex),pixel=shader_binary(ShaderKind::copy_multisample),stencil=shader_binary(ShaderKind::copy_multisample_stencil);
-    compilations+=unsigned(vertex.compiled)+unsigned(pixel.compiled)+unsigned(stencil.compiled);
+SurfaceCopy::SurfaceCopy(ID3D11Device* device,ID3D11DeviceContext* context,std::uint64_t& compilations):context_(context) {
+    const auto vertex=shader_binary(ShaderKind::display_vertex);compilations+=unsigned(vertex.compiled);
     checked_aa(device->CreateVertexShader(vertex.bytes.data(),vertex.bytes.size(),nullptr,&vertex_),"MSAA transfer vertex shader");
-    checked_aa(device->CreatePixelShader(pixel.bytes.data(),pixel.bytes.size(),nullptr,&pixel_),"MSAA colour/depth transfer shader");
-    checked_aa(device->CreatePixelShader(stencil.bytes.data(),stencil.bytes.size(),nullptr,&stencil_),"MSAA stencil transfer shader");
+    for(unsigned i=0;i<2;++i) {
+        const auto pixel=shader_binary(i?ShaderKind::copy_multisample:ShaderKind::copy_surface);
+        const auto stencil=shader_binary(i?ShaderKind::copy_multisample_stencil:ShaderKind::copy_surface_stencil);
+        compilations+=unsigned(pixel.compiled)+unsigned(stencil.compiled);
+        checked_aa(device->CreatePixelShader(pixel.bytes.data(),pixel.bytes.size(),nullptr,&pixel_[i]),"Surface colour/depth transfer shader");
+        checked_aa(device->CreatePixelShader(stencil.bytes.data(),stencil.bytes.size(),nullptr,&stencil_[i]),"Surface stencil transfer shader");
+    }
+    D3D11_BUFFER_DESC constants{};constants.ByteWidth=16;constants.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
+    checked_aa(device->CreateBuffer(&constants,nullptr,&constants_),"Surface transfer constants");
     D3D11_RASTERIZER_DESC raster{};raster.FillMode=D3D11_FILL_SOLID;raster.CullMode=D3D11_CULL_NONE;raster.DepthClipEnable=raster.MultisampleEnable=TRUE;
     checked_aa(device->CreateRasterizerState(&raster,&raster_),"MSAA transfer rasterizer");
     D3D11_DEPTH_STENCIL_DESC depth{};depth.DepthEnable=TRUE;depth.DepthWriteMask=D3D11_DEPTH_WRITE_MASK_ALL;depth.DepthFunc=D3D11_COMPARISON_ALWAYS;
@@ -79,16 +85,21 @@ MultisampleCopy::MultisampleCopy(ID3D11Device* device,ID3D11DeviceContext* conte
         checked_aa(device->CreateBuffer(&buffer,&data,&stencil_masks_[bit]),"MSAA stencil transfer mask");
     }
 }
-void MultisampleCopy::grow(ID3D11ShaderResourceView* color,ID3D11ShaderResourceView* depth,ID3D11ShaderResourceView* stencil,
-                           ID3D11RenderTargetView* target,ID3D11DepthStencilView* destination,unsigned width,unsigned height) {
+void SurfaceCopy::copy(ID3D11ShaderResourceView* color,ID3D11ShaderResourceView* depth,ID3D11ShaderResourceView* stencil,
+                      ID3D11RenderTargetView* target,ID3D11DepthStencilView* destination,unsigned width,unsigned height,
+                      unsigned source_samples,unsigned destination_samples,float source_scale) {
+    const struct {float scale,padding;unsigned source,destination;} constants{source_scale,0,source_samples,destination_samples};
+    context_->UpdateSubresource(constants_.Get(),0,nullptr,&constants,0,0);
+    auto buffer=constants_.Get();context_->PSSetConstantBuffers(1,1,&buffer);
     const D3D11_VIEWPORT viewport{0,0,float(width),float(height),0,1};context_->RSSetViewports(1,&viewport);
     context_->RSSetState(raster_.Get());context_->OMSetBlendState(nullptr,nullptr,UINT_MAX);
     context_->IASetInputLayout(nullptr);context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    context_->VSSetShader(vertex_.Get(),nullptr,0);context_->PSSetShader(pixel_.Get(),nullptr,0);
+    context_->GSSetShader(nullptr,nullptr,0);
+    context_->VSSetShader(vertex_.Get(),nullptr,0);context_->PSSetShader(pixel_[source_samples>1].Get(),nullptr,0);
     context_->OMSetRenderTargets(1,&target,destination);context_->OMSetDepthStencilState(depth_.Get(),0);
     ID3D11ShaderResourceView* sources[]={color,depth,stencil};context_->PSSetShaderResources(0,3,sources);context_->Draw(3,0);
     if(stencil) {
-        context_->OMSetRenderTargets(0,nullptr,destination);context_->PSSetShader(stencil_.Get(),nullptr,0);
+        context_->OMSetRenderTargets(0,nullptr,destination);context_->PSSetShader(stencil_[source_samples>1].Get(),nullptr,0);
         for(unsigned bit=0;bit<8;++bit) {
             context_->OMSetDepthStencilState(stencil_states_[bit].Get(),1U<<bit);
             auto buffer=stencil_masks_[bit].Get();context_->PSSetConstantBuffers(0,1,&buffer);context_->Draw(3,0);

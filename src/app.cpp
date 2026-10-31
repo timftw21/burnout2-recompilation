@@ -93,10 +93,13 @@ struct Preferences {
     int aspect_ratio=0; // 0=4:3, 1=16:9, 2=21:9.
     int refresh_rate=60,volume=100,resolution_scale=1,antialiasing=0,anisotropy=0;
     int ambient_occlusion=0,ambient_occlusion_strength=35;
+    bool hdr=false;
+    int hdr_paper_white=200,hdr_peak=0;
     bool custom_music=false,loop_track=false,mute_on_focus_loss=false;
     bool skip_intro=false,fast_load=false,clean_hud=true;
     int draw_distance=1;
     KeyboardBindings bindings=default_keyboard_bindings();
+    ControllerProfiles controller_bindings=default_controller_profiles();
     explicit Preferences(bool load=true,const std::filesystem::path& path="data/local/settings.cfg") {
         copy_text(xbe.data(),xbe.size(),"data/local/default.xbe");
         copy_text(disc.data(),disc.size(),"Burnout 2/Burnout 2 - Point of Impact (USA).xiso.iso");
@@ -115,6 +118,9 @@ struct Preferences {
                 auto& destination=key=="xbe"?xbe:key=="disc"?disc:music_folder;
                 if(value.size()<destination.size()) copy_text(destination.data(),destination.size(),value.c_str());
             } else if(key=="vsync") vsync=value=="1";
+            else if(key=="hdr") hdr=value=="1";
+            else if(key=="hdr_paper_white") number(hdr_paper_white,80,500);
+            else if(key=="hdr_peak") {if(value=="0") hdr_peak=0;else number(hdr_peak,200,10000);}
             else if(key=="fullscreen") fullscreen=value=="1";
             else if(key=="widescreen" && !has_aspect) aspect_ratio=value=="1"?1:0;
             else if(key=="aspect_ratio") {
@@ -149,10 +155,13 @@ struct Preferences {
             }
             else if(key=="volume") number(volume,0,100);
             else if(key.starts_with("key_")) {
-                for(unsigned i=0;i<keyboard_actions.size();++i) if(key.substr(4)==keyboard_actions[i].id) {
+                for(unsigned i=0;i<input_actions.size();++i) if(key.substr(4)==input_actions[i].id) {
                     auto candidate=bindings[i];number(candidate,0,SDL_SCANCODE_COUNT-1);
                     if(valid_keyboard_binding(candidate)) bindings[i]=candidate;
                 }
+            } else if(key.size()>5 && key.starts_with("pad") && key[3]>='1' && key[3]<='4' && key[4]=='_') {
+                for(unsigned i=0;i<input_actions.size();++i) if(key.substr(5)==input_actions[i].id)
+                    if(const auto binding=parse_controller_binding(value)) controller_bindings[key[3]-'1'][i]=*binding;
             }
         }
         if(!has_distance && legacy_distance) draw_distance=2;
@@ -165,14 +174,18 @@ struct Preferences {
             <<"\nresolution_scale="<<resolution_scale<<"\nshow_fps="<<show_fps<<"\nwidescreen="<<(aspect_ratio!=0)<<"\naspect_ratio="<<aspect_ratio
             <<"\nantialiasing="<<antialiasing<<"\nanisotropy="<<anisotropy
             <<"\nambient_occlusion="<<ambient_occlusion<<"\nambient_occlusion_strength="<<ambient_occlusion_strength
+            <<"\nhdr="<<hdr<<"\nhdr_paper_white="<<hdr_paper_white<<"\nhdr_peak="<<hdr_peak
             <<"\nskip_intro="<<skip_intro<<"\nfast_load="<<fast_load<<"\nclean_hud="<<clean_hud<<"\nmotion_blur="<<motion_blur<<"\ndraw_distance="<<draw_distance
             <<"\ncustom_music="<<custom_music<<"\nloop_track="<<loop_track<<"\nmusic_folder="<<music_folder.data()<<'\n';
-        for(unsigned i=0;i<keyboard_actions.size();++i) file<<"key_"<<keyboard_actions[i].id<<'='<<bindings[i]<<'\n';
+        for(unsigned i=0;i<input_actions.size();++i) file<<"key_"<<input_actions[i].id<<'='<<bindings[i]<<'\n';
+        for(unsigned port=0;port<controller_bindings.size();++port) for(unsigned i=0;i<input_actions.size();++i)
+            file<<"pad"<<port+1<<'_'<<input_actions[i].id<<'='<<controller_binding_id(controller_bindings[port][i])<<'\n';
         for(const auto& id:enabled_mods) file<<"mod="<<id<<'\n';
         if(!file) throw std::runtime_error("Could not save settings");
     }
     void select_refresh_rate(int rate) {refresh_rate=rate;}
     float aspect() const {return aspect_ratio==2?21.0f/9:aspect_ratio==1?16.0f/9:4.0f/3;}
+    HdrSettings hdr_options() const {return {hdr,unsigned(hdr_paper_white),unsigned(hdr_peak)};}
     float output_gain(bool focused) const {return muted || (mute_on_focus_loss && !focused)?0:volume/100.0f;}
 
 };
@@ -396,6 +409,8 @@ struct App {
     std::unique_ptr<Input> input;
     std::unique_ptr<ControlScript> controls;
     Preferences settings;
+    Preferences applied_settings{false};
+    bool settings_pending=false,display_changed=false;
     Achievements achievements;
     std::filesystem::path achievements_path;
     std::future<void> achievements_save;
@@ -432,6 +447,9 @@ struct App {
     std::vector<int> refresh_rates;
     float display_refresh=0;
     int category=0,select_category=-1,binding_action=-1,active_scale=1;
+    int control_selection=0,controller_binding_action=-1;
+    std::uint64_t controller_binding_deadline=0;
+    bool controller_navigation_blocked=false;
     bool running=true,playing=false,show_settings=true,launch=false,settings_dirty=false,active_widescreen=false,active_motion_blur=true;
     int active_aspect_ratio=0;
     std::deque<std::string> log_messages;
@@ -482,6 +500,7 @@ struct App {
             if(!script.empty()) controls=std::make_unique<ControlScript>(script);
             input=std::make_unique<Input>(controls?false:settings.keyboard,false,controls?controls->id:0);
             input->bindings(settings.bindings);
+            if(!controls) input->controller_bindings(settings.controller_bindings);
             IMGUI_CHECKVERSION();ImGui::CreateContext();
             heading_font=settings_theme(italic_font);
             if(!ImGui_ImplSDL3_InitForD3D(window) || !ImGui_ImplDX11_Init(renderer->native_device(),renderer->native_context()))
@@ -642,7 +661,22 @@ struct App {
         ImGui::TextWrapped("%s",entry.description);
         ImGui::EndGroup();ImGui::End();ImGui::PopStyleColor(2);ImGui::PopStyleVar(2);
     }
-    void exit_game() {running=false;launch=false;binding_action=-1;save_settings();}
+    void cancel_bindings() {binding_action=controller_binding_action=-1;input->cancel_binding();}
+    void exit_game() {running=false;launch=false;cancel_bindings();save_settings();}
+    void start_controller_binding(unsigned action) {
+        cancel_bindings();
+        if(control_selection>0 && input->start_binding(unsigned(control_selection-1))) {
+            controller_binding_action=int(action);controller_binding_deadline=SDL_GetTicksNS()+10000000000ULL;
+        }
+    }
+    void update_controller_binding() {
+        if(controller_binding_action<0) return;
+        if(const auto binding=input->take_binding()) {
+            auto& selected=settings.controller_bindings[control_selection-1][controller_binding_action];
+            settings_dirty|=selected!=*binding;selected=*binding;
+            input->controller_bindings(settings.controller_bindings);controller_binding_action=-1;
+        } else if(input->capture_state()==ControllerCapture::idle || SDL_GetTicksNS()>=controller_binding_deadline) cancel_bindings();
+    }
     PerfCounters performance_counters() const {
         auto counters=game?game->performance_counters():renderer->stats().counters;
         counters[unsigned(PerfMetric::displayed)]=frames;return counters;
@@ -755,8 +789,12 @@ struct App {
            event.type==SDL_EVENT_MOUSE_BUTTON_DOWN || event.type==SDL_EVENT_MOUSE_BUTTON_UP ||
            event.type==SDL_EVENT_MOUSE_WHEEL || event.type==SDL_EVENT_WINDOW_MOUSE_ENTER ||
            event.type==SDL_EVENT_WINDOW_FOCUS_GAINED) mouse_activity=SDL_GetTicksNS();
-        if(event.type==SDL_EVENT_WINDOW_DISPLAY_CHANGED || event.type==SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED) refresh_options();
+        if(event.type==SDL_EVENT_WINDOW_DISPLAY_CHANGED || event.type==SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED) {refresh_options();display_changed=true;}
+        if(event.type==SDL_EVENT_WINDOW_HDR_STATE_CHANGED || event.type==SDL_EVENT_DISPLAY_ADDED || event.type==SDL_EVENT_DISPLAY_REMOVED) display_changed=true;
         if(event.type==SDL_EVENT_QUIT || event.type==SDL_EVENT_WINDOW_CLOSE_REQUESTED) exit_game();
+        if(controller_binding_action>=0 && event.type==SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.scancode==SDL_SCANCODE_ESCAPE) {
+            cancel_bindings();return;
+        }
         if(event.type==SDL_EVENT_KEY_DOWN && !event.key.repeat && binding_action>=0) {
             if(event.key.scancode==SDL_SCANCODE_ESCAPE) binding_action=-1;
             else if(valid_keyboard_binding(event.key.scancode)) {
@@ -769,7 +807,7 @@ struct App {
            (event.key.scancode==SDL_SCANCODE_ESCAPE || event.key.scancode==SDL_SCANCODE_F1)) {
             if(achievement_reset_open || event.type==SDL_EVENT_KEY_UP) {ImGui_ImplSDL3_ProcessEvent(&event);return;}
             if(event.type==SDL_EVENT_KEY_DOWN && !event.key.repeat) {
-                show_settings=!show_settings;binding_action=-1;if(!show_settings) save_settings();
+                show_settings=!show_settings;cancel_bindings();if(!show_settings) save_settings();
             }
             // This shortcut belongs to the app. Letting ImGui also handle Escape
             // leaves the focused child and highlights its whole panel on reopen.
@@ -837,7 +875,7 @@ struct App {
             }
             if(controls->capture) {controls->capture=false;capture_frame();}
         }
-        input->capture_keyboard(show_settings);input->update();
+        input->capture_keyboard(show_settings);input->update();update_controller_binding();
         if(performance.active()) {
             if(performance.resources_due()) {
                 PerfScope overhead(&performance,PerfPhase::diagnostics);const auto r=renderer->resources();
@@ -1036,6 +1074,18 @@ struct App {
     void settings_interface() {
         PerfScope timing(&performance,PerfPhase::ui);
         save_achievements();
+        const bool blocked=input->capture_state()!=ControllerCapture::idle;
+        if(blocked!=controller_navigation_blocked) {
+            // ImGui reads physical gamepad state itself. Stop that polling while
+            // capturing, including the release, so a binding cannot activate UI.
+            ImGui_ImplSDL3_SetGamepadMode(blocked?ImGui_ImplSDL3_GamepadMode_Manual:ImGui_ImplSDL3_GamepadMode_AutoFirst,nullptr,0);
+            auto& io=ImGui::GetIO();
+            if(blocked) {
+                io.ConfigFlags&=~ImGuiConfigFlags_NavEnableGamepad;
+                for(int key=ImGuiKey_GamepadStart;key<=ImGuiKey_GamepadRStickDown;++key) io.AddKeyEvent(ImGuiKey(key),false);
+            } else io.ConfigFlags|=ImGuiConfigFlags_NavEnableGamepad;
+            controller_navigation_blocked=blocked;
+        }
         ImGui_ImplDX11_NewFrame();ImGui_ImplSDL3_NewFrame();ImGui::NewFrame();
         if(show_settings) {
             const auto* viewport=ImGui::GetMainViewport();
@@ -1057,7 +1107,7 @@ struct App {
             bool changed=false;
             constexpr const char* categories[]={"Game files","General","Audio","Graphics","Enhancements","Controls","Achievements","Mods","Diagnostics"};
             constexpr const char* navigation[]={"        Game files","        General","        Audio","        Graphics","        Enhancements","        Controls","        Achievements","        Mods","        Diagnostics"};
-            if(select_category>=0 && select_category<int(std::size(categories))) {category=select_category;binding_action=-1;}
+            if(select_category>=0 && select_category<int(std::size(categories))) {category=select_category;cancel_bindings();}
             select_category=-1;
             ImGui::BeginChild("Settings body",{0,-66},0,ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_NoScrollWithMouse);
             const float navigation_width=ImGui::GetContentRegionAvail().x<760?170.0f:190.0f;
@@ -1067,7 +1117,7 @@ struct App {
             ImGui::PushFont(nullptr,12);ImGui::TextDisabled("SETTINGS");ImGui::PopFont();ImGui::Spacing();
             ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign,{0,.5f});
             for(int tab=0;tab<int(std::size(categories));++tab) {
-                if(ImGui::Selectable(navigation[tab],category==tab,0,{0,40})) {category=tab;binding_action=-1;}
+                if(ImGui::Selectable(navigation[tab],category==tab,0,{0,40})) {category=tab;cancel_bindings();}
                 const auto p=ImGui::GetItemRectMin();
                 const auto color=category==tab?IM_COL32(255,139,70,255):IM_COL32(153,166,181,255);
                 settings_icon(*ImGui::GetWindowDrawList(),tab,{p.x+6,p.y+10},color);
@@ -1082,20 +1132,18 @@ struct App {
                     switch(category) {
                     case 0:
                         ImGui::SeparatorText("ORIGINAL GAME FILES");
-                        ImGui::BeginDisabled(playing);
                         setting_label("Game executable");ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x-104);
                         changed|=ImGui::InputText("##Executable",settings.xbe.data(),settings.xbe.size());
-                        setting_help(playing?"Restart the app to change game files.":"The supported US Xbox game executable (default.xbe).");
+                        setting_help("The supported US Xbox game executable (default.xbe). Changes apply to the next game session.");
                         ImGui::SameLine();if(ImGui::Button("Browse##xbe",{92,0})) changed|=browse(settings.xbe,false);
-                        setting_help(playing?"Restart the app to change game files.":"Select the game executable. Changes save automatically.");
+                        setting_help("Select the game executable. Changes save automatically.");
                         setting_label("Game disc image");ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x-104);
                         changed|=ImGui::InputText("##Game disc",settings.disc.data(),settings.disc.size());
-                        setting_help(playing?"Restart the app to change game files.":"Your US Xbox XISO disc image. Game files are read from this image.");
+                        setting_help("Your US Xbox XISO disc image. Changes apply to the next game session.");
                         ImGui::SameLine();if(ImGui::Button("Browse##disc",{92,0})) changed|=browse(settings.disc,true);
-                        setting_help(playing?"Restart the app to change game files.":"Select the Xbox game disc image. Changes save automatically.");
-                        ImGui::EndDisabled();
+                        setting_help("Select the Xbox game disc image. Changes save automatically.");
                         ImGui::Spacing();ImGui::TextWrapped("Use the US Xbox release of Burnout 2: Point of Impact. Select default.xbe and its XISO disc image.");
-                        if(playing) ImGui::TextWrapped("Close and reopen the app to change game files.");
+                        if(playing) ImGui::TextWrapped("Use Restart game to load different game files. The window stays open.");
                         break;
                     case 1: {
                         ImGui::SeparatorText("MOTION & PERFORMANCE");
@@ -1155,7 +1203,7 @@ struct App {
                         constexpr const char* aspects[]={"Standard (4:3)","Widescreen (16:9)","Ultrawide (21:9)"};
                         setting_label("Aspect ratio");
                         changed|=ImGui::Combo("##Aspect ratio",&settings.aspect_ratio,aspects,int(std::size(aspects)));
-                        setting_help("Wider views reveal more of the scene horizontally. HUD proportions and edge placement are preserved. Applies when you start or restart the game.");
+                        setting_help("Wider views reveal more of the scene horizontally. HUD proportions and edge placement are preserved. Applies immediately.");
                         changed|=ImGui::Checkbox("V-sync",&settings.vsync);
                         setting_help("Synchronizes presentation with the display to prevent tearing. The display's refresh rate limits the maximum frame rate.");
                         if(ImGui::Checkbox("Fullscreen",&settings.fullscreen)) {
@@ -1174,10 +1222,32 @@ struct App {
                                 }
                                 ImGui::EndCombo();
                             }
-                            setting_help(playing?"Higher resolutions sharpen geometry and use more GPU power. Original proportions are preserved. Use Restart game to apply changes.":
-                                "Higher resolutions sharpen geometry and use more GPU power. Original proportions are preserved. Applies when you start the game.");
+                            setting_help("Higher resolutions sharpen geometry and use more GPU power. Original proportions are preserved. Applies immediately.");
                         }
-                        ImGui::TextWrapped("Resolution and aspect ratio changes apply when you start or restart the game.");
+                        ImGui::Spacing();ImGui::SeparatorText("HDR");
+                        const auto hdr=renderer->hdr_status();
+                        changed|=ImGui::Checkbox("HDR output",&settings.hdr);
+                        setting_help("Expands bright highlights for an HDR display while keeping supported HUD elements at normal brightness. Switches without restarting.");
+#ifdef _WIN32
+                        if(settings.hdr && !hdr.available) ImGui::TextWrapped("Enable HDR in Windows for this display. SDR output is used until HDR is available.");
+#else
+                        ImGui::TextWrapped("HDR output is currently supported on Windows.");
+#endif
+                        ImGui::BeginDisabled(!settings.hdr);
+                        setting_label("Paper white");
+                        changed|=ImGui::SliderInt("##HDR paper white",&settings.hdr_paper_white,80,500,"%d nits");
+                        setting_help("Sets normal image and interface brightness. Adjust for your room; peak highlights are controlled separately.");
+                        bool automatic_peak=settings.hdr_peak==0;
+                        if(ImGui::Checkbox("Use display peak brightness",&automatic_peak)) {
+                            settings.hdr_peak=automatic_peak?0:std::clamp(int(std::lround(hdr.display_peak>0?hdr.display_peak:1000)),200,10000);changed=true;
+                        }
+                        setting_help("Uses the display's reported maximum brightness, or 1000 nits if it is unavailable. Turn off to use your display's calibrated peak.");
+                        if(!automatic_peak) {
+                            setting_label("Peak brightness");
+                            changed|=ImGui::SliderInt("##HDR peak",&settings.hdr_peak,200,10000,"%d nits",ImGuiSliderFlags_Logarithmic);
+                            setting_help("Match your display's peak brightness. Paper white is capped at this limit.");
+                        }
+                        ImGui::EndDisabled();
                         break;
                     }
                     case 4: {
@@ -1187,7 +1257,7 @@ struct App {
                         int distance=0;for(int i=0;i<3;++i) if(settings.draw_distance==distances[i]) distance=i;
                         setting_label("Draw distance");
                         if(ImGui::Combo("##Draw distance",&distance,distance_labels,3)) {settings.draw_distance=distances[distance];changed=true;}
-                        setting_help("Draws compatible scenery and traffic farther away, with smoother detail changes and fades. Higher settings can increase rendering work. Applies when you start or restart the game.");
+                        setting_help("Draws compatible scenery and traffic farther away, with smoother detail changes and fades. Applies immediately; enabling extra scenery can briefly pause to load it. Higher settings can increase rendering work.");
                         ImGui::Spacing();ImGui::SeparatorText("IMAGE QUALITY");
                         constexpr const char* levels[]={"Off (original)","FXAA Low","FXAA Medium","FXAA High","MSAA 2x","MSAA 4x","MSAA 8x"};
                         setting_label("Antialiasing");
@@ -1219,42 +1289,75 @@ struct App {
                         setting_help("Keeps road and other textures sharper at an angle. The original game uses anisotropic filtering. Original preserves each texture's settings; higher values use more GPU power.");
                         ImGui::Spacing();ImGui::SeparatorText("MISCELLANEOUS");
                         changed|=ImGui::Checkbox("Clean HUD",&settings.clean_hud);
-                        setting_help("Redraws the original HUD lettering, outlines, arrows, menu boxes, wreaths, Xbox button icons and gauges with smooth edges. Also prevents faded Crash bonus numbers from reappearing. Applies when you start or restart the game.");
+                        setting_help("Redraws the original HUD lettering, outlines, arrows, menu boxes, wreaths, Xbox button icons and gauges with smooth edges. Also prevents faded Crash bonus numbers from reappearing. Applies immediately.");
                         changed|=ImGui::Checkbox("Fast load",&settings.fast_load);
-                        setting_help("Finishes loading as soon as the game's assets are ready, without the original loading fades or frame delays. Applies when you start or restart the game.");
+                        setting_help("Finishes loading as soon as the game's assets are ready, without the original loading fades or frame delays. Applies immediately.");
                         changed|=ImGui::Checkbox("Motion blur",&settings.motion_blur);
-                        setting_help("Enables the original game's scene blur during boosting and other speed effects. Applies when you start or restart the game.");
+                        setting_help("Enables the original game's scene blur during boosting and other speed effects. Applies immediately.");
                         changed|=ImGui::Checkbox("Skip intro splash screens",&settings.skip_intro);
-                        setting_help("Starts at the title screen after the initial loading screen.");
+                        setting_help("Skips any remaining intro splash screens after initial loading. If the intro has already finished, this affects the next game session.");
                         ImGui::Spacing();
-                        ImGui::TextWrapped("Changes apply when you start or restart the game.");
                         break;
                     }
-                    case 5:
+                    case 5: {
                         ImGui::TextWrapped("Gamepads connect automatically. Use Tab or a gamepad to navigate settings.");
-                        if(ImGui::Checkbox("Keyboard controller",&settings.keyboard)) {input->keyboard(settings.keyboard);changed=true;}
-                        setting_help("Enables keyboard controls. Connected gamepads work automatically.");
-                        ImGui::SeparatorText("KEYBOARD BINDINGS");
-                        if(ImGui::Button("Restore keyboard defaults")) {settings.bindings=default_keyboard_bindings();input->bindings(settings.bindings);binding_action=-1;changed=true;}
-                        setting_help("Restores the original keyboard bindings.");
-                        if(ImGui::BeginTable("Keys",3,ImGuiTableFlags_RowBg)) {
+                        constexpr const char* devices[]={"Keyboard","Controller 1","Controller 2","Controller 3","Controller 4"};
+                        ImGui::SetNextItemWidth(-FLT_MIN);
+                        if(ImGui::Combo("##Control device",&control_selection,devices,int(std::size(devices)))) cancel_bindings();
+                        const bool controller=control_selection>0;const auto port=unsigned(controller?control_selection-1:0);
+                        if(controller) {
+                            ImGui::TextWrapped("%s",input->controller_name(port));
+                            setting_help("Bindings are saved for this player slot and work with compatible controllers. Settings navigation keeps its standard controls.");
+                            ImGui::SeparatorText("CONTROLLER BINDINGS");
+                            if(ImGui::Button("Restore controller defaults")) {
+                                settings.controller_bindings[port]=default_controller_bindings();input->controller_bindings(settings.controller_bindings);cancel_bindings();changed=true;
+                            }
+                            setting_help("Restores this player's controller bindings. Other players keep their settings.");
+                            if(!input->controller_id(port)) ImGui::TextWrapped("Connect a compatible controller to assign its controls.");
+                            if(controller_binding_action>=0) {
+                                ImGui::TextWrapped(input->capture_state()==ControllerCapture::neutral?"Release the controls, then press a button, pull a trigger or move a stick.":"Press a button, pull a trigger or move a stick. Esc cancels; waiting 10 seconds also cancels.");
+                                if(ImGui::Button("Cancel binding")) cancel_bindings();
+                            }
+                        } else {
+                            if(ImGui::Checkbox("Keyboard controller",&settings.keyboard)) {input->keyboard(settings.keyboard);changed=true;}
+                            setting_help("Enables keyboard controls. Connected gamepads work automatically.");
+                            ImGui::SeparatorText("KEYBOARD BINDINGS");
+                            if(ImGui::Button("Restore keyboard defaults")) {settings.bindings=default_keyboard_bindings();input->bindings(settings.bindings);cancel_bindings();changed=true;}
+                            setting_help("Restores the original keyboard bindings.");
+                        }
+                        if(ImGui::BeginTable("Bindings",3,ImGuiTableFlags_RowBg)) {
                             ImGui::TableSetupColumn("Action",ImGuiTableColumnFlags_WidthStretch);
-                            ImGui::TableSetupColumn("Key",ImGuiTableColumnFlags_WidthFixed,std::clamp(ImGui::GetContentRegionAvail().x*.25f,80.0f,150.0f));
+                            ImGui::TableSetupColumn(controller?"Control":"Key",ImGuiTableColumnFlags_WidthFixed,std::clamp(ImGui::GetContentRegionAvail().x*.4f,120.0f,230.0f));
                             ImGui::TableSetupColumn("Clear",ImGuiTableColumnFlags_WidthFixed,55);
                             constexpr unsigned order[]={15,14,16,17,8,9,4,5,0,1,2,3,10,11,12,13,6,7,18,19,20,21,22,23};
                             for(const auto i:order) {
-                                ImGui::PushID(int(i));ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextWrapped("%s",keyboard_actions[i].label.data());
-                                ImGui::TableNextColumn();const auto code=SDL_Scancode(settings.bindings[i]);
-                                const auto* name=code?SDL_GetKeyName(SDL_GetKeyFromScancode(code,SDL_KMOD_NONE,false)):"Unbound";
-                                if(ImGui::Button(binding_action==int(i)?"Press a key...":name,{-FLT_MIN,0})) binding_action=int(i);
-                                setting_help("Click, then press a key. Esc cancels. Esc, F1, F8 and F9 are reserved for settings and captures.");
-                                ImGui::TableNextColumn();if(ImGui::SmallButton("Clear")) {changed|=settings.bindings[i]!=0;settings.bindings[i]=0;input->bindings(settings.bindings);binding_action=-1;}
-                                setting_help("Removes this keyboard binding.");
+                                ImGui::PushID(int(i));ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextWrapped("%s",input_actions[i].label.data());
+                                ImGui::TableNextColumn();
+                                if(controller) {
+                                    const auto name=input->controller_binding_name(port,settings.controller_bindings[port][i]);
+                                    ImGui::BeginDisabled(!input->controller_id(port));
+                                    if(ImGui::Button(controller_binding_action==int(i)?"Press a control...":name.c_str(),{-FLT_MIN,0})) start_controller_binding(i);
+                                    ImGui::EndDisabled();
+                                    setting_help("Select, release the controls, then press a button, pull a trigger or move a stick. Analog controls keep their full range. Esc cancels.");
+                                } else {
+                                    const auto code=SDL_Scancode(settings.bindings[i]);
+                                    const auto* name=code?SDL_GetKeyName(SDL_GetKeyFromScancode(code,SDL_KMOD_NONE,false)):"Unbound";
+                                    if(ImGui::Button(binding_action==int(i)?"Press a key...":name,{-FLT_MIN,0})) {cancel_bindings();binding_action=int(i);}
+                                    setting_help("Click, then press a key. Esc cancels. Esc, F1, F8 and F9 are reserved for settings and captures.");
+                                }
+                                ImGui::TableNextColumn();if(ImGui::SmallButton("Clear")) {
+                                    if(controller) {
+                                        auto& binding=settings.controller_bindings[port][i];changed|=binding.source!=ControllerSource::none;binding={};input->controller_bindings(settings.controller_bindings);
+                                    } else {changed|=settings.bindings[i]!=0;settings.bindings[i]=0;input->bindings(settings.bindings);}
+                                    cancel_bindings();
+                                }
+                                setting_help("Removes this binding.");
                                 ImGui::PopID();
                             }
                             ImGui::EndTable();
                         }
                         break;
+                    }
                     case 6:achievements_interface();break;
                     case 7:changed|=mods_interface();break;
                     case 8:
@@ -1275,6 +1378,7 @@ struct App {
                     }
             ImGui::EndChild();ImGui::EndChild();ImGui::EndChild();
             settings_dirty|=changed;
+            settings_pending|=changed;
             ImGui::Separator();
             const auto available=ImGui::GetContentRegionAvail().x,spacing=ImGui::GetStyle().ItemSpacing.x;
             const float count=playing?3.0f:2.0f;
@@ -1288,14 +1392,14 @@ struct App {
             ImGui::PushStyleColor(ImGuiCol_Button,ImVec4{1,.49f,.19f,1});
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered,ImVec4{1,.61f,.34f,1});
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,ImVec4{.90f,.40f,.12f,1});
-            if(ImGui::Button(playing?"Restart game":"Start game",{button_width,0})) {launch=true;binding_action=-1;}
+            if(ImGui::Button(playing?"Restart game":"Start game",{button_width,0})) {launch=true;cancel_bindings();}
             ImGui::PopStyleColor(4);
             setting_help(playing?"Restarts the game from the beginning with the saved settings. The window stays open.":
                 "Starts the game with these settings. Changes save automatically. Esc opens or closes settings.");
             ImGui::EndDisabled();
             if(playing) {
                 ImGui::SameLine();
-                if(ImGui::Button("Return to game",{button_width,0})) {show_settings=false;binding_action=-1;}
+                if(ImGui::Button("Return to game",{button_width,0})) {show_settings=false;cancel_bindings();}
                 setting_help("Returns to the game. Changes save automatically. Esc opens or closes settings.");
             }
             ImGui::SameLine();
@@ -1342,6 +1446,7 @@ struct App {
             settings_interface();if(!display_paced()) {PerfScope wait(&performance,PerfPhase::pacing);pacer.wait(settings.refresh_rate);}renderer->present(settings.vsync);
             if(playing) frame_presented();
         } else pacer.wait(settings.refresh_rate);
+        if(!playing) apply_settings();
     }
     void display_game(bool wait=true) {
         if(renderer->display(wait)) {
@@ -1376,19 +1481,47 @@ struct App {
             display_game(false);
             source_pacer.next=now;
         } else display_game();
+        if(!launch && running) apply_settings();
     }
     void configure_enhancements() {
         if(settings.antialiasing>=4 && !renderer->supports_msaa(1U<<(settings.antialiasing-3))) {
             log_message(std::format("MSAA {}x is unavailable on this graphics device. Antialiasing has been set to Off.",1U<<(settings.antialiasing-3)));
             settings.antialiasing=0;settings_dirty=true;
         }
-        renderer->enhancements(settings.antialiasing,settings.anisotropy);
+        renderer->configure(settings.resolution_scale,settings.antialiasing,settings.anisotropy,
+            unsigned(settings.ambient_occlusion),settings.ambient_occlusion_strength/100.0f,settings.hdr_options());
         renderer->clean_hud(settings.clean_hud);
-        renderer->ambient_occlusion(unsigned(settings.ambient_occlusion),settings.ambient_occlusion_strength/100.0f);
+        applied_settings=settings;settings_pending=false;
+    }
+    void apply_settings() {
+        if(!settings_pending && !display_changed) return;
+        settings_pending=false;
+        if(display_changed) {renderer->refresh_display();display_changed=false;}
+        const auto apply=[&](const Preferences& selected) {
+            renderer->configure(selected.resolution_scale,selected.antialiasing,selected.anisotropy,
+                unsigned(selected.ambient_occlusion),selected.ambient_occlusion_strength/100.0f,selected.hdr_options());
+            if(game) game->settings({selected.aspect_ratio!=0,selected.aspect_ratio==2,selected.motion_blur,
+                selected.skip_intro,selected.fast_load,selected.clean_hud,unsigned(selected.draw_distance)});
+            renderer->clean_hud(selected.clean_hud);renderer->aspect_ratio(selected.aspect());
+        };
+        try {apply(settings);}
+        catch(const std::exception& error) {
+            apply(applied_settings);
+            for(auto member:{&Preferences::resolution_scale,&Preferences::antialiasing,&Preferences::anisotropy,
+                &Preferences::ambient_occlusion,&Preferences::ambient_occlusion_strength,&Preferences::aspect_ratio,&Preferences::draw_distance,
+                &Preferences::hdr_paper_white,&Preferences::hdr_peak})
+                settings.*member=applied_settings.*member;
+            for(auto member:{&Preferences::motion_blur,&Preferences::skip_intro,&Preferences::fast_load,&Preferences::clean_hud,&Preferences::hdr})
+                settings.*member=applied_settings.*member;
+            settings_dirty=true;log_message(std::string("Settings change could not be applied: ")+error.what());
+        }
+        active_scale=settings.resolution_scale;active_aspect_ratio=settings.aspect_ratio;
+        active_widescreen=active_aspect_ratio!=0;active_motion_blur=settings.motion_blur;
+        applied_settings=settings;
     }
     void configure_graphics() {
         // Preserve pipelines/UI while discarding the previous game's resources.
-        // Mid-race recreation would lose feedback, depth and texture identities.
+        // Live changes use apply_settings() to preserve the current session.
         active_scale=settings.resolution_scale;
         renderer->reset(active_scale);
         configure_enhancements();
@@ -1417,7 +1550,7 @@ struct App {
         Xbox xbox(image,memory,ram,disc,std::move(host));
         xbox.output_gain(settings.output_gain(focused));
         struct Session {App& app;~Session(){app.stop_benchmark();app.stop_performance();app.game=nullptr;app.playing=false;app.show_settings=true;app.published_at=0;}} session{*this};
-        game=&xbox;playing=true;show_settings=false;binding_action=-1;frames=first_frame=last_frame=published_at=first_source=last_source=0;pacer={};source_pacer={};display_rate={};game_rate={};memory_snapshot="[]";
+        game=&xbox;playing=true;show_settings=false;cancel_bindings();frames=first_frame=last_frame=published_at=first_source=last_source=0;pacer={};source_pacer={};display_rate={};game_rate={};memory_snapshot="[]";
         auto result=xbox.run(0);
         if(launch && running) {
             if(result.boundary.find("Native window closed")!=std::string::npos) result.boundary="Game restart requested";
@@ -1479,9 +1612,14 @@ int run_app(const std::filesystem::path& xbe,const std::filesystem::path& disc,u
     std::copy(watch_semaphores.begin(),watch_semaphores.end(),app.watch_semaphores.begin());
     if(seconds) app.stop_at=SDL_GetTicksNS()+std::uint64_t(seconds)*1000000000;
     if(!xbe.empty()) {
+        const auto executable=path_text(xbe),image=path_text(disc);
+        if(executable.size()>=app.settings.xbe.size() || image.size()>=app.settings.disc.size())
+            throw std::runtime_error("Game-file path exceeds the settings limit.");
+        copy_text(app.settings.xbe.data(),app.settings.xbe.size(),executable.c_str());
+        copy_text(app.settings.disc.data(),app.settings.disc.size(),image.c_str());
         for(;;) {
             app.launch=false;
-            const auto result=app.play(xbe,disc,frame,slices,trace_io);
+            const auto result=app.play(utf8_path(app.settings.xbe.data()),utf8_path(app.settings.disc.data()),frame,slices,trace_io);
             std::cout<<app.run_report(result)<<'\n';
             if(!app.running || !app.launch) return result.boundary.empty() || result.boundary.find("Native window closed")!=std::string::npos?0:3;
         }
@@ -1517,6 +1655,7 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     };
     if(app.settings.refresh_rate!=60) throw std::runtime_error("Default refresh rate differs from 60 Hz");
     if(app.settings.fast_load) throw std::runtime_error("Fast load must default to disabled");
+    if(app.settings.hdr || app.settings.hdr_paper_white!=200 || app.settings.hdr_peak) throw std::runtime_error("Invalid default HDR settings");
     if(!app.settings.clean_hud) throw std::runtime_error("Clean HUD must preserve the enabled default");
     if(app.settings.mute_on_focus_loss) throw std::runtime_error("Focus muting must default to disabled");
     if(!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
@@ -1526,12 +1665,16 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     Preferences saved(false);saved.resolution_scale=3;saved.select_refresh_rate(144);saved.show_fps=true;saved.aspect_ratio=2;saved.motion_blur=false;saved.bindings[15]=SDL_SCANCODE_Z;
     saved.custom_music=true;saved.loop_track=true;saved.mute_on_focus_loss=true;copy_text(saved.music_folder.data(),saved.music_folder.size(),"Music/Custom playlist");
     saved.antialiasing=6;saved.anisotropy=16;saved.ambient_occlusion=3;saved.ambient_occlusion_strength=47;
+    saved.hdr=true;saved.hdr_paper_white=240;saved.hdr_peak=800;
     saved.skip_intro=true;saved.fast_load=true;saved.clean_hud=false;saved.draw_distance=4;
     saved.enabled_mods={"paint","sound"};
+    saved.controller_bindings[0][15]={ControllerSource::button,SDL_GAMEPAD_BUTTON_SOUTH};
+    saved.controller_bindings[1][16]={ControllerSource::negative_axis,SDL_GAMEPAD_AXIS_RIGHTX};saved.controller_bindings[3][4]={};
     saved.save(preferences);Preferences restored(true,preferences);
-    if(restored.bindings!=saved.bindings || restored.resolution_scale!=3 || restored.refresh_rate!=144 || !restored.show_fps || restored.aspect_ratio!=2 || restored.motion_blur ||
+    if(restored.bindings!=saved.bindings || restored.controller_bindings!=saved.controller_bindings || restored.resolution_scale!=3 || restored.refresh_rate!=144 || !restored.show_fps || restored.aspect_ratio!=2 || restored.motion_blur ||
        !restored.custom_music || !restored.loop_track || !restored.mute_on_focus_loss || restored.music_folder!=saved.music_folder || restored.antialiasing!=6 || restored.anisotropy!=16 || restored.ambient_occlusion!=3 || restored.ambient_occlusion_strength!=47 ||
-       !restored.skip_intro || !restored.fast_load || restored.clean_hud || restored.draw_distance!=4 || restored.enabled_mods!=saved.enabled_mods)
+       !restored.skip_intro || !restored.fast_load || restored.clean_hud || restored.draw_distance!=4 || restored.enabled_mods!=saved.enabled_mods ||
+       !restored.hdr || restored.hdr_paper_white!=240 || restored.hdr_peak!=800)
         throw std::runtime_error("New settings did not survive save/load");
     restored.volume=37;
     if(restored.output_gain(false)!=0 || restored.output_gain(true)!=.37f)
@@ -1575,9 +1718,13 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
         throw std::runtime_error("Legacy settings did not preserve widescreen and original motion blur");
     {std::ofstream file(preferences);file<<"aspect_ratio=2\nwidescreen=0\n";}
     if(Preferences(true,preferences).aspect_ratio!=2) throw std::runtime_error("Legacy widescreen replaced an explicit aspect ratio");
-    {std::ofstream file(preferences);file<<"key_accelerate="<<SDL_SCANCODE_ESCAPE<<"\nkey_brake=999999\nrefresh_rate=1\nresolution_scale=99\nantialiasing=7\nanisotropy=3\ndraw_distance=3\nambient_occlusion=4\nambient_occlusion_strength=101\naspect_ratio=3\n";}
+    {std::ofstream file(preferences);file<<"key_accelerate="<<SDL_SCANCODE_ESCAPE<<"\nkey_brake=999999\nrefresh_rate=1\nresolution_scale=99\nantialiasing=7\nanisotropy=3\ndraw_distance=3\nambient_occlusion=4\nambient_occlusion_strength=101\naspect_ratio=3\nhdr_paper_white=79\nhdr_peak=10001\n";}
     Preferences invalid(true,preferences);std::filesystem::remove(preferences);
     if(invalid.bindings!=default_keyboard_bindings() || invalid.refresh_rate!=60 || invalid.resolution_scale!=1 || invalid.antialiasing || invalid.anisotropy || invalid.draw_distance!=1 || invalid.ambient_occlusion || invalid.ambient_occlusion_strength!=35 || invalid.aspect_ratio || !invalid.motion_blur) throw std::runtime_error("Invalid settings replaced valid defaults");
+    if(invalid.hdr || invalid.hdr_paper_white!=200 || invalid.hdr_peak) throw std::runtime_error("Invalid HDR settings replaced valid defaults");
+    {std::ofstream file(preferences);file<<"pad1_accelerate=-lefttrigger\npad2_start=unknown\npad5_a=south\npad1_unknown=east\n";}
+    if(Preferences(true,preferences).controller_bindings!=default_controller_profiles()) throw std::runtime_error("Invalid controller bindings replaced defaults");
+    std::filesystem::remove(preferences);
     SDL_Event escape{};escape.type=SDL_EVENT_KEY_DOWN;escape.key.scancode=SDL_SCANCODE_ESCAPE;
     app.event(escape);if(app.show_settings) throw std::runtime_error("Esc did not hide settings");
     escape.key.repeat=true;app.event(escape);if(app.show_settings) throw std::runtime_error("Held Esc repeated the toggle");
@@ -1617,6 +1764,38 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
         app.renderer->begin(0xFF16344A);app.renderer->end();app.renderer->display();
         app.settings_interface();if(present) app.renderer->present(false);
     };
+    {
+        // Exercise the settings workflow with an isolated virtual controller,
+        // without starting the game or reading the user's physical controls.
+        auto fixture=path;fixture+=".controller";{std::ofstream file(fixture);file<<"# Settings controller diagnostic\n";}
+        const auto* previous_hint=SDL_GetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS);
+        const std::optional<std::string> background=previous_hint?std::optional<std::string>{previous_hint}:std::nullopt;
+        SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS,"1");
+        ControlScript pad(fixture);std::filesystem::remove(fixture);
+        auto original_input=std::move(app.input);app.input=std::make_unique<Input>(false,false,pad.id);
+        const auto tick=[&] {SDL_UpdateJoysticks();app.input->update(true);app.update_controller_binding();};
+        app.control_selection=1;app.select_category=5;settings_frame();
+        SDL_SetJoystickVirtualButton(pad.joystick,SDL_GAMEPAD_BUTTON_SOUTH,true);tick();app.start_controller_binding(15);tick();settings_frame();
+        if(app.input->capture_state()!=ControllerCapture::neutral || !app.controller_navigation_blocked || app.controller_binding_action!=15)
+            throw std::runtime_error("Controller binding captured its activation press");
+        SDL_SetJoystickVirtualButton(pad.joystick,SDL_GAMEPAD_BUTTON_SOUTH,false);tick();settings_frame();
+        SDL_SetJoystickVirtualButton(pad.joystick,SDL_GAMEPAD_BUTTON_EAST,true);tick();settings_frame();
+        const ControllerBinding bound{ControllerSource::button,SDL_GAMEPAD_BUTTON_EAST};
+        if(app.settings.controller_bindings[0][15]!=bound || app.controller_binding_action!=-1 || !app.controller_navigation_blocked || !app.show_settings)
+            throw std::runtime_error("Controller capture did not update the selected action safely");
+        SDL_SetJoystickVirtualButton(pad.joystick,SDL_GAMEPAD_BUTTON_EAST,false);tick();settings_frame(false);
+        if(app.controller_navigation_blocked || Preferences(true,preferences).controller_bindings[0][15]!=bound)
+            throw std::runtime_error("Controller binding did not save or restore navigation");
+        auto controller_image=path;controller_image.replace_filename(controller_image.stem().string()+"-controllers.png");
+        save_png(app.renderer->read_display(),controller_image);app.renderer->present(false);
+        app.start_controller_binding(14);tick();app.event(escape);tick();
+        if(app.controller_binding_action!=-1 || !app.show_settings) throw std::runtime_error("Escape did not cancel controller binding");
+        app.start_controller_binding(14);tick();app.controller_binding_deadline=0;app.update_controller_binding();tick();
+        if(app.controller_binding_action!=-1) throw std::runtime_error("Controller binding did not time out");
+        app.settings.controller_bindings=default_controller_profiles();app.settings_dirty=true;app.input->controller_bindings(app.settings.controller_bindings);
+        app.cancel_bindings();tick();settings_frame();app.control_selection=0;app.input=std::move(original_input);
+        if(background) SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS,background->c_str());else SDL_ResetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS);
+    }
     auto& ui=ImGui::GetIO();
     ui.ClearInputKeys();ui.AddFocusEvent(true);
     app.playing=true;app.select_category=7;
@@ -1813,16 +1992,23 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
         app.playing=false;app.published_at=0;
     }
     if(const auto messages=app.renderer->errors();!messages.empty()) throw std::runtime_error("Settings validation: "+messages.front());
-    // Exercise resolution changes before a game starts, without guest execution.
+    // Use the live application path with existing resources, without booting.
+    app.playing=true;
+    const auto retained_target=app.renderer->create_target(32,32);
+    app.renderer->set_target(retained_target);app.renderer->begin(0xFF4080C0);app.renderer->end();app.renderer->set_target();
     app.settings.resolution_scale=2;app.settings.antialiasing=3;app.settings.anisotropy=16;
-    app.configure_graphics();app.renderer->begin(0xFF4080C0);app.renderer->end();app.renderer->publish_frame();
+    app.settings_pending=true;app.apply_settings();
+    const auto retained=app.renderer->read_target(retained_target);
+    if(retained.width!=64 || retained.height!=64 || retained.rgba[0]!=std::byte{64})
+        throw std::runtime_error("Live settings discarded an existing game target");
+    app.renderer->begin(0xFF4080C0);app.renderer->end();app.renderer->publish_frame();
     const auto scaled=app.renderer->read_frame();
     if(scaled.width!=1280 || scaled.height!=960) throw std::runtime_error("Selected internal resolution was not applied");
     if(scaled.rgba[0]!=std::byte{64} || scaled.rgba[1]!=std::byte{128} || scaled.rgba[2]!=std::byte{192} || scaled.rgba[3]!=std::byte{255})
         throw std::runtime_error("Built antialiasing shader changed a flat colour");
     if(const auto messages=app.renderer->errors();!messages.empty()) throw std::runtime_error("Resolution validation: "+messages.front());
     if(app.renderer->supports_msaa(4)) {
-        app.settings.antialiasing=5;app.configure_graphics();
+        app.settings.antialiasing=5;app.settings_pending=true;app.apply_settings();
         const auto target=app.renderer->create_target(32,32);app.renderer->set_target(target);
         app.renderer->begin(0xFF0000FF,0.25f);app.renderer->clear_stencil(0xA5);app.renderer->end();
         app.renderer->grow_target(target,64,64);
@@ -1836,7 +2022,7 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
             throw std::runtime_error("MSAA resolve was not presented to the window");
         app.renderer->present(false);
     }
-    app.settings.resolution_scale=1;app.settings.antialiasing=app.settings.anisotropy=0;app.configure_graphics();
+    app.playing=false;app.settings.resolution_scale=1;app.settings.antialiasing=app.settings.anisotropy=0;app.configure_graphics();
     resize(640,480);
     app.poll();
     auto& renderer=*app.renderer;
@@ -1875,6 +2061,22 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     if(!app.performance.has_gpu_samples()) throw std::runtime_error("Nonblocking performance GPU queries produced no samples");
     auto performance_path=path;performance_path+=".performance";app.performance.save(performance_path);
     app.playing=false;app.published_at=0;
+    for(bool enabled:{true,false,true,false}) {
+        app.settings.hdr=enabled;app.settings.hdr_paper_white=200;app.settings.hdr_peak=1000;app.settings_pending=true;
+        SDL_Event display{};display.type=SDL_EVENT_WINDOW_HDR_STATE_CHANGED;app.event(display);app.apply_settings();
+        const auto hdr=renderer.hdr_status();
+        if(hdr.active!=(enabled && hdr.available)) throw std::runtime_error("HDR did not follow the display's capabilities");
+        renderer.begin(0xFF808080);renderer.end();renderer.publish_frame();
+        if(!renderer.display()) throw std::runtime_error("HDR switch lost window presentation");
+        ImGui_ImplDX11_NewFrame();ImGui_ImplSDL3_NewFrame();ImGui::NewFrame();
+        ImGui::GetForegroundDrawList()->AddRectFilled({16,16},{48,48},IM_COL32_WHITE);
+        ImGui::Render();ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        const auto shown=renderer.read_display();
+        const auto offset=(std::size_t(24)*shown.width+24)*4;
+        if(shown.rgba[offset]!=std::byte{255} || shown.rgba[offset+1]!=std::byte{255} || shown.rgba[offset+2]!=std::byte{255})
+            throw std::runtime_error("HDR changed interface reference white");
+        renderer.present(false);
+    }
     if(renderer.stats().shader_compilations) throw std::runtime_error("Settings compiled shaders during runtime");
     const auto messages=app.renderer->errors();
     if(!messages.empty()) throw std::runtime_error("SDL3/ImGui validation: "+messages.front());
@@ -1885,10 +2087,10 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
         throw std::runtime_error("Exit did not cancel launch and save pending settings");
     std::filesystem::remove(preferences);
     return std::format("{{\"format\":\"b2-window-check-v4\",\"passed\":true,\"backend\":\"SDL3/D3D11/ImGui\",\"adapter\":{},\"window\":{},\"settings_font\":{},\"heading_font\":{},\"default_refresh_rate\":60,"
-        "\"bindings_and_settings\":true,\"automatic_settings_save\":true,\"restart_request\":true,\"exit_request\":true,\"widescreen_presentation\":true,\"ultrawide_presentation\":true,\"motion_blur_setting\":true,\"frame_counter\":true,\"counter_image\":{},\"escape_toggle\":true,\"resolution_change\":true,"
-        "\"pacing_60_hz\":{:.3f},\"pacing_120_hz\":{:.3f},\"source_at_120_hz\":{:.3f},\"source_at_144_hz\":{:.3f},\"display_120_hz\":{:.3f},\"display_144_hz\":{:.3f},"
+        "\"bindings_and_settings\":true,\"controller_remapping\":true,\"controller_capture\":true,\"automatic_settings_save\":true,\"restart_request\":true,\"exit_request\":true,\"widescreen_presentation\":true,\"ultrawide_presentation\":true,\"motion_blur_setting\":true,\"frame_counter\":true,\"counter_image\":{},\"escape_toggle\":true,\"resolution_change\":true,"
+        "\"pacing_60_hz\":{:.3f},\"pacing_120_hz\":{:.3f},\"source_at_120_hz\":{:.3f},\"source_at_144_hz\":{:.3f},\"display_120_hz\":{:.3f},\"display_144_hz\":{:.3f},\"hdr_settings\":true,\"hdr_switching\":true,\"hdr_display_available\":{},"
         "\"achievements_save_load\":true,\"achievements_reset\":true,\"achievement_reset_confirmation\":true,\"achievements_disable\":true,\"achievement_notification\":true,\"achievement_sound\":true,\"achievement_fades\":true,\"window_capture\":true,\"performance_capture\":true,\"shader_compilations\":0,\"game_booted\":false,\"game_fps_established\":false,\"images\":{}}}",
         json(renderer.adapter()),app.window_diagnostic(),json(ImGui::GetIO().FontDefault->GetDebugName()),json(app.heading_font->GetDebugName()),
-        json(path_text(counter_image)),measured[0],measured[1],source_rates[0],source_rates[1],display_rates[0],display_rates[1],images.str());
+        json(path_text(counter_image)),measured[0],measured[1],source_rates[0],source_rates[1],display_rates[0],display_rates[1],renderer.hdr_status().available,images.str());
 }
 }

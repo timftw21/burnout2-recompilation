@@ -1,4 +1,5 @@
 #include "shaders.h"
+#include "hdr.h"
 #include "ambient_occlusion.h"
 #include <d3dcommon.h>
 #include <atomic>
@@ -157,10 +158,11 @@ const char* shader_profile(ShaderKind kind) {
     if(kind==ShaderKind::launch ||
        kind==ShaderKind::flow_depth || kind==ShaderKind::flow_depth_ms ||
        (kind>=ShaderKind::ao_low && kind<=ShaderKind::ao_high)) return "cs_5_0";
-    if(kind==ShaderKind::clear_pixel || kind==ShaderKind::display_pixel || kind==ShaderKind::gui_pixel ||
+    if(kind==ShaderKind::clear_pixel || kind==ShaderKind::display_pixel || kind==ShaderKind::gui_pixel || kind==ShaderKind::hdr_expand ||
        (kind>=ShaderKind::combiner0 && kind<=ShaderKind::combiner8) ||
        kind==ShaderKind::fxaa ||
        kind==ShaderKind::copy_multisample || kind==ShaderKind::copy_multisample_stencil ||
+       kind==ShaderKind::copy_surface || kind==ShaderKind::copy_surface_stencil ||
        (kind>=ShaderKind::color && kind<=ShaderKind::modulate3d) ||
        (kind>=ShaderKind::layer_combiner0 && kind<=ShaderKind::layer_modulate3d) ||
        kind==ShaderKind::layer_begin || kind==ShaderKind::layer_begin_ms || kind==ShaderKind::ao_composite ||
@@ -168,11 +170,40 @@ const char* shader_profile(ShaderKind kind) {
     return "vs_5_0";
 }
 std::string shader_source(ShaderKind kind) {
+    if(kind==ShaderKind::hdr_expand) return hdr_shader_source();
+    if(kind==ShaderKind::copy_multisample || kind==ShaderKind::copy_multisample_stencil ||
+       kind==ShaderKind::copy_surface || kind==ShaderKind::copy_surface_stencil) {
+        const bool multisample=kind==ShaderKind::copy_multisample || kind==ShaderKind::copy_multisample_stencil;
+        const bool stencil=kind==ShaderKind::copy_multisample_stencil || kind==ShaderKind::copy_surface_stencil;
+        return std::string(multisample?"#define MULTISAMPLE\n":"")+R"(
+cbuffer C:register(b0){uint bit_mask;uint3 padding;}
+cbuffer Transfer:register(b1){float source_scale;float unused;uint source_samples;uint destination_samples;}
+#ifdef MULTISAMPLE
+Texture2DMS<float4> source_colour:register(t0);Texture2DMS<float> source_depth:register(t1);Texture2DMS<uint2> source_stencil:register(t2);
+#define LOAD(texture,pixel,sample) texture.Load(pixel,sample)
+#else
+Texture2D<float4> source_colour:register(t0);Texture2D<float> source_depth:register(t1);Texture2D<uint2> source_stencil:register(t2);
+#define LOAD(texture,pixel,sample) texture.Load(int3(pixel,0))
+#endif
+)"+(stencil?R"(
+void main(float4 position:SV_Position,uint sample:SV_SampleIndex) {
+ int2 pixel=int2(position.xy*source_scale);uint first=sample*source_samples/destination_samples;
+ uint last=max(first+1,(sample+1)*source_samples/destination_samples),nearest=first;
+ float depth=LOAD(source_depth,pixel,first);
+ for(uint s=first+1;s<last;++s) {float d=LOAD(source_depth,pixel,s);if(d<depth){depth=d;nearest=s;}}
+ if((LOAD(source_stencil,pixel,nearest).y&bit_mask)==0) discard;
+})":R"(
+struct Output {float4 colour:SV_Target;float depth:SV_Depth;};
+Output main(float4 position:SV_Position,uint sample:SV_SampleIndex) {
+ int2 pixel=int2(position.xy*source_scale);uint first=sample*source_samples/destination_samples;
+ uint last=max(first+1,(sample+1)*source_samples/destination_samples);
+ Output result;result.colour=0;result.depth=1;
+ for(uint s=first;s<last;++s) {result.colour+=LOAD(source_colour,pixel,s);result.depth=min(result.depth,LOAD(source_depth,pixel,s));}
+ result.colour/=last-first;return result;
+})");
+    }
     if(kind==ShaderKind::feedback || kind==ShaderKind::feedback_ms) {
-        auto source=shader_source(ShaderKind::modulate2d);
-        const std::string_view signature="float4 main(P p):SV_Target";
-        source.replace(source.find(signature),signature.size(),"float4 shade(P p)");
-        source+='\n';
+        std::string source(combiner_source.substr(0,combiner_source.find("struct R")));
         source+=kind==ShaderKind::feedback_ms?
             "#define MULTISAMPLE 1\nTexture2DMS<float4> scene:register(t12);\n":
             "Texture2D<float4> scene:register(t12);\n";
@@ -184,7 +215,13 @@ float4 main(P p
 ):SV_Target {
  // Default linear interpolation keeps history sampling at the pixel centre;
  // SV_SampleIndex selects only the destination's individual MSAA samples.
- float4 history=shade(p);
+ float4 texel=tx0.Sample(sm0,p.t0.xy/p.t0.w);
+ if(stages[0].w&2) texel.a=1;
+ if((stages[0].w&1) && texel.a==0) discard;
+ // feedback_phase accepts these two exact combiner reductions. The game's
+ // history copy uses vertex alpha even when the stored texture alpha is zero.
+ float4 history=finish(combiners[0].x==0x00002008?
+  float4(texel.rgb,saturate(p.c.a)):saturate(max(p.c,0)*texel),p.p.xy);
 #ifdef MULTISAMPLE
  float4 current=scene.Load(int2(p.p.xy),sample_index);
 #else
@@ -303,20 +340,12 @@ float4 main(uint id:SV_VertexID):SV_Position {float2 p=float2((id<<1)&2,id&2);re
     case ShaderKind::display_vertex:return R"(
 struct P {float4 p:SV_Position;float2 uv:TEXCOORD0;};
 P main(uint id:SV_VertexID) {P o;o.uv=float2((id<<1)&2,id&2);o.p=float4(o.uv*float2(2,-2)+float2(-1,1),0,1);return o;})";
-    case ShaderKind::display_pixel:return R"(
+    case ShaderKind::display_pixel:return hdr_color_source()+R"(
 Texture2D image:register(t0);SamplerState filter:register(s0);
-float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target{return image.Sample(filter,uv);})";
-    case ShaderKind::copy_multisample:return R"(
-Texture2DMS<float4> source_colour:register(t0);Texture2DMS<float> source_depth:register(t1);
-struct Output {float4 colour:SV_Target;float depth:SV_Depth;};
-Output main(float4 position:SV_Position,uint sample:SV_SampleIndex) {
- Output result;result.colour=source_colour.Load(int2(position.xy),sample);
- result.depth=source_depth.Load(int2(position.xy),sample);return result;
-})";
-    case ShaderKind::copy_multisample_stencil:return R"(
-Texture2DMS<uint2> source_stencil:register(t2);cbuffer C:register(b0){uint bit_mask;uint3 padding;}
-void main(float4 position:SV_Position,uint sample:SV_SampleIndex) {
- if((source_stencil.Load(int2(position.xy),sample).y&bit_mask)==0) discard;
+float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target {
+ float4 color=image.Sample(filter,uv);
+ if(hdr_display && !hdr_source) color.rgb=sdrLinear(color.rgb)*hdr_white;
+ return color;
 })";
     case ShaderKind::fxaa:return R"(
 Texture2D image:register(t0);SamplerState filter:register(s0);

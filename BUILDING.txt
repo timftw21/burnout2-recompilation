@@ -647,6 +647,9 @@ warnings, including relocated vertex programs, unused instruction slots and
 mapped alpha output, linear surface coordinates, XRGB/ARGB alpha kill and
 GPU cubemap face updates, shadow clear aliases, distant texture sampling,
 scaled UI alignment and repeated framebuffer copies/fades at 1x through 4x.
+Framebuffer fading handles both texture modulation and the game's texture-RGB /
+vertex-alpha blend. Animated-text checks use the captured blend with zero stored
+alpha at 60/144/360 Hz, 1x/3x resolution and single-sample/4x MSAA rendering.
 Components do not establish scene parity or game FPS. Remaining graphics
 work includes fixed lighting, other dependent texture modes and scene verification.
 Fixed transforms support all seven skin modes, transformed/normalized normals,
@@ -672,8 +675,22 @@ The native RenderWare reader rendered all 120 global.dic and 80 frontend.dic
 textures. Compare aligned original Xbox video screenshots; record source,
 timestamp and viewpoint. Asset rendering alone is not frame parity.
 
-SDL3 input supports Xbox gamepads and custom keyboard controls. Offline checks
-cover remapping, cleared bindings, stick directions and unchanged gamepad input.
+SDL3 input supports compatible Xbox, PlayStation, Nintendo and other recognized
+gamepads, plus custom keyboard controls. The Controls page selects the
+keyboard or one of four controller player slots. Each controller action accepts
+a button, trigger or stick direction; analog inputs keep their original range.
+Clear removes a binding, and Restore controller defaults resets only that player.
+Mappings save automatically and apply during play. Profiles follow player slots
+across reconnects and use SDL's standard controls; face-button names follow the
+connected controller. Settings navigation keeps its standard controls.
+To assign a control, select its action, release the controls, then press the new
+button, pull the trigger or move the stick. Small stick drift is ignored while
+listening. Esc, Cancel binding or waiting ten seconds cancels. Captured controls
+are withheld from gameplay and settings navigation until released. Disconnecting
+the selected controller cancels capture and preserves its saved bindings.
+Offline virtual-controller checks cover remapping, analog ranges, cleared
+bindings, independent players, capture, disconnection and rumble. Hidden settings
+checks verify capture, cancellation and saving without booting the game.
 The executable opens an SDL3 window without creating a terminal. Command-line
 diagnostics retain redirected output and can attach to the caller's terminal.
 Persistent Dear ImGui settings use a sidebar for Game files, General, Audio,
@@ -735,16 +752,16 @@ fits its anamorphic framebuffer to 16:9 at presentation. HUD widgets retain thei
 gauges and their animated parts, and accounts for existing native split-screen
 scaling. Native camera calculations remain unchanged. The logical framebuffer
 stays 640x480; internal scaling is unchanged. The option saves
-automatically and applies when starting or restarting a session. It defaults off.
+automatically and applies during play. It defaults off.
 Resolution scales colour/depth/feedback targets and raster/scissor rectangles;
 guest coordinates, texture addresses and gameplay are unchanged. Vertex mapping
-keeps the host half-pixel origin independent of scale. Targets are created at
-the selected scale when starting a game; changes during play require
-a new game session or app restart. Diagnostic readback storage is allocated only
+keeps the host half-pixel origin independent of scale. Changes during play resize
+the existing targets, preserving their colour, depth, stencil and feedback.
+Diagnostic readback storage is allocated only
 on request. The render-target budget accounts for scale and stays bounded.
 Enhancements follows Graphics and offers antialiasing Off/FXAA Low/Medium/High/MSAA 2x/4x/8x
 and anisotropic filtering Original/Off (1x)/2x/4x/8x/16x. Both save automatically
-and apply at the next session. Defaults preserve the original single-sample
+and apply during play. Defaults preserve the original single-sample
 rendering and per-texture anisotropy, including the game's captured 2x road filter.
 Ambient occlusion offers Off/GTAO Low/Medium/High and a strength control. It
 defaults Off; the initial strength is 35%. It adds contact shading using the
@@ -752,7 +769,7 @@ original perspective camera and a depth snapshot, without changing original
 colour/depth/feedback targets. Supported HUD layers are composed afterward.
 The added image feeds FXAA. Shaders compile during
 the build, and AO resources are allocated only while enabled. Settings apply
-at the next start/restart. Original baked shading remains; lower strength keeps
+during play. Original baked shading remains; lower strength keeps
 the added effect subtle. Screen-space AO cannot account for hidden geometry.
 FXAA runs once on each completed internal-resolution image,
 without changing original colour, depth or feedback targets. The settings and
@@ -783,8 +800,9 @@ camera retains its original range across camera switches, so scaling never
 compounds. Traffic bodies and wheels extend together to 500 units at 2x and
 750 units at 4x, bounded by the original traffic pool. Their fade shares the
 same range. Traffic spawning, physics and the original three detail levels remain.
-No extra reads or allocations occur during normal rendering. Changes apply on
-start/restart. Existing enabled override settings migrate to 2x; an explicit
+Changes apply during play. Enabling extra scenery may briefly pause to prepare
+the current track; steady rendering adds no file reads or allocations.
+Returning to 1x restores the original camera distance. Existing enabled override settings migrate to 2x; an explicit
 draw_distance=1, 2 or 4 takes precedence. Only the new setting is saved.
 Intro skip finishes the original logo sequence at the PRESS START title screen
 after required loading, preserving its normal controls and attract timeout.
@@ -819,8 +837,27 @@ Graphics / Display offers 4:3, 16:9 and 21:9 aspect ratios. Enhancements /
 Miscellaneous includes Motion blur, enabled by default, and Fast load, disabled
 by default. Fast load removes loading fades and display pacing while the original
 asset loaders finish; it does not bypass file-completion checks or change gameplay
-timing. These settings apply on game start or restart; existing widescreen settings
+timing. These settings apply during play; existing widescreen settings
 migrate to 16:9.
+Graphics also offers optional HDR output on Windows, disabled by default. Enable
+HDR for the display in Windows first. The game uses a floating-point scRGB
+swapchain and expands highlights from the original SDR image; it cannot recover
+lighting detail already clipped by the original game. Paper white sets normal
+image and interface brightness (200 nits by default). Peak brightness uses the
+display's reported limit, with a 1000-nit fallback, or a manual calibrated value.
+Paper white is capped at the peak so normal brightness cannot exceed that limit.
+The existing HUD separation keeps supported overlays at paper white. HDR uses
+one presentation pass and the existing overlay layers; original framebuffer
+values, feedback and blending remain unchanged. MSAA, FXAA and AO are supported.
+Settings apply during play. Moving to an SDR display or disabling Windows HDR
+returns to SDR while retaining the HDR preference. Native Linux/macOS HDR output
+is not yet supported. PNG captures remain SDR; window captures convert scRGB at
+paper white and clip highlights that cannot be represented in an SDR PNG.
+Native diagnostics verify highlight brightness, black levels, HUD separation,
+live changes and resource release without booting. Actual HDR display appearance
+requires a manual check on an HDR monitor; offline checks do not establish it.
+The output follows Microsoft's FP16/scRGB guidance:
+https://learn.microsoft.com/windows/win32/direct3darticles/high-dynamic-range
 Clean HUD, enabled by default in Enhancements / Miscellaneous, redraws the
 original A-Z/a-z lettering, digits, punctuation and symbols, including mathematical
 signs, copyright/trademark marks and font arrows, white menu arrows, rounded menu
@@ -831,8 +868,9 @@ keeps its original animated flames. Clean HUD also prevents faded-out Crash
 bonus numbers from reappearing when their opacity goes below zero.
 Gauge numbers have complete, smooth black outlines, including stroke ends.
 The boost bars and flame mask follow the same inner edge as the redrawn frame.
-Turning it off restores the original textures and opacity behavior on
-start/restart. Exact source-atlas hashes select the
+Turning it off restores the original textures and opacity behavior during play.
+Only matching atlas candidates are reuploaded when this setting changes.
+Exact source-atlas hashes select the
 traced outlines at upload; layout, colors and game-drawn shadows remain.
 Preparation uses cached rows and integer interpolation, with BC3 storage for the
 white font. Filtered copies down to the original atlas sizes keep both edges of
@@ -850,8 +888,11 @@ The game buttons share a centered row. Exit game saves pending setting changes
 and closes the app through the same path as closing the window.
 Restart game ends the current session
 through the native scheduler's cancellation path, releases its audio, pending
-reads and guest stacks, and starts a fresh session in the same window. Saved
-settings, including internal resolution and enhancements, apply when the new session starts.
+reads and guest stacks, and starts a fresh session in the same window.
+Saved game-file paths, mods and imported music apply when the new session starts.
+Display and enhancement changes apply between completed frames without restarting.
+Skip intro affects any remaining splash screens, or the next launch if the intro
+has already finished. Changing game-file paths no longer requires closing the app.
 
 Hidden window diagnostics check saved/invalid bindings and settings, the counter,
 all settings pages, Esc, scaled targets, 60/120 Hz pacing, original frames at

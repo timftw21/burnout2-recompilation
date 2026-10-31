@@ -53,6 +53,7 @@ struct WorldView {
     std::array<std::uint32_t,256> sectors{};
 };
 struct HudLayout {
+    bool enabled=true;
     std::uint32_t list=0;
     std::uint64_t active=0;
     float scale=1,root_scale=1,root_x=0;
@@ -60,7 +61,7 @@ struct HudLayout {
     std::array<float,2> clip_transform{1,0};
     std::array<float,2> transform(std::uint32_t queue) const {
         const auto index=(queue-list)/16;
-        if(queue<list || (queue-list)%16 || index>=anchors.size() || !(active&(1ULL<<index))) return {1,0};
+        if(!enabled || queue<list || (queue-list)%16 || index>=anchors.size() || !(active&(1ULL<<index))) return {1,0};
         return {scale,(root_x+anchors[index]*root_scale)*(1-scale)};
     }
 };

@@ -1,4 +1,5 @@
 #include "shaders.h"
+#include "hdr.h"
 #include "xbe.h"
 #include "gui_shaders.h"
 #ifdef _WIN32
@@ -28,7 +29,13 @@ std::string source(ShaderKind kind,const VertexProgram* program) {
         return translate_vertex_program(*program,kind==ShaderKind::launch).source;
     }
     if(kind==ShaderKind::gui_vertex) return std::string(gui_vertex_source);
-    if(kind==ShaderKind::gui_pixel) return std::string(gui_pixel_source);
+    if(kind==ShaderKind::gui_pixel) {
+        std::string source(gui_pixel_source);
+        const auto position=source.find("return out_col;");
+        if(position==std::string::npos) throw std::runtime_error("Pinned settings pixel shader return changed");
+        source.replace(position,15,"if(hdr_display) out_col.rgb=sdrLinear(out_col.rgb)*hdr_white; return out_col;");
+        return hdr_color_source()+source;
+    }
     return shader_source(kind);
 }
 void array(std::ostringstream& output,std::string_view name,Bytes bytes) {

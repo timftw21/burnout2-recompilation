@@ -1,4 +1,5 @@
 #include "render.h"
+#include "hdr.h"
 #include "assets.h"
 #include "gpu.h"
 #include "cpu.h"
@@ -149,17 +150,17 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
             if(!native.errors().empty()) throw std::runtime_error("Boost HUD feedback produced graphics validation errors");
         });
     }
-    for(unsigned samples:{1U,4U}) for(unsigned refresh:{60U,144U,360U}) {
+    for(unsigned scale:{1U,3U}) for(unsigned samples:{1U,4U}) for(unsigned refresh:{60U,144U,360U}) {
         if(samples>1 && !renderer.supports_msaa(samples)) continue;
-        run(std::format("reward-text-history-{}x-{}hz",samples,refresh),state,white,[&](const Image&) {
+        run(std::format("reward-text-history-{}x-{}hz-scale{}",samples,refresh,scale),state,white,[&](const Image&) {
             Renderer native(64,64,warp,debug);
-            if(samples>1) native.enhancements(5,0);
+            native.configure(scale,samples>1?5:0,0,0,0.5f);
             const std::array targets{native.create_target(64,64),native.create_target(64,64)};
-            const auto original_budget=3ULL*64*64*(samples>1?8*samples+8:12);
-            if(native.resources().target_bytes>original_budget+64ULL*64*samples*4)
+            const auto original_budget=3ULL*64*64*scale*scale*(samples>1?8*samples+8:12);
+            if(native.resources().target_bytes>original_budget+64ULL*64*scale*scale*samples*4)
                 throw std::runtime_error("Framebuffer feedback exceeded one RGBA8 colour-only scratch image");
             if(refresh==144) native.ambient_occlusion(1,0);
-            auto text=colored();text.scissor_test=true;
+            auto text=colored();text.scissor_test=true;text.color_mask=0x00010101;
             auto dark=text;dark.scissor={0,0,64,16};
             auto light=text;light.scissor={0,32,64,64};
             dark.depth_test=dark.depth_write=light.depth_test=light.depth_write=true;
@@ -167,7 +168,18 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
             native.prepare(dark);
             const auto background=[&] {
                 native.camera(1,0.1f,100,1.047197551f);
-                native.begin(0xFF807060);native.draw(dark,quad({0,0,0,1}));native.draw(light,white);
+                native.begin(0x00807060);native.draw(dark,quad({0,0,0,1}));native.draw(light,white);
+            };
+            const auto history=[&](unsigned target) {
+                // frame-439206816200 draw 835: texture RGB with vertex alpha,
+                // independent of both vertex RGB and the RGB-only target's alpha.
+                auto feedback=textured(target);feedback.color_inputs[0]=0x00002008;feedback.alpha_inputs[0]=0x14200000;
+                feedback.color_outputs[0]=feedback.alpha_outputs[0]=0xC00;feedback.final_inputs={12,0x1C80};
+                feedback.blend=true;feedback.blend_source=0x302;feedback.blend_destination=0x303;feedback.color_mask=0x00010101;
+                return feedback;
+            };
+            const auto at=[&](const Image& image,unsigned x,unsigned y,std::array<unsigned,4> expected,unsigned tolerance=1) {
+                expect(image,x*scale+scale/2,y*scale+scale/2,expected,tolerance);
             };
             for(auto target:targets) {native.set_target(target);background();native.end();}
             const auto alpha=float(std::pow(0.7,60.0/refresh));
@@ -178,18 +190,18 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
             const auto layout=native.prepare_layout(program,attributes);
             VertexConstants constants{};constants[0]={1,1,16777215,1};constants[1]={0.53125f,0.53125f,0,0};
             ProgramView view;view.depth_scale=16777215;ProgramVertex current;
-            auto history_vertices=quad({1,1,1,alpha}),text_vertices=red;
+            auto history_vertices=quad({0.2f,0.4f,0.6f,alpha}),text_vertices=red;
             for(auto* vertices:{&history_vertices,&text_vertices}) for(auto& vertex:*vertices) {
                 vertex.position[0]=(vertex.position[0]+1)*32;vertex.position[1]=(1-vertex.position[1])*32;
             }
+            for(auto& vertex:history_vertices) {vertex.position[0]-=0.5f;vertex.position[1]-=0.5f;}
             const std::array history_stream{VertexStream{std::as_bytes(std::span(history_vertices)),sizeof(Vertex)}};
             const std::array text_stream{VertexStream{std::as_bytes(std::span(text_vertices)),sizeof(Vertex)}};
             const auto resources=native.resources();
             // Include the full fade on black, midtone and white backgrounds.
             // One tick misses faint history trapped by RGB8 rounding.
             for(unsigned frame=0;frame<=refresh/2;++frame) {
-                auto feedback=textured(targets[(frame+1)&1]);feedback.blend=true;
-                feedback.blend_source=0x302;feedback.blend_destination=0x303;feedback.color_mask=0x00010101;
+                auto feedback=history(targets[(frame+1)&1]);
                 text.scissor=frame?std::array<std::int32_t,4>{8,8,24,56}:std::array<std::int32_t,4>{40,8,56,56};
                 const auto feedback_bindings=native.prepare(feedback),text_bindings=native.prepare(text);
                 native.set_target(targets[frame&1]);background();
@@ -200,21 +212,21 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
                 if(frame==first) {
                     const auto image=native.readback();const auto fade=std::pow(0.7,60.0*frame/refresh);
                     const auto blend=[&](unsigned background,unsigned text) {return unsigned(std::lround(background+(double(text)-background)*fade));};
-                    expect(image,16,12,{255,0,0,255});
-                    expect(image,48,12,{blend(0,255),0,0,255},3);
-                    expect(image,48,24,{blend(128,255),blend(112,0),blend(96,0),255},3);
-                    expect(image,48,48,{255,blend(255,0),blend(255,0),255},3);
-                    save_png(image,directory/std::format("reward-text-{}x-{}hz.png",samples,refresh));
+                    at(image,16,12,{255,0,0,0});
+                    at(image,48,12,{blend(0,255),0,0,0},3);
+                    at(image,48,24,{blend(128,255),blend(112,0),blend(96,0),0},3);
+                    at(image,48,48,{255,blend(255,0),blend(255,0),0},3);
+                    save_png(image,directory/std::format("reward-text-{}x-{}hz-scale{}.png",samples,refresh,scale));
                 }
             }
             const auto settled=native.readback();
-            save_png(settled,directory/std::format("reward-text-settled-{}x-{}hz.png",samples,refresh));
-            for(unsigned y=8;y<56;++y) for(unsigned x=32;x<56;++x)
-                expect(settled,x,y,y<16?std::array{0U,0U,0U,255U}:y<32?std::array{128U,112U,96U,255U}:std::array{255U,255U,255U,255U},1);
+            save_png(settled,directory/std::format("reward-text-settled-{}x-{}hz-scale{}.png",samples,refresh,scale));
+            for(unsigned y=8*scale;y<56*scale;++y) for(unsigned x=32*scale;x<56*scale;++x)
+                expect(settled,x,y,y<16*scale?std::array{0U,0U,0U,0U}:y<32*scale?std::array{128U,112U,96U,0U}:std::array{255U,255U,255U,0U},1);
             if(refresh==144) {
                 const auto composed=native.read_frame();
-                expect(composed,16,12,{255,0,0,255});expect(composed,48,12,{0,0,0,255},1);
-                expect(composed,48,24,{128,112,96,255},1);expect(composed,48,48,{255,255,255,255},1);
+                at(composed,16,12,{255,0,0,0});at(composed,48,12,{0,0,0,0},1);
+                at(composed,48,24,{128,112,96,0},1);at(composed,48,48,{255,255,255,0},1);
             }
             if(refresh==360) {
                 // Even the weakest non-opaque byte alpha must erase a one-byte
@@ -225,15 +237,14 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
                     native.draw(light,quad({254.0f/255,254.0f/255,254.0f/255,1},0.25f));native.end();
                 }
                 for(unsigned frame=0;frame<refresh;++frame) {
-                    auto feedback=textured(targets[(frame+1)&1]);feedback.blend=true;
-                    feedback.blend_source=0x302;feedback.blend_destination=0x303;feedback.color_mask=0x00010101;
+                    auto feedback=history(targets[(frame+1)&1]);
                     native.prepare(feedback);native.set_target(targets[frame&1]);background();
                     native.draw(feedback,quad({1,1,1,254.0f/255}));native.end();native.copy_to_main();native.publish_frame();
                 }
                 const auto faint=native.readback();
-                save_png(faint,directory/std::format("reward-last-byte-{}x.png",samples));
-                for(unsigned y=0;y<64;++y) for(unsigned x=0;x<64;++x)
-                    expect(faint,x,y,y<16?std::array{0U,0U,0U,255U}:y<32?std::array{128U,112U,96U,255U}:std::array{255U,255U,255U,255U},0);
+                save_png(faint,directory/std::format("reward-last-byte-{}x-scale{}.png",samples,scale));
+                for(unsigned y=0;y<64*scale;++y) for(unsigned x=0;x<64*scale;++x)
+                    expect(faint,x,y,y<16*scale?std::array{0U,0U,0U,0U}:y<32*scale?std::array{128U,112U,96U,0U}:std::array{255U,255U,255U,0U},0);
             }
             if(native.resources().target_bytes!=resources.target_bytes || native.resources().targets!=resources.targets)
                 throw std::runtime_error("Framebuffer feedback allocated additional images");
@@ -262,6 +273,99 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
         if(gpu.stats().flips!=1 || !native.errors().empty()) throw std::runtime_error("GPU overlay completion lost its frame or produced graphics errors");
     });
     auto diagonal=white;diagonal[1].position={1,-1,0.5f,1};diagonal[2].position={-1,-1,0.5f,1};
+    run("live-graphics-settings",colored(),white,[&](const Image&) {
+        Renderer native(32,32,warp,debug);
+        const auto scene=native.create_target(32,32),feedback=native.create_target(32,32);
+        const auto texture=native.upload({2,2,TextureFormat::argb8_linear,solid(2,2,0xFFFF0000)});
+        native.set_target(scene);native.begin(0xFF0000FF,0.25f);native.clear_stencil(0xA5);native.end();
+        native.copy_target(feedback);native.copy_to_main();native.publish_frame();
+        const std::array faces{feedback,feedback,feedback,feedback,feedback,feedback};const auto cube=native.copy_cubemap(faces);
+        const auto resources=native.resources();const auto frames=native.stats().published_frames;
+        const std::array<std::array<unsigned,2>,7> options{{{3,3},{2,5},{4,4},{1,6},{2,0},{1,5},{1,0}}};
+        for(const auto& option:options) {
+            const auto scale=option[0],aa=option[1];
+            if(aa>=4 && !native.supports_msaa(1U<<(aa-3))) continue;
+            native.configure(scale,aa,16,0,0.35f);
+            if(native.resources().textures!=resources.textures || native.stats().published_frames!=frames)
+                throw std::runtime_error("Live graphics change discarded resource identities or frame counters");
+            for(auto target:{0U,scene,feedback}) {
+                const auto image=native.read_target(target);
+                if(image.width!=32*scale || image.height!=32*scale) throw std::runtime_error("Live resolution retained old target dimensions");
+                expect(image,16*scale,16*scale,{0,0,255,255});
+            }
+            native.set_target(scene);
+            if(native.copy_cubemap(faces,cube)!=cube) throw std::runtime_error("Live resolution changed the cubemap identifier");
+            auto cubed=textured(cube);cubed.texture_modes[0]=3;auto face=white;
+            for(auto& vertex:face) vertex.uv[0]={0,0,1,1};
+            native.prepare(cubed);native.begin(0,1,false);native.draw(cubed,face);native.end();
+            expect(native.readback(),16*scale,16*scale,{0,0,255,255});
+            auto depth=colored();depth.depth_test=true;depth.depth_function=0x201;
+            native.prepare(depth);native.begin(0,1,false);native.draw(depth,red);native.end();
+            expect(native.readback(),16*scale,16*scale,{0,0,255,255});
+            auto stencil=textured(texture);stencil.stencil_test=true;stencil.stencil_function=0x202;
+            stencil.stencil_reference=0xA5;stencil.stencil_write_mask=0;
+            native.prepare(stencil);native.begin(0,1,false);native.draw(stencil,white);native.end();
+            expect(native.readback(),16*scale,16*scale,{255,0,0,255});
+            native.begin(0xFF0000FF,0.25f);native.clear_stencil(0xA5);native.end();native.copy_to_main();
+        }
+        if(!native.errors().empty()) throw std::runtime_error("Live graphics changes produced D3D11 validation errors: "+native.errors().front());
+    });
+    for(unsigned samples:{1U,4U}) {
+        if(samples>1 && !renderer.supports_msaa(samples)) continue;
+        run(std::format("hdr-{}x",samples),colored(),white,[&](const Image&) {
+            Renderer native(64,64,warp,debug);const auto aa=samples==4?5U:0U;
+            native.enhancements(aa,0);const auto baseline=native.resources().target_bytes;
+            const HdrSettings hdr{true,200,1000};native.configure(1,aa,0,0,0.35f,hdr);
+            auto surface=colored();surface.depth_test=surface.depth_write=true;native.prepare(surface);
+            const auto ui=native.prepare_program(screen_vertex_programs()[0]);
+            VertexConstants constants{};constants[0]={1,1,16777215,1};constants[1]={0.53125f,0.53125f,0,0};
+            ProgramView view;view.depth_scale=16777215;
+            auto hud=colored();hud.blend=true;hud.blend_source=0x302;hud.blend_destination=0x303;native.prepare(hud);
+            std::array<ProgramVertex,4> text{};
+            constexpr std::array<Float4,4> positions{{{16,16,0,1},{48,16,0,1},{48,48,0,1},{16,48,0,1}}};
+            for(unsigned i=0;i<4;++i) text[i].attributes[0]=positions[i];
+            const auto draw=[&](Float4 color,float opacity=-1) {
+                native.prepare(surface);native.prepare(hud);
+                native.camera(1,0.1f,100,1.047197551f);
+                native.begin();native.draw(surface,quad(color));
+                if(opacity>=0) {
+                    for(auto& vertex:text) vertex.attributes[3]={1,1,1,opacity};
+                    native.draw_program(hud,ui,constants,view,text);
+                }
+                native.end();native.publish_frame();return native.read_hdr();
+            };
+            const auto nits=[](const HdrImage& image,unsigned x,unsigned y,Float4 expected) {
+                const auto value=image.pixels[std::size_t(y)*image.width+x];
+                for(unsigned c=0;c<3;++c) if(!std::isfinite(value[c]) || std::abs(value[c]*80-expected[c])>1.5f)
+                    throw std::runtime_error(std::format("HDR channel {}: {} nits, expected {}",c,value[c]*80,expected[c]));
+            };
+            nits(draw({0,0,0,1}),32,32,{0,0,0,1});
+            nits(draw({128/255.0f,128/255.0f,128/255.0f,1}),32,32,{43.172f,43.172f,43.172f,1});
+            nits(draw({1,0,0,1}),32,32,{1000,0,0,1});
+            const auto opaque=draw({1,1,1,1},1);
+            nits(opaque,4,4,{1000,1000,1000,1});nits(opaque,32,32,{200,200,200,1});
+            expect(native.read_frame(),32,32,{255,255,255,255},0);
+            nits(draw({1,1,1,1},0.5f),32,32,{600,600,600,1});
+            save_png(hdr_sdr_image(opaque,200),directory/std::format("hdr-{}x-output.png",samples));
+            const auto frames=native.stats().published_frames;
+            native.configure(2,aa,0,1,0.35f,hdr);
+            if(native.stats().published_frames!=frames) throw std::runtime_error("HDR configuration reset frame history");
+            const auto scaled=draw({1,1,1,1},1);
+            if(scaled.width!=128 || scaled.height!=128) throw std::runtime_error("HDR did not follow live resolution");
+            nits(scaled,8,8,{1000,1000,1000,1});nits(scaled,64,64,{200,200,200,1});
+            native.configure(1,3,0,0,0.35f,hdr);nits(draw({1,1,1,1},1),32,32,{200,200,200,1});
+            native.configure(1,aa,0,0,0.35f,{true,400,200});nits(draw({1,1,1,1}),32,32,{200,200,200,1});
+            native.resize(48,32);const auto resized=draw({1,1,1,1});
+            if(resized.width!=48 || resized.height!=32) throw std::runtime_error("HDR retained the old framebuffer dimensions");
+            nits(resized,24,16,{200,200,200,1});
+            native.resize(64,64);draw({1,1,1,1});
+            native.configure(1,aa,0,0,0.35f);
+            if(native.hdr_status().active || native.resources().target_bytes!=baseline)
+                throw std::runtime_error("Disabling HDR retained HDR resources");
+            expect(native.read_frame(),32,32,{255,255,255,255},0);
+            if(!native.errors().empty()) throw std::runtime_error("HDR validation: "+native.errors().front());
+        });
+    }
     auto edge_state=colored();edge_state.primitive=5;
     Image original_edge;
     run("antialiasing-off",edge_state,std::span(diagonal).first(3),[&](const Image& image) {original_edge=image;},{},{},{},true);
