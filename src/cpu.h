@@ -104,7 +104,6 @@ struct Cpu {
     // Optional changes to verified title logic, separate from platform bindings.
     bool skip_intro = false, fast_load = false, clean_hud = false;
     bool ultrawide = false,motion_blur = true;
-    bool traffic_shared_wheels = false;
     float draw_distance = 1;
     const WorldMaterials* world_materials = nullptr;
     const WorldView* world_view = nullptr;

@@ -26,6 +26,7 @@ struct VertexTranslation {
     std::uint32_t instructions=0;
     std::uint32_t constant_first=192,constant_count=0;
     std::uint32_t input_mask=0;
+    std::array<std::uint64_t,3> constant_mask{}; // Nonzero when draw constants use packed rows.
     bool writes_context=false;
 };
 // Translation belongs to the native build tool. Gameplay selects bytecode.

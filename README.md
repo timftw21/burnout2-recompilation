@@ -18,17 +18,16 @@ I'll try to respond in a timely manner. This is an independent fan project, unaf
 Yes, AI (Codex) assisted in the development of this project. No, this project was not blindly thrown together.
 If you're skeptical, I implore you to try the recompilation for yourself. I take quality control quite seriously!👀
 
-## What's new in 1.12
+## What's new in 1.13
 
-- Graphics and enhancement settings now apply during play, including resolution,
-  aspect ratio, antialiasing, draw distance and Clean HUD. Mods and imported music
-  still use a game restart.
-- Added optional **HDR output** on Windows, with controls for normal image
-  brightness and peak highlights. Enable HDR for your display in Windows first.
-- Added controller remapping for up to four players. Assign buttons, triggers or
-  stick directions, keep the full analog range, and save each player's bindings.
-- Fixed the remaining animated-text trails missed by the 1.11 fix, including
-  high-refresh play with increased resolution and MSAA.
+- Reduced CPU and graphics overhead for faster gameplay.
+- Added optional **Discord Rich Presence** under **Settings → General**, using
+  the project's icon and showing activity and elapsed time.
+- Increased draw distance now keeps traffic and loose car parts at full mesh
+  detail, including Crash mode. Loose-part ground shadows also extend farther.
+- Fixed memory handling, portable CPU instructions, audio error handling and
+  compiled sound-effect validation. Settings save more safely and load Windows
+  line endings correctly on other platforms.
 
 Download the new **Installation.zip**. On Windows, run **Install.cmd** again to
 update. On Linux, open **Install.desktop**; on macOS, open **Install.command**.
@@ -88,12 +87,14 @@ support is still being tested.
 - Imported custom music through the original Music Selection menu, with a saved
   **Loop Track** option in Music Selection and **Pause → Options**.
 - Optional motion blur from the original game.
-- Optional intro skipping and 2×/4× draw distance, including traffic detail.
+- Optional intro skipping and 2×/4× draw distance, with detailed traffic and loose
+  car parts, plus extended loose-part ground shadows.
 - Clean HUD redraws the original low-resolution interface assets with smooth edges.
 - Optional fast loading skips loading transitions and frame delays.
 - Ten achievements with saved progress and animated unlock notifications.
 - Asset replacement mods with saved load order and conflict checks.
 - Optional automatic muting when the game loses focus.
+- Optional Discord Rich Presence with the project's icon and elapsed time.
 
 ### What still needs work
 
@@ -216,63 +217,28 @@ game-file locations while keeping the restored settings.
 
 Click **Start game** to play; press **Esc** to open or close settings. Changes
 save automatically. Graphics, controls and enhancement changes apply during play.
-Mods and imported music still use a game restart. Hover over options for details.
+Mods and imported music use a game restart. Hover over options for details.
 
-- **General:** Choose the refresh rate (60 Hz by default) or **Unlimited**, and
-  enable the FPS overlay. Higher rates smooth gameplay and menus without changing
-  game speed. Unlimited removes the frame cap; V-sync still follows your display.
-- **Graphics:** Select 1×–4× resolution, Original (4:3), Widescreen (16:9),
-  Ultrawide (21:9), and V-sync.
-  Higher resolutions use more graphics power.
-  On Windows, **HDR output** expands highlights from the original SDR image.
-  Enable HDR in Windows first, then adjust **Paper white** for normal image and
-  interface brightness. Use the display's reported peak brightness or set a
-  calibrated value. Output falls back to SDR when HDR is unavailable.
-- **Enhancements:** Adjust MSAA/FXAA, anisotropic filtering and **Draw distance**
-  (Original, 2× or 4×). **Ambient occlusion** adds contact shading, with three
-  quality levels and a strength slider; Off preserves the original appearance.
-  Increased distance and shading quality use more resources. Extended draw distance
-  fades scenery and traffic detail changes for smoother transitions.
-  **Clean HUD**, **Fast load**, **Motion blur** and **Skip intro splash screens**
-  are under **Miscellaneous**. Clean HUD is enabled by default and redraws the
-  original lettering, icons and gauges. Fast load is optional and removes loading
-  transitions and frame limits while the game's assets load.
-  Motion blur controls the original game's scene blur during boosting and other
-  speed effects; it is enabled by default.
-  Intro skipping affects any remaining splash screens, or the next game session
-  if the intro has already finished.
-- **Audio:** Adjust volume, mute the game, or enable **Mute on focus loss** to
-  silence it while another window has focus. To use custom songs, **Browse** for a music folder, click
-  **Import music**, then select the collection in the game's **Music Selection**
-  menu. MP3, WAV, WMA, FLAC, M4A and AAC are supported through Windows codecs
-  on Windows and FFmpeg on Linux and macOS.
-  Importing replaces the previous collection and restarts an active game.
-  In-game music volume and Crash-mode music stopping also apply to Burnout 1 and
-  imported songs. **Loop Track** repeats the selected song until you turn it off;
-  change it in **Music Selection** or **Pause → Options** and confirm your choice.
-- **Controls:** Choose **Keyboard** or **Controller 1–4**, then select a binding.
-  Press a new key, or release the controller controls before pressing a button,
-  pulling a trigger or moving a stick. Controller mappings save separately for
-  each player slot and preserve analog input. Use **Clear** or restore defaults
-  for the selected device. Esc cancels rebinding; controller capture also has a
-  **Cancel binding** button and a ten-second timeout.
-- **Achievements:** View progress and the requirements for each achievement.
-  **Disable achievements** pauses new unlocks and notifications while keeping
-  progress; **Enable achievements** resumes tracking. **Reset achievements** asks
-  for confirmation before clearing achievement progress. Game saves are kept.
-- **Mods:** Open the mods folder, add a mod, then **Refresh**. Enable the mods you
-  want and use the arrows to set their order; lower enabled mods override earlier
-  ones when files overlap. **Check mods** reports conflicts. Changes apply when
-  you start or restart the game. Setup includes **Test Mod**, disabled by default,
-  which recolors the game's logos using files generated from your own disc.
-  *Scripts and executable patches are not yet supported.* See
-  [BUILDING.txt](BUILDING.txt) for the mod format and creation steps.
-- **Diagnostics:** View startup and error messages, capture a frame, or record performance.
+- **General:** Set the refresh rate or **Unlimited**, show FPS, and enable
+  **Discord Rich Presence**. Presence is off by default and requires Discord desktop.
+- **Graphics:** Choose resolution, aspect ratio, V-sync and Windows HDR output.
+  Enable HDR in Windows first; hover over its controls for brightness guidance.
+- **Enhancements:** Set antialiasing, texture filtering, ambient occlusion and
+  draw distance. **Miscellaneous** contains Clean HUD, Fast load, Motion blur
+  and intro skipping. Higher quality and distance use more resources.
+- **Audio:** Set volume and muting, including **Mute on focus loss**. Browse for
+  songs, click **Import music**, then choose the collection in **Music Selection**.
+  **Loop Track** is in Music Selection and **Pause → Options**.
+- **Controls:** Select **Keyboard** or **Controller 1–4**, click a binding, then
+  press the new control. Each player keeps separate mappings. Esc cancels capture.
+- **Achievements:** View progress, pause tracking or reset achievement progress.
+- **Mods:** Add files to the mods folder, **Refresh**, enable mods and arrange
+  their order. Lower enabled mods take priority; **Check mods** reports conflicts.
+  Scripts and executable patches are unsupported. See [BUILDING.txt](BUILDING.txt).
+- **Diagnostics:** View logs, capture frames or record performance.
 
 Press **F9** to start or stop a performance recording. Reports are saved under
 `build/captures/performance-*`; include the whole folder when reporting a slowdown.
-Saves are in `data/user` beside the game executable (`b2.exe` on Windows, `b2` on
-Linux and macOS); back up that folder to keep your profiles.
 
 ### Achievements
 

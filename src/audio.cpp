@@ -384,6 +384,7 @@ Audio::Audio(bool output,float gain):voices_{},controls_(std::make_unique<Contro
     stream_=SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,&specification,
         [](void* context,SDL_AudioStream* stream,int additional,int) {
             auto& audio=*static_cast<Audio*>(context);
+            if(audio.failed_.load(std::memory_order_acquire)) return;
             auto* live=audio.live_.get();Live::Callback* recorded=nullptr;
             if(live && live->sample_count<live->samples.size() && live->callback_count<live->callbacks.size()) {
                 recorded=&live->callbacks[live->callback_count++];

@@ -203,6 +203,10 @@ std::string check_effects(const std::filesystem::path& source) {
     if(!compiled_effects_match(image)) throw std::runtime_error("Effects input differs from the compiled programs");
     unsigned checks=0;std::vector<std::string> failures;
     const auto require=[&](bool passed,std::string_view detail){++checks;if(!passed) failures.emplace_back(detail);};
+    auto changed=image;changed.effects[0].descriptor[2]+=4;
+    require(!compiled_effects_match(changed),"compiled effects reject relocated state and coefficient addresses");
+    changed=image;++changed.program_words;
+    require(!compiled_effects_match(changed),"compiled effects reject a changed program memory layout");
     Dsp state(image);
     state.write(14,0xFFFFFF);require(state.accumulators[0]==-0x1000000,"signed accumulator move");
     state.write(10,0x7F);require(state.read(10)==0x7F,"extension write");

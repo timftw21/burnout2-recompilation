@@ -1392,6 +1392,41 @@ unsigned check_presentation(Memory& memory) {
         require(!std::memcmp(memory.access(shadows+8,48),copied.data(),48),"A replacement shadow inherited another body's motion");
         presentation->end(cpu,memory);++checks;
     }
+    // Execute the original loose-part shadow culling, stopping at the ground
+    // lookup only when the original clip tests accept the part.
+    {
+        constexpr std::uint32_t shadows=0x2000,view=0x2200,sp=0x4000;
+        std::array<std::byte,0xD00> graphics;
+        std::memcpy(graphics.data(),memory.access(0x5AD000,graphics.size()),graphics.size());
+        memory.fill_elements<std::uint32_t>(shadows,0,56/4,false);
+        memory.store<std::uint32_t>(shadows+4,1);
+        memory.store<std::uint32_t>(shadows+0x24,0x3F800000);
+        memory.store<std::uint32_t>(shadows+0x34,0x3F800000);
+        memory.fill_elements<std::uint32_t>(view,0,0x110/4,false);
+        memory.store<std::uint32_t>(0x5ADCA0,view);
+        memory.store<std::uint32_t>(view+0xB4,0xBF800000);
+        for(unsigned plane=0;plane<4;++plane)
+            memory.store<std::uint32_t>(view+0xCC+plane*0x14,std::bit_cast<std::uint32_t>(10000.f));
+        for(float origin:{-1000.f,0.f,1000.f}) for(unsigned distance:{1U,2U,4U})
+            for(float depth:{-2.f,0.f,50.f,52.f,100.f,102.f,200.f,202.f}) {
+                memory.store<std::uint32_t>(view+0xB8,std::bit_cast<std::uint32_t>(-origin));
+                memory.store<std::uint32_t>(shadows+0x10,std::bit_cast<std::uint32_t>(origin+depth));
+                memory.store<std::uint32_t>(sp,0xABCDEF00);memory.store<std::uint32_t>(sp+4,0);
+                Cpu shadow;shadow.draw_distance=float(distance);shadow.registers[esp]=sp;shadow.registers[ecx]=shadows;
+                ExecutionDiagnostic stop;stop.break_address=0x8F240;shadow.diagnostic=&stop;
+                bool visible=false;
+                try {invoke_native(shadow,memory,0x78C10);}
+                catch(const NativeBoundary& boundary) {
+                    require(boundary.address==stop.break_address,"Part shadow failed before its ground lookup");visible=true;
+                }
+                require(visible==(depth>=-1 && depth<=50*distance+1),
+                    std::format("Part shadow range disagrees with draw distance: origin {}, distance {}, depth {}",origin,distance,depth));
+                require(memory.load<std::uint32_t>(view+0xB8)==std::bit_cast<std::uint32_t>(-origin) &&
+                    memory.load<std::uint32_t>(0x2BF250)==0x42480000,"Part shadow range changed the camera or shared constant");
+                ++checks;
+            }
+        std::memcpy(memory.access(0x5AD000,graphics.size()),graphics.data(),graphics.size());
+    }
     // Spark trajectories remain original; only the cached drawing time changes.
     // Clip a real spark before GPU submission and inspect its original endpoints.
     {

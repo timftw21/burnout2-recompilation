@@ -309,8 +309,13 @@ std::string compile_effects(const std::filesystem::path& source,const std::files
     if(coefficients.size()>Dsp::coefficient_capacity) throw std::runtime_error("DSP coefficient count exceeds its bounded capacity");
     code<<"}\nstd::span<const std::uint32_t> compiled_effect_coefficients() {\nstatic constexpr std::array<std::uint32_t,"<<coefficients.size()<<"> words={";
     for(const auto word:coefficients) code<<literal(word)<<',';
-    code<<"};return words;\n}\nbool compiled_effects_match(const EffectsImage& image) {\nif(image.effects.size()!="<<image.effects.size()<<") return false;\n";
+    code<<"};return words;\n}\nbool compiled_effects_match(const EffectsImage& image) {\nif(image.effects.size()!="<<image.effects.size()
+        <<" || image.program_words!="<<image.program_words<<" || image.data_file_offset!="<<image.data_file_offset
+        <<" || image.data.size()!="<<image.data.size()<<") return false;\n";
     for(unsigned i=0;i<image.effects.size();++i) {
+        code<<"if(image.effects["<<i<<"].descriptor!=std::array<std::uint32_t,8>{";
+        for(auto field:image.effects[i].descriptor) code<<literal(field)<<',';
+        code<<"}) return false;\n";
         code<<"{const auto& bytes=image.effects["<<i<<"].code; if(bytes.size()!="<<image.effects[i].code.size()<<") return false;\n"
             <<"std::uint64_t hash=14695981039346656037ULL;for(auto byte:bytes){hash^=std::to_integer<unsigned>(byte);hash*=1099511628211ULL;}\n"
             <<"if(hash!="<<fingerprint(image.effects[i].code)<<"ULL) return false;}\n";

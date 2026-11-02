@@ -21,7 +21,7 @@ struct Key {
     ShaderKind kind;VertexProgram program{};
     auto operator<=>(const Key&) const = default;
 };
-struct Compiled {std::vector<std::byte> bytes;std::uint32_t first=0,count=192,input_mask=0;};
+struct Compiled {std::vector<std::byte> bytes;std::uint32_t first=0,count=192,input_mask=0;std::array<std::uint64_t,3> constant_mask{};};
 std::map<Key,Compiled> bytecode;
 std::string source(ShaderKind kind,const VertexProgram* program) {
     if(kind==ShaderKind::vertex || kind==ShaderKind::launch) {
@@ -57,11 +57,13 @@ void program(std::ostringstream& output,const StaticVertex& value) {
 }
 ShaderBinary shader_binary(ShaderKind kind,const VertexProgram* program) {
     Key key{kind};if(program) key.program=normalize_vertex_program(*program);
-    if(const auto found=bytecode.find(key);found!=bytecode.end()) return {found->second.bytes,false,found->second.first,found->second.count,found->second.input_mask};
+    if(const auto found=bytecode.find(key);found!=bytecode.end()) return {found->second.bytes,false,found->second.first,found->second.count,found->second.input_mask,found->second.constant_mask};
     std::uint32_t first=0,count=192,input_mask=0;
+    std::array<std::uint64_t,3> constant_mask{};
     if(kind==ShaderKind::vertex) {
         const auto translated=translate_vertex_program(key.program);
         first=translated.constant_first;count=translated.constant_count;input_mask=translated.input_mask;
+        constant_mask=translated.constant_mask;
     } else if((kind>=ShaderKind::fixed0 && kind<=ShaderKind::fixed6)) count=96;
     const auto hlsl=source(kind,program?&key.program:nullptr);
     std::vector<std::byte> compiled;
@@ -88,8 +90,8 @@ ShaderBinary shader_binary(ShaderKind kind,const VertexProgram* program) {
         throw std::runtime_error(std::format("Offline shader {}: {}",unsigned(kind),output.messages?output.messages:"unknown compiler error"));
     const auto* data=static_cast<const std::byte*>(output.code.code);compiled.assign(data,data+output.code.size);
 #endif
-    auto [stored,inserted]=bytecode.emplace(std::move(key),Compiled{std::move(compiled),first,count,input_mask});
-    return {stored->second.bytes,inserted,first,count,input_mask};
+    auto [stored,inserted]=bytecode.emplace(std::move(key),Compiled{std::move(compiled),first,count,input_mask,constant_mask});
+    return {stored->second.bytes,inserted,first,count,input_mask,constant_mask};
 }
 std::span<const StaticVertex> static_vertex_shaders() {return {};}
 std::string compile_shaders(const std::filesystem::path& executable,const std::filesystem::path& destination,bool replace) {
@@ -145,8 +147,9 @@ std::string compile_shaders(const std::filesystem::path& executable,const std::f
     output<<"default:break;}\nif(!program) throw std::runtime_error(\"Missing static shader program\");\nconst auto key=normalize_vertex_program(*program);\n";
     for(unsigned i=0;i<vertices.size();++i) {
         const auto binary=shader_binary(vertices[i].launch?ShaderKind::launch:ShaderKind::vertex,&vertices[i].program);
-        output<<std::format("if(kind==ShaderKind::{} && key==programs[{}].program) return {{Bytes(reinterpret_cast<const std::byte*>(vertex_{}),sizeof(vertex_{})),false,{}, {},{}}};\n",
-            vertices[i].launch?"launch":"vertex",i,i,i,binary.constant_first,binary.constant_count,binary.input_mask);
+        output<<std::format("if(kind==ShaderKind::{} && key==programs[{}].program) return {{Bytes(reinterpret_cast<const std::byte*>(vertex_{}),sizeof(vertex_{})),false,{}, {},{},{{{}ULL,{}ULL,{}ULL}}}};\n",
+            vertices[i].launch?"launch":"vertex",i,i,i,binary.constant_first,binary.constant_count,binary.input_mask,
+            binary.constant_mask[0],binary.constant_mask[1],binary.constant_mask[2]);
     }
     output<<"throw std::runtime_error(\"Vertex program is missing from the compiled shader bank\");}\n}\n";
     write_text(destination,output.str(),replace);

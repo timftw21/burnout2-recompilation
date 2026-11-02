@@ -6,6 +6,7 @@
 #include "custom_music.h"
 #include "mods.h"
 #include "achievements.h"
+#include "discord.h"
 #include <SDL3/SDL.h>
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
@@ -97,6 +98,7 @@ struct Preferences {
     int hdr_paper_white=200,hdr_peak=0;
     bool custom_music=false,loop_track=false,mute_on_focus_loss=false;
     bool skip_intro=false,fast_load=false,clean_hud=true;
+    bool discord_presence=false;
     int draw_distance=1;
     KeyboardBindings bindings=default_keyboard_bindings();
     ControllerProfiles controller_bindings=default_controller_profiles();
@@ -107,6 +109,7 @@ struct Preferences {
         std::ifstream file(path);std::string line;
         bool legacy_distance=false,has_distance=false,has_aspect=false;
         while(std::getline(file,line)) {
+            if(line.ends_with('\r')) line.pop_back();
             if(line.size()>8192) throw std::runtime_error("Settings line exceeds its bound");
             const auto split=line.find('=');if(split==std::string::npos) continue;
             const auto key=line.substr(0,split),value=line.substr(split+1);
@@ -134,6 +137,7 @@ struct Preferences {
             else if(key=="custom_music") custom_music=value=="1";
             else if(key=="loop_track") loop_track=value=="1";
             else if(key=="skip_intro") skip_intro=value=="1";
+            else if(key=="discord_presence") discord_presence=value=="1";
             else if(key=="fast_load") fast_load=value=="1";
             else if(key=="clean_hud") clean_hud=value=="1";
             else if(key=="mod" && valid_mod_id(value) && enabled_mods.size()<128 &&
@@ -167,8 +171,7 @@ struct Preferences {
         if(!has_distance && legacy_distance) draw_distance=2;
     }
     void save(const std::filesystem::path& path="data/local/settings.cfg") const {
-        if(!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
-        std::ofstream file(path,std::ios::trunc);
+        std::ostringstream file;
         file<<"xbe="<<xbe.data()<<"\ndisc="<<disc.data()<<"\nvsync="<<vsync<<"\nfullscreen="<<fullscreen<<"\nkeyboard="<<keyboard
             <<"\nrefresh_rate="<<refresh_rate<<"\nvolume="<<volume<<"\nmuted="<<muted<<"\nmute_on_focus_loss="<<mute_on_focus_loss
             <<"\nresolution_scale="<<resolution_scale<<"\nshow_fps="<<show_fps<<"\nwidescreen="<<(aspect_ratio!=0)<<"\naspect_ratio="<<aspect_ratio
@@ -176,12 +179,12 @@ struct Preferences {
             <<"\nambient_occlusion="<<ambient_occlusion<<"\nambient_occlusion_strength="<<ambient_occlusion_strength
             <<"\nhdr="<<hdr<<"\nhdr_paper_white="<<hdr_paper_white<<"\nhdr_peak="<<hdr_peak
             <<"\nskip_intro="<<skip_intro<<"\nfast_load="<<fast_load<<"\nclean_hud="<<clean_hud<<"\nmotion_blur="<<motion_blur<<"\ndraw_distance="<<draw_distance
-            <<"\ncustom_music="<<custom_music<<"\nloop_track="<<loop_track<<"\nmusic_folder="<<music_folder.data()<<'\n';
+            <<"\ncustom_music="<<custom_music<<"\nloop_track="<<loop_track<<"\nmusic_folder="<<music_folder.data()<<"\ndiscord_presence="<<discord_presence<<'\n';
         for(unsigned i=0;i<input_actions.size();++i) file<<"key_"<<input_actions[i].id<<'='<<bindings[i]<<'\n';
         for(unsigned port=0;port<controller_bindings.size();++port) for(unsigned i=0;i<input_actions.size();++i)
             file<<"pad"<<port+1<<'_'<<input_actions[i].id<<'='<<controller_binding_id(controller_bindings[port][i])<<'\n';
         for(const auto& id:enabled_mods) file<<"mod="<<id<<'\n';
-        if(!file) throw std::runtime_error("Could not save settings");
+        write_text(path,file.view(),true);
     }
     void select_refresh_rate(int rate) {refresh_rate=rate;}
     float aspect() const {return aspect_ratio==2?21.0f/9:aspect_ratio==1?16.0f/9:4.0f/3;}
@@ -410,6 +413,8 @@ struct App {
     std::unique_ptr<ControlScript> controls;
     Preferences settings;
     Preferences applied_settings{false};
+    DiscordPresence discord{B2_DISCORD_APPLICATION_ID};
+    bool presence_allowed=false;
     bool settings_pending=false,display_changed=false;
     Achievements achievements;
     std::filesystem::path achievements_path;
@@ -460,6 +465,7 @@ struct App {
     bool cursor_hidden=false,focused=false;
     App(bool hidden,bool warp,const std::filesystem::path& script={},const std::filesystem::path& preferences="data/local/settings.cfg"):
         settings(!hidden,preferences),settings_path(preferences) {
+        presence_allowed=!hidden && script.empty();
         achievements_path=hidden?std::filesystem::path(preferences).concat(".achievements"):preferences.parent_path()/"achievements.cfg";
         if(!hidden) try {achievements.load(achievements_path);}
         catch(const std::exception& error) {achievements_error=error.what();log_message("Achievements: "+achievements_error);}
@@ -718,6 +724,9 @@ struct App {
     void start_benchmark() {
         if(!playing || benchmark_started) return;
         stop_performance();benchmark_frames.clear();benchmark_frames.reserve(8192);benchmark_dropped=0;
+#if defined(__LLVM_INSTR_PROFILE_GENERATE)
+        __llvm_profile_reset_counters();
+#endif
         benchmark_cpu=cpu_name();benchmark_build=build_description();
         benchmark_properties=benchmark_settings();benchmark_started=SDL_GetTicksNS();
     }
@@ -876,6 +885,7 @@ struct App {
             if(controls->capture) {controls->capture=false;capture_frame();}
         }
         input->capture_keyboard(show_settings);input->update();update_controller_binding();
+        discord.update(presence_allowed && settings.discord_presence,playing,show_settings);
         if(performance.active()) {
             if(performance.resources_due()) {
                 PerfScope overhead(&performance,PerfPhase::diagnostics);const auto r=renderer->resources();
@@ -1161,6 +1171,10 @@ struct App {
                         ImGui::Spacing();ImGui::SeparatorText("ON-SCREEN INFO");
                         changed|=ImGui::Checkbox("Show frame rate",&settings.show_fps);
                         setting_help("Displays the game and display frame rates in the upper-right corner.");
+                        ImGui::Spacing();ImGui::SeparatorText("DISCORD");
+                        changed|=ImGui::Checkbox("Discord Rich Presence",&settings.discord_presence);
+                        setting_help("Shares your game activity and elapsed time with Discord while its desktop app is running. Turning this off clears the activity.");
+                        if(settings.discord_presence) disabled_text("%s",discord.status().data());
                         break;
                     }
                     case 2: {
@@ -1257,7 +1271,7 @@ struct App {
                         int distance=0;for(int i=0;i<3;++i) if(settings.draw_distance==distances[i]) distance=i;
                         setting_label("Draw distance");
                         if(ImGui::Combo("##Draw distance",&distance,distance_labels,3)) {settings.draw_distance=distances[distance];changed=true;}
-                        setting_help("Draws compatible scenery and traffic farther away, with smoother detail changes and fades. Applies immediately; enabling extra scenery can briefly pause to load it. Higher settings can increase rendering work.");
+                        setting_help("Draws compatible scenery and traffic farther away and keeps traffic bodies and loose parts at full mesh detail. Applies immediately; enabling extra scenery can briefly pause to load it. Higher settings can increase rendering work.");
                         ImGui::Spacing();ImGui::SeparatorText("IMAGE QUALITY");
                         constexpr const char* levels[]={"Off (original)","FXAA Low","FXAA Medium","FXAA High","MSAA 2x","MSAA 4x","MSAA 8x"};
                         setting_label("Antialiasing");
@@ -1385,7 +1399,7 @@ struct App {
             const auto button_width=std::clamp((available-spacing*(count-1))/count,1.0f,145.0f);
             const auto row_width=button_width*count+spacing*(count-1);
             const auto footer=ImGui::GetCursorPos();
-            if(available-row_width>175) {ImGui::AlignTextToFramePadding();disabled_text("Saved automatically");}
+            if(available-row_width>175) {ImGui::AlignTextToFramePadding();disabled_text("Changes save automatically");}
             ImGui::SetCursorPos({footer.x+available-row_width,footer.y});
             ImGui::BeginDisabled(music_importing || music_import_requested);
             ImGui::PushStyleColor(ImGuiCol_Text,ImVec4{.08f,.07f,.06f,1});
@@ -1658,6 +1672,9 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     if(app.settings.hdr || app.settings.hdr_paper_white!=200 || app.settings.hdr_peak) throw std::runtime_error("Invalid default HDR settings");
     if(!app.settings.clean_hud) throw std::runtime_error("Clean HUD must preserve the enabled default");
     if(app.settings.mute_on_focus_loss) throw std::runtime_error("Focus muting must default to disabled");
+    if(app.settings.discord_presence) throw std::runtime_error("Discord presence must default to disabled");
+    app.settings.discord_presence=true;app.poll();app.settings.discord_presence=false;
+    if(app.discord.status()!="Off") throw std::runtime_error("Window diagnostics must not publish Discord activity");
     if(!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
     FrameRate counter_rate;counter_rate.sample(1);
     for(unsigned frame=1;frame<=60;++frame) counter_rate.sample(1+frame*1000000000ULL/120);
@@ -1665,16 +1682,33 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     Preferences saved(false);saved.resolution_scale=3;saved.select_refresh_rate(144);saved.show_fps=true;saved.aspect_ratio=2;saved.motion_blur=false;saved.bindings[15]=SDL_SCANCODE_Z;
     saved.custom_music=true;saved.loop_track=true;saved.mute_on_focus_loss=true;copy_text(saved.music_folder.data(),saved.music_folder.size(),"Music/Custom playlist");
     saved.antialiasing=6;saved.anisotropy=16;saved.ambient_occlusion=3;saved.ambient_occlusion_strength=47;
-    saved.hdr=true;saved.hdr_paper_white=240;saved.hdr_peak=800;
+    saved.hdr=true;saved.hdr_paper_white=240;saved.hdr_peak=800;saved.discord_presence=true;
     saved.skip_intro=true;saved.fast_load=true;saved.clean_hud=false;saved.draw_distance=4;
     saved.enabled_mods={"paint","sound"};
     saved.controller_bindings[0][15]={ControllerSource::button,SDL_GAMEPAD_BUTTON_SOUTH};
     saved.controller_bindings[1][16]={ControllerSource::negative_axis,SDL_GAMEPAD_AXIS_RIGHTX};saved.controller_bindings[3][4]={};
     saved.save(preferences);Preferences restored(true,preferences);
+    {
+        File original(preferences);const auto bytes=original.read(0,std::size_t(original.size()));
+        std::string crlf;
+        for(auto byte:bytes) {if(byte==std::byte{'\n'}) crlf+='\r';crlf+=char(byte);}
+        auto windows_preferences=preferences;windows_preferences+=".crlf";write_text(windows_preferences,crlf,false);
+        const Preferences windows(true,windows_preferences);
+        if(windows.disc!=saved.disc || windows.enabled_mods!=saved.enabled_mods || windows.refresh_rate!=144 ||
+            windows.controller_bindings!=saved.controller_bindings || !windows.discord_presence)
+            throw std::runtime_error("Windows settings line endings changed paths or preferences");
+        auto temporary=preferences;temporary+=".tmp";write_text(temporary,"occupied",false);
+        auto changed=saved;changed.volume=saved.volume==99?98:99;
+        bool rejected=false;try {changed.save(preferences);}catch(const std::exception&) {rejected=true;}
+        File preserved(preferences);
+        if(!rejected || preserved.read(0,std::size_t(preserved.size()))!=bytes)
+            throw std::runtime_error("Failed settings publication damaged saved preferences");
+        std::filesystem::remove(temporary);
+    }
     if(restored.bindings!=saved.bindings || restored.controller_bindings!=saved.controller_bindings || restored.resolution_scale!=3 || restored.refresh_rate!=144 || !restored.show_fps || restored.aspect_ratio!=2 || restored.motion_blur ||
        !restored.custom_music || !restored.loop_track || !restored.mute_on_focus_loss || restored.music_folder!=saved.music_folder || restored.antialiasing!=6 || restored.anisotropy!=16 || restored.ambient_occlusion!=3 || restored.ambient_occlusion_strength!=47 ||
        !restored.skip_intro || !restored.fast_load || restored.clean_hud || restored.draw_distance!=4 || restored.enabled_mods!=saved.enabled_mods ||
-       !restored.hdr || restored.hdr_paper_white!=240 || restored.hdr_peak!=800)
+       !restored.hdr || restored.hdr_paper_white!=240 || restored.hdr_peak!=800 || !restored.discord_presence)
         throw std::runtime_error("New settings did not survive save/load");
     restored.volume=37;
     if(restored.output_gain(false)!=0 || restored.output_gain(true)!=.37f)
@@ -1682,8 +1716,8 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     restored.muted=true;
     if(restored.output_gain(false)!=0 || restored.output_gain(true)!=0)
         throw std::runtime_error("Focus restored manually muted audio");
-    restored.muted=false;restored.mute_on_focus_loss=false;restored.save(preferences);
-    if(restored.output_gain(false)!=.37f || Preferences(true,preferences).mute_on_focus_loss)
+    restored.muted=false;restored.mute_on_focus_loss=false;restored.discord_presence=false;restored.save(preferences);
+    if(restored.output_gain(false)!=.37f || Preferences(true,preferences).mute_on_focus_loss || Preferences(true,preferences).discord_presence)
         throw std::runtime_error("Focus muting could not be disabled");
     const auto default_volume=app.settings.volume;
     app.settings.volume=37;app.settings.mute_on_focus_loss=true;

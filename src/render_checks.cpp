@@ -986,7 +986,9 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
     const auto upload_image=directory/"stream-upload-order.png";
     try {
         Renderer native(8,8,warp,debug);
-        auto queued_program=vertex_program;queued_program.tokens[1]=token(1,0,0,96,3,false,true,3);
+        auto queued_program=vertex_program;
+        queued_program.tokens[1]=token(1,0,0,0,3,false,false,3,3,3,0,15);
+        queued_program.tokens[2]=token(3,0,0,96,3,false,true,1);
         const auto program=native.prepare_program(queued_program);
         VertexLayout attributes{};attributes[0]={0,0,0x42};
         const std::array layouts{native.prepare_layout(program,attributes),native.prepare_layout(native.prepare_program(vertex_program),attributes)};
@@ -995,7 +997,11 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
         for(auto& state:states) {state.color_inputs[0]=0x01040000;state.alpha_inputs[0]=0x11140000;native.prepare(state);}
         states[0].factor0[0]=0xFFFF0000;states[1].factor0[0]=0xFFFFFFFF;
         std::array<VertexConstants,2> uniforms{context,context};
-        uniforms[0][96]={1,1,1,1};uniforms[1][96]={0,0,1,1};
+        uniforms[0][0]=uniforms[1][0]={0.25f,0,0,0};
+        uniforms[0][96]={0.75f,1,1,1};uniforms[1][96]={-0.25f,0,1,1};
+        // Separated constant rows must work in both direct and queued uploads.
+        native.begin();native.draw_program(states[0],program,uniforms[0],view,program_vertices);native.end();
+        expect(native.readback(),4,4,{255,0,0,255});
         const std::array<std::array<Float4,4>,2> positions{{
             {{{0,0,0.5f,1},{4,0,0.5f,1},{4,8,0.5f,1},{0,8,0.5f,1}}},
             {{{4,0,0.5f,1},{8,0,0.5f,1},{8,8,0.5f,1},{4,8,0.5f,1}}}}};

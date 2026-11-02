@@ -259,16 +259,18 @@ struct alignas(16) ProgramUniforms {
     std::array<std::uint32_t,4> fixed_matrices{};
     std::array<Float4,2> point_parameters{};
 };
-bool same_uniforms(const ProgramUniforms& a,const ProgramUniforms& b,unsigned first,unsigned count) {
+bool same_uniforms(const ProgramUniforms& a,const ProgramUniforms& b,unsigned first,unsigned count,std::span<const std::uint8_t> rows={}) {
     static_assert(offsetof(ProgramUniforms,viewport)==sizeof(VertexConstants));
-    return (!count || !std::memcmp(a.constants.data()+first,b.constants.data()+first,count*sizeof(Float4))) &&
-        !std::memcmp(&a.viewport,&b.viewport,sizeof(ProgramUniforms)-sizeof(VertexConstants));
+    if(rows.empty()) {if(count && std::memcmp(a.constants.data()+first,b.constants.data()+first,count*sizeof(Float4))) return false;}
+    else for(const auto row:rows) if(std::memcmp(&a.constants[row],&b.constants[row],sizeof(Float4))) return false;
+    return !std::memcmp(&a.viewport,&b.viewport,sizeof(ProgramUniforms)-sizeof(VertexConstants));
 }
 UINT uniform_bytes(unsigned count) {return count*sizeof(Float4)+sizeof(ProgramUniforms)-sizeof(VertexConstants);}
 UINT uniform_capacity(unsigned count) {return (uniform_bytes(count)+255)&~255U;}
-void write_uniforms(void* output,const ProgramUniforms& values,unsigned first,unsigned count) {
+void write_uniforms(void* output,const ProgramUniforms& values,unsigned first,unsigned count,std::span<const std::uint8_t> rows={}) {
     auto* bytes=static_cast<std::byte*>(output);const auto constants=count*sizeof(Float4);
-    if(count) std::memcpy(bytes,values.constants.data()+first,constants);
+    if(rows.empty()) {if(count) std::memcpy(bytes,values.constants.data()+first,constants);}
+    else for(unsigned i=0;i<rows.size();++i) std::memcpy(bytes+i*sizeof(Float4),&values.constants[rows[i]],sizeof(Float4));
     std::memcpy(bytes+constants,&values.viewport,sizeof(ProgramUniforms)-sizeof(VertexConstants));
 }
 Constants fragment_constants(const RenderState& state,std::uint32_t feedback_phase) {
@@ -647,6 +649,9 @@ struct Renderer::Impl {
         FixedTransform fixed_key{};
         std::uint32_t constant_first=0,constant_count=192;
         std::uint32_t upload_first=0,upload_count=192;
+        std::array<std::uint8_t,192> upload_rows{};
+        std::uint32_t packed_count=0;
+        std::span<const std::uint8_t> rows() const {return {upload_rows.data(),packed_count};}
     };
     std::vector<Program> programs;
     struct StreamLayout {
@@ -808,7 +813,7 @@ struct Renderer::Impl {
     static constexpr UINT max_vertices = 32768, max_indices = max_vertices * 6;
     static IndexPlan plan_indices(unsigned primitive,UINT vertices,std::span<const std::uint32_t> input) {
         if(!vertices || vertices>max_vertices || input.size()>max_vertices) throw std::runtime_error("Draw exceeds bounded vertex/index buffers");
-        for(const auto index:input) if(index>=vertices) throw std::runtime_error("Vertex index outside draw");
+        if(!input.empty() && *std::ranges::max_element(input)>=vertices) throw std::runtime_error("Vertex index outside draw");
         const auto count=input.empty()?vertices:static_cast<UINT>(input.size());
         IndexPlan plan;plan.count=static_cast<UINT>(input.size());
         switch(primitive) {
@@ -1880,6 +1885,12 @@ std::uint32_t Renderer::prepare_program(const VertexProgram& program,bool launch
     Impl::Program prepared{key,launch};
     prepared.input_mask=metadata.input_mask;prepared.constant_first=metadata.constant_first;prepared.constant_count=metadata.constant_count;
     prepared.upload_first=metadata.constant_first;prepared.upload_count=metadata.constant_count;
+    for(unsigned row=0;row<192;++row) if(metadata.constant_mask[row/64]&(std::uint64_t(1)<<(row%64))) {
+        if(launch || row<metadata.constant_first || row>=metadata.constant_first+metadata.constant_count)
+            throw std::runtime_error("Invalid packed shader constant row");
+        prepared.upload_rows[prepared.packed_count++]=static_cast<std::uint8_t>(row);
+    }
+    if(prepared.packed_count) prepared.upload_count=prepared.packed_count;
     const auto screen_programs=screen_vertex_programs();
     prepared.screen_space=!launch && std::ranges::find(screen_programs,key)!=screen_programs.end();
     if(prepared.screen_space) {prepared.constant_count=prepared.constant_count?std::max(2U,prepared.constant_first+prepared.constant_count):2;prepared.constant_first=0;}
@@ -2139,7 +2150,7 @@ void Renderer::draw_streams(std::span<const StreamDraw> draws) {
                 staged.program_id=program_id;
                 staged.factor_changed=last==first || std::memcmp(&staged.factors,&r.stream_uploads[last-1].factors,sizeof(Constants));
                 staged.program_changed=last==first || staged.program_id!=r.stream_uploads[last-1].program_id ||
-                    !same_uniforms(staged.uniforms,r.stream_uploads[last-1].uniforms,program.constant_first,program.constant_count);
+                    !same_uniforms(staged.uniforms,r.stream_uploads[last-1].uniforms,program.constant_first,program.constant_count,program.rows());
                 if((staged.factor_changed && factor_size>Impl::constant_capacity-factor_bytes) ||
                    (staged.program_changed && program_size>Impl::constant_capacity-program_bytes)) break;
                 staged.factor_offset=staged.factor_changed?factor_bytes:r.stream_uploads[last-1].factor_offset;
@@ -2175,7 +2186,7 @@ void Renderer::draw_streams(std::span<const StreamDraw> draws) {
                     if(staged.program_changed) {
                         const auto& program=r.programs[staged.program_id-1];
                         const auto size=uniform_bytes(program.upload_count),capacity=uniform_capacity(program.upload_count);
-                        write_uniforms(programs+staged.program_offset,staged.uniforms,program.upload_first,program.upload_count);
+                        write_uniforms(programs+staged.program_offset,staged.uniforms,program.upload_first,program.upload_count,program.rows());
                         if(capacity>size) std::memset(programs+staged.program_offset+size,0,capacity-size);
                     }
                     staged.program_offset+=program_base;
@@ -2292,7 +2303,7 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
     const auto upload = [&](ID3D11Buffer* buffer,const void* data,std::size_t size,UINT& cursor,UINT& offset,const Program* packed=nullptr) {
         PerfScope timing(r.profile,PerfPhase::buffer_upload);
         const auto write=[&](void* output) {
-            if(packed) write_uniforms(output,*static_cast<const ProgramUniforms*>(data),packed->upload_first,packed->upload_count);
+            if(packed) write_uniforms(output,*static_cast<const ProgramUniforms*>(data),packed->upload_first,packed->upload_count,packed->rows());
             else std::memcpy(output,data,size);
         };
         if(r.constant_context) {
@@ -2378,7 +2389,7 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
             values=&fixed_values;
         }
         const auto id=static_cast<std::uint32_t>(program-r.programs.data())+1;
-        if(!r.program_valid || r.last_program_id!=id || !same_uniforms(r.last_program,*values,program->constant_first,program->constant_count)) {
+        if(!r.program_valid || r.last_program_id!=id || !same_uniforms(r.last_program,*values,program->constant_first,program->constant_count,program->rows())) {
             upload(r.program_constants.Get(),values,uniform_bytes(program->upload_count),r.program_cursor,r.program_offset,program);r.last_program=*values;r.program_valid=true;r.last_program_id=id;
         }
     }

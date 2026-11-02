@@ -923,3 +923,83 @@ using the platform's italic font. Windows uses Segoe UI Italic or Arial Italic;
 no font is redistributed. Release and the hidden-window diagnostics pass on
 the RTX 5060 Ti, including regular and minimum-size settings layouts.
 Evidence: build/checks/settings-followup-20261027. No game was booted.
+
+Vehicle mesh detail at enhanced draw distance (2026-11-01)
+-------------------------------------------------------
+User reported traffic and loose wheels/bumpers/debris changing to more complex
+shapes while enhanced draw distance was enabled. They clarified that the issue
+is mesh LOD, not disappearance or texture mip quality. Enhanced mode is expected
+to retain detailed meshes rather than postpone the same visible shape switches.
+
+Verified original XBE SHA256 B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+Bounded native analyses are private under build/checks/vehicle-distance-20261101;
+the largest requested function budget was 1600 instructions. Generated native
+source references were searched with streaming native text tools. No whole-file
+binary decoding, Python, computer use, subagents or gameplay automation was used.
+
+The prior 9B3DC edit multiplied linear thresholds; 9BFFC/9C01E still selected
+levels 0/1/2. Enhanced 9C09A then deliberately blended adjacent original levels
+over the last 20% of each range, so simpler geometry remained eligible. Original
+9A330 selects its body records through model+LOD*4+14, and its movable-part records
+through model+LOD*4+2C. Thus parts use their parent vehicle's level even after
+separation. Changing only their distance fades cannot fix a mesh selection.
+
+Enhanced 9C09A now passes detail level 0 once to original 9A330 for every traffic
+model. Remove the lower-level crossfade and its duplicate-wheel suppression flag
+and branch. Keep original transforms, damage, per-part state, body/material alpha
+and close-range shader-effect input. The deferred wheel queue still receives
+body opacity as coverage. Existing range fades, visibility, simulation and wheel
+queue bounds are retained. Original (1x) bypasses the helper and retains its
+original three-level selection. The UI help and BUILDING.txt describe this policy.
+
+The existing native storage/service diagnostic now exercises actual original
+9A330 body and movable-part table selection. It constructs distinct records for
+all 26 traffic model slots and all three original levels. At 1x it verifies each
+original choice; at 2x/4x it verifies level 0 for both records, including physical
+and nonphysical vehicle cases. The breakpoint is the second iteration of original
+9A3D0, after body and first part color preparation and before GPU setup. This
+checks real guest pointer selection without booting, inventing callbacks, or
+requiring a scene simulation. There are 468 model/level/mode/physical cases;
+opacity and shader-effect arguments are checked independently. Validation pending.
+
+Validation completed: Release build passed. All 52 CPU groups passed (26026
+integer, 3988 memory, 6744 floating and 109 control cases). The existing native
+storage/service diagnostic passed 4415 checks, including all 468 vehicle-detail
+cases. Original body and first movable-part records selected the expected LOD
+for every model slot, incoming level and physical/nonphysical case; material
+opacity and close-range effect arguments were preserved. No game boot, gameplay
+automation or FPS benchmark was run. Crash-mode appearance remains for the user's
+manual check after restarting with 2x/4x selected. Personal settings, six save
+files and the original XBE hash are unchanged; no owned workers remain.
+
+Canonical b2.exe SHA256:
+09F196C97587BBA51A16425162C537EDA06161C3CFFA0C63888F26BF51CDA083.
+Private validation.json, original-byte analyses and source snapshots are in
+build/checks/vehicle-distance-20261101. Nothing was staged or published.
+
+Loose-part ground-shadow distance (2026-11-02)
+---------------------------------------------
+The loose-part mesh fix did not affect its separate ground-shadow renderer.
+Original 78C10 constructs an extra far clipping plane from the camera's near
+plane, subtracting the float 50 at 2BF250 (78C93), negating it and storing the
+result at local +BC (78D32). Original 78B00 tests that plane before the ground
+lookup. Thus increasing the main camera's range leaves these shadows at 50.
+The supported XBE SHA256 remains B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+
+At verified 78D39, enhanced distance rebuilds only that local far-plane offset
+as original_range * draw_distance - original_near_plane_offset. This gives 100
+units at 2x and 200 at 4x, retaining the original 50 at 1x. The camera's near
+plane, side planes, shared constant, shadow shape, ground projection and physics
+remain original. Preserve MXCSR around the extra calculation. No additional
+world cache, render pass, allocation or guest callback is introduced.
+
+The existing CPU diagnostic executes original 78C10 through its actual clipping
+tests, stopping at original 8F240 only for accepted shadows. All 72 cases pass:
+three camera origins, all three distance settings, and positions before/after
+the near and each far boundary. Release build and all 52 CPU groups pass, now
+including 4,060 memory/presentation cases. Storage passes all 4,433 checks,
+including the preceding 468 vehicle body/movable-part LOD cases. The largest
+original routine analysis budget was 1,600 instructions; no game boot, gameplay
+automation, computer use or performance benchmark was used. Visual confirmation
+remains for the user after restarting the rebuilt game. Evidence and preservation
+hashes are private under build/checks/part-shadow-distance-20261102.

@@ -236,7 +236,8 @@ VertexTranslation translate_vertex_program(const VertexProgram& program,bool lau
     if(program.start>=program.tokens.size()) throw std::runtime_error("NV2A vertex start exceeds 136 slots");
     VertexTranslation result;
     std::string body="float4 r[12]; float4 o[13]; int a0=0;\n[unroll] for(int i=0;i<12;++i) r[i]=0;\n[unroll] for(int i=0;i<13;++i) o[i]=float4(0,0,0,1);\n";
-    bool final=false;
+    bool final=false,relative_constants=false;
+    std::array<bool,192> used_constants{};
     for(unsigned slot=program.start;slot<program.tokens.size();++slot) {
         const auto& t=program.tokens[slot];
         const auto mac=bits(t[1],21,4),ilu=bits(t[1],25,3),input=bits(t[1],9,4),constant=bits(t[1],13,8);
@@ -253,8 +254,9 @@ VertexTranslation translate_vertex_program(const VertexProgram& program,bool lau
             } else if(type==2) {result.input_mask|=1U<<input;value=std::format("v[{}]",input);}
             else if(type==3) {
                 if(!relative && constant>=192) throw std::runtime_error(std::format("NV2A slot {} reads invalid constant {}",slot,constant));
-                if(relative) {result.constant_first=0;result.constant_count=192;}
+                if(relative) {result.constant_first=0;result.constant_count=192;relative_constants=true;}
                 else {
+                    used_constants[constant]=true;
                     const auto end=result.constant_count?std::max(result.constant_first+result.constant_count,constant+1):constant+1;
                     result.constant_first=std::min(result.constant_first,constant);result.constant_count=end-result.constant_first;
                 }
@@ -305,7 +307,16 @@ VertexTranslation translate_vertex_program(const VertexProgram& program,bool lau
         result.source+="#define B2_CONSTANT_FIRST 0\nRWStructuredBuffer<float4> k:register(u0); StructuredBuffer<float4> inputs:register(t0);\n[numthreads(1,1,1)] void main(uint3 id:SV_DispatchThreadID) { float4 v[16]; [unroll] for(int i=0;i<16;++i) v[i]=inputs[i];\n"+body+"}\n";
     } else {
         if((result.output_masks[0]&14)!=14) throw std::runtime_error("NV2A vertex program does not write complete position XYZ");
-        result.source=draw_source(body,result.constant_first,result.constant_count);
+        const auto used=static_cast<unsigned>(std::ranges::count(used_constants,true));
+        if(!relative_constants && used<result.constant_count) {
+            unsigned packed=0;
+            for(unsigned row=0;row<used_constants.size();++row) if(used_constants[row]) {
+                result.constant_mask[row/64]|=std::uint64_t(1)<<(row%64);
+                const auto original=std::format("k[{}-B2_CONSTANT_FIRST]",row),replacement=std::format("k[{}]",packed++);
+                for(std::size_t at=0;(at=body.find(original,at))!=std::string::npos;at+=replacement.size()) body.replace(at,original.size(),replacement);
+            }
+            result.source=draw_source(body,0,used);
+        } else result.source=draw_source(body,result.constant_first,result.constant_count);
     }
     return result;
 }

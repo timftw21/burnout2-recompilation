@@ -428,6 +428,12 @@ struct Gpu::Impl {
         if(!capture_data(name,binary.bytes)) return;
         capture_trace<<std::format("{{\"type\":\"native_shader\",\"kind\":{},\"constant_first\":{},\"constant_count\":{},\"input_mask\":{},\"bytes\":{},\"data\":{}",
             unsigned(kind),binary.constant_first,binary.constant_count,binary.input_mask,binary.bytes.size(),json(name));
+        capture_trace<<",\"constant_rows\":[";bool comma=false;
+        for(unsigned row=0;row<192;++row) if(binary.constant_mask[row/64]&(std::uint64_t(1)<<(row%64))) {
+            if(comma) capture_trace<<',';
+            capture_trace<<row;comma=true;
+        }
+        capture_trace<<']';
         if(vertex) capture_trace<<std::format(",\"program_start\":{},\"program\":{}",vertex->start,json(hex_bytes(std::as_bytes(std::span(vertex->tokens)))));
         capture_trace<<"}\n";
     }
@@ -723,9 +729,12 @@ void Gpu::submit(std::uint32_t begin,std::uint32_t end,bool flush) {
                 if(elements>32768-g.indices.size()) throw std::runtime_error("NV097 inline draw exceeds its bound");
                 const auto previous=g.indices.size();g.indices.resize(previous+elements);
                 if(first==0x1808) std::memcpy(g.indices.data()+previous,commands+(begin-start),count*4);
-                else for(unsigned i=0;i<count;++i) {
-                    const auto pair=word_at(begin+i*4);
-                    g.indices[previous+i*2]=pair&0xFFFF;g.indices[previous+i*2+1]=pair>>16;
+                else {
+                    auto* output=g.indices.data()+previous;
+                    for(unsigned i=0;i<count;++i) {
+                        const auto pair=word_at(begin+i*4);
+                        output[i*2]=pair&0xFFFF;output[i*2+1]=pair>>16;
+                    }
                 }
                 g.registers[0][first/4]=word_at(begin+(count-1)*4);
                 g.statistics.methods+=count;begin+=count*4;continue;

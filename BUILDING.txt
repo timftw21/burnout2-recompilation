@@ -787,8 +787,10 @@ The target budget includes multisample colour/depth and resolved images. See
 research/enhancements.txt for evidence and native validation.
 Draw distance replaces the separate LOD and render-distance overrides. Choose
 Original (1x), 2x or 4x in Enhancements; Original is the default. Camera far
-clipping, scenery fade, traffic opacity and model-detail thresholds scale
-together. Additional track sections are drawn beyond the original visibility
+clipping, scenery fade and traffic opacity scale together. Enhanced modes keep
+traffic bodies and movable/loose parts at full mesh detail instead of blending
+between lower-detail models. Loose-part ground shadows extend their original
+cutoff by the same multiplier. Additional track sections are drawn beyond the original visibility
 list, using original material records compatible with the active distant models.
 Viewing directions are derived from the original mesh visibility records to
 avoid exposing unfinished terrain backs. Scenery already represented by an
@@ -799,7 +801,8 @@ prepare the extra visibility lists during loading; Original does neither. Each s
 camera retains its original range across camera switches, so scaling never
 compounds. Traffic bodies and wheels extend together to 500 units at 2x and
 750 units at 4x, bounded by the original traffic pool. Their fade shares the
-same range. Traffic spawning, physics and the original three detail levels remain.
+same range. Traffic spawning and physics remain original. Original (1x) retains
+the game's three mesh-detail levels.
 Changes apply during play. Enabling extra scenery may briefly pause to prepare
 the current track; steady rendering adds no file reads or allocations.
 Returning to 1x restores the original camera distance. Existing enabled override settings migrate to 2x; an explicit
@@ -1030,6 +1033,16 @@ stop. Race modes and scene audio parity remain unverified.
 & .\build\windows\Release\b2.exe --check-window build/checks/settings-warp.png --warp
 & .\build\windows\Release\b2.exe --run-game data/local/default.xbe --disc 'Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso' --seconds 20 --frame build/checks/live.png
 
+General > Discord Rich Presence shares whether the game is running or settings
+are open, together with elapsed time. It is off by default and saves automatically.
+The Discord desktop app must be running with activity sharing allowed. No account
+linking, bot or extra DLL is needed. Turning the setting off or closing the game
+clears its activity. Connections retry automatically if Discord starts later.
+Local IPC runs on a background worker; changed activity is sent at most once per
+15 seconds. Window diagnostics and scripted runs never publish presence.
+The project's public application ID is built in; developers can override it with
+-DB2_DISCORD_APPLICATION_ID=ID when configuring CMake.
+
 --run-game also accepts --controls SCRIPT for explicit autonomous diagnostics.
 Each text line contains milliseconds, an SDL button/axis name and its value:
 0 start 1
@@ -1074,9 +1087,10 @@ cmake --preset windows -DB2_PROFILE_GENERATE=ON -DB2_PROFILE_USE=
 cmake --build --preset release
 
 Set LLVM_PROFILE_FILE to an absolute private filename containing %p before
-launching the game. Use the normal timed controller/performance script; F9 (or
-its performance control) resets compiler counters when recording starts, so
-startup/menu navigation is excluded. Exit normally within 30 seconds of that
+launching the game. Use a timed control script with benchmark 1/0 to collect
+normal-play branches without the detailed recorder. Starting either a frame
+benchmark or F9 performance recording resets compiler counters, excluding
+startup/menu navigation. Exit normally within 30 seconds of that
 start. Compiler data is written on exit. This training executable is not an
 FPS acceptance result. Clear the environment variable after training.
 

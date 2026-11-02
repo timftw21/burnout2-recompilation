@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.2)
-project(burnout2 VERSION 1.12.0 LANGUAGES C CXX)
+project(burnout2 VERSION 1.13.0 LANGUAGES C CXX)
 
 if((NOT WIN32 AND NOT APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux") OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR
    (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$" AND NOT (APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")))
@@ -229,7 +229,12 @@ if(B2_XBE)
         DEPENDS b2-tool "${B2_EFFECTS}"
         VERBATIM)
     target_sources(b2-cpu PRIVATE src/dsp.cpp src/spatial.cpp "${native_effects}")
-    add_library(b2-app STATIC src/app.cpp)
+    set(B2_DISCORD_APPLICATION_ID "1566600235583807578" CACHE STRING "Discord Rich Presence application ID")
+    if(B2_DISCORD_APPLICATION_ID AND NOT B2_DISCORD_APPLICATION_ID MATCHES "^[0-9]+$")
+        message(FATAL_ERROR "B2_DISCORD_APPLICATION_ID must contain decimal digits only.")
+    endif()
+    add_library(b2-app STATIC src/app.cpp src/discord.cpp)
+    target_compile_definitions(b2-app PRIVATE B2_DISCORD_APPLICATION_ID="${B2_DISCORD_APPLICATION_ID}")
     target_link_libraries(b2-app PRIVATE b2-core b2-graphics b2-cpu b2-ui SDL3::SDL3-static)
     if(WIN32)
         target_link_libraries(b2-app PRIVATE comdlg32)

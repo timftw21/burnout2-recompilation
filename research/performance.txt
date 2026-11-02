@@ -1809,3 +1809,265 @@ Raw benchmark: build/captures/benchmark-77301942426/benchmark.json.
 Pre/post captures: build/captures/frame-42254566464 and frame-78219613421.
 Isolated settings, saves, scripts and results are under
 build/checks/linux-gameplay-20261021-164251.
+
+Muted offline Airport optimization - 2026-11-01
+---------------------------------------------
+User renewed benchmark automation permission and prohibited computer use. All
+runs used local single-player Airport Terminal 3, muted master output, original
+audio processing retained, 360 Hz selected, fullscreen, 1x native, widescreen,
+interpolation/V-sync/AA/AF/AO/HDR off and original draw distance. No computer use
+or network transport was used. Settings and six personal save/storage files
+were hashed before/after and are unchanged. Each accepted recording lasted ten
+seconds; menu/loading setup preceded recording. Private save copies were reset
+per run. Track fields at 003525E0 remained 2; runtime shader compilation was 0.
+Early introduction-only recordings were excluded from the race comparison.
+
+Hardware: AMD Ryzen 5 5600X / NVIDIA GeForce RTX 5060 Ti, Windows D3D11,
+counter-free LLVM Release using the existing primary-direct-airport.profdata,
+AVX2 off. Two low-overhead recordings per version/scene were pooled by elapsed
+source-frame time. Driving held the accelerator from script second 36; both
+scenes recorded seconds 40..50. Traffic varies between launches, so these are
+short scene measurements, not a deterministic whole-track FPS guarantee.
+
+                              Before       Final
+Stationary source FPS         267.037810    280.242037  (+4.94%)
+Stationary median ms             3.6193       3.4455
+Stationary p99 / max ms          5.0543/6.0664 4.8080/5.7479
+Stationary source intervals       5340         5603
+Driving source FPS            267.046385    276.819622  (+3.66%)
+Driving median ms                3.5961       3.4562
+Driving p99 / max ms             5.1794/8.7183 4.8959/6.6195
+Driving source intervals          5339         5535
+No recorder drops, settings changes or intervals above 20 ms in these runs.
+The 360 FPS / 2.778 ms sustained target remains unmet.
+
+The main constraint is CPU work, not GPU execution. Separate ten-second F9
+profiles measured guest code at 1.907 -> 1.776 ms/source record, GPU command
+processing at 1.241 -> 1.260 ms, and median GPU work at 1.528 -> 1.537 ms.
+The original shader-copy routine 219750 fell from 228.266 to 183.510 ns/call
+(19.6%); 90A50 fell from 752.036 to 594.696 ns/call (20.9%). Vertex packet
+writer 21F9C0 stayed effectively unchanged, 152.942 -> 153.393 ns/call.
+These instrumented wall costs include recorder/scheduling effects and are not
+the low-overhead FPS result. Recorder limit counters were zero. Working-set
+peaks during these profiles were 223674368 -> 225673216 bytes; private committed
+memory was 203935744 -> 204050432 bytes. Loading peaks were not measured.
+
+Root cause: original MMX streaming stores bypass the host cache, immediately
+before the host consumes the command/vertex bytes. Validated bulk RAM helpers
+now emit cached MOVQ stores. Memory order, MMX state and original SFENCEs remain;
+alignment or range failures retain individual original instructions. A build-time
+check avoids the bulk path when store alignments conflict. There is no runtime
+decoder, new platform binding or address-specific replacement. Native bounded
+read of original 219898..2198D7 confirms MOVQ/MOVNTQ bytes against the supported
+B5207C40... target; shader-copy-bytes.json retains the exact 64-byte evidence.
+
+Render-target, texture-size and vertex-descriptor caches were tried together.
+Their small stationary gain was not reliable across driving runs; all gpu.cpp
+changes were removed. The accepted change is only the generic MMX store policy.
+
+Final existing diagnostics pass: 52 CPU groups, 26026 integer comparisons,
+3988 memory cases, 6744 floating cases, 109 control cases; 54 spatial cases and
+155 original audio bindings; 2074 storage cases including graphics resources.
+The graphics experiment also passed 273 hardware render cases with zero D3D11
+warnings before it was removed. No tests or dependencies were added. All owned
+game, diagnostic, compiler and linker workers exited.
+
+Baseline executable SHA256:
+2338DE23CECFDE2C5D25D50337D342EF647C74441AE56430FCE07E6DBDB9F4DC
+Final canonical Release executable SHA256:
+369BE09762834CECFBF97F96113C52474BEBAB5085C799136C5F10D326DCD5F5
+Private reports, controller scripts, settings/save copies and binary snapshots:
+build/checks/airport-performance-20261101. comparison.json, profile-comparison.json
+and validation.json retain measurements, checks, personal-data hashes and the
+zero-survivor audit. No release was published.
+
+Continued 360 Hz goal - 2026-11-01
+--------------------------------
+The user authorized continued autonomous optimization while away. The goal is
+ACTIVE and UNMET. Muted/offline single-player, no computer use, 360 Hz selected,
+fullscreen/1x/widescreen, interpolation and V-sync off remain the conditions.
+Accepted recordings are ten seconds, after setup; saves reset from private
+copies. Hardware remains Ryzen 5 5600X / RTX 5060 Ti. No subagents were used.
+
+Native sampling of the accepted copy-only executable collected 5194 samples
+with zero failures. Local PDB lookups and bounded native disassembly identified
+two repeated index loops: scalar index-range validation at RVA 0132AF04 and
+packed-index expansion at 012A84E4..012A8505. The latter reloaded the vector's
+data pointer for each store. Holding that pointer once permits compiler loop
+optimization; validating the maximum index uses the existing standard-library
+vectorized reduction. Bounds, draw order and index values remain unchanged.
+No persistent graphics cache or new test was added.
+
+The old LLVM profile also discarded substantial renderer counts after source
+changes: prepare (355256142), draw (268710740), stream_uniforms (677318003),
+among others. Retraining removed every hot-renderer mismatch. A single unused
+tool-only shader function still had a zero-count mismatch. Training binaries
+were never used as FPS acceptance results.
+
+Two fresh profile sets were compared. The first used normal F9 race recordings.
+The second used mostly ordinary play, avoiding the detailed recorder's active
+branches. Its retained instrumented executable predates benchmark counter reset,
+so F9 pulses at script 38.00..38.08 s reset counters, then disabled recording
+before the frame benchmark at 40..50 s. Pulse captures prove 71.934/74.871 ms
+duration and nine frame records each. Exit at 51 s is within 30 s of reset.
+The new start_benchmark implementation also resets compiler counters in a
+training build; BUILDING.txt now recommends that lighter workflow. The next
+instrumented build should exercise that new trigger directly.
+
+Pooled frame-only measurements (two recordings per row except copy baseline):
+                                   FPS       median ms   p99 ms   maximum ms
+Copy-only recent baseline         277.975907   3.4534     4.9486    7.0977
+Index loops / original profile    286.588386   3.3606     4.6829    5.8039
+Fresh F9 profile, stationary      302.597476   3.1836     4.4116    5.4963
+Fresh F9 profile, driving         297.846566   3.2057     4.6051    6.3938
+Mostly normal profile, stationary 305.191318   3.1561     4.3513    5.0657
+Mostly normal profile, driving    300.535029   3.1874     4.5003    5.4038
+All selected runs have no dropped frames, setting changes or >20 ms intervals.
+Traffic varies between launches. The normal-profile improvement over F9 training
+is small; its recording branch behavior also better matches ordinary play.
+The sustained 360 FPS / 2.778 ms goal remains unmet. No broader FPS claim is made.
+
+A separate final F9 diagnostic has 2796 source records. Per-record main-thread
+wall costs are guest code 1.660 ms, GPU commands 1.100, buffer uploads 0.326,
+draw submission 0.229 and resource preparation 0.119. Measured GPU median is
+1.403744 ms, p99 1.623136. Main-thread utilization is 95.985% of one core.
+Guest indexed submission 219750 costs 177.397 ns/call (3283926 calls);
+21F9C0 costs 149.622 ns/call. These recorded costs are not frame-only FPS.
+Recorder limit counters are zero. Peak working set is 232583168 bytes and
+private committed memory 206815232 bytes during recording; loading peaks are
+not measured. The remaining constraint is CPU execution/submission.
+
+Original-byte classification correction: 219750 emits BEGIN_END (17FC) and
+repeated packed ARRAY_ELEMENT16 (1800) commands. It is an indexed-draw packet
+writer. Earlier references to this address as shader/constant copying were
+incorrect labels. Bounded original bytes are retained in original-index-loop.json
+and the earlier 192-instruction SDK analysis, both tied to the B5207C40 target.
+
+Existing final checks pass: 52 CPU groups / 26026 integer / 3988 memory /
+6744 floating / 109 control cases; 54 spatial and 155 audio bindings; 2074
+storage cases including graphics resources; 273 hardware rendering cases with
+zero D3D11 warnings. All 292 PNGs, including nested capture images, match their
+existing references byte-for-byte, with no missing references. Personal settings,
+six save/storage files and the original executable hash are unchanged. All owned
+workers exited. No tests, dependencies or release assets were added.
+
+Canonical build: profiling counters OFF, AVX2 OFF,
+build/checks/airport-360-followup-20261101/current-light-airport.profdata.
+b2.exe SHA256: 67D427AF0266D5D7DD89C9C8D0967FDE62B5E63629C9BDEA566FDCE4703D9295.
+Comparison binaries, original bytes, profiles, sampling results, scripts,
+comparison.json, final-profile-summary.json and validation.json are private under
+build/checks/airport-360-followup-20261101. Nothing was staged or published.
+
+Next evidence-driven candidates: inspect the indexed writer's remaining MMX
+helper overhead and non-temporal prefetches, plus buffer-upload reuse. The old
+NOP/pointer-grouping trial predates the retained cached-store policy, which now
+removes the streaming-store cost that previously obscured helper overhead.
+Any new trial must retain alignment/range failure behavior, original MMX state,
+and the existing checked instruction path. A direct SDK draw binding requires
+separate verification of ABI, device/push-buffer side effects, buffer ownership
+and CPU-versus-platform coverage; do not bypass those requirements for FPS.
+
+2026-11-01 follow-up: bounded MMX/upload experiments
+-------------------------------------------------
+Private evidence: build/checks/airport-mmx-followup-20261101. All game
+recordings remain ten seconds, muted, offline, 360 Hz selected, native 1x,
+widescreen, interpolation/V-sync/enhancements off, on Ryzen 5 5600X / RTX 5060 Ti.
+Computer use and subagents were not used.
+
+MMX helper merging across two original one-byte NOPs plus cached native range
+pointers measured 303.208949 FPS stationary, 296.896052 driving; its adjacent
+accepted baseline measured 303.946137 stationary. This trial also invalidated
+462195812 old profile counts for guest 219750. Pointer caching alone retained
+the profile match but measured 302.474602 stationary / 300.310037 driving.
+Neither established an improvement. Both were removed; the previously accepted
+cached MOVQ stores, checks and fallback remain. CPU/spatial diagnostics passed.
+
+A 64-slot within-batch vertex-upload reuse cache passed all 273 hardware
+rendering checks with zero D3D warnings but measured 301.745773 stationary /
+300.162550 driving, versus 305.590384 adjacent baseline stationary. Its detailed
+recording spent 914.9618 ms uploading across 2783 source records (0.329 ms each),
+with 322994 buffer maps and 20923072700 uploaded bytes. No useful reduction was
+shown, so the experiment was removed.
+
+A native helper linked the existing vertex translator and examined only the
+18 static shader records. Fifteen game shaders read constants from sparse rows:
+most span 58..190 (133 rows), but use only 7..18 rows. Rows 58/59, 96..111 and
+189/190 account for the sparse references. Three SDK screen shaders use only
+rows 0/1. This finding is distinct from the earlier contiguous-range packing;
+packing gaps is being evaluated with original CPU snapshots preserved and
+relative-address/launch shaders kept on their original full layout.
+
+2026-11-01 accepted sparse shader constant uploads
+------------------------------------------------
+Only rows actually referenced by a static, non-relative draw program are packed
+into its GPU constant buffer. The native translator remaps HLSL row references
+at build time and emits a three-word row mask in the static shader metadata.
+The renderer gathers those rows and compares only them before reusing an upload.
+Raw CPU constant ranges remain intact. Fixed transforms, relative addressing and
+transform launches retain their previous layouts. Opt-in captures include the
+packed row order. No runtime shader compilation or token decoding was introduced.
+
+The existing stream-upload-order diagnostic was extended, without adding another
+case, to combine separated rows 0 and 96 and verify both direct and queued draws.
+This specifically checks the changed constant-buffer layout and its reuse rules.
+
+Before retraining, a stationary recording measured 309.941988 FPS versus its
+adjacent baseline 300.551090; driving measured 304.299871. Its detailed recording
+used 209279 buffer maps across 2830 source records, versus 322994 across 2783 in
+the earlier contiguous-layout diagnostic (approximately 36% fewer maps per frame).
+Uploaded bytes also fell, from 20923072700/2783 to 18872481664/2830 per recording.
+
+A new instrumented build exercised benchmark counter reset directly. Two normal
+benchmark training runs were merged into sparse-airport.profdata, then profiling
+counters were disabled for acceptance. No hot renderer profile mismatch remains;
+one unused tool-only shader_binary function discarded zero counts. The generated
+shader bank is identical before/after retraining, SHA256:
+2D8EE230F48B100CFCBC0C23839217377F68A01B3B8DF0C182FAFDE2248467E4.
+
+Counter-free pooled measurements, including every fresh-profile acceptance run:
+                                  FPS       median ms   p99 ms   maximum ms
+Adjacent baseline stationary     303.545388   3.1721     4.3350    5.1676
+Packed/fresh profile stationary  306.289129   3.1501     4.3319    5.6279
+Adjacent baseline driving        299.187704   3.1796     4.8132    9.3745
+Packed/fresh profile driving     302.784783   3.1519     4.4510    5.8240
+Stationary uses two baseline recordings and four candidate recordings (12245
+candidate intervals). Driving uses one adjacent baseline and two candidate
+recordings (6052 candidate intervals). Each recording is ten seconds. Candidate
+stationary runs range from 295.481910 to 310.976685 FPS. The initial slow run is
+retained; no unverified cause is assigned. This is a modest, variable gain and
+does not establish sustained 360 FPS. All runs have zero dropped frames and no
+setting changes. Hardware/settings/muted/offline conditions remain as above.
+
+The separate final F9 recording has 2755 source records: guest CPU code 1.717 ms,
+GPU command handling 1.089 ms, buffer uploads 0.310 ms, draw submission 0.245 ms,
+resource preparation 0.123 ms per source record. GPU median 1.375744 ms, p99
+1.584288 ms; main-thread use 95.956% of one core. The CPU remains the limit.
+Final counters: 203538 maps, 18366962908 uploaded bytes, 3344846 draws; no runtime
+shader compiles, cache misses or texture uploads. Recording peak working set
+230461440 bytes, private memory 203440128 bytes. Loading peaks were not measured.
+Recorder limits and >20 ms frame counts are zero. F9 timings are not FPS results.
+
+Final native checks pass: 52 CPU groups / 26026 integer / 3988 memory / 6744
+floating / 109 control cases; 54 spatial and 155 audio bindings; 2074 storage
+cases including graphics; 273 hardware rendering cases, zero warnings. All 292
+render PNGs match the existing reference byte-for-byte. The software renderer
+also passed 273 cases with zero warnings before retraining. The final audit
+confirmed personal settings, six save/storage files and the supported XBE hash
+unchanged, with no surviving owned workers. Its first process audit encountered
+a null StartTime on an inaccessible/exited process; the auditor now guards that
+value, and the audit alone was rerun using the completed diagnostic results.
+
+Canonical build: profile generation OFF, AVX2 OFF, profile use
+build/checks/airport-mmx-followup-20261101/sparse-airport.profdata.
+b2.exe SHA256: 63027C0F46FD6EDAA9EECED174242BBB6670BCD88D812E07A8A6662E5F4B50EC.
+Private evidence includes sparse-comparison.json, sparse-validation.json,
+sparse-fresh-profile/result.json, retained comparison executables and profiles.
+Nothing was staged, committed or published. Computer use and subagents were not
+used. The user returned and requested stopping for now; no further benchmarks
+were started.
+
+Remaining evidence-driven work: CPU execution and GPU command processing still
+dominate. Inspect sparse CPU-side constant copies and the sampled five-word
+texture-map comparisons before making further changes. Preserve CPU consumers,
+resource invalidation and launch/relative-address behavior; do not infer a direct
+SDK binding from a packet writer without verifying its ABI and side effects.

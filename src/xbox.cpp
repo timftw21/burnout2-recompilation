@@ -504,8 +504,8 @@ struct Xbox::State {
         if(committed && clear) std::memset(memory.access(cursor,size),0,size);
         return cursor;
     }
-    auto allocation(std::uint32_t address) {
-        address&=0x0FFFFFFF;
+    auto allocation(std::uint32_t address,bool physical=true) {
+        if(physical) address&=0x0FFFFFFF;
         auto found=allocations.upper_bound(address);
         if(found==allocations.begin()) return allocations.end();
         --found;
@@ -2357,46 +2357,24 @@ struct Xbox::State {
         const auto manager=cpu.registers[ecx],stack=cpu.registers[esp];
         std::array<std::uint32_t,4> arguments;
         for(unsigned i=0;i<arguments.size();++i) arguments[i]=memory.load<std::uint32_t>(stack+i*4);
-        const auto vehicle=arguments[0],lod=arguments[1];
-        if(lod>2) throw NativeBoundary(0x9C09A,"invalid traffic detail level");
-        const bool shared_wheels=lod==0 || memory.load<std::uint32_t>(vehicle+0x1A0)!=0;
-        std::uint64_t coverage=UINT64_MAX;
-        if(lod<2 && !memory.load<std::uint32_t>(vehicle+0x1E8)) {
-            // 9BFF3 has already measured this camera-relative vector. Fade
-            // inside the current LOD's range.
-            float squared=0;
-            for(unsigned i=0;i<3;++i) {
-                const auto delta=std::bit_cast<float>(memory.load<std::uint32_t>(stack+0x50+i*4));squared+=delta*delta;
-            }
-            const auto end=std::bit_cast<float>(memory.load<std::uint32_t>(manager+0x2E280+lod*4));
-            const auto start=end*.8f;
-            if(end>0 && squared>start*start) {
-                const auto count=unsigned(std::clamp((end-std::sqrt(squared))/(end-start)*64.f,0.f,64.f));
-                coverage=count==64?UINT64_MAX:(1ULL<<count)-1;
-            }
-        }
+        if(arguments[1]>2) throw NativeBoundary(0x9C09A,"invalid traffic detail level");
+        // 9A330 uses the same level for the body and movable-part mesh arrays.
+        // Enhanced distance retains their detailed geometry, including parts
+        // that have separated from a distant parent vehicle in Crash mode.
+        arguments[1]=0;
         // The wheel queue has no opacity field. Carry the body's final opacity
-        // as sample coverage, including both sides of a wheel LOD transition.
+        // as sample coverage. Preserve distance/material opacity independently
+        // of the choice of geometry.
         const auto samples=unsigned(std::clamp(std::bit_cast<float>(arguments[2])*64.f,0.f,64.f));
         const auto fade=samples==64?UINT64_MAX:(1ULL<<samples)-1;
-        const auto draw=[&](std::uint64_t body_mask,std::uint64_t wheel_mask) {
-            std::array<unsigned,8> wheels;
-            for(unsigned i=0;i<wheels.size();++i) wheels[i]=memory.load<unsigned>(0x528130+i*4);
-            world_prop_mask(body_mask);world_call(cpu,0x9A330,manager,arguments);
-            for(unsigned i=0;i<wheels.size();++i) {
-                const auto count=memory.load<unsigned>(0x528130+i*4);
-                if(count>64 || wheels[i]>count) throw NativeBoundary(0x9C09A,"invalid traffic wheel queue");
-                for(unsigned j=wheels[i];j<count;++j) traffic_wheel_coverage[i*64+j]=fade&wheel_mask;
-            }
-        };
-        draw(coverage,shared_wheels?UINT64_MAX:coverage);
-        if(coverage!=UINT64_MAX) {
-            arguments[1]=lod+1;arguments[3]=0;
-            cpu.traffic_shared_wheels=shared_wheels;
-            draw(~coverage,~coverage);
-            cpu.traffic_shared_wheels=false;
+        std::array<unsigned,8> wheels;
+        for(unsigned i=0;i<wheels.size();++i) wheels[i]=memory.load<unsigned>(0x528130+i*4);
+        world_prop_mask(UINT64_MAX);world_call(cpu,0x9A330,manager,arguments);
+        for(unsigned i=0;i<wheels.size();++i) {
+            const auto count=memory.load<unsigned>(0x528130+i*4);
+            if(count>64 || wheels[i]>count) throw NativeBoundary(0x9C09A,"invalid traffic wheel queue");
+            for(unsigned j=wheels[i];j<count;++j) traffic_wheel_coverage[i*64+j]=fade;
         }
-        world_prop_mask(UINT64_MAX);
     }
     void extend_camera(Cpu& cpu) {
         // Reflection rendering uses its own visibility and sky geometry. Its
@@ -3374,7 +3352,7 @@ struct Xbox::State {
                 finish(cpu,20,invalid_parameter); return;
             }
             if(base && !(flags&MEM_RESERVE)) {
-                const auto found=allocation(base);
+                const auto found=allocation(base,false);
                 if(found==allocations.end() || base-found->first+static_cast<std::uint64_t>(size)>found->second.size) {
                     finish(cpu,20,conflicting_addresses); return;
                 }
@@ -3392,11 +3370,12 @@ struct Xbox::State {
         } else if constexpr(Ordinal==199) {
             const auto pointer=argument(cpu,0),size_pointer=argument(cpu,1),flags=argument(cpu,2);
             const auto base=memory.load<std::uint32_t>(pointer),size=memory.load<std::uint32_t>(size_pointer);
-            const auto found=allocation(base);
+            const auto found=allocation(base,false);
             if(found==allocations.end() || (flags!=MEM_RELEASE && flags!=MEM_DECOMMIT) ||
                 (flags==MEM_RELEASE && (size || base!=found->first))) { finish(cpu,12,invalid_parameter); return; }
             if(flags==MEM_RELEASE) { release_allocation(found);memory.store<std::uint32_t>(pointer,0);memory.store<std::uint32_t>(size_pointer,0); }
             else {
+                if(size>found->second.size-(base-found->first)) {finish(cpu,12,invalid_parameter);return;}
                 const auto first=(base-found->first)/page;
                 const auto last=size?align_up(base-found->first+size,page)/page:found->second.size/page;
                 if(last>found->second.pages.size()) { finish(cpu,12,invalid_parameter); return; }
@@ -3430,11 +3409,10 @@ struct Xbox::State {
         } else if constexpr(Ordinal==173) finish(cpu,4,argument(cpu,0)&0x0FFFFFFFU);
         else if constexpr(Ordinal==217) {
             const auto base=argument(cpu,0),output=argument(cpu,1);
-            const auto found=allocation(base);
+            const auto found=allocation(base,false);
             if(found==allocations.end()) { finish(cpu,8,invalid_parameter); return; }
             const auto index=(base-found->first)/page,protect=found->second.pages[index];
-            auto first=index,last=index+1;
-            while(first && found->second.pages[first-1]==protect) --first;
+            const auto first=index;auto last=index+1;
             while(last<found->second.pages.size() && found->second.pages[last]==protect) ++last;
             const std::uint32_t information[]={found->first+first*page,found->first,found->second.protect,(last-first)*page,
                 static_cast<std::uint32_t>(protect?MEM_COMMIT:MEM_RESERVE),protect,MEM_PRIVATE};
@@ -4672,7 +4650,7 @@ std::string check_storage(const std::filesystem::path& executable,const std::fil
        hex_bytes(image.data(0x000B8741,6))!="C700398EE33F")
         throw std::runtime_error("Original widescreen selection differs from its verified layout");
     std::filesystem::create_directories(output);
-    unsigned checks=0;
+    unsigned checks=0,vehicle_detail_cases=0;
     const auto require=[&](bool passed,std::string_view name) {
         if(!passed) throw std::runtime_error("Storage check failed: "+std::string(name));
         ++checks;
@@ -4732,6 +4710,29 @@ std::string check_storage(const std::filesystem::path& executable,const std::fil
             const auto timestamp=read_timestamp(cpu);state.started=epoch;
             require(counter>=3375000 && counter<6750000 && timestamp>=733333333 && timestamp<1466666666,
                 "kernel ACPI counter and original CPU timestamp retain separate clock rates");
+            const auto region=state.allocate(3*page,page,true,PAGE_READWRITE);
+            require(region!=0,"bounded virtual memory audit storage");
+            require(invoke(0xFFF00000U+217*16,{region+page+37,area+0x100})==success &&
+                memory.load<std::uint32_t>(area+0x100)==region+page && memory.load<std::uint32_t>(area+0x104)==region &&
+                memory.load<std::uint32_t>(area+0x10C)==2*page,"virtual query starts at the requested page and counts forward");
+            for(const auto alias:{0x10000000U,0x80000000U,0xF0000000U})
+                require(invoke(0xFFF00000U+217*16,{region|alias,area+0x100})==invalid_parameter,
+                    "virtual queries cannot index physical aliases as virtual pages");
+            memory.store(area+0x180,region+page);memory.store<std::uint32_t>(area+0x184,UINT32_MAX);
+            memory.store<std::uint32_t>(region+page,0x12345678);
+            require(invoke(0xFFF00000U+199*16,{area+0x180,area+0x184,MEM_DECOMMIT})==invalid_parameter &&
+                memory.load<std::uint32_t>(region+page)==0x12345678 && state.allocations.at(region).pages[1]==PAGE_READWRITE,
+                "oversized decommit fails before address arithmetic or memory writes");
+            memory.store(area+0x180,region|0x80000000U);memory.store<std::uint32_t>(area+0x184,page);
+            require(invoke(0xFFF00000U+184*16,{area+0x180,0,area+0x184,MEM_COMMIT,PAGE_READWRITE})==conflicting_addresses &&
+                invoke(0xFFF00000U+199*16,{area+0x180,area+0x184,MEM_DECOMMIT})==invalid_parameter,
+                "virtual commit and free do not fold physical addresses");
+            memory.store(area+0x180,region+page+37);memory.store<std::uint32_t>(area+0x184,100);
+            require(invoke(0xFFF00000U+199*16,{area+0x180,area+0x184,MEM_DECOMMIT})==success &&
+                memory.load<std::uint32_t>(area+0x180)==region+page && memory.load<std::uint32_t>(area+0x184)==page &&
+                !memory.load<std::uint32_t>(region+page),"valid decommit retains page rounding and zeroing");
+            memory.store(area+0x180,region);memory.store<std::uint32_t>(area+0x184,0);
+            require(invoke(0xFFF00000U+199*16,{area+0x180,area+0x184,MEM_RELEASE})==success,"release virtual audit storage");
             const bool convert=!IsThreadAFiber();
             state.scheduler=convert?ConvertThreadToFiberEx(nullptr,FIBER_FLAG_FLOAT_SWITCH):GetCurrentFiber();
             require(state.scheduler!=nullptr,"isolated native thread scheduler");
@@ -4812,6 +4813,51 @@ std::string check_storage(const std::filesystem::path& executable,const std::fil
             require(worker.cpu.ultrawide && worker.cpu.fast_load && worker.cpu.clean_hud && worker.cpu.draw_distance==4,
                 "live settings update suspended workers");
             xbox.settings({});memory.store<std::uint32_t>(view+0x6AC7C,0);
+            // Run the original body and movable-part mesh selection, stopping
+            // on its second material-preparation iteration before GPU setup.
+            const auto fixture=state.allocate(0x60000,page,true,PAGE_READWRITE);
+            require(fixture!=0,"vehicle detail fixture storage");
+            const auto manager=fixture,models=fixture+0x30000,vehicle=fixture+0x50000,meshes=fixture+0x51000;
+            memory.store(manager+0x2E11C,models);memory.store<std::uint32_t>(vehicle+0x138,1);
+            for(unsigned channel=0;channel<3;++channel) memory.store(manager+0x28AE0+channel*4,0x3E800000U+channel*0x400000U);
+            for(unsigned model=0;model<26;++model) for(unsigned lod=0;lod<3;++lod) {
+                const auto metadata=models+model*0xF00+0x40,mesh=meshes+(model*3+lod)*0x100;
+                memory.store(metadata+0x14+lod*4,mesh);memory.store<std::uint32_t>(metadata+0x20+lod*4,2);
+                memory.store(metadata+0x2C+lod*4,mesh+0x40);
+            }
+            const auto saved_cpu=cpu;
+            for(unsigned distance:{1U,2U,4U}) for(unsigned model=0;model<26;++model)
+                for(unsigned lod=0;lod<3;++lod) for(bool physical:{false,true}) {
+                    cpu=saved_cpu;cpu.draw_distance=float(distance);cpu.registers[esp]=stack;cpu.registers[ecx]=manager;
+                    memory.store(vehicle+0x190,model);memory.store<std::uint32_t>(vehicle+0x194,0);
+                    memory.store<std::uint32_t>(vehicle+0x1A0,physical?fixture+0x5A000:0);
+                    memory.store<std::uint32_t>(vehicle+0x1E8,unsigned(physical));
+                    for(unsigned level=0;level<3;++level) {
+                        const auto mesh=meshes+(model*3+level)*0x100;
+                        memory.fill_elements<std::uint32_t>(mesh,0,0x100/4,false);memory.store<std::uint8_t>(mesh+0x70,1);
+                    }
+                    const std::array arguments{vehicle,lod,0x3F200000U,0x3EC00000U};
+                    for(unsigned i=0;i<arguments.size();++i) memory.store(stack+i*4,arguments[i]);
+                    ExecutionDiagnostic stop;stop.break_address=0x9A3D0;stop.break_hit=2;cpu.diagnostic=&stop;
+                    try {
+                        if(distance==1) state.world_call(cpu,0x9A330,manager,arguments);
+                        else state.enhancement(cpu,0x9C09A);
+                        throw std::runtime_error("Vehicle detail check missed its native boundary");
+                    } catch(const NativeBoundary& boundary) {
+                        require(boundary.address==stop.break_address,"original vehicle mesh selection reaches the bounded diagnostic stop");
+                    }
+                    const auto selected=distance==1?lod:0U;
+                    for(unsigned level=0;level<3;++level) {
+                        const auto mesh=meshes+(model*3+level)*0x100,expected=level==selected?0x3E800000U:0U;
+                        require(memory.load<std::uint32_t>(mesh+0x14)==expected && memory.load<std::uint32_t>(mesh+0x54)==expected,
+                            "body and movable-part meshes keep original LOD at 1x and full detail at enhanced distances");
+                    }
+                    const auto call_stack=stack-0x1000-16;
+                    require(memory.load<std::uint32_t>(call_stack+12)==arguments[2] && memory.load<std::uint32_t>(call_stack+16)==arguments[3],
+                        "mesh detail selection preserves material opacity and the original close-range effect");
+                    ++vehicle_detail_cases;
+                }
+            cpu=saved_cpu;
         }
         const auto text=[&](std::uint32_t address,std::string_view value) {
             std::memcpy(memory.access(address,value.size()),value.data(),value.size());memory.store<std::uint8_t>(address+static_cast<std::uint32_t>(value.size()),0);
@@ -5002,7 +5048,7 @@ std::string check_storage(const std::filesystem::path& executable,const std::fil
             require(reference(span(disk,16),changed)!=expected,"changed save data fails integrity verification");
         }
     }
-    return std::format("{{\"format\":\"b2-storage-check-v1\",\"passed\":true,\"game_booted\":false,\"cases\":{},\"profile_bytes\":31748,\"reopened\":true,\"overwritten\":true,\"async_write\":true,\"runtime_decoder\":false,\"graphics_checked\":{},\"graphics_status\":{},\"storage\":{}}}",checks,graphics_checked,json(graphics_checked?"checked":"unsupported-metal-gpu"),json(utf8(std::filesystem::absolute(output).wstring())));
+    return std::format("{{\"format\":\"b2-storage-check-v1\",\"passed\":true,\"game_booted\":false,\"cases\":{},\"vehicle_detail_cases\":{},\"profile_bytes\":31748,\"reopened\":true,\"overwritten\":true,\"async_write\":true,\"runtime_decoder\":false,\"graphics_checked\":{},\"graphics_status\":{},\"storage\":{}}}",checks,vehicle_detail_cases,graphics_checked,json(graphics_checked?"checked":"unsupported-metal-gpu"),json(utf8(std::filesystem::absolute(output).wstring())));
 }
 std::string check_mods(const std::filesystem::path& executable,const std::filesystem::path& disc_path,const std::filesystem::path& output) {
     Xbe image(executable);Disc disc(disc_path);

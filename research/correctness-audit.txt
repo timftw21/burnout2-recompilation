@@ -450,3 +450,184 @@ CA7E4DD0D449DA1D4C242390CA4390C6AE0A24148623FD281C5BF59F2559B2C6.
 Rejected source and executable are retained privately under
 build/checks/thin-objects-20261015/rejected. Numerical checks did not establish
 acceptable gameplay quality. The user's current settings and saves are unchanged.
+
+Source correctness audit, 2026-11-02
+==================================
+
+Scope and evidence
+------------------
+Reviewed the 95 files in src as subsystem groups: CPU state/instructions and
+ahead-of-time generation; Xbox service/loader/scheduler/storage bindings; disc,
+assets, mods and track import; audio/DSP/spatial/custom music; GPU, vertex and
+pixel translation, rendering and presentation; input, settings, achievements,
+Discord and diagnostics. Headers are included in the corresponding translation
+units. The Windows Clang analyzer was run serially over all 42 project C++
+translation units, using the actual Release compile commands and a 50,000-node
+per-function analysis limit. This supplements manual contract and call-path
+review; it is not proof that all execution paths are correct.
+
+Private evidence: build/checks/correctness-audit-20261102. Source copies/hashes
+preserve the starting worktree, including the preceding performance, Discord
+and mesh-detail work. No game was booted or automated, no computer use occurred,
+and no personal save or preference changes were intended.
+
+Hash comparisons confirm the initial preference file, local XBE and three root
+data/user files are unchanged. The runtime save profile's last-write time is
+2026-11-02 02:05:14 UTC, before this audit began at 17:01:20 UTC; no pre-audit
+hash of that profile was captured. All diagnostics used private output folders.
+
+Extracted default.xbe afresh from the local 3,074,031,616-byte XISO using the
+native disc tool. It and data/local/default.xbe both match supported_target.json:
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+The disc's effects image and texture dictionaries are checked separately below.
+Original binary analysis was limited to individually identified small routines.
+The .text embedded SHA-1 mismatch is already recorded by supported_target.json;
+the extracted file matches the complete supported SHA-256, including that fact.
+
+Confirmed corrections
+---------------------
+1. NtQueryVirtualMemory scanned backward from the queried page and returned
+   the beginning/size of the entire matching region. The contract starts at
+   the requested page, rounds it down, and counts matching pages forward.
+   Corrected the range; AllocationBase remains the owning reservation.
+
+2. Virtual allocate/free/query used the physical allocator's alias folding.
+   A high address could locate a low allocation, then index its page metadata
+   with the original high address. Virtual operations now use an exact virtual
+   lookup; physical Mm operations retain their verified alias behavior.
+
+3. Decommit added the caller's size before checking its range. Unsigned wrap
+   could produce a reversed iterator range. Check the remaining allocation
+   capacity before adding/rounding or changing memory.
+
+4. Portable x87 FCOMI/FUCOMI changed x87 C0/C2/C3 in addition to CPU flags.
+   Intel specifies that these x87 condition bits are unaffected. Separate the
+   two comparison destinations. The private native-vs-portable probe reproduced
+   both wrong status results before the correction and passes afterward.
+
+5. Portable MMX stores read an unused 64-bit operand from the destination,
+   including MOVD's four-byte destination. Avoid loading operands for stores.
+   The pre-change -O0 helper faults on a destination ending at a guarded page;
+   the corrected helper completes. This is source-level ARM helper validation
+   on x86-64; it does not establish Mac hardware behavior or a Release symptom.
+
+6. The compiled DSP compatibility check verified instruction bytes but ignored
+   the state/scratch descriptors and declared memory layout from which fixed
+   coefficient addresses were generated. Reject incompatible layouts before
+   initialization; mutable parameter data remains permitted. The original disc
+   layout remains supported. Added two cases to the existing effects diagnostic.
+
+7. An audio callback could continue after publishing failure and overwrite the
+   error string while the game thread read it after the atomic failure flag.
+   A failed callback now stays stopped, keeping the published error immutable.
+   Normal mixing and its locking/queue ordering are unchanged.
+
+8. POSIX settings loading retained Windows CR characters in paths, numbers and
+   booleans. Accept CRLF explicitly. Save the complete configuration through
+   the existing atomic file-publishing helper instead of truncating the live
+   file before formatting/writing succeeds. Existing hidden-window diagnostics
+   now cover CRLF input and preservation when publication fails.
+
+Reviewed suspicions that were not defects
+----------------------------------------
+The original CMcpxBuffer::GetCurrentPosition at 234D32 was recovered with a
+320-instruction ceiling (complete). Its loop write cursor really computes
+loop_start + (play + ahead) % loop_size; do not replace this with the more
+intuitive relative-loop formula. The existing audio implementation matches
+234DB2..234DC6 exactly, including that unusual behavior.
+
+The analyzer's decoder.cpp:856 warning depends on treating two calls to the
+same const target() function as different optional results / treating the
+external Zydis output as unwritten on success. The function returns a value
+only after successful ZydisCalcAbsoluteAddress. No confirmed uninitialized
+instruction/target was found. Remaining analyzer messages are object padding,
+a diagnostic-only dead store, and the MSVC library's valid bitmask enum casts;
+none justifies changing game behavior or rearranging large state structures.
+
+The Windows manifest already selects UTF-8, so narrow command-line paths do
+not establish a Windows Unicode defect. Native tool wide-argument conversion
+is also present. Texture filter and mip-clamp suspicions were checked against
+the NV2A implementation; no speculative sampler change was made.
+
+External primary references consulted
+------------------------------------
+https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntqueryvirtualmemory
+  Page rounding and forward extent for a memory query.
+https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-zwfreevirtualmemory
+  Virtual decommit/release contracts; Xbox-specific differences must still be
+  checked independently instead of assuming the desktop ABI is identical.
+https://raw.githubusercontent.com/Cxbx-Reloaded/Cxbx-Reloaded/master/src/core/kernel/exports/EmuKrnlNt.cpp
+https://raw.githubusercontent.com/Cxbx-Reloaded/Cxbx-Reloaded/master/src/core/kernel/memory-manager/VMManager.cpp
+  Independent Xbox ABI/virtual-address corroboration, not copied implementation.
+https://cdrdv2-public.intel.com/671200/325462-sdm-vol-1-2abcd-3abcd.pdf
+  FCOMI/FUCOMI condition flags and instruction memory widths; complemented by
+  direct hardware comparison and the guarded-page probe.
+https://xboxdevwiki.net/XDVDFS
+https://github.com/XboxDev/extract-xiso/blob/master/extract-xiso.c
+  Disc directory sectors, length fields and DWORD-relative tree links.
+https://raw.githubusercontent.com/FFmpeg/FFmpeg/master/libavcodec/adpcm.c
+  Xbox ADPCM predictor, nibble order and 64-sample truncation.
+https://raw.githubusercontent.com/xemu-project/xemu/master/hw/xbox/nv2a/pgraph/texture.c
+https://raw.githubusercontent.com/xemu-project/xemu/master/hw/xbox/nv2a/pgraph/gl/texture.c
+https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-map
+  Texture layout/filter checks and dynamic-buffer write contracts.
+https://wiki.libsdl.org/SDL3/SDL_AudioStreamCallback
+https://wiki.libsdl.org/SDL3/SDL_LockAudioStream
+  Callback synchronization and stream-lock contracts.
+https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexa
+https://learn.microsoft.com/en-us/windows/win32/fileio/moving-and-replacing-files
+  Publishing the completed settings file through the existing native helper.
+
+Validation and limits
+---------------------
+Baseline: image, CPU, input, audio, effects, spatial, storage, performance and
+all 273 D3D11 hardware/debug rendering cases passed. Native renderer diagnostics
+do not establish original-game visual parity or 360 FPS.
+
+Portable focused probe: pre-change reports FCOMI status 3100 instead of 3000,
+and 3100 instead of 7500; then faults at the guarded MOVD destination. After:
+three checks, zero failures. Core dumps were disabled; no compiler/probe worker
+remains. This probe lives only in ignored build/checks, not in src.
+
+Release rebuild succeeded. Post-change native diagnostics all passed:
+- CPU: 52 groups, 26,026 instruction, 3,988 memory, 6,744 floating and 109
+  control cases, exercising the original supported XBE's generated functions.
+- Input: 107 cases. Audio: 77. Effects: 69 checks over five compiled programs.
+- Spatial: 54 cases and 139 audio-binding cases.
+- Storage: 4,433 cases, including all 468 preceding vehicle/part-detail cases.
+- Hidden settings window: save/load, CRLF, failed publication, controller,
+  achievement, presentation and pacing fixtures passed on the RTX 5060 Ti.
+- Visibility: 13,116 checks across four rendering configurations, no D3D debug
+  messages. This is isolated visibility validation, not a gameplay benchmark.
+- Replays: all 18 original disc replay files round-trip identically through
+  the original generated routines. Mods: 135 cases. Custom music: 2,071 cases.
+- Original soundtrack: all 12 files decode an initial 96,000 frames each;
+  no audio device was opened. This does not validate each entire song.
+
+The native disc parser traversed 110 directories / 776 entries. Both standalone
+texture dictionaries parsed: Frontend/frontend.dic (80 textures) and global.dic
+(120). Embedded track/vehicle texture payloads were not all enumerated by this
+check. The freshly extracted effects file matches the build input, SHA-256:
+4DA840E1EFADADE3FD7DDFE5DC0500157DEDC133F18748B738F8D00EE3746BE8.
+
+Additional Linux Clang analysis covered file, POSIX host/diagnostics, rendering,
+custom music, settings and Discord paths. Its only warning is the same harmless
+diagnostic-only occluded_texture dead store found on Windows. Neither analysis
+pass found another confirmed defect. All recorded native audit workers exited;
+no Linux compiler/probe worker remains. git diff --check passes.
+
+Final b2.exe SHA-256:
+237C8C3D3411EDD9B33A637666D99EF74B51889911A15A768FCBAF8F6094FDD9.
+Machine-readable check results are in the private audit folder's validation.json.
+
+Coverage remains explicitly partial: the current generated batch reports
+36,149 emitted functions / 713,245 original instructions, with 32,636 functions
+in the proven closed set. Platform bindings are separate from CPU coverage.
+Unresolved indirect targets are still explicit boundaries, not interpreter
+fallbacks. APC delivery, some audio scheduling modes, unsupported GPU methods,
+native Mac hardware behavior and complete gameplay visual/mode coverage remain
+outside what these offline fixtures establish. Prediction feasibility is an
+unfinished research diagnostic, not a feature whose gate is expected to pass.
+Track import's external-tool round trip was not run; no prepared imported track
+fixture was available. Offline diagnostics also do not establish live Discord
+reconnection behavior, physical controller behavior or rare callback failures.

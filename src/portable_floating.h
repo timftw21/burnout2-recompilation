@@ -56,11 +56,12 @@ inline void fp_rounded(FloatingState& s,extFloat80_t before,extFloat80_t after) 
     before.signExp&=0x7FFF;after.signExp&=0x7FFF;
     if(after.signExp>before.signExp || (after.signExp==before.signExp && after.signif>before.signif)) fp_word(s,4,fp_word(s,4)|0x200U);
 }
-template<bool Quiet> inline std::uint32_t fp_compare(FloatingState& s,extFloat80_t a,extFloat80_t b) {
+template<bool Quiet,bool CpuFlags=false> inline std::uint32_t fp_compare(FloatingState& s,extFloat80_t a,extFloat80_t b) {
     const bool equal=Quiet?extF80_eq(a,b):extF80_eq_signaling(a,b);
     const bool less=extF80_lt_quiet(a,b),greater=extF80_lt_quiet(b,a);
     const auto flags=equal?0x40U:less?1U:greater?0U:0x45U;
-    fp_word(s,4,(fp_word(s,4)&~0x4500U)|((flags&1)<<8)|((flags&4)<<8)|((flags&64)<<8));return flags;
+    if constexpr(!CpuFlags) fp_word(s,4,(fp_word(s,4)&~0x4500U)|((flags&1)<<8)|((flags&4)<<8)|((flags&64)<<8));
+    return flags;
 }
 
 // Opcode and ModRM are compile-time constants supplied by the recompiler.
@@ -154,7 +155,7 @@ template<unsigned Opcode,unsigned Modrm> inline std::uint32_t portable_x87(void*
     else if constexpr(!mem && Opcode==0xDD && (group==2 || group==3)) {fp_set(s,index,fp_get(s,0));if constexpr(group==3) fp_pop(s);}
     else if constexpr(!mem && ((Opcode==0xDD && (group==4 || group==5)) || (Opcode==0xDA && Modrm==0xE9) ||
                               ((Opcode==0xDB || Opcode==0xDF) && (group==5 || group==6)))) {
-        flags=fp_compare<(Opcode==0xDD || Opcode==0xDA || group==5)>(s,fp_get(s,0),fp_get(s,Opcode==0xDA?1:index));
+        flags=fp_compare<(Opcode==0xDD || Opcode==0xDA || group==5),Opcode==0xDB || Opcode==0xDF>(s,fp_get(s,0),fp_get(s,Opcode==0xDA?1:index));
         if constexpr((Opcode==0xDD && group==5) || Opcode==0xDF || Opcode==0xDA) fp_pop(s);
         if constexpr(Opcode==0xDA) fp_pop(s);
     } else if constexpr(!mem && Opcode==0xD9 && (Modrm==0xE0 || Modrm==0xE1)) {
@@ -213,7 +214,8 @@ template<unsigned Opcode,unsigned Modrm,unsigned Immediate=0> inline void portab
     const auto get=[&](unsigned r){return fp_load<std::uint64_t>(s.image.data()+28+slot(r)*10);};
     const auto put=[&](unsigned r,std::uint64_t v){fp_store(s.image.data()+28+slot(r)*10,v);fp_store(s.image.data()+36+slot(r)*10,std::uint16_t(0xFFFF));fp_tag(s,slot(r),2);};
     const auto a=get(reg);std::uint64_t b=0;
-    if constexpr(Opcode!=0x6E && Opcode!=0x2D && Opcode!=0x71 && Opcode!=0x72) b=mem?fp_load<std::uint64_t>(memory):get(rm);
+    if constexpr(Opcode!=0x6E && Opcode!=0x7E && Opcode!=0x7F && Opcode!=0xE7 && Opcode!=0x2D && Opcode!=0x71 && Opcode!=0x72)
+        b=mem?fp_load<std::uint64_t>(memory):get(rm);
     if constexpr(Opcode==0x6F) put(reg,b);
     else if constexpr(Opcode==0x7F || Opcode==0xE7) {if constexpr(mem) fp_store(memory,a);else put(rm,a);}
     else if constexpr(Opcode==0x6E) put(reg,fp_load<std::uint32_t>(memory));

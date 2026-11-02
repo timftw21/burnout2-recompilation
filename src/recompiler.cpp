@@ -417,7 +417,7 @@ public:
              << "            goto " << label(run.back()->address+run.back()->decoded.length) << ";\n        }\n    }\n";
     }
     void mmx_run(const std::vector<const Instruction*>& run) {
-        struct Range {ZydisDecodedOperand operand;std::int64_t first,last;};
+        struct Range {ZydisDecodedOperand operand;std::int64_t first,last;int store_alignment=-1;};
         std::vector<Range> ranges;
         std::map<std::string,unsigned> groups;
         std::vector<unsigned> operands;
@@ -431,6 +431,11 @@ public:
             if(inserted) ranges.push_back({operand,displacement,displacement});
             auto& range=ranges[group->second];
             range.first=std::min(range.first,displacement);range.last=std::max(range.last,displacement);
+            if(instruction->decoded.mnemonic==ZYDIS_MNEMONIC_MOVNTQ) {
+                const auto alignment=static_cast<unsigned>(displacement)&7U;
+                if(range.store_alignment>=0 && unsigned(range.store_alignment)!=alignment) return;
+                range.store_alignment=static_cast<int>(alignment);
+            }
             operands.push_back(group->second);
         }
         const auto helper=std::format("b2_mmx_run_{:08X}_{:08X}",run.front()->address,run.back()->address);
@@ -440,6 +445,8 @@ public:
             auto operand=ranges[i].operand;operand.mem.disp.has_displacement=true;operand.mem.disp.value=ranges[i].first;
             body << "            memory.try_access(" << address(operand) << ',' << ranges[i].last-ranges[i].first+8 << "ULL),\n";
             if(!ready.empty()) ready+=" && ";ready+=std::format("mmx_operands[{}]",i);
+            if(ranges[i].store_alignment>=0) ready+=std::format(" && (reinterpret_cast<std::uintptr_t>(mmx_operands[{}])&7U)=={}U",
+                i,(static_cast<std::uint64_t>(ranges[i].first)-unsigned(ranges[i].store_alignment))&7U);
         }
         body << "        }};\n        if(" << (ranges.empty()?"true":ready) << ") {\n            " << helper << "(mmx_operands.data());\n"
              << "            goto " << label(run.back()->address+run.back()->decoded.length) << ";\n        }\n    }\n";
@@ -455,11 +462,13 @@ public:
                 if(offset<=0x7FFFFFFF) {if(offset) assembly+=std::format("    lea rax,[rax+{}]\n",offset);}
                 else assembly+=std::format("    mov r8d,0{:08X}h\n    add rax,r8\n",offset);
             }
-            assembly+=std::format("    db 00Fh,0{:02X}h,0{:02X}h\n",ins.opcode,
+            const auto opcode=ins.mnemonic==ZYDIS_MNEMONIC_MOVNTQ?0x7FU:ins.opcode;
+            assembly+=std::format("    db 00Fh,0{:02X}h,0{:02X}h\n",opcode,
                 memory?ins.raw.modrm.reg<<3:(3U<<6)|(ins.raw.modrm.reg<<3)|ins.raw.modrm.rm);
         }
-        // GPRs and flags are unchanged. Keep original MMX/NT stores in order;
-        // failed range preflight falls through to the individual instructions.
+        // The host consumes these RAM writes immediately. Cached MOVQ stores
+        // retain MMX state and order without streaming around the CPU cache.
+        // Original alignment faults and failed ranges use individual instructions.
         native_helpers[helper]=assembly+"    ret\n"+helper+" ENDP\n";
         native_declarations[helper]="extern \"C\" B2_ASM void "+helper+"(const void*);\n";
         floating=true;
@@ -708,6 +717,16 @@ public:
             (void)read_reg(ZYDIS_REGISTER_EBP);
             body << "    if(cpu.draw_distance>1) ram.store<std::uint32_t>(ebp-4U,std::bit_cast<std::uint32_t>(std::bit_cast<float>(ram.load<std::uint32_t>(ebp-4U))/cpu.draw_distance));\n";
         }
+        if(instruction.address==0x78D39) {
+            (void)read_reg(ZYDIS_REGISTER_ESP);
+            // Loose-part shadows build a separate far plane 50 units beyond
+            // the near plane. Extend its range without moving the near plane.
+            body << "    if(cpu.draw_distance>1) {\n"
+                 << "    const auto near=std::bit_cast<float>(ram.load<std::uint32_t>(esp+0x78U)),range=std::bit_cast<float>(ram.load<std::uint32_t>(0x2BF250U));\n"
+                 << "    const auto mxcsr=_mm_getcsr();_mm_setcsr(0x1F80);\n"
+                 << "    ram.store<std::uint32_t>(esp+0xBCU,std::bit_cast<std::uint32_t>(range*cpu.draw_distance-near));\n"
+                 << "    _mm_setcsr(mxcsr);\n    }\n";
+        }
         if(instruction.address==0x9B3DC) {
             (void)read_reg(ZYDIS_REGISTER_ECX);
             // The traffic renderer recomputes both linear LOD thresholds from
@@ -728,8 +747,6 @@ public:
             if(instruction.address==0x9C09A) body << " esp+=16U;goto i_0009C09F;";
             body << "}\n";
         }
-        if(instruction.address==0x9AB49)
-            body << "    if(cpu.traffic_shared_wheels) goto i_0009AEFD;\n";
         if(loop_headers.contains(instruction.address))
             body << "    if(b2::checkpoint_due(cpu)) { commit(); b2::checkpoint(cpu," << constant(instruction.address) << "); }\n";
         if(const auto run=floating_runs.find(instruction.address);run!=floating_runs.end()) {
@@ -1366,11 +1383,12 @@ LoweredFunction lower(const Function& function,bool fuse_floating,bool portable)
         {0x910F6,"8B8496D0000000"},{0x91295,"8B8C86D0000000"},{0x91370,"8B792C"},{0x913E5,"8B8496D0000000"},
         {0x92149,"8B8718010000"},{0x92182,"5F"},
         {0x9B3DC,"8D642400"},{0xA7306,"C20800"},
-        {0x9C09A,"E891E2FFFF"},{0x9C09F,"83C730"},{0x9AB49,"8B4340"},
+        {0x9C09A,"E891E2FFFF"},{0x9C09F,"83C730"},
         {0x9C12A,"E8B1720200"},{0x9C152,"6A00"},
         {0x9F3BF,"F6830101000001"},{0x9F405,"F6830101000002"},
         {0x9F447,"F6830101000004"},{0x9F488,"F6830101000008"},
         {0xC31C4,"D9442410"},{0xC3A2E,"D945FC"},
+        {0x78C93,"D82550F22B00"},{0x78D32,"D99C24BC000000"},{0x78D39,"89B424E8000000"},
         {0x9BA15,"8B4E0C"},{0x9BA18,"8B81E8010000"},{0x9BA24,"3991A0010000"},
         {0x9BA2C,"8B4508"},{0x9BA42,"8D9C98E08E0200"},{0x9BA49,"D903"},
         {0x9BA6D,"D835D01A2C00"},{0x9BA73,"D999E4010000"},{0x9BA8D,"D981E0010000"},
