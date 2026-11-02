@@ -4521,10 +4521,16 @@ std::string check_visibility(const std::filesystem::path& executable,const std::
     const auto require=[&](bool condition,std::string_view name) {
         if(!condition) throw std::runtime_error("Visibility check failed: "+std::string(name));++checks;
     };
-    std::string results;
+    std::string results,unsupported;
     for(const auto config:std::array<std::array<unsigned,2>,4>{{{1,0},{3,0},{1,5},{2,6}}}) {
         const auto scale=config[0],aa=config[1];
-        Renderer renderer(64,64,warp,render_debug_layer,scale);renderer.enhancements(aa,0);
+        Renderer renderer(64,64,warp,render_debug_layer,scale);
+        if(aa>=4 && !renderer.supports_msaa(1U<<(aa-3))) {
+            if(!unsupported.empty()) unsupported+=',';
+            unsupported+=std::format("{{\"scale\":{},\"aa\":{},\"reason\":\"MSAA {}x is unavailable on this graphics device\"}}",scale,aa,1U<<(aa-3));
+            continue;
+        }
+        renderer.enhancements(aa,0);
         std::vector<std::byte> ram(64*1024*1024);image.load(std::span(ram).subspan(image.base,image.image_size));Memory memory(0,ram);
         XboxHost provider;provider.storage_root=output/std::format("storage-{}-{}",scale,aa);
         Xbox xbox(image,memory,ram,{},std::move(provider));auto& state=*xbox.state_;
@@ -4632,7 +4638,7 @@ std::string check_visibility(const std::filesystem::path& executable,const std::
         if(!results.empty()) results+=',';
         results+=std::format("{{\"scale\":{},\"aa\":{},\"reports\":{},\"visible_pixels\":196,\"half_visible_pixels\":98,\"blocked_pixels\":0,\"debug_messages\":0}}",scale,aa,reports);
     }
-    const auto report=std::format("{{\"format\":\"b2-visibility-check-v1\",\"source_sha256\":{},\"passed\":true,\"game_booted\":false,\"warp\":{},\"checks\":{},\"configurations\":[{}]}}",json(image.sha256),warp,checks,results);
+    const auto report=std::format("{{\"format\":\"b2-visibility-check-v1\",\"source_sha256\":{},\"passed\":true,\"game_booted\":false,\"warp\":{},\"checks\":{},\"configurations\":[{}],\"unsupported_configurations\":[{}]}}",json(image.sha256),warp,checks,results,unsupported);
     write_text(output/"report.json",report,false);return report;
 }
 std::string check_storage(const std::filesystem::path& executable,const std::filesystem::path& output) {

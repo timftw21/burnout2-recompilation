@@ -607,7 +607,11 @@ Offline D3D11 rendering
 & .\build\windows\Release\b2.exe --check-visibility data/local/default.xbe build/checks/visibility-warp --warp
 
 Use fresh output directories. Runs save PNGs and structured adapter, failure and
-GPU timing reports. The renderer supports all ten NV097 primitives, indexed draws,
+GPU timing reports. Visibility checks list unavailable MSAA modes separately in
+unsupported_configurations; all supported configurations retain their assertions.
+Software Vulkan validation needs Mesa 25.3 or newer: older llvmpipe versions
+have incorrect MSAA scissor boundaries. Mesa 26.2.5 passes these rendering checks.
+The renderer supports all ten NV097 primitives, indexed draws,
 depth, stencil, culling, scissor, polygon offset, blending, alpha tests, four texture
 stages, register combiners and fog.
 Points retain their original size or distance attenuation. Point sprites use a
