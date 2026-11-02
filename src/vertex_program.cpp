@@ -1,4 +1,5 @@
 #include "vertex_program.h"
+#include <algorithm>
 #include <format>
 #include <stdexcept>
 
