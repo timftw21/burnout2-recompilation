@@ -111,9 +111,31 @@ paths and formats, and make enabled order and conflicts visible in settings and
 offline JSON diagnostics. Apply the mount once per session, using the existing
 read-only asynchronous/synchronous handles and directory metadata. Avoid scanning
 folders or decoding mod content during rendering or file reads. Leave the disc,
-executable, saves and compiled programs intact. Executable patches, scripts,
-runtime plugins and hot reload are unsupported; changes to native game behavior
-remain source changes compiled ahead of time.
+executable, saves and compiled programs intact. Executable patches, native
+plugins and hot reload are unsupported; changes to native game behavior remain
+source changes compiled ahead of time.
+
+Optional Lua scripts use an explicit versioned host API in isolated, bounded
+states. Load and compile source before guest execution. Keep states only for
+mods registering supported gameplay events; close all states on restart/exit.
+Verified native observations append scalar data to a fixed, bounded queue with
+no Lua, allocation, file access or logging. Dispatch subscribed callbacks at
+completed frame boundaries with instruction, time and memory limits. Preserve
+enabled mod order and handler state; defer remaining callbacks within a bounded
+frame allowance. Stage messages and session settings, discard failed callback
+output, and disable only that failed mod until restart. Expose no file, OS,
+network, native-code loading, arbitrary guest memory or per-frame callback API.
+Keep all original game code compiled ahead of time. Report script failures and
+setting conflicts separately from CPU coverage and platform bindings.
+
+Texture packs use the same manifest, enabled order and conflict reporting, with
+type=texture-pack and an explicit id. Install validated PNG replacements through
+settings, staging updates before replacing an installed pack. Identify original
+2D textures by their bytes and layout, never by transient guest addresses. Decode,
+filter mip levels and upload a bounded winning set once before gameplay. Reuse
+those GPU resources at ordinary texture-cache misses; perform no pack file reads
+or image decoding in rendering. User packs take priority over built-in Clean HUD.
+Preserve original texture coordinates, game memory and disc formats.
 
 Implementation order
 

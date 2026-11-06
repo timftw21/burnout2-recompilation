@@ -23,6 +23,7 @@ inline constexpr bool render_debug_layer=true;
 inline constexpr bool render_debug_layer=false;
 #endif
 struct MotionCamera;
+struct ModFile;
 struct Image {
     std::uint32_t width, height;
     std::vector<std::byte> rgba;
@@ -142,6 +143,7 @@ public:
     Renderer(const Renderer&) = delete;
     Renderer& operator=(const Renderer&) = delete;
     std::uint32_t upload(const TextureData&);
+    void texture_packs(std::span<const ModFile>); // Decode and upload replacements once, before gameplay.
     void release(std::uint32_t resource); // After queued draws have been submitted; native GPU work retains its references.
     std::uint32_t create_target(std::uint32_t width,std::uint32_t height,
                                 SurfaceColor=SurfaceColor::rgba8,SurfaceDepth=SurfaceDepth::z24s8);

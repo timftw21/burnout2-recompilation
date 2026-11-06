@@ -1,6 +1,7 @@
 #include "achievements.h"
 #include "cpu.h"
 #include "file.h"
+#include "mod_scripts.h"
 #include <cmath>
 #include <sstream>
 
@@ -63,9 +64,16 @@ namespace {
 bool observing(const Cpu& cpu,const Memory& memory) {
     return cpu.achievements && cpu.achievements->enabled() && !memory.load<std::uint32_t>(0x2FFD74);
 }
+bool watching(const Cpu& cpu,const Memory& memory) {
+    return (cpu.script_events || (cpu.achievements && cpu.achievements->enabled())) && !memory.load<std::uint32_t>(0x2FFD74);
+}
 bool player(const Memory& memory,std::uint32_t racer) {
     return racer && (racer==memory.load<std::uint32_t>(0x2FE370) || racer==memory.load<std::uint32_t>(0x2FE374)) &&
         memory.load<std::uint32_t>(racer+0xCC4)==1;
+}
+unsigned player_number(const Memory& memory,std::uint32_t racer) {
+    if(!player(memory,racer)) return 0;
+    return racer==memory.load<std::uint32_t>(0x2FE370)?1:2;
 }
 bool medals(const Memory& memory,std::uint32_t progress,unsigned count,unsigned gold) {
     for(unsigned i=0;i<count;++i) if(memory.load<std::uint32_t>(progress+i*4)!=gold) return false;
@@ -73,7 +81,9 @@ bool medals(const Memory& memory,std::uint32_t progress,unsigned count,unsigned 
 }
 }
 void title_crash_result(Cpu& cpu,Memory& memory,std::uint32_t progress,std::uint32_t zone,std::uint32_t medal) {
-    if(!observing(cpu,memory) || zone>=30 || medal<1 || medal>3) return;
+    if(!watching(cpu,memory) || zone>=30 || medal>3) return;
+    if(cpu.script_events) cpu.script_events->push({.type=ScriptEventType::crash_result,.zone=zone+1,.medal=medal});
+    if(!observing(cpu,memory) || !medal) return;
     cpu.achievements->crash_result(zone,medal);
     if(medals(memory,progress,30,3)) cpu.achievements->unlock(AchievementId::see_you_in_hell);
 }
@@ -97,20 +107,43 @@ void title_race_result(Cpu& cpu,Memory& memory,std::uint32_t stats) {
     case 1:case 2:case 5:case 6:case 10:case 11: cpu.achievements->unlock(AchievementId::youre_winner);break;
     }
 }
+void title_race_finish(Cpu& cpu,Memory& memory,std::uint32_t racer) {
+    if(!cpu.script_events || memory.load<std::uint32_t>(0x2FFD74)) return;
+    const auto player=player_number(memory,racer);
+    // The original store at 84260 follows this observation. Its finish flag
+    // resets naturally for a new race, even when the racer address is reused.
+    if(!player || memory.load<std::uint32_t>(racer+0x38) || memory.load<std::uint32_t>(racer+0x3C)) return;
+    const auto position=memory.load<std::uint32_t>(racer+0x40);
+    if(!position) return;
+    const auto mode=memory.load<std::uint32_t>(0x34AB58);
+    switch(mode) {
+    case 1:case 2:case 5:case 6:case 10:case 11:
+        cpu.script_events->push({.type=ScriptEventType::race_finish,.player=player,.position=position,.mode=mode});break;
+    }
+}
 void title_starting_boost(Cpu& cpu,Memory& memory,std::uint32_t vehicle) {
     // This site is the timed accelerator/brake success, before the separate
     // automatic Crash Zone launch. FC0 links the physical car to its racer.
-    if(observing(cpu,memory) && player(memory,memory.load<std::uint32_t>(vehicle+0xFC0)))
-        cpu.achievements->unlock(AchievementId::started_in_second_gear);
+    if(!watching(cpu,memory)) return;
+    if(const auto player=player_number(memory,memory.load<std::uint32_t>(vehicle+0xFC0))) {
+        if(cpu.script_events) cpu.script_events->push({.type=ScriptEventType::starting_boost,.player=player});
+        if(observing(cpu,memory)) cpu.achievements->unlock(AchievementId::started_in_second_gear);
+    }
 }
 void title_burnout_chain(Cpu& cpu,Memory& memory,std::uint32_t boost,std::uint32_t racer) {
-    if(observing(cpu,memory) && player(memory,racer) && boost==racer+0x608 && memory.load<std::uint32_t>(boost+0x1C)>=15)
-        cpu.achievements->unlock(AchievementId::burnout_x_achievement);
+    if(!watching(cpu,memory) || !racer || boost!=racer+0x608) return;
+    const auto player=player_number(memory,racer),chain=memory.load<std::uint32_t>(boost+0x1C);
+    if(player && chain) {
+        if(cpu.script_events) cpu.script_events->push({.type=ScriptEventType::burnout,.player=player,.chain=chain});
+        if(observing(cpu,memory) && chain>=15) cpu.achievements->unlock(AchievementId::burnout_x_achievement);
+    }
 }
 void title_time_attack_lap(Cpu& cpu,Memory& memory,std::uint32_t session,std::uint32_t time_bits) {
-    if(!observing(cpu,memory) || session!=0x303C34 || memory.load<std::uint32_t>(0x34AB58)!=8 ||
-       memory.load<std::uint32_t>(0x48A150)!=10) return;
+    if(!watching(cpu,memory) || session!=0x303C34 || memory.load<std::uint32_t>(0x34AB58)!=8) return;
     const float seconds=std::bit_cast<float>(time_bits);
-    if(std::isfinite(seconds) && seconds>0 && seconds<=40.f) cpu.achievements->unlock(AchievementId::stay_frosty);
+    if(!std::isfinite(seconds) || seconds<=0) return;
+    const auto track=memory.load<std::uint32_t>(0x48A150);
+    if(cpu.script_events) cpu.script_events->push({.type=ScriptEventType::time_attack_lap,.track=track,.seconds=seconds});
+    if(observing(cpu,memory) && track==10 && seconds<=40.f) cpu.achievements->unlock(AchievementId::stay_frosty);
 }
 }

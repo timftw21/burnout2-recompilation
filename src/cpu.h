@@ -111,6 +111,8 @@ struct Cpu {
     GameTiming* game_timing = nullptr;
     Presentation* presentation = nullptr;
     Achievements* achievements = nullptr;
+    unsigned camera_fov = 100; // Percentage of the original vertical field of view.
+    class ScriptEvents* script_events = nullptr;
 };
 
 class NativeBoundary : public std::runtime_error {
@@ -158,6 +160,7 @@ void title_crash_result(Cpu&,Memory&,std::uint32_t progress,std::uint32_t zone,s
 void title_training_result(Cpu&,Memory&,std::uint32_t progress);
 void title_championship_result(Cpu&,Memory&,std::uint32_t progress);
 void title_race_result(Cpu&,Memory&,std::uint32_t stats);
+void title_race_finish(Cpu&,Memory&,std::uint32_t racer);
 void title_starting_boost(Cpu&,Memory&,std::uint32_t vehicle);
 void title_burnout_chain(Cpu&,Memory&,std::uint32_t boost,std::uint32_t racer);
 void title_time_attack_lap(Cpu&,Memory&,std::uint32_t session,std::uint32_t time_bits);

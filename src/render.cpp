@@ -5,6 +5,7 @@
 #include "ambient_occlusion.h"
 #include "hdr.h"
 #include "ui_art.h"
+#include "texture_packs.h"
 #ifdef _WIN32
 #include <Windows.h>
 #include <wincodec.h>
@@ -30,6 +31,7 @@
 #include "com_ptr.h"
 #include <algorithm>
 #include <bit>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 #include <format>
@@ -221,12 +223,17 @@ PipelineKey pipeline_key(const RenderState& state,bool multisample) {
     key[i]=std::uint32_t(multisample);return key;
 }
 using SamplerKey=std::array<std::uint32_t,6>;
-SamplerKey sampler_key(const RenderState& state,unsigned stage,unsigned anisotropy,bool ui_art=false) {
+SamplerKey sampler_key(const RenderState& state,unsigned stage,unsigned anisotropy,bool ui_art=false,unsigned pack_mips=0) {
     const auto address=state.textures[stage]?state.texture_address[stage]:0x030303;
     // The original UI has one mip and disables mip filtering. Enlarged vector
     // artwork needs coverage filtering at its displayed size on both sides of
     // the game's black outline. Its mip chain ends at the original atlas size.
     if(ui_art) return {address&0x0F0F0F,D3D11_FILTER_MIN_MAG_MIP_LINEAR,0,0,ui_art_mips-1,1};
+    if(pack_mips) {
+        const auto control=state.textures[stage]?state.texture_control[stage]:0x0003FFC0;
+        const auto strength=anisotropy?anisotropy:1U<<((control>>4)&3);
+        return {address&0x0F0F0F,unsigned(strength>1?D3D11_FILTER_ANISOTROPIC:D3D11_FILTER_MIN_MAG_MIP_LINEAR),0,0,pack_mips-1,strength};
+    }
     const auto filter=state.textures[stage]?state.texture_filter[stage]:0x01030000;
     const auto control=state.textures[stage]?state.texture_control[stage]:0x0003FFC0;
     const auto min=(filter>>16)&63,mag=(filter>>24)&15;
@@ -716,10 +723,16 @@ struct Renderer::Impl {
             }
         }
     }
-    struct Texture {ComPtr<ID3D11ShaderResourceView> view;unsigned dimension=0;std::size_t bytes=0;bool white_mask=false,ui_art=false;};
+    struct Texture {
+        ComPtr<ID3D11ShaderResourceView> view;unsigned dimension=0;std::size_t bytes=0;bool white_mask=false,ui_art=false;
+        unsigned references=1,pack_mips=0;
+    };
     std::vector<Texture> textures{1};
     std::vector<std::uint32_t> free_textures;
     bool clean_hud=false;
+    std::map<ShaDigest,std::uint32_t> texture_packs;
+    std::size_t pack_bytes=0;
+    bool loading_packs=false;
     bool texture_capacity() const {return !free_textures.empty() || textures.size()<4096;}
     std::uint32_t retain_texture(ComPtr<ID3D11ShaderResourceView> view,unsigned dimension,std::size_t bytes) {
         if(!texture_capacity()) throw std::runtime_error("Texture resource limit reached");
@@ -1164,6 +1177,7 @@ void Renderer::reset(unsigned scale) {
     r.camera_valid=false;
     r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
     r.targets.clear();r.textures.resize(1);r.free_textures.clear();r.texture_bytes=0;
+    r.texture_packs.clear();r.pack_bytes=0;
     r.presentation_target=r.feedback_target=0;r.feedback_image=std::move(feedback);
     r.targets.emplace(0,std::move(main));r.target_bytes=r.target_size(width,height);r.select_target(0);r.ended=false;
     const auto compilations=r.stats.shader_compilations;r.stats={};r.stats.shader_compilations=compilations;
@@ -1278,7 +1292,7 @@ std::uint32_t Renderer::copy_cubemap(const std::array<std::uint32_t,6>& faces,st
     if(!cube) {
         const auto required=std::size_t(description.Width)*description.Height*6*(description.Format==DXGI_FORMAT_B5G6R5_UNORM?2:frame_color_bytes);
         const auto previous=destination?r.textures[destination].bytes:0;
-        if((!destination && !r.texture_capacity()) || required>256*1024*1024-(r.texture_bytes-previous))
+        if((!destination && !r.texture_capacity()) || required>256*1024*1024-(r.texture_bytes-r.pack_bytes-previous))
             throw std::runtime_error("Cubemap texture resource limit reached");
         checked(r.device->CreateTexture2D(&description,nullptr,&cube),"GPU cubemap");
         ComPtr<ID3D11ShaderResourceView> view;
@@ -1661,13 +1675,18 @@ RenderResources Renderer::resources() const {
 std::uint32_t Renderer::upload(const TextureData& source) {
     auto& r = *impl_;
     PerfScope timing(r.profile,PerfPhase::texture_upload);GpuSpan gpu(r.gpu_meter.get(),1);
-    auto pixels=r.clean_hud?redraw_ui_texture(source):std::nullopt;
+    if (r.recording) throw std::runtime_error("Upload textures before frame submission");
+    if(!r.texture_packs.empty() && !source.cubemap && source.depth==1) {
+        if(const auto found=r.texture_packs.find(texture_digest(source));found!=r.texture_packs.end()) {
+            ++r.textures[found->second].references;return found->second;
+        }
+    }
+    auto pixels=r.clean_hud && !r.loading_packs?redraw_ui_texture(source):std::nullopt;
     const auto texture=pixels?TextureData{source.width*ui_art_scale,source.height*ui_art_scale,pixels->format,pixels->bytes,ui_art_mips}:source;
     r.count(PerfMetric::texture_uploads);r.count(PerfMetric::texture_bytes,texture.bytes.size());
-    if (r.recording) throw std::runtime_error("Upload textures before frame submission");
     extent(texture.width, texture.height);
     if (!texture.depth || texture.depth>2048 || (texture.depth>1 && (texture.width>2048 || texture.height>2048)) ||
-        texture.bytes.size() > 64 * 1024 * 1024 || !texture.mip_levels ||
+        texture.bytes.size() > (r.loading_packs?96ULL:64ULL)*1024*1024 || !texture.mip_levels ||
         texture.mip_levels > static_cast<unsigned>(std::bit_width(std::max({texture.width, texture.height,texture.depth}))))
         throw std::runtime_error("Invalid texture size or mip count");
     DXGI_FORMAT format;
@@ -1691,8 +1710,9 @@ std::uint32_t Renderer::upload(const TextureData& source) {
     if (texture.pitch && (swizzled || block || texture.mip_levels != 1))
         throw std::runtime_error("An explicit pitch requires a single linear mip");
     if (!r.texture_capacity()) throw std::runtime_error("Texture resource limit reached");
-    if (texture.bytes.size() > 256 * 1024 * 1024 - r.texture_bytes)
-        throw std::runtime_error("Texture resources exceed 256 MiB");
+    if (r.loading_packs?texture.bytes.size()>texture_pack_budget-r.texture_bytes:
+        texture.bytes.size()>256*1024*1024-(r.texture_bytes-r.pack_bytes))
+        throw std::runtime_error(r.loading_packs?"Enabled texture packs exceed 512 MiB. Disable a pack or use smaller images.":"Original texture resources exceed 256 MiB");
     if(texture.cubemap && (texture.width!=texture.height || texture.depth!=1)) throw std::runtime_error("Cubemap faces must be square and two-dimensional");
     const auto faces=texture.cubemap?6U:1U;
     std::vector<D3D11_SUBRESOURCE_DATA> data(texture.mip_levels*faces);
@@ -1763,10 +1783,41 @@ std::uint32_t Renderer::upload(const TextureData& source) {
     const auto id=r.retain_texture(std::move(view),texture.cubemap?3U:texture.depth>1?2U:1U,texture.bytes.size());
     r.textures[id].white_mask=white_mask && varying_alpha;r.textures[id].ui_art=pixels.has_value();return id;
 }
+void Renderer::texture_packs(std::span<const ModFile> files) {
+    auto& r=*impl_;
+    if(r.recording || r.texture_bytes || !r.texture_packs.empty() || files.size()>2048)
+        throw std::runtime_error("Prepare up to 2048 texture pack images between game sessions, after resetting graphics.");
+    std::map<ShaDigest,std::uint32_t> prepared;
+    r.loading_packs=true;
+    try {
+        for(const auto& file:files) {
+            if(file.path.size()!=44 || !file.path.ends_with(".png")) throw std::runtime_error("Invalid texture replacement name: "+file.path);
+            ShaDigest digest{};
+            for(unsigned i=0;i<digest.size();++i) {
+                unsigned value=0;const auto* start=file.path.data()+i*2;
+                const auto result=std::from_chars(start,start+2,value,16);
+                if(result.ec!=std::errc{} || result.ptr!=start+2) throw std::runtime_error("Invalid texture id: "+file.path);
+                digest[i]=std::byte(value);
+            }
+            auto [entry,inserted]=prepared.try_emplace(digest,0);
+            if(!inserted) throw std::runtime_error("Duplicate texture replacement: "+file.path);
+            try {
+                const auto image=load_pack_image(file.source);
+                entry->second=upload(image.texture());r.textures[entry->second].pack_mips=image.mip_levels;
+            } catch(const std::exception& error) {throw std::runtime_error("Texture pack "+file.mod+": "+error.what());}
+        }
+    } catch(...) {
+        r.loading_packs=false;
+        for(const auto& [path,id]:prepared) if(id) release(id);
+        throw;
+    }
+    r.loading_packs=false;r.pack_bytes=r.texture_bytes;r.texture_packs=std::move(prepared);
+}
 void Renderer::release(std::uint32_t resource) {
     auto& r=*impl_;
     if(r.recording || !resource || resource>=r.textures.size() || !r.textures[resource].view)
         throw std::runtime_error("Release an existing game resource outside frame submission");
+    if(r.textures[resource].references>1) {--r.textures[resource].references;return;}
     // Unbind context references as well as cache references. D3D11 keeps work
     // already submitted alive without a CPU wait for the GPU.
     r.unbind_textures();
@@ -1788,7 +1839,8 @@ Renderer::PreparedState Renderer::prepare(const RenderState& state) {
     for(unsigned i=0;i<4;++i) {
         const auto mode=state.texture_modes[i];
         if(!mode || mode==4 || mode==5) continue;
-        const auto key=sampler_key(state,i,r.anisotropy,state.textures[i]<r.textures.size() && r.textures[state.textures[i]].ui_art);
+        const auto* texture=state.textures[i]<r.textures.size()?&r.textures[state.textures[i]]:nullptr;
+        const auto key=sampler_key(state,i,r.anisotropy,texture && texture->ui_art,texture?texture->pack_mips:0);
         if(r.prepared_samplers[i] && !std::memcmp(&key,&r.prepared_sampler_keys[i],sizeof(key))) {
             prepared.samplers_[i]=r.prepared_samplers[i];continue;
         }
@@ -2339,7 +2391,8 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
         }
         if(bindings && sampled) samplers[i]=bindings->samplers_[i].Get();
         else if(sampled) {
-            const auto sampler=r.sampler_states.find(sampler_key(state,i,r.anisotropy,r.textures[state.textures[i]].ui_art));
+            const auto& texture=r.textures[state.textures[i]];
+            const auto sampler=r.sampler_states.find(sampler_key(state,i,r.anisotropy,texture.ui_art,texture.pack_mips));
             if(sampler==r.sampler_states.end()) throw std::runtime_error("Sampler was not prepared before submission");
             samplers[i]=sampler->second.Get();
         }

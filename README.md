@@ -18,21 +18,17 @@ I'll try to respond in a timely manner. This is an independent fan project, unaf
 Yes, AI (Codex) assisted in the development of this project. No, this project was not blindly thrown together.
 If you're skeptical, I implore you to try the recompilation for yourself. I take quality control quite seriously!👀
 
-## What's new in 1.13
+## What's new in 1.14
 
-- Reduced CPU and graphics overhead for faster gameplay.
-- Added optional **Discord Rich Presence** under **Settings → General**, using
-  the project's icon and showing activity and elapsed time.
-- Increased draw distance now keeps traffic and loose car parts at full mesh
-  detail, including Crash mode. Loose-part ground shadows also extend farther.
-- Fixed memory handling, portable CPU instructions, audio error handling and
-  compiled sound-effect validation. Settings save more safely and load Windows
-  line endings correctly on other platforms.
+- Added camera FOV slider to Graphics options.
+- Texture packs can now be easily installed. See the Mods tab in Settings for more information.
+- Added initial scripting support.
 
-Download the new **Installation.zip**. On Windows, run **Install.cmd** again to
-update. On Linux, open **Install.desktop**; on macOS, open **Install.command**.
-See [Updating between releases](#updating-between-releases) to keep your saves,
-settings and imported music.
+Download **Installation.zip** and extract it over your existing source folder,
+keeping `build` and `data`. Rerun **Install.cmd** on Windows, **Install.desktop**
+on Linux, or **Install.command** on macOS. Back up saves, settings, achievement
+progress, imported music and mods first; [Updating between releases](#updating-between-releases)
+lists the locations. Your own US Xbox XISO is required. Game files are not included.
 
 ## Screenshots
 
@@ -81,6 +77,7 @@ support is still being tested.
 - Custom keyboard and controller bindings, and 1×–4× internal resolution.
 - Native 16:9 and ultrawide 21:9 cameras with the HUD's original proportions
   and edge placement.
+- Adjustable camera FOV from 50% to 150%, with the original view at 100%.
 - Optional MSAA or FXAA antialiasing and anisotropic filtering up to 16×.
 - Optional ambient occlusion with adjustable quality and strength.
 - Optional Windows HDR output with adjustable image and highlight brightness.
@@ -93,6 +90,8 @@ support is still being tested.
 - Optional fast loading skips loading transitions and frame delays.
 - Ten achievements with saved progress and animated unlock notifications.
 - Asset replacement mods with saved load order and conflict checks.
+- Texture pack installation from Settings and sandboxed Lua scripting with
+  supported gameplay events.
 - Optional automatic muting when the game loses focus.
 - Optional Discord Rich Presence with the project's icon and elapsed time.
 
@@ -189,29 +188,31 @@ also cover offline debugging.
 
 ### Updating between releases
 
-These installer steps apply to Windows. On Linux and macOS, extract the updated
-source over your existing folder, keeping `build` and `data`. Rerun
-**Install.desktop** (Linux) or **Install.command** (macOS) and choose your XISO;
-settings, saves and imported music are preserved. Keep that folder in place so
-the application shortcut remains valid. After moving it, rerun setup to rebuild
-and refresh the game paths. `bash Install.sh --shortcuts-only` recreates a
-deleted shortcut without rebuilding an installation that remains in place.
+Keep your source folder in place so the application shortcut remains valid.
+The backup paths below are relative to the folder containing **b2.exe** (Windows)
+or **b2** (Linux/macOS), normally `build/windows/Release`, `build/linux/Release`,
+`build/steamdeck/Release` or `build/macos/Release`.
 
 1. Close the game and builder.
 2. Back up `data/user`, `data/local/settings.cfg` and, if present,
-   `data/local/achievements.cfg` beside your current `b2.exe`. These contain your
+   `data/local/achievements.cfg`. These contain your
    saves, settings and achievements. If you imported music, also back up
    `data/local/custom-music`. Back up the `mods` folder as well if you added mods.
 3. Download the latest **Installation.zip** and extract it into your existing
    source folder—the folder containing **Build.cmd**—replacing the source files.
    Keep the existing `build` and `data` folders.
-4. Run **Install.cmd** again and select your XISO. It prepares any missing tools,
-   rebuilds the game and updates game-file locations while preserving your other
-   settings, saves and imported music. Click **Launch game** when the build finishes.
+4. Rerun **Install.cmd** (Windows), **Install.desktop** (Linux/Steam Deck) or
+   **Install.command** (macOS) and select your own US Xbox XISO. Setup prepares
+   missing tools, rebuilds the game and updates game-file locations while
+   preserving your other settings, saves, achievement progress, imported music
+   and mods. Game files are not included in the download.
 
 For a new-folder installation, build it first, then restore your backups to the
-same locations beside the new `b2.exe`. Run **Install.cmd** once more to refresh
-game-file locations while keeping the restored settings.
+same locations beside the new executable. Rerun your platform's installer to
+refresh game-file locations while keeping the restored settings. After moving an
+installation folder, rerun setup to rebuild and refresh shortcut paths.
+`bash Install.sh --shortcuts-only` recreates a Linux/macOS shortcut without
+rebuilding an installation that remains in place.
 
 ### Game settings
 
@@ -221,7 +222,9 @@ Mods and imported music use a game restart. Hover over options for details.
 
 - **General:** Set the refresh rate or **Unlimited**, show FPS, and enable
   **Discord Rich Presence**. Presence is off by default and requires Discord desktop.
-- **Graphics:** Choose resolution, aspect ratio, V-sync and Windows HDR output.
+- **Graphics:** Choose resolution, aspect ratio, camera FOV, V-sync and Windows HDR output.
+  Camera FOV uses percentages (50-150%). **100%** or **Reset** restores the
+  original view. Camera zoom effects are preserved. Changes apply immediately.
   Enable HDR in Windows first; hover over its controls for brightness guidance.
 - **Enhancements:** Set antialiasing, texture filtering, ambient occlusion and
   draw distance. **Miscellaneous** contains Clean HUD, Fast load, Motion blur
@@ -232,9 +235,16 @@ Mods and imported music use a game restart. Hover over options for details.
 - **Controls:** Select **Keyboard** or **Controller 1–4**, click a binding, then
   press the new control. Each player keeps separate mappings. Esc cancels capture.
 - **Achievements:** View progress, pause tracking or reset achievement progress.
-- **Mods:** Add files to the mods folder, **Refresh**, enable mods and arrange
-  their order. Lower enabled mods take priority; **Check mods** reports conflicts.
-  Scripts and executable patches are unsupported. See [BUILDING.txt](BUILDING.txt).
+- **Mods:** For texture packs, extract the download, click **Install texture
+  pack...**, and select the folder containing `mod.cfg`. The pack is installed
+  and enabled automatically; start or restart the game to apply it. Use the
+  checkboxes to disable packs and the arrows to change priority. Lower enabled
+  packs/mods take priority; **Check mods** validates images and reports conflicts.
+  Game file mods can still be added through **Open folder**, then **Refresh**.
+  Sandboxed Lua scripts can set session FOV, display messages and react to
+  supported gameplay events. Test Mod shows a confirmation at startup and your
+  finishing position after a race. Executable patches and arbitrary game-memory
+  access are unsupported. See [BUILDING.txt](BUILDING.txt).
 - **Diagnostics:** View logs, capture frames or record performance.
 
 Press **F9** to start or stop a performance recording. Reports are saved under

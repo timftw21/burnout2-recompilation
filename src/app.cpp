@@ -5,6 +5,8 @@
 #include "diagnostics.h"
 #include "custom_music.h"
 #include "mods.h"
+#include "mod_scripts.h"
+#include "texture_packs.h"
 #include "achievements.h"
 #include "discord.h"
 #include <SDL3/SDL.h>
@@ -99,7 +101,7 @@ struct Preferences {
     bool custom_music=false,loop_track=false,mute_on_focus_loss=false;
     bool skip_intro=false,fast_load=false,clean_hud=true;
     bool discord_presence=false;
-    int draw_distance=1;
+    int draw_distance=1,camera_fov=100;
     KeyboardBindings bindings=default_keyboard_bindings();
     ControllerProfiles controller_bindings=default_controller_profiles();
     explicit Preferences(bool load=true,const std::filesystem::path& path="data/local/settings.cfg") {
@@ -142,6 +144,7 @@ struct Preferences {
             else if(key=="clean_hud") clean_hud=value=="1";
             else if(key=="mod" && valid_mod_id(value) && enabled_mods.size()<128 &&
                     std::ranges::find(enabled_mods,value)==enabled_mods.end()) enabled_mods.push_back(value);
+            else if(key=="camera_fov") number(camera_fov,50,150);
             else if(key=="highest_lod" || key=="unlimited_distance") legacy_distance|=value=="1";
             else if(key=="draw_distance") {
                 int candidate=0;number(candidate,1,4);
@@ -175,6 +178,7 @@ struct Preferences {
         file<<"xbe="<<xbe.data()<<"\ndisc="<<disc.data()<<"\nvsync="<<vsync<<"\nfullscreen="<<fullscreen<<"\nkeyboard="<<keyboard
             <<"\nrefresh_rate="<<refresh_rate<<"\nvolume="<<volume<<"\nmuted="<<muted<<"\nmute_on_focus_loss="<<mute_on_focus_loss
             <<"\nresolution_scale="<<resolution_scale<<"\nshow_fps="<<show_fps<<"\nwidescreen="<<(aspect_ratio!=0)<<"\naspect_ratio="<<aspect_ratio
+            <<"\ncamera_fov="<<camera_fov
             <<"\nantialiasing="<<antialiasing<<"\nanisotropy="<<anisotropy
             <<"\nambient_occlusion="<<ambient_occlusion<<"\nambient_occlusion_strength="<<ambient_occlusion_strength
             <<"\nhdr="<<hdr<<"\nhdr_paper_white="<<hdr_paper_white<<"\nhdr_peak="<<hdr_peak
@@ -448,6 +452,12 @@ struct App {
     std::vector<ModConflict> mod_conflicts;
     std::string mods_status;
     bool mods_error=false;
+    std::shared_ptr<MusicFolderSelection> texture_pack_selection;
+    std::future<Mod> texture_pack_install;
+    std::optional<unsigned> script_fov;
+    std::vector<ScriptMessage> script_messages;
+    std::size_t script_message_index=0;
+    std::uint64_t script_message_started=0;
     bool music_importing=false,music_import_requested=false,music_restart=false;
     std::vector<int> refresh_rates;
     float display_refresh=0;
@@ -530,7 +540,7 @@ struct App {
         }
         logo.Reset();input.reset();controls.reset();renderer.reset();if(window) SDL_DestroyWindow(window);window=nullptr;SDL_Quit();
     }
-    ~App() {music_import.cancel();save_settings();save_achievements(true);cleanup();}
+    ~App() {music_import.cancel();finish_texture_pack_install(true);save_settings();save_achievements(true);cleanup();}
     void log_message(std::string message) {
         if(message.empty()) return;
         if(log_messages.size()==64) log_messages.pop_front();
@@ -696,9 +706,44 @@ struct App {
             log_message("Performance saved: "+directory.string());
         } catch(const std::exception& error) {performance.reset();log_message(error.what());}
     }
+    unsigned active_camera_fov() const {return script_fov.value_or(unsigned(settings.camera_fov));}
+    void receive_script_output(const ScriptResult& output) {
+        if(output.camera_fov) script_fov=output.camera_fov;
+        if(script_message_index) {
+            script_messages.erase(script_messages.begin(),script_messages.begin()+script_message_index);script_message_index=0;
+        }
+        bool full=false;
+        const auto enqueue=[&](const std::string& id,const std::string& text) {
+            if(script_messages.size()==128) {full=true;return;}
+            const auto mod=std::ranges::find(available_mods,id,&Mod::id);
+            script_messages.push_back({mod==available_mods.end()?id:mod->name,text,true});
+        };
+        for(const auto& message:output.messages) {
+            log_message(message.mod+": "+message.text);
+            if(message.on_screen) enqueue(message.mod,message.text);
+        }
+        for(const auto& error:output.errors) {
+            log_message(error.mod+": "+error.text);
+            if(error.mod!="events") enqueue(error.mod,"Gameplay script disabled. See Diagnostics.");
+        }
+        if(full) log_message("Mod message queue full; additional notices were skipped.");
+    }
+    void script_toast() {
+        if(!playing || !first_source) return;
+        while(script_message_index<script_messages.size() && !script_messages[script_message_index].on_screen) ++script_message_index;
+        if(script_message_index>=script_messages.size()) return;
+        const auto now=SDL_GetTicksNS();
+        if(!script_message_started) script_message_started=now;
+        if(now-script_message_started>=5000000000ULL) {++script_message_index;script_message_started=0;return;}
+        const auto& message=script_messages[script_message_index];const auto* viewport=ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos({viewport->WorkPos.x+viewport->WorkSize.x*.5f,viewport->WorkPos.y+viewport->WorkSize.y-24},ImGuiCond_Always,{.5f,1});
+        ImGui::SetNextWindowSize({std::min(500.f,viewport->WorkSize.x-32),0});ImGui::SetNextWindowBgAlpha(.94f);
+        ImGui::Begin("Mod message",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoInputs|ImGuiWindowFlags_NoFocusOnAppearing);
+        ImGui::TextDisabled("%s",message.mod.c_str());ImGui::TextWrapped("%s",message.text.c_str());ImGui::End();
+    }
     std::string benchmark_settings() const {
-        return std::format("\"refresh_rate\":{},\"resolution_scale\":{},\"output_resolution_scale\":{},\"draw_distance\":{},\"widescreen\":{},\"aspect_ratio\":{},\"motion_blur\":{},\"vsync\":{}",
-            settings.refresh_rate,active_scale,settings.resolution_scale,settings.draw_distance,active_widescreen,active_aspect_ratio,active_motion_blur,settings.vsync);
+        return std::format("\"refresh_rate\":{},\"resolution_scale\":{},\"output_resolution_scale\":{},\"draw_distance\":{},\"widescreen\":{},\"aspect_ratio\":{},\"camera_fov_percent\":{},\"motion_blur\":{},\"vsync\":{}",
+            settings.refresh_rate,active_scale,settings.resolution_scale,settings.draw_distance,active_widescreen,active_aspect_ratio,active_camera_fov(),active_motion_blur,settings.vsync);
     }
     void stop_benchmark() {
         if(!benchmark_started) return;
@@ -841,6 +886,16 @@ struct App {
         SDL_Event event;
         while(SDL_PollEvent(&event)) this->event(event);
         update_cursor();
+        if(texture_pack_selection && texture_pack_selection->finished.load(std::memory_order_acquire)) {
+            const auto selected=std::move(texture_pack_selection);
+            if(!selected->error.empty()) {mods_status=selected->error;mods_error=true;}
+            else if(!selected->path.empty()) {
+                const auto source=utf8_path(selected->path),root=mods_root;
+                texture_pack_install=std::async(std::launch::async,[source,root] {return install_texture_pack(source,root);});
+                mods_status="Installing texture pack...";mods_error=false;
+            }
+        }
+        finish_texture_pack_install();
         if(file_selection && file_selection->finished.load(std::memory_order_acquire)) {
             if(!file_selection->error.empty()) log_message(file_selection->error);
             else if(!file_selection->path.empty()) {
@@ -903,19 +958,50 @@ struct App {
         try {available_mods=discover_mods(mods_root);}
         catch(const std::exception& error) {mods_status=error.what();mods_error=true;}
     }
+    void browse_texture_pack() {
+        texture_pack_selection=std::make_shared<MusicFolderSelection>();
+        auto* request=new std::shared_ptr<MusicFolderSelection>(texture_pack_selection);
+        SDL_ShowOpenFolderDialog([](void* userdata,const char* const* files,int) {
+            std::unique_ptr<std::shared_ptr<MusicFolderSelection>> request(static_cast<std::shared_ptr<MusicFolderSelection>*>(userdata));
+            auto& result=**request;
+            if(!files) result.error=SDL_GetError();else if(files[0]) result.path=files[0];
+            result.finished.store(true,std::memory_order_release);
+        },request,window,nullptr,false);
+    }
+    void finish_texture_pack_install(bool wait=false) {
+        if(!texture_pack_install.valid() || (!wait && texture_pack_install.wait_for(std::chrono::seconds(0))!=std::future_status::ready)) return;
+        try {
+            const auto pack=texture_pack_install.get();refresh_mods();
+            bool enabled=std::ranges::find(settings.enabled_mods,pack.id)!=settings.enabled_mods.end();
+            if(!enabled && settings.enabled_mods.size()<128) {settings.enabled_mods.push_back(pack.id);enabled=true;settings_dirty=true;}
+            mods_error=false;mods_status=enabled?"Installed and enabled "+pack.name+(playing?". Restart the game to use it.":". Start the game to use it."):
+                "Installed "+pack.name+". Disable another mod before enabling this pack.";
+            save_settings();
+        } catch(const std::exception& error) {mods_status=error.what();mods_error=true;}
+    }
     bool mods_interface() {
         bool changed=false;
+        ImGui::SeparatorText("TEXTURE PACKS");
+        ImGui::BeginDisabled(texture_pack_selection || texture_pack_install.valid());
+        if(ImGui::Button("Install texture pack...")) browse_texture_pack();
+        setting_help("Select the extracted pack folder containing mod.cfg. Installs and enables the pack; selecting an updated copy replaces the installed version.");
+        ImGui::EndDisabled();
+        ImGui::TextWrapped("Downloaded a ZIP? Extract it first, then choose the folder containing mod.cfg.");
+        if(!mods_status.empty()) {
+            if(mods_error) ImGui::PushStyleColor(ImGuiCol_Text,ImVec4{1,.55f,.42f,1});
+            ImGui::TextWrapped("%s",mods_status.c_str());
+            if(mods_error) ImGui::PopStyleColor();
+        }
+        ImGui::Spacing();ImGui::SeparatorText("INSTALLED PACKS & MODS");
         ImGui::TextWrapped(playing?"Restart the game to apply changes.":"Enable the mods you want to use.");
-        ImGui::PushFont(italic_font,0);
-        ImGui::TextWrapped("Mod support currently covers replacement game files. Scripts and executable patches are not yet supported.");
-        ImGui::PopFont();
+        ImGui::BeginDisabled(texture_pack_install.valid());
         const bool reorder=settings.enabled_mods.size()>1;
         std::string action;int direction=0;
         if(available_mods.empty() && settings.enabled_mods.empty()) {
-            disabled_text("No mods installed.");
+            disabled_text("No packs or mods installed. Use Install texture pack to add your first pack.");
         } else if(ImGui::BeginTable("Mods list",reorder?3:2,ImGuiTableFlags_RowBg|ImGuiTableFlags_BordersInnerH|ImGuiTableFlags_PadOuterX)) {
             ImGui::TableSetupColumn("Enabled",ImGuiTableColumnFlags_WidthFixed,ImGui::CalcTextSize("Enabled").x);
-            ImGui::TableSetupColumn("Mod",ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Pack / Mod",ImGuiTableColumnFlags_WidthStretch);
             if(reorder) ImGui::TableSetupColumn("Order",ImGuiTableColumnFlags_WidthFixed,ImGui::GetFrameHeight()*2+ImGui::GetStyle().ItemSpacing.x);
             ImGui::TableHeadersRow();
             const auto row=[&](const std::string& id,const Mod* mod,std::size_t order) {
@@ -944,9 +1030,11 @@ struct App {
                     if(ImGui::CalcTextSize(mod?mod->name.c_str():id.c_str()).x>ImGui::GetContentRegionAvail().x)
                         ImGui::TextWrapped("%s",mod?mod->name.c_str():id.c_str());
                     if(mod) {
+                        ImGui::TextUnformatted(mod->texture_pack?"Texture pack":mod->files.empty() && mod->script?"Lua script mod":"Game file mod");
+                        if(mod->script) ImGui::TextWrapped("Startup script: %s (Lua API 1)",mod->script->path.c_str());
                         if(!mod->version.empty()) ImGui::TextWrapped("Version: %s",mod->version.c_str());
                         if(!mod->author.empty()) ImGui::TextWrapped("Author: %s",mod->author.c_str());
-                        disabled_text("%zu %s",mod->files.size(),mod->files.size()==1?"file":"files");
+                        disabled_text("%zu %s",mod->files.size(),mod->texture_pack?(mod->files.size()==1?"texture":"textures"):(mod->files.size()==1?"file":"files"));
                     }
                     ImGui::TextWrapped("Folder: %s",id.c_str());
                 }
@@ -983,7 +1071,7 @@ struct App {
             else settings.enabled_mods.push_back(action);
             changed=true;mod_conflicts.clear();mods_status.clear();mods_error=false;
         }
-        if(reorder) ImGui::TextWrapped("If files overlap, the lower enabled mod is used.");
+        if(reorder) ImGui::TextWrapped("Lower enabled mods take priority for overlapping files, textures and scripted settings.");
         ImGui::Spacing();
         if(ImGui::Button("Open folder")) {
             try {
@@ -1006,26 +1094,26 @@ struct App {
         };
         toolbar_next("Refresh");if(ImGui::Button("Refresh")) refresh_mods();
         setting_help("Find newly installed or edited mods.");
-        toolbar_next("Check mods");ImGui::BeginDisabled(settings.enabled_mods.empty());
+        toolbar_next("Check mods");ImGui::BeginDisabled(settings.enabled_mods.empty() || playing);
         if(ImGui::Button("Check mods")) {
             try {
                 Xbe image(utf8_path(settings.xbe.data()));Disc disc(utf8_path(settings.disc.data()));
                 if(!image.supported() || disc.sha256(disc.find("default.xbe"))!=image.sha256)
                     throw std::runtime_error("Select the supported original executable and disc in Game files first.");
                 Mods mounted(mods_root,settings.enabled_mods,disc);mod_conflicts=mounted.conflicts();
+                const auto bytes=validate_texture_packs(mounted.textures());
+                const auto scripts=run_startup_scripts(mounted.scripts(),unsigned(settings.camera_fov));
+                mod_conflicts.insert(mod_conflicts.end(),scripts.conflicts.begin(),scripts.conflicts.end());
                 mods_error=false;
-                mods_status=mod_conflicts.empty()?"Enabled mods passed file checks.":std::format("{} file conflict{}.",mod_conflicts.size(),mod_conflicts.size()==1?"":"s");
+                mods_status=std::format("Checks passed. {} textures ({:.1f} MiB), {} startup scripts, {} conflicts.",mounted.textures().size(),bytes/1048576.0,scripts.runs.size(),mod_conflicts.size());
                 diagnostic_record(mounted.report());
+                if(!scripts.runs.empty()) diagnostic_record(scripts.report());
             } catch(const std::exception& error) {mod_conflicts.clear();mods_status=error.what();mods_error=true;}
         }
-        setting_help("Check enabled mods against your original disc and find files changed by more than one mod. Edited assets must still use the game's original formats.");
+        setting_help("Before starting the game, validate replacement images, startup scripts and overlapping content against your original disc. Gameplay callbacks are checked when their events occur.");
         ImGui::EndDisabled();
-        if(!mods_status.empty()) {
-            if(mods_error) ImGui::PushStyleColor(ImGuiCol_Text,ImVec4{1,.55f,.42f,1});
-            ImGui::TextWrapped("%s",mods_status.c_str());
-            if(mods_error) ImGui::PopStyleColor();
-        }
-        if(!mod_conflicts.empty() && ImGui::CollapsingHeader("File conflicts")) {
+        ImGui::EndDisabled();
+        if(!mod_conflicts.empty() && ImGui::CollapsingHeader("Mod conflicts")) {
             const auto name=[&](const std::string& id) {
                 const auto mod=std::ranges::find(available_mods,id,&Mod::id);
                 return mod==available_mods.end()?id.c_str():mod->name.c_str();
@@ -1034,7 +1122,8 @@ struct App {
         }
         ImGui::Spacing();
         if(ImGui::CollapsingHeader("Adding mods")) {
-            ImGui::TextWrapped("Place each mod in its own folder, then refresh the list. A mod contains mod.cfg and a files folder matching the disc paths. See BUILDING.txt for creation steps.");
+            ImGui::TextWrapped("Texture packs use mod.cfg and a textures folder of PNGs. Packs for other games or emulators need conversion. Pack textures take priority over Clean HUD. See BUILDING.txt for pack creation steps.");
+            ImGui::TextWrapped("Game file mods use mod.cfg and a files folder matching the disc paths. Lua scripts use script=startup.lua and script_api=1; they can register gameplay event handlers. Place each mod in its own folder, then refresh. See BUILDING.txt for script creation and the supported events. Executable patches and arbitrary game-memory access are unsupported.");
             ImGui::TextWrapped("Folder: %s",path_text(mods_root).c_str());
         }
         return changed;
@@ -1218,6 +1307,15 @@ struct App {
                         setting_label("Aspect ratio");
                         changed|=ImGui::Combo("##Aspect ratio",&settings.aspect_ratio,aspects,int(std::size(aspects)));
                         setting_help("Wider views reveal more of the scene horizontally. HUD proportions and edge placement are preserved. Applies immediately.");
+                        setting_label("Camera FOV");
+                        int fov_percent=int(active_camera_fov());
+                        const auto reset_width=ImGui::CalcTextSize("Reset").x+ImGui::GetStyle().FramePadding.x*2;
+                        ImGui::SetNextItemWidth(std::max(1.f,ImGui::GetContentRegionAvail().x-reset_width-ImGui::GetStyle().ItemSpacing.x));
+                        if(ImGui::SliderInt("##Camera FOV",&fov_percent,50,150,"%d%%",ImGuiSliderFlags_AlwaysClamp)) {script_fov.reset();settings.camera_fov=fov_percent;changed=true;}
+                        setting_help("Adjusts the driving and replay field of view relative to the original camera. 100% restores the original view. Camera zoom effects and HUD size are preserved. Applies immediately.");
+                        ImGui::SameLine();
+                        if(ImGui::Button("Reset##Camera FOV",{reset_width,0})) {script_fov.reset();settings.camera_fov=100;changed=true;}
+                        setting_help("Restores the original camera field of view (100%).");
                         changed|=ImGui::Checkbox("V-sync",&settings.vsync);
                         setting_help("Synchronizes presentation with the display to prevent tearing. The display's refresh rate limits the maximum frame rate.");
                         if(ImGui::Checkbox("Fullscreen",&settings.fullscreen)) {
@@ -1401,7 +1499,7 @@ struct App {
             const auto footer=ImGui::GetCursorPos();
             if(available-row_width>175) {ImGui::AlignTextToFramePadding();disabled_text("Changes save automatically");}
             ImGui::SetCursorPos({footer.x+available-row_width,footer.y});
-            ImGui::BeginDisabled(music_importing || music_import_requested);
+            ImGui::BeginDisabled(music_importing || music_import_requested || texture_pack_selection || texture_pack_install.valid());
             ImGui::PushStyleColor(ImGuiCol_Text,ImVec4{.08f,.07f,.06f,1});
             ImGui::PushStyleColor(ImGuiCol_Button,ImVec4{1,.49f,.19f,1});
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered,ImVec4{1,.61f,.34f,1});
@@ -1438,6 +1536,7 @@ struct App {
             ImGui::TextUnformatted("Recording performance - F9 saves");ImGui::End();
         }
         achievement_toast();
+        script_toast();
         ImGui::Render();ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         if(!pending_window_capture.empty()) {
             PerfScope capture(&performance,PerfPhase::capture);
@@ -1515,14 +1614,14 @@ struct App {
             renderer->configure(selected.resolution_scale,selected.antialiasing,selected.anisotropy,
                 unsigned(selected.ambient_occlusion),selected.ambient_occlusion_strength/100.0f,selected.hdr_options());
             if(game) game->settings({selected.aspect_ratio!=0,selected.aspect_ratio==2,selected.motion_blur,
-                selected.skip_intro,selected.fast_load,selected.clean_hud,unsigned(selected.draw_distance)});
+                selected.skip_intro,selected.fast_load,selected.clean_hud,unsigned(selected.draw_distance),script_fov.value_or(unsigned(selected.camera_fov))});
             renderer->clean_hud(selected.clean_hud);renderer->aspect_ratio(selected.aspect());
         };
         try {apply(settings);}
         catch(const std::exception& error) {
             apply(applied_settings);
             for(auto member:{&Preferences::resolution_scale,&Preferences::antialiasing,&Preferences::anisotropy,
-                &Preferences::ambient_occlusion,&Preferences::ambient_occlusion_strength,&Preferences::aspect_ratio,&Preferences::draw_distance,
+                &Preferences::ambient_occlusion,&Preferences::ambient_occlusion_strength,&Preferences::aspect_ratio,&Preferences::draw_distance,&Preferences::camera_fov,
                 &Preferences::hdr_paper_white,&Preferences::hdr_peak})
                 settings.*member=applied_settings.*member;
             for(auto member:{&Preferences::motion_blur,&Preferences::skip_intro,&Preferences::fast_load,&Preferences::clean_hud,&Preferences::hdr})
@@ -1553,17 +1652,21 @@ struct App {
         host.widescreen=active_widescreen;
         host.ultrawide=active_aspect_ratio==2;host.motion_blur=active_motion_blur;
         host.skip_intro=settings.skip_intro;host.fast_load=settings.fast_load;host.clean_hud=settings.clean_hud;host.draw_distance=unsigned(settings.draw_distance);
+        host.camera_fov=unsigned(settings.camera_fov);
         if(settings.custom_music && music_songs) host.custom_music_root=music_cache();
         host.mods_root=mods_root;host.enabled_mods=settings.enabled_mods;
         host.loop_track=settings.loop_track;
         host.music_loop_changed=[this](bool enabled) {settings.loop_track=enabled;settings_dirty=true;save_settings();};
         host.achievements=&achievements;
+        host.script_output=[this](const ScriptResult& output) {receive_script_output(output);};
         host.performance=&performance;
         host.trace_io=trace_io;
         host.watch_semaphores=watch_semaphores;
         Xbox xbox(image,memory,ram,disc,std::move(host));
         xbox.output_gain(settings.output_gain(focused));
-        struct Session {App& app;~Session(){app.stop_benchmark();app.stop_performance();app.game=nullptr;app.playing=false;app.show_settings=true;app.published_at=0;}} session{*this};
+        script_fov.reset();script_messages.clear();script_message_index=0;script_message_started=0;
+        receive_script_output(xbox.startup_scripts());
+        struct Session {App& app;~Session(){app.stop_benchmark();app.stop_performance();app.game=nullptr;app.playing=false;app.show_settings=true;app.published_at=0;app.script_fov.reset();app.script_messages.clear();}} session{*this};
         game=&xbox;playing=true;show_settings=false;cancel_bindings();frames=first_frame=last_frame=published_at=first_source=last_source=0;pacer={};source_pacer={};display_rate={};game_rate={};memory_snapshot="[]";
         auto result=xbox.run(0);
         if(launch && running) {
@@ -1609,8 +1712,8 @@ struct App {
         }
         const auto fps=last_frame>first_frame?(frames-1)*1000000000.0/(last_frame-first_frame):0;
         const auto source_fps=last_source>first_source?(stats.published_frames-1)*1000000000.0/(last_source-first_source):0;
-        report<<std::format("],\"adapter\":{},\"shader_compilations\":{},\"uploaded_vertex_bytes\":{},\"reused_vertex_bytes\":{},\"vblank_callbacks\":{},\"refresh_rate\":{},\"resolution_scale\":{},\"widescreen\":{},\"aspect_ratio\":{},\"motion_blur\":{},\"source_fps\":{:.3f},\"presented_fps\":{:.3f},\"original_camera_far\":{},\"camera_far\":{},\"original_world_sections\":{},\"extra_world_sections\":{},\"extra_world_batches\":{},\"display_refresh\":{},\"output_resolution_scale\":{},\"memory\":{}}}",
-            json(result.graphics_adapter),stats.shader_compilations,stats.vertex_bytes,stats.reused_vertex_bytes,result.vblank_callbacks,settings.refresh_rate,active_scale,active_widescreen,active_aspect_ratio,active_motion_blur,source_fps,fps,result.original_camera_far,result.camera_far,result.original_world_sections,result.extra_world_sections,result.extra_world_batches,display_refresh,settings.resolution_scale,memory_snapshot);
+        report<<std::format("],\"adapter\":{},\"shader_compilations\":{},\"uploaded_vertex_bytes\":{},\"reused_vertex_bytes\":{},\"vblank_callbacks\":{},\"refresh_rate\":{},\"resolution_scale\":{},\"widescreen\":{},\"aspect_ratio\":{},\"camera_fov_percent\":{},\"motion_blur\":{},\"source_fps\":{:.3f},\"presented_fps\":{:.3f},\"original_camera_far\":{},\"camera_far\":{},\"original_world_sections\":{},\"extra_world_sections\":{},\"extra_world_batches\":{},\"display_refresh\":{},\"output_resolution_scale\":{},\"memory\":{}}}",
+            json(result.graphics_adapter),stats.shader_compilations,stats.vertex_bytes,stats.reused_vertex_bytes,result.vblank_callbacks,settings.refresh_rate,active_scale,active_widescreen,active_aspect_ratio,active_camera_fov(),active_motion_blur,source_fps,fps,result.original_camera_far,result.camera_far,result.original_world_sections,result.extra_world_sections,result.extra_world_batches,display_refresh,settings.resolution_scale,memory_snapshot);
         return report.str();
     }
 };
@@ -1668,6 +1771,7 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
             throw std::runtime_error(SDL_GetError());
     };
     if(app.settings.refresh_rate!=60) throw std::runtime_error("Default refresh rate differs from 60 Hz");
+    if(app.settings.camera_fov!=100) throw std::runtime_error("Camera FOV must default to the original view");
     if(app.settings.fast_load) throw std::runtime_error("Fast load must default to disabled");
     if(app.settings.hdr || app.settings.hdr_paper_white!=200 || app.settings.hdr_peak) throw std::runtime_error("Invalid default HDR settings");
     if(!app.settings.clean_hud) throw std::runtime_error("Clean HUD must preserve the enabled default");
@@ -1683,7 +1787,7 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     saved.custom_music=true;saved.loop_track=true;saved.mute_on_focus_loss=true;copy_text(saved.music_folder.data(),saved.music_folder.size(),"Music/Custom playlist");
     saved.antialiasing=6;saved.anisotropy=16;saved.ambient_occlusion=3;saved.ambient_occlusion_strength=47;
     saved.hdr=true;saved.hdr_paper_white=240;saved.hdr_peak=800;saved.discord_presence=true;
-    saved.skip_intro=true;saved.fast_load=true;saved.clean_hud=false;saved.draw_distance=4;
+    saved.skip_intro=true;saved.fast_load=true;saved.clean_hud=false;saved.draw_distance=4;saved.camera_fov=75;
     saved.enabled_mods={"paint","sound"};
     saved.controller_bindings[0][15]={ControllerSource::button,SDL_GAMEPAD_BUTTON_SOUTH};
     saved.controller_bindings[1][16]={ControllerSource::negative_axis,SDL_GAMEPAD_AXIS_RIGHTX};saved.controller_bindings[3][4]={};
@@ -1707,7 +1811,7 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     }
     if(restored.bindings!=saved.bindings || restored.controller_bindings!=saved.controller_bindings || restored.resolution_scale!=3 || restored.refresh_rate!=144 || !restored.show_fps || restored.aspect_ratio!=2 || restored.motion_blur ||
        !restored.custom_music || !restored.loop_track || !restored.mute_on_focus_loss || restored.music_folder!=saved.music_folder || restored.antialiasing!=6 || restored.anisotropy!=16 || restored.ambient_occlusion!=3 || restored.ambient_occlusion_strength!=47 ||
-       !restored.skip_intro || !restored.fast_load || restored.clean_hud || restored.draw_distance!=4 || restored.enabled_mods!=saved.enabled_mods ||
+       !restored.skip_intro || !restored.fast_load || restored.clean_hud || restored.draw_distance!=4 || restored.camera_fov!=75 || restored.enabled_mods!=saved.enabled_mods ||
        !restored.hdr || restored.hdr_paper_white!=240 || restored.hdr_peak!=800 || !restored.discord_presence)
         throw std::runtime_error("New settings did not survive save/load");
     restored.volume=37;
@@ -1734,6 +1838,16 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
         saved.draw_distance=value;saved.save(preferences);
         if(Preferences(true,preferences).draw_distance!=value) throw std::runtime_error("Draw distance did not survive save/load");
     }
+    for(const auto value:{50,75,100,150}) {
+        saved.camera_fov=value;saved.save(preferences);
+        if(Preferences(true,preferences).camera_fov!=value) throw std::runtime_error("Camera FOV did not survive save/load");
+    }
+    for(const auto value:{-1,0,49,151}) {
+        {std::ofstream file(preferences);file<<"camera_fov="<<value<<'\n';}
+        if(Preferences(true,preferences).camera_fov!=100) throw std::runtime_error("Invalid camera FOV replaced the original view");
+    }
+    {std::ofstream file(preferences);file<<"camera_fov_degrees=75\n";}
+    if(Preferences(true,preferences).camera_fov!=100) throw std::runtime_error("Legacy FOV degrees were treated as a percentage");
     saved.select_refresh_rate(0);saved.save(preferences);
     if(Preferences(true,preferences).refresh_rate) throw std::runtime_error("Unlimited refresh rate did not survive save/load");
     FramePacer unlimited;
@@ -1773,10 +1887,28 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     if(automatic.bindings[15]!=SDL_SCANCODE_Z || app.settings_dirty) throw std::runtime_error("Edited settings were not saved when closing settings");
     app.event(escape);
     app.log_message("Starting game...");
+    {
+        app.mods_root=std::filesystem::absolute(preferences).concat(".mods").lexically_normal();
+        const auto download=std::filesystem::path(preferences).concat(".download")/"window-preview";
+        std::filesystem::create_directories(download.parent_path());create_mod(download,"HD texture pack",true);
+        save_png({1,1,{std::byte{255},std::byte{128},std::byte{0},std::byte{255}}},download/"textures"/(std::string(40,'a')+".png"));
+        // Exercise the asynchronous folder-selection result without opening a dialog.
+        app.texture_pack_selection=std::make_shared<MusicFolderSelection>();
+        app.texture_pack_selection->path=path_text(std::filesystem::absolute(download));
+        app.texture_pack_selection->finished.store(true,std::memory_order_release);
+        app.playing=true;const auto deadline=SDL_GetTicksNS()+10000000000ULL;
+        do {app.poll();SDL_Delay(1);} while(app.texture_pack_install.valid() && SDL_GetTicksNS()<deadline);
+        if(app.texture_pack_install.valid() || app.mods_error || app.launch || app.available_mods.size()!=1 ||
+           !app.available_mods[0].texture_pack || app.settings.enabled_mods!=std::vector<std::string>{"window-preview"} ||
+           Preferences(true,preferences).enabled_mods!=app.settings.enabled_mods || app.mods_status.find("Restart")==std::string::npos)
+            throw std::runtime_error("Settings texture pack installation did not persist or changed the active session");
+        app.playing=false;
+    }
     constexpr const char* names[]={"game-files","general","audio","graphics","enhancements","controls","achievements","mods","log"};
     std::ostringstream images;images<<'[';
     for(int tab=0;tab<int(std::size(names));++tab) {
         app.select_category=tab;
+        app.script_fov=tab==3?std::optional<unsigned>{125}:std::nullopt;
         app.playing=tab==1;
         for(unsigned frame=0;frame<3;++frame) {
             app.poll();app.renderer->begin(0xFF16344A);app.renderer->end();
@@ -1792,12 +1924,35 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
         images<<std::format("{{\"category\":{},\"image\":{}}}",json(names[tab]),json(path_text(output)));
         app.renderer->present(false);
     }
+    app.script_fov.reset();
     // Reopen a panel after mouse focus, then verify keyboard focus still works.
     // Escape must only toggle settings, not select the child panel itself.
     const auto settings_frame=[&](bool present=true) {
         app.renderer->begin(0xFF16344A);app.renderer->end();app.renderer->display();
         app.settings_interface();if(present) app.renderer->present(false);
     };
+    {
+        const auto script=path.parent_path()/"test-mod-startup.lua";write_text(script,test_mod_script,false);
+        const ModFile file{"startup.lua",script,unsigned(test_mod_script.size()),"modding-test"};
+        ModScripts scripts(std::span(&file,1));const auto& result=scripts.startup();
+        if(result.messages.size()!=1 || !result.messages[0].on_screen) throw std::runtime_error("Test Mod did not queue its Lua confirmation");
+        app.script_messages=result.messages;app.script_messages[0].mod="Test Mod";
+        app.script_message_index=0;app.script_message_started=0;app.first_source=1;app.playing=true;app.show_settings=false;
+        for(unsigned frame=0;frame<3;++frame) settings_frame(frame!=2);
+        if(!app.script_message_started || !ImGui::GetDrawData()->TotalVtxCount) throw std::runtime_error("Lua startup message did not draw over the game");
+        auto output=path.parent_path()/path.stem();output+="-script-message.png";save_png(app.renderer->read_display(),output);
+        images<<std::format(",{{\"category\":\"script-message\",\"image\":{}}}",json(path_text(output)));app.renderer->present(false);
+        app.script_messages.clear();app.script_message_index=0;app.script_message_started=0;
+        scripts.events().push({.type=ScriptEventType::race_finish,.player=1,.position=2,.mode=1});
+        const auto event=scripts.dispatch(100);
+        if(!event.errors.empty() || event.messages.size()!=1 || event.messages[0].text!="Test Mod: finished in position 2.")
+            throw std::runtime_error("Test Mod did not react to a race finish");
+        app.receive_script_output(event);app.script_messages[0].mod="Test Mod";
+        for(unsigned frame=0;frame<3;++frame) settings_frame(frame!=2);
+        output=path.parent_path()/path.stem();output+="-script-event.png";save_png(app.renderer->read_display(),output);
+        images<<std::format(",{{\"category\":\"script-event\",\"image\":{}}}",json(path_text(output)));app.renderer->present(false);
+        app.script_messages.clear();app.script_message_index=0;app.script_message_started=0;app.first_source=0;app.playing=false;app.show_settings=true;
+    }
     {
         // Exercise the settings workflow with an isolated virtual controller,
         // without starting the game or reading the user's physical controls.
@@ -2121,9 +2276,9 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
         throw std::runtime_error("Exit did not cancel launch and save pending settings");
     std::filesystem::remove(preferences);
     return std::format("{{\"format\":\"b2-window-check-v4\",\"passed\":true,\"backend\":\"SDL3/D3D11/ImGui\",\"adapter\":{},\"window\":{},\"settings_font\":{},\"heading_font\":{},\"default_refresh_rate\":60,"
-        "\"bindings_and_settings\":true,\"controller_remapping\":true,\"controller_capture\":true,\"automatic_settings_save\":true,\"restart_request\":true,\"exit_request\":true,\"widescreen_presentation\":true,\"ultrawide_presentation\":true,\"motion_blur_setting\":true,\"frame_counter\":true,\"counter_image\":{},\"escape_toggle\":true,\"resolution_change\":true,"
+        "\"bindings_and_settings\":true,\"camera_fov_setting\":true,\"controller_remapping\":true,\"controller_capture\":true,\"automatic_settings_save\":true,\"restart_request\":true,\"exit_request\":true,\"widescreen_presentation\":true,\"ultrawide_presentation\":true,\"motion_blur_setting\":true,\"frame_counter\":true,\"counter_image\":{},\"escape_toggle\":true,\"resolution_change\":true,"
         "\"pacing_60_hz\":{:.3f},\"pacing_120_hz\":{:.3f},\"source_at_120_hz\":{:.3f},\"source_at_144_hz\":{:.3f},\"display_120_hz\":{:.3f},\"display_144_hz\":{:.3f},\"hdr_settings\":true,\"hdr_switching\":true,\"hdr_display_available\":{},"
-        "\"achievements_save_load\":true,\"achievements_reset\":true,\"achievement_reset_confirmation\":true,\"achievements_disable\":true,\"achievement_notification\":true,\"achievement_sound\":true,\"achievement_fades\":true,\"window_capture\":true,\"performance_capture\":true,\"shader_compilations\":0,\"game_booted\":false,\"game_fps_established\":false,\"images\":{}}}",
+        "\"achievements_save_load\":true,\"achievements_reset\":true,\"achievement_reset_confirmation\":true,\"achievements_disable\":true,\"achievement_notification\":true,\"achievement_sound\":true,\"achievement_fades\":true,\"texture_pack_install\":true,\"window_capture\":true,\"performance_capture\":true,\"shader_compilations\":0,\"game_booted\":false,\"game_fps_established\":false,\"images\":{}}}",
         json(renderer.adapter()),app.window_diagnostic(),json(ImGui::GetIO().FontDefault->GetDebugName()),json(app.heading_font->GetDebugName()),
         json(path_text(counter_image)),measured[0],measured[1],source_rates[0],source_rates[1],display_rates[0],display_rates[1],renderer.hdr_status().available,images.str());
 }

@@ -3,6 +3,7 @@
 #include "file.h"
 #include <algorithm>
 #include <cmath>
+#include <numbers>
 #include <ostream>
 
 namespace b2 {
@@ -123,8 +124,13 @@ void Presentation::camera_cut(Cpu& cpu,std::uint32_t wrapper) {
     if(drawing_ || !cpu.game_timing->update) return;
     for(auto& camera:cameras_) if(camera.wrapper==wrapper) camera.cut=true;
 }
+std::optional<std::array<float,3>> Presentation::camera_lens(std::uint32_t address) const {
+    for(const auto& camera:cameras_) if(camera.address==address && camera.rendered_valid) return camera.rendered;
+    return std::nullopt;
+}
 void Presentation::cameras(Cpu& cpu,Memory& memory) {
     const auto& timing=*cpu.game_timing;
+    for(auto& camera:cameras_) camera.rendered_valid=false;
     for(auto& camera:cameras_) if(camera.wrapper && camera.touched+1>=timing.step) {
         // Replay uses the controller at wrapper+98. Its visibility scratch
         // array overlaps the driving camera's first mode record at +170.
@@ -154,12 +160,29 @@ void Presentation::cameras(Cpu& cpu,Memory& memory) {
         unsigned i=0;for(const auto offset:{0x68U,0x6CU,0x80U}) current[i++]=std::bit_cast<float>(memory.load<std::uint32_t>(address+offset));
         if(!cut && camera.step!=timing.step) {camera.previous=camera.current;camera.paired=true;}
         camera.address=address;camera.frame=frame;camera.mode=mode;camera.projection=projection;camera.step=timing.step;camera.current=current;
-        if(!timing.render || !camera.paired || current==camera.previous) continue;
-        const auto fraction=float(double(timing.remainder)/733333333.0);
-        for(i=0;i<3;++i) current[i]=camera.previous[i]+(current[i]-camera.previous[i])*fraction;
+        if(!timing.render) continue;
+        const bool interpolate=camera.paired && current!=camera.previous;
+        const bool adjust_fov=cpu.camera_fov!=100 && projection==1 && current[0]>0 && current[1]>0 &&
+            std::isfinite(current[0]) && std::isfinite(current[1]);
+        if(interpolate) {
+            const auto fraction=float(double(timing.remainder)/733333333.0);
+            for(i=0;i<3;++i) current[i]=camera.previous[i]+(current[i]-camera.previous[i])*fraction;
+        }
+        if(adjust_fov) {
+            // RwCamera +68/+6C are tan(half-angle) view extents. Widen both
+            // axes together, retaining the chosen full/split-screen aspect.
+            constexpr auto radians=std::numbers::pi_v<float>/180.f;
+            const auto half_angle=std::clamp(std::atan(current[1])*cpu.camera_fov/100.f,radians*.5f,radians*85.f);
+            const auto height=std::tan(half_angle);
+            current[0]*=height/current[1];current[1]=height;
+        }
+        camera.rendered=current;camera.rendered_valid=true;
+        if(!interpolate && !adjust_fov) continue;
         // View width, height and near clipping change together in A04A0.
         // Rebuild projection through the original setter, at the same fraction
         // as the pose, then restore all three before the next simulation step.
+        // FOV uses this same scope so authored zoom never compounds or feeds
+        // back into the camera controller, physics or replay simulation.
         for(i=0;i<2;++i) {
             memory.store<std::uint32_t>(address+0x68+i*4,std::bit_cast<std::uint32_t>(current[i]));
             memory.store<std::uint32_t>(address+0x70+i*4,std::bit_cast<std::uint32_t>(1.f/current[i]));

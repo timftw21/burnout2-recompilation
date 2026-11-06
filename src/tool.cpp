@@ -1,6 +1,8 @@
 #include "decoder.h"
 #include "disc.h"
 #include "mods.h"
+#include "mod_scripts.h"
+#include "texture_packs.h"
 #include "recompiler.h"
 #include "batch.h"
 #include "render.h"
@@ -36,6 +38,13 @@ constexpr auto usage =
     "  b2-tool list ISO [DIRECTORY]\n"
     "  b2-tool extract ISO DISC_PATH OUTPUT\n"
     "  b2-tool create-mod MOD_DIRECTORY NAME\n"
+    "  b2-tool create-script-mod MOD_DIRECTORY NAME\n"
+    "  b2-tool check-scripting OUTPUT_DIRECTORY\n"
+    "  b2-tool inspect-scripts ISO MODS_DIRECTORY [MOD_ID ...]\n"
+    "  b2-tool create-texture-pack PACK_DIRECTORY NAME\n"
+    "  b2-tool install-texture-pack PACK_DIRECTORY MODS_DIRECTORY\n"
+    "  b2-tool export-texture-pack DICTIONARY PACK_DIRECTORY NAME [--warp]\n"
+    "  b2-tool check-texture-packs OUTPUT_DIRECTORY [--warp]\n"
     "  b2-tool install-modding-test ISO MODS_DIRECTORY\n"
     "  b2-tool inspect-mods ISO MODS_DIRECTORY [MOD_ID ...]\n"
     "  b2-tool import-interstate BURNOUT_ISO BURNOUT2_ISO OUTPUT_DIRECTORY\n"
@@ -80,6 +89,22 @@ int tool_main(int argc, char** argv) {
         std::string output;
         if(command=="create-mod" && argc==4) {
             output=b2::create_mod(paths[2],argv[3]);
+        } else if(command=="create-script-mod" && argc==4) {
+            output=b2::create_script_mod(paths[2],argv[3]);
+        } else if(command=="check-scripting" && argc==3) {
+            output=b2::check_scripting(paths[2]);
+        } else if(command=="inspect-scripts" && argc>=4 && argc<=132) {
+            std::vector<std::string> enabled;for(int i=4;i<argc;++i) enabled.emplace_back(argv[i]);
+            output=b2::inspect_scripts(paths[2],paths[3],enabled);
+        } else if(command=="create-texture-pack" && argc==4) {
+            output=b2::create_mod(paths[2],argv[3],true);
+        } else if(command=="install-texture-pack" && argc==4) {
+            const auto pack=b2::install_texture_pack(paths[2],paths[3]);
+            output="{\"format\":\"b2-texture-pack-install-v1\",\"id\":"+b2::json(pack.id)+",\"name\":"+b2::json(pack.name)+",\"textures\":"+std::to_string(pack.files.size())+'}';
+        } else if(command=="export-texture-pack" && (argc==5 || (argc==6 && std::string_view(argv[5])=="--warp"))) {
+            output=b2::export_texture_pack(paths[2],paths[3],argv[4],argc==6);
+        } else if(command=="check-texture-packs" && (argc==3 || (argc==4 && std::string_view(argv[3])=="--warp"))) {
+            output=b2::check_texture_packs(paths[2],argc==4);
         } else if(command=="install-modding-test" && argc==4) {
             output=b2::install_modding_test(paths[2],paths[3]);
         } else if(command=="inspect-mods" && argc>=4 && argc<=132) {

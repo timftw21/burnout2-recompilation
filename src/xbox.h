@@ -7,10 +7,12 @@
 
 namespace b2 {
 class Input;
+struct ScriptResult;
 struct GameSettings {
     bool widescreen=false,ultrawide=false,motion_blur=true;
     bool skip_intro=false,fast_load=false,clean_hud=false;
     unsigned draw_distance=1;
+    unsigned camera_fov=100;
 };
 struct XboxHost {
     Renderer* renderer=nullptr;
@@ -26,6 +28,7 @@ struct XboxHost {
     bool skip_intro=false,fast_load=false,clean_hud=false;
     bool audio_output=true;
     unsigned draw_distance=1;
+    unsigned camera_fov=100;
     std::filesystem::path custom_music_root;
     std::filesystem::path imported_tracks;
     std::filesystem::path mods_root;
@@ -33,6 +36,7 @@ struct XboxHost {
     bool loop_track=false;
     std::function<void(bool)> music_loop_changed;
     Achievements* achievements=nullptr;
+    std::function<void(const ScriptResult&)> script_output;
 };
 struct BootIo {
     std::uint32_t ordinal=0,status=0,information=0,callsite=0;
@@ -85,6 +89,7 @@ public:
     void output_gain(float);
     bool fast_loading() const;
     void settings(const GameSettings&); // Apply at a completed game frame.
+    const ScriptResult& startup_scripts() const;
     void capture_frame(const std::filesystem::path& directory,bool automated=false);
     void performance_recording(bool);
     PerfCounters performance_counters() const;

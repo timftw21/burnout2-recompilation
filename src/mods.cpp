@@ -1,4 +1,5 @@
 #include "mods.h"
+#include "mod_scripts.h"
 #include "assets.h"
 #include "target.h"
 #include <algorithm>
@@ -44,16 +45,15 @@ bool asset_path(std::string_view path) {
     }
     return false;
 }
-Mod read_mod(const std::filesystem::path& directory,unsigned& entries) {
+Mod read_mod(const std::filesystem::path& directory,unsigned& entries,bool importing=false,bool metadata_only=false) {
     Mod mod;mod.id=path_text(directory.filename());mod.name=mod.id;
     try {
-        if(!valid_mod_id(mod.id)) throw std::runtime_error("Folder names must use 1-64 lowercase letters, digits, underscores or hyphens.");
         plain_directory(directory);safe_file(directory/"mod.cfg");
         File manifest(directory/"mod.cfg");
         if(manifest.size()>8192) throw std::runtime_error("mod.cfg exceeds 8 KiB.");
         const auto bytes=manifest.read(0,static_cast<std::size_t>(manifest.size()));
         std::istringstream lines(std::string(reinterpret_cast<const char*>(bytes.data()),bytes.size()));
-        std::set<std::string> seen;std::string line,target_id,format;
+        std::set<std::string> seen;std::string line,target_id,format,type,declared_id,script,script_api;
         bool first=true;
         while(std::getline(lines,line)) {
             if(first && line.starts_with("\xEF\xBB\xBF")) line.erase(0,3);
@@ -73,29 +73,63 @@ Mod read_mod(const std::filesystem::path& directory,unsigned& entries) {
             else if(field=="description") mod.description=value;
             else if(field=="version") mod.version=value;
             else if(field=="author") mod.author=value;
+            else if(field=="type") type=value;
+            else if(field=="id") declared_id=value;
+            else if(field=="script") script=value;
+            else if(field=="script_api") script_api=value;
             else throw std::runtime_error("Unknown mod.cfg field: "+field);
         }
         if(format!="1") throw std::runtime_error("Unsupported mod format; format=1 is required.");
         if(target_id!=target::id) throw std::runtime_error("Mod target does not match "+std::string(target::id)+'.');
-        const auto files=directory/"files";plain_directory(files);
+        if(!type.empty() && type!="texture-pack" && type!="script") throw std::runtime_error("Unknown mod type: "+type);
+        mod.texture_pack=type=="texture-pack";
+        if(mod.texture_pack && declared_id.empty()) throw std::runtime_error("Texture pack mod.cfg needs an id field.");
+        if(importing) {
+            if(!mod.texture_pack) throw std::runtime_error("Choose a texture pack folder containing mod.cfg with type=texture-pack.");
+            mod.id=declared_id;
+        } else if(!declared_id.empty() && declared_id!=mod.id) throw std::runtime_error("The mod id must match its installed folder name.");
+        if(!valid_mod_id(mod.id)) throw std::runtime_error("Folder ids must use 1-64 lowercase letters, digits, underscores or hyphens.");
+        if(!script.empty()) {
+            if(script!="startup.lua" || script_api!="1") throw std::runtime_error("Startup scripts require script=startup.lua and script_api=1.");
+            if(!metadata_only) {
+                safe_file(directory/script);const auto size=std::filesystem::file_size(directory/script);
+                if(size>max_script_bytes || ++entries>max_files) throw std::runtime_error("Startup script exceeds 64 KiB or the mod entry limit.");
+                mod.script=ModFile{script,directory/script,static_cast<std::uint32_t>(size),mod.id};
+            }
+        } else if(!script_api.empty() || type=="script") throw std::runtime_error("Script mods require script=startup.lua and script_api=1.");
+        if(metadata_only) return mod;
+        if(type=="script") return mod;
+        const auto files=directory/(mod.texture_pack?"textures":"files");plain_directory(files);
+        std::uint64_t total_size=0;
         for(auto it=std::filesystem::recursive_directory_iterator(files);it!=std::filesystem::recursive_directory_iterator();++it) {
             if(++entries>max_files || it.depth()>16) throw std::runtime_error("Mods exceed 16384 entries or 16 directory levels.");
             const auto path=it->path();
             const auto relative=key(path_text(path.lexically_relative(files)));
+            if(mod.texture_pack && (relative==".ds_store" || relative=="thumbs.db" || relative=="desktop.ini")) continue;
             if(!asset_path(relative)) throw std::runtime_error("Invalid Xbox asset path: "+relative);
-            if(it->is_directory()) {plain_directory(path);continue;}
+            if(it->is_directory()) {
+                if(mod.texture_pack) throw std::runtime_error("Place replacement PNGs directly in the textures folder.");
+                plain_directory(path);continue;
+            }
             safe_file(path);
             const auto normalized=key(relative);
+            if(mod.texture_pack && (normalized.size()!=44 || !normalized.ends_with(".png") ||
+               !std::ranges::all_of(std::string_view(normalized).substr(0,40),[](char ch) {
+                   return (ch>='0' && ch<='9') || (ch>='a' && ch<='f');
+               }))) throw std::runtime_error("Texture PNG names must keep their exported 40-character texture id: "+relative);
             if(normalized.ends_with(".xbe") || normalized=="data/b2distfx.bin")
                 throw std::runtime_error("Executable and compiled DSP replacements require rebuilding the game: "+relative);
             const auto size=it->file_size();
-            if(size>UINT32_MAX) throw std::runtime_error("Mod file exceeds the Xbox 4 GiB limit: "+relative);
+            if(size>(mod.texture_pack?64ULL*1024*1024:UINT32_MAX)) throw std::runtime_error("Mod file exceeds its size limit: "+relative);
+            total_size+=size;
+            if(mod.texture_pack && total_size>512ULL*1024*1024) throw std::runtime_error("Texture pack PNG files exceed 512 MiB.");
             mod.files.push_back({normalized,path,static_cast<std::uint32_t>(size),mod.id});
+            if(mod.texture_pack && mod.files.size()>2048) throw std::runtime_error("A texture pack can contain at most 2048 PNGs.");
         }
         std::ranges::sort(mod.files,{},&ModFile::path);
         for(std::size_t i=1;i<mod.files.size();++i) if(mod.files[i-1].path==mod.files[i].path)
             throw std::runtime_error("Duplicate asset path ignoring case: "+mod.files[i].path);
-        if(mod.files.empty()) throw std::runtime_error("No replacement files in the files folder.");
+        if(mod.files.empty()) throw std::runtime_error(mod.texture_pack?"No replacement PNGs in the textures folder.":"No replacement files in the files folder.");
     } catch(const std::exception& error) {mod.error=error.what();mod.files.clear();}
     return mod;
 }
@@ -111,6 +145,7 @@ std::vector<Mod> discover_mods(const std::filesystem::path& root) {
     plain_directory(directory);
     std::vector<Mod> mods;unsigned entries=0,file_entries=0;
     for(const auto& entry:std::filesystem::directory_iterator(directory)) {
+        if(path_text(entry.path().filename()).starts_with(".texture-pack-")) continue;
         if(++entries>max_mods) throw std::runtime_error("Mods folder exceeds 128 entries.");
         if(!entry.is_directory()) continue;
         auto mod=read_mod(entry.path(),file_entries);
@@ -119,7 +154,12 @@ std::vector<Mod> discover_mods(const std::filesystem::path& root) {
     }
     std::ranges::sort(mods,{},&Mod::id);return mods;
 }
-std::string create_mod(const std::filesystem::path& directory,std::string_view name) {
+Mod read_texture_pack(const std::filesystem::path& directory,bool metadata_only) {
+    unsigned entries=0;auto mod=read_mod(std::filesystem::absolute(directory).lexically_normal(),entries,true,metadata_only);
+    if(!mod.error.empty()) throw std::runtime_error(mod.error);
+    return mod;
+}
+std::string create_mod(const std::filesystem::path& directory,std::string_view name,bool texture_pack) {
     const auto path=std::filesystem::absolute(directory).lexically_normal();
     if(!valid_mod_id(path_text(path.filename())) || name.empty() || name.size()>256 ||
        std::ranges::any_of(name,[](unsigned char ch){return ch<32 || ch==127;}))
@@ -127,8 +167,10 @@ std::string create_mod(const std::filesystem::path& directory,std::string_view n
     plain_directory(path.parent_path());
     if(std::filesystem::exists(path)) throw std::runtime_error("Mod destination already exists.");
     if(!std::filesystem::create_directory(path)) throw std::runtime_error("Mod destination already exists.");
-    std::filesystem::create_directory(path/"files");
-    write_text(path/"mod.cfg","format=1\ntarget="+std::string(target::id)+"\nname="+std::string(name)+"\n# description=Briefly explain what this mod changes.\nversion=1.0\n",false);
+    std::filesystem::create_directory(path/(texture_pack?"textures":"files"));
+    write_text(path/"mod.cfg","format=1\ntarget="+std::string(target::id)+'\n'+
+        (texture_pack?"type=texture-pack\nid="+path_text(path.filename())+'\n':std::string{})+
+        "name="+std::string(name)+"\n# description=Briefly explain what this mod changes.\nversion=1.0\n",false);
     return "{\"format\":\"b2-create-mod-v1\",\"directory\":"+json(path_text(path))+",\"target\":"+json(target::id)+'}';
 }
 std::string install_modding_test(const std::filesystem::path& disc_path,const std::filesystem::path& root) {
@@ -150,7 +192,13 @@ std::string install_modding_test(const std::filesystem::path& disc_path,const st
         unsigned entries=0;const auto mod=read_mod(destination,entries);
         const bool rename=mod.name=="Modding test";
         const bool describe=mod.description.empty() || mod.description==previous_modding_test_description;
-        if(mod.error.empty() && (rename || describe) &&
+        const bool add_script=!mod.script && !std::filesystem::exists(std::filesystem::symlink_status(destination/"startup.lua"));
+        bool upgrade_script=false;
+        if(mod.error.empty() && mod.script && mod.script->size==previous_test_mod_script.size()) {
+            File script(mod.script->source);const auto bytes=script.read(0,mod.script->size);
+            upgrade_script=std::string_view(reinterpret_cast<const char*>(bytes.data()),bytes.size())==previous_test_mod_script;
+        }
+        if(mod.error.empty() && (rename || describe || add_script || upgrade_script) &&
            mod.files.size()==1 && mod.files[0].path=="frontend/global.dic") {
             File asset(mod.files[0].source);
             if(asset.size()==1253484 && hash(asset,0,asset.size())==modding_test_sha256) {
@@ -173,8 +221,13 @@ std::string install_modding_test(const std::filesystem::path& disc_path,const st
                 };
                 if(rename) replace_field("name","Test Mod");
                 if(describe) replace_field("description",modding_test_description);
+                if(add_script) {replace_field("script","startup.lua");replace_field("script_api","1");}
                 if(text.size()<=8192) {
-                    write_text(destination/"mod.cfg",text,true);return report("updated_metadata");
+                    if(add_script) write_text(destination/"startup.lua",test_mod_script,false);
+                    try {write_text(destination/"mod.cfg",text,true);}
+                    catch(...) {if(add_script) {std::error_code ignored;std::filesystem::remove(destination/"startup.lua",ignored);}throw;}
+                    if(upgrade_script) write_text(destination/"startup.lua",test_mod_script,true);
+                    return report(add_script?"added_startup_script":upgrade_script?"added_gameplay_example":"updated_metadata");
                 }
             }
         }
@@ -222,13 +275,14 @@ std::string install_modding_test(const std::filesystem::path& disc_path,const st
             if(hash(generated,0,generated.size())!=modding_test_sha256)
                 throw std::runtime_error("Generated Test Mod does not match the verified texture mod.");
         }
-        write_text(staging/"mod.cfg","format=1\ntarget="+std::string(target::id)+"\nname=Test Mod\ndescription="+std::string(modding_test_description)+"\nversion=1.0\n",false);
+        write_text(staging/"startup.lua",test_mod_script,false);
+        write_text(staging/"mod.cfg","format=1\ntarget="+std::string(target::id)+"\nname=Test Mod\ndescription="+std::string(modding_test_description)+"\nversion=1.0\nscript=startup.lua\nscript_api=1\n",false);
         if(std::filesystem::exists(destination)) throw std::runtime_error("Test Mod destination appeared during installation.");
         std::filesystem::rename(staging,destination);
     } catch(...) {
         // Remove only the known files created by this invocation.
         std::error_code ignored;
-        for(const auto& path:std::array{output,staging/"files/Frontend",staging/"files",staging/"mod.cfg",staging})
+        for(const auto& path:std::array{output,staging/"files/Frontend",staging/"files",staging/"startup.lua",staging/"mod.cfg",staging})
             std::filesystem::remove(path,ignored);
         throw;
     }
@@ -238,13 +292,20 @@ Mods::Mods(const std::filesystem::path& root,std::span<const std::string> enable
     if(enabled.size()>max_mods) throw std::runtime_error("More than 128 mods enabled.");
     if(enabled.empty()) return;
     const auto mods=discover_mods(root);
+    std::map<std::string,ModFile,std::less<>> textures;
     for(const auto& id:enabled) {
         if(!valid_mod_id(id) || std::ranges::find(enabled_,id)!=enabled_.end()) throw std::runtime_error("Invalid or duplicate enabled mod: "+id);
         const auto mod=std::ranges::find(mods,id,&Mod::id);
         if(mod==mods.end()) throw std::runtime_error("Enabled mod is missing: "+id);
         if(!mod->error.empty()) throw std::runtime_error("Mod "+id+": "+mod->error);
         enabled_.push_back(id);
+        if(mod->script) scripts_.push_back(*mod->script);
         for(const auto& file:mod->files) {
+            if(mod->texture_pack) {
+                if(const auto previous=textures.find(file.path);previous!=textures.end())
+                    conflicts_.push_back({"textures/"+file.path,previous->second.mod,id});
+                textures.insert_or_assign(file.path,file);continue;
+            }
             const auto original=disc.lookup(file.path);
             if(!original || original->directory()) throw std::runtime_error("Mod "+id+" must replace an existing disc file: "+file.path);
             if(const auto previous=files_.find(file.path);previous!=files_.end())
@@ -252,6 +313,8 @@ Mods::Mods(const std::filesystem::path& root,std::span<const std::string> enable
             files_.insert_or_assign(file.path,file);
         }
     }
+    if(textures.size()>2048) throw std::runtime_error("Enabled texture packs exceed 2048 replacement images.");
+    for(auto& [path,file]:textures) textures_.push_back(std::move(file));
 }
 const ModFile* Mods::lookup(std::string_view relative) const {
     if(files_.empty()) return nullptr;
@@ -264,6 +327,16 @@ std::string Mods::report() const {
     for(const auto& [path,file]:files_) {
         if(count++) report<<',';
         report<<"{\"path\":"<<json(path)<<",\"mod\":"<<json(file.mod)<<",\"bytes\":"<<file.size<<'}';
+    }
+    report<<"],\"scripts\":[";
+    for(unsigned i=0;i<scripts_.size();++i) {
+        if(i) report<<',';const auto& script=scripts_[i];
+        report<<"{\"mod\":"<<json(script.mod)<<",\"entry\":"<<json(script.path)<<",\"api\":1,\"bytes\":"<<script.size<<'}';
+    }
+    report<<"],\"textures\":[";
+    for(unsigned i=0;i<textures_.size();++i) {
+        if(i) report<<',';const auto& file=textures_[i];
+        report<<"{\"id\":"<<json(file.path.substr(0,40))<<",\"mod\":"<<json(file.mod)<<",\"bytes\":"<<file.size<<'}';
     }
     report<<"],\"conflicts\":[";
     for(unsigned i=0;i<conflicts_.size();++i) {

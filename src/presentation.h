@@ -2,6 +2,7 @@
 #include <array>
 #include <cstdint>
 #include <iosfwd>
+#include <optional>
 
 namespace b2 {
 struct Cpu;
@@ -15,6 +16,7 @@ public:
     void frame(Cpu&,std::uint32_t address,bool destroy=false);
     void camera(Cpu&,std::uint32_t wrapper,unsigned controller=0);
     void camera_cut(Cpu&,std::uint32_t wrapper);
+    std::optional<std::array<float,3>> camera_lens(std::uint32_t address) const;
     void begin(Cpu&,Memory&);
     void end(Cpu&,Memory&);
     void traffic(Cpu&,Memory&,std::uint32_t manager);
@@ -54,9 +56,10 @@ private:
         std::uint32_t wrapper=0,address=0,frame=0,mode=0,projection=0;
         std::uint64_t touched=0,step=0;
         std::array<float,3> previous{},current{};
+        std::array<float,3> rendered{};
         unsigned controller=0;
         float view_scale=0;
-        bool paired=false,applied=false,cut=false;
+        bool paired=false,applied=false,cut=false,rendered_valid=false;
     };
     struct Shadow {std::uint32_t address=0;std::array<std::uint32_t,12> original{};};
     struct ShadowSource {std::uint32_t record=0,address=0,body=0;Matrix pose{};};

@@ -2,6 +2,7 @@
 #include "custom_music.h"
 #include "disc.h"
 #include "mods.h"
+#include "mod_scripts.h"
 #include "tracks.h"
 #include "input.h"
 #include "audio.h"
@@ -128,6 +129,8 @@ struct Xbox::State {
     std::span<std::byte> ram;
     std::unique_ptr<Disc> disc;
     std::unique_ptr<Mods> mods;
+    ScriptResult scripts;
+    std::unique_ptr<ModScripts> script_runtime;
     std::shared_ptr<OpenFile> disc_io;
     std::array<PendingIo,32> pending_io{};
     unsigned pending_io_count=0;
@@ -302,6 +305,7 @@ struct Xbox::State {
         audio_deferred_environment=audio_environment;
         if(this->host.draw_distance!=1 && this->host.draw_distance!=2 && this->host.draw_distance!=4)
             throw std::runtime_error("Draw distance must be 1x, 2x or 4x.");
+        if(this->host.camera_fov<50 || this->host.camera_fov>150) throw std::runtime_error("Camera FOV must be 50-150 percent.");
         if(this->host.draw_distance>1) {
             world_storage.resize(64U*1024*1024+4096);
             memory.map(world_base&0x7FFFFFFF,world_storage);memory.map(world_base,world_storage);
@@ -319,6 +323,14 @@ struct Xbox::State {
         if(!this->host.enabled_mods.empty()) {
             if(!disc || this->host.mods_root.empty()) throw std::runtime_error("Enabled mods require a mounted disc and a mods folder.");
             mods=std::make_unique<Mods>(this->host.mods_root,this->host.enabled_mods,*disc);
+            script_runtime=std::make_unique<ModScripts>(mods->scripts(),this->host.camera_fov);
+            scripts=script_runtime->startup();
+            if(scripts.camera_fov) this->host.camera_fov=*scripts.camera_fov;
+            if(!scripts.runs.empty()) diagnostic_record(scripts.report());
+            if(!mods->textures().empty()) {
+                if(!this->host.renderer) throw std::runtime_error("Enabled texture packs require the native renderer.");
+                this->host.renderer->texture_packs(mods->textures());
+            }
             diagnostic_record(mods->report());
         }
         if(this->host.storage_root.empty()) {
@@ -424,6 +436,17 @@ struct Xbox::State {
         kernel_cursor+=size;
         for(const auto& import : image.imports) if(import.ordinal==ordinal) memory.store<std::uint32_t>(import.address,address);
         return address;
+    }
+    void dispatch_scripts() {
+        if(!script_runtime) return;
+        const auto output=script_runtime->dispatch(host.camera_fov);
+        if(output.camera_fov) {
+            host.camera_fov=*output.camera_fov;
+            for(auto& thread:threads) thread->cpu.camera_fov=host.camera_fov;
+        }
+        if(!output.errors.empty() || !output.conflicts.empty() || std::ranges::any_of(output.messages,[](const auto& message) {return !message.on_screen;}))
+            diagnostic_record(output.report());
+        if(host.script_output && (output.camera_fov || !output.messages.empty() || !output.errors.empty())) host.script_output(output);
     }
     void initialize_save_keys() {
         // The native profile owns its console identity; no original EEPROM is required.
@@ -585,9 +608,11 @@ struct Xbox::State {
         cpu.kernel=&services; cpu.clock=&clock; cpu.diagnostic=live && graphics_initialized?nullptr:&diagnostic;
         cpu.skip_intro=host.skip_intro;cpu.fast_load=host.fast_load;cpu.clean_hud=host.clean_hud;cpu.draw_distance=float(host.draw_distance);
         cpu.ultrawide=host.ultrawide;cpu.motion_blur=host.motion_blur;
+        cpu.camera_fov=host.camera_fov;
         cpu.game_timing=host.renderer?&game_timing:nullptr;
         cpu.presentation=host.renderer?&presentation:nullptr;
         cpu.achievements=host.achievements;
+        cpu.script_events=script_runtime?&script_runtime->events():nullptr;
         if(!host.imported_tracks.empty()) cpu.world_materials=&imported.materials;
         if(!world_storage.empty()) cpu.world_view=&world_view;
         hud_layout.enabled=host.widescreen;cpu.hud_layout=&hud_layout;
@@ -2514,9 +2539,16 @@ struct Xbox::State {
                     MotionCamera motion;motion.identifier=camera;motion.near_plane=value(0x80);motion.far_plane=value(0x84);
                     motion.projection=memory.load<std::uint32_t>(camera+0x14);
                     for(unsigned i=0;i<motion.view.size();++i) motion.view[i]=value(0x20+i*4);
-                    graphics->camera(camera,motion.near_plane,motion.far_plane,2*std::atan(value(0x6C)),&motion,value(0x68)/value(0x6C));
+                    auto width=value(0x68),height=value(0x6C);
+                    // Drawing restores simulation camera fields before some
+                    // flips. AO must use the lens that produced this image.
+                    if(host.camera_fov!=100) if(const auto lens=presentation.camera_lens(camera)) {
+                        width=(*lens)[0];height=(*lens)[1];motion.near_plane=(*lens)[2];
+                    }
+                    graphics->camera(camera,motion.near_plane,motion.far_plane,2*std::atan(height),&motion,width/height);
                 } else graphics->camera(0,0,0,0);
             }
+            dispatch_scripts();
             if(host.flip) host.flip();
         };
         if(host.performance && host.performance->active()) gpu->performance(host.performance);
@@ -3757,6 +3789,7 @@ struct Xbox::State {
         }
         result.cpu.kernel=nullptr; result.cpu.diagnostic=nullptr; result.cpu.clock=nullptr; result.cpu.preempt=nullptr; result.cpu.profile=nullptr;result.cpu.world_view=nullptr;result.cpu.hud_layout=nullptr;
         result.cpu.achievements=nullptr;
+        result.cpu.script_events=nullptr;
         diagnostic_guest(nullptr);
         return result;
     }
@@ -3768,6 +3801,7 @@ void Xbox::settings(const GameSettings& settings) {
     auto& s=*state_;auto& host=s.host;
     if(settings.draw_distance!=1 && settings.draw_distance!=2 && settings.draw_distance!=4)
         throw std::runtime_error("Draw distance must be 1x, 2x or 4x.");
+    if(settings.camera_fov<50 || settings.camera_fov>150) throw std::runtime_error("Camera FOV must be 50-150 percent.");
     if(settings.draw_distance>1 && s.world_storage.empty()) {
         s.world_storage.resize(64U*1024*1024+4096);
         s.memory.map(s.world_base&0x7FFFFFFF,s.world_storage);s.memory.map(s.world_base,s.world_storage);
@@ -3782,10 +3816,12 @@ void Xbox::settings(const GameSettings& settings) {
         s.world_prepare_pending=settings.draw_distance>1;
     }
     host.draw_distance=settings.draw_distance;s.hud_layout.enabled=host.widescreen;
+    host.camera_fov=settings.camera_fov;
     for(auto& thread:s.threads) {
         auto& cpu=thread->cpu;
         cpu.skip_intro=host.skip_intro;cpu.fast_load=host.fast_load;cpu.clean_hud=host.clean_hud;
         cpu.ultrawide=host.ultrawide;cpu.motion_blur=host.motion_blur;cpu.draw_distance=float(host.draw_distance);
+        cpu.camera_fov=host.camera_fov;
         cpu.world_view=s.world_storage.empty()?nullptr:&s.world_view;
     }
     if(aspect_changed && s.current) {
@@ -3795,6 +3831,7 @@ void Xbox::settings(const GameSettings& settings) {
         s.world_call(cpu,0x18390,0);s.world_call(cpu,0x183B0,0);
     }
 }
+const ScriptResult& Xbox::startup_scripts() const {return state_->scripts;}
 void Xbox::output_gain(float gain) {
     if(!(gain>=0 && gain<=1)) throw std::runtime_error("Output volume must be between zero and one");
     if(state_->audio) state_->audio->output_gain(gain);
@@ -4806,17 +4843,18 @@ std::string check_storage(const std::filesystem::path& executable,const std::fil
             for(unsigned mode:{0U,2U}) for(unsigned ratio:{1U,2U,0U}) {
                 memory.store<std::uint32_t>(view+0x6AC7C,mode);
                 const bool enabled=ratio!=0;
-                xbox.settings({enabled,ratio==2,!enabled,enabled,enabled,enabled,ratio==2?4U:enabled?2U:1U});
+                const auto fov=ratio==2?150U:enabled?50U:100U;
+                xbox.settings({enabled,ratio==2,!enabled,enabled,enabled,enabled,ratio==2?4U:enabled?2U:1U,fov});
                 const auto expected=ratio==2?(mode==2?0x3F955555U:0x40155555U):ratio==1?(mode==2?0x3F638E39U:0x3FE38E39U):0x3FAAAAABU;
                 require(memory.load<std::uint32_t>(0x4D03F8)==unsigned(enabled) && memory.load<std::uint32_t>(aspect)==expected &&
                     memory.load<std::uint32_t>(aspect+0x660)==expected,"live aspect switch uses both original view slots");
                 require(state.threads.size()==count && cpu.hud_layout && cpu.hud_layout->enabled==enabled &&
                     cpu.skip_intro==enabled && cpu.fast_load==enabled && cpu.clean_hud==enabled && cpu.motion_blur!=enabled &&
-                    cpu.draw_distance==(ratio==2?4:enabled?2:1),"live enhancements preserve the running guest thread");
+                    cpu.draw_distance==(ratio==2?4:enabled?2:1) && cpu.camera_fov==fov,"live enhancements preserve the running guest thread");
             }
             auto& worker=state.create(0,0,0,image.stack_commit,0,true);
-            xbox.settings({true,true,false,true,true,true,4});
-            require(worker.cpu.ultrawide && worker.cpu.fast_load && worker.cpu.clean_hud && worker.cpu.draw_distance==4,
+            xbox.settings({true,true,false,true,true,true,4,75});
+            require(worker.cpu.ultrawide && worker.cpu.fast_load && worker.cpu.clean_hud && worker.cpu.draw_distance==4 && worker.cpu.camera_fov==75,
                 "live settings update suspended workers");
             xbox.settings({});memory.store<std::uint32_t>(view+0x6AC7C,0);
             // Run the original body and movable-part mesh selection, stopping
@@ -5080,11 +5118,23 @@ std::string check_mods(const std::filesystem::path& executable,const std::filesy
         try {operation();} catch(const std::exception& error) {rejected=std::string_view(error.what()).find(message)!=std::string_view::npos;}
         require(rejected,message);
     };
+    create_script_mod(root/"startup","Startup API fixture");
+    write_text(root/"startup/startup.lua","b2.set_camera_fov(75)\n"+std::string(test_mod_script),true);
     const std::vector<std::string> order{"base","override"},reversed{"override","base"};
     Mods mounted(root,order,disc),reverse(root,reversed,disc),disabled(root,{},disc);
     require(mounted.lookup("TrAcKpSs\\FORWARD\\FWYL.pss")->size==override_data.size(),"case-insensitive mixed-separator lookup");
     require(mounted.conflicts().size()==1 && mounted.conflicts()[0].winner=="override","last enabled mod wins with conflict details");
     require(reverse.lookup(asset)->mod=="base" && !disabled.lookup(asset),"reordering and disabling change the mount");
+    create_mod(root/"textures-low","Low priority textures",true);create_mod(root/"textures-high","High priority textures",true);
+    const auto texture_name=std::string(40,'a')+".png";
+    write_text(root/"textures-low/textures"/texture_name,"low",false);
+    write_text(root/"textures-high/textures"/texture_name,"high",false);
+    Mods texture_order(root,std::vector<std::string>{"base","textures-low","override","textures-high"},disc);
+    Mods texture_reverse(root,std::vector<std::string>{"textures-high","textures-low"},disc);
+    require(texture_order.textures().size()==1 && texture_order.textures()[0].mod=="textures-high" &&
+        texture_reverse.textures()[0].mod=="textures-low","texture conflicts follow the visible mod order");
+    require(texture_order.conflicts().size()==2 && texture_order.conflicts()[1].path=="textures/"+texture_name &&
+        texture_order.lookup(asset)->mod=="override" && disabled.textures().empty(),"texture and disc replacements have separate mounts and report conflicts");
     require(!valid_mod_id("../base") && !valid_mod_id("C:base") && !valid_mod_id("BASE"),"mod ids cannot escape their folder");
     rejects([&]{Mods invalid(root,std::vector<std::string>{"missing"},disc);},"Enabled mod is missing");
     rejects([&]{Mods invalid(root,std::vector<std::string>{"base","base"},disc);},"duplicate enabled mod");
@@ -5094,10 +5144,20 @@ std::string check_mods(const std::filesystem::path& executable,const std::filesy
     std::filesystem::remove(root/"base/files/not-on-disc.dat");
     const auto run=[&](const std::vector<std::string>& enabled,std::string_view expected,std::uint32_t size,unsigned session) {
         std::vector<std::byte> ram(64*1024*1024);image.load(std::span(ram).subspan(image.base,image.image_size));Memory memory(0,ram);
+        ScriptResult gameplay;
         XboxHost provider;provider.storage_root=output/std::format("storage-{}",session);provider.mods_root=root;provider.enabled_mods=enabled;provider.audio_output=false;provider.draw_distance=2;
+        provider.script_output=[&](const ScriptResult& result) {gameplay=result;};
+        if(!session) provider.enabled_mods.push_back("startup");
         Xbox xbox(image,memory,ram,disc_path,std::move(provider));auto& state=*xbox.state_;
         auto& thread=state.create(0,0,0,image.stack_commit,0,false);state.current=&thread;
         auto& cpu=thread.cpu;cpu.preempt=nullptr;const auto stack=cpu.registers[esp]-4096;
+        require(cpu.camera_fov==(session?100U:75U) && xbox.startup_scripts().runs.size()==(session?0U:1U),"startup Lua settings apply only to the enabled session");
+        if(!session) require(xbox.startup_scripts().messages.size()==1 && xbox.startup_scripts().messages[0].on_screen,"Test Mod Lua message reaches the session without a game boot");
+        if(!session) {
+            require(cpu.script_events!=nullptr,"enabled gameplay script receives the native event queue");
+            cpu.script_events->push({.type=ScriptEventType::race_finish,.player=1,.position=2,.mode=1});state.dispatch_scripts();
+            require(gameplay.errors.empty() && gameplay.messages.size()==1 && gameplay.messages[0].text=="Test Mod: finished in position 2.","Test Mod gameplay callback reaches the host without booting");
+        }
         const auto invoke=[&](unsigned ordinal,std::initializer_list<std::uint32_t> arguments) {
             cpu.registers[esp]=stack;memory.store<std::uint32_t>(stack,return_sentinel);
             unsigned index=0;for(auto value:arguments) memory.store<std::uint32_t>(stack+4+index++*4,value);

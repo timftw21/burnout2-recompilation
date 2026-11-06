@@ -1,4 +1,5 @@
 #include "gpu.h"
+#include "texture_packs.h"
 #include "ui_art.h"
 #include "shaders.h"
 #include <thread>
@@ -302,8 +303,10 @@ struct Gpu::Impl {
             found->second.captured=capture_serial;
             const auto name=std::format("texture-{:04}.bin",capture_textures++);
             if(capture_data(name,Bytes(static_cast<const std::byte*>(memory.access(address,static_cast<std::size_t>(size))),static_cast<std::size_t>(size)))) {
-                capture_trace<<std::format("{{\"type\":\"texture\",\"resource\":{},\"address\":{},\"format\":{},\"width\":{},\"height\":{},\"depth\":{},\"mip_levels\":{},\"pitch\":{},\"cubemap\":{},\"bytes\":{},\"data\":{}}}\n",
-                    found->second.identifier,json(hex32(address)),json(hex32(format)),width,height,depth,mips,linear?pitch:0,cube,size,json(name));
+                const auto bytes=Bytes(static_cast<const std::byte*>(memory.access(address,static_cast<std::size_t>(size))),static_cast<std::size_t>(size));
+                capture_trace<<std::format("{{\"type\":\"texture\",\"resource\":{},\"address\":{},\"format\":{},\"width\":{},\"height\":{},\"depth\":{},\"mip_levels\":{},\"pitch\":{},\"cubemap\":{},\"bytes\":{},\"data\":{},\"texture_id\":{}}}\n",
+                    found->second.identifier,json(hex32(address)),json(hex32(format)),width,height,depth,mips,linear?pitch:0,cube,size,json(name),
+                    json(texture_id({width,height,static_cast<TextureFormat>(code),bytes,mips,linear?pitch:0,cube,depth})));
             }
         }
         return found->second.identifier;

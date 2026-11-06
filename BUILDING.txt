@@ -281,6 +281,202 @@ See research/build-time.txt for measurements and native validation.
 
 Asset mods
 
+Installing texture packs
+
+Open Mods in settings and click Install texture pack.... Select the downloaded
+pack folder containing mod.cfg. If the download is a ZIP, extract it first.
+The installer checks the images, copies the pack into the mods folder beside the
+game, and enables it automatically. Start or restart the game to use it.
+There is no need to edit settings or copy files into the disc image. Installing
+an updated copy with the same pack id replaces the installed version after its
+images pass checks; a failed update preserves the previous version. Installation
+runs in the background, including while playing; the current session keeps its
+already loaded images until restart.
+
+Packs appear alongside game file mods with the same Enabled checkboxes and
+up/down priority arrows. The lower enabled pack wins when images overlap.
+Disable a pack and restart to restore the original textures. Check mods validates
+enabled images and their memory use and lists both image and disc-file conflicts.
+It is available before starting the game. Pack textures take priority over Clean
+HUD. Settings and enabled order save automatically. Open folder also allows
+manual installation/removal; Refresh updates the list after manual changes.
+
+Texture packs must be made for this recomp and the supported US game. Packs for
+other games or emulators need conversion. Initial image support is PNG, including
+transparency and higher resolutions, up to 4096x4096 and 64 MiB per PNG. At most
+2048 winning images and 512 MiB of prepared pixels, including smaller mip levels,
+can be enabled at once. Each pack's PNG files also have a 512 MiB storage limit.
+All winning images are prepared and uploaded once before
+play. The renderer reuses them without pack file reads, image decoding or new
+replacement uploads during play. Unmatched textures retain their original pixels.
+Rendered surfaces, cubemaps and volume textures are not replaced by PNG packs.
+DDS, archive installation without extraction and hot reload are unsupported.
+Packs may bundle a startup.lua script using the manifest fields below; the
+installer copies and checks it before enabling the pack.
+
+Creating a texture pack
+
+Export an original Xbox texture dictionary into an editable pack:
+
+& .\build\windows\Release\b2-tool.exe extract 'Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso' Frontend/global.dic data/local/global.dic
+& .\build\windows\Release\b2-tool.exe export-texture-pack data/local/global.dic build/checks/my-texture-pack 'My texture pack'
+
+Use a fresh output directory with an existing parent. This creates mod.cfg,
+textures/*.png and index.json, which maps original texture names to image ids.
+Edit or upscale the PNGs while keeping their filenames. Delete unchanged PNGs
+to keep the pack small and allow other packs to replace those textures. Exported
+images contain your private game assets; they are not included in releases.
+Pack authors are responsible for permissions for any images they distribute.
+
+To start with an empty template instead:
+
+& .\build\windows\Release\b2-tool.exe create-texture-pack build/checks/my-texture-pack 'My texture pack'
+
+A texture pack's mod.cfg has the usual name/description/version/author fields,
+plus type=texture-pack and id=my-texture-pack. format=1 and the supported target
+are required, as for file mods below. id uses the same lowercase folder-id rules;
+it stays the same across updates. The installer accepts any downloaded folder
+name and uses the manifest id for the installed folder. Manual installs must
+name their folder after that id. Keep PNGs directly in textures, with their
+exported 40-character ids; names are matched without ASCII case sensitivity.
+Only mod.cfg, replacement images and any declared startup.lua are installed; author notes/index.json stay
+with the downloaded copy.
+
+Ids hash a versioned original layout and its complete pixel/mip payload, before
+Clean HUD or pack replacement. Opt-in F8 texture records also include texture_id,
+allowing authors to identify textures in a captured scene. Identical original
+content/layout shares a replacement regardless of where the game loads it.
+Game file mods run first; an image pack must match the bytes supplied by those
+mods if they change the same texture. The native exporter and runtime use the
+same id function. No executable offsets or original-file patches are needed.
+
+Install a prepared pack from the command line:
+
+& .\build\windows\Release\b2-tool.exe install-texture-pack build/checks/my-texture-pack build/windows/Release/mods
+
+Command-line installation validates and copies the pack; enable it in settings.
+The focused offline diagnostic exercises visible higher-resolution replacements,
+transparency, filtering, original fallback, shared GPU resources, restart release,
+Unicode download paths, successful/failed updates and malformed-image rejection:
+
+& .\build\windows\Release\b2-tool.exe check-texture-packs build/checks/texture-packs --warp
+
+Use a fresh directory. It saves PNGs and texture-packs-check.json without booting
+the game. Component timings do not establish gameplay FPS.
+
+Lua scripts and gameplay events
+
+Mods load a sandboxed Lua script once when a game session starts. Scripts can
+register handlers for the supported gameplay events below. Only those mods keep
+a Lua state during play; original Xbox code still runs ahead of time.
+Scripts do not edit the disc, saves, executable or persistent user preferences.
+Enable script mods in Mods, in the same order as file mods and texture packs.
+Changes to a script apply on the next start/restart. Check mods validates startup
+code and event registration without starting the game or applying proposed
+settings. Gameplay handlers run only when their events occur.
+
+Create an editable script-only mod:
+
+& .\build\windows\Release\b2-tool.exe create-script-mod build/windows/Release/mods/my-script 'My script'
+
+This creates mod.cfg and startup.lua. The manifest has format=1, the supported
+target and the usual name/description/version/author fields, plus:
+
+type=script
+script=startup.lua
+script_api=1
+
+File mods and texture packs can also add script=startup.lua and script_api=1
+while keeping their existing type and content folders. startup.lua lives next
+to mod.cfg; other entry filenames and API versions are currently unsupported.
+
+The initial API is:
+
+b2.api_version                 -- 1
+b2.target                      -- supported target id
+b2.camera_fov_unit            -- "percent"
+b2.get_camera_fov()            -- current percentage, 50-150; 100 means Original
+b2.set_camera_fov(125)         -- 125% of the original angle; 100 for Original
+b2.log("My script loaded")     -- structured log and Diagnostics message
+b2.show_message("Welcome!")    -- five-second on-screen message after first frame
+b2.on("race_finish", function(event)
+    b2.show_message("Finished in position " .. event.position .. ".")
+end)
+
+Register one function per event during startup. Unknown events, duplicate
+registrations and registration from inside a handler are rejected. Local Lua
+variables and handler closures persist between events, separately for each mod.
+There is no per-frame/update callback, hot reload or arbitrary game-memory API.
+
+Supported events and their payload fields (event.name is always included):
+
+race_finish       player (1 or 2), position (1 means first), mode (original id)
+crash_result      zone (1-30), medal (0=none, 1=bronze, 2=silver, 3=gold)
+starting_boost    player (1 or 2)
+burnout           player (1 or 2), chain (current completed Burnout count)
+time_attack_lap   track (original id), seconds (completed lap time)
+
+Race finishes cover the verified race modes 1, 2, 5, 6, 10 and 11; Time Attack
+has its own lap event. Demo playback is excluded. Player events include human
+drivers only and retain split-screen player identity. Events work independently
+of whether achievements are enabled or already unlocked. They observe results
+and do not replace or cancel the original game logic.
+
+Native observations use the race-finished flag transition at 0x84260 and the
+verified achievement sites at 0x1275D, 0x60AC0, 0x797B9 and 0x188A0 in the
+supported executable. The finish transition reports once per race, including
+when the original racer storage is reused. Observers only queue copied
+scalar values. Lua runs at a completed frame boundary, after native game work;
+source files are never read or compiled in the event hooks.
+
+Scripts can use Lua arithmetic, functions, loops and tables, math, and the base
+functions assert, error, ipairs, next, pairs, select, tonumber, tostring and type.
+Each mod gets its own environment. File/OS/network APIs, package loading,
+debugging, string-library helpers, coroutines, protected calls and dynamic code
+loading are not exposed. Only Lua text source is accepted, never binary chunks.
+
+Each source is limited to 64 KiB and each Lua heap to 4 MiB, with 64 MiB shared
+across all live mod states. Startup work has a
+100000-instruction budget and a 100 ms timeout checked at instruction hooks and
+completion. Each gameplay callback has 10000 instructions and a 1 ms limit,
+checked at instruction hooks and completion. Dispatch checks a 2 ms frame budget
+and allows up to eight calls, deferring remaining handlers in order. Native events use a
+64-entry queue; overflow drops new events and reports it in Diagnostics.
+Each call can produce 16 printable UTF-8 messages of up to 256
+bytes, with 128 total startup messages and 128 pending on-screen notices. On-screen messages queue;
+ordinary log messages appear in Diagnostics and the structured startup report.
+Startup failures stop the session with the mod id and error, applying no partial
+startup output. A gameplay failure discards that callback's settings/messages
+and disables only that mod's scripts until restart; other mods keep running.
+The error appears in Diagnostics and a brief on-screen notice.
+
+The last enabled script setting the same option wins. Check mods and startup
+JSON report the conflicting providers. Scripted FOV is visible in Graphics for
+that session. Changing the camera control overrides it immediately; a later
+handler can set it again. Restarting resets Lua state and reruns scripts. Saved
+user preferences stay separate from script settings. All FOV APIs now use
+percentages; scripts written for the earlier degree prototype must be updated.
+
+Test Mod now includes startup.lua, which calls b2.show_message to display
+"Test Mod scripting is working." It also registers race_finish and shows
+"Test Mod: finished in position N." after a race. Its recolored logos remain
+unchanged. Setup adds the script or upgrades the previous unedited startup
+example, preserving custom scripts and enabled selections. After updating a
+developer build, install/update it with:
+
+& .\build\windows\Release\b2-tool.exe install-modding-test 'Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso' build/windows/Release/mods
+
+Inspect real enabled scripts or run the focused sandbox diagnostic without
+booting the game (use a fresh diagnostic output directory):
+
+& .\build\windows\Release\b2-tool.exe inspect-scripts 'Burnout 2\Burnout 2 - Point of Impact (USA).xiso.iso' build/windows/Release/mods modding-test
+& .\build\windows\Release\b2-tool.exe check-scripting build/checks/scripting
+
+Lua 5.4.9 is pinned and built as a small static library; no separate Lua program
+or Python is required. Its license is included in THIRD_PARTY_NOTICES.txt.
+
+Game file mods
+
 Mods replace files from the original disc without changing the disc or saves.
 Open Mods in settings, then Open folder. Each mod has its own folder beside
 the game executable, under mods. Refresh after installing or editing a mod.
@@ -328,8 +524,8 @@ trackpss/forward/fwyl.pss goes in mods/my-mod/files/trackpss/forward/fwyl.pss.
 Use b2-tool list ISO [DIRECTORY] to find original paths and b2-tool extract ISO
 DISC_PATH OUTPUT to copy individual assets for editing. Existing inspect-textures
 and render-dictionary commands can inspect original Xbox texture dictionaries.
-Mod files must retain formats the game understands; loose PNGs, arbitrary audio
-files and scripts are not converted by the mod loader. Custom music uses the
+Game file mods must retain formats the game understands; use a texture pack for
+loose PNGs. Arbitrary audio files and scripts are not converted by the file mod loader. Custom music uses the
 separate Audio settings import. Assets packaged together must be replaced as a
 complete file. Validation checks the mount, not the behavior of edited assets.
 
@@ -343,7 +539,7 @@ folders, 16384 asset entries, 16 directory levels and Xbox-compatible names/size
 junctions, ambiguous paths and duplicate filenames ignoring case are rejected.
 
 Replacing .xbe executables or data/b2distfx.bin requires rebuilding the native
-game and is rejected by this loader. Runtime scripts, native plugin DLLs,
+game and is rejected by this loader. Unlisted gameplay events, native plugin DLLs,
 executable patches, new disc files and hot reload are unsupported. The original
 verified executable and compiled CPU/shader/sound programs stay in use. Mods take
 priority over the built-in imported-track file mounts; replacements for those
@@ -840,7 +1036,20 @@ Progress is shared across game profiles in this installation and saves separatel
 in data/local/achievements.cfg
 beside settings.cfg. Back up this file with your saves. Saves run in the background;
 closing the app finishes pending writes. Existing medals do not unlock retroactively.
-Graphics / Display offers 4:3, 16:9 and 21:9 aspect ratios. Enhancements /
+Graphics / Display offers 4:3, 16:9 and 21:9 aspect ratios. Camera FOV adjusts
+driving and replay views from 50% to 150% of the original vertical angle.
+100% and Reset restore the original view. Higher values show more of the scene;
+lower values zoom in. Camera zoom effects are preserved, with effective angles
+clamped to 1-170 degrees. It applies during play and saves as camera_fov=100.
+The old degree preference is ignored and defaults to 100%.
+FOV adjustments preserve HUD size, physics and replay timing.
+Full and split-screen views keep their chosen aspect ratio. Only perspective
+scene cameras are adjusted; orthographic menus keep their original view.
+The camera's drawing scope updates its view/frustum and restores the
+simulation lens afterwards; ambient occlusion receives the rendered lens.
+Native CPU and hidden-window diagnostics cover the setting without booting;
+gameplay appearance and performance still need a manual check.
+Enhancements /
 Miscellaneous includes Motion blur, enabled by default, and Fast load, disabled
 by default. Fast load removes loading fades and display pacing while the original
 asset loaders finish; it does not bypass file-completion checks or change gameplay

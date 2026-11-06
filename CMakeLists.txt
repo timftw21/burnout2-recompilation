@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.2)
-project(burnout2 VERSION 1.13.0 LANGUAGES C CXX)
+project(burnout2 VERSION 1.14.0 LANGUAGES C CXX)
 
 if((NOT WIN32 AND NOT APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux") OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR
    (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$" AND NOT (APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")))
@@ -70,7 +70,24 @@ FetchContent_Declare(zydis
     GIT_PROGRESS FALSE)
 FetchContent_MakeAvailable(zydis)
 
-add_library(b2-core STATIC src/file.cpp src/disc.cpp src/mods.cpp src/xbe.cpp src/assets.cpp src/tracks.cpp src/effects.cpp src/crypto.cpp src/performance.cpp src/achievements.cpp)
+# Bounded Lua mod sandbox. Original game code remains compiled ahead of time.
+FetchContent_Declare(b2_lua
+    URL https://www.lua.org/ftp/lua-5.4.9.tar.gz
+    URL_HASH SHA256=2335b6c582a52654f94612bf10d2f4672805d05329aa6568b1d8cd9e5c6fb8e6
+    DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
+FetchContent_MakeAvailable(b2_lua)
+set(lua_sources "")
+foreach(name IN ITEMS lapi lcode lctype ldebug ldo ldump lfunc lgc llex lmem lobject lopcodes lparser lstate lstring ltable ltm lundump lvm lzio lauxlib lbaselib lmathlib)
+    list(APPEND lua_sources "${b2_lua_SOURCE_DIR}/src/${name}.c")
+endforeach()
+add_library(b2-lua STATIC ${lua_sources})
+target_include_directories(b2-lua PUBLIC "${b2_lua_SOURCE_DIR}/src")
+if(NOT WIN32)
+    target_link_libraries(b2-lua PRIVATE m)
+endif()
+
+add_library(b2-core STATIC src/file.cpp src/disc.cpp src/mods.cpp src/mod_scripts.cpp src/xbe.cpp src/assets.cpp src/tracks.cpp src/effects.cpp src/crypto.cpp src/performance.cpp src/achievements.cpp)
+target_link_libraries(b2-core PRIVATE b2-lua)
 target_include_directories(b2-core PUBLIC src PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 if(WIN32)
     target_sources(b2-core PRIVATE src/diagnostics.cpp src/host_windows.cpp)
@@ -94,7 +111,7 @@ else()
     endif()
 endif()
 
-add_library(b2-graphics STATIC src/render.cpp src/render_checks.cpp src/vertex_program.cpp src/shaders.cpp src/gpu.cpp src/frame_processing.cpp src/antialiasing.cpp src/ambient_occlusion.cpp src/hdr.cpp src/ui_art.cpp)
+add_library(b2-graphics STATIC src/render.cpp src/render_checks.cpp src/texture_packs.cpp src/vertex_program.cpp src/shaders.cpp src/gpu.cpp src/frame_processing.cpp src/antialiasing.cpp src/ambient_occlusion.cpp src/hdr.cpp src/ui_art.cpp)
 target_link_libraries(b2-graphics PUBLIC b2-core)
 if(WIN32)
     target_link_libraries(b2-graphics PRIVATE d3d11 dxgi windowscodecs ole32)
@@ -395,6 +412,8 @@ foreach(target IN ITEMS b2-core b2-portable-cpu b2-cpu b2-input b2-graphics b2-a
        target MATCHES "^b2(-tool)?$")
         target_link_options(${target} PRIVATE
             "$<$<CONFIG:Release>:/opt:lldlto=3>"
+            "$<$<CONFIG:Release>:/opt:lldltojobs=${B2_LINK_JOBS}>"
+            "$<$<CONFIG:Release>:/threads:${B2_LINK_JOBS}>"
             "$<$<CONFIG:Release>:/lldltocache:lto-cache/${target}/Release>"
             "$<$<CONFIG:Release>:/lldltocachepolicy:cache_size_bytes=3g>")
     endif()

@@ -4,6 +4,7 @@
 #include "file.h"
 #include "xbe.h"
 #include "achievements.h"
+#include "mod_scripts.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -1096,6 +1097,48 @@ unsigned check_presentation(Memory& memory) {
         require(!std::memcmp(original.data(),memory.access(frame,original.size()),original.size()),"Camera zoom restoration changed simulation state");
         ++checks;
     }
+    // Adjust the real camera/frustum, then restore its simulation lens. Each
+    // draw starts from authored data, including when the slider changes live.
+    memory.store<std::uint32_t>(wrapper+0x4A0,0);memory.store<std::uint32_t>(wrapper+0x4A4,0);
+    for(const auto site:{0xADCA0U,0xA6130U,0xB58C0U}) for(float aspect:{4.f/3,16.f/9,21.f/9,8.f/9,7.f/6}) {
+        presentation->reset();timing.step=1;timing.remainder=0;
+        lens(0.5f,0.1f);
+        memory.store<std::uint32_t>(camera+0x68,std::bit_cast<std::uint32_t>(0.5f*aspect));
+        memory.store<std::uint32_t>(camera+0x70,std::bit_cast<std::uint32_t>(2.f/aspect));
+        memory.store<std::uint32_t>(wrapper+0x210,std::bit_cast<std::uint32_t>(2.f/aspect));synchronize();
+        std::memcpy(original.data(),memory.access(frame,original.size()),original.size());
+        for(unsigned percent:{50U,150U,100U}) {
+            cpu.camera_fov=percent;title_presentation(cpu,memory,site,wrapper);title_presentation(cpu,memory,1);synchronize();
+            const auto width=std::bit_cast<float>(memory.load<std::uint32_t>(camera+0x68));
+            const auto height=std::bit_cast<float>(memory.load<std::uint32_t>(camera+0x6C));
+            const auto expected_angle=std::clamp(2*std::atan(0.5f)*percent/100.f,3.141592653589793f/180.f,170*3.141592653589793f/180.f);
+            require(std::abs(2*std::atan(height)-expected_angle)<0.00001f &&
+                std::abs(width/height-aspect)<0.00001f && memory.load<std::uint32_t>(camera+0x80)==std::bit_cast<std::uint32_t>(0.1f),
+                "Camera FOV did not preserve the selected view aspect or near plane");
+            require(percent==100 || std::memcmp(original.data()+(camera-frame)+0x128,memory.access(camera+0x128,96),96),
+                "Original camera frustum did not follow the FOV adjustment");
+            const auto rendered=presentation->camera_lens(camera);
+            title_presentation(cpu,memory,2);
+            require(!std::memcmp(original.data(),memory.access(frame,original.size()),original.size()) &&
+                memory.load<std::uint32_t>(wrapper+0x210)==std::bit_cast<std::uint32_t>(2.f/aspect),
+                "FOV adjustment compounded or changed simulation camera state");
+            require(rendered && presentation->camera_lens(camera)==rendered && (*rendered)[0]==width && (*rendered)[1]==height,
+                "Postprocessing lost the lens used for the rendered frame");++checks;
+        }
+    }
+    presentation->reset();timing.step=1;cpu.camera_fov=150;
+    lens(0.5f,0.1f);title_presentation(cpu,memory,0xADCA0,wrapper);title_presentation(cpu,memory,1);title_presentation(cpu,memory,2);
+    ++timing.step;timing.remainder=733333333/2;lens(1.f,0.2f);
+    title_presentation(cpu,memory,0xADCA0,wrapper);title_presentation(cpu,memory,1);
+    require(std::abs(std::bit_cast<float>(memory.load<std::uint32_t>(camera+0x6C))-std::tan(std::atan(.75f)*1.5f))<0.00001f &&
+        std::abs(std::bit_cast<float>(memory.load<std::uint32_t>(camera+0x80))-0.15f)<0.00001f,
+        "Percentage FOV lost animated zoom or near-plane interpolation");
+    title_presentation(cpu,memory,2);++checks;
+    presentation->reset();timing.step=1;memory.store<std::uint32_t>(camera+0x14,2);
+    std::memcpy(original.data(),memory.access(frame,original.size()),original.size());
+    title_presentation(cpu,memory,0xADCA0,wrapper);title_presentation(cpu,memory,1);title_presentation(cpu,memory,2);
+    require(!std::memcmp(original.data(),memory.access(frame,original.size()),original.size()),"FOV changed an orthographic camera");++checks;
+    memory.store<std::uint32_t>(camera+0x14,1);cpu.camera_fov=100;
     // Replay's visibility scratch overlaps the driving mode at wrapper+170.
     // Only its own shot selection and the original cut notification can cut.
     presentation->reset();timing.step=1;memory.store<std::uint32_t>(wrapper+0x228,0);
@@ -1617,12 +1660,14 @@ unsigned check_cpu_image(const std::filesystem::path& path) {
             {silver,2},{std::nextafter(gold,0.f),2},{gold,3}}};
         for(const auto [score,medal]:scores) {
             Achievements achievements;
+            ScriptEvents script_events{all_script_events};
             constexpr unsigned profile=0x8000,profile_size=0x8C;
             const auto award=[&](bool observe) {
                 memory.fill_elements<std::uint32_t>(profile,0,profile_size/4,false);
                 memory.store(profile+zone*4,previous);
                 memory.store<std::uint32_t>(stack,0xABCDEF00);memory.store(stack+4,zone);memory.store(stack+8,std::bit_cast<std::uint32_t>(score));
                 Cpu cpu;cpu.registers[ecx]=profile;cpu.registers[esp]=stack;cpu.achievements=observe?&achievements:nullptr;
+                cpu.script_events=observe?&script_events:nullptr;
                 function(0x12650).run(cpu,memory);return cpu;
             };
             const auto original=award(false);
@@ -1634,6 +1679,9 @@ unsigned check_cpu_image(const std::filesystem::path& path) {
                 memory.load<unsigned>(profile+0x78)==medal,"Original crash medal result or calling convention differs");
             require(achievements.unlocked(AchievementId::crash_course)==(medal!=0) && achievements.take_notification()==
                 (medal?std::optional(AchievementId::crash_course):std::nullopt),"Crash medal did not produce exactly the qualifying achievement");
+            const auto event=script_events.pop();
+            require(event && event->type==ScriptEventType::crash_result && event->zone==zone+1 && event->medal==medal && !script_events.pop(),
+                "Native crash completion did not queue exactly the current run's result");
             award(true);
             require(!achievements.take_notification(),"Repeated crash results notified twice");++cases;
         }
@@ -1682,13 +1730,16 @@ unsigned check_cpu_image(const std::filesystem::path& path) {
             require(achievements.unlocked(AchievementId::copped_cars)==(completed==7) && achievements.count()==(completed==7),
                 "Pursuit completion incorrectly awarded a season or skipped a Pursuit");++cases;
         }
-        for(unsigned chain:{13U,14U,15U}) {
+        for(unsigned chain:{0U,13U,14U,15U}) {
             Achievements achievements;
+            ScriptEvents script_events{all_script_events};
             const auto run=[&](bool observe) {
                 setup();number(0x598188,1.f/60);number(0x4F3330,100.f);number(0x4F3328,5.f);
                 number(boost,0.001f);number(boost+4,100.f);number(boost+0x10,5.f);value(boost+8,1);value(boost+0x1C,chain);
                 value(stack,0xABCDEF00);value(stack+4,racer);
                 Cpu cpu;cpu.registers[ecx]=boost;cpu.registers[esp]=stack;cpu.achievements=observe?&achievements:nullptr;
+                if(!chain) cpu.achievements=nullptr;
+                cpu.script_events=observe?&script_events:nullptr;
                 function(0x796E0).run(cpu,events);return cpu;
             };
             const auto original=run(false);std::array<std::byte,0x2C> saved{};std::memcpy(saved.data(),events.access(boost,saved.size()),saved.size());
@@ -1697,15 +1748,20 @@ unsigned check_cpu_image(const std::filesystem::path& path) {
                 !std::memcmp(saved.data(),events.access(boost,saved.size()),saved.size()),"Burnout observer changed the original boost calculation");
             require(events.load<unsigned>(boost+0x1C)==chain+1 && achievements.unlocked(AchievementId::burnout_x_achievement)==(chain>=14),
                 "Burnout x15 must unlock on the fifteenth completed boost");++cases;
+            const auto event=script_events.pop();
+            require(event && event->type==ScriptEventType::burnout && event->player==1 && event->chain==chain+1 && !script_events.pop(),
+                "Native Burnout completion did not queue its current chain");
         }
         for(unsigned mode:{1U,8U}) for(unsigned track:{9U,10U,25U})
             for(float seconds:{0.f,-1.f,39.99f,40.f,std::nextafter(40.f,41.f),std::numeric_limits<float>::quiet_NaN()}) {
                 setup();value(0x34AB58,mode);value(0x48A150,track);
                 Achievements achievements;
+                ScriptEvents script_events{all_script_events};
                 const auto run=[&](bool observe) {
                     for(unsigned i=0;i<5;++i) number(session+0x18+i*4,std::numeric_limits<float>::max());
                     value(session+0x2C,0);value(stack,0xABCDEF00);number(stack+4,seconds);
                     Cpu cpu;cpu.registers[ecx]=session;cpu.registers[esp]=stack;cpu.achievements=observe?&achievements:nullptr;
+                    cpu.script_events=observe?&script_events:nullptr;
                     function(0x188A0).run(cpu,events);return cpu;
                 };
                 const auto original=run(false);std::array<std::byte,24> saved{};std::memcpy(saved.data(),events.access(session+0x18,saved.size()),saved.size());
@@ -1714,6 +1770,10 @@ unsigned check_cpu_image(const std::filesystem::path& path) {
                     !std::memcmp(saved.data(),events.access(session+0x18,saved.size()),saved.size()),"Lap observer changed the original Time Attack record");
                 require(achievements.unlocked(AchievementId::stay_frosty)==(mode==8 && track==10 && seconds>0 && seconds<=40.f),
                     "Stay Frosty accepted the wrong mode, track, or lap time");++cases;
+                const auto event=script_events.pop();
+                require(bool(event)==(mode==8 && std::isfinite(seconds) && seconds>0),"Time Attack lap events accepted an invalid mode or time");
+                if(event) require(event->type==ScriptEventType::time_attack_lap && event->track==track && event->seconds==seconds && !script_events.pop(),
+                    "Native Time Attack event lost its track or lap time");
             }
         for(unsigned mode:{1U,2U,5U,6U,8U,10U,11U,15U}) for(unsigned place:{1U,2U}) {
             setup();value(0x34AB58,mode);value(0x4B8468,4);
@@ -1721,24 +1781,46 @@ unsigned check_cpu_image(const std::filesystem::path& path) {
             value(stats+0x14,1);value(stats+0x378,1);value(stats+0x34,place);number(stats+8,60.f);
             value(stack,0xABCDEF00);value(stack+4,0);value(stack+8,0);
             Achievements achievements;Cpu cpu;cpu.registers[ecx]=stats;cpu.registers[esp]=stack;cpu.achievements=&achievements;
+            ScriptEvents script_events{all_script_events};cpu.script_events=&script_events;
             function(0x8B840).run(cpu,events);
             require(events.load<unsigned>(stats+0x2C)==1 && achievements.unlocked(AchievementId::youre_winner)==(place==1 && mode!=8 && mode!=15),
                 "A natural race finish did not award exactly a first-place race result");++cases;
+            const auto event=script_events.pop();
+            require(bool(event)==(mode!=8 && mode!=15),"Race finish events accepted an unsupported mode");
+            if(event) require(event->type==ScriptEventType::race_finish && event->player==1 && event->position==place && event->mode==mode,
+                "Native race finish lost its player or finishing position");
+            cpu.achievements=nullptr;cpu.registers[ecx]=stats;cpu.registers[esp]=stack;function(0x8B840).run(cpu,events);
+            require(!script_events.pop(),"Repeated updates emitted the same race finish twice");
+            if(mode==1 && place==2) {
+                value(racer+0x38,0);cpu.registers[ecx]=racer;cpu.registers[esp]=stack;function(0x84250).run(cpu,events);
+                const auto next=script_events.pop();
+                require(next && next->position==place && !script_events.pop(),"Reusing a racer in a new race suppressed its finish event");
+            }
         }
         for(bool enabled:{false,true}) for(bool demo:{false,true}) for(bool human:{false,true}) {
             setup();value(0x2FFD74,demo);value(racer+0xCC4,human);
             Achievements achievements;achievements.enabled(enabled);Cpu cpu;cpu.achievements=&achievements;
+            ScriptEvents script_events{all_script_events};cpu.script_events=&script_events;
             events.fill_elements<unsigned>(progress,3,30,false);title_crash_result(cpu,events,progress,0,3);
             events.fill_elements<unsigned>(progress,2,6,false);value(progress+0x24,2);title_training_result(cpu,events,progress);
             value(progress,21);for(unsigned event:{3U,7U,11U,14U,21U}) value(progress+(event+1)*0x9C,1);
-            title_championship_result(cpu,events,progress);value(stats+0x2C,1);value(stats+0x34,1);value(0x34AB58,1);
+            title_championship_result(cpu,events,progress);value(stats+0x2C,0);value(stats+0x34,1);value(0x34AB58,1);
+            title_race_finish(cpu,events,racer);value(stats+0x2C,1);
             title_race_result(cpu,events,stats);title_starting_boost(cpu,events,vehicle);value(boost+0x1C,15);title_burnout_chain(cpu,events,boost,racer);
             value(0x34AB58,8);title_time_attack_lap(cpu,events,session,std::bit_cast<unsigned>(40.f));
             const unsigned expected_count=enabled && !demo?(human?10:7):0;
             require(achievements.count()==expected_count,"Achievement events ignored disable, demo, player, or completion rules");
             unsigned notifications=0;while(achievements.take_notification()) ++notifications;
             require(notifications==expected_count,"Simultaneous achievements lost a notification");++cases;
+            unsigned queued=0;while(script_events.pop()) ++queued;
+            require(queued==(!demo?(human?5U:2U):0U),"Gameplay events depend on achievements or include demo/AI actions");
         }
+        setup();value(0x2FE370,0);value(0x2FE374,racer);
+        ScriptEvents script_events{all_script_events};Cpu cpu;cpu.script_events=&script_events;
+        title_starting_boost(cpu,events,vehicle);
+        const auto second_player=script_events.pop();
+        require(second_player && second_player->type==ScriptEventType::starting_boost && second_player->player==2,
+            "Gameplay events need achievements enabled or lose split-screen player identity");++cases;
     }
     for(bool ultrawide:{false,true}) for(unsigned split:{0U,2U}) {
         Cpu cpu;cpu.ultrawide=ultrawide;cpu.registers[ecx]=0x3D8570;cpu.registers[esp]=stack;

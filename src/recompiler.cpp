@@ -498,7 +498,7 @@ public:
             // 12650 has finished awarding this run's medal at [esi+78].
             // Observe EBX, not the saved personal best: repeats still qualify.
             const auto progress=read_reg(ZYDIS_REGISTER_ESI),zone=read_reg(ZYDIS_REGISTER_EDI),medal=read_reg(ZYDIS_REGISTER_EBX);
-            body << "    if(cpu.achievements) b2::title_crash_result(cpu,memory," << progress << ',' << zone << ',' << medal << ");\n";
+            body << "    if(cpu.achievements || cpu.script_events) b2::title_crash_result(cpu,memory," << progress << ',' << zone << ',' << medal << ");\n";
         }
         if(instruction.address==0x12F36 || instruction.address==0x11538 || instruction.address==0x8BB17 || instruction.address==0x60AC0) {
             const auto [signature,observer]=[&]() -> std::pair<std::string_view,std::string_view> {
@@ -511,17 +511,24 @@ public:
             }();
             if(hex_bytes(Bytes(instruction.bytes).first(ins.length))!=signature) throw std::runtime_error("Achievement result signature changed");
             const auto object=read_reg(ZYDIS_REGISTER_ESI);
-            body << "    if(cpu.achievements) b2::" << observer << "(cpu,memory," << object << ");\n";
+            body << "    if(cpu.achievements || cpu.script_events) b2::" << observer << "(cpu,memory," << object << ");\n";
+        }
+        if(instruction.address==0x84260) {
+            if(hex_bytes(Bytes(instruction.bytes).first(ins.length))!="C7473801000000") throw std::runtime_error("Race finish transition signature changed");
+            // 84250 commits finished at racer+38. Observe its 0 -> 1 edge,
+            // not 8BB17, which can run again on later checkpoint updates.
+            const auto racer=read_reg(ZYDIS_REGISTER_EDI);
+            body << "    if(cpu.script_events) b2::title_race_finish(cpu,memory," << racer << ");\n";
         }
         if(instruction.address==0x797B9) {
             if(hex_bytes(Bytes(instruction.bytes).first(ins.length))!="8B4714") throw std::runtime_error("Burnout chain signature changed");
             const auto boost=read_reg(ZYDIS_REGISTER_ECX),racer=read_reg(ZYDIS_REGISTER_EDI);
-            body << "    if(cpu.achievements) b2::title_burnout_chain(cpu,memory," << boost << ',' << racer << ");\n";
+            body << "    if(cpu.achievements || cpu.script_events) b2::title_burnout_chain(cpu,memory," << boost << ',' << racer << ");\n";
         }
         if(instruction.address==0x188A0) {
             if(hex_bytes(Bytes(instruction.bytes).first(ins.length))!="D9442404") throw std::runtime_error("Time Attack lap signature changed");
             const auto session=read_reg(ZYDIS_REGISTER_ECX),stack=read_reg(ZYDIS_REGISTER_ESP);
-            body << "    if(cpu.achievements) b2::title_time_attack_lap(cpu,memory," << session << ",memory.load<std::uint32_t>(" << stack << "+4U));\n";
+            body << "    if(cpu.achievements || cpu.script_events) b2::title_time_attack_lap(cpu,memory," << session << ",memory.load<std::uint32_t>(" << stack << "+4U));\n";
         }
         if(instruction.address>=0x1AC00 && instruction.address<0x1CFE0 && ins.mnemonic==ZYDIS_MNEMONIC_CALL &&
            operands[0].type==ZYDIS_OPERAND_TYPE_MEMORY && operands[0].mem.disp.value==4) {
