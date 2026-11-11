@@ -12,7 +12,7 @@ if (Test-Path -LiteralPath $outputPath) { throw 'Package already exists; choose 
 $inputs = @(
     'Install.cmd', 'Build.cmd', 'Build.sh', 'Install.sh', 'Install.command', 'Install.desktop', 'Play.sh',
     'CMakeLists.txt', 'CMakePresets.json', 'README.md', 'BUILDING.txt',
-    'LICENSE', 'NOTICE.md', 'THIRD_PARTY_NOTICES.txt',
+    'LICENSE', 'NOTICE.md', 'THIRD_PARTY_NOTICES.txt', 'third_party/lua-5.4.9.tar.gz',
     'cmake/build.ps1', 'cmake/build-ui.ps1', 'cmake/windows-dependencies.ps1', 'cmake/target.h.in', 'cmake/kernel_names.h.in',
     'cmake/cpu-seeds.txt.in', 'cmake/imgui-shaders.cmake',
     'cmake/linux.cmake', 'cmake/posix-dependencies.sh', 'cmake/vkd3d-copy-propagation.patch',

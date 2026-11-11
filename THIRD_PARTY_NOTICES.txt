@@ -1,5 +1,6 @@
 Lua 5.4.9 (mod scripting sandbox)
 https://www.lua.org/ftp/lua-5.4.9.tar.gz
+The unmodified source archive is bundled at third_party/lua-5.4.9.tar.gz.
 Copyright (C) 1994-2026 Lua.org, PUC-Rio.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy

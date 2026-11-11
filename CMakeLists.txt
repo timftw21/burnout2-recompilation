@@ -70,9 +70,9 @@ FetchContent_Declare(zydis
     GIT_PROGRESS FALSE)
 FetchContent_MakeAvailable(zydis)
 
-# Bounded Lua mod sandbox. Original game code remains compiled ahead of time.
+# Bundle Lua so setup can configure even when lua.org is unreachable.
 FetchContent_Declare(b2_lua
-    URL https://www.lua.org/ftp/lua-5.4.9.tar.gz
+    URL "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lua-5.4.9.tar.gz"
     URL_HASH SHA256=2335b6c582a52654f94612bf10d2f4672805d05329aa6568b1d8cd9e5c6fb8e6
     DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
 FetchContent_MakeAvailable(b2_lua)
