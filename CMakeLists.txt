@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.2)
-project(burnout2 VERSION 1.14.1 LANGUAGES C CXX)
+project(burnout2 VERSION 1.14.5 LANGUAGES C CXX)
 
 if((NOT WIN32 AND NOT APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux") OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR
    (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$" AND NOT (APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")))
@@ -230,7 +230,7 @@ if(B2_XBE)
         target_link_libraries(b2-input PRIVATE mfplat mfreadwrite mf mfuuid ole32 delayimp)
         target_link_options(b2-input INTERFACE /DELAYLOAD:mfplat.dll /DELAYLOAD:mfreadwrite.dll /DELAYLOAD:mf.dll)
     endif()
-    add_library(b2-cpu STATIC src/cpu.cpp src/presentation.cpp src/xbox.cpp src/floating.cpp ${b2_floating_assembly})
+    add_library(b2-cpu STATIC src/cpu.cpp src/presentation.cpp src/xbox.cpp src/xbox_save.cpp src/floating.cpp ${b2_floating_assembly})
     target_include_directories(b2-cpu PUBLIC src)
     target_link_libraries(b2-cpu PUBLIC b2-core PRIVATE b2-input b2-graphics)
     if(WIN32)

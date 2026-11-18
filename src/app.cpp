@@ -2,6 +2,7 @@
 #include "input.h"
 #include "file.h"
 #include "xbox.h"
+#include "xbox_save.h"
 #include "diagnostics.h"
 #include "custom_music.h"
 #include "mods.h"
@@ -400,9 +401,20 @@ struct FramePacer {
         advance();
     }
 };
-struct MusicFolderSelection {
+struct PathSelection {
     std::atomic<bool> finished{false};
     std::string path,error;
+    static void* start(std::shared_ptr<PathSelection>& pending) {
+        pending=std::make_shared<PathSelection>();
+        return new std::shared_ptr<PathSelection>(pending);
+    }
+    static void SDLCALL receive(void* userdata,const char* const* files,int) {
+        std::unique_ptr<std::shared_ptr<PathSelection>> request(static_cast<std::shared_ptr<PathSelection>*>(userdata));
+        auto& result=**request;
+        if(!files) result.error=SDL_GetError();
+        else if(files[0]) result.path=files[0];
+        result.finished.store(true,std::memory_order_release);
+    }
 };
 constexpr std::uint64_t achievement_duration=5000000000ULL;
 float achievement_opacity(std::uint64_t elapsed) {
@@ -420,6 +432,7 @@ struct App {
     DiscordPresence discord{B2_DISCORD_APPLICATION_ID};
     bool presence_allowed=false;
     bool settings_pending=false,display_changed=false;
+    double defaults_message_until=0;
     Achievements achievements;
     std::filesystem::path achievements_path;
     std::future<void> achievements_save;
@@ -443,8 +456,10 @@ struct App {
     Xbox* game=nullptr;
     std::array<std::uint32_t,4> watch_semaphores{};
     MusicImport music_import;
-    std::shared_ptr<MusicFolderSelection> music_folder_selection;
-    std::shared_ptr<MusicFolderSelection> file_selection;
+    std::shared_ptr<PathSelection> music_folder_selection,file_selection,save_selection;
+    std::future<std::string> save_import;
+    std::string save_import_status;
+    std::filesystem::path storage_override;
     bool file_selection_iso=false;
     unsigned music_songs=0;
     std::filesystem::path mods_root;
@@ -452,7 +467,7 @@ struct App {
     std::vector<ModConflict> mod_conflicts;
     std::string mods_status;
     bool mods_error=false;
-    std::shared_ptr<MusicFolderSelection> texture_pack_selection;
+    std::shared_ptr<PathSelection> texture_pack_selection;
     std::future<Mod> texture_pack_install;
     std::optional<unsigned> script_fov;
     std::vector<ScriptMessage> script_messages;
@@ -476,6 +491,7 @@ struct App {
     App(bool hidden,bool warp,const std::filesystem::path& script={},const std::filesystem::path& preferences="data/local/settings.cfg"):
         settings(!hidden,preferences),settings_path(preferences) {
         presence_allowed=!hidden && script.empty();
+        if(hidden || !script.empty()) storage_override=preferences.parent_path()/"automation-user";
         achievements_path=hidden?std::filesystem::path(preferences).concat(".achievements"):preferences.parent_path()/"achievements.cfg";
         if(!hidden) try {achievements.load(achievements_path);}
         catch(const std::exception& error) {achievements_error=error.what();log_message("Achievements: "+achievements_error);}
@@ -678,6 +694,28 @@ struct App {
         ImGui::EndGroup();ImGui::End();ImGui::PopStyleColor(2);ImGui::PopStyleVar(2);
     }
     void cancel_bindings() {binding_action=controller_binding_action=-1;input->cancel_binding();}
+    bool apply_fullscreen() {
+        if(SDL_SetWindowFullscreen(window,settings.fullscreen)) return true;
+        settings.fullscreen=!settings.fullscreen;log_message(SDL_GetError());return false;
+    }
+    void restore_defaults() {
+        Preferences defaults(false);
+        defaults.xbe=settings.xbe;defaults.disc=settings.disc;defaults.music_folder=settings.music_folder;
+        const bool change_fullscreen=settings.fullscreen!=defaults.fullscreen;
+        settings=std::move(defaults);
+        if(change_fullscreen) apply_fullscreen();
+        cancel_bindings();
+        input->bindings(settings.bindings);
+        if(!controls) {
+            input->keyboard(settings.keyboard);
+            input->controller_bindings(settings.controller_bindings);
+        }
+        update_audio_gain();
+        script_fov.reset();
+        achievements.enabled(true);
+        mod_conflicts.clear();mods_status.clear();mods_error=false;
+        settings_dirty=settings_pending=true;
+    }
     void exit_game() {running=false;launch=false;cancel_bindings();save_settings();}
     void start_controller_binding(unsigned action) {
         cancel_bindings();
@@ -896,6 +934,22 @@ struct App {
             }
         }
         finish_texture_pack_install();
+        if(save_selection && save_selection->finished.load(std::memory_order_acquire)) {
+            const auto selected=std::move(save_selection);
+            if(!selected->error.empty()) save_import_status="Could not open the save picker. "+selected->error;
+            else if(!selected->path.empty()) {
+                try {
+                    save_import=std::async(std::launch::async,import_xbox_save,utf8_path(settings.xbe.data()),
+                                           utf8_path(selected->path),storage_override);
+                    save_import_status="Importing Xbox save...";
+                } catch(const std::exception& error) {save_import_status=error.what();}
+            }
+        }
+        if(save_import.valid() && save_import.wait_for(std::chrono::seconds(0))==std::future_status::ready) {
+            try {
+                save_import_status=save_import.get()+(playing?" Restart the game, then open Load/Save.":" Open Load/Save in the game to load it.");
+            } catch(const std::exception& error) {save_import_status="Import failed. "+std::string(error.what());}
+        }
         if(file_selection && file_selection->finished.load(std::memory_order_acquire)) {
             if(!file_selection->error.empty()) log_message(file_selection->error);
             else if(!file_selection->path.empty()) {
@@ -959,14 +1013,7 @@ struct App {
         catch(const std::exception& error) {mods_status=error.what();mods_error=true;}
     }
     void browse_texture_pack() {
-        texture_pack_selection=std::make_shared<MusicFolderSelection>();
-        auto* request=new std::shared_ptr<MusicFolderSelection>(texture_pack_selection);
-        SDL_ShowOpenFolderDialog([](void* userdata,const char* const* files,int) {
-            std::unique_ptr<std::shared_ptr<MusicFolderSelection>> request(static_cast<std::shared_ptr<MusicFolderSelection>*>(userdata));
-            auto& result=**request;
-            if(!files) result.error=SDL_GetError();else if(files[0]) result.path=files[0];
-            result.finished.store(true,std::memory_order_release);
-        },request,window,nullptr,false);
+        SDL_ShowOpenFolderDialog(PathSelection::receive,PathSelection::start(texture_pack_selection),window,nullptr,false);
     }
     void finish_texture_pack_install(bool wait=false) {
         if(!texture_pack_install.valid() || (!wait && texture_pack_install.wait_for(std::chrono::seconds(0))!=std::future_status::ready)) return;
@@ -1129,15 +1176,8 @@ struct App {
         return changed;
     }
     void browse_music() {
-        music_folder_selection=std::make_shared<MusicFolderSelection>();
-        auto* request=new std::shared_ptr<MusicFolderSelection>(music_folder_selection);
-        SDL_ShowOpenFolderDialog([](void* userdata,const char* const* files,int) {
-            std::unique_ptr<std::shared_ptr<MusicFolderSelection>> request(static_cast<std::shared_ptr<MusicFolderSelection>*>(userdata));
-            auto& result=**request;
-            if(!files) result.error=SDL_GetError();
-            else if(files[0]) result.path=files[0];
-            result.finished.store(true,std::memory_order_release);
-        },request,window,settings.music_folder[0]?settings.music_folder.data():nullptr,false);
+        SDL_ShowOpenFolderDialog(PathSelection::receive,PathSelection::start(music_folder_selection),window,
+                                 settings.music_folder[0]?settings.music_folder.data():nullptr,false);
     }
     void begin_music_import() {
         music_import_requested=false;music_importing=true;
@@ -1158,15 +1198,9 @@ struct App {
         return false;
 #else
         if(file_selection) return false;
-        file_selection=std::make_shared<MusicFolderSelection>();file_selection_iso=iso;
-        auto* request=new std::shared_ptr<MusicFolderSelection>(file_selection);
-        const SDL_DialogFileFilter filter{iso?"Xbox game disc":"Xbox executable",iso?"iso":"xbe"};
-        SDL_ShowOpenFileDialog([](void* userdata,const char* const* files,int) {
-            std::unique_ptr<std::shared_ptr<MusicFolderSelection>> request(static_cast<std::shared_ptr<MusicFolderSelection>*>(userdata));
-            auto& result=**request;
-            if(!files) result.error=SDL_GetError();else if(files[0]) result.path=files[0];
-            result.finished.store(true,std::memory_order_release);
-        },request,window,&filter,1,path[0]?path.data():nullptr,false);
+        file_selection_iso=iso;
+        static constexpr SDL_DialogFileFilter filters[]={{"Xbox executable","xbe"},{"Xbox game disc","iso"}};
+        SDL_ShowOpenFileDialog(PathSelection::receive,PathSelection::start(file_selection),window,&filters[iso],1,path[0]?path.data():nullptr,false);
         return false;
 #endif
     }
@@ -1243,6 +1277,13 @@ struct App {
                         setting_help("Select the Xbox game disc image. Changes save automatically.");
                         ImGui::Spacing();ImGui::TextWrapped("Use the US Xbox release of Burnout 2: Point of Impact. Select default.xbe and its XISO disc image.");
                         if(playing) ImGui::TextWrapped("Use Restart game to load different game files. The window stays open.");
+                        ImGui::Spacing();ImGui::SeparatorText("IMPORT XBOX SAVE");
+                        ImGui::TextWrapped("Choose Profile 1, Profile 2 or Profile 3 from your extracted Xbox save. The game imports it into a free profile slot.");
+                        ImGui::BeginDisabled(save_selection || save_import.valid());
+                        if(ImGui::Button("Import Xbox save..."))
+                            SDL_ShowOpenFileDialog(PathSelection::receive,PathSelection::start(save_selection),window,nullptr,0,nullptr,false);
+                        ImGui::EndDisabled();
+                        if(!save_import_status.empty()) ImGui::TextWrapped("%s",save_import_status.c_str());
                         break;
                     case 1: {
                         ImGui::SeparatorText("MOTION & PERFORMANCE");
@@ -1319,8 +1360,7 @@ struct App {
                         changed|=ImGui::Checkbox("V-sync",&settings.vsync);
                         setting_help("Synchronizes presentation with the display to prevent tearing. The display's refresh rate limits the maximum frame rate.");
                         if(ImGui::Checkbox("Fullscreen",&settings.fullscreen)) {
-                            if(!SDL_SetWindowFullscreen(window,settings.fullscreen)) {settings.fullscreen=!settings.fullscreen;log_message(SDL_GetError());}
-                            else changed=true;
+                            changed|=apply_fullscreen();
                         }
                         setting_help("Switches between a window and fullscreen immediately.");
                         ImGui::Spacing();ImGui::SeparatorText("RESOLUTION");
@@ -1493,13 +1533,17 @@ struct App {
             settings_pending|=changed;
             ImGui::Separator();
             const auto available=ImGui::GetContentRegionAvail().x,spacing=ImGui::GetStyle().ItemSpacing.x;
-            const float count=playing?3.0f:2.0f;
+            const float count=playing?4.0f:3.0f;
             const auto button_width=std::clamp((available-spacing*(count-1))/count,1.0f,145.0f);
             const auto row_width=button_width*count+spacing*(count-1);
             const auto footer=ImGui::GetCursorPos();
-            if(available-row_width>175) {ImGui::AlignTextToFramePadding();disabled_text("Changes save automatically");}
+            if(available-row_width>175) {
+                ImGui::AlignTextToFramePadding();
+                disabled_text(ImGui::GetTime()<defaults_message_until?"Defaults restored":"Changes save automatically");
+            }
             ImGui::SetCursorPos({footer.x+available-row_width,footer.y});
-            ImGui::BeginDisabled(music_importing || music_import_requested || texture_pack_selection || texture_pack_install.valid());
+            const bool importing=music_importing || music_import_requested || texture_pack_selection || texture_pack_install.valid() || save_selection || save_import.valid();
+            ImGui::BeginDisabled(importing);
             ImGui::PushStyleColor(ImGuiCol_Text,ImVec4{.08f,.07f,.06f,1});
             ImGui::PushStyleColor(ImGuiCol_Button,ImVec4{1,.49f,.19f,1});
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered,ImVec4{1,.61f,.34f,1});
@@ -1514,6 +1558,12 @@ struct App {
                 if(ImGui::Button("Return to game",{button_width,0})) {show_settings=false;cancel_bindings();}
                 setting_help("Returns to the game. Changes save automatically. Esc opens or closes settings.");
             }
+            ImGui::SameLine();ImGui::BeginDisabled(importing);
+            if(ImGui::Button("Restore defaults",{button_width,0})) {
+                restore_defaults();defaults_message_until=ImGui::GetTime()+3;
+            }
+            setting_help("Restores settings across all categories, including key and controller bindings. Keeps your file locations and game progress.");
+            ImGui::EndDisabled();
             ImGui::SameLine();
             if(ImGui::Button("Exit game",{button_width,0})) exit_game();
             setting_help("Closes the game and the window. Pending setting changes save automatically.");
@@ -1614,7 +1664,7 @@ struct App {
             renderer->configure(selected.resolution_scale,selected.antialiasing,selected.anisotropy,
                 unsigned(selected.ambient_occlusion),selected.ambient_occlusion_strength/100.0f,selected.hdr_options());
             if(game) game->settings({selected.aspect_ratio!=0,selected.aspect_ratio==2,selected.motion_blur,
-                selected.skip_intro,selected.fast_load,selected.clean_hud,unsigned(selected.draw_distance),script_fov.value_or(unsigned(selected.camera_fov))});
+                selected.skip_intro,selected.fast_load,selected.clean_hud,unsigned(selected.draw_distance),script_fov.value_or(unsigned(selected.camera_fov)),settings.loop_track});
             renderer->clean_hud(selected.clean_hud);renderer->aspect_ratio(selected.aspect());
         };
         try {apply(settings);}
@@ -1648,7 +1698,7 @@ struct App {
             json(path_text(executable)),json(path_text(disc)),json(image.sha256)));
         std::vector<std::byte> ram(64*1024*1024);image.load(std::span(ram).subspan(image.base,image.image_size));Memory memory(0,ram);
         XboxHost host{renderer.get(),input.get(),[&]{return poll_game();},[&]{game_flip();}};
-        if(controls) host.storage_root=settings_path.parent_path()/"automation-user";
+        host.storage_root=storage_override;
         host.widescreen=active_widescreen;
         host.ultrawide=active_aspect_ratio==2;host.motion_blur=active_motion_blur;
         host.skip_intro=settings.skip_intro;host.fast_load=settings.fast_load;host.clean_hud=settings.clean_hud;host.draw_distance=unsigned(settings.draw_distance);
@@ -1893,7 +1943,7 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
         std::filesystem::create_directories(download.parent_path());create_mod(download,"HD texture pack",true);
         save_png({1,1,{std::byte{255},std::byte{128},std::byte{0},std::byte{255}}},download/"textures"/(std::string(40,'a')+".png"));
         // Exercise the asynchronous folder-selection result without opening a dialog.
-        app.texture_pack_selection=std::make_shared<MusicFolderSelection>();
+        app.texture_pack_selection=std::make_shared<PathSelection>();
         app.texture_pack_selection->path=path_text(std::filesystem::absolute(download));
         app.texture_pack_selection->finished.store(true,std::memory_order_release);
         app.playing=true;const auto deadline=SDL_GetTicksNS()+10000000000ULL;
@@ -2269,6 +2319,16 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     if(renderer.stats().shader_compilations) throw std::runtime_error("Settings compiled shaders during runtime");
     const auto messages=app.renderer->errors();
     if(!messages.empty()) throw std::runtime_error("SDL3/ImGui validation: "+messages.front());
+    copy_text(saved.xbe.data(),saved.xbe.size(),"original/default.xbe");
+    copy_text(saved.disc.data(),saved.disc.size(),"original/disc.iso");
+    app.settings=saved;app.script_fov=125;app.achievements.enabled(false);
+    app.restore_defaults();app.apply_settings();app.save_settings();
+    const Preferences reset_settings(true,preferences),defaults(false);
+    if(reset_settings.xbe!=saved.xbe || reset_settings.disc!=saved.disc || reset_settings.music_folder!=saved.music_folder ||
+       reset_settings.bindings!=defaults.bindings || reset_settings.controller_bindings!=defaults.controller_bindings ||
+       reset_settings.refresh_rate!=defaults.refresh_rate || reset_settings.loop_track || !reset_settings.enabled_mods.empty() ||
+       app.active_camera_fov()!=defaults.camera_fov || !app.achievements.enabled())
+        throw std::runtime_error("Restore defaults did not reset preferences and keep configured file locations");
     app.settings.volume=37;app.settings_dirty=true;app.launch=true;app.binding_action=15;
     SDL_Event close{};close.type=SDL_EVENT_WINDOW_CLOSE_REQUESTED;app.event(close);
     Preferences closed(true,preferences);

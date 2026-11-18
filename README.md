@@ -18,11 +18,10 @@ I'll try to respond in a timely manner. This is an independent fan project, unaf
 Yes, AI (Codex) assisted in the development of this project. No, this project was not blindly thrown together.
 If you're skeptical, I implore you to try the recompilation for yourself. I take quality control quite seriously!👀
 
-## What's new in 1.14
+## What's new in 1.14.5
 
-- Added camera FOV slider to Graphics options.
-- Texture packs can now be easily installed. See the Mods tab in Settings for more information.
-- Added initial scripting support.
+- **Import Xbox save** brings an original Burnout 2 profile into a free slot. The recomp signs the copy automatically, so you can import it without an Xbox HDD key.
+- **Restore defaults** resets settings across all categories, including keyboard and controller bindings. During play, it sits between **Return to game** and **Exit game**.
 
 Download **Installation.zip** and extract it over your existing source folder,
 keeping `build` and `data`. Rerun **Install.cmd** on Windows, **Install.desktop**
@@ -220,6 +219,14 @@ Click **Start game** to play; press **Esc** to open or close settings. Changes
 save automatically. Graphics, controls and enhancement changes apply during play.
 Mods and imported music use a game restart. Hover over options for details.
 
+- **Game files** — Click **Import Xbox save…** and select the file named `Profile 1`,
+  `Profile 2` or `Profile 3` in your extracted Xbox save folder. The importer
+  checks the save and keeps its slot number if available. If that slot is taken,
+  it uses another free slot. Open **Load/Save** in the game and choose the
+  reported slot. If you imported during play, restart the game first.
+- **Restore defaults** — Click the button at the bottom of Settings to restore
+  the built-in preferences. Your selected file locations, saves and achievement
+  progress are preserved.
 - **General:** Set the refresh rate or **Unlimited**, show FPS, and enable
   **Discord Rich Presence**. Presence is off by default and requires Discord desktop.
 - **Graphics:** Choose resolution, aspect ratio, camera FOV, V-sync and Windows HDR output.

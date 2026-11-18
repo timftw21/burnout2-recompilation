@@ -765,6 +765,12 @@ The cache binding creates Z: and a private title directory. Requested cache
 formatting affects only that title's cache. Storage rejects traversal and reparse
 points; saves remain persistent.
 
+To import a US Xbox profile, open Game files > Import Xbox Save and select the
+file named Profile 1, Profile 2 or Profile 3 in the extracted Xbox save folder.
+The importer verifies the profile checksum and signs a copy for this installation.
+It keeps the Xbox slot number when available, otherwise it uses a free slot.
+Open Load/Save in the game and choose the reported slot.
+
 & .\build\windows\Release\b2.exe --check-storage data/local/default.xbe build/checks/storage
 
 Use a fresh output directory. This isolated check runs the original process-heap,

@@ -13,6 +13,7 @@ struct GameSettings {
     bool skip_intro=false,fast_load=false,clean_hud=false;
     unsigned draw_distance=1;
     unsigned camera_fov=100;
+    bool loop_track=false;
 };
 struct XboxHost {
     Renderer* renderer=nullptr;

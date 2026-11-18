@@ -1,4 +1,5 @@
 #include "xbox.h"
+#include "xbox_save.h"
 #include "custom_music.h"
 #include "disc.h"
 #include "mods.h"
@@ -333,14 +334,9 @@ struct Xbox::State {
             }
             diagnostic_record(mods->report());
         }
-        if(this->host.storage_root.empty()) {
-            user_root=executable_path().parent_path()/"data/user";
-        } else user_root=std::filesystem::absolute(this->host.storage_root).lexically_normal();
-        user_root=std::filesystem::absolute(user_root).lexically_normal();
-        if(std::filesystem::weakly_canonical(user_root)!=user_root)
-            throw std::runtime_error("Native storage path crosses a reparse point");
-        std::filesystem::create_directories(user_root/"TDATA");
-        std::filesystem::create_directories(user_root/"UDATA");
+        user_root=xbox_storage_root(this->host.storage_root);
+        std::filesystem::create_directories(xbox_storage_child(user_root,"TDATA"));
+        std::filesystem::create_directories(xbox_storage_child(user_root,"UDATA"));
         if(!this->host.custom_music_root.empty()) {
             auto& root=this->host.custom_music_root;root=std::filesystem::absolute(root).lexically_normal();
             if(std::filesystem::weakly_canonical(root)!=root) throw std::runtime_error("Custom music storage crosses a link or junction.");
@@ -449,31 +445,13 @@ struct Xbox::State {
         if(host.script_output && (output.camera_fov || !output.messages.empty() || !output.errors.empty())) host.script_output(output);
     }
     void initialize_save_keys() {
-        // The native profile owns its console identity; no original EEPROM is required.
-        const auto path=user_root/"storage.key";
-        if(GetFileAttributesW(path.c_str())!=INVALID_FILE_ATTRIBUTES &&
-           (GetFileAttributesW(path.c_str())&FILE_ATTRIBUTE_REPARSE_POINT))
-            throw std::runtime_error("Native save identity is a reparse point");
-        std::array<std::byte,32> keys{};
-        if(!std::filesystem::exists(path)) {
-            random_bytes(keys.data(),keys.size());
-            write_text(path,std::string_view(reinterpret_cast<const char*>(keys.data()),keys.size()),false);
-        }
-        File file(path);
-        if(file.size()!=keys.size()) throw std::runtime_error("Native save identity has an invalid size; preserve storage.key with your saves");
-        file.read(0,keys);
-        if(std::ranges::all_of(Bytes(keys).first(16),[](std::byte value){return value==std::byte{};}))
-            throw std::runtime_error("Native save identity has an invalid empty disk key");
-        std::memcpy(memory.access(export_data(323,16),16),keys.data(),16);
-        const auto certificate=image.data(u32(image.data(image.base+0x118,4),0),0x1D0);
-        if(u32(certificate,0)<certificate.size()) throw std::runtime_error("Executable certificate has no save signing keys");
-        const auto derive=[&](std::uint32_t destination,unsigned offset) {
-            const auto key=xbox_hmac(Bytes(keys).subspan(16),Bytes(certificate).subspan(offset,16));
-            std::memcpy(memory.access(destination,16),key.data(),16);
+        const auto keys=xbox_save_keys(image,user_root);
+        const auto publish=[&](unsigned ordinal,Bytes bytes) {
+            const auto size=static_cast<std::uint32_t>(bytes.size());
+            std::memcpy(memory.access(export_data(ordinal,size),size),bytes.data(),size);
         };
-        derive(export_data(325,16),0xC0);derive(export_data(353,16),0xB0);
-        const auto alternate=export_data(354,256);
-        for(unsigned i=0;i<16;++i) derive(alternate+i*16,0xD0+i*16);
+        publish(323,keys.disk);publish(325,keys.signature);publish(353,keys.lan);
+        publish(354,std::as_bytes(std::span(keys.alternate)));
         diagnostic_record("{\"type\":\"storage_ready\",\"root\":"+json(path_text(user_root))+"}");
     }
     std::uint32_t allocate(std::uint32_t size,std::uint32_t alignment,bool committed,std::uint32_t protect,
@@ -990,25 +968,8 @@ struct Xbox::State {
             const auto base=folded(part.substr(0,part.find('.')));
             if(base=="CON" || base=="PRN" || base=="AUX" || base=="NUL" ||
                 (base.size()==4 && (base.starts_with("COM") || base.starts_with("LPT")) && base[3]>='1' && base[3]<='9')) return std::nullopt;
-            auto candidate=path/std::string(part);
-#ifndef _WIN32
-            // FATX names are case-insensitive even on a case-sensitive host.
-            // Exact names stay fast; only a miss needs a bounded directory walk.
-            std::error_code error;
-            if(!std::filesystem::exists(candidate,error) && !error && std::filesystem::is_directory(path,error) && !error) {
-                std::optional<std::filesystem::path> match;unsigned entries=0;
-                const auto wanted=folded(part);
-                for(const auto& entry:std::filesystem::directory_iterator(path)) {
-                    if(++entries>4096) throw NativeBoundary(current->cpu.eip,"native storage directory exceeds 4096 entries");
-                    if(folded(path_text(entry.path().filename()))!=wanted) continue;
-                    if(match) throw NativeBoundary(current->cpu.eip,"native storage contains ambiguous FATX filename casing");
-                    match=entry.path();
-                }
-                if(match) candidate=*match;
-            }
-#endif
-            path=std::move(candidate);
-            if(!validate(path)) throw NativeBoundary(current->cpu.eip,"writable guest path crosses a reparse point");
+            try {path=xbox_storage_child(path,part);}
+            catch(const std::runtime_error& error) {throw NativeBoundary(current->cpu.eip,error.what());}
             if(end==std::string_view::npos) break;
             start=end+1;
         }
@@ -3816,7 +3777,7 @@ void Xbox::settings(const GameSettings& settings) {
         s.world_prepare_pending=settings.draw_distance>1;
     }
     host.draw_distance=settings.draw_distance;s.hud_layout.enabled=host.widescreen;
-    host.camera_fov=settings.camera_fov;
+    host.camera_fov=settings.camera_fov;host.loop_track=settings.loop_track;
     for(auto& thread:s.threads) {
         auto& cpu=thread->cpu;
         cpu.skip_intro=host.skip_intro;cpu.fast_load=host.fast_load;cpu.clean_hud=host.clean_hud;
@@ -5090,6 +5051,30 @@ std::string check_storage(const std::filesystem::path& executable,const std::fil
             memory.store<std::uint8_t>(profile,memory.load<std::uint8_t>(profile)^1U);
             const auto changed=reference(span(key,16),span(profile,signed_size));
             require(reference(span(disk,16),changed)!=expected,"changed save data fails integrity verification");
+
+            // Prepare a disk-sized save with the title's writer and a foreign console signature.
+            constexpr unsigned disk_size=0x7C00;
+            text(area+0x40,"IMPORT");cpu.registers[ecx]=profile;invoke(0xD62E0,{area+0x40,1});
+            const auto foreign=reference(Bytes(saved_keys).last(16),reference(span(key,16),span(profile,signed_size)));
+            std::memcpy(memory.access(profile+signed_size,foreign.size()),foreign.data(),foreign.size());
+            const auto source=output/"xbox"/"Profile 2";
+            const auto original=span(profile,disk_size);
+            write_text(source,{reinterpret_cast<const char*>(original.data()),original.size()},false);
+            import_xbox_save(executable,source,output);
+            require(std::ranges::equal(File(source).read(0,disk_size),original),"import preserves the original Xbox file");
+            require(import_xbox_save(executable,source,output)=="Profile 2 already contains this save.","repeat import identifies the existing profile");
+
+            constexpr char16_t imported_name[]=u"Profile 2";
+            std::memcpy(memory.access(area+0x40,sizeof(imported_name)),imported_name,sizeof(imported_name));
+            require(invoke(0xE1445,{area,area+0x40,3,0,area+0x100,260})==0,"original SDK reopens imported profile metadata");
+            const std::string slot(static_cast<const char*>(memory.access(area+0x100,260)));
+            text(area+0x300,slot+"Profile 2");
+            const auto imported=invoke(0xE09BA,{area+0x300,GENERIC_READ,3,0,3,0x80,0});
+            require(imported!=UINT32_MAX && invoke(0xFFF00000U+219*16,{imported,0,0,0,area+0x710,profile,disk_size,area+0x700})==success &&
+                    memory.load<std::uint32_t>(area+0x714)==disk_size,"original SDK reads the imported profile");
+            invoke(0xFFF00000U+187*16,{imported});
+            cpu.registers[ecx]=profile;
+            require(invoke(0xD6420,{})==3,"original game accepts the imported signature, checksum and version");
         }
     }
     return std::format("{{\"format\":\"b2-storage-check-v1\",\"passed\":true,\"game_booted\":false,\"cases\":{},\"vehicle_detail_cases\":{},\"profile_bytes\":31748,\"reopened\":true,\"overwritten\":true,\"async_write\":true,\"runtime_decoder\":false,\"graphics_checked\":{},\"graphics_status\":{},\"storage\":{}}}",checks,vehicle_detail_cases,graphics_checked,json(graphics_checked?"checked":"unsupported-metal-gpu"),json(utf8(std::filesystem::absolute(output).wstring())));
