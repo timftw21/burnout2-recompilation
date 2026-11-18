@@ -120,13 +120,25 @@ function Remove-SetupDirectory([string]$path) {
 
 function Get-PortableTool([string]$key) {
     $package = $windowsPackages[$key]
-    $directory = Join-Path $toolsRoot $package.Directory
-    $program = Join-Path $directory $package.Program
-    $stamp = Join-Path $directory 'setup.sha256'
-    if ((Test-Path -LiteralPath $stamp) -and [IO.File]::ReadAllText($stamp) -eq $package.Hash -and
-        (Find-Program '' @($program) ([version]$package.Version) $package.Companions -CandidatesOnly)) { return $program }
+    $installs = @(Join-Path $toolsRoot $package.Directory)
+    if (Test-Path -LiteralPath $toolsRoot) {
+        $installs += @(Get-ChildItem -LiteralPath $toolsRoot -Directory -Filter "$($package.Directory)-*" | ForEach-Object {
+            if ($package.Folder) { Join-Path $_.FullName $package.Folder }
+            else { $_.FullName }
+        })
+    }
+    foreach ($directory in $installs) {
+        $stamp = Join-Path $directory 'setup.sha256'
+        if ((Test-Path -LiteralPath $stamp) -and [IO.File]::ReadAllText($stamp) -eq $package.Hash) {
+            $program = Find-Program '' @((Join-Path $directory $package.Program)) ([version]$package.Version) $package.Companions -CandidatesOnly
+            if ($program) { return $program }
+        }
+    }
+
     $archive = Get-SetupDownload $package
-    $unpack = Join-Path $toolsRoot ('.unpack-' + [Guid]::NewGuid())
+    # Keep executables where they were unpacked. Windows can lock them as soon
+    # as they appear, so publish the installation by writing the stamp last.
+    $unpack = Join-Path $toolsRoot "$($package.Directory)-$([Guid]::NewGuid().ToString('N'))"
     [IO.Directory]::CreateDirectory($unpack) | Out-Null
     try {
         Show-Status "Preparing $($package.Name)..."
@@ -138,19 +150,18 @@ function Get-PortableTool([string]$key) {
             Run-Step "Unpacking $($package.Name)..." $script:cmake @('-E', 'tar', 'xf', $archive) -Directory $unpack
         }
         if ($cancelled) { throw 'Installation cancelled.' }
-        $source = if ($package.Folder) { Join-Path $unpack $package.Folder } else { $unpack }
-        if (!(Find-Program '' @((Join-Path $source $package.Program)) ([version]$package.Version) $package.Companions -CandidatesOnly)) {
+        $directory = if ($package.Folder) { Join-Path $unpack $package.Folder } else { $unpack }
+        $program = Find-Program '' @((Join-Path $directory $package.Program)) ([version]$package.Version) $package.Companions -CandidatesOnly
+        if (!$program) {
             throw "$($package.Name) archive does not contain a working toolchain. Open the build log for details."
         }
-        Remove-SetupDirectory $directory
-        # Both paths are confined to this installer-owned cache before moving.
-        $prefix = [IO.Path]::GetFullPath($toolsRoot).TrimEnd('\') + '\'
-        if (![IO.Path]::GetFullPath($source).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or
-            ![IO.Path]::GetFullPath($directory).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Invalid tool-cache move.' }
-        Move-Item -LiteralPath $source -Destination $directory
-        [IO.File]::WriteAllText($stamp, $package.Hash)
-    } finally { Remove-SetupDirectory $unpack }
-    return $program
+        [IO.File]::WriteAllText((Join-Path $directory 'setup.sha256'), $package.Hash)
+        return $program
+    } catch {
+        try { Remove-SetupDirectory $unpack }
+        catch { Show-Status "Could not clean up the incomplete $($package.Name) installation. $($_.Exception.Message)" }
+        throw
+    }
 }
 
 function Find-WindowsSdk {
