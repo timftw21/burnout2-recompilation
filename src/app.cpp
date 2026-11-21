@@ -10,6 +10,7 @@
 #include "texture_packs.h"
 #include "achievements.h"
 #include "discord.h"
+#include "installation.h"
 #include <SDL3/SDL.h>
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
@@ -292,7 +293,7 @@ Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> settings_logo(ID3D11Device* dev
         SDL_LoadPNG_IO(SDL_IOFromConstMem(bytes,SizeofResource(module,resource)),true),SDL_DestroySurface);
 #else
     std::unique_ptr<SDL_Surface,decltype(&SDL_DestroySurface)> pixels(
-        SDL_LoadPNG((executable_path().parent_path()/"resources/b2.png").c_str()),SDL_DestroySurface);
+        SDL_LoadPNG(resource_path("b2.png").c_str()),SDL_DestroySurface);
 #endif
     if(!pixels) throw std::runtime_error(SDL_GetError());
     if(pixels->format!=SDL_PIXELFORMAT_RGBA32) pixels.reset(SDL_ConvertSurface(pixels.get(),SDL_PIXELFORMAT_RGBA32));
@@ -459,6 +460,8 @@ struct App {
     std::shared_ptr<PathSelection> music_folder_selection,file_selection,save_selection;
     std::future<std::string> save_import;
     std::string save_import_status;
+    std::future<void> game_files_setup;
+    std::string game_files_status;
     std::filesystem::path storage_override;
     bool file_selection_iso=false;
     unsigned music_songs=0;
@@ -496,7 +499,7 @@ struct App {
         if(!hidden) try {achievements.load(achievements_path);}
         catch(const std::exception& error) {achievements_error=error.what();log_message("Achievements: "+achievements_error);}
         music_songs=custom_music_count(music_cache());
-        mods_root=std::filesystem::absolute(hidden?preferences.parent_path()/"mods":executable_path().parent_path()/"mods").lexically_normal();
+        mods_root=std::filesystem::absolute(hidden?preferences.parent_path()/"mods":data_root()/"mods").lexically_normal();
         refresh_mods();
         // Explicit scripts must work while the user keeps another app focused.
         // This process reads only its own virtual controller in script mode.
@@ -594,7 +597,7 @@ struct App {
         if(!bytes) throw std::runtime_error("The achievement sound resource is missing");
         auto* source=SDL_IOFromConstMem(bytes,SizeofResource(module,resource));
 #else
-        auto* source=SDL_IOFromFile((executable_path().parent_path()/"resources/achievement-unlocked.wav").c_str(),"rb");
+        auto* source=SDL_IOFromFile(resource_path("achievement-unlocked.wav").c_str(),"rb");
 #endif
         if(!SDL_LoadWAV_IO(source,true,&format,&achievement_audio_data,&achievement_audio_size))
             throw std::runtime_error(SDL_GetError());
@@ -950,12 +953,21 @@ struct App {
                 save_import_status=save_import.get()+(playing?" Restart the game, then open Load/Save.":" Open Load/Save in the game to load it.");
             } catch(const std::exception& error) {save_import_status="Import failed. "+std::string(error.what());}
         }
+        if(game_files_setup.valid() && game_files_setup.wait_for(std::chrono::seconds(0))==std::future_status::ready) {
+            try {
+                game_files_setup.get();
+                copy_text(settings.xbe.data(),settings.xbe.size(),"data/local/default.xbe");settings_dirty=true;refresh_mods();
+                game_files_status="Your game files are ready. Select Start game to play.";
+            } catch(const std::exception& error) {game_files_status="The selected disc image cannot be used. "+std::string(error.what());}
+        }
         if(file_selection && file_selection->finished.load(std::memory_order_acquire)) {
             if(!file_selection->error.empty()) log_message(file_selection->error);
             else if(!file_selection->path.empty()) {
                 auto& destination=file_selection_iso?settings.disc:settings.xbe;
-                if(file_selection->path.size()<destination.size()) {copy_text(destination.data(),destination.size(),file_selection->path);settings_dirty=true;}
-                else log_message("The selected file path is too long.");
+                if(file_selection->path.size()<destination.size()) {
+                    copy_text(destination.data(),destination.size(),file_selection->path);settings_dirty=true;
+                    if(file_selection_iso) prepare_game_files();
+                } else log_message("The selected file path is too long.");
             }
             file_selection.reset();
         }
@@ -1175,6 +1187,13 @@ struct App {
         }
         return changed;
     }
+    // First-run setup: the selected disc supplies its verified executable and the disabled Test Mod.
+    void prepare_game_files() {
+        if(game_files_setup.valid()) return;
+        const auto disc=utf8_path(settings.disc.data());const auto root=std::filesystem::current_path();const auto mods=mods_root;
+        game_files_status.clear();
+        game_files_setup=std::async(std::launch::async,[disc,root,mods] {extract_game_executable(disc,root);install_modding_test(disc,mods);});
+    }
     void browse_music() {
         SDL_ShowOpenFolderDialog(PathSelection::receive,PathSelection::start(music_folder_selection),window,
                                  settings.music_folder[0]?settings.music_folder.data():nullptr,false);
@@ -1273,9 +1292,13 @@ struct App {
                         setting_label("Game disc image");ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x-104);
                         changed|=ImGui::InputText("##Game disc",settings.disc.data(),settings.disc.size());
                         setting_help("Your US Xbox XISO disc image. Changes apply to the next game session.");
-                        ImGui::SameLine();if(ImGui::Button("Browse##disc",{92,0})) changed|=browse(settings.disc,true);
-                        setting_help("Select the Xbox game disc image. Changes save automatically.");
-                        ImGui::Spacing();ImGui::TextWrapped("Use the US Xbox release of Burnout 2: Point of Impact. Select default.xbe and its XISO disc image.");
+                        ImGui::SameLine();ImGui::BeginDisabled(game_files_setup.valid());
+                        if(ImGui::Button("Browse##disc",{92,0}) && browse(settings.disc,true)) {changed=true;prepare_game_files();}
+                        ImGui::EndDisabled();
+                        setting_help("Select the Xbox game disc image. The game executable is extracted and verified from it automatically.");
+                        ImGui::Spacing();ImGui::TextWrapped("Use the US Xbox release of Burnout 2: Point of Impact as an XISO disc image. Selecting it prepares the game executable automatically.");
+                        if(game_files_setup.valid()) ImGui::TextWrapped("Preparing game files...");
+                        else if(!game_files_status.empty()) ImGui::TextWrapped("%s",game_files_status.c_str());
                         if(playing) ImGui::TextWrapped("Use Restart game to load different game files. The window stays open.");
                         ImGui::Spacing();ImGui::SeparatorText("IMPORT XBOX SAVE");
                         ImGui::TextWrapped("Choose Profile 1, Profile 2 or Profile 3 from your extracted Xbox save. The game imports it into a free profile slot.");
@@ -1542,7 +1565,7 @@ struct App {
                 disabled_text(ImGui::GetTime()<defaults_message_until?"Defaults restored":"Changes save automatically");
             }
             ImGui::SetCursorPos({footer.x+available-row_width,footer.y});
-            const bool importing=music_importing || music_import_requested || texture_pack_selection || texture_pack_install.valid() || save_selection || save_import.valid();
+            const bool importing=music_importing || music_import_requested || texture_pack_selection || texture_pack_install.valid() || save_selection || save_import.valid() || game_files_setup.valid();
             ImGui::BeginDisabled(importing);
             ImGui::PushStyleColor(ImGuiCol_Text,ImVec4{.08f,.07f,.06f,1});
             ImGui::PushStyleColor(ImGuiCol_Button,ImVec4{1,.49f,.19f,1});
@@ -1772,7 +1795,7 @@ int run_app(const std::filesystem::path& xbe,const std::filesystem::path& disc,u
             const std::filesystem::path& controls,std::span<const MemorySlice> slices,bool trace_io,const std::filesystem::path& settings,std::span<const std::uint32_t> watch_semaphores) {
     if(watch_semaphores.size()>4) throw std::runtime_error("At most four semaphore memory watches are supported");
     if(xbe.empty()) {
-        std::filesystem::current_path(executable_path().parent_path());
+        std::filesystem::current_path(data_root());
     }
     App app(false,false,controls,settings);
     diagnostic_record("{\"type\":\"window_ready\",\"window\":"+app.window_diagnostic()+'}');

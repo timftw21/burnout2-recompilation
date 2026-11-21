@@ -375,6 +375,28 @@ The patched source, COPYING and individual copyright notices remain in
 build/deps/vkd3d-source (or vkd3d-source-macos-ARCH). The builder installs COPYING under
 build/deps/vkd3d/share/licenses/vkd3d and the patch under build/deps/vkd3d/share/b2.
 
+Windows setup (Burnout2-Setup.exe)
+The setup program contains the compiled b2.exe and b2-tool.exe. They statically
+link SDL3, Dear ImGui and Lua; b2-tool.exe also links Zydis and Zycore. Their
+notices above apply. Setup also installs the unmodified Microsoft Visual C++
+runtime libraries (vcruntime140*.dll, msvcp140*.dll and concrt140.dll) from
+Visual Studio's redistributable folder, as permitted by its license terms.
+The original game executable, disc data and game assets are not included;
+setup extracts and verifies them from the player's own disc image.
+
+Linux AppImage and macOS application packages
+The Linux AppImage contains the compiled b2 with SDL3, DXVK Native (zlib
+license) built from the pinned sources above, and the unmodified libpng and
+libjpeg-turbo shared libraries from Ubuntu 24.04. The macOS disk images contain
+b2 with SDL3 and DXMT (LGPL 2.1 or later; the pinned source and this project's
+build adaptations are listed above, and the dynamic libraries are replaceable),
+and the unmodified Homebrew OpenSSL (Apache 2.0), libpng, libjpeg-turbo and, on
+Apple Silicon, MPFR and GMP (LGPL 3.0 or later) dynamic libraries. Each package
+includes these libraries' license files and licenses/bundled-libraries.txt,
+which names every bundled library and its package version; their corresponding
+sources are available from Ubuntu, Homebrew and the upstream projects. The
+AppImage uses the AppImage type2 runtime (MIT), release 20251108.
+
 Linux libcrypto (OpenSSL), libpng, libjpeg and Fontconfig are shared system dependencies.
 Their licenses and source packages are supplied by the Linux distribution.
 Installation.zip contains build sources and instructions, not these binaries.

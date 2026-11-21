@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <climits>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <fstream>
@@ -369,6 +370,42 @@ std::filesystem::path executable_path() {
     std::array<char,32768> path{};const auto length=readlink("/proc/self/exe",path.data(),path.size());
     if(length<0 || std::size_t(length)==path.size()) throw std::runtime_error("Cannot locate executable");return std::string(path.data(),length);
 #endif
+}
+std::filesystem::path data_root() {
+    static const auto root=[] {
+        const auto executable=executable_path();
+        const char* home=std::getenv("HOME");
+        std::filesystem::path packaged;
+#ifdef __APPLE__
+        const auto contents=executable.parent_path().parent_path();
+        if(executable.parent_path().filename()=="MacOS" && contents.filename()=="Contents" && contents.parent_path().extension()==".app") {
+            if(!home || *home!='/') throw std::runtime_error("HOME must name your user folder");
+            packaged=std::filesystem::path(home)/"Library/Application Support/Burnout 2 Recompilation";
+        }
+#else
+        // The AppImage runtime mounts the package read-only and names its mount in APPDIR.
+        const char* image=std::getenv("APPIMAGE");const char* mount=std::getenv("APPDIR");
+        if(image && *image && mount && *mount=='/' && executable.native().starts_with(std::string(mount)+'/')) {
+            const char* data=std::getenv("XDG_DATA_HOME");
+            if(data && *data=='/') packaged=std::filesystem::path(data)/"burnout2-recompilation";
+            else if(home && *home=='/') packaged=std::filesystem::path(home)/".local/share/burnout2-recompilation";
+            else throw std::runtime_error("HOME must name your user folder");
+        }
+#endif
+        if(packaged.empty()) return executable.parent_path();
+        std::filesystem::create_directories(packaged);
+        return std::filesystem::canonical(packaged);
+    }();
+    return root;
+}
+std::filesystem::path resource_path(std::string_view name) {
+    const auto directory=executable_path().parent_path();
+#ifdef __APPLE__
+    // Application packages keep data in Contents/Resources, outside the signed code folder.
+    if(const auto bundled=directory.parent_path()/"Resources"/name;!std::filesystem::exists(directory/"resources"/name) && std::filesystem::exists(bundled))
+        return bundled;
+#endif
+    return directory/"resources"/name;
 }
 void random_bytes(void* output,std::size_t size) {
     if(size>INT_MAX || RAND_bytes(static_cast<unsigned char*>(output),static_cast<int>(size))!=1) throw std::runtime_error("Native random source failed");

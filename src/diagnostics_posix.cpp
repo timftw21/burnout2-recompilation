@@ -61,7 +61,7 @@ void fatal(int signal,siginfo_t* info,void* context) {
 void initialize_diagnostics() noexcept {
     if(log_file>=0) return;
     try {
-        const auto directory=executable_path().parent_path()/"logs";std::filesystem::create_directories(directory);
+        const auto directory=data_root()/"logs";std::filesystem::create_directories(directory);
         const auto now=std::time(nullptr);tm utc{};gmtime_r(&now,&utc);
         log_path=directory/std::format("b2-{:04}{:02}{:02}-{:02}{:02}{:02}-{}.log",utc.tm_year+1900,utc.tm_mon+1,utc.tm_mday,utc.tm_hour,utc.tm_min,utc.tm_sec,getpid());
         log_file=open(log_path.c_str(),O_WRONLY|O_APPEND|O_CREAT|O_EXCL|O_CLOEXEC,0600);if(log_file<0) return;

@@ -26,6 +26,8 @@ std::filesystem::path executable_path() {
     std::array<wchar_t,32768> path{};const auto size=GetModuleFileNameW(nullptr,path.data(),static_cast<DWORD>(path.size()));
     if(!size || size==path.size()) throw std::runtime_error("Cannot locate executable");return std::wstring_view(path.data(),size);
 }
+std::filesystem::path data_root() {return executable_path().parent_path();}
+std::filesystem::path resource_path(std::string_view name) {return executable_path().parent_path()/"resources"/name;}
 void random_bytes(void* output,std::size_t size) {
     if(size>ULONG_MAX || BCryptGenRandom(nullptr,static_cast<PUCHAR>(output),static_cast<ULONG>(size),BCRYPT_USE_SYSTEM_PREFERRED_RNG)<0)
         throw std::runtime_error("Native random source failed");

@@ -1,6 +1,49 @@
 Building the game
 
-Guided Linux/macOS installation
+Prebuilt Linux and macOS packages
+
+Players download Burnout2-x86_64.AppImage (Linux and Steam Deck) or
+Burnout2-macOS-AppleSilicon.dmg / Burnout2-macOS-Intel.dmg. They contain the
+prebuilt game, the bundled SDL3, DXVK Native or DXMT libraries, the non-system
+libraries the game links (libpng and libjpeg on Linux; Homebrew's OpenSSL,
+libpng, libjpeg-turbo and, on Apple Silicon, MPFR/GMP on macOS), resources and
+license notices, with no game data. Nothing is compiled or downloaded on the
+player's computer.
+
+Packaged games keep settings, saves, mods, logs and captures outside the
+read-only package: $XDG_DATA_HOME/burnout2-recompilation (normally
+~/.local/share/burnout2-recompilation) when b2 runs from an AppImage mount, and
+~/Library/Application Support/Burnout 2 Recompilation when b2 runs from
+Contents/MacOS of an .app. Source builds and Windows keep using the folder
+beside the executable. On first launch, selecting the disc image in Game files
+extracts and verifies data/local/default.xbe from it, sets the executable
+location and generates the disabled Test Mod. The same setup runs without a
+window, for validation:
+
+  b2 --prepare-game-files DISC.iso
+
+It also records the xbe/disc locations in data/local/settings.cfg and prints
+two JSON reports. Through an AppImage, pass --appimage-extract-and-run first
+when FUSE is unavailable.
+
+The AppImage requires glibc 2.38 and libstdc++ from GCC 13 or newer, as built
+on Ubuntu 24.04. It uses the pinned static type2 AppImage runtime (20251108),
+so players need no libfuse2. The macOS app is ad-hoc signed, not notarized;
+its LSMinimumSystemVersion is the newest minimum among the bundled binaries
+(Homebrew bottles built on macOS 15 require macOS 15).
+
+Packaging, after Build.sh built the game on that system:
+
+  bash cmake/package-linux.sh [BUILD_DIRECTORY] [OUTPUT_DIRECTORY]   (Ubuntu 24.04, squashfs-tools)
+  bash cmake/package-macos.sh [BUILD_DIRECTORY] [OUTPUT_DIRECTORY]   (per Mac architecture)
+
+Both write a .sha256 file beside the package and list bundled libraries and
+their sources in licenses/bundled-libraries.txt inside it. The Native Linux
+and macOS builds workflow builds, packages and checks all three on each
+v* tag (or manual run) using the encrypted CI game inputs, and uploads the
+packages as workflow artifacts for the release.
+
+Linux/macOS source builds
 
 Extract Installation.zip into a permanent folder. On Linux, open Install.desktop
 (Allow Launching/Run as Program if your desktop asks), or run bash Install.sh.
@@ -218,13 +261,66 @@ Build.sh --tools-only provides a source-only build locally and does not change
 game settings or saves. On ARM,
 this also compiles the portable arithmetic core without needing a game image.
 
-Windows x64
+Windows x64 setup
 
-Extract Installation.zip into a permanent folder, double-click Install.cmd,
-select the supported US Xbox XISO disc image and wait for setup. Click Launch
-game when it finishes. Build.cmd remains an alias for the same installer.
+Players download Burnout2-Setup.exe from the release page. It needs no build
+tools, downloads or administrator rights. Setup verifies default.xbe on the
+selected XISO against knowledge/supported_target.json before changing anything,
+then installs the prebuilt b2.exe, b2-tool.exe, application-local Visual C++
+runtime libraries and license notices from its embedded, SHA-256-listed cabinet.
+It extracts and verifies data/local/default.xbe, optionally copies the image to
+data/local/game.iso, writes the xbe/disc locations into data/local/settings.cfg
+while keeping other preferences, generates the disabled Test Mod from the disc
+with the installed b2-tool, and adds Start-menu, optional desktop and Installed
+apps entries for the current user. The default folder is
+%LOCALAPPDATA%\Programs\Burnout 2 Recompilation. Setup uses the static C++
+runtime and Windows' cabinet services. Work is staged in the selected folder
+and committed only after verification; a running game blocks replacement.
 
-Setup reuses compatible installed tools and automatically downloads missing
+A new installation folder must be empty or contain only data and mods copied
+from an earlier build. Reinstalling into the recorded folder updates the game
+and keeps saves, settings, achievements, imported music and mods. Uninstall
+removes only recorded program files, the extracted executable and a copied
+image; saves, settings, mods and the original image are kept.
+
+Validation without the desktop:
+
+  Burnout2-Setup.exe --silent-install DISC.iso FOLDER [--reference-disc] [--no-register]
+  Burnout2-Setup.exe --preview OUTPUT.bmp [--dpi 96..384]
+  Burnout2-Setup.exe --preview-progress OUTPUT.bmp
+  FOLDER\Uninstall.exe --uninstall FOLDER --silent
+
+--silent-install prints a JSON result to standard output and errors to standard
+error. --reference-disc keeps the image in place; --no-register skips shortcuts
+and the Installed apps entry. Previews save a BMP and a JSON description.
+
+Release packaging (developers)
+
+After building the game once from a source checkout, run:
+
+  powershell -NoProfile -ExecutionPolicy Bypass -File cmake\package.ps1
+
+It rebuilds b2 and b2-tool when needed, stages CMake's Runtime component,
+compresses it with makecab, builds b2-setup with that payload and writes
+Burnout2-Setup.exe, its .sha256 file and the Linux/macOS Installation.zip to
+build/release. -SkipBuild packages the existing binaries. The Runtime component
+is an explicit whitelist; media, saves, settings, generated sources and debug
+files are never included. Push the v* tag, then download the Linux and macOS
+packages from that tag's Native Linux and macOS builds run:
+
+  gh run download RUN_ID --dir build/release
+
+Publish Burnout2-Setup.exe, Burnout2-x86_64.AppImage,
+Burnout2-macOS-AppleSilicon.dmg, Burnout2-macOS-Intel.dmg, their .sha256 files
+and Installation.zip (Linux/macOS sources) as the release assets.
+
+Windows x64 source build
+
+Clone the repository, double-click Install.cmd in the source folder, select the
+supported US Xbox XISO disc image and wait for setup. Click Launch game when it
+finishes. Build.cmd remains an alias for the same builder.
+
+The source builder reuses compatible installed tools and automatically downloads missing
 CMake, MinGit, Ninja and LLVM into build/deps/windows. Downloads come from the
 official projects, use fixed versions and SHA-256 checks, and remain cached for
 retries. The tool directories are added only to setup's process PATH.
@@ -492,7 +588,7 @@ Fresh disc-based setup on Windows, Linux, macOS and Steam Deck also installs
 Test Mod, disabled by default. It recolors the Burnout 2 logos with magenta
 and cyan checks. Enable it in Mods and start/restart the game to try it. Setup
 generates it from your verified original disc; no original game assets are
-included in Installation.zip. Repeated setup preserves the installed mod and
+included in Installation.zip or Burnout2-Setup.exe. Repeated setup preserves the installed mod and
 your enabled-mod selections. Older unmodified copies named Modding test are
 renamed to Test Mod during setup; their folder id remains modding-test.
 Developer builds using --game-inputs have no disc
@@ -576,15 +672,14 @@ Use C++23. Zydis is pinned and linked only into b2-tool, never the game executab
 Run PowerShell commands from the repository root. Private media and generated
 outputs remain ignored. No Python is required.
 
-Updating Windows installations between releases, including 1.8:
+Updating Windows source builds between releases:
 Close the game and builder. Back up data/user and data/local/settings.cfg beside
-b2.exe, plus data/local/custom-music if you imported music. Extract the latest
-Installation.zip over the existing source folder containing Build.cmd, replacing
-source files while keeping build and data folders. Run Install.cmd again and select
+b2.exe, plus data/local/custom-music if you imported music. Pull the latest
+source, keeping build and data folders. Run Install.cmd again and select
 your XISO. Setup prepares missing tools, refreshes game-file locations and preserves other settings,
-saves and imported music. For a new-folder installation, build first, restore
-those backups beside the new b2.exe, then run Install.cmd once more to refresh
-game-file locations. With V-sync enabled, display rates are limited by the
+saves and imported music. To move to Burnout2-Setup.exe instead, copy data and
+mods from build/windows/Release into an empty folder and install there.
+With V-sync enabled, display rates are limited by the
 monitor's refresh rate; lower selected rates keep their cap.
 
 Release uses clang-cl, Ninja and parallel ThinLTO with a 3 GiB linker cache per

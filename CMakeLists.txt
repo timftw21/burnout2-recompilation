@@ -86,7 +86,7 @@ if(NOT WIN32)
     target_link_libraries(b2-lua PRIVATE m)
 endif()
 
-add_library(b2-core STATIC src/file.cpp src/disc.cpp src/mods.cpp src/mod_scripts.cpp src/xbe.cpp src/assets.cpp src/tracks.cpp src/effects.cpp src/crypto.cpp src/performance.cpp src/achievements.cpp)
+add_library(b2-core STATIC src/file.cpp src/disc.cpp src/installation.cpp src/mods.cpp src/mod_scripts.cpp src/xbe.cpp src/assets.cpp src/tracks.cpp src/effects.cpp src/crypto.cpp src/performance.cpp src/achievements.cpp)
 target_link_libraries(b2-core PRIVATE b2-lua)
 target_include_directories(b2-core PUBLIC src PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 if(WIN32)
@@ -387,9 +387,36 @@ if(B2_XBE)
     add_dependencies(b2 b2-native-generated b2-shaders-generated)
     target_link_libraries(b2 PRIVATE b2-core b2-graphics b2-cpu b2-app SDL3::SDL3-static)
     target_compile_definitions(b2 PRIVATE B2_FINITE_ADDRESS=${finite_address} B2_COMPARE_ADDRESS=${compare_address})
+    if(WIN32)
+        # The Windows setup payload: an explicit whitelist without media, saves,
+        # settings, generated sources or debug files. Resources are embedded.
+        install(TARGETS b2 b2-tool RUNTIME DESTINATION . COMPONENT Runtime)
+        install(FILES LICENSE NOTICE.md THIRD_PARTY_NOTICES.txt DESTINATION . COMPONENT Runtime)
+        set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION .)
+        set(CMAKE_INSTALL_SYSTEM_RUNTIME_COMPONENT Runtime)
+        include(InstallRequiredSystemLibraries)
+    endif()
 else()
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/gui_shaders.h"
         "#pragma once\n#include <string_view>\nnamespace b2 {inline constexpr std::string_view gui_vertex_source{},gui_pixel_source{};}\n")
+endif()
+
+set(B2_INSTALLER_PAYLOAD "" CACHE FILEPATH "Release cabinet built by cmake/package.ps1")
+set(B2_INSTALLER_MANIFEST "" CACHE FILEPATH "Release payload manifest built by cmake/package.ps1")
+if(WIN32 AND B2_INSTALLER_PAYLOAD AND B2_INSTALLER_MANIFEST)
+    # Setup uses the static C++ runtime so it starts before the payload exists.
+    enable_language(RC)
+    configure_file(resources/installer.rc.in generated/installer.rc @ONLY)
+    add_executable(b2-setup WIN32 EXCLUDE_FROM_ALL src/installer.cpp src/installation.cpp src/file.cpp src/disc.cpp
+        resources/installer.manifest "${CMAKE_CURRENT_BINARY_DIR}/generated/installer.rc")
+    set_property(TARGET b2-setup PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_include_directories(b2-setup PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    target_compile_definitions(b2-setup PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE B2_VERSION="${PROJECT_VERSION}")
+    target_compile_options(b2-setup PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(b2-setup PRIVATE /ENTRY:wmainCRTStartup)
+    target_link_libraries(b2-setup PRIVATE bcrypt cabinet shell32 ole32 comctl32 gdi32 user32 advapi32 uuid uxtheme dwmapi)
+    set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/installer.rc" APPEND PROPERTY OBJECT_DEPENDS
+        "${B2_INSTALLER_PAYLOAD}" "${B2_INSTALLER_MANIFEST}" "${CMAKE_CURRENT_SOURCE_DIR}/resources/b2.ico")
 endif()
 
 foreach(target IN ITEMS b2-core b2-portable-cpu b2-cpu b2-input b2-graphics b2-app b2-tool b2)

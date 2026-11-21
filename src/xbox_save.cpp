@@ -47,7 +47,7 @@ void publish_slot(const fs::path& staged,const fs::path& slot) {
 }
 
 fs::path xbox_storage_root(const fs::path& override_root) {
-    const auto root=fs::absolute(override_root.empty()?executable_path().parent_path()/"data/user":override_root).lexically_normal();
+    const auto root=fs::absolute(override_root.empty()?data_root()/"data/user":override_root).lexically_normal();
     if(fs::weakly_canonical(root)!=root) throw std::runtime_error("Native storage path crosses a link or junction");
     return root;
 }

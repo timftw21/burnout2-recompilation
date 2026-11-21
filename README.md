@@ -23,11 +23,12 @@ If you're skeptical, I implore you to try the recompilation for yourself. I take
 - **Import Xbox save** brings an original Burnout 2 profile into a free slot. The recomp signs the copy automatically, so you can import it without an Xbox HDD key.
 - **Restore defaults** resets settings across all categories, including keyboard and controller bindings. During play, it sits between **Return to game** and **Exit game**.
 
-Download **Installation.zip** and extract it over your existing source folder,
-keeping `build` and `data`. Rerun **Install.cmd** on Windows, **Install.desktop**
-on Linux, or **Install.command** on macOS. Back up saves, settings, achievement
-progress, imported music and mods first; [Updating between releases](#updating-between-releases)
-lists the locations. Your own US Xbox XISO is required. Game files are not included.
+Every platform now has a ready-to-play download: **Burnout2-Setup.exe** for
+Windows, **Burnout2-x86_64.AppImage** for Linux and Steam Deck, and a disk image
+for Apple Silicon or Intel Macs. Nothing is built or downloaded on your computer;
+select your disc image and play. Coming from a source build? See
+[Updating between releases](#updating-between-releases) to keep your saves.
+Your own US Xbox XISO is required. Game files are not included.
 
 ## Screenshots
 
@@ -102,116 +103,97 @@ support is still being tested.
 ## Getting started
 
 All platforms require **your own copy of the US Xbox release** as an XISO disc
-image. Game files are not included. Keep the source and build folders together.
-
-### Linux x86-64
-
-Use a glibc-based 64-bit Linux distribution and a compatible Vulkan 1.4 graphics
-driver. Extract **Installation.zip** into a folder you will keep, then open
-**Install.desktop**. Your desktop may first require **Allow Launching** or
-**Run as Program**. You can also start setup from a terminal:
-
-```bash
-bash Install.sh
-```
-
-Setup installs missing dependencies on Ubuntu 24.04+/Debian 13+, Fedora and
-Arch Linux, opens a disc picker and builds the game. Installing system packages
-may require your password. Start the game from your application menu or run
-`bash Play.sh`. Rerun setup in the same folder to update. For other distributions
-and manual builds, see [BUILDING.txt](BUILDING.txt).
-
-Linux uses Vulkan through DXVK Native and runs without Wine. Desktop gameplay,
-sound and graphics performance still need testing; the existing WSL software
-rendering result does not measure native GPU performance.
-
-### macOS Intel and Apple Silicon
-
-Building requires macOS 15.2+ and Xcode 16.3+; the game targets macOS 14+ and
-a compatible Metal 3 GPU. Install Xcode and open it once to finish its setup.
-Extract **Installation.zip** into a folder you will keep, then double-click
-**Install.command**. Setup installs Homebrew and the missing build tools, opens
-a disc picker, builds for your Mac and adds **Burnout 2 Recompilation.app** to
-your home **Applications** folder. You can also start setup from a terminal:
-
-```bash
-bash Install.command
-```
-
-Intel and Apple Silicon use separate native builds. Graphics run through DXMT
-and Metal, without Wine or Rosetta. Both architectures still need real gameplay,
-visual, audio and performance testing. No Mac gameplay result is available yet.
-CI compiles the full game on both architectures. Its Intel virtual GPU lacks
-the features required by the Metal backend, so Intel graphics need testing on
-a compatible physical Mac. Run `./build/macos/Release/b2-tool inspect-metal` to
-check GPU support.
-
-Linux and macOS do not support WARP, D3D11 debug
-layers or hardware memory watches. Custom music imports require FFmpeg.
-
-### Steam Deck / SteamOS
-
-In Desktop Mode, extract **Installation.zip** into a permanent folder, then open
-**Install.desktop**. Setup detects SteamOS and installs its build tools and
-runtime through Flatpak in your user account. It leaves SteamOS's system files
-alone. The first installation needs internet access and several GB of free space.
-
-Launch from the application menu, or add **Burnout 2: Point of Impact** to Steam
-as a non-Steam game for Gaming Mode. Leave the compatibility-tool override off.
-You can also run `bash Install.sh --steamdeck` and later `bash Play.sh --steamdeck`.
-Keep the installation folder and XISO in place. Steam Deck support is experimental;
-gameplay, sound and performance still need checking on physical hardware.
+image. Game files are not included.
 
 ### Windows x64
 
-You need a 64-bit Windows PC and a graphics card that supports DirectX 11.
+You need a 64-bit Windows 10 or 11 PC and a graphics card that supports DirectX 11.
 
-1. Download [Installation.zip](https://github.com/timftw21/burnout2-recompilation/releases/latest/download/Installation.zip)
-   and extract it into a folder you will keep.
-2. Double-click **Install.cmd** and select your US Xbox XISO disc image (`.iso` or `.xiso`).
-   Use an XISO; full-disc dumps need conversion to XISO first.
-   Setup automatically downloads missing tools and builds the game. If Microsoft
-   C++ tools are missing, approve the Windows permission prompt for their installer.
-   The first installation needs internet access and can take a while; progress
-   and download sizes appear in the setup window.
-3. Click **Launch game**. For later launches, open `build/windows/Release/b2.exe`.
+1. Download [Burnout2-Setup.exe](https://github.com/timftw21/burnout2-recompilation/releases/latest/download/Burnout2-Setup.exe)
+   and run it.
+2. Select your US Xbox XISO disc image (`.iso` or `.xiso`). Full-disc dumps need
+   conversion to XISO first. Choose an installation folder; you can keep a copy of
+   the image with the game and create a desktop shortcut.
+3. Click **Install**. Setup checks your image, installs the game and prepares its
+   files. Nothing is downloaded and no build tools are needed.
+4. Click **Play game**, or launch it later from the Start menu or desktop shortcut.
 
-There are no separate tool downloads, commands to type or PATH changes to make.
-Compatible installed tools are reused; portable tools stay in `build/deps/windows`.
-The full Visual Studio editor is not required. **Build.cmd** also opens the same
-installer. If setup asks for a restart, restart Windows and run **Install.cmd**
-again. Verified downloads and completed build work are kept for retries.
-If building fails, click **Open build log**.
-The [developer build instructions](https://github.com/timftw21/burnout2-recompilation/blob/main/BUILDING.txt)
-also cover offline debugging.
+The default installation folder is `%LOCALAPPDATA%\Programs\Burnout 2 Recompilation`.
+If you do not keep a copy of the image, leave it where it is while playing.
+Windows SmartScreen or antivirus software may warn about the unsigned setup
+program; the published SHA-256 checksum is beside it on the release page.
+Uninstall through Windows **Installed apps**. Saves, settings, achievement
+progress, imported music, mods and your original image are kept.
+To build the game yourself instead, see [BUILDING.txt](BUILDING.txt).
+
+### Linux x86-64 and Steam Deck
+
+You need a 64-bit distribution with glibc 2.38 or newer (for example Ubuntu
+24.04+, Debian 13+, Fedora 39+, Arch Linux or current SteamOS) and a Vulkan 1.4
+graphics driver.
+
+1. Download [Burnout2-x86_64.AppImage](https://github.com/timftw21/burnout2-recompilation/releases/latest/download/Burnout2-x86_64.AppImage).
+2. Allow it to run: in your file manager open **Properties → Permissions** and
+   enable **Allow executing file as program** (or run `chmod +x Burnout2-x86_64.AppImage`).
+3. Open it. In **Game files**, click **Browse** next to **Game disc image** and
+   select your US Xbox XISO. The game prepares its files automatically.
+4. Click **Start game**.
+
+Settings, saves, mods and logs are kept in `~/.local/share/burnout2-recompilation`.
+Keep the disc image where it is while playing. If your system lacks FUSE, start
+the AppImage with `--appimage-extract-and-run`. Linux uses Vulkan through DXVK
+Native and runs without Wine. Desktop gameplay, sound and graphics performance
+still need testing.
+
+On **Steam Deck**, download the AppImage in Desktop Mode and allow it to run as
+above. Add it to Steam with **Add a Non-Steam Game** to play in Gaming Mode;
+leave the compatibility-tool override off. Steam Deck support is experimental.
+
+### macOS Apple Silicon and Intel
+
+You need macOS 15 Sequoia or newer and a Mac with a Metal 3 GPU.
+
+1. Download [Burnout2-macOS-AppleSilicon.dmg](https://github.com/timftw21/burnout2-recompilation/releases/latest/download/Burnout2-macOS-AppleSilicon.dmg)
+   for M-series Macs, or [Burnout2-macOS-Intel.dmg](https://github.com/timftw21/burnout2-recompilation/releases/latest/download/Burnout2-macOS-Intel.dmg)
+   for Intel Macs.
+2. Open it and drag **Burnout 2 Recompilation** to **Applications**.
+3. Open the app. The app is not notarized by Apple, so macOS blocks the first
+   launch: open **System Settings → Privacy & Security**, click **Open Anyway**
+   for Burnout 2 Recompilation and confirm.
+4. In **Game files**, click **Browse** next to **Game disc image**, select your
+   US Xbox XISO, then click **Start game**.
+
+Settings, saves, mods and logs are kept in
+`~/Library/Application Support/Burnout 2 Recompilation`. Keep the disc image
+where it is while playing. Graphics run through DXMT and Metal, without Wine or
+Rosetta. Both architectures still need real gameplay, visual, audio and
+performance testing on physical Macs.
+
+Linux and macOS do not support WARP, D3D11 debug layers or hardware memory
+watches. Custom music imports require FFmpeg. To build the game yourself on
+Linux, Steam Deck or macOS, see [BUILDING.txt](BUILDING.txt).
 
 ### Updating between releases
 
-Keep your source folder in place so the application shortcut remains valid.
-The backup paths below are relative to the folder containing **b2.exe** (Windows)
-or **b2** (Linux/macOS), normally `build/windows/Release`, `build/linux/Release`,
-`build/steamdeck/Release` or `build/macos/Release`.
+On Windows, close the game and run the newer **Burnout2-Setup.exe**. It selects
+your existing installation folder and keeps saves, settings, achievement
+progress, imported music and mods. On Linux and macOS, replace the AppImage or
+the app with the newer download; your data folder stays as it is.
 
-1. Close the game and builder.
-2. Back up `data/user`, `data/local/settings.cfg` and, if present,
-   `data/local/achievements.cfg`. These contain your
-   saves, settings and achievements. If you imported music, also back up
-   `data/local/custom-music`. Back up the `mods` folder as well if you added mods.
-3. Download the latest **Installation.zip** and extract it into your existing
-   source folder—the folder containing **Build.cmd**—replacing the source files.
-   Keep the existing `build` and `data` folders.
-4. Rerun **Install.cmd** (Windows), **Install.desktop** (Linux/Steam Deck) or
-   **Install.command** (macOS) and select your own US Xbox XISO. Setup prepares
-   missing tools, rebuilds the game and updates game-file locations while
-   preserving your other settings, saves, achievement progress, imported music
-   and mods. Game files are not included in the download.
+**Moving from an earlier source build:** close the game, then copy the `data`
+and `mods` folders from the folder containing **b2.exe** or **b2** (normally
+`build/windows/Release`, `build/linux/Release`, `build/steamdeck/Release` or
+`build/macos/Release` in your source folder):
 
-For a new-folder installation, build it first, then restore your backups to the
-same locations beside the new executable. Rerun your platform's installer to
-refresh game-file locations while keeping the restored settings. After moving an
-installation folder, rerun setup to rebuild and refresh shortcut paths.
-`bash Install.sh --shortcuts-only` recreates a Linux/macOS shortcut without
-rebuilding an installation that remains in place.
+- **Windows:** into a new, empty folder, then run **Burnout2-Setup.exe** and
+  choose that folder. Setup keeps the copied saves and settings.
+- **Linux and Steam Deck:** into `~/.local/share/burnout2-recompilation`.
+- **macOS:** into `~/Library/Application Support/Burnout 2 Recompilation`.
+
+These folders hold your saves (`data/user`), settings and achievements
+(`data/local/settings.cfg` and `achievements.cfg`), imported music
+(`data/local/custom-music`) and mods. On Linux and macOS, select your disc
+image once in **Game files** after copying.
 
 ### Game settings
 
@@ -219,7 +201,8 @@ Click **Start game** to play; press **Esc** to open or close settings. Changes
 save automatically. Graphics, controls and enhancement changes apply during play.
 Mods and imported music use a game restart. Hover over options for details.
 
-- **Game files** — Click **Import Xbox save…** and select the file named `Profile 1`,
+- **Game files** — Select your disc image; the game extracts and verifies its
+  executable automatically. Click **Import Xbox save…** and select the file named `Profile 1`,
   `Profile 2` or `Profile 3` in your extracted Xbox save folder. The importer
   checks the save and keeps its slot number if available. If that slot is taken,
   it uses another free slot. Open **Load/Save** in the game and choose the
@@ -255,7 +238,8 @@ Mods and imported music use a game restart. Hover over options for details.
 - **Diagnostics:** View logs, capture frames or record performance.
 
 Press **F9** to start or stop a performance recording. Reports are saved under
-`build/captures/performance-*`; include the whole folder when reporting a slowdown.
+`build/captures/performance-*` in the game's folder; include the whole folder
+when reporting a slowdown.
 
 ### Achievements
 

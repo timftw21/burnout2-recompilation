@@ -11,6 +11,9 @@
 #include "input.h"
 #include "diagnostics.h"
 #include "custom_music.h"
+#include "installation.h"
+#include "mods.h"
+#include "host.h"
 #ifdef _WIN32
 #include <Windows.h>
 #else
@@ -330,10 +333,17 @@ int main(int argc, char** argv) {
                          "  b2 --check-music XBE ISO OUTPUT_DIRECTORY\n"
                          "  b2 --import-music FOLDER CACHE_DIRECTORY\n"
                          "  b2 --check-custom-music XBE OUTPUT_DIRECTORY [CACHE_DIRECTORY]\n"
-                         "  b2 --inspect-audio CAPTURE.bin EFFECTS_IMAGE OUTPUT_DIRECTORY\n";
+                         "  b2 --inspect-audio CAPTURE.bin EFFECTS_IMAGE OUTPUT_DIRECTORY\n"
+                         "  b2 --prepare-game-files ISO\n";
             return 0;
         }
         const auto command = std::string_view(argv[1]);
+        // The same first-run setup as selecting a disc in Game files, without a window.
+        if(command=="--prepare-game-files" && argc==3) {
+            const auto root=b2::data_root();const auto disc=b2::utf8_path(argv[2]);
+            std::cout<<b2::install_game_files(disc,root,false)<<'\n'<<b2::install_modding_test(disc,root/"mods")<<'\n';
+            return 0;
+        }
         if(command=="--check-prediction" && argc==5) {
             const auto report=b2::check_prediction_race(argv[2],argv[3],argv[4]);std::cout<<report<<'\n';
             return report.find("\"gate_passed\":true")!=std::string::npos?0:3;

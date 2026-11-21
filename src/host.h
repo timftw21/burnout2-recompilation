@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <filesystem>
+#include <string_view>
 #ifdef _WIN32
 #include <Windows.h>
 #else
@@ -75,6 +76,10 @@ void SwitchToFiber(void*);
 #endif
 namespace b2 {
 std::filesystem::path executable_path();
+// Writable folder for settings, saves, mods and logs. It is the executable's
+// folder except for the read-only AppImage and macOS application packages.
+std::filesystem::path data_root();
+std::filesystem::path resource_path(std::string_view name);
 std::uint32_t ethernet_status();
 std::uint32_t dos_error(std::uint32_t status);
 void random_bytes(void*,std::size_t);

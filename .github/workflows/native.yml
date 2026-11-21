@@ -1,8 +1,11 @@
-name: Native macOS build
+name: Native Linux and macOS builds
 on:
   push:
+    branches: ['**']
+    # Release tags always build the downloadable Linux and macOS packages.
+    tags: ['v*']
     paths:
-      - '.github/workflows/macos.yml'
+      - '.github/workflows/native.yml'
       - 'Build.sh'
       - 'Install.sh'
       - 'Install.command'
@@ -25,16 +28,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-15-intel, macos-15]
+        runner: [ubuntu-24.04, macos-15-intel, macos-15]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       HOMEBREW_NO_AUTO_UPDATE: '1'
       HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      CI: 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Free runner disk space for the Linux build
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       # Bound each expansion below the Actions template and OS argument limits.
       - name: Stage private build inputs 1
         run: |
@@ -133,10 +140,14 @@ jobs:
           node cmake/ci-game-inputs.mjs restore < data/local/ci-inputs.base64
           rm data/local/ci-inputs.base64
       - name: Install native build dependencies
-        run: bash Install.command --dependencies-only
+        run: |
+          if [[ $RUNNER_OS == macOS ]]; then bash Install.command --dependencies-only
+          else bash Install.sh --dependencies-only && sudo apt-get install -y --no-install-recommends squashfs-tools
+          fi
       - name: Build native tooling
         run: bash Build.sh --tools-only
       - name: Report native Metal capabilities
+        if: runner.os == 'macOS'
         id: metal
         run: |
           build/macos/Release/b2-tool inspect-metal > build/macos/metal-info.json
@@ -155,8 +166,12 @@ jobs:
             exit 1
           fi
       - name: Build full native game
+        env:
+          # The hosted Linux runner has 16 GB of memory for parallel ThinLTO.
+          B2_BUILD_JOBS: ${{ runner.os == 'Linux' && '4' || '' }}
         run: bash Build.sh --game-inputs
       - name: Check native installer application shortcut
+        if: runner.os == 'macOS'
         run: |
           bash Install.command --shortcuts-only
           plutil -lint "$HOME/Applications/Burnout 2 Recompilation.app/Contents/Info.plist"
@@ -164,23 +179,62 @@ jobs:
           PATH=/usr/bin:/bin:/usr/sbin:/sbin "$HOME/Applications/Burnout 2 Recompilation.app/Contents/MacOS/b2" --help
       - name: Check native executables and offline CPU, audio and storage
         run: |
+          platform=$([[ $RUNNER_OS == macOS ]] && echo macos || echo linux)
           for executable in b2 b2-tool; do
-            file "build/macos/Release/$executable"
-            lipo "build/macos/Release/$executable" -verify_arch "$(uname -m)"
-            otool -L "build/macos/Release/$executable"
+            file "build/$platform/Release/$executable"
+            if [[ $platform == macos ]]; then
+              lipo "build/macos/Release/$executable" -verify_arch "$(uname -m)"
+              otool -L "build/macos/Release/$executable"
+            else ldd "build/linux/Release/$executable"
+            fi
           done
-          build/macos/Release/b2-tool --help
-          build/macos/Release/b2 --help
+          build/$platform/Release/b2-tool --help
+          build/$platform/Release/b2 --help
           status=0
           check() {
             printf '\nChecking %s\n' "$1"
-            build/macos/Release/b2 "$@" || status=1
+            "build/$platform/Release/b2" "$@" || status=1
           }
           check --check-cpu data/local/default.xbe
           check --check-audio
           check --check-effects data/local/b2distfx.bin
-          check --check-storage data/local/default.xbe build/macos/storage-check
+          check --check-storage data/local/default.xbe "build/$platform/storage-check"
           exit "$status"
+      - name: Package the downloadable game
+        run: |
+          if [[ $RUNNER_OS == macOS ]]; then bash cmake/package-macos.sh build/macos build/release
+          else bash cmake/package-linux.sh build/linux build/release
+          fi
+          ls -l build/release
+      # Packages run their own copy of the game from outside the build tree.
+      - name: Check the packaged game
+        run: |
+          if [[ $RUNNER_OS == macOS ]]; then
+            mount=$(mktemp -d)
+            hdiutil attach -quiet -nobrowse -readonly -mountpoint "$mount" build/release/Burnout2-macOS-*.dmg
+            app="$mount/Burnout 2 Recompilation.app"
+            codesign --verify --deep --strict "$app"
+            plutil -p "$app/Contents/Info.plist"
+            otool -L "$app/Contents/MacOS/b2"
+            if otool -L "$app/Contents/MacOS/b2" "$app"/Contents/Frameworks/* | grep -E '(/opt/homebrew|/usr/local|/Users/)'; then
+              echo 'The app still references build-machine libraries.' >&2; exit 1
+            fi
+            "$app/Contents/MacOS/b2" --check-cpu data/local/default.xbe
+            "$app/Contents/MacOS/b2" --check-audio
+            hdiutil detach -quiet "$mount"
+          else
+            game=build/release/Burnout2-x86_64.AppImage
+            "$game" --appimage-extract-and-run --check-cpu data/local/default.xbe
+            "$game" --appimage-extract-and-run --check-audio
+          fi
+      - name: Upload release packages
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: burnout2-${{ matrix.runner }}
+          path: build/release/
+          if-no-files-found: error
+          retention-days: 14
       - name: Remove private inputs and generated game output
         if: always()
-        run: rm -rf -- data/local build/macos
+        run: rm -rf -- data/local build/macos build/linux build/release
