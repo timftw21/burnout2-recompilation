@@ -263,14 +263,20 @@ void remove_registered_shortcut(const std::filesystem::path& path,const std::fil
     if(SUCCEEDED(link->GetPath(target.data(),int(target.size()),nullptr,SLGP_RAWPATH)) && std::filesystem::path(target.data())==root/"b2.exe")
         std::filesystem::remove(path);
 }
+// A staging folder left by a setup that was ended without cleanup (for example by a power loss).
+bool stale_staging(const std::filesystem::path& path) {
+    const auto& name=path.filename().native();
+    return name.size()>12 && name.starts_with(L".installing-") && name.find_first_not_of(L"0123456789",12)==std::wstring::npos;
+}
 void install(const std::filesystem::path& iso,const std::filesystem::path& chosen,bool copy_disc,bool desktop,bool registration) {
-    const auto root=folder_path(chosen);
-    if(root==root.root_path() || root.native().size()>160 || std::filesystem::weakly_canonical(root)!=root)
-        throw std::runtime_error("Choose a shorter installation folder without links or junctions.");
+    const auto root=b2::real_folder(chosen);
+    if(root==root.root_path()) throw std::runtime_error("Choose a folder rather than the top of a drive.");
+    if(root.native().size()>160) throw std::runtime_error("Choose a shorter installation folder.");
+    if(std::filesystem::exists(root) && !std::filesystem::is_directory(root)) throw std::runtime_error("The installation location is a file. Choose a folder.");
     // A new installation may only reuse saved data and mods copied from an earlier build.
     if(std::filesystem::exists(root) && !std::filesystem::exists(root/"install-manifest.txt"))
         for(const auto& child:std::filesystem::directory_iterator(root))
-            if(child.path().filename()!="data" && child.path().filename()!="mods")
+            if(child.path().filename()!="data" && child.path().filename()!="mods" && !stale_staging(child.path()))
                 throw std::runtime_error("Choose an empty folder, or the folder containing an existing installation.");
     std::set<std::filesystem::path> previous_files;
     if(std::filesystem::exists(root/"install-manifest.txt")) {
@@ -281,15 +287,19 @@ void install(const std::filesystem::path& iso,const std::filesystem::path& chose
     }
     const auto entries=payload();
     for(const auto& entry:entries) {
-        if(std::filesystem::weakly_canonical((root/entry.path).parent_path())!=(root/entry.path).parent_path())
-            throw std::runtime_error("An application folder crosses a link or junction.");
+        b2::real_folder((root/entry.path).parent_path());
         if(std::filesystem::exists(root/entry.path) && !previous_files.contains(entry.path))
             throw std::runtime_error("The destination contains an unrelated application file. Choose an empty folder.");
     }
-    if(std::filesystem::weakly_canonical(root/"data/local")!=root/"data/local") throw std::runtime_error("The game-data folder crosses a link or junction.");
+    b2::real_folder(root/"data/local");
     report(1,0,"Checking your game image");b2::verify_install_disc(iso);cancellation();report(1,100,"Game image verified");
     std::filesystem::create_directories(root);
     SetupLock lock(root);
+    for(const auto& child:std::filesystem::directory_iterator(root)) if(stale_staging(child.path())) {
+        // Only real folders are removed recursively; a link in their place stops setup.
+        if(b2::real_folder(child.path())!=child.path() || !child.is_directory()) throw std::runtime_error("Remove "+b2::path_text(child.path())+", then try again.");
+        std::filesystem::remove_all(child.path());
+    }
     const auto staging=root/std::format(".installing-{}",GetCurrentProcessId());
     if(!std::filesystem::create_directory(staging)) throw std::runtime_error("An installation is already using this folder.");
     struct Staging {
@@ -337,13 +347,16 @@ void install(const std::filesystem::path& iso,const std::filesystem::path& chose
         report(4,unsigned(++committed*90/files.size()),"Finishing installation");
     }
     report(4,90,"Installing the optional Test Mod (disabled by default)");
-    install_test_mod(root,copy_disc?root/"data/local/game.iso":std::filesystem::absolute(iso).lexically_normal());
+    // The game is complete without this optional sample mod; never fail setup for it.
+    std::string test_mod;
+    try {install_test_mod(root,copy_disc?root/"data/local/game.iso":std::filesystem::absolute(iso).lexically_normal());}
+    catch(const std::exception& error) {test_mod=error.what();}
     if(registration) register_install(root,desktop);
-    report(4,100,"Ready to race. Your installation is complete.");
+    report(4,100,test_mod.empty()?"Ready to race. Your installation is complete.":"Ready to race. "+test_mod);
 }
 void uninstall(const std::filesystem::path& chosen) {
-    const auto root=folder_path(chosen);
-    if(root==root.root_path() || std::filesystem::weakly_canonical(root)!=root) throw std::runtime_error("Invalid installation folder.");
+    const auto root=b2::real_folder(chosen);
+    if(root==root.root_path()) throw std::runtime_error("Invalid installation folder.");
     const auto path=root/"install-manifest.txt";
     if(!std::filesystem::exists(path)) throw std::runtime_error("This folder is not an installed copy of the game.");
     SetupLock lock(root);
@@ -355,7 +368,7 @@ void uninstall(const std::filesystem::path& chosen) {
         const auto file=relative_path(line,true);
         if(std::ranges::find(entries,file,&Entry::path)==entries.end() && file!="Uninstall.exe" && file!="data/local/default.xbe" && file!="data/local/game.iso")
             throw std::runtime_error("Uninstall manifest contains an unknown file. No files were removed.");
-        if(std::filesystem::weakly_canonical((root/file).parent_path())!=(root/file).parent_path()) throw std::runtime_error("An uninstall path crosses a link or junction.");
+        b2::real_folder((root/file).parent_path());
         files.push_back(file);
     }
     input.close();unsigned count=0;

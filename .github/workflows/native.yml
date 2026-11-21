@@ -216,7 +216,9 @@ jobs:
             codesign --verify --deep --strict "$app"
             plutil -p "$app/Contents/Info.plist"
             otool -L "$app/Contents/MacOS/b2"
-            if otool -L "$app/Contents/MacOS/b2" "$app"/Contents/Frameworks/* | grep -E '(/opt/homebrew|/usr/local|/Users/)'; then
+            # Inspect only load commands, not otool's header lines naming the mounted files.
+            if for file in "$app/Contents/MacOS/b2" "$app"/Contents/Frameworks/*; do otool -L "$file" | tail -n +2; otool -l "$file" | grep -A2 LC_RPATH; done |
+              grep -E '(/opt/homebrew|/usr/local|/Users/|/private/)'; then
               echo 'The app still references build-machine libraries.' >&2; exit 1
             fi
             "$app/Contents/MacOS/b2" --check-cpu data/local/default.xbe

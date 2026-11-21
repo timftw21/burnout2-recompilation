@@ -24,17 +24,44 @@ void replace_file(const std::filesystem::path& temporary,const std::filesystem::
     std::filesystem::rename(temporary,output);
 #endif
 }
+// A private work file; one left by an interrupted run is replaced.
 struct Temporary {
     std::filesystem::path path;
     explicit Temporary(std::filesystem::path value):path(std::move(value)) {
-        if(std::filesystem::exists(path)) throw std::runtime_error("An unfinished installation file already exists: "+path_text(path));
+        if(std::filesystem::exists(std::filesystem::symlink_status(path)) && !std::filesystem::is_regular_file(std::filesystem::symlink_status(path)))
+            throw std::runtime_error("An unexpected item uses an installation work-file name: "+path_text(path));
+        // write_text also stages through NAME.tmp.
+        auto partial=path;partial+=".tmp";
+        std::filesystem::remove(path);std::filesystem::remove(partial);
     }
     ~Temporary() {std::error_code error;std::filesystem::remove(path,error);}
 };
+#ifdef _WIN32
+bool name_surrogate(const std::filesystem::path& path) {
+    WIN32_FIND_DATAW data{};
+    const auto handle=FindFirstFileExW(path.c_str(),FindExInfoBasic,&data,FindExSearchNameMatch,nullptr,0);
+    if(handle==INVALID_HANDLE_VALUE) return false;
+    FindClose(handle);
+    return (data.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT) && IsReparseTagNameSurrogate(data.dwReserved0);
+}
+#endif
+}
+std::filesystem::path real_folder(const std::filesystem::path& path) {
+    auto folder=std::filesystem::absolute(path).lexically_normal();
+    if(!folder.has_filename() && folder!=folder.root_path()) folder=folder.parent_path();
+#ifdef _WIN32
+    // Cloud-file and other data reparse points are ordinary folders; only links redirect writes.
+    for(auto part=folder;part.has_relative_path();part=part.parent_path())
+        if(name_surrogate(part)) throw std::runtime_error("Choose a folder that is not reached through a link or junction.");
+    return std::filesystem::weakly_canonical(folder);
+#else
+    if(std::filesystem::weakly_canonical(folder)!=folder) throw std::runtime_error("Choose a folder that is not reached through a symbolic link.");
+    return folder;
+#endif
 }
 void extract_game_executable(const std::filesystem::path& iso,const std::filesystem::path& directory) {
     Disc disc(iso);verified(disc);
-    const auto local=std::filesystem::absolute(directory).lexically_normal()/"data/local";
+    const auto local=real_folder(directory)/"data/local";
     std::filesystem::create_directories(local);
     if(std::filesystem::exists(local/"default.xbe") && std::filesystem::file_size(local/"default.xbe")==target::file_size) {
         File existing(local/"default.xbe");if(hash(existing,0,existing.size())==target::sha256) return;
@@ -54,11 +81,9 @@ std::string install_game_files(const std::filesystem::path& iso,const std::files
     const auto cancelled=[&] {if(cancel && cancel->load()) throw std::runtime_error("Installation cancelled. Your original game image and saves were kept.");};
     cancelled();
     Disc disc(iso);const auto entry=verified(disc);
-    const auto root=std::filesystem::absolute(directory).lexically_normal();
-    if(root==root.root_path() || std::filesystem::weakly_canonical(root)!=root)
-        throw std::runtime_error("Choose an installation folder without links or junctions.");
-    const auto local=root/"data/local";
-    if(std::filesystem::weakly_canonical(local)!=local) throw std::runtime_error("The game-data folder crosses a link or junction.");
+    const auto root=real_folder(directory);
+    if(root==root.root_path()) throw std::runtime_error("Choose a folder rather than the top of a drive.");
+    const auto local=real_folder(root/"data/local");
     std::filesystem::create_directories(local);
     const auto executable=local/"default.xbe",settings=local/"settings.cfg",image=local/"game.iso";
     auto disc_path=std::filesystem::absolute(iso).lexically_normal();

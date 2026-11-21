@@ -460,7 +460,8 @@ struct App {
     std::shared_ptr<PathSelection> music_folder_selection,file_selection,save_selection;
     std::future<std::string> save_import;
     std::string save_import_status;
-    std::future<void> game_files_setup;
+    std::future<std::string> game_files_setup;
+    bool launch_after_setup=false;
     std::string game_files_status;
     std::filesystem::path storage_override;
     bool file_selection_iso=false;
@@ -955,10 +956,12 @@ struct App {
         }
         if(game_files_setup.valid() && game_files_setup.wait_for(std::chrono::seconds(0))==std::future_status::ready) {
             try {
-                game_files_setup.get();
+                const auto note=game_files_setup.get();
                 copy_text(settings.xbe.data(),settings.xbe.size(),"data/local/default.xbe");settings_dirty=true;refresh_mods();
-                game_files_status="Your game files are ready. Select Start game to play.";
+                game_files_status=(launch_after_setup?"Your game files are ready.":"Your game files are ready. Select Start game to play.")+note;
+                if(launch_after_setup) launch=true;
             } catch(const std::exception& error) {game_files_status="The selected disc image cannot be used. "+std::string(error.what());}
+            launch_after_setup=false;
         }
         if(file_selection && file_selection->finished.load(std::memory_order_acquire)) {
             if(!file_selection->error.empty()) log_message(file_selection->error);
@@ -1192,7 +1195,12 @@ struct App {
         if(game_files_setup.valid()) return;
         const auto disc=utf8_path(settings.disc.data());const auto root=std::filesystem::current_path();const auto mods=mods_root;
         game_files_status.clear();
-        game_files_setup=std::async(std::launch::async,[disc,root,mods] {extract_game_executable(disc,root);install_modding_test(disc,mods);});
+        game_files_setup=std::async(std::launch::async,[disc,root,mods]()->std::string {
+            extract_game_executable(disc,root);
+            // The optional sample mod never blocks play.
+            try {install_modding_test(disc,mods);return {};}
+            catch(const std::exception& error) {return std::string(" The optional Test Mod was not installed: ")+error.what();}
+        });
     }
     void browse_music() {
         SDL_ShowOpenFolderDialog(PathSelection::receive,PathSelection::start(music_folder_selection),window,
@@ -1571,7 +1579,12 @@ struct App {
             ImGui::PushStyleColor(ImGuiCol_Button,ImVec4{1,.49f,.19f,1});
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered,ImVec4{1,.61f,.34f,1});
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,ImVec4{.90f,.40f,.12f,1});
-            if(ImGui::Button(playing?"Restart game":"Start game",{button_width,0})) {launch=true;cancel_bindings();}
+            if(ImGui::Button(playing?"Restart game":"Start game",{button_width,0})) {
+                cancel_bindings();std::error_code missing;
+                // A typed disc path, or copied settings without the executable, gets the same first-run setup.
+                if(!playing && settings.disc[0] && !std::filesystem::is_regular_file(utf8_path(settings.xbe.data()),missing)) {launch_after_setup=true;prepare_game_files();}
+                else launch=true;
+            }
             ImGui::PopStyleColor(4);
             setting_help(playing?"Restarts the game from the beginning with the saved settings. The window stays open.":
                 "Starts the game with these settings. Changes save automatically. Esc opens or closes settings.");

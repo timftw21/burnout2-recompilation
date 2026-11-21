@@ -7,6 +7,9 @@
 
 namespace b2 {
 using InstallProgress=std::function<void(unsigned,std::string_view)>;
+// The absolute folder with the letter case stored on disk. Rejects symbolic
+// links and junctions, but not differences in case or Windows short names.
+std::filesystem::path real_folder(const std::filesystem::path& path);
 std::string verify_install_disc(const std::filesystem::path& iso,const InstallProgress& progress={});
 // Prepares data/local below directory: the verified executable, an optional
 // image copy and settings.cfg file locations. Other preferences are kept.

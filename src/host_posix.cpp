@@ -385,7 +385,9 @@ std::filesystem::path data_root() {
 #else
         // The AppImage runtime mounts the package read-only and names its mount in APPDIR.
         const char* image=std::getenv("APPIMAGE");const char* mount=std::getenv("APPDIR");
-        if(image && *image && mount && *mount=='/' && executable.native().starts_with(std::string(mount)+'/')) {
+        std::string_view prefix(mount?mount:"");
+        while(prefix.size()>1 && prefix.back()=='/') prefix.remove_suffix(1);
+        if(image && *image && prefix.starts_with('/') && executable.native().starts_with(std::string(prefix)+'/')) {
             const char* data=std::getenv("XDG_DATA_HOME");
             if(data && *data=='/') packaged=std::filesystem::path(data)/"burnout2-recompilation";
             else if(home && *home=='/') packaged=std::filesystem::path(home)/".local/share/burnout2-recompilation";
