@@ -198,7 +198,9 @@ jobs:
           check --check-cpu data/local/default.xbe
           check --check-audio
           check --check-effects data/local/b2distfx.bin
-          check --check-storage data/local/default.xbe "build/$platform/storage-check"
+          # Storage checks create a D3D11 device; the hosted Linux runner has no
+          # Vulkan driver for DXVK, so they run on Linux machines with a GPU.
+          if [[ $platform == macos ]]; then check --check-storage data/local/default.xbe build/macos/storage-check; fi
           exit "$status"
       - name: Package the downloadable game
         run: |
