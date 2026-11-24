@@ -2931,9 +2931,9 @@ struct Xbox::State {
         information=1;
         return success;
     }
-    std::uint32_t file_attributes(const OpenFile& file) const {
-        if(!file.disc_file && file.native!=INVALID_HANDLE_VALUE) return file.entry.directory()?0x10U:0x20U;
-        return file.entry.directory()?0x11U:0x21U;
+    void file_times(std::uint32_t output,const FILETIME& creation,const FILETIME& access,const FILETIME& write) {
+        const FILETIME times[]={creation,access,write,write};
+        for(unsigned i=0;i<4;++i) memory.store<std::uint64_t>(output+i*8,(std::uint64_t(times[i].dwHighDateTime)<<32)|times[i].dwLowDateTime);
     }
     std::uint64_t file_size(const OpenFile& file) const {
         if(file.native!=INVALID_HANDLE_VALUE && !file.entry.directory()) {
@@ -2954,14 +2954,15 @@ struct Xbox::State {
         const auto size=file_size(file);
         const bool native_disk=!file.disc_file && file.native!=INVALID_HANDLE_VALUE;
         const auto unit=native_disk?16384ULL:2048ULL,allocated=(size+unit-1)&~(unit-1);
+        DWORD attributes=file.entry.directory()?0x11U:0x21U;
         if(native_disk && (type==4 || type==34)) {
             BY_HANDLE_FILE_INFORMATION native{};
             if(!GetFileInformationByHandle(file.native,&native)) return file_error(GetLastError());
-            const FILETIME times[]={native.ftCreationTime,native.ftLastAccessTime,native.ftLastWriteTime,native.ftLastWriteTime};
-            for(unsigned i=0;i<4;++i) memory.store<std::uint64_t>(output+i*8,(static_cast<std::uint64_t>(times[i].dwHighDateTime)<<32)|times[i].dwLowDateTime);
+            file_times(output,native.ftCreationTime,native.ftLastAccessTime,native.ftLastWriteTime);
+            attributes=native.dwFileAttributes;
         }
         switch(type) {
-        case 4:memory.store<std::uint32_t>(output+32,file_attributes(file));break;
+        case 4:memory.store<std::uint32_t>(output+32,attributes);break;
         case 5:memory.store<std::uint64_t>(output,allocated);memory.store<std::uint64_t>(output+8,size);
             memory.store<std::uint32_t>(output+16,1);memory.store<std::uint8_t>(output+21,file.entry.directory());break;
         case 6:
@@ -2980,7 +2981,7 @@ struct Xbox::State {
         case 19:memory.store<std::uint64_t>(output,allocated);break;
         case 20:memory.store<std::uint64_t>(output,size);break;
         case 34:memory.store<std::uint64_t>(output+32,allocated);memory.store<std::uint64_t>(output+40,size);
-            memory.store<std::uint32_t>(output+48,file_attributes(file));break;
+            memory.store<std::uint32_t>(output+48,attributes);break;
         }
         written=required;return success;
     }
@@ -3084,17 +3085,20 @@ struct Xbox::State {
                 if constexpr(Ordinal==236) if(file.disc_file) {
                     io_complete(cpu,write_protected,0);finish(cpu,cleanup,write_protected);return;
                 }
+                const bool append=Ordinal==236 && (file.access&FILE_APPEND_DATA) && !(file.access&(GENERIC_ALL|GENERIC_WRITE|FILE_WRITE_DATA));
+                if constexpr(Ordinal==236) {
+                    if(append) offset=0;
+                    else if(offset==UINT64_MAX) offset=file_size(file);
+                }
                 if(!(file.options&0x30)) {
-                    if constexpr(Ordinal==236) if(offset==UINT64_MAX) offset=file_size(file);
                     finish(cpu,cleanup,queue_io(cpu,found->second,Ordinal==236,offset));return;
                 }
                 if(file.native!=INVALID_HANDLE_VALUE) {
-                    if constexpr(Ordinal==236) if(offset==UINT64_MAX) offset=file_size(file);
                     if(offset>INT64_MAX) result=invalid_parameter;
                     else if(file.entry.directory()) result=0xC00000BA;
                     else {
                         const LARGE_INTEGER position{.QuadPart=static_cast<LONGLONG>(offset)};
-                        if(!SetFilePointerEx(file.native,position,nullptr,FILE_BEGIN)) result=file_error(GetLastError());
+                        if(!append && !SetFilePointerEx(file.native,position,nullptr,FILE_BEGIN)) result=file_error(GetLastError());
                         else {
                             const auto buffer=memory.access(output,length);
                             if constexpr(Ordinal==219) if(watched_addresses!=std::array<std::uint32_t,4>{}) {
@@ -3108,7 +3112,15 @@ struct Xbox::State {
                             written=native_written;
                             if(!completed) result=file_error(GetLastError());
                             else if constexpr(Ordinal==219) {if(!written && length) result=end_of_file;}
-                            if(completed) {file.position=offset+written;memory.store<std::uint64_t>(found->second.address+0x14,file.position);}
+                            if(completed) {
+                                file.position=offset+written;
+                                if(append) {
+                                    LARGE_INTEGER actual{};
+                                    if(SetFilePointerEx(file.native,{},&actual,FILE_CURRENT)) file.position=actual.QuadPart;
+                                    else result=file_error(GetLastError());
+                                }
+                                memory.store<std::uint64_t>(found->second.address+0x14,file.position);
+                            }
                         }
                     }
                 } else if constexpr(Ordinal==236) result=write_protected;
@@ -3139,9 +3151,7 @@ struct Xbox::State {
                             file.listing.clear();
                             for(const auto& entry:std::filesystem::directory_iterator(file.host_path)) {
                                 if(file.listing.size()>=4096 || entry.is_symlink()) throw NativeBoundary(cpu.eip,"native directory exceeds its bound or contains a link");
-                                const auto size=entry.is_directory()?0:entry.file_size();
-                                if(size>UINT32_MAX) throw NativeBoundary(cpu.eip,"native directory contains a file larger than Xbox supports");
-                                file.listing.push_back({utf8(entry.path().filename().native()),0,static_cast<std::uint32_t>(size),static_cast<std::uint8_t>(entry.is_directory()?0x10:0x20)});
+                                file.listing.push_back({utf8(entry.path().filename().native()),0,0,0});
                             }
                             std::ranges::sort(file.listing,[](const auto& a,const auto& b) {return folded(a.name)<folded(b.name);});
                         } else {
@@ -3163,13 +3173,28 @@ struct Xbox::State {
                         const auto name_length=static_cast<unsigned>(entry.name.size()),required=align_up(header+name_length,8);
                         if(required>length-written) {if(!any) result=0x80000005;break;}
                         const auto destination=output+written;
+                        WIN32_FILE_ATTRIBUTE_DATA native{};
+                        const bool native_disk=file.native!=INVALID_HANDLE_VALUE;
+                        if(type==1 && native_disk) {
+                            const auto path=file.host_path/utf8_path(entry.name);
+                            if(!GetFileAttributesExW(path.c_str(),GetFileExInfoStandard,&native)) {
+                                const auto error=GetLastError();
+                                if(error==ERROR_FILE_NOT_FOUND || error==ERROR_PATH_NOT_FOUND) {++file.listing_position;continue;}
+                                result=file_error(error);break;
+                            }
+                            if(native.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT || native.nFileSizeHigh)
+                                throw NativeBoundary(cpu.eip,"native directory entry is a link or exceeds the Xbox file size limit");
+                        }
                         std::memset(memory.access(destination,required),0,required);
                         memory.store<std::uint32_t>(destination+4,static_cast<std::uint32_t>(file.listing_position));
                         if(type==1) {
-                            memory.store<std::uint64_t>(destination+40,entry.directory()?0:entry.size);
-                            const auto unit=file.native!=INVALID_HANDLE_VALUE?16384ULL:2048ULL;
-                            memory.store<std::uint64_t>(destination+48,entry.directory()?0:(static_cast<std::uint64_t>(entry.size)+unit-1)&~(unit-1));
-                            memory.store<std::uint32_t>(destination+56,(entry.directory()?0x10U:0x20U)|(file.native==INVALID_HANDLE_VALUE?1U:0U));
+                            const DWORD attributes=native_disk?native.dwFileAttributes:(entry.directory()?0x11U:0x21U);
+                            const std::uint64_t size=(attributes&FILE_ATTRIBUTE_DIRECTORY)?0:native_disk?native.nFileSizeLow:entry.size;
+                            const auto unit=native_disk?16384ULL:2048ULL;
+                            if(native_disk) file_times(destination+8,native.ftCreationTime,native.ftLastAccessTime,native.ftLastWriteTime);
+                            memory.store<std::uint64_t>(destination+40,size);
+                            memory.store<std::uint64_t>(destination+48,(size+unit-1)&~(unit-1));
+                            memory.store<std::uint32_t>(destination+56,attributes);
                             memory.store<std::uint32_t>(destination+60,name_length);
                         } else memory.store<std::uint32_t>(destination+8,name_length);
                         std::memcpy(memory.access(destination+header,name_length),entry.name.data(),name_length);
@@ -3272,9 +3297,8 @@ struct Xbox::State {
                 WIN32_FILE_ATTRIBUTE_DATA data{};
                 if(!GetFileAttributesExW(path->c_str(),GetFileExInfoStandard,&data)) {finish(cpu,8,file_error(GetLastError()));return;}
                 const auto output=argument(cpu,1);
-                const FILETIME times[]={data.ftCreationTime,data.ftLastAccessTime,data.ftLastWriteTime,data.ftLastWriteTime};
-                for(unsigned i=0;i<4;++i) memory.store<std::uint64_t>(output+i*8,(static_cast<std::uint64_t>(times[i].dwHighDateTime)<<32)|times[i].dwLowDateTime);
-                const auto size=(static_cast<std::uint64_t>(data.nFileSizeHigh)<<32)|data.nFileSizeLow;
+                file_times(output,data.ftCreationTime,data.ftLastAccessTime,data.ftLastWriteTime);
+                const auto size=(data.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)?0ULL:(static_cast<std::uint64_t>(data.nFileSizeHigh)<<32)|data.nFileSizeLow;
                 memory.store<std::uint64_t>(output+32,(size+16383)&~16383ULL);memory.store<std::uint64_t>(output+40,size);
                 memory.store<std::uint32_t>(output+48,data.dwFileAttributes);finish(cpu,8,success);return;
             }
@@ -4950,6 +4974,37 @@ std::string check_storage(const std::filesystem::path& executable,const std::fil
         memory.store<std::uint64_t>(area+0x700,0);
         require(invoke(0xFFF00000U+(reload?219U:236U)*16,{handle,0,0,0,area+0x710,profile,profile_size,area+0x700})==success &&
             memory.load<std::uint32_t>(area+0x714)==profile_size,"complete original profile write/read");
+        if(!reload) {
+            const auto parent=saved_directory.substr(0,saved_directory.find_last_not_of("\\/")+1);
+            text(area+0x800,parent);
+            const auto dir=invoke(0x000E09BA,{area+0x800,GENERIC_READ,7,0,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,0});
+            require(dir!=UINT32_MAX,"open save directory for metadata comparison");
+            constexpr auto io=area+0x710,pattern=area+0x900,object=area+0x910,basic=area+0x940,
+                network=area+0x980,named=area+0x9C0,entry=area+0xA00;
+            memory.store(object,dir);memory.store(object+4,pattern);
+            memory.store<std::uint16_t>(pattern,9);memory.store<std::uint16_t>(pattern+2,9);
+            memory.store(pattern+4,area+0x300+static_cast<std::uint32_t>(saved_directory.size()));
+            for(auto attributes:{FILE_ATTRIBUTE_READONLY,FILE_ATTRIBUTE_NORMAL}) {
+                memory.fill_elements<std::uint8_t>(basic,0,36,false);
+                for(unsigned i=0;i<3;++i) memory.store<std::uint64_t>(basic+i*8,132854203780000000ULL+i*10000000ULL);
+                memory.store<std::uint32_t>(basic+32,attributes);
+                require(invoke(0xFFF00000U+226*16,{handle,io,basic,36,4})==success,"set save times and read-only attribute");
+                require(invoke(0xFFF00000U+211*16,{handle,io,basic,36,4})==success &&
+                    invoke(0xFFF00000U+211*16,{handle,io,network,52,34})==success &&
+                    invoke(0xFFF00000U+210*16,{object,named})==success &&
+                    invoke(0xFFF00000U+207*16,{dir,0,0,0,io,entry,128,1,pattern,1})==success,"query save metadata through every guest service");
+                const auto flags=memory.load<std::uint32_t>(basic+32);
+                require((flags&FILE_ATTRIBUTE_READONLY)==(attributes&FILE_ATTRIBUTE_READONLY) &&
+                    flags==memory.load<std::uint32_t>(network+48) && flags==memory.load<std::uint32_t>(named+48) &&
+                    flags==memory.load<std::uint32_t>(entry+56),"save attributes agree by handle, name and directory entry");
+                require(memory.load<std::uint64_t>(basic)!=0 && !std::memcmp(memory.access(basic,32),memory.access(network,32),32) &&
+                    !std::memcmp(memory.access(basic,32),memory.access(named,32),32) &&
+                    !std::memcmp(memory.access(basic,32),memory.access(entry+8,32),32) &&
+                    memory.load<std::uint64_t>(entry+40)==profile_size && memory.load<std::uint32_t>(entry+60)==9 &&
+                    !std::memcmp(memory.access(entry+64,9),"Profile 1",9),"save directory returns the file's times, size and name");
+            }
+            require(invoke(0xFFF00000U+187*16,{dir})==success,"close save metadata directory");
+        }
         if(reload==1 && graphics_checked) {
             // File reads replace texture bytes without releasing the allocation,
             // just as the original fixed course buffers do. Exercise both APIs.
@@ -4973,16 +5028,25 @@ std::string check_storage(const std::filesystem::path& executable,const std::fil
             packet(0x33C,{0x207,0,1,0});packet(0x350,{0x8006,0x203,0x01010101,0,255,0x207,0,255,0x1E00,0x1E00,0x1E00});
             packet(0x288,{8,0x1800});packet(0x1E70,{1});
             for(unsigned stage=0;stage<4;++stage) packet(0x1B08+stage*0x40,{0x030303});
-            packet(0x1B00,{texture,0x02210620,0x030303,0x40000000});packet(0x1B14,{0x01010000});
+            packet(0x1B00,{texture,0x02210628,0x030303,0x40000000});packet(0x1B14,{0x01010000});
             packet(0xAF0,{0x3F800000,0x3F800000,0x3F800000,0});packet(0xA20,{0x42000000,0x42000000,0,0});
             packet(0x680,{0x42000000,0,0,0,0,0xC2000000,0,0,0,0,0x3F800000,0,0,0,0,0x3F800000});
             packet(0x1720,{positions});packet(0x1760,{0x1042});packet(0x1744,{coordinates});packet(0x1784,{0x1042});
             const auto expected=memory.load<std::uint32_t>(profile),old=(expected^0x00FFFFFFU)|0xFF000000U;
-            const auto verify_pixel=[&](std::uint32_t color) {
+            const auto verify_pixel=[&](std::uint32_t color,std::string_view label="file read refreshes a resident GPU texture") {
                 const auto image=renderer.readback();const auto pixel=image.rgba.data()+(32*64+32)*4;
                 require(unsigned(pixel[0])==((color>>16)&255) && unsigned(pixel[1])==((color>>8)&255) && unsigned(pixel[2])==(color&255),
-                    "file read refreshes a resident GPU texture");
+                    label);
             };
+            constexpr auto outside=coordinates+64;
+            for(unsigned i=0;i<4;++i) {
+                memory.store(outside+i*16,0xBF800000U);memory.store(outside+i*16+12,0x3F800000U);
+            }
+            packet(0x1744,{outside});packet(0x1B08,{0x030304});
+            for(auto color:{0xFF146AC3U,0xFFB24F38U,0xFF146AC3U}) {
+                packet(0x1B24,{color});paint();verify_pixel(color,"NV097 register border color survives sampler changes and reuse");
+            }
+            packet(0x1744,{coordinates});packet(0x1B08,{0x030303});
             for(bool asynchronous:{false,true}) {
                 state.gpu->invalidate_memory(texture,64);memory.fill_elements<std::uint32_t>(texture,old,16,false);
                 if(asynchronous) {state.gpu->capture_frame(output/"texture-read-capture");packet(0x12C,{0});}

@@ -30,7 +30,7 @@ using Microsoft::WRL::ComPtr;
 namespace {
 constexpr wchar_t title[]=L"Burnout 2 Recompilation";
 constexpr wchar_t registry[]=L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Burnout2Recomp";
-constexpr std::string_view marker="B2-INSTALL-V1";
+constexpr std::string_view marker="B2-INSTALL-V2",legacy_marker="B2-INSTALL-V1";
 constexpr COLORREF background=RGB(14,17,22),panel=RGB(20,24,30),field=RGB(28,33,41),border=RGB(49,59,71),
     text_color=RGB(237,240,245),muted=RGB(153,166,181),accent=RGB(255,126,48),accent_label=RGB(255,139,70),warning=RGB(240,119,104);
 constexpr RECT form_panel{24,116,856,432};
@@ -80,10 +80,10 @@ std::filesystem::path folder_path(const std::filesystem::path& chosen) {
     if(!root.has_filename() && root!=root.root_path()) root=root.parent_path();
     return root;
 }
-b2::Bytes resource(unsigned id) {
-    const auto entry=FindResourceW(nullptr,MAKEINTRESOURCEW(id),RT_RCDATA);checked(entry!=nullptr,"Setup data is missing");
-    const auto handle=LoadResource(nullptr,entry);checked(handle!=nullptr,"Cannot read Setup data");
-    return {static_cast<const std::byte*>(LockResource(handle)),SizeofResource(nullptr,entry)};
+b2::Bytes resource(unsigned id,HMODULE module=nullptr) {
+    const auto entry=FindResourceW(module,MAKEINTRESOURCEW(id),RT_RCDATA);checked(entry!=nullptr,"Setup data is missing");
+    const auto handle=LoadResource(module,entry);checked(handle!=nullptr,"Cannot read Setup data");
+    return {static_cast<const std::byte*>(LockResource(handle)),SizeofResource(module,entry)};
 }
 std::filesystem::path relative_path(std::string_view value,bool data=false) {
     const auto path=b2::utf8_path(value);
@@ -96,8 +96,8 @@ std::filesystem::path relative_path(std::string_view value,bool data=false) {
         throw std::runtime_error("The installation manifest includes private user data.");
     return path;
 }
-std::vector<Entry> payload() {
-    const auto bytes=resource(3);
+std::vector<Entry> payload(HMODULE module=nullptr) {
+    const auto bytes=resource(3,module);
     if(bytes.size()>256*1024) throw std::runtime_error("Installation manifest exceeds its size limit.");
     std::istringstream input(std::string(reinterpret_cast<const char*>(bytes.data()),bytes.size()));
     std::string line;std::getline(input,line);
@@ -123,9 +123,15 @@ void cancellation() {if(state.cancel.load()) throw std::runtime_error("Installat
 struct SetupLock {
     HANDLE handle=INVALID_HANDLE_VALUE;
     explicit SetupLock(const std::filesystem::path& root) {
-        handle=CreateFileW((root/".setup-lock").c_str(),GENERIC_READ|GENERIC_WRITE,0,nullptr,CREATE_NEW,
-            FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE,nullptr);
+        handle=CreateFileW((root/".setup-lock").c_str(),FILE_READ_ATTRIBUTES|DELETE,0,nullptr,OPEN_ALWAYS,
+            FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
         if(handle==INVALID_HANDLE_VALUE) throw std::runtime_error("Another setup may be using this folder. Close it and try again.");
+        BY_HANDLE_FILE_INFORMATION info{};FILE_DISPOSITION_INFO remove{TRUE};
+        if(!GetFileInformationByHandle(handle,&info) || info.nFileSizeLow || info.nFileSizeHigh ||
+           (info.dwFileAttributes&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT)) ||
+           !SetFileInformationByHandle(handle,FileDispositionInfo,&remove,sizeof(remove))) {
+            CloseHandle(handle);throw std::runtime_error("Cannot reserve the setup lock in this folder.");
+        }
     }
     ~SetupLock() {CloseHandle(handle);}
 };
@@ -265,27 +271,137 @@ void remove_registered_shortcut(const std::filesystem::path& path,const std::fil
 }
 // A staging folder left by a setup that was ended without cleanup (for example by a power loss).
 bool stale_staging(const std::filesystem::path& path) {
-    const auto& name=path.filename().native();
+    const auto name=path.filename().native();
     return name.size()>12 && name.starts_with(L".installing-") && name.find_first_not_of(L"0123456789",12)==std::wstring::npos;
+}
+std::string file_identity(HANDLE handle) {
+    BY_HANDLE_FILE_INFORMATION info{};
+    checked(GetFileInformationByHandle(handle,&info)!=FALSE,"Cannot identify an installation file");
+    if(info.dwFileAttributes&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT))
+        throw std::runtime_error("Expected an ordinary installation file.");
+    FILE_ID_INFO id{};std::string identity;
+    if(GetFileInformationByHandleEx(handle,FileIdInfo,&id,sizeof(id)) && std::ranges::any_of(id.FileId.Identifier,[](auto b){return b!=0;}))
+        identity=std::format("{:016X}{}",id.VolumeSerialNumber,b2::hex_bytes(std::as_bytes(std::span(id.FileId.Identifier))));
+    else if(info.nFileIndexHigh || info.nFileIndexLow)
+        identity=std::format("{:08X}{:08X}{:08X}",info.dwVolumeSerialNumber,info.nFileIndexHigh,info.nFileIndexLow);
+    else throw std::runtime_error("The destination volume could not identify an installation file.");
+    return std::format("{}-{:08X}{:08X}-{:08X}{:08X}",identity,info.nFileSizeHigh,info.nFileSizeLow,
+                       info.ftLastWriteTime.dwHighDateTime,info.ftLastWriteTime.dwLowDateTime);
+}
+std::string file_identity(const std::filesystem::path& path) {
+    const auto handle=CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,
+                                  OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+    checked(handle!=INVALID_HANDLE_VALUE,"Cannot identify an installation file");
+    struct Close {HANDLE h;~Close(){CloseHandle(h);}} close{handle};
+    return file_identity(handle);
+}
+std::set<std::filesystem::path> owned_files(const std::filesystem::path& root,std::string& disc_id) {
+    const auto manifest=root/"install-manifest.txt";
+    if(std::filesystem::file_size(manifest)>256*1024) throw std::runtime_error("Invalid installation manifest.");
+    std::ifstream input(manifest);std::string line;std::getline(input,line);
+    const bool legacy=line==legacy_marker;
+    if(!legacy && line!=marker) throw std::runtime_error("This folder is not a Burnout 2 Recompilation installation.");
+    std::set<std::filesystem::path> files;
+    while(std::getline(input,line)) {
+        if(!legacy && line.starts_with("disc-id=")) disc_id=line.substr(8);
+        else files.insert(relative_path(line,true));
+    }
+    if(input.bad() || !input.eof()) throw std::runtime_error("Cannot read the installation manifest.");
+    const std::filesystem::path image="data/local/game.iso";
+    // V1 recorded the Copy checkbox even when the file belonged to the player.
+    if(files.contains(image) && (disc_id.empty() || !std::filesystem::exists(root/image) || file_identity(root/image)!=disc_id))
+        files.erase(image);
+    return files;
+}
+void move_install_file(const std::filesystem::path& from,const std::filesystem::path& to) {
+    checked(MoveFileExW(from.c_str(),to.c_str(),MOVEFILE_WRITE_THROUGH)!=FALSE,"Cannot move an installation file");
+}
+// Each published file has left staging. Its previous version, if any, is in
+// backup. Both moves are exclusive and each step of recovery is restartable.
+void rollback_install(const std::filesystem::path& root,const std::filesystem::path& staging,const std::vector<Entry>& entries) {
+    const auto journal=staging/"publication.txt";
+    if(!std::filesystem::exists(journal)) return;
+    if(std::filesystem::file_size(journal)>256*1024) throw std::runtime_error("Invalid installation recovery record.");
+    std::ifstream input(journal);std::string line;
+    std::vector<std::pair<std::filesystem::path,std::string>> files;
+    while(std::getline(input,line)) {
+        const auto tab=line.find('\t');
+        if(tab==std::string::npos) throw std::runtime_error("Invalid installation recovery record.");
+        const auto name=line.substr(0,tab);
+        const auto file=name=="data/local/settings.cfg"?std::filesystem::path(name):relative_path(name,true);
+        if(std::ranges::find(entries,file,&Entry::path)==entries.end() && file!="Uninstall.exe" && file!="data/local/default.xbe" &&
+           file!="data/local/game.iso" && file!="data/local/settings.cfg" && file!="install-manifest.txt")
+            throw std::runtime_error("Unknown file in installation recovery record.");
+        files.emplace_back(file,line.substr(tab+1));
+    }
+    if(input.bad() || !input.eof()) throw std::runtime_error("Cannot read the installation recovery record.");
+    input.close();
+    for(auto it=files.rbegin();it!=files.rend();++it) {
+        const auto& [file,id]=*it;
+        const auto live=root/file,staged=staging/file,backup=staging/"backup"/file;
+        for(const auto& path:{live,staged,backup}) b2::real_folder(path.parent_path());
+        if(!std::filesystem::exists(staged) && std::filesystem::exists(live)) {
+            if(file_identity(live)!=id) throw std::runtime_error("An installation file changed during recovery: "+b2::path_text(live));
+            move_install_file(live,staged);
+        }
+        if(std::filesystem::exists(backup)) move_install_file(backup,live);
+    }
+    std::filesystem::remove(journal);
+}
+void recover_installations(const std::filesystem::path& root,const std::vector<Entry>& entries) {
+    for(const auto& child:std::filesystem::directory_iterator(root)) if(stale_staging(child.path())) {
+        if(b2::real_folder(child.path())!=child.path() || !child.is_directory()) continue;
+        const auto owner=child.path()/"setup-owner";
+        if(!std::filesystem::is_regular_file(std::filesystem::symlink_status(owner)) || std::filesystem::file_size(owner)!=marker.size()) continue;
+        std::ifstream input(owner,std::ios::binary);std::string value(marker.size(),'\0');
+        if(!input.read(value.data(),value.size()) || value!=marker) continue;
+        input.close();
+        rollback_install(root,child.path(),entries);
+        std::filesystem::remove_all(child.path());
+    }
+}
+std::set<std::filesystem::path> recover_legacy_files(const std::filesystem::path& root,const std::vector<Entry>& entries) {
+    // Older installers published a prefix of the payload before writing any
+    // ownership record. Their uninstaller carries the corresponding file hashes.
+    std::set<std::filesystem::path> files;
+    const auto uninstaller=root/"Uninstall.exe";
+    std::vector<Entry> old_entries;
+    if(std::filesystem::exists(uninstaller)) {
+        file_identity(uninstaller);
+        const auto old=LoadLibraryExW(uninstaller.c_str(),nullptr,LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE|LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+        checked(old!=nullptr,"Cannot identify the previous uninstaller");
+        struct Release {HMODULE module;~Release(){FreeLibrary(module);}} release{old};
+        old_entries=payload(old);files.insert("Uninstall.exe");
+    }
+    const auto& source=old_entries.empty()?entries:old_entries;
+    for(const auto& entry:entries) {
+        const auto path=root/entry.path;b2::real_folder(path.parent_path());
+        if(!std::filesystem::exists(path)) continue;
+        const auto previous=std::ranges::find(source,entry.path,&Entry::path);
+        file_identity(path);b2::File file(path);
+        if(previous==source.end() || file.size()!=previous->size || b2::hash(file,0,file.size())!=previous->digest)
+            throw std::runtime_error("The destination contains an unrelated application file. Choose an empty folder.");
+        files.insert(entry.path);
+    }
+    for(const auto& child:std::filesystem::directory_iterator(root)) {
+        const auto name=child.path().filename();
+        if(name=="data" || name=="mods" || name==".setup-lock" || stale_staging(child.path())) continue;
+        if(std::ranges::none_of(files,[&](const auto& file){return *file.begin()==name;}))
+            throw std::runtime_error("Choose an empty folder, or the folder containing an existing installation.");
+    }
+    return files;
 }
 void install(const std::filesystem::path& iso,const std::filesystem::path& chosen,bool copy_disc,bool desktop,bool registration) {
     const auto root=b2::real_folder(chosen);
     if(root==root.root_path()) throw std::runtime_error("Choose a folder rather than the top of a drive.");
     if(root.native().size()>160) throw std::runtime_error("Choose a shorter installation folder.");
     if(std::filesystem::exists(root) && !std::filesystem::is_directory(root)) throw std::runtime_error("The installation location is a file. Choose a folder.");
-    // A new installation may only reuse saved data and mods copied from an earlier build.
-    if(std::filesystem::exists(root) && !std::filesystem::exists(root/"install-manifest.txt"))
-        for(const auto& child:std::filesystem::directory_iterator(root))
-            if(child.path().filename()!="data" && child.path().filename()!="mods" && !stale_staging(child.path()))
-                throw std::runtime_error("Choose an empty folder, or the folder containing an existing installation.");
-    std::set<std::filesystem::path> previous_files;
-    if(std::filesystem::exists(root/"install-manifest.txt")) {
-        if(std::filesystem::file_size(root/"install-manifest.txt")>256*1024) throw std::runtime_error("Invalid previous installation manifest.");
-        std::ifstream input(root/"install-manifest.txt");std::string line;std::getline(input,line);
-        if(line!=marker) throw std::runtime_error("This folder belongs to another program. Choose an empty installation folder.");
-        while(std::getline(input,line)) previous_files.insert(relative_path(line,true));
-    }
+    std::filesystem::create_directories(root);
+    SetupLock lock(root);
     const auto entries=payload();
+    recover_installations(root,entries);
+    std::string previous_disc_id;
+    const auto previous_files=std::filesystem::exists(root/"install-manifest.txt")?owned_files(root,previous_disc_id):recover_legacy_files(root,entries);
     for(const auto& entry:entries) {
         b2::real_folder((root/entry.path).parent_path());
         if(std::filesystem::exists(root/entry.path) && !previous_files.contains(entry.path))
@@ -293,13 +409,6 @@ void install(const std::filesystem::path& iso,const std::filesystem::path& chose
     }
     b2::real_folder(root/"data/local");
     report(1,0,"Checking your game image");b2::verify_install_disc(iso);cancellation();report(1,100,"Game image verified");
-    std::filesystem::create_directories(root);
-    SetupLock lock(root);
-    for(const auto& child:std::filesystem::directory_iterator(root)) if(stale_staging(child.path())) {
-        // Only real folders are removed recursively; a link in their place stops setup.
-        if(b2::real_folder(child.path())!=child.path() || !child.is_directory()) throw std::runtime_error("Remove "+b2::path_text(child.path())+", then try again.");
-        std::filesystem::remove_all(child.path());
-    }
     const auto staging=root/std::format(".installing-{}",GetCurrentProcessId());
     if(!std::filesystem::create_directory(staging)) throw std::runtime_error("An installation is already using this folder.");
     struct Staging {
@@ -307,10 +416,12 @@ void install(const std::filesystem::path& iso,const std::filesystem::path& chose
         ~Staging() {
             // Recursive cleanup is restricted to this newly-created child of the selected installation folder.
             std::error_code error;
-            if(path.parent_path()==root && path.filename().native().starts_with(L".installing-") && std::filesystem::weakly_canonical(path,error)==path)
+            if(path.parent_path()==root && path.filename().native().starts_with(L".installing-") && std::filesystem::weakly_canonical(path,error)==path &&
+               !std::filesystem::exists(path/"publication.txt",error) && !error)
                 std::filesystem::remove_all(path,error);
         }
     } cleanup{staging,root};
+    b2::write_text(staging/"setup-owner",marker,false);
     report(2,0,"Installing application files");extract_payload(staging,entries);
     const auto preferences=root/"data/local/settings.cfg";
     if(std::filesystem::exists(preferences)) {
@@ -318,17 +429,20 @@ void install(const std::filesystem::path& iso,const std::filesystem::path& chose
         std::filesystem::copy_file(preferences,staging/"data/local/settings.cfg");
     }
     report(3,0,"Preparing your game files");
-    bool reuse_disc=false;
-    if(copy_disc && std::filesystem::exists(root/"data/local/game.iso") && std::filesystem::equivalent(iso,root/"data/local/game.iso")) {
-        std::filesystem::create_directories(staging/"data/local");std::error_code error;
-        std::filesystem::create_hard_link(root/"data/local/game.iso",staging/"data/local/game.iso",error);reuse_disc=!error;
-    }
-    b2::install_game_files(iso,staging,copy_disc,[](unsigned percent,std::string_view phase){report(3,percent,phase);},&state.cancel);
+    const std::filesystem::path image="data/local/game.iso";
+    const bool has_image=std::filesystem::exists(root/image);
+    const bool reuse_disc=copy_disc && has_image && std::filesystem::equivalent(iso,root/image);
+    if(copy_disc && has_image && !reuse_disc && !previous_files.contains(image))
+        throw std::runtime_error("A different game image already exists in this folder. Keep the selected image in its current location or choose another folder.");
+    const auto location=reuse_disc?b2::InstallDisc::already_in_place:copy_disc?b2::InstallDisc::copy:b2::InstallDisc::reference;
+    b2::install_game_files(iso,staging,location,[](unsigned percent,std::string_view phase){report(3,percent,phase);},&state.cancel);
     checked(CopyFileW(module_path().c_str(),(staging/"Uninstall.exe").c_str(),TRUE)!=FALSE,"Cannot prepare the uninstaller");
     std::vector<std::filesystem::path> files;for(const auto& entry:entries) files.push_back(entry.path);
     files.push_back("Uninstall.exe");files.push_back("data/local/default.xbe");
-    if(copy_disc || previous_files.contains("data/local/game.iso")) files.push_back("data/local/game.iso");
+    if((copy_disc && !reuse_disc) || previous_files.contains(image)) files.push_back(image);
     std::string manifest(marker);manifest+='\n';for(const auto& file:files) manifest+=b2::path_text(file)+'\n';
+    if(std::ranges::find(files,image)!=files.end())
+        manifest+="disc-id="+(std::filesystem::exists(staging/image)?file_identity(staging/image):previous_disc_id)+'\n';
     b2::write_text(staging/"install-manifest.txt",manifest,false);
     files.push_back("data/local/settings.cfg");files.push_back("install-manifest.txt");cancellation();
     // Detect a running game before replacing any of its application files.
@@ -338,13 +452,29 @@ void install(const std::filesystem::path& iso,const std::filesystem::path& chose
         CloseHandle(handle);
     }
     report(4,0,"Finishing installation");
-    unsigned committed=0;
-    for(const auto& file:files) {
-        if(reuse_disc && file=="data/local/game.iso") continue;
-        if(!std::filesystem::exists(staging/file)) continue;
-        std::filesystem::create_directories((root/file).parent_path());
-        checked(MoveFileExW((staging/file).c_str(),(root/file).c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=FALSE,"Cannot finish installing application files");
-        report(4,unsigned(++committed*90/files.size()),"Finishing installation");
+    std::erase_if(files,[&](const auto& file){return !std::filesystem::exists(staging/file);});
+    std::string journal;
+    for(const auto& file:files) journal+=file.generic_string()+'\t'+file_identity(staging/file)+'\n';
+    b2::write_text(staging/"publication.txt",journal,false);
+    try {
+        unsigned committed=0;
+        for(const auto& file:files) {
+            const auto live=root/file,backup=staging/"backup"/file;
+            std::filesystem::create_directories(live.parent_path());
+            if(std::filesystem::exists(live) && (previous_files.contains(file) || file=="data/local/default.xbe" ||
+               file=="data/local/settings.cfg" || file=="install-manifest.txt")) {
+                std::filesystem::create_directories(backup.parent_path());
+                move_install_file(live,backup);
+                if(file==image && file_identity(backup)!=previous_disc_id)
+                    throw std::runtime_error("The destination game image changed during installation.");
+            }
+            move_install_file(staging/file,live);
+            report(4,unsigned(++committed*90/files.size()),"Finishing installation");
+        }
+        std::filesystem::remove(staging/"publication.txt");
+    } catch(...) {
+        rollback_install(root,staging,entries);
+        throw;
     }
     report(4,90,"Installing the optional Test Mod (disabled by default)");
     // The game is complete without this optional sample mod; never fail setup for it.
@@ -358,20 +488,16 @@ void uninstall(const std::filesystem::path& chosen) {
     const auto root=b2::real_folder(chosen);
     if(root==root.root_path()) throw std::runtime_error("Invalid installation folder.");
     const auto path=root/"install-manifest.txt";
-    if(!std::filesystem::exists(path)) throw std::runtime_error("This folder is not an installed copy of the game.");
     SetupLock lock(root);
-    if(std::filesystem::file_size(path)>256*1024) throw std::runtime_error("Invalid uninstall manifest.");
-    std::ifstream input(path);std::string line;std::getline(input,line);
-    if(line!=marker) throw std::runtime_error("This folder is not a Burnout 2 Recompilation installation.");
-    const auto entries=payload();std::vector<std::filesystem::path> files;
-    while(std::getline(input,line)) {
-        const auto file=relative_path(line,true);
+    const auto entries=payload();recover_installations(root,entries);
+    if(!std::filesystem::exists(path)) throw std::runtime_error("This folder is not an installed copy of the game.");
+    std::string disc_id;const auto files=owned_files(root,disc_id);
+    for(const auto& file:files) {
         if(std::ranges::find(entries,file,&Entry::path)==entries.end() && file!="Uninstall.exe" && file!="data/local/default.xbe" && file!="data/local/game.iso")
             throw std::runtime_error("Uninstall manifest contains an unknown file. No files were removed.");
         b2::real_folder((root/file).parent_path());
-        files.push_back(file);
     }
-    input.close();unsigned count=0;
+    unsigned count=0;
     for(const auto& file:files) if(std::filesystem::exists(root/file)) {
         const auto handle=CreateFileW((root/file).c_str(),GENERIC_WRITE|DELETE,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
         if(handle==INVALID_HANDLE_VALUE) throw std::runtime_error("Close the game and its diagnostics before uninstalling. No files were removed.");
@@ -379,6 +505,15 @@ void uninstall(const std::filesystem::path& chosen) {
     }
     for(const auto& file:files) {
         report(1,unsigned(count++*100/files.size()),"Removing "+b2::path_text(file));
+        if(file=="data/local/game.iso") {
+            const auto handle=CreateFileW((root/file).c_str(),FILE_READ_ATTRIBUTES|DELETE,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+            if(handle==INVALID_HANDLE_VALUE && GetLastError()==ERROR_FILE_NOT_FOUND) continue;
+            checked(handle!=INVALID_HANDLE_VALUE,"Cannot open the installed game image for removal");
+            struct Close {HANDLE h;~Close(){CloseHandle(h);}} close{handle};
+            FILE_DISPOSITION_INFO remove{TRUE};
+            if(file_identity(handle)==disc_id) checked(SetFileInformationByHandle(handle,FileDispositionInfo,&remove,sizeof(remove))!=FALSE,"Cannot remove the installed game image");
+            continue;
+        }
         std::error_code error;std::filesystem::remove(root/file,error);
         if(error) throw std::runtime_error("Close the game before uninstalling. Could not remove "+b2::path_text(file));
     }
@@ -412,7 +547,7 @@ Defaults defaults() {
     const auto manifest=result.folder/"install-manifest.txt";
     if(std::filesystem::exists(manifest) && std::filesystem::file_size(manifest)<256*1024) {
         std::ifstream input(manifest);std::string line;std::getline(input,line);
-        if(line==marker) {
+        if(line==marker || line==legacy_marker) {
             result.copy=false;
             while(std::getline(input,line)) if(line=="data/local/game.iso" || line=="data\\local\\game.iso") result.copy=true;
             DWORD desktop=0;size=sizeof(desktop);

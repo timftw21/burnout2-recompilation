@@ -13,7 +13,8 @@ std::filesystem::path real_folder(const std::filesystem::path& path);
 std::string verify_install_disc(const std::filesystem::path& iso,const InstallProgress& progress={});
 // Prepares data/local below directory: the verified executable, an optional
 // image copy and settings.cfg file locations. Other preferences are kept.
-std::string install_game_files(const std::filesystem::path& iso,const std::filesystem::path& directory,bool copy_disc,
+enum class InstallDisc { reference, copy, already_in_place };
+std::string install_game_files(const std::filesystem::path& iso,const std::filesystem::path& directory,InstallDisc location,
                                const InstallProgress& progress={},const std::atomic_bool* cancel=nullptr);
 // Extracts and verifies directory/data/local/default.xbe from the selected disc,
 // for the game's own first-run setup. Settings are left to the caller.

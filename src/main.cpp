@@ -1,4 +1,5 @@
 #include "cpu.h"
+#include "native_api.h"
 #include "file.h"
 #include "cpu_checks.h"
 #include "xbe.h"
@@ -41,6 +42,11 @@ std::uint32_t B2_ASM b2_and32_flags(std::uint32_t, std::uint32_t);
 }
 
 namespace {
+std::string cpu_coverage_fields() {
+    const auto entries=b2::compiled_batch.size();
+    return std::format(",\"compiled_functions\":{},\"native_platform_bindings\":{},\"emitted_entries\":{}",
+        entries-b2::compiled_platform_bindings,b2::compiled_platform_bindings,entries);
+}
 const b2::CompiledFunction& compiled(std::uint32_t address) {
     const auto found = std::ranges::lower_bound(b2::compiled_batch, address, {}, &b2::CompiledFunction::address);
     if (found == b2::compiled_batch.end() || found->address != address)
@@ -238,7 +244,7 @@ bool check_boot(const std::filesystem::path& path,std::uint32_t budget,const std
         << ",\"methods\":" << boot.graphics.methods << ",\"draws\":" << boot.graphics.draws
         << ",\"vertices\":" << boot.graphics.vertices << ",\"clears\":" << boot.graphics.clears
         << ",\"flips\":" << boot.graphics.flips << ",\"fences\":" << boot.graphics.fences << '}'
-        << ",\"compiled_functions\":" << b2::compiled_batch.size() << ",\"visits\":" << diagnostic.visits
+        << cpu_coverage_fields() << ",\"visits\":" << diagnostic.visits
         << ",\"boundary\":" << b2::json(boot.boundary) << ",\"eip\":" << b2::json(b2::hex32(cpu.eip))
         << ",\"flags\":" << b2::json(b2::hex32(cpu.flags)) << ",\"registers\":[";
     for(unsigned i=0;i<cpu.registers.size();++i) { if(i) report << ','; report << b2::json(b2::hex32(cpu.registers[i])); }
@@ -341,7 +347,7 @@ int main(int argc, char** argv) {
         // The same first-run setup as selecting a disc in Game files, without a window.
         if(command=="--prepare-game-files" && argc==3) {
             const auto root=b2::data_root();const auto disc=b2::utf8_path(argv[2]);
-            std::cout<<b2::install_game_files(disc,root,false)<<'\n'<<b2::install_modding_test(disc,root/"mods")<<'\n';
+            std::cout<<b2::install_game_files(disc,root,b2::InstallDisc::reference)<<'\n'<<b2::install_modding_test(disc,root/"mods")<<'\n';
             return 0;
         }
         if(command=="--check-prediction" && argc==5) {
@@ -449,7 +455,7 @@ int main(int argc, char** argv) {
                       << ",\"memory_cases\":" << additional.memory_cases
                       << ",\"floating_cases\":" << additional.floating_cases
                       << ",\"control_cases\":" << additional.control_cases
-                      << ",\"compiled_functions\":" << b2::compiled_batch.size() << "}\n";
+                      << cpu_coverage_fields() << "}\n";
             return 0;
         }
         const auto count = argc == 3 ? iterations(argv[2]) : 1000000;
@@ -480,7 +486,7 @@ int main(int argc, char** argv) {
                   << ",\"includes_input_setup\":true},\"matrix\":{\"guest_address\":\"0x00227BD9\",\"calls\":" << count
                   << ",\"fused_ns_per_call\":" << matrix.fused.ns_per_call << ",\"unfused_ns_per_call\":" << matrix.unfused.ns_per_call
                   << ",\"fused_checksum\":" << matrix.fused.checksum << ",\"unfused_checksum\":" << matrix.unfused.checksum
-                  << ",\"includes_input_setup\":true,\"game_booted\":false},\"compiled_functions\":" << b2::compiled_batch.size() << "}\n";
+                  << ",\"includes_input_setup\":true,\"game_booted\":false}" << cpu_coverage_fields() << "}\n";
         return 0;
     } catch (const std::exception& error) {
         b2::diagnostic_record("{\"type\":\"error\",\"message\":"+b2::json(error.what())+'}');

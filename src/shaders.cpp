@@ -26,17 +26,32 @@ public:
     void* STDMETHODCALLTYPE GetBufferPointer() override {return const_cast<std::byte*>(bytes_.data());}
     SIZE_T STDMETHODCALLTYPE GetBufferSize() override {return bytes_.size();}
 };
-constexpr std::string_view combiner_source=R"(
+constexpr std::string_view combiner_source=
+#ifndef _WIN32
+"#define FILTER_CUSTOM_BORDER 1\n"
+#endif
+R"(
 struct P {float4 p:SV_Position;float4 c:COLOR0;float4 s:COLOR1;
  float4 t0:TEXCOORD0;float4 t1:TEXCOORD1;float4 t2:TEXCOORD2;float4 t3:TEXCOORD3;float fog:TEXCOORD4;};
 cbuffer Factors:register(b0) {
  float4 factor0[8];float4 factor1[8];float4 final0;float4 final1;float4 fog;float4 alpha;
  uint4 combiners[8];uint4 stages[4];uint4 controls;uint4 coverage;
+#ifdef FILTER_CUSTOM_BORDER
+ uint4 borders;
+#endif
 };
 SamplerState sm0:register(s0);SamplerState sm1:register(s1);SamplerState sm2:register(s2);SamplerState sm3:register(s3);
 Texture2D tx0:register(t0);Texture2D tx1:register(t1);Texture2D tx2:register(t2);Texture2D tx3:register(t3);
 TextureCube cube0:register(t4);TextureCube cube1:register(t5);TextureCube cube2:register(t6);TextureCube cube3:register(t7);
 Texture3D vol0:register(t8);Texture3D vol1:register(t9);Texture3D vol2:register(t10);Texture3D vol3:register(t11);
+#ifdef FILTER_CUSTOM_BORDER
+SamplerState white0:register(s4);SamplerState white1:register(s5);SamplerState white2:register(s6);SamplerState white3:register(s7);
+float4 border_rgba(uint c) {return float4((c>>16)&255,(c>>8)&255,c&255,c>>24)/255.0;}
+#define SAMPLE_STAGE_TEXTURE(N,T,UV,V) { V=T.Sample(sm##N,UV); \
+ [branch] if(stages[N].w&4) { V=lerp(V,T.Sample(white##N,UV),border_rgba(borders[N])); } }
+#else
+#define SAMPLE_STAGE_TEXTURE(N,T,UV,V) { V=T.Sample(sm##N,UV); }
+#endif
 float4 finish(float4 result,float2 position) {
  // Common geometry keeps full coverage. Changed representations occupy
  // complementary samples, retaining their original depth and blend state.
@@ -98,15 +113,15 @@ void write_alpha(inout R r,uint destination,float v) {
    uint clip=stages[N].z; \
    if((clip&1)?coord.x>=0:coord.x<0) discard;if((clip&2)?coord.y>=0:coord.y<0) discard; \
    if((clip&4)?coord.z>=0:coord.z<0) discard;if((clip&8)?coord.w>=0:coord.w<0) discard; \
-  } else if(mode==3) sampled=cube##N.Sample(sm##N,coord.xyz); \
-  else if(mode==2) sampled=vol##N.Sample(sm##N,coord.xyz/coord.w); \
+  } else if(mode==3) SAMPLE_STAGE_TEXTURE(N,cube##N,coord.xyz,sampled) \
+  else if(mode==2) SAMPLE_STAGE_TEXTURE(N,vol##N,coord.xyz/coord.w,sampled) \
   else { \
    float2 uv=coord.xy/coord.w; \
    if(mode==15 || mode==16) { \
     uint previous=stages[N].y;enabled=stages[previous].x!=0 && stages[previous].x!=5; \
     float4 value=source(r,8+previous,0,false);uv=mode==15?value.ar:value.gb; \
    } \
-   if(enabled) sampled=tx##N.Sample(sm##N,uv); \
+   if(enabled) SAMPLE_STAGE_TEXTURE(N,tx##N,uv,sampled) \
   } \
   if(enabled && mode!=4 && mode!=5) { \
    if(stages[N].w&2) sampled.a=1; \
@@ -215,7 +230,7 @@ float4 main(P p
 ):SV_Target {
  // Default linear interpolation keeps history sampling at the pixel centre;
  // SV_SampleIndex selects only the destination's individual MSAA samples.
- float4 texel=tx0.Sample(sm0,p.t0.xy/p.t0.w);
+ float4 texel;SAMPLE_STAGE_TEXTURE(0,tx0,p.t0.xy/p.t0.w,texel)
  if(stages[0].w&2) texel.a=1;
  if((stages[0].w&1) && texel.a==0) discard;
  // feedback_phase accepts these two exact combiner reductions. The game's
@@ -319,9 +334,9 @@ void main(point P input[1],inout TriangleStream<P> output) {
         std::string source(combiner_source.substr(0,combiner_source.find("struct R")));
         if(kind==ShaderKind::color)
             return source+"float4 main(P p):SV_Target {return finish((controls.x&255)?saturate(p.c):max(p.c,0),p.p.xy);}";
-        const auto sample=kind==ShaderKind::modulate2d?"tx0.Sample(sm0,p.t0.xy/p.t0.w)":
-            kind==ShaderKind::modulate_cube?"cube0.Sample(sm0,p.t0.xyz)":"vol0.Sample(sm0,p.t0.xyz/p.t0.w)";
-        return source+std::format("float4 main(P p):SV_Target {{float4 t={};if(stages[0].w&2) t.a=1;if((stages[0].w&1) && t.a==0) discard;return finish(saturate(max(p.c,0)*t),p.p.xy);}}",sample);
+        const auto sample=kind==ShaderKind::modulate2d?"SAMPLE_STAGE_TEXTURE(0,tx0,p.t0.xy/p.t0.w,t)":
+            kind==ShaderKind::modulate_cube?"SAMPLE_STAGE_TEXTURE(0,cube0,p.t0.xyz,t)":"SAMPLE_STAGE_TEXTURE(0,vol0,p.t0.xyz/p.t0.w,t)";
+        return source+std::format("float4 main(P p):SV_Target {{float4 t;{} if(stages[0].w&2) t.a=1;if((stages[0].w&1) && t.a==0) discard;return finish(saturate(max(p.c,0)*t),p.p.xy);}}",sample);
     }
     if(kind>=ShaderKind::combiner0 && kind<=ShaderKind::combiner8)
         return std::format("#define COMBINER_COUNT {}\n",unsigned(kind)-unsigned(ShaderKind::combiner0))+std::string(combiner_source);

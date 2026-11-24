@@ -222,17 +222,37 @@ PipelineKey pipeline_key(const RenderState& state,bool multisample) {
         std::bit_cast<std::uint32_t>(state.polygon_offset_scale),std::bit_cast<std::uint32_t>(state.polygon_offset_bias),std::uint32_t(state.scissor_test)}) key[i++]=value;
     key[i]=std::uint32_t(multisample);return key;
 }
-using SamplerKey=std::array<std::uint32_t,6>;
+using SamplerKey=std::array<std::uint32_t,7>;
+std::uint32_t texture_border(const RenderState& state,unsigned stage) {
+    const auto address=state.texture_address[stage];
+    const bool border=(address&15)==4 || ((address>>8)&15)==4 || ((address>>16)&15)==4;
+    return state.textures[stage] && border?state.texture_border_color[stage]:0U;
+}
+#ifndef _WIN32
+bool custom_border(std::uint32_t color) {return color!=0 && color!=0xFF000000U && color!=0xFFFFFFFFU;}
+#endif
+template<class Bind> void bind_stage_samplers(unsigned stage,SamplerKey key,Bind bind) {
+#ifndef _WIN32
+    // Metal exposes three fixed border colors. The same filtered footprint
+    // sampled with black and white borders gives both endpoints for any RGBA.
+    if(custom_border(key[6])) {
+        key[6]=0;bind(stage,key);
+        key[6]=0xFFFFFFFFU;bind(stage+4,key);return;
+    }
+#endif
+    bind(stage,key);
+}
 SamplerKey sampler_key(const RenderState& state,unsigned stage,unsigned anisotropy,bool ui_art=false,unsigned pack_mips=0) {
     const auto address=state.textures[stage]?state.texture_address[stage]:0x030303;
+    const auto border=texture_border(state,stage);
     // The original UI has one mip and disables mip filtering. Enlarged vector
     // artwork needs coverage filtering at its displayed size on both sides of
     // the game's black outline. Its mip chain ends at the original atlas size.
-    if(ui_art) return {address&0x0F0F0F,D3D11_FILTER_MIN_MAG_MIP_LINEAR,0,0,ui_art_mips-1,1};
+    if(ui_art) return {address&0x0F0F0F,D3D11_FILTER_MIN_MAG_MIP_LINEAR,0,0,ui_art_mips-1,1,border};
     if(pack_mips) {
         const auto control=state.textures[stage]?state.texture_control[stage]:0x0003FFC0;
         const auto strength=anisotropy?anisotropy:1U<<((control>>4)&3);
-        return {address&0x0F0F0F,unsigned(strength>1?D3D11_FILTER_ANISOTROPIC:D3D11_FILTER_MIN_MAG_MIP_LINEAR),0,0,pack_mips-1,strength};
+        return {address&0x0F0F0F,unsigned(strength>1?D3D11_FILTER_ANISOTROPIC:D3D11_FILTER_MIN_MAG_MIP_LINEAR),0,0,pack_mips-1,strength,border};
     }
     const auto filter=state.textures[stage]?state.texture_filter[stage]:0x01030000;
     const auto control=state.textures[stage]?state.texture_control[stage]:0x0003FFC0;
@@ -246,7 +266,7 @@ SamplerKey sampler_key(const RenderState& state,unsigned stage,unsigned anisotro
     auto bias=int(filter&0x1FFF);if(bias&0x1000) bias-=0x2000;
     // Ignore register fields that do not affect the native descriptor.
     return {address&0x0F0F0F,native_filter,mip_enabled?std::uint32_t(bias):0U,
-            mip_enabled?(control>>18)&0xFFF:0U,mip_enabled?(control>>6)&0xFFF:0U,strength};
+            mip_enabled?(control>>18)&0xFFF:0U,mip_enabled?(control>>6)&0xFFF:0U,strength,border};
 }
 struct alignas(16) Constants {
     std::array<Float4, 8> factor0, factor1;
@@ -255,6 +275,9 @@ struct alignas(16) Constants {
     std::array<std::array<std::uint32_t,4>,4> stages;
     std::array<std::uint32_t,4> controls;
     std::array<std::uint32_t,4> coverage;
+#ifndef _WIN32
+    std::array<std::uint32_t,4> borders;
+#endif
 };
 struct alignas(16) ProgramUniforms {
     VertexConstants constants;
@@ -290,8 +313,14 @@ Constants fragment_constants(const RenderState& state,std::uint32_t feedback_pha
     values.final0=color(state.final_factors[0]);values.final1=color(state.final_factors[1]);
     values.fog=color(state.fog_color);values.alpha[0]=float(state.alpha_reference&255);
     values.controls={state.combiner_control,state.final_inputs[0],state.final_inputs[1],state.alpha_test?state.alpha_function:0x207};
-    for(unsigned i=0;i<4;++i) values.stages[i]={state.texture_modes[i],state.texture_sources[i],state.texture_clip[i],
-        std::uint32_t(state.alpha_kill[i])|(std::uint32_t(state.texture_opaque[i])<<1)};
+    for(unsigned i=0;i<4;++i) {
+        values.stages[i]={state.texture_modes[i],state.texture_sources[i],state.texture_clip[i],
+            std::uint32_t(state.alpha_kill[i])|(std::uint32_t(state.texture_opaque[i])<<1)};
+#ifndef _WIN32
+        values.borders[i]=texture_border(state,i);
+        if(custom_border(values.borders[i])) values.stages[i][3]|=4;
+#endif
+    }
     return values;
 }
 struct AttributeFormat {DXGI_FORMAT native;unsigned bytes,fetched;};
@@ -549,7 +578,7 @@ struct Renderer::Impl {
         ID3D11GeometryShader* geometry=nullptr;
         ID3D11BlendState* blend=nullptr;ID3D11DepthStencilState* depth=nullptr;ID3D11RasterizerState* raster=nullptr;
         std::array<ID3D11ShaderResourceView*,13> views{};
-        std::array<ID3D11SamplerState*,4> samplers{};
+        std::array<ID3D11SamplerState*,sampler_slots> samplers{};
         UINT stencil=0;D3D11_RECT scissor{};
         UINT factor_offset=0,program_offset=0,program_count=0;
         bool valid=false,scissor_enabled=false,layers=false;
@@ -642,8 +671,8 @@ struct Renderer::Impl {
     unsigned sampler_next=0;
     PipelineKey prepared_pipeline_key{};
     const Pipeline* prepared_pipeline=nullptr;
-    std::array<SamplerKey,4> prepared_sampler_keys{};
-    std::array<ID3D11SamplerState*,4> prepared_samplers{};
+    std::array<SamplerKey,sampler_slots> prepared_sampler_keys{};
+    std::array<ID3D11SamplerState*,sampler_slots> prepared_samplers{};
     struct Program {
         VertexProgram key;
         bool launch;
@@ -1836,17 +1865,13 @@ Renderer::PreparedState Renderer::prepare(const RenderState& state) {
     PreparedState prepared;prepared.owner_=&r;
     // Sampling varies per texture, independently of blend/depth/raster state.
     // Sharing these objects avoids rebuilding whole pipelines for LOD changes.
-    for(unsigned i=0;i<4;++i) {
-        const auto mode=state.texture_modes[i];
-        if(!mode || mode==4 || mode==5) continue;
-        const auto* texture=state.textures[i]<r.textures.size()?&r.textures[state.textures[i]]:nullptr;
-        const auto key=sampler_key(state,i,r.anisotropy,texture && texture->ui_art,texture?texture->pack_mips:0);
+    const auto prepare_sampler=[&](unsigned i,const SamplerKey& key) {
         if(r.prepared_samplers[i] && !std::memcmp(&key,&r.prepared_sampler_keys[i],sizeof(key))) {
-            prepared.samplers_[i]=r.prepared_samplers[i];continue;
+            prepared.samplers_[i]=r.prepared_samplers[i];return;
         }
         if(const auto found=r.sampler_states.find(key);found!=r.sampler_states.end()) {
             prepared.samplers_[i]=found->second.Get();
-            r.prepared_sampler_keys[i]=key;r.prepared_samplers[i]=prepared.samplers_[i].Get();continue;
+            r.prepared_sampler_keys[i]=key;r.prepared_samplers[i]=prepared.samplers_[i].Get();return;
         }
         if(r.sampler_states.size()==r.sampler_order.size()) {
             const auto oldest=r.sampler_states.find(r.sampler_order[r.sampler_next]);
@@ -1858,6 +1883,7 @@ Renderer::PreparedState Renderer::prepare(const RenderState& state) {
         sampler.AddressU=address_mode(key[0]&15);
         sampler.AddressV=address_mode((key[0]>>8)&15);
         sampler.AddressW=address_mode((key[0]>>16)&15);
+        std::ranges::copy(color(key[6]),sampler.BorderColor);
         sampler.MaxAnisotropy=key[5];
         sampler.ComparisonFunc=D3D11_COMPARISON_NEVER;
         sampler.MipLODBias=float(std::bit_cast<std::int32_t>(key[2]))/256;
@@ -1867,6 +1893,12 @@ Renderer::PreparedState Renderer::prepare(const RenderState& state) {
         prepared.samplers_[i]=r.sampler_states.emplace(key,std::move(native)).first->second.Get();
         r.sampler_order[r.sampler_next]=key;r.sampler_next=(r.sampler_next+1)%r.sampler_order.size();
         r.prepared_sampler_keys[i]=key;r.prepared_samplers[i]=prepared.samplers_[i].Get();
+    };
+    for(unsigned i=0;i<4;++i) {
+        const auto mode=state.texture_modes[i];
+        if(!mode || mode==4 || mode==5) continue;
+        const auto* texture=state.textures[i]<r.textures.size()?&r.textures[state.textures[i]]:nullptr;
+        bind_stage_samplers(i,sampler_key(state,i,r.anisotropy,texture && texture->ui_art,texture?texture->pack_mips:0),prepare_sampler);
         r.count(PerfMetric::sampler_misses);
     }
     const auto key = pipeline_key(state,r.samples>1);
@@ -2374,7 +2406,7 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
     const auto* constants=constant_batch?&constant_batch->factors:&local_factors.emplace(fragment_constants(state,r.feedback_phase(state)));
     const bool feedback=constants->coverage[2]!=0;
     std::array<ID3D11ShaderResourceView*, 13> views{};
-    std::array<ID3D11SamplerState*, 4> samplers{};
+    std::array<ID3D11SamplerState*,sampler_slots> samplers{};
     samplers.fill(r.default_sampler.Get()); // Static shaders declare all four slots.
     for (unsigned i = 0; i < 4; ++i) {
         const auto mode=state.texture_modes[i];
@@ -2389,12 +2421,17 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
             if(r.samples>1) if(const auto target=r.targets.find(state.textures[i]);target!=r.targets.end()) r.resolve(target->second);
             views[i+(mode==3?4:mode==2?8:0)] = r.textures[state.textures[i]].view.Get();
         }
-        if(bindings && sampled) samplers[i]=bindings->samplers_[i].Get();
+        if(bindings && sampled) {
+            samplers[i]=bindings->samplers_[i].Get();
+            if constexpr(sampler_slots>4) samplers[i+4]=bindings->samplers_[i+4].Get();
+        }
         else if(sampled) {
             const auto& texture=r.textures[state.textures[i]];
-            const auto sampler=r.sampler_states.find(sampler_key(state,i,r.anisotropy,texture.ui_art,texture.pack_mips));
-            if(sampler==r.sampler_states.end()) throw std::runtime_error("Sampler was not prepared before submission");
-            samplers[i]=sampler->second.Get();
+            bind_stage_samplers(i,sampler_key(state,i,r.anisotropy,texture.ui_art,texture.pack_mips),[&](unsigned slot,const SamplerKey& key) {
+                const auto sampler=r.sampler_states.find(key);
+                if(sampler==r.sampler_states.end()) throw std::runtime_error("Sampler was not prepared before submission");
+                samplers[slot]=sampler->second.Get();
+            });
         }
     }
     if(feedback) {
@@ -2541,7 +2578,7 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
     }
     bound.program_offset=r.program_offset;bound.factor_offset=r.factor_offset;bound.program_count=r.program_count;
     if(!bound.valid || bound.views!=views) r.context->PSSetShaderResources(0,static_cast<UINT>(views.size()),views.data());
-    if(!bound.valid || bound.samplers!=samplers) r.context->PSSetSamplers(0,4,samplers.data());
+    if(!bound.valid || bound.samplers!=samplers) r.context->PSSetSamplers(0,sampler_slots,samplers.data());
     if(!bound.valid || bound.blend!=blend) r.context->OMSetBlendState(blend,nullptr,~0U);
     if(!bound.valid || bound.depth!=pipeline.depth.Get() || bound.stencil!=state.stencil_reference)
         r.context->OMSetDepthStencilState(pipeline.depth.Get(),state.stencil_reference);

@@ -284,6 +284,8 @@ int tool_main(int argc, char** argv) {
                 b2::write_text(report_path, output + ",\"elapsed_ms\":" + std::to_string(elapsed) + '}'+ '\n', replace);
                 output = "{\"format\":\"b2-batch-summary-v1\",\"complete\":" + std::string(batch.complete ? "true" : "false") +
                     ",\"functions_discovered\":" + std::to_string(batch.discovered) + ",\"functions_compiled\":" + std::to_string(batch.compiled) +
+                    ",\"native_platform_bindings\":" + std::to_string(batch.bindings) + ",\"emitted_entries\":" + std::to_string(batch.compiled+batch.bindings) +
+                    ",\"instructions_compiled\":" + std::to_string(batch.compiled_instructions) + ",\"instructions_in_platform_bindings\":" + std::to_string(batch.binding_instructions) +
                     ",\"instructions_discovered\":" + std::to_string(batch.instructions) + ",\"report\":" + b2::json(b2::path_text(report_path)) + '}';
             }
             if (!batch.complete && !allow_partial) result = 3;

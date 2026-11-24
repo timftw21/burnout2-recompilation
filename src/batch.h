@@ -6,7 +6,7 @@ struct Batch {
     std::string source, assembly, report, header;
     std::vector<std::string> shards;
     bool complete = false;
-    std::size_t discovered = 0, compiled = 0, instructions = 0;
+    std::size_t discovered=0,compiled=0,bindings=0,instructions=0,compiled_instructions=0,binding_instructions=0;
 };
 Batch recompile_batch(Xbe& image, std::span<const std::uint32_t> seeds,
                       std::uint32_t function_limit, std::uint32_t instruction_limit,

@@ -508,6 +508,13 @@ std::string check_render(const std::filesystem::path& directory, bool warp, bool
         run(std::format("texture-{:02X}", static_cast<unsigned>(format)), textured(texture), white,
             [opaque](const Image& image) { expect(image,32,32,{255,0,0,opaque?255U:64U}); });
     }
+    {
+        const auto texels=solid(4,4,0x80402010);
+        auto state=textured(renderer.upload({4,4,TextureFormat::argb8,texels}));
+        state.texture_address[0]=0x030304;state.texture_filter[0]=0x02020000;state.texture_border_color[0]=0x40A0C0F0;
+        auto edge=white;for(auto& vertex:edge) vertex.uv[0]={0,0.5f,0,1};
+        run("texture-border-linear-rgba",state,edge,[](const Image& image){expect(image,32,32,{112,112,128,96});});
+    }
     std::vector<std::byte> rgb565(32);
     for (unsigned i = 1; i < rgb565.size(); i += 2) rgb565[i] = std::byte{0xF8};
     run("texture-565", textured(renderer.upload({4,4,TextureFormat::rgb565,rgb565})), white, red_pixel);

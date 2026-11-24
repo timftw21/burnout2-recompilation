@@ -631,3 +631,414 @@ unfinished research diagnostic, not a feature whose gate is expected to pass.
 Track import's external-tool round trip was not run; no prepared imported track
 fixture was available. Offline diagnostics also do not establish live Discord
 reconnection behavior, physical controller behavior or rare callback failures.
+
+Source correctness audit, 2026-11-24
+====================================
+
+Revision a24b7031b64c93e223eb554fd2444652d4786bc4, tagged v1.15.0.
+All 104 tracked files in src were in scope. The worktree contained the same
+104 source files. This review found 13 issues. The first two can destroy
+existing data. File and line numbers below refer to this revision. The
+verification section after the file inventory records their fixes.
+
+Findings
+--------
+
+1. Windows Setup can overwrite or claim the player's original disc image.
+   src/installer.cpp:330, uninstall at line 382. A first install accepts a
+   folder containing data/local/game.iso. If the player selects that very file
+   and leaves the default Copy setting enabled, Setup reuses it and writes its
+   path into the uninstall manifest. Uninstall removes each listed file.
+   Reproduced with the real setup executable, registration disabled, and a
+   disposable XDVDFS image containing the verified original XBE. Setup passed
+   and listed the pre-existing image. In a second first-install test, an
+   existing destination and the selected source had different hashes and
+   contained the same supported XBE. Setup overwrote the existing destination
+   with the selected source. Both cases used disposable images. Require
+   ownership before replacing an existing disc and record only a destination
+   that Setup created or previously owned.
+
+2. Append-only writes can overwrite existing data on Linux and macOS.
+   src/host_posix.cpp:149 and 268, called from src/xbox.cpp:2686 and 3107.
+   FILE_APPEND_DATA opens an ordinary writable descriptor. The write uses
+   the current or supplied offset. In a current-source Linux probe, opening a
+   file containing ABC with append-only access and writing Z at offset zero
+   produced ZBC. The same open, seek and write on Windows produced ABCZ,
+   as the local-file contract requires. Preserve append
+   semantics for both synchronous and asynchronous writes, including concurrent
+   writers. Microsoft documents the access right here.
+   https://learn.microsoft.com/en-us/windows/win32/fileio/file-access-rights-constants
+
+3. A failed first installation leaves a folder that Setup refuses to repair.
+   src/installer.cpp:346 and 277. Setup publishes the executable and libraries
+   before the game files and ownership manifest. Holding a disposable
+   data/local/default.xbe open during installation produced Windows error 5.
+   The executable and libraries were present, and install-manifest.txt was
+   absent. After the handle closed, a second install rejected the folder as
+   nonempty. Record and roll back the files published by a failed attempt, or
+   retain enough verified transaction state to resume it. Checking the initial
+   file locks alone leaves the same failure possible during publication.
+
+4. Preparing game files can silently erase preferences.
+   src/installation.cpp:116. The migration checks the size of settings.cfg
+   and treats an unsuccessful read like an empty file. In an isolated Windows
+   installation, the existing file permitted replacement and denied reading
+   its contents. --prepare-game-files exited successfully. The output retained
+   the XBE and disc paths and lost both existing preferences. A separate
+   sharing violation that also prevented replacement produced a visible error
+   and kept the preferences. Check that the input opens and reaches EOF
+   successfully before publishing any replacement.
+
+5. POSIX delete-on-close breaks file sharing and makes a name reusable early.
+   src/host_posix.cpp:141 and 181. In a Linux probe with two open handles,
+   closing the delete-on-close handle unlinked the file while the reader was
+   still open. Creating a new file with the same name then succeeded. The
+   equivalent Windows control rejected creation with error 5. Linux also
+   accepted a delete-on-close open while an existing reader denied delete
+   sharing. Include the flag in the delete-access check and maintain pending
+   deletion across all handles for the file identity until final close.
+   https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
+
+6. Save directory listings discard file timestamps on every host.
+   src/xbox.cpp:3144 and 3166. NtQueryDirectoryFile class 1 collects only the
+   name, size and directory bit. It clears the output and leaves the creation,
+   access and write times at zero. For the same writable file, the handle
+   query at line 2959 reads those times from the host. A caller enumerating
+   saves and a caller opening each save can therefore see different dates.
+   The XBE imports both services at 0x00293D40 and 0x00293D00. Carry the
+   available times into the Xbox directory record. The Xbox layout uses an
+   eight-byte prefix before the first timestamp.
+   https://github.com/XboxDev/nxdk/blob/master/lib/xboxkrnl/xboxkrnl.h#L315
+
+7. A successful read-only attribute change disappears from guest queries.
+   src/xbox.cpp:2935, 2964, 2983 and 3172. The set-information service at
+   line 3229 passes FileAttributes to the host. Both the basic/network-open
+   handle queries and directory listings rebuild the flags from file versus
+   directory and writable volume versus disc. They omit a writable-volume
+   file's recorded read-only bit. The path-based query at line 3279 returns
+   the host attributes. A guest can therefore set the bit, then get different
+   answers by handle and by name. Derive the guest flags from current host
+   metadata in the query paths.
+   https://github.com/XboxDev/nxdk/blob/master/lib/xboxkrnl/xboxkrnl.h#L361
+
+8. The portable x87 implementation loses the denormal-operand status bit.
+   src/portable_floating.h:50 and 102. It maps SoftFloat's five exception
+   flags and converts single/double inputs before recording their original
+   representation. With the smallest positive single as input, native x87
+   FLD returned status 0x3802 and the portable helper returned 0x3800.
+   FLD1 followed by FADD returned 0x3822 versus 0x3820. Both comparisons ran
+   on the same x86-64 CPU against current portable code. The verified title
+   uses FLD m32 at 0x0001EF10 (D944240C). Detect denormal operands before
+   conversion and apply the guest mask/status rules. This backend ships on
+   Apple Silicon. A game frame depending on this flag has not been identified.
+   https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
+   https://github.com/ucb-bar/berkeley-softfloat-3/blob/master/doc/SoftFloat.html
+
+9. Portable FNINIT erases the data shared by the x87 and MMX registers.
+   src/portable_floating.h:19 and 96. fp_reset clears the full saved register
+   image. The instruction resets the x87 environment and marks the registers
+   empty while preserving the physical register contents. Loading MM0 with
+   0x1122334455667788, executing FNINIT and storing MM0 returned that value
+   on hardware and zero through the portable helper. Preserve the physical
+   register data when implementing the instruction. The FNSAVE reset at
+   line 92 uses the same helper.
+   https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-2a-manual.pdf
+
+10. A programmed texture border is sampled as transparent black.
+    src/gpu.cpp:343, src/render.cpp:226 and 1856. Border address mode is
+    supported, but the draw state omits NV097_SET_TEXTURE_BORDER_COLOR
+    (0x1B24 plus 0x40 per stage). The sampler cache key omits it too, and
+    D3D11 receives a zero-initialized BorderColor. Two otherwise identical
+    register-color samplers asking for different borders therefore share
+    the same black border. Carry the color through the draw state, sampler
+    key and D3D11 descriptor. The sources below establish the register and
+    how the destination sampler uses it. No frame-specific impact was measured.
+    https://github.com/XboxDev/nxdk/blob/master/lib/pbkit/nv_regs.h#L624
+    https://github.com/xemu-project/xemu/blob/master/hw/xbox/nv2a/pgraph/gl/texture.c#L178
+    https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ns-d3d11-d3d11_sampler_desc
+
+11. Wi-Fi can be reported to the title as a connected Ethernet cable.
+    src/host_posix.cpp:420 and 425. macOS accepts any running, non-loopback
+    link-layer interface and returns only the active bit, even for wired
+    Ethernet with known speed. Linux accepts a physical device with Ethernet
+    framing and carrier. Managed mac80211 Wi-Fi devices can meet all three
+    conditions. This conflicts with research/native-ethernet.txt. The original
+    title calls PhyGetLinkState at 0x000E7295 and masks bit 0 at 0x000E72A7.
+    Identify the physical medium, link state and negotiated speed separately.
+    The platform implementations establish the classification error. Physical
+    connections were not changed during this audit.
+    https://github.com/apple-oss-distributions/configd/blob/main/SystemConfiguration.fproj/SCNetworkConfiguration.h
+    https://github.com/torvalds/linux/blob/master/net/mac80211/iface.c
+    https://github.com/torvalds/linux/blob/master/net/ethernet/eth.c
+
+12. Batch totals count replaced platform routines as translated CPU code.
+    src/batch.cpp:114, 207 and 296. A one-entry batch for D3DDevice_IsBusy
+    at 0x00216870 reported one compiled, closed function and 13 compiled
+    instructions. Its generated body calls native_platform. Across the release
+    report, 72 such entries account for 2,213 decoded instructions within
+    the headline 713,245. The per-function native_platform_api field makes
+    this recoverable. Publish separate counts for translated bodies and
+    platform bindings while retaining an aggregate for callable entries.
+    DESIGN.txt requires this distinction. It affects coverage reporting.
+
+13. The POSIX crash handler calls a formatter without a signal-safety guarantee.
+    src/diagnostics_posix.cpp:52. The fatal signal can interrupt libc, then
+    call snprintf from the handler. Re-entering a libc operation in that
+    state can prevent both log completion and the intended re-raise. The
+    later write already uses an async-signal-safe primitive. Format the
+    numbers and fixed text using bounded local operations as well. This is
+    a source-level portability finding. The audit did not induce a crash.
+    https://man7.org/linux/man-pages/man7/signal-safety.7.html
+
+Evidence from the original disc
+-------------------------------
+
+The private US XISO is 3,074,031,616 bytes. An independent reader traversed
+its XDVDFS index by sector and compared all 776 entries in 110 directories
+against b2-tool list, including names, types, offsets and lengths. Its
+default.xbe starts at sector 27,109. The 3,448,832-byte member hashes to
+B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+The certificate identifies title 0x41430019, version 3, with retail entry
+0x000E2555. All 17 section ranges and their length-prefixed SHA-1 digests
+matched knowledge/supported_target.json. That record also predicts the
+original .text embedded-digest mismatch. The image loader compared all
+17 sections, 14 preloads, TLS and 142 kernel imports.
+https://github.com/XboxDev/extract-xiso/blob/master/extract-xiso.c
+
+Direct reads at the source-declared addresses matched 72 native API signatures,
+134 recompiler byte patterns and 24 decoder byte patterns. These 230 checks
+cover 228 distinct starting addresses, with at most 42 bytes per pattern.
+An independent header parser also matched the names, dimensions, mip counts,
+raster/filter fields and pixel-data ranges of all 200 records in the disc's
+two standalone RenderWare dictionaries (80 frontend, 120 global).
+https://github.com/aap/rwtools/blob/master/src/txdread.cpp#L157
+
+The on-disc effects image is 21,756 bytes and hashes to
+4DA840E1EFADADE3FD7DDFE5DC0500157DEDC133F18748B738F8D00EE3746BE8.
+Recompiling all five programs (1,754 instructions) reproduced the release
+effects source byte for byte. The regenerated shader source also matched the
+release output exactly. The compiler reported 17 title records, three SDK
+programs, 18 vertex programs, 57 built-in shaders and 2,460,116 bytes of
+shader bytecode. At 0x000D6420 the original save verifier signs 0x7AB8 bytes
+and compares 20 signature bytes. An independent HMAC-SHA1 calculation from
+the original certificate and the disposable storage identity matched the
+imported 31,744-byte fixture. Its version and XOR checksum also matched.
+
+Execution and coverage
+----------------------
+
+The review used the local Windows Release executables and current-source
+probes on Windows and x86-64 Linux. The host was an AMD Ryzen 5 5600X with
+an NVIDIA GeForce RTX 5060 Ti. Compiler static analysis covered all 50 C++
+implementations. It processed 47 files in the Windows configuration and 47
+in Linux/portable configurations, including the shared sources in both. All 48
+headers were reachable from source consumers. The two MASM files were
+reviewed with their Windows callers. The two Intel GNU assembly sources
+each assembled for ELF and Mach-O, and the macOS fiber switch assembled for
+Intel and AArch64. The exact revision's release CI built Linux and both Mac
+architectures. Its Apple Silicon offscreen Metal step passed and its Intel
+Metal step was skipped. A separate same-commit run failed in Apple Silicon
+packaging. These are historical CI observations.
+https://github.com/timftw21/burnout2-recompilation/actions/runs/44859584309
+https://github.com/timftw21/burnout2-recompilation/actions/runs/44859582522
+
+Windows CPU diagnostics passed 52 routine cases, 26,026 instruction cases,
+4,109 memory cases, 6,744 floating cases and 109 control cases. The release
+report marks complete=false. It records 36,149 emitted entries and 32,636
+in the closed set. The 36,077 entries without a native API binding account
+for 711,032 decoded instructions. These are per-entry counts. They do not
+measure unique instruction addresses or establish full game behavior.
+
+The debug D3D11 renderer passed 273 cases with zero debug messages. Visibility
+passed 13,116 checks in four configurations. The hidden settings window passed,
+as did 21 software-rendered texture-pack checks. Storage passed 4,444 cases
+(468 vehicle-detail cases), input 107, audio 77, effects 69 across five programs,
+spatial audio 54 plus 155 binding cases, and custom music 2,071. The soundtrack
+check decoded 96,000 frames from each of the 12 original tracks. Replay passed
+18 cases, mods 143, and Lua scripts 65. The performance recorder and the
+non-crashing hardware memory-watch diagnostic passed. The prepared Interstate
+import passed 100,821 checks against the B2 disc, including native checkpoint
+crossings. The prediction diagnostic passed its components and reported its
+feasibility gate incomplete, as designed.
+
+Source coverage by file (paths relative to src)
+-----------------------------------------------
+
+disc.cpp, disc.h, file.cpp, file.h
+  XDVDFS traversal, streamed ranges, digests, extraction and publication.
+  Independent original directory comparison and disc-member hashes above.
+xbe.cpp, xbe.h, assets.cpp, assets.h
+  Retail image layout, preload, imports, TLS and dictionaries. Independent
+  section and texture record checks covered the supported media.
+decoder.cpp, decoder.h, recompiler.cpp, recompiler.h, native_api.h
+  Original instruction boundaries, indirect recovery, signature guards and
+  SDK replacement. Recovered and emitted the 38-instruction routine at
+  0x0001EF10 in portable mode and emitted native code for 0x0011FFF5.
+batch.cpp, batch.h, tool.cpp
+  Seed limits, closure, emitted bodies and reports. The single-binding case
+  reproduces finding 12. Disc, image, DSP and shader CLI entry points ran.
+cpu.cpp, cpu.h, cpu_checks.cpp, cpu_checks.h, native_abi.h, simd.h
+  Guest integer/control state, memory and ABI helpers. Hardware-referenced
+  CPU cases, fault boundaries and both native and portable compilation.
+floating.cpp, floating.h, portable_floating.cpp, portable_floating.h
+  Environment save/restore, arithmetic and host control state. The targeted
+  hardware comparison found issues 8 and 9. FLDL2E agreed in all four rounding
+  modes in the same probe.
+cpu_floating.asm, cpu_floating.S, cpu_reference.asm, cpu_reference.S, assembly.h
+  Floating entry/exit, reference instructions and symbol/ABI conventions.
+  Windows CPU diagnostics and fresh ELF/Mach-O assembly checks.
+host.h, host_windows.cpp, host_posix.cpp, fiber_context.S
+  File/service contracts, sharing, adapter detection and fiber context layout.
+  Native file-handle comparisons found issues 2 and 5. Issue 11 follows from
+  the interface predicates. Both macOS context layouts were checked.
+diagnostics.cpp, diagnostics_posix.cpp, diagnostics.h
+  Session recording, guest context, Windows watches and POSIX signal delivery.
+  Two Windows overwrite traps fired and were released. Finding 13 is open.
+xbox.cpp, xbox.h, xbox_save.cpp, xbox_save.h, crypto.cpp, crypto.h
+  Guest services, file queries, storage identity, profile import and signatures.
+  Original SDK calls, save reopen/overwrite/import and independent signature
+  validation passed. Guest file metadata still has findings 6 and 7.
+installation.cpp, installation.h, installer.cpp
+  Target verification, settings migration, setup publication and uninstall
+  ownership. Isolated setup/prepare runs reproduced findings 1, 3 and 4.
+gpu.cpp, gpu.h, render.cpp, render.h, render_checks.cpp, com_ptr.h
+  Command state, resource lifetime, draw state and sampler reuse. Hardware
+  renderer, software texture checks and visibility were exercised. Finding 10
+  is traceable from the push-buffer register to the D3D11 sampler.
+vertex_program.cpp, vertex_program.h, shader_compiler.cpp, shaders.cpp, shaders.h
+  Vertex instruction translation, combiner modes and shader generation.
+  Original shader inputs reproduced the release source. Render fixtures cover
+  fixed-function and programmed draws.
+frame_processing.cpp, frame_processing.h, presentation.cpp, presentation.h
+  Frame history, layer reconstruction, poses and original/display cadence.
+  Renderer HUD-history cases and the settings/presentation diagnostic passed.
+ambient_occlusion.cpp, ambient_occlusion.h, antialiasing.cpp, antialiasing.h,
+hdr.cpp, hdr.h, metal.m, metal.h
+  GTAO, FXAA/MSAA, HDR passes and Metal device selection. Offscreen cases
+  exercised the image passes. The local display reported HDR unavailable.
+  The Objective-C bridge and its consumers were checked against release CI.
+audio.cpp, audio.h, spatial.cpp, spatial.h, effects.cpp, effects.h
+  Voice decoding, mixing, routing, spatial parameters and effect image parsing.
+  Offline mixer and original setter diagnostics passed.
+dsp.cpp, dsp.h, dsp_compiler.cpp, dsp_compiler.h
+  DSP register/memory behavior, image lowering and dispatch. All five
+  original effect programs regenerated and the DSP fixtures passed.
+input.cpp, input.h, achievements.cpp, achievements.h, app.cpp, app.h
+  Bindings, controller mapping, achievement persistence, notifications and
+  settings lifecycle. Input and hidden-window checks covered these paths.
+mods.cpp, mods.h, mod_scripts.cpp, mod_scripts.h, texture_packs.cpp,
+texture_packs.h, ui_art.cpp, ui_art.h
+  Overlay resolution, scripted events, texture replacement and UI atlas
+  selection. Mod, Lua, pack installation and UI rendering paths were checked.
+tracks.cpp, tracks.h, custom_music.cpp, custom_music.h
+  Track imports, catalogue updates, cancellation and original playback.
+  The prepared Interstate asset and the original/custom music checks passed.
+performance.cpp, performance.h, main.cpp, prediction_checks.cpp, discord.cpp,
+discord.h
+  Recorder serialization, runtime command dispatch, checkpoint replay and
+  presence worker lifetime. Recorder and prediction components were exercised.
+  Discord transport was reviewed in source. Live desktop RPC was unverified.
+
+The game diagnostics ran without booting the title. Gameplay, full-frame
+visual parity, physical controllers, HDR output, live audio, end-to-end
+import from a first-game disc and sustained frame rate remain unverified here.
+
+Fixes and verification, 2026-11-24
+==================================
+
+The numbered results below correspond to the 13 findings above. The rebuilt
+Windows Setup used a prebuilt application payload and ran 31 checks with
+registration disabled in disposable directories. Its small XDVDFS fixture
+contained the exact default.xbe from the supported US disc. The settings check
+also prepared game files directly from the original 3,074,031,616-byte XISO.
+
+1. Setup records the identity of a disc it copied. Installing from the image
+   already in the destination and uninstalling preserved its SHA-256. A
+   different existing image survived a refused install. An owned copy was
+   removed, while a replacement with identical bytes and a disc claimed by
+   an ambiguous V1 manifest both survived uninstall.
+2. POSIX append-only handles append through one O_APPEND descriptor per
+   open file identity. A synchronous write and an asynchronous write with
+   offset zero turned ABC into ABCZY. Two concurrent writers using both
+   APIs added all 200 bytes on ext4 and a WSL-mounted NTFS volume. Ordinary
+   write access still overwrote the requested offset. The synchronous append
+   position matched Win32. Apple's AIO write path honors O_APPEND when it
+   chooses whether to apply the supplied offset.
+   https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_aio.c#L2069
+3. Setup journals publication and restores displaced files on failure. A
+   locked XBE rolled back a first install, and retry succeeded. A locked
+   upgrade restored the previous executable and manifest hashes. Fixtures
+   for interruption during first install and upgrade verified recovery by
+   both Setup and Uninstall. Setup also repaired an older, unjournaled
+   partial installation after verifying its payload hashes. An unrelated
+   executable and a user folder with a staging-like name were preserved.
+4. With a Windows ACL denying ReadData but allowing replacement,
+   --prepare-game-files failed and preserved both settings and the old XBE.
+   Restoring read access migrated both preferences and extracted the
+   supported XBE with SHA-256 B5207C40C11D7C5B5E129EF555F7632FA3584A4240BD0421C2B1B9AD9BFED7BF.
+5. Delete-on-close now requires delete sharing and reserves the name until
+   the final handle closes. POSIX checks covered two handles on different
+   hard links, a denied new open, a denied recreation, final deletion of
+   the selected link and cancellation of a separate delete disposition.
+6. The writable directory service now returns creation, access and write
+   times. The storage diagnostic set three distinct timestamps and compared
+   all four fields by name, by handle and by directory entry. All three
+   queries use the existing last-write value for the change-time field.
+7. The same diagnostic set and cleared the read-only bit through the guest
+   kernel. Basic and network-open handle queries, the name query and the
+   directory listing agreed on the attributes after both changes.
+8. The portable backend recognizes denormal input before conversion and
+   preserves x87 exception priority, stack effects and pending delivery.
+   Hardware comparisons covered both signs, four rounding modes, masked and
+   unmasked operands, single/double/extended loads, arithmetic and compares.
+9. FNINIT and the FNSAVE reset now preserve the eight physical registers
+   when TOP changes. Checks of register bytes, tags and the MM0 value
+   0x1122334455667788 passed. Together, findings 8 and 9 were exercised by
+   256 x86 hardware comparisons plus the MM0 check on each of two builds,
+   native x86-64 portable code and AArch64 portable code executed with QEMU.
+   https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
+10. NV097 register-sourced texture border colors reach the Windows D3D11
+    sampler and its cache key. DXMT exposes only transparent black, opaque
+    black and opaque white. The portable renderer reconstructs other RGBA
+    borders from black-border and white-border samples with the same filter
+    and coordinates. The offscreen GPU check submits three draws with two
+    distinct borders, including reuse of the first color. A separate edge
+    sample checks a half-texel blend in all four channels. Texture-sourced
+    borders in border address mode produce an explicit unsupported result.
+    The renderer, shader source and rendering checks also compiled to Intel
+    and Apple Silicon Mach-O objects against DXMT and the macOS 15.2 SDK.
+    https://github.com/XboxDev/nxdk/blob/master/lib/pbkit/nv_regs.h
+    https://github.com/3Shain/dxmt/blob/9839e55f98d4aca103957ee4132d6395a325a9ed/src/d3d11/d3d11_state_object.cpp#L701
+11. Linux fixtures covered the wireless sysfs markers, WLAN device type,
+    carrier and unknown, 10, 100 and 2,500 Mb/s Ethernet speeds. A macOS
+    interface fixture exercised Wi-Fi, bridge, loopback, down links,
+    active media and negotiated speed. The POSIX host and crash handler
+    compiled to Intel and Apple Silicon Mach-O objects with the macOS 15.2
+    SDK. The portable floating backend also compiled for Apple Silicon.
+    Physical Mac adapters and live cable changes were not exercised.
+    https://github.com/apple-oss-distributions/xnu/blob/main/bsd/net/if_media.h
+12. A batch containing only D3DDevice_IsBusy reported one callable binding,
+    13 instructions within the binding and zero translated CPU functions or
+    instructions. An independent streaming recount of every release entry
+    matched 36,077 translated bodies, 711,032 translated instructions, 72
+    bindings and 2,213 instructions in those bindings. Of 36,149 callable
+    entries, 32,636 were closed, including 32,564 translated bodies.
+13. The POSIX fatal handler formats its record in a fixed stack buffer.
+    Two isolated Linux children raised SIGABRT. Both wrote parseable JSON
+    with their thread and native address, then terminated from SIGABRT.
+    The guest case also reported EIP 0xDEADBEEF and flags 0x00000202.
+
+After the fixes, the Windows release passed 4,469 storage checks, including
+the offscreen register-color draws, and 274 rendering checks on a GeForce
+RTX 5060 Ti with zero D3D11 debug messages. CPU diagnostics passed 52
+routine cases, 26,026 instruction cases, 4,109 memory cases, 6,744 floating
+cases and 109 control cases against the verified XBE.
+
+The Linux release passed the same storage and CPU checks. Its renderer
+passed all 267 available cases on Mesa 26.2.5 llvmpipe (LLVM 21.1.8),
+including the filtered border and all six 4x MSAA reward-text cases. An
+earlier run on Mesa 25.2.8 reproduced the six scissor-boundary failures
+documented in BUILDING.txt. All six pixel errors matched the November 2
+results on that driver. The filtered border passed on both versions.
+These were offscreen checks. Gameplay and physical Mac hardware remain
+unverified.

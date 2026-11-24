@@ -345,10 +345,17 @@ struct Gpu::Impl {
             s.texture_sources[i]=i<2?0:(reg(0x1E78)>>(8+i*4))&15;
             s.texture_clip[i]=(reg(0x17F8)>>(i*4))&15;s.texture_address[i]=reg(method+8);
             s.texture_filter[i]=reg(method+0x14);s.texture_control[i]=reg(method+12);
+            s.texture_border_color[i]=reg(method+0x24);
             s.alpha_kill[i]=(s.texture_control[i]&4)!=0;
             const auto code=(reg(method+4)>>8)&255;
             s.texture_opaque[i]=code==7 || code==0x1E;
-            if((reg(method+12)&0x40000000U) && s.texture_modes[i]) s.textures[i]=texture(i,view);
+            if((reg(method+12)&0x40000000U) && s.texture_modes[i]) {
+                const auto format=reg(method+4),dimensions=(format>>4)&15,address=s.texture_address[i];
+                const bool border=(address&15)==4 || (dimensions>=2 && ((address>>8)&15)==4) ||
+                    (dimensions==3 && ((address>>16)&15)==4);
+                if(border && !(format&8)) throw std::runtime_error("Unsupported NV097 texture-sourced border");
+                s.textures[i]=texture(i,view);
+            }
         }
         return s;
     }

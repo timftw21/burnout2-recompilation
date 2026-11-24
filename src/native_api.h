@@ -1,9 +1,11 @@
 #pragma once
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string_view>
 
 namespace b2 {
+extern const std::size_t compiled_platform_bindings;
 struct NativeApi {std::uint32_t address;std::string_view name,prefix;};
 // Independently checked original entry bytes and caller ABIs for the supported XBE.
 inline constexpr std::array native_apis{

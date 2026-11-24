@@ -6,7 +6,6 @@
 #include <array>
 #include <atomic>
 #include <csignal>
-#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <format>
@@ -23,22 +22,28 @@ namespace b2 {
 namespace {
 int log_file=-1;std::filesystem::path log_path;
 thread_local const Cpu* guest=nullptr;
+#ifdef __APPLE__
+thread_local std::uint64_t diagnostic_thread_id=0;
+#endif
 std::atomic_flag handling=ATOMIC_FLAG_INIT;
 alignas(16) thread_local std::array<std::byte,64*1024> signal_stack;
 void install_signal_stack() noexcept {
     thread_local bool attempted=false;if(attempted) return;attempted=true;
+#ifdef __APPLE__
+    pthread_threadid_np(nullptr,&diagnostic_thread_id);
+#endif
     stack_t stack{};stack.ss_sp=signal_stack.data();stack.ss_size=signal_stack.size();sigaltstack(&stack,nullptr);
 }
 void append(std::string_view text) noexcept {
     if(log_file<0) return;
-    while(!text.empty()) {const auto size=write(log_file,text.data(),text.size());if(size<0) {if(errno==EINTR) continue;break;}text.remove_prefix(size);}
+    while(!text.empty()) {const auto size=write(log_file,text.data(),text.size());if(size<=0) {if(size<0 && errno==EINTR) continue;break;}text.remove_prefix(size);}
 }
 void shutdown() {append("{\"type\":\"session_end\"}\n");if(log_file>=0) close(log_file);log_file=-1;}
 void fatal(int signal,siginfo_t* info,void* context) {
     if(handling.test_and_set()) _exit(128+signal);
     const auto* cpu=guest;
 #ifdef __APPLE__
-    std::uint64_t thread=0;pthread_threadid_np(nullptr,&thread);
+    const auto thread=diagnostic_thread_id;
 #if defined(__aarch64__)
     const auto address=static_cast<ucontext_t*>(context)->uc_mcontext->__ss.__pc;
 #else
@@ -49,11 +54,27 @@ void fatal(int signal,siginfo_t* info,void* context) {
     const auto& registers=static_cast<ucontext_t*>(context)->uc_mcontext.gregs;
     const auto address=registers[REG_RIP];
 #endif
-    char buffer[1024];const auto size=std::snprintf(buffer,sizeof(buffer),
-        "{\"type\":\"native_crash\",\"signal\":%d,\"thread\":%llu,\"fault_address\":\"0x%016llX\",\"native_address\":\"0x%016llX\",\"guest_available\":%s,\"guest_eip\":\"0x%08X\",\"flags\":\"0x%08X\"}\n",
-        signal,static_cast<unsigned long long>(thread),static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info->si_addr)),
-        static_cast<unsigned long long>(address),cpu?"true":"false",cpu?cpu->eip:0,cpu?cpu->flags:0);
-    if(size>0 && std::size_t(size)<sizeof(buffer)) append({buffer,std::size_t(size)});
+    // Fixed fields, two decimal integers (at most 20 digits each) and four
+    // fixed-width hex values fit in 256 bytes. No stdio or locale state here.
+    char record[256];char* out=record;
+    const auto literal=[&](std::string_view text){for(char c:text) *out++=c;};
+    const auto decimal=[&](std::uint64_t value) {
+        char digits[20];auto* end=digits+sizeof digits;auto* first=end;
+        do {*--first=char('0'+value%10);value/=10;} while(value);
+        while(first!=end) *out++=*first++;
+    };
+    const auto hex=[&](std::uint64_t value,unsigned digits) {
+        literal("\"0x");
+        while(digits) *out++="0123456789ABCDEF"[(value>>(4*--digits))&15];
+        *out++='"';
+    };
+    literal("{\"type\":\"native_crash\",\"signal\":");decimal(signal);
+    literal(",\"thread\":");if(thread) decimal(thread);else literal("null");
+    literal(",\"fault_address\":");hex(reinterpret_cast<std::uintptr_t>(info->si_addr),16);
+    literal(",\"native_address\":");hex(address,16);
+    literal(",\"guest_available\":");literal(cpu?"true":"false");
+    literal(",\"guest_eip\":");hex(cpu?cpu->eip:0,8);literal(",\"flags\":");hex(cpu?cpu->flags:0,8);
+    literal("}\n");append({record,static_cast<std::size_t>(out-record)});
     // The handler is reset before delivery, preserving the native core dump.
     raise(signal);
 }

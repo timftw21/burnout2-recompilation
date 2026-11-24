@@ -16,7 +16,15 @@ inline void fp_top(FloatingState& s,unsigned top) {fp_word(s,4,(fp_word(s,4)&~0x
 inline void fp_tag(FloatingState& s,unsigned i,unsigned tag) {const auto shift=((fp_top(s)+i)&7)*2;fp_word(s,8,(fp_word(s,8)&~(3U<<shift))|(tag<<shift));}
 inline unsigned fp_tag(const FloatingState& s,unsigned i) {return (fp_word(s,8)>>(((fp_top(s)+i)&7)*2))&3;}
 inline constexpr extFloat80_t fp_indefinite{0xC000000000000000ULL,0xFFFF};
-inline void fp_reset(FloatingState& s) {std::fill(s.image.begin(),s.image.end(),std::byte{});fp_word(s,0,0x037F);fp_word(s,8,0xFFFF);}
+inline void fp_rotate(FloatingState& s,unsigned slots) {
+    auto first=s.image.begin()+28;
+    if(slots&7) std::rotate(first,first+(slots&7)*10,s.image.end());
+}
+inline void fp_reset(FloatingState& s) {
+    // FSAVE stores ST(0)..ST(7). Rebase to physical R0..R7 before clearing TOP.
+    fp_rotate(s,8-fp_top(s));std::fill_n(s.image.begin(),28,std::byte{});
+    fp_word(s,0,0x037F);fp_word(s,8,0xFFFF);
+}
 inline extFloat80_t fp_get(FloatingState& s,unsigned i) {
     if(fp_tag(s,i)==3) {fp_word(s,4,(fp_word(s,4)&~0x200U)|0x41U);return fp_indefinite;}
     extFloat80_t v{};std::memcpy(&v.signif,s.image.data()+28+i*10,8);std::memcpy(&v.signExp,s.image.data()+36+i*10,2);return v;
@@ -39,6 +47,27 @@ inline void fp_push(FloatingState& s,extFloat80_t v) {
 }
 template<class T> inline T fp_load(const void* p) {T value;std::memcpy(&value,p,sizeof(T));return value;}
 template<class T> inline void fp_store(void* p,T value) {std::memcpy(p,&value,sizeof(T));}
+template<class T> inline extFloat80_t fp_real(const void* memory,bool& denormal) {
+    constexpr unsigned fraction_bits=sizeof(T)==4?23:52;
+    const auto bits=fp_load<T>(memory),magnitude=bits&(std::numeric_limits<T>::max()>>1);
+    denormal=magnitude && magnitude<(T{1}<<fraction_bits);
+    if constexpr(sizeof(T)==4) return f32_to_extF80({bits});
+    else return f64_to_extF80({bits});
+}
+inline bool fp_denormal(extFloat80_t v) {return !(v.signExp&0x7FFF) && v.signif;}
+inline bool fp_unordered(extFloat80_t v) {
+    const auto exp=v.signExp&0x7FFF;
+    return exp && (!(v.signif>>63) || (exp==0x7FFF && (v.signif<<1)));
+}
+// SoftFloat has no denormal-operand flag. An unmasked #D leaves the x87
+// exception pending for the next waiting instruction.
+inline bool fp_raise_denormal(FloatingState& s) {
+    const bool unmasked=!(fp_word(s,0)&2);
+    fp_word(s,4,fp_word(s,4)|(unmasked?0x8082:2));return unmasked;
+}
+inline bool fp_denormal_operands(extFloat80_t a,extFloat80_t b,bool memory_denormal=false) {
+    return (memory_denormal || fp_denormal(a) || fp_denormal(b)) && !fp_unordered(a) && !fp_unordered(b);
+}
 inline void fp_begin(FloatingState& s) {
     constexpr unsigned rounding[]={0,2,3,1};const auto control=fp_word(s,0);
     softfloat_roundingMode=rounding[(control>>10)&3];softfloat_exceptionFlags=0;b2_softfloat_round_up=false;
@@ -70,10 +99,11 @@ template<bool Quiet,bool CpuFlags=false> inline std::uint32_t fp_compare(Floatin
 template<unsigned Opcode,unsigned Modrm> inline std::uint32_t portable_x87(void* memory=nullptr) {
     auto& s=portable_floating();constexpr bool mem=Modrm<0xC0;
     constexpr unsigned group=(Modrm>>3)&7,index=Modrm&7;
-    if constexpr(Opcode==0x9B) {
+    constexpr bool no_wait=(mem && ((Opcode==0xD9 && (group==6 || group==7)) || (Opcode==0xDD && (group==6 || group==7)))) ||
+        (!mem && ((Opcode==0xDB && (Modrm==0xE2 || Modrm==0xE3)) || (Opcode==0xDF && Modrm==0xE0)));
+    if constexpr(!no_wait)
         if((fp_word(s,4)&63U)&~fp_word(s,0)) throw std::runtime_error("Unmasked Xbox x87 exception");
-        return 0;
-    }
+    if constexpr(Opcode==0x9B) return 0;
     if constexpr(mem && Opcode==0xD9 && group==5) {fp_word(s,0,fp_load<std::uint16_t>(memory));return 0;}
     if constexpr(mem && Opcode==0xD9 && group==7) {fp_store(memory,fp_word(s,0));return 0;}
     if constexpr((mem && Opcode==0xDD && group==7) || (!mem && Opcode==0xDF && Modrm==0xE0)) {
@@ -83,11 +113,7 @@ template<unsigned Opcode,unsigned Modrm> inline std::uint32_t portable_x87(void*
         constexpr auto size=Opcode==0xD9?28:108;
         if constexpr(group==4) {
             const auto previous=fp_top(s);std::memcpy(s.image.data(),memory,size);
-            if constexpr(Opcode==0xD9) {
-                const auto difference=(fp_top(s)+8-previous)&7;std::array<std::byte,80> registers;
-                std::memcpy(registers.data(),s.image.data()+28,80);
-                for(unsigned i=0;i<8;++i) std::memcpy(s.image.data()+28+i*10,registers.data()+((i+difference)&7)*10,10);
-            }
+            if constexpr(Opcode==0xD9) fp_rotate(s,fp_top(s)+8-previous);
         }
         else {std::memcpy(memory,s.image.data(),size);if constexpr(Opcode==0xDD) fp_reset(s);else fp_word(s,0,fp_word(s,0)|63);}
         return 0;
@@ -98,14 +124,16 @@ template<unsigned Opcode,unsigned Modrm> inline std::uint32_t portable_x87(void*
     fp_begin(s);std::uint32_t flags=0;
     if constexpr(mem && ((Opcode==0xD9 && group==0) || (Opcode==0xDD && group==0) ||
                          (Opcode==0xDB && (group==0 || group==5)) || (Opcode==0xDF && (group==0 || group==5)))) {
-        extFloat80_t value{};
-        if constexpr(Opcode==0xD9) value=f32_to_extF80({fp_load<std::uint32_t>(memory)});
-        if constexpr(Opcode==0xDD) value=f64_to_extF80({fp_load<std::uint64_t>(memory)});
+        extFloat80_t value{};bool denormal=false;
+        if constexpr(Opcode==0xD9) value=fp_real<std::uint32_t>(memory,denormal);
+        if constexpr(Opcode==0xDD) value=fp_real<std::uint64_t>(memory,denormal);
         if constexpr(Opcode==0xDB && group==0) value=i32_to_extF80(fp_load<std::int32_t>(memory));
         if constexpr(Opcode==0xDF && group==0) value=i32_to_extF80(fp_load<std::int16_t>(memory));
         if constexpr(Opcode==0xDF && group==5) value=i64_to_extF80(fp_load<std::int64_t>(memory));
         if constexpr(Opcode==0xDB && group==5) {value.signif=fp_load<std::uint64_t>(memory);value.signExp=fp_load<std::uint16_t>(static_cast<std::byte*>(memory)+8);}
+        const bool report_denormal=denormal && fp_tag(s,7)==3;
         fp_push(s,value);
+        if(report_denormal && fp_raise_denormal(s)) return 0;
     } else if constexpr(mem && ((Opcode==0xD9 && (group==2 || group==3)) || (Opcode==0xDD && (group==2 || group==3)) ||
                                 (Opcode==0xDB && (group==1 || group==2 || group==3 || group==7)) ||
                                 (Opcode==0xDF && (group==1 || group==2 || group==3 || group==7)) || (Opcode==0xDD && group==1))) {
@@ -127,15 +155,17 @@ template<unsigned Opcode,unsigned Modrm> inline std::uint32_t portable_x87(void*
         if constexpr(group==1 || group==3 || group==7) fp_pop(s);
     } else if constexpr((mem && (Opcode==0xD8 || Opcode==0xDC || Opcode==0xDA || Opcode==0xDE)) ||
                         (!mem && (Opcode==0xD8 || Opcode==0xDC || Opcode==0xDE))) {
-        auto a=fp_get(s,0);extFloat80_t b{};
+        auto a=fp_get(s,0);extFloat80_t b{};bool memory_denormal=false;
         if constexpr(mem) {
-            if constexpr(Opcode==0xD8) b=f32_to_extF80({fp_load<std::uint32_t>(memory)});
-            if constexpr(Opcode==0xDC) b=f64_to_extF80({fp_load<std::uint64_t>(memory)});
+            if constexpr(Opcode==0xD8) b=fp_real<std::uint32_t>(memory,memory_denormal);
+            if constexpr(Opcode==0xDC) b=fp_real<std::uint64_t>(memory,memory_denormal);
             if constexpr(Opcode==0xDA) b=i32_to_extF80(fp_load<std::int32_t>(memory));
             if constexpr(Opcode==0xDE) b=i32_to_extF80(fp_load<std::int16_t>(memory));
         } else b=fp_get(s,index);
         if constexpr(group==2 || group==3) {
-            fp_compare<false>(s,a,b);if constexpr(group==3) fp_pop(s);
+            fp_compare<false>(s,a,b);
+            if(fp_denormal_operands(a,b,memory_denormal) && fp_raise_denormal(s)) return 0;
+            if constexpr(group==3) fp_pop(s);
             if constexpr(Opcode==0xDE && !mem && Modrm==0xD9) fp_pop(s);
         } else {
             constexpr bool destination_i=!mem && (Opcode==0xDC || Opcode==0xDE);
@@ -147,6 +177,8 @@ template<unsigned Opcode,unsigned Modrm> inline std::uint32_t portable_x87(void*
             if constexpr(group==5) value=destination_i?extF80_sub(a,b):extF80_sub(b,a);
             if constexpr(group==6) value=destination_i?extF80_div(b,a):extF80_div(a,b);
             if constexpr(group==7) value=destination_i?extF80_div(a,b):extF80_div(b,a);
+            if(!(softfloat_exceptionFlags&(softfloat_flag_invalid|softfloat_flag_infinite)) &&
+               fp_denormal_operands(a,b,memory_denormal) && fp_raise_denormal(s)) return 0;
             fp_set(s,destination_i?index:0,value);if constexpr(!mem && Opcode==0xDE) fp_pop(s);
         }
     } else if constexpr(!mem && Opcode==0xD9 && group==0) fp_push(s,fp_get(s,index));
@@ -155,12 +187,17 @@ template<unsigned Opcode,unsigned Modrm> inline std::uint32_t portable_x87(void*
     else if constexpr(!mem && Opcode==0xDD && (group==2 || group==3)) {fp_set(s,index,fp_get(s,0));if constexpr(group==3) fp_pop(s);}
     else if constexpr(!mem && ((Opcode==0xDD && (group==4 || group==5)) || (Opcode==0xDA && Modrm==0xE9) ||
                               ((Opcode==0xDB || Opcode==0xDF) && (group==5 || group==6)))) {
-        flags=fp_compare<(Opcode==0xDD || Opcode==0xDA || group==5),Opcode==0xDB || Opcode==0xDF>(s,fp_get(s,0),fp_get(s,Opcode==0xDA?1:index));
+        const auto a=fp_get(s,0),b=fp_get(s,Opcode==0xDA?1:index);
+        flags=fp_compare<(Opcode==0xDD || Opcode==0xDA || group==5),Opcode==0xDB || Opcode==0xDF>(s,a,b);
+        if(fp_denormal_operands(a,b) && fp_raise_denormal(s)) return flags;
         if constexpr((Opcode==0xDD && group==5) || Opcode==0xDF || Opcode==0xDA) fp_pop(s);
         if constexpr(Opcode==0xDA) fp_pop(s);
     } else if constexpr(!mem && Opcode==0xD9 && (Modrm==0xE0 || Modrm==0xE1)) {
         auto a=fp_get(s,0);if constexpr(Modrm==0xE0) a.signExp^=0x8000;else a.signExp&=0x7FFF;fp_set(s,0,a);
-    } else if constexpr(!mem && Opcode==0xD9 && Modrm==0xE4) fp_compare<false>(s,fp_get(s,0),extFloat80_t{});
+    } else if constexpr(!mem && Opcode==0xD9 && Modrm==0xE4) {
+        const auto a=fp_get(s,0);fp_compare<false>(s,a,extFloat80_t{});
+        if(fp_denormal(a) && fp_raise_denormal(s)) return 0;
+    }
     else if constexpr(!mem && Opcode==0xD9 && Modrm>=0xE8 && Modrm<=0xEE) {
         constexpr extFloat80_t constants[]={{0x8000000000000000ULL,0x3FFF},{0xD49A784BCD1B8AFEULL,0x4000},
             {0xB8AA3B295C17F0BCULL,0x3FFF},{0xC90FDAA22168C235ULL,0x4000},{0x9A209A84FBCFF799ULL,0x3FFD},
@@ -169,14 +206,18 @@ template<unsigned Opcode,unsigned Modrm> inline std::uint32_t portable_x87(void*
         if constexpr(Modrm>=0xEA && Modrm<=0xED) {if(rounding==1 || rounding==3) --value.signif;}
         if constexpr(Modrm==0xE9) {if(rounding==2) ++value.signif;}
         fp_push(s,value);
-    } else if constexpr(!mem && Opcode==0xD9 && Modrm==0xFA) fp_set(s,0,extF80_sqrt(fp_get(s,0)));
+    } else if constexpr(!mem && Opcode==0xD9 && Modrm==0xFA) {
+        const auto a=fp_get(s,0);
+        if(fp_denormal(a) && !(a.signExp&0x8000) && fp_raise_denormal(s)) return 0;
+        fp_set(s,0,extF80_sqrt(a));
+    }
     else if constexpr(!mem && Opcode==0xD9 && Modrm==0xFC) {
-        const auto before=fp_get(s,0),after=extF80_roundToInt(before,softfloat_roundingMode,true);fp_rounded(s,before,after);fp_set(s,0,after);
+        const auto before=fp_get(s,0);
+        if(fp_denormal(before) && fp_raise_denormal(s)) return 0;
+        const auto after=extF80_roundToInt(before,softfloat_roundingMode,true);fp_rounded(s,before,after);fp_set(s,0,after);
     }
     else if constexpr(!mem && Opcode==0xD9 && (Modrm==0xF6 || Modrm==0xF7)) {
-        constexpr unsigned shift=Modrm==0xF6?7:1;std::array<std::byte,80> registers;
-        std::memcpy(registers.data(),s.image.data()+28,80);
-        for(unsigned i=0;i<8;++i) std::memcpy(s.image.data()+28+i*10,registers.data()+((i+shift)&7)*10,10);
+        constexpr unsigned shift=Modrm==0xF6?7:1;fp_rotate(s,shift);
         fp_top(s,fp_top(s)+shift);
     }
     else if constexpr(!mem && Opcode==0xD9 && (Modrm==0xF0 || Modrm==0xF1 || Modrm==0xF2 || Modrm==0xF3 ||
@@ -185,6 +226,8 @@ template<unsigned Opcode,unsigned Modrm> inline std::uint32_t portable_x87(void*
         if constexpr(Modrm==0xF2 || Modrm==0xFB || Modrm==0xFE || Modrm==0xFF)
             if((a.signExp&0x7FFF)>=0x403E && (a.signExp&0x7FFF)!=0x7FFF) {fp_word(s,4,fp_word(s,4)|0x400U);return 0;}
         const auto result=x87_transcend<Modrm>(a,b);
+        if(!(softfloat_exceptionFlags&(softfloat_flag_invalid|softfloat_flag_infinite)) &&
+           fp_denormal_operands(a,b) && fp_raise_denormal(s)) return 0;
         if constexpr(Modrm==0xF1 || Modrm==0xF3 || Modrm==0xF9) {fp_set(s,1,result);fp_pop(s);}
         else {fp_set(s,0,result);if constexpr(Modrm==0xF2) fp_push(s,i32_to_extF80(1));if constexpr(Modrm==0xFB) fp_push(s,x87_transcend<0xFF>(a,{}));}
         fp_word(s,4,fp_word(s,4)&~0x400U);
@@ -195,8 +238,7 @@ template<unsigned Opcode,unsigned Modrm> inline std::uint32_t portable_x87(void*
 inline void fp_mmx_finish(FloatingState& s,bool empty=false) {
     const auto top=fp_top(s);
     if(top) {
-        std::array<std::byte,80> registers;std::memcpy(registers.data(),s.image.data()+28,80);
-        for(unsigned i=0;i<8;++i) std::memcpy(s.image.data()+28+i*10,registers.data()+((i+8-top)&7)*10,10);
+        fp_rotate(s,8-top);
         fp_top(s,0);
     }
     if(empty) {fp_word(s,8,0xFFFF);return;}

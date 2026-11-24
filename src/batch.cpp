@@ -158,12 +158,17 @@ Batch recompile_batch(Xbe& image, std::span<const std::uint32_t> seeds,
     const auto ready_count = std::ranges::count_if(units, [](const auto& pair) { return pair.second.ready; });
     const auto emitted_count = std::ranges::count_if(units, [](const auto& pair) { return pair.second.emit; });
     result.discovered = units.size();
-    result.compiled = static_cast<std::size_t>(emitted_count);
     result.instructions = instruction_count;
-    std::size_t ready_instructions = 0;
+    std::size_t closed_cpu=0;
     std::set<std::uint32_t> required_kernel;
     bool needs_clock = false, needs_exceptions = false;
     for (const auto& [address, unit] : units) if (unit.emit) {
+        if(unit.native_api.empty()) {
+            ++result.compiled;result.compiled_instructions+=unit.instruction_count;
+            if(unit.ready) ++closed_cpu;
+        } else {
+            ++result.bindings;result.binding_instructions+=unit.instruction_count;
+        }
         required_kernel.insert(unit.kernel.begin(), unit.kernel.end());
         needs_clock |= unit.clock;
         needs_exceptions |= unit.traps;
@@ -204,7 +209,6 @@ Batch recompile_batch(Xbe& image, std::span<const std::uint32_t> seeds,
             helpers.insert(unit.native_helpers.begin(),unit.native_helpers.end());
             if(unit.floating) destination << "void entry_" << std::format("{:08X}",address)
                 << "(Cpu& cpu,Memory& memory) { FloatingScope scope(cpu.floating); " << symbol(address) << "(cpu,memory); }\n";
-            ready_instructions += unit.instruction_count;
         }
         for(const auto address : missing) {
             source << "void " << symbol(address) << "(Cpu& cpu,[[maybe_unused]] Memory& memory) { cpu.eip="
@@ -231,7 +235,8 @@ Batch recompile_batch(Xbe& image, std::span<const std::uint32_t> seeds,
         for(std::size_t i=0;i<dispatch.size();++i)
             source << dispatch[i] << 'U' << (i+1==dispatch.size()?"\n":i%32==31?",\n":",");
         source << "}};\n}\nconst std::span<const CompiledFunction> compiled_batch{functions};\n"
-            "const CompiledFunction* lookup_native(std::uint32_t address) noexcept {\n"
+            << "extern const std::size_t compiled_platform_bindings=" << result.bindings << ";\n"
+            << "const CompiledFunction* lookup_native(std::uint32_t address) noexcept {\n"
             "    auto slot=(address*2654435761U)>>" << shift << ";\n"
             "    while(const auto index=dispatch[slot]) {\n"
             "        const auto& function=functions[index-1];\n"
@@ -291,9 +296,11 @@ Batch recompile_batch(Xbe& image, std::span<const std::uint32_t> seeds,
     report << ",\"complete\":" << (result.complete ? "true" : "false")
            << ",\"function_limit\":" << function_limit << ",\"instruction_limit_per_function\":" << instruction_limit
            << ",\"total_instruction_limit\":" << total_instruction_limit << ",\"functions_discovered\":" << units.size()
-           << ",\"instructions_discovered\":" << instruction_count << ",\"functions_compiled\":" << emitted_count
-           << ",\"closed_functions\":" << ready_count << ",\"shard_count\":" << shard_count
-           << ",\"instructions_compiled\":" << ready_instructions << ",\"pending_functions\":[";
+           << ",\"instructions_discovered\":" << instruction_count << ",\"functions_compiled\":" << result.compiled
+           << ",\"instructions_compiled\":" << result.compiled_instructions << ",\"closed_functions\":" << closed_cpu
+           << ",\"native_platform_bindings\":" << result.bindings << ",\"instructions_in_platform_bindings\":" << result.binding_instructions
+           << ",\"emitted_entries\":" << emitted_count << ",\"closed_entries\":" << ready_count << ",\"shard_count\":" << shard_count
+           << ",\"pending_functions\":[";
     bool first = true;
     for (const auto address : pending) {
         if (!first) report << ',';
@@ -325,7 +332,8 @@ Batch recompile_batch(Xbe& image, std::span<const std::uint32_t> seeds,
         if (!first) report << ',';
         first = false;
         report << "{\"entry\":" << json(hex32(address)) << ",\"instruction_count\":" << unit.instruction_count
-               << ",\"compiled\":" << (unit.emit ? "true" : "false") << ",\"closed\":" << (unit.ready?"true":"false")
+               << ",\"emitted\":" << (unit.emit?"true":"false") << ",\"compiled\":" << (unit.emit && unit.native_api.empty()?"true":"false")
+               << ",\"closed\":" << (unit.ready?"true":"false")
                << ",\"floating_point\":" << (unit.floating?"true":"false")
                << ",\"budget_exhausted\":" << (unit.truncated ? "true" : "false")
                << ",\"unresolved_control_flow\":" << (unit.unresolved ? "true" : "false") << ",\"calls\":";

@@ -79,6 +79,7 @@ struct RenderState {
     std::array<std::uint32_t, 4> texture_address{0x030303, 0x030303, 0x030303, 0x030303};
     std::array<std::uint32_t,4> texture_filter{0x01030000,0x01030000,0x01030000,0x01030000};
     std::array<std::uint32_t,4> texture_control{0x0003FFC0,0x0003FFC0,0x0003FFC0,0x0003FFC0};
+    std::array<std::uint32_t,4> texture_border_color{};
     std::array<bool, 4> alpha_kill{}, texture_opaque{};
     std::uint32_t combiner_control = 0;
     std::array<std::uint32_t, 8> color_inputs{}, alpha_inputs{}, color_outputs{}, alpha_outputs{};
@@ -117,6 +118,11 @@ struct RenderResources {
 
 class Renderer {
     struct Impl;
+#ifdef _WIN32
+    static constexpr unsigned sampler_slots=4;
+#else
+    static constexpr unsigned sampler_slots=8;
+#endif
 public:
     struct Visibility {void* context;void (*scope)(void*,bool original_draw);};
     class PreparedState {
@@ -125,7 +131,7 @@ public:
         const void* owner_=nullptr;
         const void* pipeline_=nullptr;
         // Keep queued draws valid when their samplers leave the cache.
-        std::array<Microsoft::WRL::ComPtr<ID3D11SamplerState>,4> samplers_{};
+        std::array<Microsoft::WRL::ComPtr<ID3D11SamplerState>,sampler_slots> samplers_{};
     };
     struct StreamDraw {
         const RenderState* state=nullptr;

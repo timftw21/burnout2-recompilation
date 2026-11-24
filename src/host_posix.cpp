@@ -1,3 +1,6 @@
+#ifdef __APPLE__
+#include <SystemConfiguration/SystemConfiguration.h>
+#endif
 #include "host.h"
 #include <algorithm>
 #include <array>
@@ -8,6 +11,8 @@
 #include <cstring>
 #include <exception>
 #include <fstream>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -18,6 +23,9 @@
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <net/if_dl.h>
+#include <net/if_media.h>
+#include <sys/ioctl.h>
+#include <sys/sockio.h>
 #include <sys/sysctl.h>
 #else
 #include <cpuid.h>
@@ -77,12 +85,22 @@ DWORD error_code(int value) {
     }
 }
 BOOL failed(int error=errno) {last_error=error_code(error);return FALSE;}
-struct Handle {
-    int fd=-1;bool delete_on_close=false;DWORD access=0,share=0;
-    std::filesystem::path path;
+struct OpenInode {
+    dev_t device;ino_t number;
+    int append_fd=-1;
+    std::vector<std::filesystem::path> pending_unlinks;
+    explicit OpenInode(const struct stat& s):device(s.st_dev),number(s.st_ino) {}
+    ~OpenInode(){if(append_fd>=0) close(append_fd);}
+    bool matches(const struct stat& value) const {return device==value.st_dev && number==value.st_ino;}
 };
-// Only the cooperative guest thread opens/closes these; AIO uses descriptors.
-thread_local std::vector<Handle*> files;
+bool append_only(DWORD access) {return (access&FILE_APPEND_DATA) && !(access&(FILE_WRITE_DATA|GENERIC_WRITE|GENERIC_ALL));}
+struct Handle {
+    int fd;bool delete_on_close,disposition;DWORD access,share;
+    std::filesystem::path path;std::shared_ptr<OpenInode> inode;
+};
+// Share modes and delete disposition apply across host threads and hard links.
+std::mutex files_mutex;
+std::vector<Handle*> files;
 Handle& handle(HANDLE value) {return *static_cast<Handle*>(value);}
 constexpr std::int64_t epoch=11644473600LL;
 FILETIME timestamp(timespec value) {
@@ -93,8 +111,9 @@ timespec timestamp(LARGE_INTEGER value) {
     return {value.QuadPart/10000000-epoch,(value.QuadPart%10000000)*100};
 }
 DWORD attributes(const struct stat& value) {
-    return (S_ISDIR(value.st_mode)?FILE_ATTRIBUTE_DIRECTORY:FILE_ATTRIBUTE_NORMAL)|
+    const DWORD flags=(S_ISDIR(value.st_mode)?FILE_ATTRIBUTE_DIRECTORY:0)|
         (S_ISLNK(value.st_mode)?FILE_ATTRIBUTE_REPARSE_POINT:0)|((value.st_mode&0222)?0:FILE_ATTRIBUTE_READONLY);
+    return flags?flags:FILE_ATTRIBUTE_NORMAL;
 }
 FILETIME creation_time(int fd,const char* path,const struct stat& status) {
     std::uint64_t saved=0;
@@ -131,13 +150,17 @@ void fiber_entry() {
 }
 DWORD GetLastError() {return last_error;}
 HANDLE CreateFileW(const char* path,DWORD access,DWORD share,void*,DWORD mode,DWORD flags,HANDLE) {
+    std::lock_guard lock(files_mutex);
     const auto normalized=std::filesystem::absolute(path).lexically_normal();
+    if(access&GENERIC_ALL) access|=GENERIC_READ|GENERIC_WRITE|DELETE;
+    if(flags&FILE_FLAG_DELETE_ON_CLOSE) access|=DELETE;
     const auto wants_read=bool(access&(GENERIC_READ|FILE_READ_DATA)),wants_write=bool(access&(GENERIC_WRITE|FILE_WRITE_DATA|FILE_APPEND_DATA));
     struct stat target_status{};const bool exists=!lstat(path,&target_status);
+    std::shared_ptr<OpenInode> inode;
     for(const auto* file:files) {
-        struct stat open_status{};
-        if(file->path!=normalized && !(exists && !fstat(file->fd,&open_status) &&
-           open_status.st_dev==target_status.st_dev && open_status.st_ino==target_status.st_ino)) continue;
+        if(!exists || !file->inode->matches(target_status)) continue;
+        inode=file->inode;
+        if(file->disposition || !inode->pending_unlinks.empty()) {last_error=ERROR_ACCESS_DENIED;return INVALID_HANDLE_VALUE;}
         if((wants_read && !(file->share&FILE_SHARE_READ)) || (wants_write && !(file->share&FILE_SHARE_WRITE)) ||
            ((access&DELETE) && !(file->share&FILE_SHARE_DELETE)) ||
            ((file->access&(GENERIC_READ|FILE_READ_DATA)) && !(share&FILE_SHARE_READ)) ||
@@ -146,16 +169,26 @@ HANDLE CreateFileW(const char* path,DWORD access,DWORD share,void*,DWORD mode,DW
             last_error=ERROR_SHARING_VIOLATION;return INVALID_HANDLE_VALUE;
         }
     }
+    const auto opened=[&](int fd)->HANDLE {
+        if(fd<0) {failed();return INVALID_HANDLE_VALUE;}
+        struct stat status{};
+        if(fstat(fd,&status)) {const int error=errno;close(fd);failed(error);return INVALID_HANDLE_VALUE;}
+        if(!inode || !inode->matches(status)) inode=std::make_shared<OpenInode>(status);
+        if(append_only(access) && inode->append_fd<0 && (inode->append_fd=fcntl(fd,F_DUPFD_CLOEXEC,0))<0) {
+            const auto error=errno;close(fd);failed(error);return INVALID_HANDLE_VALUE;
+        }
+        auto* result=new Handle{fd,bool(flags&FILE_FLAG_DELETE_ON_CLOSE),false,access,share,normalized,std::move(inode)};
+        files.push_back(result);return result;
+    };
     int options=(wants_write?(wants_read?O_RDWR:O_WRONLY):O_RDONLY)|O_CLOEXEC|O_NOFOLLOW;
+    // O_APPEND makes EOF selection and the write one operation, including aio_write.
+    if(append_only(access)) options|=O_APPEND;
     struct stat status{};
     if((flags&FILE_FLAG_BACKUP_SEMANTICS) && !lstat(path,&status) && S_ISDIR(status.st_mode)) {
         // Directory contents are changed through namespace operations, not
         // read/write on the directory descriptor. Retain the guest's access
         // mask for permission/share checks and use a native directory handle.
-        const auto fd=open(path,O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
-        if(fd<0) {failed();return INVALID_HANDLE_VALUE;}
-        auto* result=new Handle{fd,bool(flags&FILE_FLAG_DELETE_ON_CLOSE),access,share,normalized};
-        files.push_back(result);return result;
+        return opened(open(path,O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW));
     }
     switch(mode) {
     case CREATE_NEW:options|=O_CREAT|O_EXCL;break;case CREATE_ALWAYS:options|=O_CREAT|O_TRUNC;break;
@@ -172,15 +205,19 @@ HANDLE CreateFileW(const char* path,DWORD access,DWORD share,void*,DWORD mode,DW
     if(flags&FILE_FLAG_RANDOM_ACCESS) posix_fadvise(fd,0,0,POSIX_FADV_RANDOM);
     if(flags&FILE_FLAG_SEQUENTIAL_SCAN) posix_fadvise(fd,0,0,POSIX_FADV_SEQUENTIAL);
 #endif
-    auto* result=new Handle{fd,bool(flags&FILE_FLAG_DELETE_ON_CLOSE),access,share,normalized};
-    files.push_back(result);return result;
+    return opened(fd);
 }
 BOOL CloseHandle(HANDLE value) {
     if(!value || value==INVALID_HANDLE_VALUE) return FALSE;
+    std::lock_guard lock(files_mutex);
     auto* item=static_cast<Handle*>(value);bool okay=true;
-    if(item->delete_on_close) {
-        struct stat status{};const bool directory=!fstat(item->fd,&status) && S_ISDIR(status.st_mode);
-        if((directory?rmdir(item->path.c_str()):unlink(item->path.c_str())) && errno!=ENOENT) okay=failed();
+    auto& pending=item->inode->pending_unlinks;
+    if((item->delete_on_close || item->disposition) && std::ranges::find(pending,item->path)==pending.end())
+        pending.push_back(std::move(item->path));
+    if(item->inode.use_count()==1) for(const auto& path:pending) {
+        struct stat status{};
+        if(lstat(path.c_str(),&status)) {if(errno!=ENOENT) okay=failed();continue;}
+        if(item->inode->matches(status) && (S_ISDIR(status.st_mode)?rmdir(path.c_str()):unlink(path.c_str()))) okay=failed();
     }
     if(close(item->fd)) okay=failed();
     std::erase(files,item);
@@ -225,10 +262,9 @@ BOOL SetFileInformationByHandle(HANDLE file,FILE_INFO_BY_HANDLE_CLASS kind,void*
 #endif
     }
     if(kind==FileDispositionInfo) {
-        for(const auto* other:files) if(other!=&item && other->path==item.path && !(other->share&FILE_SHARE_DELETE)) {
-            last_error=ERROR_SHARING_VIOLATION;return FALSE;
-        }
-        item.delete_on_close=static_cast<FILE_DISPOSITION_INFO*>(data)->DeleteFile;return TRUE;
+        std::lock_guard lock(files_mutex);
+        if(!(item.access&DELETE)) {last_error=ERROR_ACCESS_DENIED;return FALSE;}
+        item.disposition=static_cast<FILE_DISPOSITION_INFO*>(data)->DeleteFile!=FALSE;return TRUE;
     }
     auto& value=*static_cast<FILE_BASIC_INFO*>(data);
     // Linux birth/change timestamps cannot be set through futimens. Preserve
@@ -259,11 +295,20 @@ BOOL GetDiskFreeSpaceExW(const char* path,ULARGE_INTEGER* available,ULARGE_INTEG
 }
 namespace {
 BOOL transfer(HANDLE file,void* buffer,DWORD count,DWORD* transferred,OVERLAPPED* overlap,bool write) {
-    if(overlap) {
-        auto& io=overlap->io;io={};io.aio_fildes=handle(file).fd;io.aio_buf=buffer;io.aio_nbytes=count;
-        io.aio_offset=(std::uint64_t(overlap->OffsetHigh)<<32)|overlap->Offset;io.aio_sigevent.sigev_notify=SIGEV_NONE;
+    const auto& item=handle(file);
+    const bool append=write && append_only(item.access);
+    if(overlap || append) {
+        // Route every append to the same AIO queue for this inode. Some mounted
+        // filesystems implement O_APPEND separately for each open description.
+        OVERLAPPED synchronous{};auto& request=overlap?*overlap:synchronous;
+        auto& io=request.io;io={};io.aio_fildes=append?item.inode->append_fd:item.fd;io.aio_buf=buffer;io.aio_nbytes=count;
+        io.aio_offset=append?0:(std::uint64_t(request.OffsetHigh)<<32)|request.Offset;io.aio_sigevent.sigev_notify=SIGEV_NONE;
         if((write?aio_write(&io):aio_read(&io))) return failed();
-        overlap->submitted=true;last_error=ERROR_IO_PENDING;return FALSE;
+        request.submitted=true;
+        if(overlap) {last_error=ERROR_IO_PENDING;return FALSE;}
+        DWORD written=0;if(!GetOverlappedResult(file,&request,&written,TRUE)) return FALSE;
+        if(transferred) *transferred=written;
+        return lseek(item.fd,0,SEEK_END)<0?failed():TRUE;
     }
     ssize_t result;do {result=write ? ::write(handle(file).fd,buffer,count) : ::read(handle(file).fd,buffer,count);} while(result<0 && errno==EINTR);
     if(result<0) return failed();if(transferred) *transferred=DWORD(result);return TRUE;
@@ -281,9 +326,9 @@ BOOL GetOverlappedResult(HANDLE,OVERLAPPED* overlap,DWORD* transferred,BOOL wait
     const auto result=aio_return(&overlap->io);overlap->submitted=false;
     if(error) return failed(error);if(result<0) return failed();*transferred=DWORD(result);return TRUE;
 }
-BOOL CancelIoEx(HANDLE file,OVERLAPPED* overlap) {
+BOOL CancelIoEx(HANDLE,OVERLAPPED* overlap) {
     if(!overlap->submitted) {last_error=ERROR_NOT_FOUND;return FALSE;}
-    return aio_cancel(handle(file).fd,&overlap->io)<0?failed():TRUE;
+    return aio_cancel(overlap->io.aio_fildes,&overlap->io)<0?failed():TRUE;
 }
 BOOL FlushFileBuffers(HANDLE file) {return fsync(handle(file).fd)?failed():TRUE;}
 void GetSystemTimeAsFileTime(FILETIME* output) {timespec now{};clock_gettime(CLOCK_REALTIME,&now);*output=timestamp(now);}
@@ -412,22 +457,64 @@ std::filesystem::path resource_path(std::string_view name) {
 void random_bytes(void* output,std::size_t size) {
     if(size>INT_MAX || RAND_bytes(static_cast<unsigned char*>(output),static_cast<int>(size))!=1) throw std::runtime_error("Native random source failed");
 }
-std::uint32_t ethernet_status() {
+namespace {
+std::uint32_t ethernet_link(std::int64_t mbps) {return 1|(mbps>=100?2U:mbps>=10?4U:0U);}
 #ifdef __APPLE__
-    ifaddrs* interfaces=nullptr;if(getifaddrs(&interfaces)) return 0;
+std::uint32_t ethernet_media_link(unsigned media,std::uint32_t baudrate) {
+    switch(IFM_SUBTYPE(media)) {
+    case IFM_10_T:case IFM_10_2:case IFM_10_5:case IFM_10_STP:case IFM_10_FL:return ethernet_link(10);
+    case IFM_100_TX:case IFM_100_FX:case IFM_100_T4:case IFM_100_VG:case IFM_100_T2:
+    case IFM_1000_SX:case IFM_1000_LX:case IFM_1000_CX:case IFM_1000_T:case IFM_2500_T:
+    case IFM_10G_T:case IFM_10G_SR:case IFM_10G_LR:case IFM_10G_CX4:return ethernet_link(100);
+    default:return ethernet_link(baudrate/1000000);
+    }
+}
+std::uint32_t wired_interfaces(CFArrayRef devices,const ifaddrs* interfaces,int socket) {
     std::uint32_t result=0;
-    for(auto* item=interfaces;item;item=item->ifa_next)
-        if(item->ifa_addr && item->ifa_addr->sa_family==AF_LINK &&
-           (item->ifa_flags&(IFF_UP|IFF_RUNNING|IFF_LOOPBACK))==(IFF_UP|IFF_RUNNING)) {result=1;break;}
-    freeifaddrs(interfaces);return result;
+    for(CFIndex i=0;i<CFArrayGetCount(devices);++i) {
+        const auto device=static_cast<SCNetworkInterfaceRef>(CFArrayGetValueAtIndex(devices,i));
+        const auto type=SCNetworkInterfaceGetInterfaceType(device),name=SCNetworkInterfaceGetBSDName(device);
+        if(!type || !name || !CFEqual(type,kSCNetworkInterfaceTypeEthernet)) continue;
+        ifmediareq media{};
+        if(!CFStringGetCString(name,media.ifm_name,sizeof(media.ifm_name),kCFStringEncodingUTF8) ||
+           ioctl(socket,SIOCGIFMEDIA,&media)<0 || IFM_TYPE(media.ifm_active)!=IFM_ETHER ||
+           (media.ifm_status&(IFM_AVALID|IFM_ACTIVE))!=(IFM_AVALID|IFM_ACTIVE)) continue;
+        for(auto* item=interfaces;item;item=item->ifa_next) {
+            if(!item->ifa_addr || item->ifa_addr->sa_family!=AF_LINK || std::strcmp(media.ifm_name,item->ifa_name) ||
+               (item->ifa_flags&(IFF_UP|IFF_RUNNING|IFF_LOOPBACK))!=(IFF_UP|IFF_RUNNING)) continue;
+            const auto* data=static_cast<const if_data*>(item->ifa_data);
+            result=ethernet_media_link(media.ifm_active,data?data->ifi_baudrate:0);
+            if(result!=1) return result;
+        }
+    }
+    return result;
+}
 #else
-    for(const auto& entry:std::filesystem::directory_iterator("/sys/class/net")) {
-        const auto path=entry.path();unsigned type=0,carrier=0,speed=0;
+std::uint32_t wired_interfaces(const std::filesystem::path& directory) {
+    for(const auto& entry:std::filesystem::directory_iterator(directory)) {
+        const auto path=entry.path();unsigned type=0,carrier=0;int speed=0;
         std::ifstream(path/"type")>>type;if(type!=ARPHRD_ETHER || !std::filesystem::exists(path/"device")) continue;
+        if(std::filesystem::exists(path/"phy80211") || std::filesystem::exists(path/"wireless")) continue;
+        std::ifstream events(path/"uevent");std::string line;
+        while(std::getline(events,line) && line!="DEVTYPE=wlan") {}
+        if(line=="DEVTYPE=wlan") continue;
         std::ifstream(path/"carrier")>>carrier;if(!carrier) continue;
-        std::ifstream(path/"speed")>>speed;return 1|(speed>=100?2U:speed>=10?4U:0U);
+        std::ifstream(path/"speed")>>speed;return ethernet_link(speed);
     }
     return 0;
+}
+#endif
+}
+std::uint32_t ethernet_status() {
+#ifdef __APPLE__
+    const auto devices=SCNetworkInterfaceCopyAll();if(!devices) return 0;
+    ifaddrs* interfaces=nullptr;const int fd=socket(AF_INET,SOCK_DGRAM,0);
+    std::uint32_t status=0;
+    if(fd>=0 && !getifaddrs(&interfaces)) {status=wired_interfaces(devices,interfaces,fd);freeifaddrs(interfaces);}
+    if(fd>=0) close(fd);
+    CFRelease(devices);return status;
+#else
+    return wired_interfaces("/sys/class/net");
 #endif
 }
 std::uint32_t dos_error(std::uint32_t status) {
