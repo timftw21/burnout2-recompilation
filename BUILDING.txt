@@ -55,8 +55,11 @@ The source folder stays the installation location, as with Windows setup.
 
 Automatic Linux package setup supports Ubuntu 24.04+/Debian 13+ through apt,
 Fedora through dnf and Arch through pacman. It installs only missing packages,
-including FFmpeg and the disc picker. An older system CMake is supplemented by
-the hash-verified official CMake 4.4.4 binary under build/deps/cmake-linux.
+including FFmpeg and the disc picker. When a launcher starts setup without a
+terminal, it asks for the password through the desktop's polkit dialog, or a
+zenity/kdialog prompt for sudo when pkexec is unavailable. An older system
+CMake is supplemented by the hash-verified official CMake 4.4.4 binary under
+build/deps/cmake-linux.
 It does not change the system's default compiler or CMake installation.
 Other distributions can use the manual build steps below.
 

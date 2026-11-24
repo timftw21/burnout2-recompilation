@@ -46,8 +46,21 @@ message() {
         kde) kdialog --title 'Burnout 2 setup' --msgbox "$1" ;;
     esac
 }
+askpass_directory=""
+askpass_helper() {
+    local program
+    if command -v zenity >/dev/null; then program="exec zenity --password --title='Burnout 2 setup'"
+    elif command -v kdialog >/dev/null; then program="exec kdialog --title 'Burnout 2 setup' --password 'Enter your password to install the missing build packages.'"
+    else return 1
+    fi
+    askpass_directory=$(mktemp -d "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/burnout2-setup.XXXXXX") || return 1
+    printf '#!/bin/sh\n%s\n' "$program" > "$askpass_directory/askpass"
+    chmod 700 -- "$askpass_directory/askpass"
+    export SUDO_ASKPASS="$askpass_directory/askpass"
+}
 failed() {
     local status=$?
+    if [[ -n $askpass_directory ]]; then rm -rf -- "$askpass_directory"; fi
     if (( status )); then
         printf '\nSetup stopped. Your existing saves and settings are preserved.\n' >&2
         if [[ -t 0 && ${CI:-} != true ]]; then read -r -p 'Press Return to close this window. ' _ || true; fi
@@ -99,10 +112,20 @@ prepare_linux() {
         if (( EUID )); then
             command -v sudo >/dev/null || { printf '%s\n' 'sudo is required to install missing system packages.' >&2; return 1; }
             admin=(sudo)
+            # Launchers start setup without a terminal, where sudo cannot read a password.
+            if ! ( exec </dev/tty ) 2>/dev/null && ! sudo -n true 2>/dev/null; then
+                if [[ -x ${SUDO_ASKPASS:-} ]]; then admin=(sudo -A)
+                elif [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]] && command -v pkexec >/dev/null; then admin=(pkexec)
+                elif [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]] && askpass_helper; then admin=(sudo -A)
+                else
+                    printf 'Setup was started without a terminal or graphical password prompt, so it cannot install: %s\nRun bash Install.sh in a terminal, or install these packages and start setup again.\n' "${missing[*]}" >&2
+                    return 1
+                fi
+            fi
         fi
         printf '\nInstalling missing system packages. Your system may ask for your password.\n'
         case $manager in
-            apt) "${admin[@]}" apt-get update; "${admin[@]}" apt-get install -y --no-install-recommends "${missing[@]}" ;;
+            apt) "${admin[@]}" /bin/sh -c 'apt-get update && exec apt-get install -y --no-install-recommends "$@"' apt-get "${missing[@]}" ;;
             dnf) "${admin[@]}" dnf install -y "${missing[@]}" ;;
             pacman) "${admin[@]}" pacman -S --needed --noconfirm "${missing[@]}" ;;
         esac
