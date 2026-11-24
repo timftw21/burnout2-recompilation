@@ -130,6 +130,22 @@ FILETIME creation_time(int fd,const char* path,const struct stat& status) {
     return timestamp(status.st_ctim);
 #endif
 }
+int set_file_times(int fd,const FILE_BASIC_INFO& value) {
+    // futimens only sets access and modification times. Keep explicit Xbox
+    // creation and change times on the file across close and reopen.
+#ifdef __APPLE__
+    if(value.CreationTime.QuadPart>0 && fsetxattr(fd,"b2.creation_time",&value.CreationTime.QuadPart,8,0,0)) return -1;
+    if(value.ChangeTime.QuadPart>0 && fsetxattr(fd,"b2.change_time",&value.ChangeTime.QuadPart,8,0,0)) return -1;
+#else
+    if(value.CreationTime.QuadPart>0 && fsetxattr(fd,"user.b2.creation_time",&value.CreationTime.QuadPart,8,0)) return -1;
+    if(value.ChangeTime.QuadPart>0 && fsetxattr(fd,"user.b2.change_time",&value.ChangeTime.QuadPart,8,0)) return -1;
+#endif
+    if(value.LastAccessTime.QuadPart<=0 && value.LastWriteTime.QuadPart<=0) return 0;
+    std::array<timespec,2> times{{{0,UTIME_OMIT},{0,UTIME_OMIT}}};
+    if(value.LastAccessTime.QuadPart>0) times[0]=timestamp(value.LastAccessTime);
+    if(value.LastWriteTime.QuadPart>0) times[1]=timestamp(value.LastWriteTime);
+    return futimens(fd,times.data());
+}
 struct Fiber {
 #ifdef __APPLE__
     alignas(16) std::array<std::byte,640> context{};
@@ -224,14 +240,17 @@ BOOL CloseHandle(HANDLE value) {
     delete item;return okay;
 }
 DWORD GetFileAttributesW(const char* path) {
+    std::lock_guard lock(files_mutex);
     struct stat value{};if(lstat(path,&value)) {failed();return INVALID_FILE_ATTRIBUTES;}return attributes(value);
 }
 BOOL GetFileAttributesExW(const char* path,DWORD,WIN32_FILE_ATTRIBUTE_DATA* output) {
+    std::lock_guard lock(files_mutex);
     struct stat value{};if(lstat(path,&value)) return failed();
     *output={attributes(value),creation_time(-1,path,value),timestamp(value.st_atim),timestamp(value.st_mtim),DWORD(std::uint64_t(value.st_size)>>32),DWORD(value.st_size)};return TRUE;
 }
 BOOL CreateDirectoryW(const char* path,void*) {return mkdir(path,0777)?failed():TRUE;}
 BOOL GetFileInformationByHandle(HANDLE file,BY_HANDLE_FILE_INFORMATION* output) {
+    std::lock_guard lock(files_mutex);
     struct stat value{};if(fstat(handle(file).fd,&value)) return failed();
     *output={attributes(value),creation_time(handle(file).fd,nullptr,value),timestamp(value.st_atim),timestamp(value.st_mtim),DWORD(value.st_dev),
         DWORD(std::uint64_t(value.st_size)>>32),DWORD(value.st_size),DWORD(value.st_nlink),DWORD(std::uint64_t(value.st_ino)>>32),DWORD(value.st_ino)};return TRUE;
@@ -266,24 +285,24 @@ BOOL SetFileInformationByHandle(HANDLE file,FILE_INFO_BY_HANDLE_CLASS kind,void*
         if(!(item.access&DELETE)) {last_error=ERROR_ACCESS_DENIED;return FALSE;}
         item.disposition=static_cast<FILE_DISPOSITION_INFO*>(data)->DeleteFile!=FALSE;return TRUE;
     }
-    auto& value=*static_cast<FILE_BASIC_INFO*>(data);
-    // Linux birth/change timestamps cannot be set through futimens. Preserve
-    // explicitly supplied Xbox metadata on the save itself, across reopening.
-#ifdef __APPLE__
-    if(value.CreationTime.QuadPart>0 && fsetxattr(item.fd,"b2.creation_time",&value.CreationTime.QuadPart,8,0,0)) return failed();
-    if(value.ChangeTime.QuadPart>0 && fsetxattr(item.fd,"b2.change_time",&value.ChangeTime.QuadPart,8,0,0)) return failed();
-#else
-    if(value.CreationTime.QuadPart>0 && fsetxattr(item.fd,"user.b2.creation_time",&value.CreationTime.QuadPart,8,0)) return failed();
-    if(value.ChangeTime.QuadPart>0 && fsetxattr(item.fd,"user.b2.change_time",&value.ChangeTime.QuadPart,8,0)) return failed();
-#endif
-    std::array<timespec,2> times{{{0,UTIME_OMIT},{0,UTIME_OMIT}}};
-    if(value.LastAccessTime.QuadPart>0) times[0]=timestamp(value.LastAccessTime);
-    if(value.LastWriteTime.QuadPart>0) times[1]=timestamp(value.LastWriteTime);
-    if(futimens(item.fd,times.data())) return failed();
-    if(value.FileAttributes) {
-        struct stat status{};if(fstat(item.fd,&status)) return failed();
-        const auto mode=value.FileAttributes&FILE_ATTRIBUTE_READONLY?status.st_mode&~0222:status.st_mode|S_IWUSR;
-        if(fchmod(item.fd,mode)) return failed();
+    if(!(item.access&(GENERIC_WRITE|FILE_WRITE_ATTRIBUTES))) return failed(EACCES);
+    const auto& value=*static_cast<const FILE_BASIC_INFO*>(data);
+    std::lock_guard lock(files_mutex);
+    struct stat status{};if(fstat(item.fd,&status)) return failed();
+    const mode_t original_mode=status.st_mode&07777;
+    mode_t final_mode=original_mode;
+    if(value.FileAttributes) final_mode=value.FileAttributes&FILE_ATTRIBUTE_READONLY?original_mode&~0222:original_mode|S_IWUSR;
+    // POSIX checks current write permission for extended attributes even on
+    // an already-open descriptor. Grant only the owner's bit while updating
+    // a read-only save. Guest opens and metadata queries share this lock.
+    const bool writes_xattr=value.CreationTime.QuadPart>0 || value.ChangeTime.QuadPart>0;
+    mode_t update_mode=original_mode|(final_mode&S_IWUSR);
+    if(writes_xattr && !(update_mode&S_IWUSR) && status.st_uid==geteuid()) update_mode|=S_IWUSR;
+    if(update_mode!=original_mode && fchmod(item.fd,update_mode)) return failed();
+    if(set_file_times(item.fd,value) || (final_mode!=update_mode && fchmod(item.fd,final_mode))) {
+        const int error=errno;
+        if(update_mode!=original_mode && fchmod(item.fd,original_mode)) return failed();
+        return failed(error);
     }
     return TRUE;
 }
