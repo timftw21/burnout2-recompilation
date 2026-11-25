@@ -22,11 +22,11 @@ I'll try to respond in a timely manner. This is an independent fan project, unaf
 Yes, AI (Codex) assisted in the development of this project. No, this project was not blindly thrown together.
 If you're skeptical, I implore you to try the recompilation for yourself. I take quality control quite seriously!👀
 
-## What's new in 1.15.5
+## What's new in 1.15.6
 
-- **Safer installs and upgrades.** Windows Setup preserves disc images you already own and can recover an interrupted install. Preparing game files also preserves your existing settings if they cannot be read.
-- **More reliable saves.** Concurrent appends on Linux and macOS preserve existing save data. The game can update a save's timestamps and read-only setting together, and save listings show the same details as the file itself.
-- **Texture borders.** The renderer now uses the border color requested by the game when filtering the edge of a texture.
+The settings window now follows your monitor’s display scaling. Text, buttons
+and icons stay readable on high-resolution screens, including 4K at 300%.
+The panel also adjusts when you resize the window or move it to another monitor.
 
 Coming from a source build? See [Updating between releases](#updating-between-releases)
 to keep your saves. Your own US Xbox XISO is required. Game files are not included.
