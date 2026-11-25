@@ -2,6 +2,10 @@
 
 # <div align="center">Burnout 2: Point of Impact — Static Recompilation</div>
 
+<p align="center">
+  <em>From the creator of the <a href="https://github.com/timftw21/smbd-recompilation">Super Monkey Ball Deluxe</a> and <a href="https://github.com/timftw21/scoobymm-recompilation">Scooby-Doo! Mystery Mayhem</a> recompilations.</em>
+</p>
+
 An unofficial version of the original Xbox game for Windows, with experimental
 Linux, Steam Deck, and macOS ports, focused on fast gameplay, preserving the original's look
 and feel, and a variety of enhancements.
