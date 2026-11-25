@@ -1002,6 +1002,8 @@ Graphics, Enhancements, Controls and Diagnostics. The charcoal/orange interface
 uses Windows UI fonts, custom vector icons, scrollable option panels and pinned
 game buttons. Fonts are loaded from Windows, not redistributed. Keyboard and
 gamepad navigation are enabled, and descriptions appear in hover tooltips.
+The settings panel, text and controls follow the monitor's display scaling
+and fit the available window when it is resized or moved between monitors.
 Diagnostics contains capture/performance controls and the latest 64 startup,
 capture and error messages, newest first.
 Esc toggles settings; F1 remains an alias.

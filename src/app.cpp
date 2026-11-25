@@ -35,6 +35,7 @@
 #include <future>
 #include <iostream>
 #include <sstream>
+#include <tuple>
 
 #if defined(__LLVM_INSTR_PROFILE_GENERATE)
 extern "C" void __llvm_profile_reset_counters();
@@ -310,29 +311,30 @@ Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> settings_logo(ID3D11Device* dev
         throw std::runtime_error("Could not upload the settings logo");
     return view;
 }
-void settings_icon(ImDrawList& draw,int kind,ImVec2 p,ImU32 color) {
-    const auto point=[&](float x,float y){return ImVec2{p.x+x,p.y+y};};
-    const auto line=[&](float x,float y,float u,float v){draw.AddLine(point(x,y),point(u,v),color,1.6f);};
+void settings_icon(ImDrawList& draw,int kind,ImVec2 p,ImU32 color,float scale) {
+    const auto point=[&](float x,float y){return ImVec2{p.x+x*scale,p.y+y*scale};};
+    const float stroke=1.6f*scale;
+    const auto line=[&](float x,float y,float u,float v){draw.AddLine(point(x,y),point(u,v),color,stroke);};
     switch(kind) {
     case 0:
-        draw.AddCircle(point(10,10),8.5f,color,32,1.6f);
-        draw.AddCircle(point(10,10),2.3f,color,16,1.6f);
+        draw.AddCircle(point(10,10),8.5f*scale,color,32,stroke);
+        draw.AddCircle(point(10,10),2.3f*scale,color,16,stroke);
         for(const float start:{-.95f,2.19f}) {
-            draw.PathArcTo(point(10,10),5.5f,start,start+.7f,8);
-            draw.PathStroke(color,0,1.6f);
+            draw.PathArcTo(point(10,10),5.5f*scale,start,start+.7f,8);
+            draw.PathStroke(color,stroke);
         }
         break;
-    case 1:for(int i=0;i<3;++i) {const float y=4.0f+6*i,x=i==1?13.0f:7.0f;line(1,y,19,y);draw.AddCircleFilled(point(x,y),2.5f,color);}break;
+    case 1:for(int i=0;i<3;++i) {const float y=4.0f+6*i,x=i==1?13.0f:7.0f;line(1,y,19,y);draw.AddCircleFilled(point(x,y),2.5f*scale,color);}break;
     case 2:line(2,7,6,7);line(6,7,11,3);line(11,3,11,18);line(11,18,6,14);line(6,14,2,14);line(2,14,2,7);
-        draw.PathArcTo(point(11,10.5f),7,-.8f,.8f,10);draw.PathStroke(color,0,1.6f);break;
-    case 3:draw.AddRect(point(1,2),point(19,15),color,2);line(10,15,10,19);line(5,19,15,19);break;
+        draw.PathArcTo(point(11,10.5f),7*scale,-.8f,.8f,10);draw.PathStroke(color,stroke);break;
+    case 3:draw.AddRect(point(1,2),point(19,15),color,2*scale,scale);line(10,15,10,19);line(5,19,15,19);break;
     case 4:
         draw.PathLineTo(point(8,2));
         draw.PathBezierCubicCurveTo(point(9,7),point(10,8),point(15,9));
         draw.PathBezierCubicCurveTo(point(10,10),point(9,11),point(8,16));
         draw.PathBezierCubicCurveTo(point(7,11),point(6,10),point(1,9));
         draw.PathBezierCubicCurveTo(point(6,8),point(7,7),point(8,2));
-        draw.PathStroke(color,ImDrawFlags_Closed,1.6f);
+        draw.PathStroke(color,stroke,ImDrawFlags_Closed);
         line(16,1,16,5);line(14,3,18,3);break;
     case 5:
         draw.PathLineTo(point(6,5));draw.PathLineTo(point(14,5));
@@ -343,17 +345,17 @@ void settings_icon(ImDrawList& draw,int kind,ImVec2 p,ImU32 color) {
         draw.PathBezierCubicCurveTo(point(3,18.8f),point(.3f,18),point(1,14));
         draw.PathLineTo(point(1.8f,9));
         draw.PathBezierCubicCurveTo(point(2.2f,6.4f),point(3.5f,5),point(6,5));
-        draw.PathStroke(color,ImDrawFlags_Closed,1.6f);
+        draw.PathStroke(color,stroke,ImDrawFlags_Closed);
         line(6.3f,7.5f,6.3f,11.5f);line(4.3f,9.5f,8.3f,9.5f);
-        draw.AddCircleFilled(point(13,8.5f),1.1f,color);draw.AddCircleFilled(point(15.7f,11),1.1f,color);break;
+        draw.AddCircleFilled(point(13,8.5f),1.1f*scale,color);draw.AddCircleFilled(point(15.7f,11),1.1f*scale,color);break;
     case 6:
         draw.PathLineTo(point(5,2));draw.PathLineTo(point(15,2));draw.PathLineTo(point(14,9));
         draw.PathBezierCubicCurveTo(point(13,14),point(7,14),point(6,9));
-        draw.PathStroke(color,ImDrawFlags_Closed,1.6f);
+        draw.PathStroke(color,stroke,ImDrawFlags_Closed);
         draw.PathLineTo(point(5,4));draw.PathLineTo(point(2,4));
-        draw.PathBezierCubicCurveTo(point(2,9),point(3,10),point(7,10));draw.PathStroke(color,0,1.6f);
+        draw.PathBezierCubicCurveTo(point(2,9),point(3,10),point(7,10));draw.PathStroke(color,stroke);
         draw.PathLineTo(point(15,4));draw.PathLineTo(point(18,4));
-        draw.PathBezierCubicCurveTo(point(18,9),point(17,10),point(13,10));draw.PathStroke(color,0,1.6f);
+        draw.PathBezierCubicCurveTo(point(18,9),point(17,10),point(13,10));draw.PathStroke(color,stroke);
         line(10,13,10,18);line(6,18,14,18);break;
     case 7:
         draw.PathLineTo(point(3,5));draw.PathLineTo(point(7,5));
@@ -368,8 +370,8 @@ void settings_icon(ImDrawList& draw,int kind,ImVec2 p,ImU32 color) {
         draw.PathLineTo(point(3,18));draw.PathLineTo(point(3,13));
         draw.PathBezierCubicCurveTo(point(6,14),point(7,12.8f),point(7,11));
         draw.PathBezierCubicCurveTo(point(7,9.2f),point(6,8),point(3,9));
-        draw.PathStroke(color,ImDrawFlags_Closed,1.6f);break;
-    case 8:draw.AddRect(point(2,1),point(18,19),color,2);for(int i=0;i<3;++i) line(6,6.0f+4*i,14,6.0f+4*i);break;
+        draw.PathStroke(color,stroke,ImDrawFlags_Closed);break;
+    case 8:draw.AddRect(point(2,1),point(18,19),color,2*scale,scale);for(int i=0;i<3;++i) line(6,6.0f+4*i,14,6.0f+4*i);break;
     }
 }
 void setting_label(const char* text) {
@@ -424,6 +426,7 @@ float achievement_opacity(std::uint64_t elapsed) {
     return fraction*fraction*(3-2*fraction);
 }
 struct App {
+    static constexpr int minimum_width=640,minimum_height=480;
     SDL_Window* window=nullptr;
     std::unique_ptr<Renderer> renderer;
     std::unique_ptr<Input> input;
@@ -445,6 +448,8 @@ struct App {
     Uint8* achievement_audio_data=nullptr;
     Uint32 achievement_audio_size=0;
     ImFont* heading_font=nullptr;ImFont* italic_font=nullptr;
+    ImGuiStyle unscaled_style;
+    float ui_scale=1;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> logo;
     std::filesystem::path settings_path,pending_window_capture;
     FramePacer pacer,source_pacer;
@@ -519,7 +524,7 @@ struct App {
 #endif
             );
             if(!window) throw std::runtime_error(SDL_GetError());
-            SDL_SetWindowMinimumSize(window,640,480);
+            SDL_SetWindowMinimumSize(window,minimum_width,minimum_height);
             mouse_activity=SDL_GetTicksNS();
             focused=(SDL_GetWindowFlags(window)&SDL_WINDOW_INPUT_FOCUS)!=0;
             refresh_options();
@@ -539,6 +544,7 @@ struct App {
             if(!controls) input->controller_bindings(settings.controller_bindings);
             IMGUI_CHECKVERSION();ImGui::CreateContext();
             heading_font=settings_theme(italic_font);
+            unscaled_style=ImGui::GetStyle();
             if(!ImGui_ImplSDL3_InitForD3D(window) || !ImGui_ImplDX11_Init(renderer->native_device(),renderer->native_context()))
                 throw std::runtime_error("Could not initialize the settings interface");
             logo=settings_logo(renderer->native_device());
@@ -637,7 +643,7 @@ struct App {
         ImGui::EndDisabled();
         const auto* viewport=ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(viewport->GetCenter(),ImGuiCond_Appearing,{.5f,.5f});
-        ImGui::SetNextWindowSize({std::min(440.0f,viewport->WorkSize.x-32),0});
+        ImGui::SetNextWindowSize({std::min(440*ui_scale,viewport->WorkSize.x-32*ui_scale),0});
         if(ImGui::BeginPopupModal("Reset achievements?",&achievement_reset_open,ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoSavedSettings)) {
             ImGui::TextWrapped("This will clear all achievement progress so you can earn them again. This cannot be undone. Are you sure?");
             ImGui::Spacing();
@@ -658,7 +664,7 @@ struct App {
             const auto& entry=achievement_definitions[i];const bool unlocked=achievements.unlocked(AchievementId(i));
             ImGui::PushStyleVar(ImGuiStyleVar_Alpha,ImGui::GetStyle().Alpha*(unlocked?1.0f:.5f));
             ImGui::SeparatorText(unlocked?"UNLOCKED":"LOCKED");
-            ImGui::Image(logo.Get(),{56,56});ImGui::SameLine();ImGui::BeginGroup();
+            ImGui::Image(logo.Get(),{56*ui_scale,56*ui_scale});ImGui::SameLine();ImGui::BeginGroup();
             ImGui::PushFont(heading_font,22);ImGui::TextWrapped("%s",entry.title);ImGui::PopFont();
             ImGui::TextWrapped("%s",entry.description);ImGui::EndGroup();ImGui::Spacing();
             ImGui::PopStyleVar();
@@ -683,15 +689,15 @@ struct App {
         if(elapsed>=achievement_duration) {stop_achievement_notification();return;}
         const auto& entry=achievement_definitions[unsigned(*achievement_notification)];
         const auto* viewport=ImGui::GetMainViewport();
-        ImGui::SetNextWindowPos({viewport->WorkPos.x+viewport->WorkSize.x-16,viewport->WorkPos.y+viewport->WorkSize.y-16},ImGuiCond_Always,{1,1});
-        ImGui::SetNextWindowSize({std::min(380.0f,viewport->WorkSize.x-32),0});
+        ImGui::SetNextWindowPos({viewport->WorkPos.x+viewport->WorkSize.x-16*ui_scale,viewport->WorkPos.y+viewport->WorkSize.y-16*ui_scale},ImGuiCond_Always,{1,1});
+        ImGui::SetNextWindowSize({std::min(380*ui_scale,viewport->WorkSize.x-32*ui_scale),0});
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha,ImGui::GetStyle().Alpha*achievement_opacity(elapsed));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,{16,14});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,{16*ui_scale,14*ui_scale});
         ImGui::PushStyleColor(ImGuiCol_WindowBg,ImVec4{.08f,.10f,.14f,.97f});
         ImGui::PushStyleColor(ImGuiCol_Border,ImVec4{1,.55f,.27f,1});
         ImGui::Begin("Achievement unlocked",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_AlwaysAutoResize|
             ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoFocusOnAppearing|ImGuiWindowFlags_NoNav|ImGuiWindowFlags_NoInputs);
-        ImGui::Image(logo.Get(),{56,56});ImGui::SameLine();ImGui::BeginGroup();
+        ImGui::Image(logo.Get(),{56*ui_scale,56*ui_scale});ImGui::SameLine();ImGui::BeginGroup();
         ImGui::TextColored({1,.55f,.27f,1},"Achievement unlocked");
         ImGui::PushFont(heading_font,22);ImGui::TextWrapped("%s",entry.title);ImGui::PopFont();
         ImGui::TextWrapped("%s",entry.description);
@@ -778,8 +784,8 @@ struct App {
         if(!script_message_started) script_message_started=now;
         if(now-script_message_started>=5000000000ULL) {++script_message_index;script_message_started=0;return;}
         const auto& message=script_messages[script_message_index];const auto* viewport=ImGui::GetMainViewport();
-        ImGui::SetNextWindowPos({viewport->WorkPos.x+viewport->WorkSize.x*.5f,viewport->WorkPos.y+viewport->WorkSize.y-24},ImGuiCond_Always,{.5f,1});
-        ImGui::SetNextWindowSize({std::min(500.f,viewport->WorkSize.x-32),0});ImGui::SetNextWindowBgAlpha(.94f);
+        ImGui::SetNextWindowPos({viewport->WorkPos.x+viewport->WorkSize.x*.5f,viewport->WorkPos.y+viewport->WorkSize.y-24*ui_scale},ImGuiCond_Always,{.5f,1});
+        ImGui::SetNextWindowSize({std::min(500*ui_scale,viewport->WorkSize.x-32*ui_scale),0});ImGui::SetNextWindowBgAlpha(.94f);
         ImGui::Begin("Mod message",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoInputs|ImGuiWindowFlags_NoFocusOnAppearing);
         ImGui::TextDisabled("%s",message.mod.c_str());ImGui::TextWrapped("%s",message.text.c_str());ImGui::End();
     }
@@ -1075,7 +1081,7 @@ struct App {
                 if(ImGui::Checkbox("##Enabled",&enabled)) action=id;
                 setting_help("Applies when you start or restart the game.");ImGui::EndDisabled();
                 ImGui::TableNextColumn();
-                ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,ImVec2{ImGui::GetStyle().ItemSpacing.x,4});
+                ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,ImVec2{ImGui::GetStyle().ItemSpacing.x,4*ui_scale});
                 const bool details=ImGui::TreeNodeEx("##Details",ImGuiTreeNodeFlags_FramePadding|ImGuiTreeNodeFlags_SpanAvailWidth|ImGuiTreeNodeFlags_NoTreePushOnOpen,
                     "%s",mod?mod->name.c_str():id.c_str());
                 setting_help("Expand for version, author and file details.");
@@ -1231,7 +1237,21 @@ struct App {
         return false;
 #endif
     }
-    void settings_interface() {
+    void scale_settings(float display_scale,float framebuffer_scale,ImVec2 size) {
+        if(size.x<=0 || size.y<=0) return;
+        // The renderer already converts ImGui coordinates to framebuffer pixels.
+        const float preferred=display_scale>0 && framebuffer_scale>0?display_scale/framebuffer_scale:1.0f;
+        const float fit=std::min(size.x/minimum_width,size.y/minimum_height);
+        const float scale=std::min(preferred,fit);
+        if(scale==ui_scale) return;
+        ui_scale=scale;
+        auto& style=ImGui::GetStyle();
+        // ScaleAllSizes rounds dimensions, so always start from the original theme.
+        style=unscaled_style;
+        style.ScaleAllSizes(scale);
+        style.FontScaleDpi=scale;
+    }
+    void settings_interface(float display_scale) {
         PerfScope timing(&performance,PerfPhase::ui);
         save_achievements();
         const bool blocked=input->capture_state()!=ControllerCapture::idle;
@@ -1246,7 +1266,10 @@ struct App {
             } else io.ConfigFlags|=ImGuiConfigFlags_NavEnableGamepad;
             controller_navigation_blocked=blocked;
         }
-        ImGui_ImplDX11_NewFrame();ImGui_ImplSDL3_NewFrame();ImGui::NewFrame();
+        ImGui_ImplDX11_NewFrame();ImGui_ImplSDL3_NewFrame();
+        const auto& io=ImGui::GetIO();
+        scale_settings(display_scale,io.DisplayFramebufferScale.x,io.DisplaySize);
+        ImGui::NewFrame();
         if(show_settings) {
             const auto* viewport=ImGui::GetMainViewport();
             auto& backdrop=*ImGui::GetBackgroundDrawList();
@@ -1254,34 +1277,34 @@ struct App {
                 const auto p=viewport->Pos,size=viewport->Size;
                 backdrop.AddRectFilledMultiColor(p,{p.x+size.x,p.y+size.y},IM_COL32(15,22,32,255),IM_COL32(26,31,40,255),IM_COL32(10,14,21,255),IM_COL32(10,14,21,255));
                 for(int i=0;i<5;++i) {
-                    const float x=p.x+size.x*.6f+i*48;
-                    backdrop.AddLine({x,p.y},{x-size.y*.6f,p.y+size.y},IM_COL32(255,126,48,12),16);
+                    const float x=p.x+size.x*.6f+i*48*ui_scale;
+                    backdrop.AddLine({x,p.y},{x-size.y*.6f,p.y+size.y},IM_COL32(255,126,48,12),16*ui_scale);
                 }
             } else backdrop.AddRectFilled(viewport->Pos,{viewport->Pos.x+viewport->Size.x,viewport->Pos.y+viewport->Size.y},IM_COL32(0,0,0,100));
             ImGui::SetNextWindowPos(viewport->GetCenter(),ImGuiCond_Always,{0.5f,0.5f});
-            ImGui::SetNextWindowSize({std::min(1040.0f,viewport->Size.x-32),std::min(740.0f,viewport->Size.y-32)});
+            ImGui::SetNextWindowSize({std::min(1040*ui_scale,viewport->Size.x-32*ui_scale),std::min(740*ui_scale,viewport->Size.y-32*ui_scale)});
             ImGui::Begin("Burnout 2: Point of Impact",nullptr,ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoScrollbar);
             const auto header=ImGui::GetCursorPos();
-            ImGui::Image(logo.Get(),{64,64});
-            ImGui::SetCursorPos({header.x,header.y+74});ImGui::Separator();ImGui::Spacing();
+            ImGui::Image(logo.Get(),{64*ui_scale,64*ui_scale});
+            ImGui::SetCursorPos({header.x,header.y+74*ui_scale});ImGui::Separator();ImGui::Spacing();
             bool changed=false;
             constexpr const char* categories[]={"Game files","General","Audio","Graphics","Enhancements","Controls","Achievements","Mods","Diagnostics"};
             constexpr const char* navigation[]={"        Game files","        General","        Audio","        Graphics","        Enhancements","        Controls","        Achievements","        Mods","        Diagnostics"};
             if(select_category>=0 && select_category<int(std::size(categories))) {category=select_category;cancel_bindings();}
             select_category=-1;
-            ImGui::BeginChild("Settings body",{0,-66},0,ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_NoScrollWithMouse);
-            const float navigation_width=ImGui::GetContentRegionAvail().x<760?170.0f:190.0f;
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,{10,14});
-            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,{8,6});
+            ImGui::BeginChild("Settings body",{0,-66*ui_scale},0,ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_NoScrollWithMouse);
+            const float navigation_width=(ImGui::GetContentRegionAvail().x<760*ui_scale?170:190)*ui_scale;
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,{10*ui_scale,14*ui_scale});
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,{8*ui_scale,6*ui_scale});
             ImGui::BeginChild("Navigation",{navigation_width,0},ImGuiChildFlags_Borders);
             ImGui::PushFont(nullptr,12);ImGui::TextDisabled("SETTINGS");ImGui::PopFont();ImGui::Spacing();
             ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign,{0,.5f});
             for(int tab=0;tab<int(std::size(categories));++tab) {
-                if(ImGui::Selectable(navigation[tab],category==tab,0,{0,40})) {category=tab;cancel_bindings();}
+                if(ImGui::Selectable(navigation[tab],category==tab,0,{0,40*ui_scale})) {category=tab;cancel_bindings();}
                 const auto p=ImGui::GetItemRectMin();
                 const auto color=category==tab?IM_COL32(255,139,70,255):IM_COL32(153,166,181,255);
-                settings_icon(*ImGui::GetWindowDrawList(),tab,{p.x+6,p.y+10},color);
-                if(category==tab) ImGui::GetWindowDrawList()->AddRectFilled({p.x-5,p.y+9},{p.x-2,p.y+31},color,2);
+                settings_icon(*ImGui::GetWindowDrawList(),tab,{p.x+6*ui_scale,p.y+10*ui_scale},color,ui_scale);
+                if(category==tab) ImGui::GetWindowDrawList()->AddRectFilled({p.x-5*ui_scale,p.y+9*ui_scale},{p.x-2*ui_scale,p.y+31*ui_scale},color,2*ui_scale);
             }
             ImGui::PopStyleVar();ImGui::EndChild();ImGui::PopStyleVar(2);
             ImGui::SameLine();
@@ -1289,19 +1312,21 @@ struct App {
             ImGui::PushFont(heading_font,26);ImGui::TextUnformatted(categories[category]);ImGui::PopFont();
             ImGui::Spacing();
             ImGui::BeginChild("Options",{0,0},ImGuiChildFlags_Borders);
+            const float browse_width=92*ui_scale;
+            const float path_width=ImGui::GetContentRegionAvail().x-browse_width-ImGui::GetStyle().ItemSpacing.x;
                     switch(category) {
                     case 0:
                         ImGui::SeparatorText("ORIGINAL GAME FILES");
-                        setting_label("Game executable");ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x-104);
+                        setting_label("Game executable");ImGui::SetNextItemWidth(path_width);
                         changed|=ImGui::InputText("##Executable",settings.xbe.data(),settings.xbe.size());
                         setting_help("The supported US Xbox game executable (default.xbe). Changes apply to the next game session.");
-                        ImGui::SameLine();if(ImGui::Button("Browse##xbe",{92,0})) changed|=browse(settings.xbe,false);
+                        ImGui::SameLine();if(ImGui::Button("Browse##xbe",{browse_width,0})) changed|=browse(settings.xbe,false);
                         setting_help("Select the game executable. Changes save automatically.");
-                        setting_label("Game disc image");ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x-104);
+                        setting_label("Game disc image");ImGui::SetNextItemWidth(path_width);
                         changed|=ImGui::InputText("##Game disc",settings.disc.data(),settings.disc.size());
                         setting_help("Your US Xbox XISO disc image. Changes apply to the next game session.");
                         ImGui::SameLine();ImGui::BeginDisabled(game_files_setup.valid());
-                        if(ImGui::Button("Browse##disc",{92,0}) && browse(settings.disc,true)) {changed=true;prepare_game_files();}
+                        if(ImGui::Button("Browse##disc",{browse_width,0}) && browse(settings.disc,true)) {changed=true;prepare_game_files();}
                         ImGui::EndDisabled();
                         setting_help("Select the Xbox game disc image. The game executable is extracted and verified from it automatically.");
                         ImGui::Spacing();ImGui::TextWrapped("Use the US Xbox release of Burnout 2: Point of Impact as an XISO disc image. Selecting it prepares the game executable automatically.");
@@ -1355,9 +1380,9 @@ struct App {
                         ImGui::EndDisabled();
                         disabled_text("%u songs imported",music_songs);
                         ImGui::BeginDisabled(music_importing || music_folder_selection!=nullptr);
-                        setting_label("Music folder");ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x-104);
+                        setting_label("Music folder");ImGui::SetNextItemWidth(path_width);
                         ImGui::InputText("##Music folder",settings.music_folder.data(),settings.music_folder.size(),ImGuiInputTextFlags_ReadOnly);
-                        ImGui::SameLine();if(ImGui::Button("Browse##music",{92,0})) browse_music();
+                        ImGui::SameLine();if(ImGui::Button("Browse##music",{browse_width,0})) browse_music();
                         ImGui::BeginDisabled(settings.music_folder[0]==0);
                         if(ImGui::Button(playing?"Import music and restart":"Import music")) {
                             music_import_requested=true;music_restart=playing;launch=true;
@@ -1510,8 +1535,8 @@ struct App {
                         }
                         if(ImGui::BeginTable("Bindings",3,ImGuiTableFlags_RowBg)) {
                             ImGui::TableSetupColumn("Action",ImGuiTableColumnFlags_WidthStretch);
-                            ImGui::TableSetupColumn(controller?"Control":"Key",ImGuiTableColumnFlags_WidthFixed,std::clamp(ImGui::GetContentRegionAvail().x*.4f,120.0f,230.0f));
-                            ImGui::TableSetupColumn("Clear",ImGuiTableColumnFlags_WidthFixed,55);
+                            ImGui::TableSetupColumn(controller?"Control":"Key",ImGuiTableColumnFlags_WidthFixed,std::clamp(ImGui::GetContentRegionAvail().x*.4f,120*ui_scale,230*ui_scale));
+                            ImGui::TableSetupColumn("Clear",ImGuiTableColumnFlags_WidthFixed,55*ui_scale);
                             constexpr unsigned order[]={15,14,16,17,8,9,4,5,0,1,2,3,10,11,12,13,6,7,18,19,20,21,22,23};
                             for(const auto i:order) {
                                 ImGui::PushID(int(i));ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextWrapped("%s",input_actions[i].label.data());
@@ -1565,10 +1590,10 @@ struct App {
             ImGui::Separator();
             const auto available=ImGui::GetContentRegionAvail().x,spacing=ImGui::GetStyle().ItemSpacing.x;
             const float count=playing?4.0f:3.0f;
-            const auto button_width=std::clamp((available-spacing*(count-1))/count,1.0f,145.0f);
+            const auto button_width=std::clamp((available-spacing*(count-1))/count,1.0f,145*ui_scale);
             const auto row_width=button_width*count+spacing*(count-1);
             const auto footer=ImGui::GetCursorPos();
-            if(available-row_width>175) {
+            if(available-row_width>175*ui_scale) {
                 ImGui::AlignTextToFramePadding();
                 disabled_text(ImGui::GetTime()<defaults_message_until?"Defaults restored":"Changes save automatically");
             }
@@ -1608,7 +1633,7 @@ struct App {
         }
         if(playing && settings.show_fps) {
             const auto* viewport=ImGui::GetMainViewport();
-            ImGui::SetNextWindowPos({viewport->WorkPos.x+viewport->WorkSize.x-12,viewport->WorkPos.y+12},ImGuiCond_Always,{1,0});
+            ImGui::SetNextWindowPos({viewport->WorkPos.x+viewport->WorkSize.x-12*ui_scale,viewport->WorkPos.y+12*ui_scale},ImGuiCond_Always,{1,0});
             ImGui::SetNextWindowBgAlpha(0.65f);
             ImGui::Begin("Frame rate",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_AlwaysAutoResize|
                 ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoFocusOnAppearing|ImGuiWindowFlags_NoNav|ImGuiWindowFlags_NoInputs);
@@ -1617,7 +1642,7 @@ struct App {
             ImGui::End();
         }
         if(performance.active()) {
-            ImGui::SetNextWindowPos({12,12},ImGuiCond_Always);ImGui::SetNextWindowBgAlpha(.65f);
+            ImGui::SetNextWindowPos({12*ui_scale,12*ui_scale},ImGuiCond_Always);ImGui::SetNextWindowBgAlpha(.65f);
             ImGui::Begin("Performance recording",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoInputs|ImGuiWindowFlags_NoFocusOnAppearing);
             ImGui::TextUnformatted("Recording performance - F9 saves");ImGui::End();
         }
@@ -1642,14 +1667,14 @@ struct App {
     void display(bool clear) {
         if(clear) {renderer->set_target(0);renderer->begin(0xFF16191D);renderer->end();}
         if(renderer->display()) {
-            settings_interface();if(!display_paced()) {PerfScope wait(&performance,PerfPhase::pacing);pacer.wait(settings.refresh_rate);}renderer->present(settings.vsync);
+            settings_interface(SDL_GetWindowDisplayScale(window));if(!display_paced()) {PerfScope wait(&performance,PerfPhase::pacing);pacer.wait(settings.refresh_rate);}renderer->present(settings.vsync);
             if(playing) frame_presented();
         } else pacer.wait(settings.refresh_rate);
         if(!playing) apply_settings();
     }
     void display_game(bool wait=true) {
         if(renderer->display(wait)) {
-            settings_interface();
+            settings_interface(SDL_GetWindowDisplayScale(window));
             if(renderer->present(settings.vsync,wait)) frame_presented();
         }
     }
@@ -1992,6 +2017,17 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     }
     constexpr const char* names[]={"game-files","general","audio","graphics","enhancements","controls","achievements","mods","log"};
     std::ostringstream images;images<<'[';
+    // The fixed-size captures and mouse coordinates below use a 100% desktop layout.
+    const auto draw_settings=[&] {app.settings_interface(SDL_GetWindowPixelDensity(app.window));};
+    for(const auto [display_scale,density,size,expected]:{
+            std::tuple{3.f,1.f,ImVec2{3840,2160},3.f}, // Reported Windows desktop
+            std::tuple{3.f,1.f,ImVec2{960,720},1.5f}, // Same desktop, smaller window
+            std::tuple{2.f,2.f,ImVec2{1920,1080},1.f}}) {
+        app.scale_settings(display_scale,density,size);
+        const auto& style=ImGui::GetStyle();
+        if(style.FontScaleDpi!=expected || style.WindowPadding.x!=app.unscaled_style.WindowPadding.x*expected)
+            throw std::runtime_error("Settings did not follow the display scale and available window size");
+    }
     for(int tab=0;tab<int(std::size(names));++tab) {
         app.select_category=tab;
         app.script_fov=tab==3?std::optional<unsigned>{125}:std::nullopt;
@@ -1999,7 +2035,7 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
         for(unsigned frame=0;frame<3;++frame) {
             app.poll();app.renderer->begin(0xFF16344A);app.renderer->end();
             if(!app.renderer->display()) throw std::runtime_error("Hidden SDL3 window could not display an image");
-            app.settings_interface();if(frame!=2) app.renderer->present(false);
+            draw_settings();if(frame!=2) app.renderer->present(false);
         }
         if(app.category!=tab || ImGui::GetDrawData()->TotalVtxCount==0) throw std::runtime_error("Settings category emitted no visible geometry");
         const auto image=app.renderer->read_display();
@@ -2015,7 +2051,7 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     // Escape must only toggle settings, not select the child panel itself.
     const auto settings_frame=[&](bool present=true) {
         app.renderer->begin(0xFF16344A);app.renderer->end();app.renderer->display();
-        app.settings_interface();if(present) app.renderer->present(false);
+        draw_settings();if(present) app.renderer->present(false);
     };
     {
         const auto script=path.parent_path()/"test-mod-startup.lua";write_text(script,test_mod_script,false);
@@ -2099,7 +2135,7 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
         app.select_category=category;
         for(unsigned frame=0;frame<3;++frame) {
             app.poll();app.renderer->begin(0xFF16344A);app.renderer->end();app.renderer->display();
-            app.settings_interface();if(frame!=2) app.renderer->present(false);
+            draw_settings();if(frame!=2) app.renderer->present(false);
         }
         const auto image=app.renderer->read_display();
         if(image.width!=640 || image.height!=480) throw std::runtime_error("Minimum settings window dimensions differ");
@@ -2209,13 +2245,13 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     app.launch=false;
     app.show_settings=false;app.playing=true;app.settings.show_fps=true;app.display_rate.value=144;app.game_rate.value=60;
     for(unsigned frame=0;frame<3;++frame) {
-        app.renderer->begin(0xFF16344A);app.renderer->end();app.renderer->display();app.settings_interface();
+        app.renderer->begin(0xFF16344A);app.renderer->end();app.renderer->display();draw_settings();
         if(frame!=2) app.renderer->present(false);
     }
     if(!ImGui::GetDrawData()->TotalVtxCount) throw std::runtime_error("Frame rate counter emitted no visible geometry");
     auto counter_image=path.parent_path()/path.stem();counter_image+="-fps";counter_image+=path.extension();
     save_png(app.renderer->read_display(),counter_image);app.renderer->present(false);
-    app.settings.show_fps=false;app.settings_interface();
+    app.settings.show_fps=false;draw_settings();
     if(ImGui::GetDrawData()->TotalVtxCount) throw std::runtime_error("Disabled frame rate counter stayed visible");
     app.playing=false;app.show_settings=true;
     std::array<double,2> measured{};
@@ -2371,7 +2407,7 @@ std::string check_window(const std::filesystem::path& path,bool warp) {
     if(app.running || app.launch || app.binding_action!=-1 || app.settings_dirty || closed.volume!=37)
         throw std::runtime_error("Exit did not cancel launch and save pending settings");
     std::filesystem::remove(preferences);
-    return std::format("{{\"format\":\"b2-window-check-v4\",\"passed\":true,\"backend\":\"SDL3/D3D11/ImGui\",\"adapter\":{},\"window\":{},\"settings_font\":{},\"heading_font\":{},\"default_refresh_rate\":60,"
+    return std::format("{{\"format\":\"b2-window-check-v4\",\"passed\":true,\"backend\":\"SDL3/D3D11/ImGui\",\"adapter\":{},\"window\":{},\"settings_font\":{},\"heading_font\":{},\"settings_display_scaling\":true,\"default_refresh_rate\":60,"
         "\"bindings_and_settings\":true,\"camera_fov_setting\":true,\"controller_remapping\":true,\"controller_capture\":true,\"automatic_settings_save\":true,\"restart_request\":true,\"exit_request\":true,\"widescreen_presentation\":true,\"ultrawide_presentation\":true,\"motion_blur_setting\":true,\"frame_counter\":true,\"counter_image\":{},\"escape_toggle\":true,\"resolution_change\":true,"
         "\"pacing_60_hz\":{:.3f},\"pacing_120_hz\":{:.3f},\"source_at_120_hz\":{:.3f},\"source_at_144_hz\":{:.3f},\"display_120_hz\":{:.3f},\"display_144_hz\":{:.3f},\"hdr_settings\":true,\"hdr_switching\":true,\"hdr_display_available\":{},"
         "\"achievements_save_load\":true,\"achievements_reset\":true,\"achievement_reset_confirmation\":true,\"achievements_disable\":true,\"achievement_notification\":true,\"achievement_sound\":true,\"achievement_fades\":true,\"texture_pack_install\":true,\"window_capture\":true,\"performance_capture\":true,\"shader_compilations\":0,\"game_booted\":false,\"game_fps_established\":false,\"images\":{}}}",
