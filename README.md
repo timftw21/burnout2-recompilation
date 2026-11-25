@@ -18,10 +18,11 @@ I'll try to respond in a timely manner. This is an independent fan project, unaf
 Yes, AI (Codex) assisted in the development of this project. No, this project was not blindly thrown together.
 If you're skeptical, I implore you to try the recompilation for yourself. I take quality control quite seriously!👀
 
-## What's new in 1.15.0
+## What's new in 1.15.5
 
-- **Ready-to-play downloads for every platform.** No more installing build tools or compiling: download **Burnout2-Setup.exe** for Windows, **Burnout2-x86_64.AppImage** for Linux and Steam Deck, or the disk image for your Apple Silicon or Intel Mac.
-- **Select your disc and play.** Choosing your disc image in **Game files** now prepares the game executable automatically.
+- **Safer installs and upgrades.** Windows Setup preserves disc images you already own and can recover an interrupted install. Preparing game files also preserves your existing settings if they cannot be read.
+- **More reliable saves.** Concurrent appends on Linux and macOS preserve existing save data. The game can update a save's timestamps and read-only setting together, and save listings show the same details as the file itself.
+- **Texture borders.** The renderer now uses the border color requested by the game when filtering the edge of a texture.
 
 Coming from a source build? See [Updating between releases](#updating-between-releases)
 to keep your saves. Your own US Xbox XISO is required. Game files are not included.
